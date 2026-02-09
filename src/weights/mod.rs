@@ -32,6 +32,12 @@ pub struct ModelConfig {
     pub num_experts_per_tok: usize,
     pub num_hidden_layers: usize,
     pub first_k_dense_replace: usize,
+    /// Number of shared (always-active) experts per MoE layer. 0 = none.
+    /// Shared expert intermediate_size = n_shared_experts × moe_intermediate_size.
+    pub n_shared_experts: usize,
+    /// Scaling factor applied to routed expert output before adding shared expert output.
+    /// DeepSeek V2-Lite: 1.0, Kimi K2.5: 2.827, Qwen3: N/A (no shared experts).
+    pub routed_scaling_factor: f32,
 }
 
 impl ModelConfig {
@@ -85,6 +91,15 @@ impl ModelConfig {
             return Err("Missing first_k_dense_replace or decoder_sparse_step".to_string());
         };
 
+        // Shared experts (optional — Qwen3 has none)
+        let n_shared_experts = cfg.get("n_shared_experts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let routed_scaling_factor = cfg.get("routed_scaling_factor")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32;
+
         Ok(ModelConfig {
             hidden_size,
             moe_intermediate_size,
@@ -92,6 +107,8 @@ impl ModelConfig {
             num_experts_per_tok,
             num_hidden_layers,
             first_k_dense_replace,
+            n_shared_experts,
+            routed_scaling_factor,
         })
     }
 }
@@ -112,6 +129,11 @@ pub struct WeightStore {
     /// Expert weights indexed as [moe_layer_index][expert_index].
     /// moe_layer_index is 0-based within MoE layers only (skips dense layers).
     pub experts: Vec<Vec<ExpertWeights>>,
+    /// Shared expert weights indexed as [moe_layer_index].
+    /// Empty if n_shared_experts == 0.
+    /// Shared expert is a single concatenated MLP with
+    /// intermediate_size = n_shared_experts × moe_intermediate_size.
+    pub shared_experts: Vec<ExpertWeights>,
     /// Model configuration.
     pub config: ModelConfig,
     /// Group size used for quantization.
@@ -195,6 +217,7 @@ impl WeightStore {
     pub fn new() -> Self {
         WeightStore {
             experts: Vec::new(),
+            shared_experts: Vec::new(),
             config: ModelConfig {
                 hidden_size: 0,
                 moe_intermediate_size: 0,
@@ -202,6 +225,8 @@ impl WeightStore {
                 num_experts_per_tok: 0,
                 num_hidden_layers: 0,
                 first_k_dense_replace: 0,
+                n_shared_experts: 0,
+                routed_scaling_factor: 1.0,
             },
             group_size: DEFAULT_GROUP_SIZE,
         }
@@ -256,7 +281,13 @@ impl WeightStore {
             let cpath = cache_path(model_dir, group_size);
             if cpath.exists() {
                 match Self::load_cache(&cpath, &config, group_size, num_moe_layers, config_hash) {
-                    Ok(store) => {
+                    Ok(mut store) => {
+                        // Shared experts not in cache — load them now
+                        if config.n_shared_experts > 0 {
+                            store.shared_experts = Self::load_shared_experts(
+                                model_dir, &config, store.group_size, num_moe_layers,
+                            )?;
+                        }
                         let elapsed = start.elapsed();
                         log::info!(
                             "Loaded from cache in {:.1}s: {} MoE layers × {} experts",
@@ -274,11 +305,12 @@ impl WeightStore {
         }
 
         // Load from safetensors and quantize (or load pre-quantized)
-        let (experts, effective_group_size) =
+        let (experts, shared_experts, effective_group_size) =
             Self::load_and_quantize_all(model_dir, &config, group_size, num_moe_layers)?;
 
         let store = WeightStore {
             experts,
+            shared_experts,
             config: config.clone(),
             group_size: effective_group_size,
         };
@@ -303,13 +335,13 @@ impl WeightStore {
     }
 
     /// Load from safetensors shards and quantize to INT4 (or load pre-quantized).
-    /// Returns (experts, effective_group_size).
+    /// Returns (routed_experts, shared_experts, effective_group_size).
     fn load_and_quantize_all(
         model_dir: &Path,
         config: &ModelConfig,
         group_size: usize,
         num_moe_layers: usize,
-    ) -> Result<(Vec<Vec<ExpertWeights>>, usize), String> {
+    ) -> Result<(Vec<Vec<ExpertWeights>>, Vec<ExpertWeights>, usize), String> {
         // Parse safetensors index
         let index_path = model_dir.join("model.safetensors.index.json");
         let index_str = std::fs::read_to_string(&index_path)
@@ -401,21 +433,54 @@ impl WeightStore {
             experts.push(layer_experts);
         }
 
+        // Load shared experts (always BF16, quantized to INT4 by us)
+        let shared_experts = if config.n_shared_experts > 0 {
+            let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+            log::info!(
+                "Loading shared experts: n_shared={}, intermediate_size={}",
+                config.n_shared_experts, shared_intermediate,
+            );
+            let mut shared = Vec::with_capacity(num_moe_layers);
+            for moe_idx in 0..num_moe_layers {
+                let layer_idx = moe_idx + config.first_k_dense_replace;
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.shared_experts");
+                let gate = load_and_quantize_weight(
+                    &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
+                )?;
+                let up = load_and_quantize_weight(
+                    &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                )?;
+                let down = load_and_quantize_weight(
+                    &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                )?;
+                shared.push(ExpertWeights { gate, up, down });
+            }
+            log::info!("Loaded {} shared expert layers", shared.len());
+            shared
+        } else {
+            Vec::new()
+        };
+
         let total_bytes: usize = experts.iter().flat_map(|layer| {
             layer.iter().map(|e| {
                 (e.gate.packed.len() + e.up.packed.len() + e.down.packed.len()) * 4
                     + (e.gate.scales.len() + e.up.scales.len() + e.down.scales.len()) * 2
             })
         }).sum();
+        let shared_bytes: usize = shared_experts.iter().map(|e| {
+            (e.gate.packed.len() + e.up.packed.len() + e.down.packed.len()) * 4
+                + (e.gate.scales.len() + e.up.scales.len() + e.down.scales.len()) * 2
+        }).sum();
 
         log::info!(
-            "Loaded {} MoE layers × {} experts = {:.1} GB INT4 (group_size={effective_group_size})",
+            "Loaded {} MoE layers × {} experts = {:.1} GB INT4 (group_size={effective_group_size}), shared={:.1} MB",
             num_moe_layers,
             config.n_routed_experts,
             total_bytes as f64 / 1e9,
+            shared_bytes as f64 / 1e6,
         );
 
-        Ok((experts, effective_group_size))
+        Ok((experts, shared_experts, effective_group_size))
     }
 
     /// Write INT4 expert weights to a cache file.
@@ -571,8 +636,12 @@ impl WeightStore {
             mmap.len() as f64 / 1e9 / elapsed.as_secs_f64(),
         );
 
+        // Note: shared experts are NOT cached — they are loaded from safetensors
+        // on every startup. This is fast since there's only 1 per MoE layer.
+        // TODO: add shared experts to cache format in v2.
         Ok(WeightStore {
             experts,
+            shared_experts: Vec::new(), // loaded separately after cache
             config: config.clone(),
             group_size,
         })
@@ -617,10 +686,80 @@ impl WeightStore {
         migrated
     }
 
+    /// Load shared expert weights from safetensors (always BF16, quantized to INT4).
+    fn load_shared_experts(
+        model_dir: &Path,
+        config: &ModelConfig,
+        group_size: usize,
+        num_moe_layers: usize,
+    ) -> Result<Vec<ExpertWeights>, String> {
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let index_str = std::fs::read_to_string(&index_path)
+            .map_err(|e| format!("Failed to read safetensors index: {e}"))?;
+        let index: SafetensorsIndex = serde_json::from_str(&index_str)
+            .map_err(|e| format!("Failed to parse safetensors index: {e}"))?;
+        let layers_prefix = detect_expert_prefix(&index.weight_map)?;
+
+        // Collect shard names needed for shared experts
+        let mut shard_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for moe_idx in 0..num_moe_layers {
+            let layer_idx = moe_idx + config.first_k_dense_replace;
+            let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.shared_experts");
+            for proj in &["gate_proj", "up_proj", "down_proj"] {
+                let name = format!("{prefix}.{proj}.weight");
+                if let Some(shard) = index.weight_map.get(&name) {
+                    shard_names.insert(shard.clone());
+                }
+            }
+        }
+
+        let mut shards: HashMap<String, MmapSafetensors> = HashMap::new();
+        for name in &shard_names {
+            let path = model_dir.join(name);
+            let st = MmapSafetensors::open(&path)
+                .map_err(|e| format!("Failed to open {name}: {e}"))?;
+            shards.insert(name.clone(), st);
+        }
+
+        let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+        log::info!(
+            "Loading shared experts: n_shared={}, intermediate_size={}, {} layers",
+            config.n_shared_experts, shared_intermediate, num_moe_layers,
+        );
+
+        let start = std::time::Instant::now();
+        let mut shared = Vec::with_capacity(num_moe_layers);
+        for moe_idx in 0..num_moe_layers {
+            let layer_idx = moe_idx + config.first_k_dense_replace;
+            let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.shared_experts");
+            let gate = load_and_quantize_weight(
+                &prefix, "gate_proj", &index.weight_map, &shards, group_size,
+            )?;
+            let up = load_and_quantize_weight(
+                &prefix, "up_proj", &index.weight_map, &shards, group_size,
+            )?;
+            let down = load_and_quantize_weight(
+                &prefix, "down_proj", &index.weight_map, &shards, group_size,
+            )?;
+            shared.push(ExpertWeights { gate, up, down });
+        }
+        log::info!(
+            "Loaded {} shared expert layers in {:.1}s",
+            shared.len(), start.elapsed().as_secs_f64(),
+        );
+        Ok(shared)
+    }
+
     /// Get expert weights for a given MoE layer index and expert index.
     /// moe_layer_idx is 0-based within MoE layers (not absolute layer index).
     pub fn get_expert(&self, moe_layer_idx: usize, expert_idx: usize) -> &ExpertWeights {
         &self.experts[moe_layer_idx][expert_idx]
+    }
+
+    /// Get shared expert weights for a given MoE layer index.
+    /// Returns None if no shared experts.
+    pub fn get_shared_expert(&self, moe_layer_idx: usize) -> Option<&ExpertWeights> {
+        self.shared_experts.get(moe_layer_idx)
     }
 
     /// Number of MoE layers loaded.
@@ -933,7 +1072,9 @@ mod tests {
             "n_routed_experts": 64,
             "num_experts_per_tok": 6,
             "num_hidden_layers": 27,
-            "first_k_dense_replace": 1
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 2,
+            "routed_scaling_factor": 1.0
         }"#).unwrap();
         let config = ModelConfig::from_json(&json).unwrap();
         assert_eq!(config.hidden_size, 2048);
@@ -942,6 +1083,8 @@ mod tests {
         assert_eq!(config.num_experts_per_tok, 6);
         assert_eq!(config.num_hidden_layers, 27);
         assert_eq!(config.first_k_dense_replace, 1);
+        assert_eq!(config.n_shared_experts, 2);
+        assert_eq!(config.routed_scaling_factor, 1.0);
     }
 
     #[test]
@@ -954,7 +1097,9 @@ mod tests {
                 "n_routed_experts": 384,
                 "num_experts_per_tok": 8,
                 "num_hidden_layers": 61,
-                "first_k_dense_replace": 1
+                "first_k_dense_replace": 1,
+                "n_shared_experts": 1,
+                "routed_scaling_factor": 2.827
             },
             "vision_config": {}
         }"#).unwrap();
@@ -965,6 +1110,8 @@ mod tests {
         assert_eq!(config.num_experts_per_tok, 8);
         assert_eq!(config.num_hidden_layers, 61);
         assert_eq!(config.first_k_dense_replace, 1);
+        assert_eq!(config.n_shared_experts, 1);
+        assert!((config.routed_scaling_factor - 2.827).abs() < 0.001);
     }
 
     #[test]
@@ -985,6 +1132,9 @@ mod tests {
         assert_eq!(config.num_hidden_layers, 94);
         // decoder_sparse_step=1 → all layers are MoE → first_k_dense_replace=0
         assert_eq!(config.first_k_dense_replace, 0);
+        // No shared experts in Qwen3
+        assert_eq!(config.n_shared_experts, 0);
+        assert_eq!(config.routed_scaling_factor, 1.0);
     }
 
     #[test]

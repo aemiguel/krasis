@@ -43,19 +43,17 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 - [x] **SGLang import toggle** — `KRASIS_BACKEND=1` env var in kt_ep_wrapper.py
 - [x] **Launch script** — `run_krasis.sh` for DeepSeek-V2-Lite testing
 
+### Shared Experts
+- [x] **Shared expert loading** — loads `shared_experts.{gate,up,down}_proj` BF16 weights, quantizes to INT4
+- [x] **Shared expert forward** — always-active MLP added to routed expert output
+- [x] **routed_scaling_factor** — scale routed output before adding shared (V2-Lite: 1.0, Kimi K2.5: 2.827)
+- [x] **Model support**: V2-Lite (2 shared), Kimi K2.5 (1 shared), Qwen3 (0 shared, no-op)
+
 ### Infrastructure
 - [x] **System checks** — CPU governor, hugepages, memory budget, NUMA, SIMD
 - [x] **MoE benchmark script** — `bench_moe.py` for latency profiling
-- [x] **33 Rust tests** — unit + integration, all passing
+- [x] **34 Rust tests** — unit + integration, all passing
 - [x] **3 Python bridge tests** — engine roundtrip, wrapper interface, batch forward
-
-## Not Yet Implemented
-
-### Shared Experts (next up)
-- [ ] **Shared expert loading** — load `shared_experts.{gate,up,down}_proj` weights
-- [ ] **Shared expert forward** — always-active MLP added to routed expert output
-- [ ] **routed_scaling_factor** — scale routed output before adding shared (Kimi K2.5: 2.827)
-- [ ] **Models**: V2-Lite (2 shared), Kimi K2.5 (1 shared), Qwen3 (0 shared)
 
 ### GPU Expert Pinning
 - [ ] **Heatmap-based pinning** — pin hottest experts as INT4 Marlin on GPU VRAM

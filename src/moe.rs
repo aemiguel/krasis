@@ -146,6 +146,9 @@ pub fn expert_forward_integer(
 /// processed in node order (all node-0 experts first, then node-1, etc.).
 /// Each group's threads are pinned to the target node for data locality.
 ///
+/// If the model has shared experts, the shared expert forward is computed
+/// and the final output is: `routed_scaling_factor * routed_output + shared_output`.
+///
 /// # Arguments
 /// * `store` - Loaded expert weights
 /// * `moe_layer_idx` - MoE layer index (0-based, skipping dense layers)
@@ -155,6 +158,7 @@ pub fn expert_forward_integer(
 /// * `output` - Output buffer [hidden_size] as f32 (accumulated weighted sum)
 /// * `scratch` - Reusable intermediate buffers (includes INT16 activation buffers)
 /// * `scratch_pool` - Pre-allocated per-expert scratch buffers
+/// * `shared_scratch` - Scratch buffer for shared expert (may differ in intermediate size)
 /// * `parallel` - Use multi-threaded matmul
 /// * `numa_map` - Optional NUMA expert map for node-aware dispatch
 pub fn moe_forward(
@@ -166,6 +170,7 @@ pub fn moe_forward(
     output: &mut [f32],
     scratch: &mut ExpertScratch,
     scratch_pool: &mut [ExpertScratch],
+    shared_scratch: &mut Option<ExpertScratch>,
     parallel: bool,
     numa_map: Option<&crate::numa::NumaExpertMap>,
 ) {
@@ -283,6 +288,34 @@ pub fn moe_forward(
         }
     }
 
+    // Apply shared expert if present
+    if let Some(shared_expert) = store.get_shared_expert(moe_layer_idx) {
+        if let Some(ss) = shared_scratch.as_mut() {
+            // Reuse the same quantized activation (same hidden_size, same group_size).
+            // Use take pattern to split borrows, same as for routed experts.
+            let mut ss_act_int16 = std::mem::take(&mut ss.input_act_int16);
+            let mut ss_act_scales = std::mem::take(&mut ss.input_act_scales);
+
+            // Copy quantized activation from routed path
+            ss_act_int16.clear();
+            ss_act_int16.extend_from_slice(&act_int16);
+            ss_act_scales.clear();
+            ss_act_scales.extend_from_slice(&act_scales);
+
+            expert_forward_integer(shared_expert, &ss_act_int16, &ss_act_scales, ss, parallel);
+
+            // output = routed_scaling_factor * routed_output + shared_output
+            let scale = store.config.routed_scaling_factor;
+            for j in 0..hidden {
+                output[j] = scale * output[j] + ss.expert_out[j];
+            }
+
+            // Return buffers
+            ss.input_act_int16 = ss_act_int16;
+            ss.input_act_scales = ss_act_scales;
+        }
+    }
+
     // Return buffers to scratch for reuse
     scratch.input_act_int16 = act_int16;
     scratch.input_act_scales = act_scales;
@@ -383,6 +416,14 @@ fn moe_worker(
         .collect();
     let mut output_f32 = vec![0.0f32; hidden];
 
+    // Shared expert scratch (different intermediate size: n_shared * moe_intermediate)
+    let mut shared_scratch = if store.config.n_shared_experts > 0 {
+        let shared_intermediate = store.config.n_shared_experts * intermediate;
+        Some(ExpertScratch::new(hidden, shared_intermediate, group_size))
+    } else {
+        None
+    };
+
     while let Ok(work) = work_rx.recv() {
         let batch = work.batch_size;
         let topk = work.topk;
@@ -412,6 +453,7 @@ fn moe_worker(
                 &store, work.moe_layer_idx, act,
                 &expert_indices, &expert_weights,
                 &mut output_f32, &mut scratch, &mut scratch_pool,
+                &mut shared_scratch,
                 parallel, numa_map.as_ref(),
             );
 
@@ -442,6 +484,8 @@ pub struct KrasisEngine {
     scratch: Option<ExpertScratch>,
     /// Pre-allocated scratch buffers for expert-level parallelism (one per top-k expert).
     scratch_pool: Vec<ExpertScratch>,
+    /// Scratch buffer for shared expert (different intermediate size). None if no shared experts.
+    shared_scratch: Option<ExpertScratch>,
     output_buf: Vec<f32>,
     parallel: bool,
     /// NUMA expert placement map (None if single-node or NUMA disabled).
@@ -482,6 +526,7 @@ impl KrasisEngine {
             store: None,
             scratch: None,
             scratch_pool: Vec::new(),
+            shared_scratch: None,
             output_buf: Vec::new(),
             parallel,
             numa_map: None,
@@ -540,6 +585,18 @@ impl KrasisEngine {
             ))
             .collect();
 
+        // Shared expert scratch (different intermediate size)
+        let shared_scratch = if store.config.n_shared_experts > 0 {
+            let shared_intermediate = store.config.n_shared_experts * store.config.moe_intermediate_size;
+            log::info!(
+                "Shared expert scratch: intermediate_size={}, routed_scaling_factor={}",
+                shared_intermediate, store.config.routed_scaling_factor,
+            );
+            Some(ExpertScratch::new(store.config.hidden_size, shared_intermediate, effective_gs))
+        } else {
+            None
+        };
+
         // Detect NUMA topology and migrate expert weights if multi-node
         let topo = crate::numa::NumaTopology::detect();
         let numa_map = if topo.is_numa() {
@@ -589,6 +646,7 @@ impl KrasisEngine {
 
         self.output_buf = vec![0.0f32; store.config.hidden_size];
         self.scratch_pool = scratch_pool;
+        self.shared_scratch = shared_scratch;
         self.work_tx = Some(work_tx);
         self.result_rx = Some(Mutex::new(result_rx));
         self.worker_handle = Some(Mutex::new(handle));
@@ -658,6 +716,7 @@ impl KrasisEngine {
             &mut self.output_buf,
             scratch,
             &mut self.scratch_pool,
+            &mut self.shared_scratch,
             parallel,
             self.numa_map.as_ref(),
         );
@@ -972,11 +1031,19 @@ mod tests {
         let expert_indices: Vec<usize> = (0..top_k).collect();
         let expert_weights: Vec<f32> = vec![1.0 / top_k as f32; top_k];
 
+        // Shared expert scratch for V2-Lite (2 shared experts)
+        let shared_intermediate = store.config.n_shared_experts * store.config.moe_intermediate_size;
+        let mut shared_scratch = if store.config.n_shared_experts > 0 {
+            Some(ExpertScratch::new(hidden, shared_intermediate, group_size))
+        } else {
+            None
+        };
+
         // Time full MoE forward
         let start = std::time::Instant::now();
         moe_forward(
             &store, 0, &activation, &expert_indices, &expert_weights,
-            &mut output, &mut scratch, &mut scratch_pool, true, None,
+            &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None,
         );
         let moe_us = start.elapsed().as_micros();
 
@@ -986,7 +1053,7 @@ mod tests {
         }
         rms = (rms / hidden as f64).sqrt();
 
-        eprintln!("V2-Lite MoE forward (layer 0, top-{top_k}):");
+        eprintln!("V2-Lite MoE forward (layer 0, top-{top_k}, shared={}):", store.config.n_shared_experts);
         eprintln!("  Time: {moe_us} μs ({:.1} ms)", moe_us as f64 / 1000.0);
         eprintln!("  Output RMS: {rms:.6}");
         eprintln!(
@@ -1038,11 +1105,16 @@ mod tests {
         let expert_indices: Vec<usize> = (0..top_k).collect();
         let expert_weights: Vec<f32> = vec![1.0 / top_k as f32; top_k];
 
+        // Shared expert scratch for Kimi K2.5 (1 shared expert)
+        // Note: partial load (max_layers=1) may not load shared experts from cache path,
+        // so we test with None here. Full test below tests shared.
+        let mut shared_scratch: Option<ExpertScratch> = None;
+
         // Time MoE forward
         let start = std::time::Instant::now();
         moe_forward(
             &store, 0, &activation, &expert_indices, &expert_weights,
-            &mut output, &mut scratch, &mut scratch_pool, true, None,
+            &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None,
         );
         let moe_us = start.elapsed().as_micros();
 
@@ -1087,10 +1159,16 @@ mod tests {
         let mut scratch_pool: Vec<ExpertScratch> = (0..top_k)
             .map(|_| ExpertScratch::new(hidden, store.config.moe_intermediate_size, group_size))
             .collect();
+        let shared_intermediate = store.config.n_shared_experts * store.config.moe_intermediate_size;
+        let mut shared_scratch = if store.config.n_shared_experts > 0 {
+            Some(ExpertScratch::new(hidden, shared_intermediate, group_size))
+        } else {
+            None
+        };
         let mut ref_output = vec![0.0f32; hidden];
         moe_forward(
             &store, 0, &activation, &expert_indices, &expert_weights,
-            &mut ref_output, &mut scratch, &mut scratch_pool, true, None,
+            &mut ref_output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None,
         );
 
         // Convert reference to BF16 for comparison
@@ -1192,5 +1270,85 @@ mod tests {
         drop(work_tx);
         handle.join().expect("Worker panicked");
         eprintln!("  Worker thread joined cleanly");
+    }
+
+    #[test]
+    fn test_shared_expert_v2_lite() {
+        let _ = env_logger::try_init();
+        let model_dir = Path::new("/home/main/Documents/Claude/hf-models/DeepSeek-V2-Lite");
+        if !model_dir.exists() {
+            eprintln!("Skipping — V2-Lite not downloaded");
+            return;
+        }
+
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None)
+            .expect("Failed to load");
+
+        // V2-Lite has 2 shared experts with routed_scaling_factor=1.0
+        assert_eq!(store.config.n_shared_experts, 2);
+        assert_eq!(store.config.routed_scaling_factor, 1.0);
+        assert_eq!(store.shared_experts.len(), store.num_moe_layers());
+
+        let hidden = store.config.hidden_size;
+        let intermediate = store.config.moe_intermediate_size;
+        let shared_intermediate = store.config.n_shared_experts * intermediate;
+        let top_k = store.config.num_experts_per_tok;
+        let group_size = store.group_size;
+
+        // Check shared expert dimensions
+        let shared_exp = &store.shared_experts[0];
+        assert_eq!(shared_exp.gate.rows, shared_intermediate); // 2816
+        assert_eq!(shared_exp.gate.cols, hidden);               // 2048
+        assert_eq!(shared_exp.down.rows, hidden);               // 2048
+        assert_eq!(shared_exp.down.cols, shared_intermediate); // 2816
+
+        // Activation
+        let mut activation = vec![0u16; hidden];
+        for i in 0..hidden {
+            activation[i] = f32_to_bf16(((i * 7 + 13) as f32 / hidden as f32 - 0.5) * 0.1);
+        }
+
+        let mut scratch = ExpertScratch::new(hidden, intermediate, group_size);
+        let mut scratch_pool: Vec<ExpertScratch> = (0..top_k)
+            .map(|_| ExpertScratch::new(hidden, intermediate, group_size))
+            .collect();
+
+        // First: MoE forward WITHOUT shared experts
+        let mut output_no_shared = vec![0.0f32; hidden];
+        let expert_indices: Vec<usize> = (0..top_k).collect();
+        let expert_weights: Vec<f32> = vec![1.0 / top_k as f32; top_k];
+        let mut no_shared: Option<ExpertScratch> = None;
+        moe_forward(
+            &store, 0, &activation, &expert_indices, &expert_weights,
+            &mut output_no_shared, &mut scratch, &mut scratch_pool,
+            &mut no_shared, true, None,
+        );
+
+        // Second: MoE forward WITH shared experts
+        let mut output_with_shared = vec![0.0f32; hidden];
+        let mut shared_scratch = Some(ExpertScratch::new(hidden, shared_intermediate, group_size));
+        moe_forward(
+            &store, 0, &activation, &expert_indices, &expert_weights,
+            &mut output_with_shared, &mut scratch, &mut scratch_pool,
+            &mut shared_scratch, true, None,
+        );
+
+        // Outputs should differ (shared expert adds to routed output)
+        let mut max_diff: f32 = 0.0;
+        for j in 0..hidden {
+            max_diff = max_diff.max((output_with_shared[j] - output_no_shared[j]).abs());
+        }
+
+        let rms_no_shared = (output_no_shared.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / hidden as f64).sqrt();
+        let rms_with_shared = (output_with_shared.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / hidden as f64).sqrt();
+
+        eprintln!("V2-Lite shared expert test:");
+        eprintln!("  n_shared={}, shared_intermediate={}", store.config.n_shared_experts, shared_intermediate);
+        eprintln!("  RMS without shared: {rms_no_shared:.6}");
+        eprintln!("  RMS with shared:    {rms_with_shared:.6}");
+        eprintln!("  Max diff:           {max_diff:.6}");
+
+        assert!(max_diff > 1e-4, "Shared expert should change output (max_diff={max_diff})");
+        assert!(rms_with_shared > 1e-5, "Output with shared too small");
     }
 }
