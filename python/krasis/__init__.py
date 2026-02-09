@@ -5,3 +5,9 @@ try:
 except ImportError:
     # Native module not built yet
     pass
+
+try:
+    from krasis.sglang_bridge import KrasisMoEWrapper
+except ImportError:
+    # torch/numpy not available
+    pass
