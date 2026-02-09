@@ -1,5 +1,6 @@
 pub mod kernel;
 pub mod moe;
+pub mod syscheck;
 pub mod weights;
 
 use pyo3::prelude::*;
@@ -10,5 +11,6 @@ fn krasis(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = env_logger::try_init();
     m.add_class::<moe::KrasisEngine>()?;
     m.add_class::<weights::WeightStore>()?;
+    m.add_function(wrap_pyfunction!(syscheck::system_check, m)?)?;
     Ok(())
 }
