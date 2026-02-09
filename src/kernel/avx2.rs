@@ -200,6 +200,72 @@ pub fn matmul_int4_avx2(q: &QuantizedInt4, activation: &[u16], output: &mut [f32
     }
 }
 
+/// Parallel AVX2 INT4 matmul — splits output rows across rayon threads.
+///
+/// Each thread processes a chunk of rows independently. The activation
+/// vector is shared (read-only, cached in L1/L2 across all threads).
+/// Weight rows are accessed sequentially within each chunk for optimal
+/// prefetcher behavior.
+pub fn matmul_int4_parallel(q: &QuantizedInt4, activation: &[u16], output: &mut [f32]) {
+    use rayon::prelude::*;
+
+    assert_eq!(activation.len(), q.cols);
+    assert_eq!(output.len(), q.rows);
+    assert!(q.cols % q.group_size == 0);
+    assert!(q.cols % 8 == 0);
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    // For small matrices, avoid rayon overhead
+    if q.rows <= 64 {
+        unsafe {
+            expert_matmul_int4(
+                q.packed.as_ptr(),
+                q.scales.as_ptr(),
+                activation.as_ptr(),
+                output.as_mut_ptr(),
+                q.cols,
+                q.rows,
+                q.group_size,
+            );
+        }
+        return;
+    }
+
+    let packed_k = q.cols / 8;
+    let num_groups = q.cols / q.group_size;
+    let chunk_size = 32; // rows per chunk — balances parallelism vs overhead
+
+    // Safety: each chunk writes to disjoint output rows and reads from
+    // disjoint weight rows + shared activation. No data races.
+    // Convert to usize for Send+Sync in rayon closure.
+    // Safety: all threads read disjoint weight rows + shared activation.
+    let packed_addr = q.packed.as_ptr() as usize;
+    let scales_addr = q.scales.as_ptr() as usize;
+    let act_addr = activation.as_ptr() as usize;
+    let cols = q.cols;
+    let group_size = q.group_size;
+
+    output.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start_row = chunk_idx * chunk_size;
+        let chunk_rows = chunk.len();
+
+        unsafe {
+            expert_matmul_int4(
+                (packed_addr as *const u32).add(start_row * packed_k),
+                (scales_addr as *const u16).add(start_row * num_groups),
+                act_addr as *const u16,
+                chunk.as_mut_ptr(),
+                cols,
+                chunk_rows,
+                group_size,
+            );
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,13 +471,62 @@ mod tests {
         let gb_per_sec = (weight_bytes as f64 / 1e9) / (us_per_call / 1e6);
 
         eprintln!(
-            "AVX2 INT4 matmul [{n}×{k}]: {us_per_call:.0} μs/call, {gb_per_sec:.1} GB/s effective"
+            "AVX2 INT4 single-thread [{n}×{k}]: {us_per_call:.0} μs/call, {gb_per_sec:.1} GB/s"
+        );
+
+        // Parallel version
+        matmul_int4_parallel(&q, &activation, &mut output);
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            matmul_int4_parallel(&q, &activation, &mut output);
+        }
+        let elapsed = start.elapsed();
+
+        let us_par = elapsed.as_micros() as f64 / iters as f64;
+        let gb_par = (weight_bytes as f64 / 1e9) / (us_par / 1e6);
+        let speedup = us_per_call / us_par;
+
+        eprintln!(
+            "AVX2 INT4 parallel      [{n}×{k}]: {us_par:.0} μs/call, {gb_par:.1} GB/s, {speedup:.1}x speedup"
         );
         eprintln!(
-            "  Weight data: {:.1} KB (packed) + {:.1} KB (scales) = {:.1} KB",
-            q.packed.len() as f64 * 4.0 / 1024.0,
-            q.scales.len() as f64 * 2.0 / 1024.0,
+            "  Weight data: {:.1} KB, rayon threads: {}",
             weight_bytes as f64 / 1024.0,
+            rayon::current_num_threads(),
         );
+    }
+
+    #[test]
+    fn test_parallel_correctness() {
+        let n = 1408;
+        let k = 2048;
+        let group_size = 128;
+
+        let mut weight_bf16 = vec![0u16; n * k];
+        for i in 0..weight_bf16.len() {
+            let val = ((i * 37 + 11) as f32 / weight_bf16.len() as f32 - 0.5) * 0.1;
+            weight_bf16[i] = f32_to_bf16(val);
+        }
+
+        let mut activation = vec![0u16; k];
+        for i in 0..k {
+            let val = ((i * 7 + 3) as f32 / k as f32 - 0.5) * 0.2;
+            activation[i] = f32_to_bf16(val);
+        }
+
+        let q = quantize_int4(&weight_bf16, n, k, group_size);
+
+        let mut serial_out = vec![0.0f32; n];
+        let mut parallel_out = vec![0.0f32; n];
+
+        matmul_int4_avx2(&q, &activation, &mut serial_out);
+        matmul_int4_parallel(&q, &activation, &mut parallel_out);
+
+        let mut max_diff: f32 = 0.0;
+        for i in 0..n {
+            max_diff = max_diff.max((serial_out[i] - parallel_out[i]).abs());
+        }
+        eprintln!("Parallel vs serial max_diff: {max_diff:.8}");
+        assert!(max_diff == 0.0, "Parallel should be bit-identical to serial");
     }
 }
