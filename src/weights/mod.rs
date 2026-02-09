@@ -488,6 +488,8 @@ fn write_quantized<W: Write>(w: &mut W, q: &QuantizedInt4) -> Result<(), String>
 }
 
 /// Read a QuantizedInt4 from mmap'd cache data at the given offset.
+///
+/// Uses direct memcpy — safe on x86_64 (little-endian, unaligned loads OK).
 fn read_quantized(
     data: &[u8],
     offset: &mut usize,
@@ -497,20 +499,26 @@ fn read_quantized(
     packed_bytes: usize,
     scales_bytes: usize,
 ) -> QuantizedInt4 {
-    // Read packed u32s
-    let packed_slice = &data[*offset..*offset + packed_bytes];
-    let packed: Vec<u32> = packed_slice
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let packed_count = packed_bytes / 4;
+    let mut packed = vec![0u32; packed_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            packed.as_mut_ptr() as *mut u8,
+            packed_bytes,
+        );
+    }
     *offset += packed_bytes;
 
-    // Read scales u16s
-    let scales_slice = &data[*offset..*offset + scales_bytes];
-    let scales: Vec<u16> = scales_slice
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let scales_count = scales_bytes / 2;
+    let mut scales = vec![0u16; scales_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            scales.as_mut_ptr() as *mut u8,
+            scales_bytes,
+        );
+    }
     *offset += scales_bytes;
 
     QuantizedInt4 {

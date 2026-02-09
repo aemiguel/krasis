@@ -13,6 +13,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::path::Path;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 /// Scratch buffers for expert computation (reused across calls).
 pub struct ExpertScratch {
     /// SiLU(gate) * up result as BF16 for down_proj input.
@@ -74,6 +77,8 @@ pub fn expert_forward(
 /// Full MoE forward for a single token on one layer.
 ///
 /// Runs the selected experts and combines their outputs with routing weights.
+/// While computing expert[i], prefetches expert[i+1]'s weights into L3 cache
+/// using NTA hints to avoid displacing the activation vector in L1/L2.
 ///
 /// # Arguments
 /// * `store` - Loaded expert weights
@@ -101,15 +106,80 @@ pub fn moe_forward(
     // Zero output before accumulation
     output.fill(0.0);
 
-    for (&eidx, &weight) in expert_indices.iter().zip(expert_weights.iter()) {
+    let n = expert_indices.len();
+
+    for i in 0..n {
+        let eidx = expert_indices[i];
+        let weight = expert_weights[i];
         let expert = store.get_expert(moe_layer_idx, eidx);
+
+        // Prefetch next expert's weights into L3 while we compute this one
+        if i + 1 < n {
+            let next_expert = store.get_expert(moe_layer_idx, expert_indices[i + 1]);
+            prefetch_expert_nta(next_expert);
+        }
+
         expert_forward(expert, activation, scratch, parallel);
 
         // Accumulate: output += weight * expert_out
-        for i in 0..output.len() {
-            output[i] += weight * scratch.expert_out[i];
+        for j in 0..output.len() {
+            output[j] += weight * scratch.expert_out[j];
         }
     }
+}
+
+/// Prefetch an expert's weight data into L3 cache using NTA (non-temporal) hints.
+///
+/// NTA brings data to L3 without displacing L1/L2 contents, keeping the
+/// activation vector (which is reused across all experts) hot in L1/L2.
+/// Prefetches every 512 bytes (8 cache lines) — enough coverage without
+/// overwhelming the prefetch buffers.
+#[cfg(target_arch = "x86_64")]
+fn prefetch_expert_nta(expert: &ExpertWeights) {
+    const STRIDE: usize = 512; // 8 cache lines per prefetch
+
+    unsafe {
+        // Prefetch gate_proj packed weights
+        let gate_bytes = expert.gate.packed.len() * 4;
+        let gate_ptr = expert.gate.packed.as_ptr() as *const i8;
+        let mut off = 0;
+        while off < gate_bytes {
+            _mm_prefetch(gate_ptr.add(off), _MM_HINT_NTA);
+            off += STRIDE;
+        }
+
+        // Prefetch up_proj packed weights
+        let up_bytes = expert.up.packed.len() * 4;
+        let up_ptr = expert.up.packed.as_ptr() as *const i8;
+        off = 0;
+        while off < up_bytes {
+            _mm_prefetch(up_ptr.add(off), _MM_HINT_NTA);
+            off += STRIDE;
+        }
+
+        // Prefetch down_proj packed weights
+        let down_bytes = expert.down.packed.len() * 4;
+        let down_ptr = expert.down.packed.as_ptr() as *const i8;
+        off = 0;
+        while off < down_bytes {
+            _mm_prefetch(down_ptr.add(off), _MM_HINT_NTA);
+            off += STRIDE;
+        }
+
+        // Prefetch scales (smaller, but still worth it)
+        let gate_scales_bytes = expert.gate.scales.len() * 2;
+        let gs_ptr = expert.gate.scales.as_ptr() as *const i8;
+        off = 0;
+        while off < gate_scales_bytes {
+            _mm_prefetch(gs_ptr.add(off), _MM_HINT_NTA);
+            off += STRIDE;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn prefetch_expert_nta(_expert: &ExpertWeights) {
+    // No-op on non-x86 — hardware prefetcher will handle it
 }
 
 /// Fast sigmoid approximation: 1 / (1 + exp(-x))
