@@ -5,6 +5,7 @@ SGLang's KTEPWrapperMethod expects from KTMoEWrapper. It handles:
 - GPU ↔ CPU tensor transfers
 - Async submit/sync pattern via Krasis Rust engine
 - Expert ID masking (GPU experts = -1)
+- GPU prefill: fused_marlin_moe kernel for batch_size > threshold
 
 Usage in SGLang:
     # Before server start:
@@ -38,17 +39,26 @@ class KrasisMoEWrapper:
     - submit_forward(hidden_states, topk_ids, topk_weights, cuda_stream)
     - sync_forward(hidden_states, cuda_stream)
     - load_weights(physical_to_logical_map_cpu)
+
+    GPU Prefill:
+    When batch_size >= gpu_prefill_threshold, uses fused_marlin_moe on GPU
+    instead of CPU. This is 10-20x faster for long prompts (>300 tokens).
     """
 
     # ── Class-level configuration ─────────────────────────────────
     # Set before creating any wrapper instances.
     hf_model_path: Optional[str] = None
     num_threads: int = 16
+    gpu_prefill_threshold: int = 300  # tokens; 0 = disabled
 
     # Shared engine singleton (loaded once, used by all layer wrappers)
     _shared_engine: Optional[KrasisEngine] = None
     _engine_lock = threading.Lock()
     _first_k_dense: Optional[int] = None
+
+    # Shared GPU prefill manager singleton
+    _shared_gpu_prefill = None
+    _gpu_prefill_lock = threading.Lock()
 
     def __init__(
         self,
@@ -85,6 +95,7 @@ class KrasisMoEWrapper:
         self._device: Optional[torch.device] = None
         self._batch_size: int = 0
         self._engine: Optional[KrasisEngine] = None
+        self._gpu_output: Optional[torch.Tensor] = None  # GPU prefill result
 
         logger.info(
             "KrasisMoEWrapper: layer=%d, experts=%d, gpu_experts=%d, hidden=%d",
@@ -113,6 +124,43 @@ class KrasisMoEWrapper:
                 engine.hidden_size(), cls._first_k_dense,
             )
             return engine
+
+    @classmethod
+    def _get_gpu_prefill(cls, model_path: str, device: torch.device):
+        """Get or create the shared GpuPrefillManager singleton."""
+        with cls._gpu_prefill_lock:
+            if cls._shared_gpu_prefill is not None:
+                return cls._shared_gpu_prefill
+
+            from krasis.gpu_prefill import GpuPrefillManager
+
+            # Read model config for GPU prefill parameters
+            config_path = os.path.join(model_path, "config.json")
+            with open(config_path) as f:
+                raw = json.load(f)
+            cfg = raw.get("text_config", raw)
+
+            num_experts = cfg.get("n_routed_experts", cfg.get("num_experts", 0))
+            hidden_size = cfg["hidden_size"]
+            intermediate_size = cfg["moe_intermediate_size"]
+            n_shared = cfg.get("n_shared_experts", 0)
+            routed_scale = cfg.get("routed_scaling_factor", 1.0)
+            first_k = cls._first_k_dense or 0
+
+            manager = GpuPrefillManager(
+                model_path=model_path,
+                device=device,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                params_dtype=torch.bfloat16,
+                n_shared_experts=n_shared,
+                routed_scaling_factor=routed_scale,
+                first_k_dense=first_k,
+            )
+            cls._shared_gpu_prefill = manager
+            logger.info("GPU prefill manager created (threshold=%d)", cls.gpu_prefill_threshold)
+            return manager
 
     @staticmethod
     def _read_first_k_dense(model_path: str) -> int:
@@ -150,7 +198,10 @@ class KrasisMoEWrapper:
         topk_weights: torch.Tensor,
         cuda_stream: int,
     ) -> None:
-        """Submit MoE forward computation to CPU worker thread (non-blocking).
+        """Submit MoE forward computation.
+
+        If batch_size >= gpu_prefill_threshold, uses GPU Marlin kernel (blocking).
+        Otherwise, submits to CPU worker thread (non-blocking).
 
         Args:
             hidden_states: [batch_size, hidden_size] BF16 tensor on GPU
@@ -158,8 +209,28 @@ class KrasisMoEWrapper:
             topk_weights: [batch_size, topk] float32 tensor on GPU
             cuda_stream: Raw CUDA stream pointer (for DMA synchronization)
         """
-        engine = self._engine or self._get_engine(self._model_path, self._cpuinfer_threads)
         batch_size = hidden_states.shape[0]
+        self._device = hidden_states.device
+        self._batch_size = batch_size
+
+        # GPU prefill path
+        threshold = KrasisMoEWrapper.gpu_prefill_threshold
+        if threshold > 0 and batch_size >= threshold and hidden_states.is_cuda:
+            first_k = KrasisMoEWrapper._first_k_dense or 0
+            moe_layer_idx = self.layer_idx - first_k
+
+            manager = self._get_gpu_prefill(self._model_path, hidden_states.device)
+            self._gpu_output = manager.forward(
+                moe_layer_idx,
+                hidden_states,
+                topk_ids.to(torch.int32),
+                topk_weights.float(),
+            )
+            return
+
+        # CPU decode path
+        self._gpu_output = None
+        engine = self._engine or self._get_engine(self._model_path, self._cpuinfer_threads)
 
         # Ensure GPU writes are complete before CPU reads
         torch.cuda.current_stream(hidden_states.device).synchronize()
@@ -185,16 +256,12 @@ class KrasisMoEWrapper:
 
         engine.submit_forward(moe_layer_idx, act_bytes, ids_bytes, wts_bytes, batch_size)
 
-        # Save state for sync_forward
-        self._device = hidden_states.device
-        self._batch_size = batch_size
-
     def sync_forward(
         self,
         hidden_states: torch.Tensor,
         cuda_stream: int,
     ) -> torch.Tensor:
-        """Wait for CPU computation and return result on GPU.
+        """Wait for computation and return result on GPU.
 
         Args:
             hidden_states: Reference tensor for shape/device/dtype info
@@ -203,6 +270,13 @@ class KrasisMoEWrapper:
         Returns:
             [batch_size, hidden_size] BF16 tensor on same device as input
         """
+        # GPU prefill path: result already computed
+        if self._gpu_output is not None:
+            result = self._gpu_output
+            self._gpu_output = None
+            return result
+
+        # CPU decode path: wait for Rust engine
         engine = self._engine or self._get_engine(self._model_path, self._cpuinfer_threads)
 
         # Block until worker finishes and get BF16 output bytes
@@ -235,7 +309,9 @@ class KrasisMoEWrapper:
 
     @classmethod
     def reset(cls):
-        """Reset the shared engine (for testing)."""
+        """Reset the shared engine and GPU prefill manager (for testing)."""
         with cls._engine_lock:
             cls._shared_engine = None
             cls._first_k_dense = None
+        with cls._gpu_prefill_lock:
+            cls._shared_gpu_prefill = None

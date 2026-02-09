@@ -55,15 +55,13 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 - [x] **34 Rust tests** — unit + integration, all passing
 - [x] **3 Python bridge tests** — engine roundtrip, wrapper interface, batch forward
 
-### GPU Expert Pinning
-- [ ] **Heatmap-based pinning** — pin hottest experts as INT4 Marlin on GPU VRAM
-- [ ] **Hybrid dispatch** — GPU kernel for pinned experts, CPU for rest, per-layer
-- [ ] **VRAM budget** — auto-fit experts within available GPU memory
-
 ### GPU Prefill
-- [ ] **INT4 Marlin prefill kernel** — GPU-accelerated prefill for long prompts
-- [ ] **CPU/GPU prefill switching** — GPU for prompts > threshold, CPU for short
-- [ ] **Expert buffer management** — DMA cached INT4 weights to GPU
+- [x] **INT4 Marlin prefill kernel** — GPU-accelerated MoE via `fused_marlin_moe` kernel
+- [x] **CPU/GPU prefill switching** — GPU for prompts > threshold (300 tokens), CPU for short
+- [x] **Expert buffer management** — GPU quantize BF16→INT4, Marlin repack, RAM cache, DMA to GPU
+- [x] **Chunked expert processing** — handles models with many experts (e.g. 384) in VRAM-sized chunks
+- [x] **Shared expert GPU path** — shared expert forward via Marlin kernel with weight=1.0
+- [x] **Pre-quantized weight support** — dequantize compressed-tensors INT4 before re-quantizing to Marlin format
 
 ### Multi-GPU
 - [ ] **Pipeline parallelism** — split layers across GPUs (PP=3 for 3x RTX 2000 Ada)

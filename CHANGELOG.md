@@ -6,11 +6,33 @@
 |-------|-------|--------|----------|
 | Rust (`cargo test`) | 34 | ALL PASS | 2026-02-09 |
 | Python bridge (`test_bridge.py`) | 3 | ALL PASS | 2026-02-09 |
-| **Total** | **37** | **ALL PASS** | |
+| GPU prefill (`test_gpu_prefill.py`) | 5 | ALL PASS | 2026-02-09 |
+| **Total** | **42** | **ALL PASS** | |
 
-Re-run needed after: any change to `src/`, `python/krasis/`, or `test_bridge.py`.
+Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
 
 ---
+
+## GPU prefill implementation — 2026-02-09
+
+**Add INT4 Marlin GPU prefill for MoE layers**
+
+- `python/krasis/gpu_prefill.py`: `GpuPrefillManager` class for GPU-accelerated MoE prefill
+- `_quantize_and_pack_gpu()`: BF16→INT4 symmetric quantization + packing on GPU (group_size=128)
+- Weight pipeline: HF safetensors → BF16 → transpose [N,K]→[K,N] → GPU INT4 quantize → pack → `gptq_marlin_repack` → `marlin_permute_scales` → RAM cache
+- `prepare_layer()`: quantizes all experts for one layer, caches in CPU RAM
+- `prepare_shared_expert()`: same for shared expert (stored as single-expert MoE)
+- `forward()`: loads cached weights to GPU buffer, calls `fused_marlin_moe` kernel
+- Multi-chunk path for large expert counts (Kimi K2.5: 384 experts): remaps expert IDs per chunk
+- `_shared_expert_forward()`: runs shared expert via Marlin with topk_ids=0, weight=1.0
+- Pre-quantized weight support: dequantizes compressed-tensors INT4 → BF16 → re-quantizes to Marlin format
+- `sglang_bridge.py`: GPU prefill integration — threshold-based switching (batch >= 300 → GPU, else CPU)
+- `GpuPrefillManager` singleton shared across all layer wrappers
+- **V2-Lite benchmarks**: 26ms/layer, 40 tok/s (batch=1) → 19,123 tok/s (batch=512)
+- **GPU vs CPU cosine similarity**: 0.9825 (excellent agreement despite different INT4 implementations)
+- `test_gpu_prefill.py`: 5 tests — quantize_pack, v2_lite_forward, shared_expert, gpu_vs_cpu, scaling
+
+Tests: 34 Rust + 3 Python bridge + 5 GPU prefill = **42 PASS**
 
 ## Shared expert support — 2026-02-09
 

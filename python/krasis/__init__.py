@@ -11,3 +11,9 @@ try:
 except ImportError:
     # torch/numpy not available
     pass
+
+try:
+    from krasis.gpu_prefill import GpuPrefillManager
+except ImportError:
+    # SGLang/sgl_kernel not available
+    pass
