@@ -16,6 +16,8 @@ use crate::weights::{ExpertWeights, WeightStore};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::path::Path;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -346,6 +348,86 @@ fn fast_sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Work unit for the async MoE worker thread.
+struct MoeWork {
+    moe_layer_idx: usize,
+    /// BF16 activations [batch_size, hidden_size] flattened.
+    activations: Vec<u16>,
+    /// Expert indices [batch_size, topk] flattened. -1 = skip (GPU-handled).
+    topk_ids: Vec<i32>,
+    /// Expert routing weights [batch_size, topk] flattened.
+    topk_weights: Vec<f32>,
+    batch_size: usize,
+    topk: usize,
+}
+
+/// Background worker for async MoE computation.
+///
+/// Owns its own scratch buffers. Processes batches of tokens sequentially,
+/// with expert-level parallelism within each token via rayon.
+fn moe_worker(
+    store: Arc<WeightStore>,
+    work_rx: mpsc::Receiver<MoeWork>,
+    result_tx: mpsc::SyncSender<Vec<u16>>,
+    parallel: bool,
+    numa_map: Option<crate::numa::NumaExpertMap>,
+) {
+    let hidden = store.config.hidden_size;
+    let intermediate = store.config.moe_intermediate_size;
+    let group_size = store.group_size;
+    let topk_max = store.config.num_experts_per_tok;
+
+    let mut scratch = ExpertScratch::new(hidden, intermediate, group_size);
+    let mut scratch_pool: Vec<ExpertScratch> = (0..topk_max)
+        .map(|_| ExpertScratch::new(hidden, intermediate, group_size))
+        .collect();
+    let mut output_f32 = vec![0.0f32; hidden];
+
+    while let Ok(work) = work_rx.recv() {
+        let batch = work.batch_size;
+        let topk = work.topk;
+        let mut output_bf16 = vec![0u16; batch * hidden];
+
+        for b in 0..batch {
+            let act = &work.activations[b * hidden..(b + 1) * hidden];
+            let ids_raw = &work.topk_ids[b * topk..(b + 1) * topk];
+            let weights_raw = &work.topk_weights[b * topk..(b + 1) * topk];
+
+            // Filter out masked experts (id == -1 means GPU-handled)
+            let mut expert_indices = Vec::with_capacity(topk);
+            let mut expert_weights = Vec::with_capacity(topk);
+            for j in 0..topk {
+                if ids_raw[j] >= 0 {
+                    expert_indices.push(ids_raw[j] as usize);
+                    expert_weights.push(weights_raw[j]);
+                }
+            }
+
+            if expert_indices.is_empty() {
+                continue; // output_bf16 already zero-initialized
+            }
+
+            output_f32.fill(0.0);
+            moe_forward(
+                &store, work.moe_layer_idx, act,
+                &expert_indices, &expert_weights,
+                &mut output_f32, &mut scratch, &mut scratch_pool,
+                parallel, numa_map.as_ref(),
+            );
+
+            // Convert f32 → BF16
+            let out_slice = &mut output_bf16[b * hidden..(b + 1) * hidden];
+            for j in 0..hidden {
+                out_slice[j] = f32_to_bf16(output_f32[j]);
+            }
+        }
+
+        if result_tx.send(output_bf16).is_err() {
+            break; // Engine dropped
+        }
+    }
+}
+
 /// Main Krasis MoE engine — drop-in replacement for KTransformers CPU expert dispatch.
 ///
 /// Usage from Python:
@@ -356,7 +438,7 @@ fn fast_sigmoid(x: f32) -> f32 {
 /// ```
 #[pyclass]
 pub struct KrasisEngine {
-    store: Option<WeightStore>,
+    store: Option<Arc<WeightStore>>,
     scratch: Option<ExpertScratch>,
     /// Pre-allocated scratch buffers for expert-level parallelism (one per top-k expert).
     scratch_pool: Vec<ExpertScratch>,
@@ -364,6 +446,24 @@ pub struct KrasisEngine {
     parallel: bool,
     /// NUMA expert placement map (None if single-node or NUMA disabled).
     numa_map: Option<crate::numa::NumaExpertMap>,
+    /// Async worker: channel to send work.
+    work_tx: Option<mpsc::SyncSender<MoeWork>>,
+    /// Async worker: channel to receive BF16 results (Mutex for Sync).
+    result_rx: Option<Mutex<mpsc::Receiver<Vec<u16>>>>,
+    /// Async worker: thread handle (Mutex for Sync).
+    worker_handle: Option<Mutex<JoinHandle<()>>>,
+}
+
+impl Drop for KrasisEngine {
+    fn drop(&mut self) {
+        // Drop sender first to signal worker to exit
+        self.work_tx.take();
+        if let Some(h_mutex) = self.worker_handle.take() {
+            if let Ok(h) = h_mutex.into_inner() {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -385,6 +485,9 @@ impl KrasisEngine {
             output_buf: Vec::new(),
             parallel,
             numa_map: None,
+            work_tx: None,
+            result_rx: None,
+            worker_handle: None,
         }
     }
 
@@ -456,9 +559,39 @@ impl KrasisEngine {
             None
         };
 
+        // Wrap store in Arc for sharing with worker thread
+        let store = Arc::new(store);
+
+        // Stop existing worker if any (e.g. on re-load)
+        self.work_tx.take();
+        if let Some(h_mutex) = self.worker_handle.take() {
+            if let Ok(h) = h_mutex.into_inner() {
+                let _ = h.join();
+            }
+        }
+
+        // Spawn async worker thread
+        let (work_tx, work_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let worker_store = store.clone();
+        let worker_parallel = self.parallel;
+        let worker_numa = numa_map.clone();
+        let handle = std::thread::Builder::new()
+            .name("krasis-moe-worker".to_string())
+            .spawn(move || {
+                moe_worker(worker_store, work_rx, result_tx, worker_parallel, worker_numa);
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to spawn worker: {e}")
+            ))?;
+
+        log::info!("Async MoE worker thread started");
+
         self.output_buf = vec![0.0f32; store.config.hidden_size];
         self.scratch_pool = scratch_pool;
-        self.numa_map = numa_map;
+        self.work_tx = Some(work_tx);
+        self.result_rx = Some(Mutex::new(result_rx));
+        self.worker_handle = Some(Mutex::new(handle));
         self.store = Some(store);
         self.scratch = Some(scratch);
         Ok(())
@@ -570,6 +703,127 @@ impl KrasisEngine {
     /// Whether parallel matmul is enabled.
     pub fn is_parallel(&self) -> bool {
         self.parallel
+    }
+
+    /// Submit asynchronous MoE forward for a batch of tokens.
+    ///
+    /// Returns immediately — call `sync_forward()` to get results.
+    /// Expert indices of -1 are skipped (used for GPU-handled experts).
+    ///
+    /// Args:
+    ///   moe_layer_idx: 0-based MoE layer index
+    ///   activation_bf16: BF16 activations as bytes [batch_size × hidden_size × 2]
+    ///   topk_ids_i32: Expert indices as i32 bytes [batch_size × topk × 4]
+    ///   topk_weights_f32: Routing weights as f32 bytes [batch_size × topk × 4]
+    ///   batch_size: Number of tokens in the batch
+    #[pyo3(signature = (moe_layer_idx, activation_bf16, topk_ids_i32, topk_weights_f32, batch_size))]
+    pub fn submit_forward(
+        &self,
+        _py: Python<'_>,
+        moe_layer_idx: usize,
+        activation_bf16: &[u8],
+        topk_ids_i32: &[u8],
+        topk_weights_f32: &[u8],
+        batch_size: usize,
+    ) -> PyResult<()> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Model not loaded — call load() first"))?;
+        let work_tx = self.work_tx.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Worker not started"))?;
+
+        let hidden = store.config.hidden_size;
+
+        // Validate input sizes
+        let expected_act = batch_size * hidden * 2;
+        if activation_bf16.len() != expected_act {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Expected {expected_act} activation bytes, got {}", activation_bf16.len())
+            ));
+        }
+        if topk_ids_i32.len() % 4 != 0 || topk_weights_f32.len() % 4 != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "topk_ids must be i32 bytes (multiple of 4), topk_weights must be f32 bytes (multiple of 4)"
+            ));
+        }
+
+        // Reinterpret bytes to typed slices (safe: x86_64 is little-endian)
+        let activations: &[u16] = unsafe {
+            std::slice::from_raw_parts(
+                activation_bf16.as_ptr() as *const u16,
+                batch_size * hidden,
+            )
+        };
+        let topk_ids: &[i32] = unsafe {
+            std::slice::from_raw_parts(
+                topk_ids_i32.as_ptr() as *const i32,
+                topk_ids_i32.len() / 4,
+            )
+        };
+        let topk_weights: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                topk_weights_f32.as_ptr() as *const f32,
+                topk_weights_f32.len() / 4,
+            )
+        };
+
+        if topk_ids.len() != topk_weights.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("topk_ids ({}) and topk_weights ({}) count mismatch",
+                    topk_ids.len(), topk_weights.len())
+            ));
+        }
+        if batch_size == 0 || topk_ids.len() % batch_size != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("topk_ids len ({}) not divisible by batch_size ({batch_size})",
+                    topk_ids.len())
+            ));
+        }
+
+        let topk = topk_ids.len() / batch_size;
+
+        let work = MoeWork {
+            moe_layer_idx,
+            activations: activations.to_vec(),
+            topk_ids: topk_ids.to_vec(),
+            topk_weights: topk_weights.to_vec(),
+            batch_size,
+            topk,
+        };
+
+        work_tx.send(work)
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Worker thread died"))?;
+
+        Ok(())
+    }
+
+    /// Wait for async MoE forward to complete and return BF16 output.
+    ///
+    /// Must be called after `submit_forward()`. Blocks until the worker finishes.
+    ///
+    /// Returns: BF16 output as bytes [batch_size × hidden_size × 2]
+    pub fn sync_forward<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let rx_mutex = self.result_rx.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Worker not started"))?;
+
+        let rx = rx_mutex.lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Worker mutex poisoned"))?;
+
+        let output_bf16 = rx.recv()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Worker thread died"))?;
+
+        drop(rx); // release mutex before creating PyBytes
+
+        let output_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                output_bf16.as_ptr() as *const u8,
+                output_bf16.len() * 2,
+            )
+        };
+
+        Ok(PyBytes::new(py, output_bytes))
     }
 }
 
@@ -803,5 +1057,140 @@ mod tests {
         assert!(rms > 1e-5, "MoE output too small (RMS={rms})");
         assert!(rms < 100.0, "MoE output too large (RMS={rms})");
         assert!(nonzero > hidden / 2, "Too many zeros ({nonzero}/{hidden})");
+    }
+
+    #[test]
+    fn test_async_submit_sync() {
+        let _ = env_logger::try_init();
+        let model_dir = Path::new("/home/main/Documents/Claude/hf-models/DeepSeek-V2-Lite");
+        if !model_dir.exists() {
+            eprintln!("Skipping — V2-Lite not downloaded");
+            return;
+        }
+
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None)
+            .expect("Failed to load");
+
+        let hidden = store.config.hidden_size;
+        let top_k = store.config.num_experts_per_tok;
+        let group_size = store.group_size;
+
+        // First: compute reference output via synchronous moe_forward
+        let mut activation = vec![0u16; hidden];
+        for i in 0..hidden {
+            activation[i] = f32_to_bf16(((i * 7 + 13) as f32 / hidden as f32 - 0.5) * 0.1);
+        }
+        let expert_indices: Vec<usize> = (0..top_k).collect();
+        let expert_weights: Vec<f32> = vec![1.0 / top_k as f32; top_k];
+
+        let mut scratch = ExpertScratch::new(hidden, store.config.moe_intermediate_size, group_size);
+        let mut scratch_pool: Vec<ExpertScratch> = (0..top_k)
+            .map(|_| ExpertScratch::new(hidden, store.config.moe_intermediate_size, group_size))
+            .collect();
+        let mut ref_output = vec![0.0f32; hidden];
+        moe_forward(
+            &store, 0, &activation, &expert_indices, &expert_weights,
+            &mut ref_output, &mut scratch, &mut scratch_pool, true, None,
+        );
+
+        // Convert reference to BF16 for comparison
+        let ref_bf16: Vec<u16> = ref_output.iter().map(|&v| f32_to_bf16(v)).collect();
+
+        // Now: test async worker
+        let store_arc = Arc::new(store);
+        let (work_tx, work_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let worker_store = store_arc.clone();
+        let handle = std::thread::Builder::new()
+            .name("test-worker".to_string())
+            .spawn(move || {
+                moe_worker(worker_store, work_rx, result_tx, true, None);
+            })
+            .expect("Failed to spawn worker");
+
+        // Submit batch=1 work
+        let topk_ids: Vec<i32> = expert_indices.iter().map(|&e| e as i32).collect();
+        let topk_weights_f32: Vec<f32> = expert_weights.clone();
+
+        let work = MoeWork {
+            moe_layer_idx: 0,
+            activations: activation.clone(),
+            topk_ids,
+            topk_weights: topk_weights_f32,
+            batch_size: 1,
+            topk: top_k,
+        };
+
+        let start = std::time::Instant::now();
+        work_tx.send(work).expect("Send failed");
+        let async_output = result_rx.recv().expect("Recv failed");
+        let async_us = start.elapsed().as_micros();
+
+        assert_eq!(async_output.len(), hidden, "Async output wrong size");
+
+        // Compare async output with reference
+        let mut max_diff: f32 = 0.0;
+        for i in 0..hidden {
+            let a = crate::weights::marlin::bf16_to_f32(async_output[i]);
+            let b = crate::weights::marlin::bf16_to_f32(ref_bf16[i]);
+            max_diff = max_diff.max((a - b).abs());
+        }
+
+        eprintln!("Async submit/sync test (V2-Lite, batch=1, top-{top_k}):");
+        eprintln!("  Round-trip: {async_us} μs ({:.1} ms)", async_us as f64 / 1000.0);
+        eprintln!("  Max diff vs sync: {max_diff:.8}");
+        assert!(max_diff < 0.01, "Async/sync output mismatch: max_diff={max_diff}");
+
+        // Test batch=2 (two identical tokens → should get identical outputs)
+        let mut batch_act = vec![0u16; 2 * hidden];
+        batch_act[..hidden].copy_from_slice(&activation);
+        batch_act[hidden..].copy_from_slice(&activation);
+        let batch_ids: Vec<i32> = expert_indices.iter().map(|&e| e as i32)
+            .chain(expert_indices.iter().map(|&e| e as i32)).collect();
+        let batch_weights: Vec<f32> = expert_weights.iter().chain(expert_weights.iter()).cloned().collect();
+
+        let work2 = MoeWork {
+            moe_layer_idx: 0,
+            activations: batch_act,
+            topk_ids: batch_ids,
+            topk_weights: batch_weights,
+            batch_size: 2,
+            topk: top_k,
+        };
+        work_tx.send(work2).expect("Send failed");
+        let batch_output = result_rx.recv().expect("Recv failed");
+        assert_eq!(batch_output.len(), 2 * hidden);
+
+        // Both tokens should produce identical output
+        let max_inter_diff: f32 = (0..hidden)
+            .map(|i| {
+                let a = crate::weights::marlin::bf16_to_f32(batch_output[i]);
+                let b = crate::weights::marlin::bf16_to_f32(batch_output[hidden + i]);
+                (a - b).abs()
+            })
+            .fold(0.0f32, f32::max);
+        eprintln!("  Batch=2 inter-token diff: {max_inter_diff:.8}");
+        assert!(max_inter_diff < 1e-6, "Batch tokens should be identical: diff={max_inter_diff}");
+
+        // Test with masked experts (id=-1)
+        let masked_ids: Vec<i32> = vec![-1; top_k]; // All masked
+        let work3 = MoeWork {
+            moe_layer_idx: 0,
+            activations: activation.clone(),
+            topk_ids: masked_ids,
+            topk_weights: expert_weights.clone(),
+            batch_size: 1,
+            topk: top_k,
+        };
+        work_tx.send(work3).expect("Send failed");
+        let masked_output = result_rx.recv().expect("Recv failed");
+        let masked_nonzero = masked_output.iter().filter(|&&v| v != 0).count();
+        eprintln!("  Masked experts: {masked_nonzero}/{hidden} nonzero (should be 0)");
+        assert_eq!(masked_nonzero, 0, "All-masked experts should produce zero output");
+
+        // Clean up
+        drop(work_tx);
+        handle.join().expect("Worker panicked");
+        eprintln!("  Worker thread joined cleanly");
     }
 }
