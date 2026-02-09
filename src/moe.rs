@@ -158,6 +158,7 @@ pub fn moe_forward(
     expert_weights: &[f32],
     output: &mut [f32],
     scratch: &mut ExpertScratch,
+    scratch_pool: &mut [ExpertScratch],
     parallel: bool,
 ) {
     assert_eq!(expert_indices.len(), expert_weights.len());
@@ -181,28 +182,24 @@ pub fn moe_forward(
 
     let n = expert_indices.len();
     let hidden = store.config.hidden_size;
-    let intermediate = store.config.moe_intermediate_size;
-    let group_size = scratch.group_size;
 
-    if parallel && n > 1 {
+    if parallel && n > 1 && scratch_pool.len() >= n {
         // Expert-level parallelism: run all experts concurrently on rayon threads.
-        // Each expert gets its own scratch buffer and runs serial integer matmul.
+        // Uses pre-allocated scratch pool (one buffer per expert, no heap allocs).
         // The pre-quantized activation is shared read-only across all threads.
         use rayon::prelude::*;
 
-        let expert_outputs: Vec<Vec<f32>> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let eidx = expert_indices[i];
-                let expert = store.get_expert(moe_layer_idx, eidx);
-                let mut local_scratch = ExpertScratch::new(hidden, intermediate, group_size);
-                expert_forward_integer(expert, &act_int16, &act_scales, &mut local_scratch, false);
-                local_scratch.expert_out
-            })
-            .collect();
+        let pool = &mut scratch_pool[..n];
+        pool.par_iter_mut().enumerate().for_each(|(i, local_scratch)| {
+            let eidx = expert_indices[i];
+            let expert = store.get_expert(moe_layer_idx, eidx);
+            expert_forward_integer(expert, &act_int16, &act_scales, local_scratch, false);
+        });
 
-        for (i, expert_out) in expert_outputs.iter().enumerate() {
+        // Weighted sum (sequential — fast since it's just addition)
+        for i in 0..n {
             let weight = expert_weights[i];
+            let expert_out = &scratch_pool[i].expert_out;
             for j in 0..hidden {
                 output[j] += weight * expert_out[j];
             }
@@ -306,6 +303,8 @@ fn fast_sigmoid(x: f32) -> f32 {
 pub struct KrasisEngine {
     store: Option<WeightStore>,
     scratch: Option<ExpertScratch>,
+    /// Pre-allocated scratch buffers for expert-level parallelism (one per top-k expert).
+    scratch_pool: Vec<ExpertScratch>,
     output_buf: Vec<f32>,
     parallel: bool,
 }
@@ -318,6 +317,7 @@ impl KrasisEngine {
         KrasisEngine {
             store: None,
             scratch: None,
+            scratch_pool: Vec::new(),
             output_buf: Vec::new(),
             parallel,
         }
@@ -360,7 +360,18 @@ impl KrasisEngine {
             store.config.moe_intermediate_size,
             gs,
         );
+        // Pre-allocate scratch pool for expert-level parallelism
+        let top_k = store.config.num_experts_per_tok;
+        let scratch_pool: Vec<ExpertScratch> = (0..top_k)
+            .map(|_| ExpertScratch::new(
+                store.config.hidden_size,
+                store.config.moe_intermediate_size,
+                gs,
+            ))
+            .collect();
+
         self.output_buf = vec![0.0f32; store.config.hidden_size];
+        self.scratch_pool = scratch_pool;
         self.store = Some(store);
         self.scratch = Some(scratch);
         Ok(())
@@ -426,6 +437,7 @@ impl KrasisEngine {
             &expert_weights,
             &mut self.output_buf,
             scratch,
+            &mut self.scratch_pool,
             parallel,
         );
 
@@ -609,6 +621,9 @@ mod tests {
         }
 
         let mut scratch = ExpertScratch::new(hidden, intermediate, group_size);
+        let mut scratch_pool: Vec<ExpertScratch> = (0..top_k)
+            .map(|_| ExpertScratch::new(hidden, intermediate, group_size))
+            .collect();
         let mut output = vec![0.0f32; hidden];
 
         // Simulate router output: top-6 experts with softmax weights
@@ -619,7 +634,7 @@ mod tests {
         let start = std::time::Instant::now();
         moe_forward(
             &store, 0, &activation, &expert_indices, &expert_weights,
-            &mut output, &mut scratch, true,
+            &mut output, &mut scratch, &mut scratch_pool, true,
         );
         let moe_us = start.elapsed().as_micros();
 
