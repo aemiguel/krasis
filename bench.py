@@ -43,6 +43,7 @@ def main():
     parser.add_argument("--group-size", type=int, default=128, help="INT4 group size")
     parser.add_argument("--iters", type=int, default=50, help="Iterations per benchmark")
     parser.add_argument("--layers", type=int, default=5, help="Number of layers to benchmark")
+    parser.add_argument("--max-layers", type=int, default=None, help="Max MoE layers to load (None=all)")
     parser.add_argument("--no-parallel", action="store_true", help="Disable parallel matmul")
     args = parser.parse_args()
 
@@ -103,7 +104,7 @@ def main():
 
     print("Loading model...")
     t0 = time.time()
-    engine.load(args.model_dir, group_size=args.group_size)
+    engine.load(args.model_dir, group_size=args.group_size, max_layers=args.max_layers)
     load_time = time.time() - t0
     print(f"  Load time: {load_time:.1f}s")
     print(f"  {engine.num_moe_layers()} MoE layers, {engine.num_experts()} experts loaded")

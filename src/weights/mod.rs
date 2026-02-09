@@ -214,7 +214,13 @@ impl WeightStore {
     /// First checks for a cached `.krasis_cache/experts_int4_g{group_size}.bin`.
     /// If valid, loads directly from cache (mmap + copy, ~1-2s for V2-Lite).
     /// Otherwise, reads BF16 safetensors, quantizes to INT4, and writes cache.
-    pub fn load_from_hf(model_dir: &Path, group_size: usize) -> Result<Self, String> {
+    ///
+    /// If `max_layers` is Some(n), only load the first n MoE layers (skips cache).
+    pub fn load_from_hf(
+        model_dir: &Path,
+        group_size: usize,
+        max_layers: Option<usize>,
+    ) -> Result<Self, String> {
         let start = std::time::Instant::now();
 
         // Parse config.json (supports multiple MoE architectures)
@@ -232,30 +238,42 @@ impl WeightStore {
             config.num_experts_per_tok, config.num_hidden_layers, config.first_k_dense_replace,
         );
 
-        let num_moe_layers = config.num_hidden_layers - config.first_k_dense_replace;
-        let config_hash = fnv1a(config_str.as_bytes());
-        let cpath = cache_path(model_dir, group_size);
-
-        // Try loading from cache first
-        if cpath.exists() {
-            match Self::load_cache(&cpath, &config, group_size, num_moe_layers, config_hash) {
-                Ok(store) => {
-                    let elapsed = start.elapsed();
-                    log::info!(
-                        "Loaded from cache in {:.1}s: {} MoE layers × {} experts",
-                        elapsed.as_secs_f64(),
-                        num_moe_layers,
-                        config.n_routed_experts,
-                    );
-                    return Ok(store);
+        let total_moe_layers = config.num_hidden_layers - config.first_k_dense_replace;
+        let num_moe_layers = match max_layers {
+            Some(n) => {
+                let capped = n.min(total_moe_layers);
+                if capped < total_moe_layers {
+                    log::info!("Partial load: {capped}/{total_moe_layers} MoE layers");
                 }
-                Err(e) => {
-                    log::warn!("Cache invalid, re-quantizing: {e}");
+                capped
+            }
+            None => total_moe_layers,
+        };
+        let config_hash = fnv1a(config_str.as_bytes());
+
+        // Try loading from cache (only for full model loads)
+        if max_layers.is_none() {
+            let cpath = cache_path(model_dir, group_size);
+            if cpath.exists() {
+                match Self::load_cache(&cpath, &config, group_size, num_moe_layers, config_hash) {
+                    Ok(store) => {
+                        let elapsed = start.elapsed();
+                        log::info!(
+                            "Loaded from cache in {:.1}s: {} MoE layers × {} experts",
+                            elapsed.as_secs_f64(),
+                            num_moe_layers,
+                            config.n_routed_experts,
+                        );
+                        return Ok(store);
+                    }
+                    Err(e) => {
+                        log::warn!("Cache invalid, re-quantizing: {e}");
+                    }
                 }
             }
         }
 
-        // No valid cache — load from safetensors and quantize (or load pre-quantized)
+        // Load from safetensors and quantize (or load pre-quantized)
         let (experts, effective_group_size) =
             Self::load_and_quantize_all(model_dir, &config, group_size, num_moe_layers)?;
 
@@ -265,15 +283,18 @@ impl WeightStore {
             group_size: effective_group_size,
         };
 
-        // Save cache for next time
-        match store.save_cache(&cpath, config_hash) {
-            Ok(()) => log::info!("Saved INT4 cache to {}", cpath.display()),
-            Err(e) => log::warn!("Failed to save cache: {e}"),
+        // Save cache for next time (only for full model loads)
+        if max_layers.is_none() {
+            let cpath = cache_path(model_dir, group_size);
+            match store.save_cache(&cpath, config_hash) {
+                Ok(()) => log::info!("Saved INT4 cache to {}", cpath.display()),
+                Err(e) => log::warn!("Failed to save cache: {e}"),
+            }
         }
 
         let total_elapsed = start.elapsed();
         log::info!(
-            "Loaded and quantized {} MoE layers in {:.1}s (cache saved for next run)",
+            "Loaded {} MoE layers in {:.1}s",
             num_moe_layers,
             total_elapsed.as_secs_f64(),
         );
@@ -791,7 +812,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None)
             .expect("Failed to load V2-Lite");
 
         // V2-Lite: 27 layers, layer 0 dense, layers 1-26 MoE = 26 MoE layers
@@ -836,7 +857,7 @@ mod tests {
         }
 
         // Load (will use cache if available, or quantize + create cache)
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None)
             .expect("Failed to load V2-Lite");
 
         // Verify cache file exists

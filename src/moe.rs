@@ -327,8 +327,8 @@ impl KrasisEngine {
     ///
     /// Reads config.json, opens safetensors shards, quantizes BF16 → INT4.
     /// Runs startup system checks (CPU governor, hugepages, memory budget).
-    #[pyo3(signature = (model_dir, group_size=None))]
-    pub fn load(&mut self, model_dir: &str, group_size: Option<usize>) -> PyResult<()> {
+    #[pyo3(signature = (model_dir, group_size=None, max_layers=None))]
+    pub fn load(&mut self, model_dir: &str, group_size: Option<usize>, max_layers: Option<usize>) -> PyResult<()> {
         let gs = group_size.unwrap_or(DEFAULT_GROUP_SIZE);
         let path = Path::new(model_dir);
 
@@ -352,7 +352,7 @@ impl KrasisEngine {
             }
         }
 
-        let store = WeightStore::load_from_hf(path, gs)
+        let store = WeightStore::load_from_hf(path, gs, max_layers)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         // Use the effective group_size from the loaded store (may differ for pre-quantized models)
@@ -553,7 +553,7 @@ mod tests {
         }
 
         // Load just enough to test one expert
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -609,7 +609,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -656,5 +656,66 @@ mod tests {
         );
 
         assert!(rms > 1e-5, "MoE output too small");
+    }
+
+    #[test]
+    fn test_kimi_k25_moe_forward() {
+        let model_dir = Path::new("/home/main/Documents/Claude/hf-models/Kimi-K2.5");
+        if !model_dir.exists() {
+            eprintln!("Skipping — Kimi K2.5 not downloaded");
+            return;
+        }
+
+        // Load just 1 MoE layer (384 experts × 1 layer ≈ 9.5 GB)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, Some(1))
+            .expect("Failed to load Kimi K2.5");
+
+        assert_eq!(store.num_moe_layers(), 1);
+        assert_eq!(store.config.n_routed_experts, 384);
+        assert_eq!(store.config.hidden_size, 7168);
+        assert_eq!(store.config.moe_intermediate_size, 2048);
+        // Pre-quantized with group_size=32
+        assert_eq!(store.group_size, 32);
+
+        let hidden = store.config.hidden_size;
+        let intermediate = store.config.moe_intermediate_size;
+        let top_k = store.config.num_experts_per_tok; // 8
+
+        // Create activation vector
+        let mut activation = vec![0u16; hidden];
+        for i in 0..hidden {
+            activation[i] = f32_to_bf16(((i * 7 + 13) as f32 / hidden as f32 - 0.5) * 0.1);
+        }
+
+        let group_size = store.group_size;
+        let mut scratch = ExpertScratch::new(hidden, intermediate, group_size);
+        let mut scratch_pool: Vec<ExpertScratch> = (0..top_k)
+            .map(|_| ExpertScratch::new(hidden, intermediate, group_size))
+            .collect();
+        let mut output = vec![0.0f32; hidden];
+
+        // Use top-8 experts (indices 0..7)
+        let expert_indices: Vec<usize> = (0..top_k).collect();
+        let expert_weights: Vec<f32> = vec![1.0 / top_k as f32; top_k];
+
+        // Time MoE forward
+        let start = std::time::Instant::now();
+        moe_forward(
+            &store, 0, &activation, &expert_indices, &expert_weights,
+            &mut output, &mut scratch, &mut scratch_pool, true,
+        );
+        let moe_us = start.elapsed().as_micros();
+
+        let rms = (output.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / hidden as f64).sqrt();
+        let nonzero = output.iter().filter(|&&v| v.abs() > 1e-10).count();
+
+        eprintln!("Kimi K2.5 MoE forward (1 layer, top-{top_k}, group_size={group_size}):");
+        eprintln!("  Time: {moe_us} μs ({:.1} ms)", moe_us as f64 / 1000.0);
+        eprintln!("  Output RMS: {rms:.6}, nonzero: {nonzero}/{hidden}");
+        eprintln!("  Per-expert: {:.0} μs", moe_us as f64 / top_k as f64);
+
+        assert!(rms > 1e-5, "MoE output too small (RMS={rms})");
+        assert!(rms < 100.0, "MoE output too large (RMS={rms})");
+        assert!(nonzero > hidden / 2, "Too many zeros ({nonzero}/{hidden})");
     }
 }
