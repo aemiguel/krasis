@@ -193,7 +193,7 @@ pub fn moe_forward(
         pool.par_iter_mut().enumerate().for_each(|(i, local_scratch)| {
             let eidx = expert_indices[i];
             let expert = store.get_expert(moe_layer_idx, eidx);
-            expert_forward_integer(expert, &act_int16, &act_scales, local_scratch, false);
+            expert_forward_integer(expert, &act_int16, &act_scales, local_scratch, true);
         });
 
         // Weighted sum (sequential — fast since it's just addition)
@@ -312,8 +312,15 @@ pub struct KrasisEngine {
 #[pymethods]
 impl KrasisEngine {
     #[new]
-    #[pyo3(signature = (parallel=true))]
-    pub fn new(parallel: bool) -> Self {
+    #[pyo3(signature = (parallel=true, num_threads=None))]
+    pub fn new(parallel: bool, num_threads: Option<usize>) -> Self {
+        // Configure rayon thread pool (once, globally)
+        if let Some(n) = num_threads {
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build_global();
+            log::info!("Rayon thread pool: {n} threads");
+        }
         KrasisEngine {
             store: None,
             scratch: None,
