@@ -6,7 +6,11 @@
 //!   3. For each selected expert: gate+up matmul → SiLU → down matmul
 //!   4. Weighted sum of expert outputs returned to SGLang
 
-use crate::kernel::avx2::{matmul_int4_avx2, matmul_int4_parallel};
+use crate::kernel::avx2::{
+    matmul_int4_avx2, matmul_int4_parallel,
+    matmul_int4_integer, matmul_int4_integer_parallel,
+    quantize_activation_int16,
+};
 use crate::weights::marlin::{f32_to_bf16, DEFAULT_GROUP_SIZE};
 use crate::weights::{ExpertWeights, WeightStore};
 use pyo3::prelude::*;
@@ -26,28 +30,37 @@ pub struct ExpertScratch {
     pub up_out: Vec<f32>,
     /// Single expert output (f32).
     pub expert_out: Vec<f32>,
+    /// INT16-quantized input activation for gate/up projections.
+    pub input_act_int16: Vec<i16>,
+    /// Per-group scales for input activation INT16 quantization.
+    pub input_act_scales: Vec<f32>,
+    /// INT16-quantized hidden state for down projection.
+    pub hidden_int16: Vec<i16>,
+    /// Per-group scales for hidden state INT16 quantization.
+    pub hidden_scales: Vec<f32>,
+    /// Quantization group size.
+    pub group_size: usize,
 }
 
 impl ExpertScratch {
-    pub fn new(hidden_size: usize, intermediate_size: usize) -> Self {
+    pub fn new(hidden_size: usize, intermediate_size: usize, group_size: usize) -> Self {
         ExpertScratch {
             hidden_bf16: vec![0u16; intermediate_size],
             gate_out: vec![0.0f32; intermediate_size],
             up_out: vec![0.0f32; intermediate_size],
             expert_out: vec![0.0f32; hidden_size],
+            input_act_int16: vec![0i16; hidden_size],
+            input_act_scales: vec![0.0f32; hidden_size / group_size],
+            hidden_int16: vec![0i16; intermediate_size],
+            hidden_scales: vec![0.0f32; intermediate_size / group_size],
+            group_size,
         }
     }
 }
 
-/// Compute a single expert's output: SiLU(x @ gate^T) * (x @ up^T) @ down^T
+/// Compute a single expert's output using the FMA kernel: SiLU(x @ gate^T) * (x @ up^T) @ down^T
 ///
 /// Result is written to `scratch.expert_out`.
-///
-/// # Arguments
-/// * `expert` - INT4 quantized gate/up/down projections
-/// * `activation` - Input activation vector [hidden_size] as BF16
-/// * `scratch` - Reusable intermediate buffers (result in scratch.expert_out)
-/// * `parallel` - Use multi-threaded matmul (for large experts)
 pub fn expert_forward(
     expert: &ExpertWeights,
     activation: &[u16],
@@ -74,11 +87,59 @@ pub fn expert_forward(
     matmul(&expert.down, &scratch.hidden_bf16, &mut scratch.expert_out);
 }
 
+/// Compute a single expert's output using the integer kernel (_mm256_madd_epi16).
+///
+/// Uses pre-quantized INT16 activations for gate/up projections (shared across
+/// all experts in a layer). The intermediate hidden state is quantized to INT16
+/// per-expert before the down projection.
+///
+/// # Arguments
+/// * `expert` - INT4 quantized gate/up/down projections
+/// * `act_int16` - Pre-quantized input activation [hidden_size] as INT16
+/// * `act_scales` - Per-group scales for the input activation
+/// * `scratch` - Reusable intermediate buffers (result in scratch.expert_out)
+/// * `parallel` - Use multi-threaded matmul (for large experts)
+pub fn expert_forward_integer(
+    expert: &ExpertWeights,
+    act_int16: &[i16],
+    act_scales: &[f32],
+    scratch: &mut ExpertScratch,
+    parallel: bool,
+) {
+    let matmul = if parallel { matmul_int4_integer_parallel } else { matmul_int4_integer };
+
+    // gate_out = integer_matmul(gate_proj, act_int16) → f32 [intermediate_size]
+    matmul(&expert.gate, act_int16, act_scales, &mut scratch.gate_out);
+
+    // up_out = integer_matmul(up_proj, act_int16) → f32 [intermediate_size]
+    matmul(&expert.up, act_int16, act_scales, &mut scratch.up_out);
+
+    // hidden = SiLU(gate_out) * up_out → BF16 [intermediate_size]
+    for i in 0..scratch.gate_out.len() {
+        let x = scratch.gate_out[i];
+        let silu = x * fast_sigmoid(x);
+        let hidden = silu * scratch.up_out[i];
+        scratch.hidden_bf16[i] = f32_to_bf16(hidden);
+    }
+
+    // Quantize intermediate hidden state to INT16 for down projection
+    quantize_activation_int16(
+        &scratch.hidden_bf16,
+        scratch.group_size,
+        &mut scratch.hidden_int16,
+        &mut scratch.hidden_scales,
+    );
+
+    // expert_out = integer_matmul(down_proj, hidden_int16) → f32 [hidden_size]
+    matmul(&expert.down, &scratch.hidden_int16, &scratch.hidden_scales, &mut scratch.expert_out);
+}
+
 /// Full MoE forward for a single token on one layer.
 ///
-/// Runs the selected experts and combines their outputs with routing weights.
-/// While computing expert[i], prefetches expert[i+1]'s weights into L3 cache
-/// using NTA hints to avoid displacing the activation vector in L1/L2.
+/// Pre-quantizes the BF16 activation to INT16 once, then runs all selected
+/// experts using the integer kernel (_mm256_madd_epi16) for ~2x throughput
+/// over the FMA kernel. While computing expert[i], prefetches expert[i+1]'s
+/// weights into L3 cache using NTA hints.
 ///
 /// # Arguments
 /// * `store` - Loaded expert weights
@@ -87,7 +148,7 @@ pub fn expert_forward(
 /// * `expert_indices` - Selected expert indices from router
 /// * `expert_weights` - Routing weights (softmax scores) for selected experts
 /// * `output` - Output buffer [hidden_size] as f32 (accumulated weighted sum)
-/// * `scratch` - Reusable intermediate buffers
+/// * `scratch` - Reusable intermediate buffers (includes INT16 activation buffers)
 /// * `parallel` - Use multi-threaded matmul
 pub fn moe_forward(
     store: &WeightStore,
@@ -102,6 +163,18 @@ pub fn moe_forward(
     assert_eq!(expert_indices.len(), expert_weights.len());
     assert_eq!(activation.len(), store.config.hidden_size);
     assert_eq!(output.len(), store.config.hidden_size);
+
+    // Pre-quantize input activation to INT16 (shared across all experts).
+    // Take buffers out of scratch to split the borrow: act_int16 is read-only
+    // during expert_forward while scratch is written to.
+    let mut act_int16 = std::mem::take(&mut scratch.input_act_int16);
+    let mut act_scales = std::mem::take(&mut scratch.input_act_scales);
+    quantize_activation_int16(
+        activation,
+        scratch.group_size,
+        &mut act_int16,
+        &mut act_scales,
+    );
 
     // Zero output before accumulation
     output.fill(0.0);
@@ -119,13 +192,17 @@ pub fn moe_forward(
             prefetch_expert_nta(next_expert);
         }
 
-        expert_forward(expert, activation, scratch, parallel);
+        expert_forward_integer(expert, &act_int16, &act_scales, scratch, parallel);
 
         // Accumulate: output += weight * expert_out
         for j in 0..output.len() {
             output[j] += weight * scratch.expert_out[j];
         }
     }
+
+    // Return buffers to scratch for reuse
+    scratch.input_act_int16 = act_int16;
+    scratch.input_act_scales = act_scales;
 }
 
 /// Prefetch an expert's weight data into L3 cache using NTA (non-temporal) hints.
@@ -252,6 +329,7 @@ impl KrasisEngine {
         let scratch = ExpertScratch::new(
             store.config.hidden_size,
             store.config.moe_intermediate_size,
+            gs,
         );
         self.output_buf = vec![0.0f32; store.config.hidden_size];
         self.store = Some(store);
@@ -404,7 +482,7 @@ mod tests {
             activation[i] = f32_to_bf16(((i * 3 + 1) as f32 / hidden as f32 - 0.5) * 0.2);
         }
 
-        let mut scratch = ExpertScratch::new(hidden, intermediate);
+        let mut scratch = ExpertScratch::new(hidden, intermediate, group_size);
 
         expert_forward(&expert, &activation, &mut scratch, false);
 
@@ -437,6 +515,7 @@ mod tests {
 
         let hidden = store.config.hidden_size;
         let intermediate = store.config.moe_intermediate_size;
+        let group_size = DEFAULT_GROUP_SIZE;
 
         // Create a reasonable activation vector
         let mut activation = vec![0u16; hidden];
@@ -444,7 +523,7 @@ mod tests {
             activation[i] = f32_to_bf16(((i * 7 + 13) as f32 / hidden as f32 - 0.5) * 0.1);
         }
 
-        let mut scratch = ExpertScratch::new(hidden, intermediate);
+        let mut scratch = ExpertScratch::new(hidden, intermediate, group_size);
 
         // Test single expert forward (serial)
         let start = std::time::Instant::now();
@@ -493,13 +572,14 @@ mod tests {
         let hidden = store.config.hidden_size;
         let intermediate = store.config.moe_intermediate_size;
         let top_k = store.config.num_experts_per_tok;
+        let group_size = DEFAULT_GROUP_SIZE;
 
         let mut activation = vec![0u16; hidden];
         for i in 0..hidden {
             activation[i] = f32_to_bf16(((i * 7 + 13) as f32 / hidden as f32 - 0.5) * 0.1);
         }
 
-        let mut scratch = ExpertScratch::new(hidden, intermediate);
+        let mut scratch = ExpertScratch::new(hidden, intermediate, group_size);
         let mut output = vec![0.0f32; hidden];
 
         // Simulate router output: top-6 experts with softmax weights

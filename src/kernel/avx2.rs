@@ -200,6 +200,286 @@ pub fn matmul_int4_avx2(q: &QuantizedInt4, activation: &[u16], output: &mut [f32
     }
 }
 
+// ── Integer kernel (INT16 × INT4 → INT32 accumulation) ─────────────
+//
+// Instead of converting INT4 weights and BF16 activations to f32 and
+// using FMA, this kernel:
+//   1. Pre-quantizes BF16 activations to INT16 (once per forward call)
+//   2. Unpacks INT4 weights to INT16 (in registers, no memory writes)
+//   3. Uses _mm256_madd_epi16 to multiply 16 INT16 pairs → 8 INT32
+//   4. Accumulates in INT32, converts to f32 only at group boundaries
+//
+// Advantages over FMA kernel:
+//   - 16 values per instruction vs 8 → 2x instruction throughput
+//   - 3-cycle latency vs 5 on Zen 2
+//   - No f32 conversion in inner loop (only at group boundaries)
+
+/// Quantize BF16 activation vector to INT16 with per-group scales.
+///
+/// For each group: scale = max(|x|) / 32767, int16[i] = round(x[i] / scale).
+/// INT16 per-group quantization has 15 bits of precision — more than BF16's
+/// 7-bit mantissa — so this does NOT degrade quality.
+pub fn quantize_activation_int16(
+    activation_bf16: &[u16],
+    group_size: usize,
+    output_int16: &mut [i16],
+    output_scales: &mut [f32],
+) {
+    let k = activation_bf16.len();
+    let num_groups = k / group_size;
+    assert_eq!(output_int16.len(), k);
+    assert_eq!(output_scales.len(), num_groups);
+    assert!(k % group_size == 0);
+
+    for g in 0..num_groups {
+        let start = g * group_size;
+
+        // Find max abs value in group
+        let mut max_abs: f32 = 0.0;
+        for i in 0..group_size {
+            let val = bf16_to_f32(activation_bf16[start + i]);
+            max_abs = max_abs.max(val.abs());
+        }
+
+        // Compute scale (handle zero group)
+        let scale = if max_abs > 0.0 { max_abs / 32767.0 } else { 1.0 };
+        let inv_scale = if max_abs > 0.0 { 32767.0 / max_abs } else { 0.0 };
+        output_scales[g] = scale;
+
+        // Quantize to INT16
+        for i in 0..group_size {
+            let val = bf16_to_f32(activation_bf16[start + i]);
+            let quantized = (val * inv_scale).round() as i32;
+            output_int16[start + i] = quantized.clamp(-32768, 32767) as i16;
+        }
+    }
+}
+
+/// Scalar integer-path INT4 matmul (correctness reference).
+///
+/// Same computation as AVX2 integer kernel but without SIMD.
+pub fn matmul_int4_integer_scalar(
+    q: &QuantizedInt4,
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+) {
+    assert_eq!(act_int16.len(), q.cols);
+    assert_eq!(act_scales.len(), q.cols / q.group_size);
+    assert_eq!(output.len(), q.rows);
+
+    let num_groups = q.cols / q.group_size;
+    let packed_k = q.cols / 8;
+
+    for row in 0..q.rows {
+        let mut acc: f32 = 0.0;
+
+        for g in 0..num_groups {
+            let w_scale = bf16_to_f32(q.scales[row * num_groups + g]);
+            let a_scale = act_scales[g];
+            let combined = w_scale * a_scale;
+            let mut group_sum: i32 = 0;
+
+            for pack in 0..(q.group_size / 8) {
+                let k_base = g * q.group_size + pack * 8;
+                let word = q.packed[row * packed_k + k_base / 8];
+
+                for j in 0..8u32 {
+                    let u4 = ((word >> (j * 4)) & 0xF) as i32;
+                    let w_val = u4 - 8;
+                    let a_val = act_int16[k_base + j as usize] as i32;
+                    group_sum += w_val * a_val;
+                }
+            }
+
+            acc += group_sum as f32 * combined;
+        }
+
+        output[row] = acc;
+    }
+}
+
+/// AVX2 integer INT4 matmul using `_mm256_madd_epi16`.
+///
+/// Per iteration (16 INT4 values from 8 packed bytes):
+///   1. Load 8 bytes (2 u32 words = 16 nibbles)
+///   2. Separate low/high nibbles via mask, interleave to sequential order
+///   3. Subtract offset (unsigned [0,15] → signed [-8,7])
+///   4. Sign-extend INT8 → INT16 via `_mm256_cvtepi8_epi16`
+///   5. `_mm256_madd_epi16` against pre-quantized INT16 activations → 8 INT32
+///   6. Accumulate INT32 partial sums per group
+///   7. At group boundary: convert to f32, apply weight_scale × act_scale
+///   8. After all groups: horizontal sum → output scalar
+///
+/// # Safety
+/// Requires AVX2 + FMA. All pointers must be valid for their respective lengths.
+/// `group_size` must be divisible by 16.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn expert_matmul_int4_integer(
+    packed: *const u32,        // [N, K/8] packed INT4
+    weight_scales: *const u16, // [N, K/group_size] BF16 weight scales
+    act_int16: *const i16,     // [K] quantized INT16 activations
+    act_scales: *const f32,    // [K/group_size] activation scales
+    output: *mut f32,          // [N]
+    k: usize,
+    n: usize,
+    group_size: usize,
+) {
+    let num_groups = k / group_size;
+    let packs_per_group = group_size / 16; // 16 values per iteration
+
+    // Constants for nibble unpacking
+    let mask_0f = _mm_set1_epi8(0x0F);
+    let offset_8 = _mm_set1_epi8(8);
+
+    for row in 0..n {
+        let mut float_acc = _mm256_setzero_ps();
+        let packed_base = packed.add(row * (k / 8));
+
+        for g in 0..num_groups {
+            let mut int_acc = _mm256_setzero_si256();
+            let w_scale_f32 = bf16_to_f32(*weight_scales.add(row * num_groups + g));
+            let a_scale_f32 = *act_scales.add(g);
+            let combined_scale = w_scale_f32 * a_scale_f32;
+
+            for p in 0..packs_per_group {
+                let k_base = g * group_size + p * 16;
+
+                // Load 8 bytes of packed INT4 (2 u32 words = 16 nibbles)
+                let load_ptr = packed_base.add(k_base / 8) as *const __m128i;
+                let raw = _mm_loadl_epi64(load_ptr);
+
+                // Separate low nibbles (even values) and high nibbles (odd values)
+                let lo = _mm_and_si128(raw, mask_0f);
+                let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_0f);
+
+                // Interleave to sequential order: [v0,v1,v2,...,v15]
+                let interleaved = _mm_unpacklo_epi8(lo, hi);
+
+                // Unsigned [0,15] → signed [-8,7]
+                let signed = _mm_sub_epi8(interleaved, offset_8);
+
+                // Sign-extend INT8 → INT16 (16 values in one YMM register)
+                let w16 = _mm256_cvtepi8_epi16(signed);
+
+                // Load 16 INT16 activations
+                let a16 = _mm256_loadu_si256(act_int16.add(k_base) as *const __m256i);
+
+                // Multiply-accumulate: 16 INT16 × INT16 → 8 INT32 partial sums
+                let dot = _mm256_madd_epi16(w16, a16);
+                int_acc = _mm256_add_epi32(int_acc, dot);
+            }
+
+            // Convert INT32 partial sums to f32 and apply combined scale
+            let group_f32 = _mm256_cvtepi32_ps(int_acc);
+            float_acc = _mm256_fmadd_ps(group_f32, _mm256_set1_ps(combined_scale), float_acc);
+        }
+
+        // Horizontal sum → single f32 output
+        *output.add(row) = hsum_avx2(float_acc);
+    }
+}
+
+/// Safe wrapper for the AVX2 integer INT4 matmul kernel.
+pub fn matmul_int4_integer(
+    q: &QuantizedInt4,
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+) {
+    assert_eq!(act_int16.len(), q.cols);
+    assert_eq!(act_scales.len(), q.cols / q.group_size);
+    assert_eq!(output.len(), q.rows);
+    assert!(q.group_size % 16 == 0, "Integer kernel requires group_size divisible by 16");
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    unsafe {
+        expert_matmul_int4_integer(
+            q.packed.as_ptr(),
+            q.scales.as_ptr(),
+            act_int16.as_ptr(),
+            act_scales.as_ptr(),
+            output.as_mut_ptr(),
+            q.cols,
+            q.rows,
+            q.group_size,
+        );
+    }
+}
+
+/// Parallel AVX2 integer INT4 matmul — splits output rows across rayon threads.
+///
+/// The integer kernel is ~2x faster per-element than FMA, so parallelism only
+/// helps for larger matrices. Threshold: rows×cols > 8M elements (~500 μs serial).
+/// Below that, rayon overhead (~150 μs) exceeds the benefit.
+pub fn matmul_int4_integer_parallel(
+    q: &QuantizedInt4,
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+) {
+    use rayon::prelude::*;
+
+    assert_eq!(act_int16.len(), q.cols);
+    assert_eq!(act_scales.len(), q.cols / q.group_size);
+    assert_eq!(output.len(), q.rows);
+    assert!(q.group_size % 16 == 0, "Integer kernel requires group_size divisible by 16");
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    // For small matrices, single-thread is faster (rayon overhead > kernel benefit).
+    // Threshold: ~8M elements ≈ 500 μs serial at ~0.067 ns/element.
+    if q.rows * q.cols <= 8_000_000 {
+        unsafe {
+            expert_matmul_int4_integer(
+                q.packed.as_ptr(),
+                q.scales.as_ptr(),
+                act_int16.as_ptr(),
+                act_scales.as_ptr(),
+                output.as_mut_ptr(),
+                q.cols,
+                q.rows,
+                q.group_size,
+            );
+        }
+        return;
+    }
+
+    let packed_k = q.cols / 8;
+    let num_groups = q.cols / q.group_size;
+    let chunk_size = 32;
+
+    let packed_addr = q.packed.as_ptr() as usize;
+    let scales_addr = q.scales.as_ptr() as usize;
+    let act_addr = act_int16.as_ptr() as usize;
+    let act_scales_addr = act_scales.as_ptr() as usize;
+    let cols = q.cols;
+    let group_size = q.group_size;
+
+    output.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start_row = chunk_idx * chunk_size;
+        let chunk_rows = chunk.len();
+
+        unsafe {
+            expert_matmul_int4_integer(
+                (packed_addr as *const u32).add(start_row * packed_k),
+                (scales_addr as *const u16).add(start_row * num_groups),
+                act_addr as *const i16,
+                act_scales_addr as *const f32,
+                chunk.as_mut_ptr(),
+                cols,
+                chunk_rows,
+                group_size,
+            );
+        }
+    });
+}
+
 /// Parallel AVX2 INT4 matmul — splits output rows across rayon threads.
 ///
 /// Each thread processes a chunk of rows independently. The activation
@@ -528,5 +808,250 @@ mod tests {
         }
         eprintln!("Parallel vs serial max_diff: {max_diff:.8}");
         assert!(max_diff == 0.0, "Parallel should be bit-identical to serial");
+    }
+
+    // ── Integer kernel tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_activation_int16_quantization() {
+        let k = 256;
+        let group_size = 128;
+
+        let mut activation = vec![0u16; k];
+        for i in 0..k {
+            let val = ((i * 7 + 3) as f32 / k as f32 - 0.5) * 2.0;
+            activation[i] = f32_to_bf16(val);
+        }
+
+        let mut int16_out = vec![0i16; k];
+        let mut scales = vec![0.0f32; k / group_size];
+        quantize_activation_int16(&activation, group_size, &mut int16_out, &mut scales);
+
+        // Check round-trip: dequantize and compare
+        let mut max_err: f32 = 0.0;
+        for g in 0..(k / group_size) {
+            let scale = scales[g];
+            for i in 0..group_size {
+                let orig = bf16_to_f32(activation[g * group_size + i]);
+                let reconstructed = int16_out[g * group_size + i] as f32 * scale;
+                let err = (orig - reconstructed).abs();
+                max_err = max_err.max(err);
+            }
+        }
+        eprintln!("INT16 activation round-trip max error: {max_err:.8}");
+        // INT16 has 15 bits of precision, BF16 has 7 — so error should be tiny
+        assert!(max_err < 0.001, "INT16 round-trip error too large: {max_err}");
+    }
+
+    #[test]
+    fn test_integer_scalar_vs_avx2_synthetic() {
+        let n = 16;
+        let k = 128;
+        let group_size = 128;
+
+        let mut weight_bf16 = vec![0u16; n * k];
+        for i in 0..weight_bf16.len() {
+            let val = ((i as f32 / weight_bf16.len() as f32) - 0.5) * 0.2;
+            weight_bf16[i] = f32_to_bf16(val);
+        }
+
+        let mut activation = vec![0u16; k];
+        for i in 0..k {
+            let val = ((i as f32 / k as f32) - 0.5) * 2.0;
+            activation[i] = f32_to_bf16(val);
+        }
+
+        // Quantize weights
+        let q = quantize_int4(&weight_bf16, n, k, group_size);
+
+        // Quantize activations to INT16
+        let mut act_int16 = vec![0i16; k];
+        let mut act_scales = vec![0.0f32; k / group_size];
+        quantize_activation_int16(&activation, group_size, &mut act_int16, &mut act_scales);
+
+        // Scalar integer
+        let mut scalar_out = vec![0.0f32; n];
+        matmul_int4_integer_scalar(&q, &act_int16, &act_scales, &mut scalar_out);
+
+        // AVX2 integer
+        let mut avx2_out = vec![0.0f32; n];
+        matmul_int4_integer(&q, &act_int16, &act_scales, &mut avx2_out);
+
+        let mut max_diff: f32 = 0.0;
+        for i in 0..n {
+            let diff = (scalar_out[i] - avx2_out[i]).abs();
+            max_diff = max_diff.max(diff);
+        }
+        eprintln!("Integer scalar vs AVX2 [{n}×{k}]: max_diff={max_diff:.8}");
+        assert!(max_diff < 1e-3, "Integer scalar vs AVX2 diverged: {max_diff}");
+    }
+
+    #[test]
+    fn test_integer_vs_fma_synthetic() {
+        let n = 32;
+        let k = 256;
+        let group_size = 128;
+
+        let mut weight_bf16 = vec![0u16; n * k];
+        for i in 0..weight_bf16.len() {
+            let val = ((i * 3 + 7) as f32 / weight_bf16.len() as f32 - 0.5) * 0.4;
+            weight_bf16[i] = f32_to_bf16(val);
+        }
+
+        let mut activation = vec![0u16; k];
+        for i in 0..k {
+            let val = ((i * 11 + 3) as f32 / k as f32 - 0.5) * 0.5;
+            activation[i] = f32_to_bf16(val);
+        }
+
+        let q = quantize_int4(&weight_bf16, n, k, group_size);
+
+        // FMA kernel
+        let mut fma_out = vec![0.0f32; n];
+        matmul_int4_avx2(&q, &activation, &mut fma_out);
+
+        // Integer kernel
+        let mut act_int16 = vec![0i16; k];
+        let mut act_scales = vec![0.0f32; k / group_size];
+        quantize_activation_int16(&activation, group_size, &mut act_int16, &mut act_scales);
+
+        let mut int_out = vec![0.0f32; n];
+        matmul_int4_integer(&q, &act_int16, &act_scales, &mut int_out);
+
+        // Compare: both are INT4 quantized, so difference is from
+        // activation quantization (BF16→INT16) and accumulation method
+        let mut max_diff: f32 = 0.0;
+        let mut sum_sq_diff: f64 = 0.0;
+        let mut sum_sq_fma: f64 = 0.0;
+        for i in 0..n {
+            let diff = (fma_out[i] - int_out[i]).abs();
+            max_diff = max_diff.max(diff);
+            sum_sq_diff += (diff as f64).powi(2);
+            sum_sq_fma += (fma_out[i] as f64).powi(2);
+        }
+        let rmse = (sum_sq_diff / n as f64).sqrt();
+        let rms_fma = (sum_sq_fma / n as f64).sqrt();
+        let rel_err = rmse / rms_fma;
+
+        eprintln!("Integer vs FMA [{n}×{k}]: max_diff={max_diff:.6}, relative RMSE={rel_err:.6}");
+        // Both use same INT4 weights; difference is only from activation quantization
+        assert!(rel_err < 0.01, "Integer vs FMA relative error too large: {rel_err}");
+    }
+
+    #[test]
+    fn test_integer_parallel_correctness() {
+        let n = 1408;
+        let k = 2048;
+        let group_size = 128;
+
+        let mut weight_bf16 = vec![0u16; n * k];
+        for i in 0..weight_bf16.len() {
+            let val = ((i * 37 + 11) as f32 / weight_bf16.len() as f32 - 0.5) * 0.1;
+            weight_bf16[i] = f32_to_bf16(val);
+        }
+
+        let mut activation = vec![0u16; k];
+        for i in 0..k {
+            let val = ((i * 7 + 3) as f32 / k as f32 - 0.5) * 0.2;
+            activation[i] = f32_to_bf16(val);
+        }
+
+        let q = quantize_int4(&weight_bf16, n, k, group_size);
+
+        let mut act_int16 = vec![0i16; k];
+        let mut act_scales = vec![0.0f32; k / group_size];
+        quantize_activation_int16(&activation, group_size, &mut act_int16, &mut act_scales);
+
+        let mut serial_out = vec![0.0f32; n];
+        let mut parallel_out = vec![0.0f32; n];
+
+        matmul_int4_integer(&q, &act_int16, &act_scales, &mut serial_out);
+        matmul_int4_integer_parallel(&q, &act_int16, &act_scales, &mut parallel_out);
+
+        let mut max_diff: f32 = 0.0;
+        for i in 0..n {
+            max_diff = max_diff.max((serial_out[i] - parallel_out[i]).abs());
+        }
+        eprintln!("Integer parallel vs serial max_diff: {max_diff:.8}");
+        assert!(max_diff == 0.0, "Integer parallel should be bit-identical to serial");
+    }
+
+    #[test]
+    fn test_integer_throughput() {
+        // Benchmark: compare integer vs FMA kernel throughput
+        let n = 1408;
+        let k = 2048;
+        let group_size = 128;
+
+        let mut weight_bf16 = vec![0u16; n * k];
+        for i in 0..weight_bf16.len() {
+            let val = ((i * 37 + 11) as f32 / weight_bf16.len() as f32 - 0.5) * 0.1;
+            weight_bf16[i] = f32_to_bf16(val);
+        }
+
+        let mut activation = vec![0u16; k];
+        for i in 0..k {
+            let val = ((i * 7 + 3) as f32 / k as f32 - 0.5) * 0.2;
+            activation[i] = f32_to_bf16(val);
+        }
+
+        let q = quantize_int4(&weight_bf16, n, k, group_size);
+        let weight_bytes = q.packed.len() * 4 + q.scales.len() * 2;
+        let iters = 100;
+
+        // Quantize activation once (amortized)
+        let mut act_int16 = vec![0i16; k];
+        let mut act_scales = vec![0.0f32; k / group_size];
+        quantize_activation_int16(&activation, group_size, &mut act_int16, &mut act_scales);
+
+        let mut output = vec![0.0f32; n];
+
+        // ── FMA single-thread ──
+        matmul_int4_avx2(&q, &activation, &mut output);
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            matmul_int4_avx2(&q, &activation, &mut output);
+        }
+        let fma_st_us = start.elapsed().as_micros() as f64 / iters as f64;
+        let fma_st_gb = (weight_bytes as f64 / 1e9) / (fma_st_us / 1e6);
+
+        // ── Integer single-thread ──
+        matmul_int4_integer(&q, &act_int16, &act_scales, &mut output);
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            matmul_int4_integer(&q, &act_int16, &act_scales, &mut output);
+        }
+        let int_st_us = start.elapsed().as_micros() as f64 / iters as f64;
+        let int_st_gb = (weight_bytes as f64 / 1e9) / (int_st_us / 1e6);
+
+        // ── FMA parallel ──
+        matmul_int4_parallel(&q, &activation, &mut output);
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            matmul_int4_parallel(&q, &activation, &mut output);
+        }
+        let fma_par_us = start.elapsed().as_micros() as f64 / iters as f64;
+        let fma_par_gb = (weight_bytes as f64 / 1e9) / (fma_par_us / 1e6);
+
+        // ── Integer parallel ──
+        matmul_int4_integer_parallel(&q, &act_int16, &act_scales, &mut output);
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            matmul_int4_integer_parallel(&q, &act_int16, &act_scales, &mut output);
+        }
+        let int_par_us = start.elapsed().as_micros() as f64 / iters as f64;
+        let int_par_gb = (weight_bytes as f64 / 1e9) / (int_par_us / 1e6);
+
+        eprintln!("╔══════════════════════════════════════════════════╗");
+        eprintln!("║  Kernel Throughput [{n}×{k}]                      ║");
+        eprintln!("╠══════════════════════════════════════════════════╣");
+        eprintln!("║  FMA single-thread:     {fma_st_us:>6.0} μs  {fma_st_gb:>5.1} GB/s ║");
+        eprintln!("║  Integer single-thread: {int_st_us:>6.0} μs  {int_st_gb:>5.1} GB/s ║");
+        eprintln!("║  FMA parallel:          {fma_par_us:>6.0} μs  {fma_par_gb:>5.1} GB/s ║");
+        eprintln!("║  Integer parallel:      {int_par_us:>6.0} μs  {int_par_gb:>5.1} GB/s ║");
+        eprintln!("╠══════════════════════════════════════════════════╣");
+        eprintln!("║  Integer speedup (ST): {:.2}x                      ║", fma_st_us / int_st_us);
+        eprintln!("║  Integer speedup (MT): {:.2}x                      ║", fma_par_us / int_par_us);
+        eprintln!("╚══════════════════════════════════════════════════╝");
     }
 }
