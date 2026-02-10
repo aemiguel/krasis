@@ -21,6 +21,7 @@ Usage in SGLang:
 import json
 import logging
 import os
+import sys
 import threading
 from typing import Optional
 
@@ -50,6 +51,7 @@ class KrasisMoEWrapper:
     hf_model_path: Optional[str] = None
     num_threads: int = 16
     gpu_prefill_threshold: int = 300  # tokens; 0 = disabled
+    cpu_expert_bits: int = 4  # 4 for INT4, 8 for INT8 CPU expert quantization
 
     # Shared engine singleton (loaded once, used by all layer wrappers)
     _shared_engine: Optional[KrasisEngine] = None
@@ -64,6 +66,9 @@ class KrasisMoEWrapper:
     # Shared GPU prefill manager singleton
     _shared_gpu_prefill = None
     _gpu_prefill_lock = threading.Lock()
+
+    # VRAM budget verification (set once per rank)
+    _vram_verified = False
 
     def __init__(
         self,
@@ -198,8 +203,40 @@ class KrasisMoEWrapper:
                 logger.info(
                     "  Partial load: start_layer=%d, max_layers=%s",
                     start_layer, max_layers)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
+            # -- CRASH DIAGNOSTIC: fine-grained logging around engine creation --
+            logger.info("[DIAG] Creating KrasisEngine(parallel=True, num_threads=%d)...", num_threads)
+            sys.stdout.flush()
             engine = KrasisEngine(parallel=True, num_threads=num_threads)
-            engine.load(model_path, start_layer=start_layer, max_layers=max_layers)
+            logger.info("[DIAG] KrasisEngine created OK, calling engine.load()...")
+            sys.stdout.flush()
+
+            try:
+                import psutil
+                mem = psutil.virtual_memory()
+                logger.info(
+                    "[DIAG] RAM before engine.load(): used=%.1f/%.1f GiB, available=%.1f GiB, "
+                    "page_cache=%.1f GiB",
+                    mem.used / (1024**3), mem.total / (1024**3),
+                    mem.available / (1024**3),
+                    (mem.cached + mem.buffers) / (1024**3) if hasattr(mem, 'cached') else -1,
+                )
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+            # This is the main load call — Rust loads safetensors, quantizes to INT4/INT8
+            engine.load(
+                model_path,
+                start_layer=start_layer,
+                max_layers=max_layers,
+                num_bits=cls.cpu_expert_bits,
+            )
+
+            logger.info("[DIAG] engine.load() returned OK!")
+            sys.stdout.flush()
             cls._shared_engine = engine
 
             logger.info(
@@ -272,6 +309,77 @@ class KrasisMoEWrapper:
             return 0 if step <= 1 else step
         return 0
 
+    # ── VRAM budget verification ─────────────────────────────────
+
+    @classmethod
+    def verify_vram_budget(cls, model_path: str):
+        """Compare actual GPU memory usage to pre-computed VRAM budget estimate.
+
+        Called once per rank after engine loading. Logs INFO with actual vs
+        estimated, and WARNING if deviation exceeds 10%.
+        """
+        if cls._vram_verified:
+            return
+        cls._vram_verified = True
+
+        if not torch.cuda.is_available():
+            return
+
+        try:
+            from krasis.vram_budget import compute_vram_budget
+
+            dev = torch.cuda.current_device()
+            actual_bytes = torch.cuda.memory_allocated(dev)
+            actual_mb = actual_bytes / (1024**2)
+
+            # Determine PP partition and this rank's info
+            partition_str = os.environ.get("SGLANG_PP_LAYER_PARTITION", "")
+            if not partition_str:
+                logger.info("VRAM verify: no PP partition set, skipping")
+                return
+
+            partition = [int(x.strip()) for x in partition_str.split(",")]
+
+            # Infer rank
+            rank = -1
+            if cls._pp_first_layer_idx is not None:
+                cumsum = 0
+                for i, count in enumerate(partition):
+                    if cumsum <= cls._pp_first_layer_idx < cumsum + count:
+                        rank = i
+                        break
+                    cumsum += count
+
+            if rank < 0:
+                logger.info("VRAM verify: could not determine rank, skipping")
+                return
+
+            budget = compute_vram_budget(
+                model_path=model_path,
+                pp_partition=partition,
+                kv_cache_dtype=os.environ.get("KV_CACHE_DTYPE", "auto"),
+                quantization="w8a8_int8",  # Currently always INT8
+            )
+
+            estimated_mb = budget["ranks"][rank]["weight_total_mb"]
+            diff_pct = abs(actual_mb - estimated_mb) / estimated_mb * 100 if estimated_mb > 0 else 0
+
+            if diff_pct > 10:
+                logger.warning(
+                    "VRAM budget: rank %d actual=%.0f MB vs estimated=%.0f MB "
+                    "(%.1f%% deviation — budget may be inaccurate)",
+                    rank, actual_mb, estimated_mb, diff_pct,
+                )
+            else:
+                logger.info(
+                    "VRAM budget: rank %d actual=%.0f MB vs estimated=%.0f MB "
+                    "(%.1f%% deviation — OK)",
+                    rank, actual_mb, estimated_mb, diff_pct,
+                )
+
+        except Exception as e:
+            logger.info("VRAM verify: %s", e)
+
     # ── KTMoEWrapper interface ────────────────────────────────────
 
     def load_weights(self, physical_to_logical_map_cpu: Optional[torch.Tensor] = None):
@@ -314,6 +422,9 @@ class KrasisMoEWrapper:
                     dev, alloc, free / (1024**3), total / (1024**3))
             except Exception:
                 pass
+
+        # Verify VRAM usage against pre-computed budget (once per rank)
+        self.verify_vram_budget(self._model_path)
 
     def submit_forward(
         self,
@@ -446,3 +557,4 @@ class KrasisMoEWrapper:
             cls.pp_num_moe_layers = None
         with cls._gpu_prefill_lock:
             cls._shared_gpu_prefill = None
+        cls._vram_verified = False

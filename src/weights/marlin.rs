@@ -41,6 +41,97 @@ pub struct QuantizedInt4 {
     pub group_size: usize,
 }
 
+/// Symmetric INT8 quantization result for a single weight matrix.
+pub struct QuantizedInt8 {
+    /// Raw INT8 weights, row-major. Shape: [rows, cols]
+    pub data: Vec<i8>,
+    /// Per-group BF16 scales. Shape: [rows, cols / group_size]
+    pub scales: Vec<u16>,
+    pub rows: usize,
+    pub cols: usize,
+    pub group_size: usize,
+}
+
+/// Quantize a BF16 weight matrix to symmetric INT8 with per-group scales.
+///
+/// Symmetric INT8: values in [-128, 127], scale chosen so that
+///   max(abs(group)) maps to 127.
+///
+/// # Arguments
+/// * `weight_bf16` - row-major BF16 weight data (as raw u16), length = rows * cols
+/// * `rows` - number of rows (output dimension)
+/// * `cols` - number of columns (input dimension), must be divisible by group_size
+/// * `group_size` - quantization group size (typically 128)
+pub fn quantize_int8(
+    weight_bf16: &[u16],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> QuantizedInt8 {
+    assert_eq!(weight_bf16.len(), rows * cols);
+    assert!(cols % group_size == 0, "cols ({cols}) must be divisible by group_size ({group_size})");
+
+    let num_groups_per_row = cols / group_size;
+    let mut scales = vec![0u16; rows * num_groups_per_row];
+    let mut data = vec![0i8; rows * cols];
+
+    for row in 0..rows {
+        let row_offset = row * cols;
+
+        // Pass 1: compute per-group scales
+        for g in 0..num_groups_per_row {
+            let group_start = row_offset + g * group_size;
+            let mut amax: f32 = 0.0;
+            for i in 0..group_size {
+                let val = bf16_to_f32(weight_bf16[group_start + i]);
+                amax = amax.max(val.abs());
+            }
+            let scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+            scales[row * num_groups_per_row + g] = f32_to_bf16(scale);
+        }
+
+        // Pass 2: quantize
+        for g in 0..num_groups_per_row {
+            let group_start = row_offset + g * group_size;
+            let scale = bf16_to_f32(scales[row * num_groups_per_row + g]);
+            let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+
+            for i in 0..group_size {
+                let val = bf16_to_f32(weight_bf16[group_start + i]);
+                let q = (val * inv_scale).round().clamp(-128.0, 127.0) as i8;
+                data[group_start + i] = q;
+            }
+        }
+    }
+
+    QuantizedInt8 {
+        data,
+        scales,
+        rows,
+        cols,
+        group_size,
+    }
+}
+
+/// Dequantize INT8 weights back to f32 for verification.
+pub fn dequantize_int8(q: &QuantizedInt8) -> Vec<f32> {
+    let num_groups_per_row = q.cols / q.group_size;
+    let mut output = vec![0.0f32; q.rows * q.cols];
+
+    for row in 0..q.rows {
+        for g in 0..num_groups_per_row {
+            let scale = bf16_to_f32(q.scales[row * num_groups_per_row + g]);
+            let group_start = row * q.cols + g * q.group_size;
+
+            for i in 0..q.group_size {
+                output[group_start + i] = q.data[group_start + i] as f32 * scale;
+            }
+        }
+    }
+
+    output
+}
+
 /// Quantize a BF16 weight matrix to symmetric INT4 with per-group scales.
 ///
 /// Symmetric INT4: values in [-8, 7], scale chosen so that

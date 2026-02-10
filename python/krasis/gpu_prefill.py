@@ -27,42 +27,56 @@ logger = logging.getLogger(__name__)
 
 # Marlin quantization constants
 GROUP_SIZE = 128
-NUM_BITS = 4
 
 
-def _quantize_and_pack_gpu(w: torch.Tensor, group_size: int = GROUP_SIZE):
-    """Quantize [K, N] weight to INT4 packed on GPU.
+def _quantize_and_pack_gpu(w: torch.Tensor, group_size: int = GROUP_SIZE, num_bits: int = 4):
+    """Quantize [K, N] weight to INT4 or INT8 packed on GPU.
 
     Input weight must be transposed to [K, N] (K = input/reduction dim, N = output dim).
     This matches the GPTQ convention where packing is along the K dimension.
 
+    Args:
+        w: [K, N] weight tensor
+        group_size: quantization group size
+        num_bits: 4 for INT4 or 8 for INT8
+
     Returns:
-        packed: [K//8, N] int32 — 8 INT4 values per int32, packed along K
+        packed: [K//vals_per_int32, N] int32
         scale: [K//group_size, N] same dtype as w
     """
     K, N = w.shape
     assert K % group_size == 0, f"K={K} not divisible by group_size={group_size}"
-    assert K % 8 == 0, f"K={K} not divisible by 8"
+    assert num_bits in (4, 8), f"num_bits must be 4 or 8, got {num_bits}"
 
     w_float = w.float()
     w_grouped = w_float.reshape(K // group_size, group_size, N)
 
-    # Symmetric quantization: scale = max(|max|/7, |min|/8) per group
-    max_val = w_grouped.amax(dim=1, keepdim=True)
-    min_val = w_grouped.amin(dim=1, keepdim=True)
-    scale = torch.max(max_val.abs() / 7.0, min_val.abs() / 8.0)
-    scale = scale.clamp(min=1e-10)  # avoid division by zero
+    if num_bits == 4:
+        # Symmetric INT4: scale = max(|max|/7, |min|/8) per group
+        max_val = w_grouped.amax(dim=1, keepdim=True)
+        min_val = w_grouped.amin(dim=1, keepdim=True)
+        scale = torch.max(max_val.abs() / 7.0, min_val.abs() / 8.0)
+        scale = scale.clamp(min=1e-10)
+        w_q = (w_grouped / scale).round().clamp(-8, 7).to(torch.int32) + 8
+        vals_per_int32 = 8
+    else:  # num_bits == 8
+        # Symmetric INT8: scale = max(|max|/127, |min|/128) per group
+        max_val = w_grouped.amax(dim=1, keepdim=True)
+        min_val = w_grouped.amin(dim=1, keepdim=True)
+        scale = torch.max(max_val.abs() / 127.0, min_val.abs() / 128.0)
+        scale = scale.clamp(min=1e-10)
+        w_q = (w_grouped / scale).round().clamp(-128, 127).to(torch.int32) + 128
+        vals_per_int32 = 4
 
-    # Quantize to [-8, 7], then bias to [0, 15] for unsigned INT4 packing
-    w_q = (w_grouped / scale).round().clamp(-8, 7).to(torch.int32) + 8
     w_q = w_q.reshape(K, N)
     scale = scale.squeeze(1).to(w.dtype)  # [K//group_size, N], match model dtype
 
-    # Pack 8 INT4 values into one int32 (bits 0-3, 4-7, ..., 28-31)
-    w_q = w_q.reshape(K // 8, 8, N)
+    # Pack values into int32
+    assert K % vals_per_int32 == 0, f"K={K} not divisible by vals_per_int32={vals_per_int32}"
+    w_q = w_q.reshape(K // vals_per_int32, vals_per_int32, N)
     packed = w_q[:, 0, :].clone()
-    for i in range(1, 8):
-        packed |= w_q[:, i, :] << (4 * i)
+    for i in range(1, vals_per_int32):
+        packed |= w_q[:, i, :] << (num_bits * i)
 
     return packed, scale
 
@@ -87,6 +101,7 @@ class GpuPrefillManager:
         routed_scaling_factor: float = 1.0,
         first_k_dense: int = 0,
         chunk_size: Optional[int] = None,
+        num_bits: int = 4,
     ):
         self.model_path = model_path
         self.device = device
@@ -97,6 +112,7 @@ class GpuPrefillManager:
         self.n_shared_experts = n_shared_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.first_k_dense = first_k_dense
+        self.num_bits = num_bits
 
         # Chunk size: how many experts fit in one GPU buffer load
         if chunk_size is None:
@@ -126,21 +142,22 @@ class GpuPrefillManager:
 
         logger.info(
             "GpuPrefillManager: experts=%d, hidden=%d, intermediate=%d, "
-            "chunk_size=%d, num_chunks=%d, shared=%d, scale=%.3f",
+            "chunk_size=%d, num_chunks=%d, shared=%d, scale=%.3f, num_bits=%d",
             num_experts, hidden_size, intermediate_size,
             self.chunk_size, self.num_chunks,
-            n_shared_experts, routed_scaling_factor,
+            n_shared_experts, routed_scaling_factor, num_bits,
         )
 
     def _auto_chunk_size(self) -> int:
         """Estimate chunk size that fits in available VRAM."""
-        # Per-expert VRAM for INT4 Marlin:
-        # w13: [K//16, 2*N*2] int32 + [K//128, 2*N] scale
-        # w2: [N//16, K*2] int32 + [N//128, K] scale
+        # Per-expert VRAM for Marlin:
+        # w13: [K//16, 2*N*(num_bits//2)] int32 + [K//128, 2*N] scale
+        # w2: [N//16, K*(num_bits//2)] int32 + [N//128, K] scale
         K = self.hidden_size
         N = self.intermediate_size
-        w13_bytes = (K // 16) * (2 * N * 2) * 4 + (K // GROUP_SIZE) * (2 * N) * 2
-        w2_bytes = (N // 16) * (K * 2) * 4 + (N // GROUP_SIZE) * K * 2
+        nb2 = self.num_bits // 2  # 2 for INT4, 4 for INT8
+        w13_bytes = (K // 16) * (2 * N * nb2) * 4 + (K // GROUP_SIZE) * (2 * N) * 2
+        w2_bytes = (N // 16) * (K * nb2) * 4 + (N // GROUP_SIZE) * K * 2
         per_expert = w13_bytes + w2_bytes
 
         try:
@@ -231,10 +248,11 @@ class GpuPrefillManager:
         K = self.hidden_size
         N = self.intermediate_size
         E = self.chunk_size
+        nb2 = self.num_bits // 2  # 2 for INT4, 4 for INT8
 
-        # w13 (gate+up combined): [E, K//16, 2*N*(NUM_BITS//2)]
+        # w13 (gate+up combined): [E, K//16, 2*N*nb2]
         self._gpu_w13_packed = torch.zeros(
-            E, K // 16, 2 * N * (NUM_BITS // 2),
+            E, K // 16, 2 * N * nb2,
             dtype=torch.int32, device=self.device,
         )
         # w13 scale: [E, K//GROUP_SIZE, 2*N]
@@ -242,9 +260,9 @@ class GpuPrefillManager:
             E, K // GROUP_SIZE, 2 * N,
             dtype=self.params_dtype, device=self.device,
         )
-        # w2 (down): [E, N//16, K*(NUM_BITS//2)]
+        # w2 (down): [E, N//16, K*nb2]
         self._gpu_w2_packed = torch.zeros(
-            E, N // 16, K * (NUM_BITS // 2),
+            E, N // 16, K * nb2,
             dtype=torch.int32, device=self.device,
         )
         # w2 scale: [E, N//GROUP_SIZE, K]
@@ -315,17 +333,17 @@ class GpuPrefillManager:
 
             # Quantize on GPU
             w13_gpu = w13.to(self.device)
-            w13_packed, w13_scale = _quantize_and_pack_gpu(w13_gpu, GROUP_SIZE)
+            w13_packed, w13_scale = _quantize_and_pack_gpu(w13_gpu, GROUP_SIZE, self.num_bits)
             del w13, w13_gpu
 
             down_gpu = down.to(self.device)
-            w2_packed, w2_scale = _quantize_and_pack_gpu(down_gpu, GROUP_SIZE)
+            w2_packed, w2_scale = _quantize_and_pack_gpu(down_gpu, GROUP_SIZE, self.num_bits)
             del down, down_gpu
 
             # Marlin repack (per-expert, CUDA kernel)
             perm = torch.empty(0, dtype=torch.int32, device=self.device)
-            w13_repacked = gptq_marlin_repack(w13_packed, perm, K, 2 * N, NUM_BITS)
-            w2_repacked = gptq_marlin_repack(w2_packed, perm, N, K, NUM_BITS)
+            w13_repacked = gptq_marlin_repack(w13_packed, perm, K, 2 * N, self.num_bits)
+            w2_repacked = gptq_marlin_repack(w2_packed, perm, N, K, self.num_bits)
 
             # Permute scales for Marlin
             w13_scale_perm = marlin_permute_scales(
@@ -382,17 +400,17 @@ class GpuPrefillManager:
         # Transpose to Marlin convention: reduction dim first
         w13 = torch.cat([gate, up], dim=0).t().contiguous().to(self.device)  # [K, 2*shared_N]
         del gate, up
-        w13_packed, w13_scale = _quantize_and_pack_gpu(w13, GROUP_SIZE)
+        w13_packed, w13_scale = _quantize_and_pack_gpu(w13, GROUP_SIZE, self.num_bits)
         del w13
 
         down_gpu = down.t().contiguous().to(self.device)  # [shared_N, K]
         del down
-        w2_packed, w2_scale = _quantize_and_pack_gpu(down_gpu, GROUP_SIZE)
+        w2_packed, w2_scale = _quantize_and_pack_gpu(down_gpu, GROUP_SIZE, self.num_bits)
         del down_gpu
 
         perm = torch.empty(0, dtype=torch.int32, device=self.device)
-        w13_repacked = gptq_marlin_repack(w13_packed, perm, K, 2 * shared_N, NUM_BITS)
-        w2_repacked = gptq_marlin_repack(w2_packed, perm, shared_N, K, NUM_BITS)
+        w13_repacked = gptq_marlin_repack(w13_packed, perm, K, 2 * shared_N, self.num_bits)
+        w2_repacked = gptq_marlin_repack(w2_packed, perm, shared_N, K, self.num_bits)
         w13_scale_perm = marlin_permute_scales(w13_scale, K, 2 * shared_N, GROUP_SIZE)
         w2_scale_perm = marlin_permute_scales(w2_scale, shared_N, K, GROUP_SIZE)
 
@@ -467,7 +485,7 @@ class GpuPrefillManager:
                 sort_indices1=self._gpu_sort_idx,
                 sort_indices2=self._gpu_sort_idx,
                 workspace=self._workspace,
-                num_bits=NUM_BITS,
+                num_bits=self.num_bits,
                 is_k_full=True,
             ).to(x.dtype)
         else:
@@ -507,7 +525,7 @@ class GpuPrefillManager:
                     sort_indices1=self._gpu_sort_idx[:actual],
                     sort_indices2=self._gpu_sort_idx[:actual],
                     workspace=self._workspace,
-                    num_bits=NUM_BITS,
+                    num_bits=self.num_bits,
                     is_k_full=True,
                 ).to(x.dtype)
 
@@ -572,7 +590,7 @@ class GpuPrefillManager:
             sort_indices1=sort_idx,
             sort_indices2=sort_idx,
             workspace=workspace,
-            num_bits=NUM_BITS,
+            num_bits=self.num_bits,
             is_k_full=True,
         ).to(hidden_states.dtype)
 

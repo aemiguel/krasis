@@ -17,3 +17,15 @@ try:
 except ImportError:
     # SGLang/sgl_kernel not available
     pass
+
+try:
+    from krasis.vram_budget import compute_vram_budget
+except ImportError:
+    pass
+
+# Standalone server modules
+try:
+    from krasis.config import ModelConfig, QuantConfig
+    from krasis.model import KrasisModel
+except ImportError:
+    pass
