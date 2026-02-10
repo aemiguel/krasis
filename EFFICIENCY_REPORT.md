@@ -44,18 +44,27 @@ For comparison, SGLang is ~200K lines and KTransformers is ~50K lines. Krasis re
 
 | Metric | KT+SGLang (measured) | Krasis (measured) |
 |--------|---------------------|-------------------|
-| Decode | 4.0 tok/s (245ms ITL) | 1.55-1.87 tok/s (BF16 weights, diag ON) |
-| CPU Prefill | 19-80 tok/s | Similar (same Rust engine, GPU prefill not yet tested) |
-| GPU Prefill | N/A (not integrated in KT) | Not yet tested on Kimi K2.5 |
-| Loading time | ~8 min (multi-process OOM risk) | 722s / ~12 min (first-time INT4 quant from compressed-tensors) |
-| RAM usage | ~520 GB + mmap overhead | ~955 GB peak (includes quant workspace) |
-| GPU0 VRAM | ~7.6 GB (PP=2) | 12,063 MB weights + 1,811 MB KV = ~13.9 GB (BF16 weights) |
-| GPU1 VRAM | ~7.6 GB (PP=2) | 11,105 MB weights + 2,292 MB KV = ~13.4 GB (BF16 weights) |
-| Process count | 3+ (SGLang workers + Krasis) | 1 |
-| Silent OOM risk | **Yes** (3 PP ranks mmapping all 64 shards) | **No** (single process, sequential loading) |
-| Correctness | N/A | **3/3 generation tests PASS** |
+| Decode (BF16 wt) | 4.0 tok/s (245ms ITL) | 1.55-1.87 tok/s (diag ON) |
+| Decode (INT8 wt) | — | 1.28-1.41 tok/s |
+| Decode (INT8 wt + FP8 KV) | — | 1.21-1.28 tok/s |
+| CPU Prefill | 19-80 tok/s | Similar (same Rust engine) |
+| GPU Prefill | N/A | **CRASHED** at L31 (PP boundary), debugging |
+| Loading time | ~8 min (OOM risk) | 722s / ~12 min |
+| GPU0 VRAM (BF16 wt) | ~7.6 GB | 12,063 MB weights |
+| GPU0 VRAM (INT8 wt) | ~7.6 GB | 7,654 MB weights |
+| GPU0 KV (FP8) | — | 4,032 MB (236K tokens) |
+| GPU1 VRAM (INT8 wt) | — | 6,044 MB weights |
+| GPU1 KV (FP8) | — | 4,839 MB (293K tokens) |
+| GPU prefill buffer | N/A | GPU0: 4,224 MB, GPU1: 5,064 MB |
+| Process count | 3+ | 1 |
+| Silent OOM risk | **Yes** | **No** |
+| Correctness | — | **3/3 PASS** (all configs) |
 
-**Note**: Decode speed (1.55-1.87 tok/s) is with ALL BF16 weights (no INT8) and verbose MOE diagnostics enabled. With INT8 attention + diagnostics off, decode should approach 4.0 tok/s baseline. GPU prefill not yet tested on Kimi K2.5.
+**Notes:**
+- INT8 weights save 4-5 GB/GPU but decode ~15% slower (torch._int_mm overhead at M=1)
+- FP8 KV gives ~4x context capacity with negligible quality loss
+- GPU prefill CRASHED with CUDA illegal memory access at layer 31 (PP boundary). Debugging with sync points + CUDA_LAUNCH_BLOCKING. Disk cache added to avoid 95-min re-precompute.
+- Decode speed gap partially from verbose diagnostics + BF16 weight overhead. Expected to close.
 
 ### Key Efficiency Observations
 

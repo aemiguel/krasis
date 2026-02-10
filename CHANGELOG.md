@@ -13,6 +13,42 @@ Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
 
 ---
 
+## GPU Prefill CUDA Crash Investigation — 2026-02-10
+
+**CUDA illegal memory access at PP boundary (layer 31, first layer on GPU1)**
+
+### Crash Details
+- Test: `test_kimi_gpu_prefill.py` — 333-token prompt, INT8 weights, FP8 KV, PP=2
+- First-time Marlin precompute: 31 of 60 MoE layers completed (~95s/layer, ~49 min)
+- Crash in `fused_marlin_moe` kernel for layer 31 (async error surfaced in `prepare_shared_expert`)
+- GPU0 entered ERR! state, corrupting CUDA driver for all GPUs (requires reboot)
+- Layers 1-30 on GPU0 all processed successfully
+- GPU0: chunk_size=186, 3 chunks; GPU1: chunk_size=223, 2 chunks
+
+### Fixes Applied
+1. **Disk cache for Marlin weights** — saves 95 min re-precompute per run
+   - Path: `{model_path}/.marlin_cache/b{bits}/layer{N}_{routed|shared}.pt`
+   - Both routed experts and shared experts cached separately
+2. **Debug sync points** — `KRASIS_DEBUG_SYNC=1` env var enables:
+   - `torch.cuda.synchronize()` before/after each Marlin kernel call
+   - Device verification for all input tensors
+   - Per-chunk logging with exact crash location
+3. **Workspace zeroing** between chunks — `self._workspace.zero_()` to prevent stale kernel state
+4. **CUDA_LAUNCH_BLOCKING=1** — synchronous CUDA error reporting in test
+
+### Hypothesis
+Async CUDA error from Marlin MoE kernel on GPU1. Possible causes:
+- Stale workspace state between chunks
+- Buffer size mismatch with GPU1's larger chunk_size (223 vs 186)
+- Cross-device memory corruption during PP transfer
+
+### Next Steps
+1. Reboot to recover GPUs
+2. Re-run test — disk cache will skip 95-min precompute for layers 1-31
+3. Debug sync will pinpoint exact failing kernel call
+
+---
+
 ## Kimi K2.5 GPU Prefill Enabled — 2026-02-10
 
 **GPU prefill managers enabled on Kimi K2.5 PP=2 (INT8 weights, FP8 KV)**

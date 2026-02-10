@@ -84,13 +84,20 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 
 ## Performance Results
 
-| Model | System | Decode | Prefill | Notes |
-|-------|--------|--------|---------|-------|
-| V2-Lite | Krasis standalone PP=1 | 3.3 tok/s | 424 tok/s (GPU) | Test model, 5/6 gen tests pass |
-| V2-Lite | Krasis standalone PP=1 | 3.3 tok/s | 10 tok/s (CPU) | CPU-only MoE path |
-| Kimi K2.5 | Krasis standalone PP=2 | 1.55-1.87 tok/s | CPU only (not yet tested GPU) | BF16 weights, diag ON, **3/3 pass** |
-| Kimi K2.5 | KTransformers PP=2 | 4.0 tok/s | 19-80 tok/s CPU | Production baseline |
-| Qwen3-235B | KTransformers PP=3 | 4.21 tok/s | 25 tok/s CPU, 443 tok/s GPU | With expert pinning |
+| Model | Config | Decode | GPU0 VRAM | GPU1 VRAM | Notes |
+|-------|--------|--------|-----------|-----------|-------|
+| V2-Lite | Standalone PP=1, INT4 GPU prefill | 3.3 tok/s | 424 tok/s prefill | — | Test model, 5/6 gen tests pass |
+| Kimi K2.5 | PP=2, BF16 wt, BF16 KV | 1.55-1.87 tok/s | 12,063 MB | 11,105 MB | **3/3 PASS**, diag ON |
+| Kimi K2.5 | PP=2, INT8 wt, BF16 KV | 1.28-1.41 tok/s | 7,654 MB | 6,044 MB | **3/3 PASS** |
+| Kimi K2.5 | PP=2, INT8 wt, FP8 KV | 1.21-1.28 tok/s | 7,654+4,032 KV | 6,044+4,839 KV | **3/3 PASS**, ~4x context |
+| Kimi K2.5 | PP=2, INT8 wt, FP8 KV, GPU prefill | **CRASH** | — | — | CUDA illegal addr at L31 (PP boundary) |
+| Kimi K2.5 | KTransformers PP=2 | 4.0 tok/s | ~7.6 GB | ~7.6 GB | Production baseline |
+| Qwen3-235B | KTransformers PP=3 | 4.21 tok/s | — | — | With expert pinning |
+
+### Current Blockers
+- **GPU prefill crashes at PP boundary** — CUDA illegal memory access when Marlin kernel runs on GPU1 for first time (layer 31). Debugging with sync points + CUDA_LAUNCH_BLOCKING. See CHANGELOG for details.
+- **GPUs need reboot** — GPU0 in error state from crash, corrupted CUDA driver for all GPUs
+- **Decode speed gap** — 1.2-1.9 tok/s vs 4.0 tok/s baseline (BF16 weights + diag overhead, not yet optimized)
 
 ## Target Architecture
 
