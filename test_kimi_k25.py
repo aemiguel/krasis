@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Quick Kimi K2.5 generation test on Krasis standalone.
 
-Tests that the YaRN RoPE fix produces coherent output.
-Uses PP=2 (GPU0+GPU1) with BF16 weights and BF16 KV cache.
+Tests correctness with configurable precision.
+Uses PP=2 (GPU0+GPU1) with BF16 KV cache.
 """
 
 import logging, sys, time
@@ -42,15 +42,16 @@ def main():
     logger.info("Loading Kimi K2.5 PP=2...")
     t0 = time.perf_counter()
 
-    # BF16 weights for attention (highest quality), BF16 KV cache
-    qcfg = QuantConfig(attention="bf16", shared_expert="bf16", dense_mlp="bf16", lm_head="bf16")
+    # Default QuantConfig: INT8 attention, INT8 shared expert, INT8 dense MLP, INT8 lm_head
+    # This is the production config — halves GPU VRAM vs BF16
+    qcfg = QuantConfig()  # all defaults: int8 everywhere
     model = KrasisModel(
         model_path=MODEL_PATH,
         num_gpus=2,
-        gpu_prefill=False,
+        gpu_prefill=True,
         krasis_threads=16,
         quant_cfg=qcfg,
-        kv_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
     )
     model.load()
     load_time = time.perf_counter() - t0

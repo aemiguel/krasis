@@ -13,6 +13,51 @@ Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
 
 ---
 
+## Kimi K2.5 GPU Prefill Enabled — 2026-02-10
+
+**GPU prefill managers enabled on Kimi K2.5 PP=2 (INT8 weights, FP8 KV)**
+
+Tests: 3/3 PASS. GPU prefill managers created for both GPUs. Short prompts (~20 tokens)
+used CPU path (threshold=300). No impact on correctness or speed. GPU prefill not yet
+triggered — needs long prompt (300+ tokens) to test actual GPU Marlin prefill speed.
+
+---
+
+## Kimi K2.5 FP8 KV Cache Verification — 2026-02-10
+
+**Verified FP8 E4M3 KV cache on Kimi K2.5 PP=2 (INT8 weights)**
+
+Tests: 3/3 PASS. Quality identical to BF16 KV — same answers produced.
+
+| Metric | FP8 KV + INT8 wt | BF16 KV + INT8 wt |
+|--------|-----------------|-------------------|
+| GPU0 KV cache | 4,032 MB (236K tokens) | 1,811 MB (53K tokens) |
+| GPU1 KV cache | 4,839 MB (293K tokens) | 2,292 MB (69K tokens) |
+| Decode speed | 1.21-1.28 tok/s | 1.28-1.41 tok/s |
+| Context capacity | **~4x more** | baseline |
+
+FP8 auto-sizes to fill free VRAM, giving much more context capacity.
+
+---
+
+## Kimi K2.5 INT8 Weights Verification — 2026-02-10
+
+**Verified INT8 attention/shared_expert/dense_mlp/lm_head on Kimi K2.5 PP=2**
+
+Switched from all-BF16 to default QuantConfig (INT8 everywhere). Tests: 3/3 PASS.
+
+| Metric | INT8 | BF16 |
+|--------|------|------|
+| GPU0 VRAM | 7,654 MB | 12,063 MB |
+| GPU1 VRAM | 6,044 MB | 11,105 MB |
+| Decode speed | 1.28-1.41 tok/s | 1.55-1.87 tok/s |
+| VRAM savings | **4-5 GB/GPU** | baseline |
+
+INT8 slightly slower at M=1 decode (torch._int_mm overhead > bandwidth savings), but frees
+significant VRAM for KV cache and GPU prefill buffers. Quality identical — same answers.
+
+---
+
 ## Bug Fix: YaRN RoPE Frequency Assignment + De-interleave — 2026-02-10
 
 **Fixed two bugs in MLA attention RoPE that caused garbled output on V2-Lite (and likely Kimi K2.5)**
