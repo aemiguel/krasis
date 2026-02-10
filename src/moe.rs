@@ -9,10 +9,11 @@
 use crate::kernel::avx2::{
     matmul_int4_avx2, matmul_int4_parallel,
     matmul_int4_integer, matmul_int4_integer_parallel,
+    matmul_int8_integer, matmul_int8_integer_parallel,
     quantize_activation_int16,
 };
 use crate::weights::marlin::{f32_to_bf16, DEFAULT_GROUP_SIZE};
-use crate::weights::{ExpertWeights, WeightStore};
+use crate::weights::{ExpertWeights, QuantWeight, WeightStore};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::path::Path;
@@ -60,6 +61,24 @@ impl ExpertScratch {
     }
 }
 
+/// Dispatch integer matmul to INT4 or INT8 kernel based on weight type (sequential).
+#[inline]
+fn matmul_integer(weight: &QuantWeight, act_int16: &[i16], act_scales: &[f32], output: &mut [f32]) {
+    match weight {
+        QuantWeight::Int4(q) => matmul_int4_integer(q, act_int16, act_scales, output),
+        QuantWeight::Int8(q) => matmul_int8_integer(q, act_int16, act_scales, output),
+    }
+}
+
+/// Dispatch integer matmul to INT4 or INT8 kernel based on weight type (parallel).
+#[inline]
+fn matmul_integer_parallel(weight: &QuantWeight, act_int16: &[i16], act_scales: &[f32], output: &mut [f32]) {
+    match weight {
+        QuantWeight::Int4(q) => matmul_int4_integer_parallel(q, act_int16, act_scales, output),
+        QuantWeight::Int8(q) => matmul_int8_integer_parallel(q, act_int16, act_scales, output),
+    }
+}
+
 /// Compute a single expert's output using the FMA kernel: SiLU(x @ gate^T) * (x @ up^T) @ down^T
 ///
 /// Result is written to `scratch.expert_out`.
@@ -69,13 +88,17 @@ pub fn expert_forward(
     scratch: &mut ExpertScratch,
     parallel: bool,
 ) {
+    // FMA path only supports INT4 weights
+    let gate = expert.gate.as_int4();
+    let up = expert.up.as_int4();
+    let down = expert.down.as_int4();
     let matmul = if parallel { matmul_int4_parallel } else { matmul_int4_avx2 };
 
     // gate_out = activation @ gate_proj^T → [intermediate_size]
-    matmul(&expert.gate, activation, &mut scratch.gate_out);
+    matmul(gate, activation, &mut scratch.gate_out);
 
     // up_out = activation @ up_proj^T → [intermediate_size]
-    matmul(&expert.up, activation, &mut scratch.up_out);
+    matmul(up, activation, &mut scratch.up_out);
 
     // hidden = SiLU(gate_out) * up_out → BF16 [intermediate_size]
     for i in 0..scratch.gate_out.len() {
@@ -86,7 +109,7 @@ pub fn expert_forward(
     }
 
     // expert_out = hidden @ down_proj^T → [hidden_size]
-    matmul(&expert.down, &scratch.hidden_bf16, &mut scratch.expert_out);
+    matmul(down, &scratch.hidden_bf16, &mut scratch.expert_out);
 }
 
 /// Compute a single expert's output using the integer kernel (_mm256_madd_epi16).
@@ -108,13 +131,13 @@ pub fn expert_forward_integer(
     scratch: &mut ExpertScratch,
     parallel: bool,
 ) {
-    let matmul = if parallel { matmul_int4_integer_parallel } else { matmul_int4_integer };
+    let matmul_fn = if parallel { matmul_integer_parallel } else { matmul_integer };
 
     // gate_out = integer_matmul(gate_proj, act_int16) → f32 [intermediate_size]
-    matmul(&expert.gate, act_int16, act_scales, &mut scratch.gate_out);
+    matmul_fn(&expert.gate, act_int16, act_scales, &mut scratch.gate_out);
 
     // up_out = integer_matmul(up_proj, act_int16) → f32 [intermediate_size]
-    matmul(&expert.up, act_int16, act_scales, &mut scratch.up_out);
+    matmul_fn(&expert.up, act_int16, act_scales, &mut scratch.up_out);
 
     // hidden = SiLU(gate_out) * up_out → BF16 [intermediate_size]
     for i in 0..scratch.gate_out.len() {
@@ -133,7 +156,7 @@ pub fn expert_forward_integer(
     );
 
     // expert_out = integer_matmul(down_proj, hidden_int16) → f32 [hidden_size]
-    matmul(&expert.down, &scratch.hidden_int16, &scratch.hidden_scales, &mut scratch.expert_out);
+    matmul_fn(&expert.down, &scratch.hidden_int16, &scratch.hidden_scales, &mut scratch.expert_out);
 }
 
 /// Full MoE forward for a single token on one layer.
@@ -331,42 +354,38 @@ pub fn moe_forward(
 fn prefetch_expert_nta(expert: &ExpertWeights) {
     const STRIDE: usize = 512; // 8 cache lines per prefetch
 
-    unsafe {
-        // Prefetch gate_proj packed weights
-        let gate_bytes = expert.gate.packed.len() * 4;
-        let gate_ptr = expert.gate.packed.as_ptr() as *const i8;
+    /// Prefetch a QuantWeight's data into L3 using NTA hints.
+    unsafe fn prefetch_weight(w: &QuantWeight) {
+        let (data_ptr, data_bytes, scales_ptr, scales_bytes) = match w {
+            QuantWeight::Int4(q) => (
+                q.packed.as_ptr() as *const i8,
+                q.packed.len() * 4,
+                q.scales.as_ptr() as *const i8,
+                q.scales.len() * 2,
+            ),
+            QuantWeight::Int8(q) => (
+                q.data.as_ptr() as *const i8,
+                q.data.len(),
+                q.scales.as_ptr() as *const i8,
+                q.scales.len() * 2,
+            ),
+        };
         let mut off = 0;
-        while off < gate_bytes {
-            _mm_prefetch(gate_ptr.add(off), _MM_HINT_NTA);
+        while off < data_bytes {
+            _mm_prefetch(data_ptr.add(off), _MM_HINT_NTA);
             off += STRIDE;
         }
-
-        // Prefetch up_proj packed weights
-        let up_bytes = expert.up.packed.len() * 4;
-        let up_ptr = expert.up.packed.as_ptr() as *const i8;
         off = 0;
-        while off < up_bytes {
-            _mm_prefetch(up_ptr.add(off), _MM_HINT_NTA);
+        while off < scales_bytes {
+            _mm_prefetch(scales_ptr.add(off), _MM_HINT_NTA);
             off += STRIDE;
         }
+    }
 
-        // Prefetch down_proj packed weights
-        let down_bytes = expert.down.packed.len() * 4;
-        let down_ptr = expert.down.packed.as_ptr() as *const i8;
-        off = 0;
-        while off < down_bytes {
-            _mm_prefetch(down_ptr.add(off), _MM_HINT_NTA);
-            off += STRIDE;
-        }
-
-        // Prefetch scales (smaller, but still worth it)
-        let gate_scales_bytes = expert.gate.scales.len() * 2;
-        let gs_ptr = expert.gate.scales.as_ptr() as *const i8;
-        off = 0;
-        while off < gate_scales_bytes {
-            _mm_prefetch(gs_ptr.add(off), _MM_HINT_NTA);
-            off += STRIDE;
-        }
+    unsafe {
+        prefetch_weight(&expert.gate);
+        prefetch_weight(&expert.up);
+        prefetch_weight(&expert.down);
     }
 }
 
@@ -538,10 +557,20 @@ impl KrasisEngine {
 
     /// Load expert weights from a HuggingFace model directory.
     ///
-    /// Reads config.json, opens safetensors shards, quantizes BF16 → INT4.
+    /// Reads config.json, opens safetensors shards, quantizes BF16 → INT4/INT8.
     /// Runs startup system checks (CPU governor, hugepages, memory budget).
-    #[pyo3(signature = (model_dir, group_size=None, max_layers=None, start_layer=None))]
-    pub fn load(&mut self, model_dir: &str, group_size: Option<usize>, max_layers: Option<usize>, start_layer: Option<usize>) -> PyResult<()> {
+    ///
+    /// `num_bits`: 4 for INT4 (default), 8 for INT8 (2x precision, 2x memory).
+    #[pyo3(signature = (model_dir, group_size=None, max_layers=None, start_layer=None, num_bits=None))]
+    pub fn load(&mut self, model_dir: &str, group_size: Option<usize>, max_layers: Option<usize>, start_layer: Option<usize>, num_bits: Option<u8>) -> PyResult<()> {
+        let bits = num_bits.unwrap_or(4);
+        if bits != 4 && bits != 8 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("num_bits must be 4 or 8, got {bits}")
+            ));
+        }
+        log::info!("[DIAG-RUST] load() called: model_dir={}, start_layer={:?}, max_layers={:?}, num_bits={}", model_dir, start_layer, max_layers, bits);
+        crate::syscheck::log_memory_usage("[DIAG-RUST] load() entry");
         let gs = group_size.unwrap_or(DEFAULT_GROUP_SIZE);
         let path = Path::new(model_dir);
 
@@ -558,9 +587,16 @@ impl KrasisEngine {
                     let remaining = total_moe.saturating_sub(start_l);
                     let num_layers = max_layers.map_or(remaining, |n| n.min(remaining));
 
-                    // INT4 packed: (h/8)*m*4 + (h/gs)*m*2 per gate/up, similar for down
-                    let per_expert_bytes = (m * (h / 8.0) * 4.0 + m * (h / gs as f64) * 2.0) * 2.0
-                        + h * (m / 8.0) * 4.0 + h * (m / gs as f64) * 2.0;
+                    // Estimate per-expert bytes based on quantization bit width
+                    let per_expert_bytes = if bits == 4 {
+                        // INT4 packed: (h/8)*m*4 + (h/gs)*m*2 per gate/up, similar for down
+                        (m * (h / 8.0) * 4.0 + m * (h / gs as f64) * 2.0) * 2.0
+                            + h * (m / 8.0) * 4.0 + h * (m / gs as f64) * 2.0
+                    } else {
+                        // INT8: m*h + (h/gs)*m*2 per gate/up, similar for down
+                        (m * h + m * (h / gs as f64) * 2.0) * 2.0
+                            + h * m + h * (m / gs as f64) * 2.0
+                    };
                     let total_gb = num_layers as f64 * n_exp * per_expert_bytes / 1e9;
 
                     crate::syscheck::run_startup_checks(total_gb);
@@ -568,8 +604,12 @@ impl KrasisEngine {
             }
         }
 
-        let mut store = WeightStore::load_from_hf(path, gs, max_layers, start_layer)
+        log::info!("[DIAG-RUST] Calling WeightStore::load_from_hf (INT{})...", bits);
+        crate::syscheck::log_memory_usage("[DIAG-RUST] before load_from_hf");
+        let mut store = WeightStore::load_from_hf(path, gs, max_layers, start_layer, bits)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        log::info!("[DIAG-RUST] WeightStore::load_from_hf completed OK");
+        crate::syscheck::log_memory_usage("[DIAG-RUST] after load_from_hf");
 
         // Use the effective group_size from the loaded store (may differ for pre-quantized models)
         let effective_gs = store.group_size;
@@ -599,6 +639,9 @@ impl KrasisEngine {
         } else {
             None
         };
+
+        log::info!("[DIAG-RUST] Scratch pools allocated, detecting NUMA...");
+        crate::syscheck::log_memory_usage("[DIAG-RUST] after scratch alloc");
 
         // Detect NUMA topology and migrate expert weights if multi-node
         let topo = crate::numa::NumaTopology::detect();
@@ -645,7 +688,8 @@ impl KrasisEngine {
                 format!("Failed to spawn worker: {e}")
             ))?;
 
-        log::info!("Async MoE worker thread started");
+        log::info!("[DIAG-RUST] Async MoE worker thread started");
+        crate::syscheck::log_memory_usage("[DIAG-RUST] after worker spawn");
 
         self.output_buf = vec![0.0f32; store.config.hidden_size];
         self.scratch_pool = scratch_pool;
@@ -893,7 +937,7 @@ impl KrasisEngine {
 mod tests {
     use super::*;
     use crate::weights::marlin::{quantize_int4, DEFAULT_GROUP_SIZE};
-    use crate::weights::WeightStore;
+    use crate::weights::{QuantWeight, WeightStore};
     use std::path::Path;
 
     #[test]
@@ -916,9 +960,9 @@ mod tests {
         }
 
         let expert = ExpertWeights {
-            gate: quantize_int4(&gate_bf16, intermediate, hidden, group_size),
-            up: quantize_int4(&up_bf16, intermediate, hidden, group_size),
-            down: quantize_int4(&down_bf16, hidden, intermediate, group_size),
+            gate: QuantWeight::Int4(quantize_int4(&gate_bf16, intermediate, hidden, group_size)),
+            up: QuantWeight::Int4(quantize_int4(&up_bf16, intermediate, hidden, group_size)),
+            down: QuantWeight::Int4(quantize_int4(&down_bf16, hidden, intermediate, group_size)),
         };
 
         // Synthetic activation
@@ -955,7 +999,7 @@ mod tests {
         }
 
         // Load just enough to test one expert
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -1011,7 +1055,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -1077,7 +1121,7 @@ mod tests {
         }
 
         // Load just 1 MoE layer (384 experts × 1 layer ≈ 9.5 GB)
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, Some(1), None)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, Some(1), None, 4)
             .expect("Failed to load Kimi K2.5");
 
         assert_eq!(store.num_moe_layers(), 1);
@@ -1143,7 +1187,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -1284,7 +1328,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
             .expect("Failed to load");
 
         // V2-Lite has 2 shared experts with routed_scaling_factor=1.0
@@ -1300,10 +1344,10 @@ mod tests {
 
         // Check shared expert dimensions
         let shared_exp = &store.shared_experts[0];
-        assert_eq!(shared_exp.gate.rows, shared_intermediate); // 2816
-        assert_eq!(shared_exp.gate.cols, hidden);               // 2048
-        assert_eq!(shared_exp.down.rows, hidden);               // 2048
-        assert_eq!(shared_exp.down.cols, shared_intermediate); // 2816
+        assert_eq!(shared_exp.gate.rows(), shared_intermediate); // 2816
+        assert_eq!(shared_exp.gate.cols(), hidden);               // 2048
+        assert_eq!(shared_exp.down.rows(), hidden);               // 2048
+        assert_eq!(shared_exp.down.cols(), shared_intermediate); // 2816
 
         // Activation
         let mut activation = vec![0u16; hidden];

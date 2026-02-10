@@ -205,6 +205,60 @@ fn check_cpu_features() {
     }
 }
 
+/// Log current memory usage from /proc/self/status and /proc/meminfo.
+/// Called from diagnostic logging points to track memory consumption.
+pub fn log_memory_usage(label: &str) {
+    // Process-level memory from /proc/self/status
+    let (vm_rss_kb, vm_size_kb) = match std::fs::read_to_string("/proc/self/status") {
+        Ok(content) => {
+            let mut rss: u64 = 0;
+            let mut vsz: u64 = 0;
+            for line in content.lines() {
+                if line.starts_with("VmRSS:") {
+                    rss = parse_meminfo_value(line);
+                } else if line.starts_with("VmSize:") {
+                    vsz = parse_meminfo_value(line);
+                }
+            }
+            (rss, vsz)
+        }
+        Err(_) => (0, 0),
+    };
+
+    // System-level memory from /proc/meminfo
+    let (total_kb, avail_kb, cached_kb, buffers_kb) = match std::fs::read_to_string("/proc/meminfo") {
+        Ok(content) => {
+            let mut total: u64 = 0;
+            let mut avail: u64 = 0;
+            let mut cached: u64 = 0;
+            let mut buffers: u64 = 0;
+            for line in content.lines() {
+                if line.starts_with("MemTotal:") {
+                    total = parse_meminfo_value(line);
+                } else if line.starts_with("MemAvailable:") {
+                    avail = parse_meminfo_value(line);
+                } else if line.starts_with("Cached:") && !line.starts_with("CachedSwap") {
+                    cached = parse_meminfo_value(line);
+                } else if line.starts_with("Buffers:") {
+                    buffers = parse_meminfo_value(line);
+                }
+            }
+            (total, avail, cached, buffers)
+        }
+        Err(_) => (0, 0, 0, 0),
+    };
+
+    log::info!(
+        "{}: process RSS={:.1} GiB, VSZ={:.1} GiB | system avail={:.1}/{:.1} GiB, page_cache={:.1} GiB",
+        label,
+        vm_rss_kb as f64 / 1024.0 / 1024.0,
+        vm_size_kb as f64 / 1024.0 / 1024.0,
+        avail_kb as f64 / 1024.0 / 1024.0,
+        total_kb as f64 / 1024.0 / 1024.0,
+        (cached_kb + buffers_kb) as f64 / 1024.0 / 1024.0,
+    );
+}
+
 /// Python-callable system check function.
 #[pyfunction]
 pub fn system_check() -> PyResult<()> {

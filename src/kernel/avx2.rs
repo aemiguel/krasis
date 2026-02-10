@@ -19,7 +19,7 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-use crate::weights::marlin::{bf16_to_f32, QuantizedInt4};
+use crate::weights::marlin::{bf16_to_f32, QuantizedInt4, QuantizedInt8};
 
 /// Scalar BF16 matrix-vector multiply (reference).
 ///
@@ -537,6 +537,210 @@ pub fn matmul_int4_parallel(q: &QuantizedInt4, activation: &[u16], output: &mut 
                 (packed_addr as *const u32).add(start_row * packed_k),
                 (scales_addr as *const u16).add(start_row * num_groups),
                 act_addr as *const u16,
+                chunk.as_mut_ptr(),
+                cols,
+                chunk_rows,
+                group_size,
+            );
+        }
+    });
+}
+
+// ── INT8 integer kernel (INT16 × INT8 → INT32 accumulation) ──────────
+//
+// Simpler than INT4: no nibble extraction needed. Load 16 raw i8 values,
+// sign-extend to INT16, then _mm256_madd_epi16 against pre-quantized
+// INT16 activations. Same throughput as INT4 integer kernel but 2x memory
+// bandwidth (16 bytes per 16 values vs 8 bytes).
+
+/// Scalar integer-path INT8 matmul (correctness reference).
+pub fn matmul_int8_integer_scalar(
+    q: &QuantizedInt8,
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+) {
+    assert_eq!(act_int16.len(), q.cols);
+    assert_eq!(act_scales.len(), q.cols / q.group_size);
+    assert_eq!(output.len(), q.rows);
+
+    let num_groups = q.cols / q.group_size;
+
+    for row in 0..q.rows {
+        let mut acc: f32 = 0.0;
+
+        for g in 0..num_groups {
+            let w_scale = bf16_to_f32(q.scales[row * num_groups + g]);
+            let a_scale = act_scales[g];
+            let combined = w_scale * a_scale;
+            let mut group_sum: i32 = 0;
+
+            let group_start = g * q.group_size;
+            for i in 0..q.group_size {
+                let k_idx = row * q.cols + group_start + i;
+                let w_val = q.data[k_idx] as i32;
+                let a_val = act_int16[group_start + i] as i32;
+                group_sum += w_val * a_val;
+            }
+
+            acc += group_sum as f32 * combined;
+        }
+
+        output[row] = acc;
+    }
+}
+
+/// AVX2 integer INT8 matmul using `_mm256_madd_epi16`.
+///
+/// Per iteration (16 INT8 values):
+///   1. Load 16 bytes (16 INT8 weights) into __m128i
+///   2. Sign-extend INT8 → INT16 via `_mm256_cvtepi8_epi16` (16 values in __m256i)
+///   3. Load 16 INT16 activations
+///   4. `_mm256_madd_epi16` against activations → 8 INT32 partial sums
+///   5. Accumulate INT32 per group
+///   6. At group boundary: convert to f32, apply weight_scale × act_scale
+///   7. After all groups: horizontal sum → output scalar
+///
+/// # Safety
+/// Requires AVX2 + FMA. All pointers must be valid for their respective lengths.
+/// `group_size` must be divisible by 16.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn expert_matmul_int8_integer(
+    data: *const i8,           // [N, K] raw INT8 weights
+    weight_scales: *const u16, // [N, K/group_size] BF16 weight scales
+    act_int16: *const i16,     // [K] quantized INT16 activations
+    act_scales: *const f32,    // [K/group_size] activation scales
+    output: *mut f32,          // [N]
+    k: usize,
+    n: usize,
+    group_size: usize,
+) {
+    let num_groups = k / group_size;
+    let vals_per_iter = 16; // 16 INT8 values per iteration
+    let iters_per_group = group_size / vals_per_iter;
+
+    for row in 0..n {
+        let mut float_acc = _mm256_setzero_ps();
+        let data_base = data.add(row * k);
+
+        for g in 0..num_groups {
+            let mut int_acc = _mm256_setzero_si256();
+            let w_scale_f32 = bf16_to_f32(*weight_scales.add(row * num_groups + g));
+            let a_scale_f32 = *act_scales.add(g);
+            let combined_scale = w_scale_f32 * a_scale_f32;
+
+            for p in 0..iters_per_group {
+                let k_base = g * group_size + p * vals_per_iter;
+
+                // Load 16 INT8 weights
+                let raw = _mm_loadu_si128(data_base.add(k_base) as *const __m128i);
+
+                // Sign-extend INT8 → INT16 (16 values in one YMM register)
+                let w16 = _mm256_cvtepi8_epi16(raw);
+
+                // Load 16 INT16 activations
+                let a16 = _mm256_loadu_si256(act_int16.add(k_base) as *const __m256i);
+
+                // Multiply-accumulate: 16 INT16 × INT16 → 8 INT32 partial sums
+                let dot = _mm256_madd_epi16(w16, a16);
+                int_acc = _mm256_add_epi32(int_acc, dot);
+            }
+
+            // Convert INT32 partial sums to f32 and apply combined scale
+            let group_f32 = _mm256_cvtepi32_ps(int_acc);
+            float_acc = _mm256_fmadd_ps(group_f32, _mm256_set1_ps(combined_scale), float_acc);
+        }
+
+        // Horizontal sum → single f32 output
+        *output.add(row) = hsum_avx2(float_acc);
+    }
+}
+
+/// Safe wrapper for the AVX2 integer INT8 matmul kernel.
+pub fn matmul_int8_integer(
+    q: &QuantizedInt8,
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+) {
+    assert_eq!(act_int16.len(), q.cols);
+    assert_eq!(act_scales.len(), q.cols / q.group_size);
+    assert_eq!(output.len(), q.rows);
+    assert!(q.group_size % 16 == 0, "Integer kernel requires group_size divisible by 16");
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    unsafe {
+        expert_matmul_int8_integer(
+            q.data.as_ptr(),
+            q.scales.as_ptr(),
+            act_int16.as_ptr(),
+            act_scales.as_ptr(),
+            output.as_mut_ptr(),
+            q.cols,
+            q.rows,
+            q.group_size,
+        );
+    }
+}
+
+/// Parallel AVX2 integer INT8 matmul — splits output rows across rayon threads.
+pub fn matmul_int8_integer_parallel(
+    q: &QuantizedInt8,
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+) {
+    use rayon::prelude::*;
+
+    assert_eq!(act_int16.len(), q.cols);
+    assert_eq!(act_scales.len(), q.cols / q.group_size);
+    assert_eq!(output.len(), q.rows);
+    assert!(q.group_size % 16 == 0, "Integer kernel requires group_size divisible by 16");
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    // For small matrices, single-thread is faster
+    if q.rows * q.cols <= 8_000_000 {
+        unsafe {
+            expert_matmul_int8_integer(
+                q.data.as_ptr(),
+                q.scales.as_ptr(),
+                act_int16.as_ptr(),
+                act_scales.as_ptr(),
+                output.as_mut_ptr(),
+                q.cols,
+                q.rows,
+                q.group_size,
+            );
+        }
+        return;
+    }
+
+    let num_groups = q.cols / q.group_size;
+    let chunk_size = 32;
+
+    let data_addr = q.data.as_ptr() as usize;
+    let scales_addr = q.scales.as_ptr() as usize;
+    let act_addr = act_int16.as_ptr() as usize;
+    let act_scales_addr = act_scales.as_ptr() as usize;
+    let cols = q.cols;
+    let group_size = q.group_size;
+
+    output.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start_row = chunk_idx * chunk_size;
+        let chunk_rows = chunk.len();
+
+        unsafe {
+            expert_matmul_int8_integer(
+                (data_addr as *const i8).add(start_row * cols),
+                (scales_addr as *const u16).add(start_row * num_groups),
+                act_addr as *const i16,
+                act_scales_addr as *const f32,
                 chunk.as_mut_ptr(),
                 cols,
                 chunk_rows,

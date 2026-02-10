@@ -9,7 +9,7 @@
 pub mod marlin;
 pub mod safetensors_io;
 
-use crate::weights::marlin::{quantize_int4, QuantizedInt4, DEFAULT_GROUP_SIZE};
+use crate::weights::marlin::{quantize_int4, quantize_int8, QuantizedInt4, QuantizedInt8, DEFAULT_GROUP_SIZE};
 use crate::weights::safetensors_io::MmapSafetensors;
 use memmap2::Mmap;
 use pyo3::prelude::*;
@@ -113,14 +113,67 @@ impl ModelConfig {
     }
 }
 
-/// INT4 quantized weights for a single expert (gate + up + down projections).
+/// Quantized weight matrix — either INT4 or INT8.
+pub enum QuantWeight {
+    Int4(QuantizedInt4),
+    Int8(QuantizedInt8),
+}
+
+impl QuantWeight {
+    pub fn rows(&self) -> usize {
+        match self {
+            QuantWeight::Int4(q) => q.rows,
+            QuantWeight::Int8(q) => q.rows,
+        }
+    }
+
+    pub fn cols(&self) -> usize {
+        match self {
+            QuantWeight::Int4(q) => q.cols,
+            QuantWeight::Int8(q) => q.cols,
+        }
+    }
+
+    pub fn group_size(&self) -> usize {
+        match self {
+            QuantWeight::Int4(q) => q.group_size,
+            QuantWeight::Int8(q) => q.group_size,
+        }
+    }
+
+    /// Total bytes of weight data (packed + scales).
+    pub fn data_bytes(&self) -> usize {
+        match self {
+            QuantWeight::Int4(q) => q.packed.len() * 4 + q.scales.len() * 2,
+            QuantWeight::Int8(q) => q.data.len() + q.scales.len() * 2,
+        }
+    }
+
+    /// Return as INT4 ref (panics if INT8).
+    pub fn as_int4(&self) -> &QuantizedInt4 {
+        match self {
+            QuantWeight::Int4(q) => q,
+            QuantWeight::Int8(_) => panic!("Expected INT4 weight, got INT8"),
+        }
+    }
+
+    /// Number of bits per weight value.
+    pub fn num_bits(&self) -> u8 {
+        match self {
+            QuantWeight::Int4(_) => 4,
+            QuantWeight::Int8(_) => 8,
+        }
+    }
+}
+
+/// Quantized weights for a single expert (gate + up + down projections).
 pub struct ExpertWeights {
-    /// gate_proj: [moe_intermediate_size, hidden_size] quantized to INT4
-    pub gate: QuantizedInt4,
-    /// up_proj: [moe_intermediate_size, hidden_size] quantized to INT4
-    pub up: QuantizedInt4,
-    /// down_proj: [hidden_size, moe_intermediate_size] quantized to INT4
-    pub down: QuantizedInt4,
+    /// gate_proj: [moe_intermediate_size, hidden_size]
+    pub gate: QuantWeight,
+    /// up_proj: [moe_intermediate_size, hidden_size]
+    pub up: QuantWeight,
+    /// down_proj: [hidden_size, moe_intermediate_size]
+    pub down: QuantWeight,
 }
 
 /// Manages loaded expert weights for all MoE layers.
@@ -138,6 +191,8 @@ pub struct WeightStore {
     pub config: ModelConfig,
     /// Group size used for quantization.
     pub group_size: usize,
+    /// Quantization bit width (4 or 8).
+    pub num_bits: u8,
 }
 
 /// Safetensors shard index: maps tensor names to shard filenames.
@@ -181,32 +236,38 @@ fn fnv1a(data: &[u8]) -> u64 {
     h
 }
 
-/// Cache file path for a given model directory and group size.
-fn cache_path(model_dir: &Path, group_size: usize) -> PathBuf {
+/// Cache file path for a given model directory, bit width, and group size.
+fn cache_path(model_dir: &Path, num_bits: u8, group_size: usize) -> PathBuf {
     model_dir
         .join(".krasis_cache")
-        .join(format!("experts_int4_g{group_size}.bin"))
+        .join(format!("experts_int{num_bits}_g{group_size}.bin"))
 }
 
 /// Compute per-expert byte sizes from config.
-fn expert_byte_sizes(config: &ModelConfig, group_size: usize) -> (usize, usize, usize, usize) {
+/// Returns (gate_data_bytes, gate_scales_bytes, down_data_bytes, down_scales_bytes).
+fn expert_byte_sizes(config: &ModelConfig, group_size: usize, num_bits: u8) -> (usize, usize, usize, usize) {
     let h = config.hidden_size;
     let m = config.moe_intermediate_size;
 
-    // gate/up: [m, h] → packed [m, h/8] as u32, scales [m, h/gs] as u16
-    let gate_packed_bytes = m * (h / 8) * 4;
-    let gate_scales_bytes = m * (h / group_size) * 2;
+    let (gate_data_bytes, down_data_bytes) = if num_bits == 4 {
+        // INT4: gate/up: [m, h] → packed [m, h/8] as u32
+        // down: [h, m] → packed [h, m/8] as u32
+        (m * (h / 8) * 4, h * (m / 8) * 4)
+    } else {
+        // INT8: gate/up: [m, h] → raw i8 [m, h]
+        // down: [h, m] → raw i8 [h, m]
+        (m * h, h * m)
+    };
 
-    // down: [h, m] → packed [h, m/8] as u32, scales [h, m/gs] as u16
-    let down_packed_bytes = h * (m / 8) * 4;
+    let gate_scales_bytes = m * (h / group_size) * 2;
     let down_scales_bytes = h * (m / group_size) * 2;
 
-    (gate_packed_bytes, gate_scales_bytes, down_packed_bytes, down_scales_bytes)
+    (gate_data_bytes, gate_scales_bytes, down_data_bytes, down_scales_bytes)
 }
 
 /// Expected total cache file size.
-fn expected_cache_size(config: &ModelConfig, group_size: usize, num_moe_layers: usize) -> usize {
-    let (gpb, gsb, dpb, dsb) = expert_byte_sizes(config, group_size);
+fn expected_cache_size(config: &ModelConfig, group_size: usize, num_bits: u8, num_moe_layers: usize) -> usize {
+    let (gpb, gsb, dpb, dsb) = expert_byte_sizes(config, group_size, num_bits);
     let per_expert = gpb + gsb + gpb + gsb + dpb + dsb; // gate + up + down
     CACHE_HEADER_SIZE + num_moe_layers * config.n_routed_experts * per_expert
 }
@@ -229,6 +290,7 @@ impl WeightStore {
                 routed_scaling_factor: 1.0,
             },
             group_size: DEFAULT_GROUP_SIZE,
+            num_bits: 4,
         }
     }
 }
@@ -236,18 +298,20 @@ impl WeightStore {
 impl WeightStore {
     /// Load expert weights from a HF model directory, using disk cache if available.
     ///
-    /// First checks for a cached `.krasis_cache/experts_int4_g{group_size}.bin`.
+    /// First checks for a cached `.krasis_cache/experts_int{bits}_g{group_size}.bin`.
     /// If valid, loads directly from cache (mmap + copy, ~1-2s for V2-Lite).
-    /// Otherwise, reads BF16 safetensors, quantizes to INT4, and writes cache.
+    /// Otherwise, reads BF16 safetensors, quantizes, and writes cache.
     ///
     /// If `max_layers` is Some(n), only load n MoE layers (skips cache).
     /// If `start_layer` is Some(s), start loading from MoE layer s (0-based, skips cache).
     /// Combined: loads MoE layers [start_layer .. start_layer + max_layers).
+    /// `num_bits`: 4 for INT4 (default), 8 for INT8.
     pub fn load_from_hf(
         model_dir: &Path,
         group_size: usize,
         max_layers: Option<usize>,
         start_layer: Option<usize>,
+        num_bits: u8,
     ) -> Result<Self, String> {
         let start = std::time::Instant::now();
 
@@ -287,17 +351,21 @@ impl WeightStore {
         };
         let config_hash = fnv1a(config_str.as_bytes());
 
+        // Detect effective group_size for pre-quantized models (needed for correct cache path)
+        let effective_gs_hint = Self::detect_group_size_hint(model_dir, &config);
+        let cache_gs = effective_gs_hint.unwrap_or(group_size);
+
         // Try loading from cache (only for full model loads — no start_layer or max_layers)
         let partial = max_layers.is_some() || start_layer.is_some();
         if !partial {
-            let cpath = cache_path(model_dir, group_size);
+            let cpath = cache_path(model_dir, num_bits, cache_gs);
             if cpath.exists() {
-                match Self::load_cache(&cpath, &config, group_size, num_moe_layers, config_hash) {
+                match Self::load_cache(&cpath, &config, cache_gs, num_bits, num_moe_layers, config_hash) {
                     Ok(mut store) => {
                         // Shared experts not in cache — load them now
                         if config.n_shared_experts > 0 {
                             store.shared_experts = Self::load_shared_experts(
-                                model_dir, &config, store.group_size, num_moe_layers,
+                                model_dir, &config, store.group_size, num_bits, num_moe_layers,
                             )?;
                         }
                         let elapsed = start.elapsed();
@@ -317,21 +385,26 @@ impl WeightStore {
         }
 
         // Load from safetensors and quantize (or load pre-quantized)
+        log::info!("[DIAG-RUST] Starting load_and_quantize_all: {} MoE layers, start={}, bits={}", num_moe_layers, moe_start, num_bits);
+        crate::syscheck::log_memory_usage("[DIAG-RUST] before load_and_quantize_all");
         let (experts, shared_experts, effective_group_size) =
-            Self::load_and_quantize_all(model_dir, &config, group_size, num_moe_layers, moe_start)?;
+            Self::load_and_quantize_all(model_dir, &config, group_size, num_bits, num_moe_layers, moe_start)?;
+        log::info!("[DIAG-RUST] load_and_quantize_all completed OK");
+        crate::syscheck::log_memory_usage("[DIAG-RUST] after load_and_quantize_all");
 
         let store = WeightStore {
             experts,
             shared_experts,
             config: config.clone(),
             group_size: effective_group_size,
+            num_bits,
         };
 
         // Save cache for next time (only for full model loads)
         if !partial {
-            let cpath = cache_path(model_dir, group_size);
+            let cpath = cache_path(model_dir, num_bits, effective_group_size);
             match store.save_cache(&cpath, config_hash) {
-                Ok(()) => log::info!("Saved INT4 cache to {}", cpath.display()),
+                Ok(()) => log::info!("Saved INT{num_bits} cache to {}", cpath.display()),
                 Err(e) => log::warn!("Failed to save cache: {e}"),
             }
         }
@@ -346,15 +419,17 @@ impl WeightStore {
         Ok(store)
     }
 
-    /// Load from safetensors shards and quantize to INT4 (or load pre-quantized).
+    /// Load from safetensors shards and quantize to INT4/INT8 (or load pre-quantized).
     /// Returns (routed_experts, shared_experts, effective_group_size).
     ///
     /// `start_moe_layer`: 0-based offset into MoE layers (skips first N MoE layers).
     /// `num_moe_layers`: how many MoE layers to load starting from `start_moe_layer`.
+    /// `num_bits`: 4 for INT4, 8 for INT8.
     fn load_and_quantize_all(
         model_dir: &Path,
         config: &ModelConfig,
         group_size: usize,
+        num_bits: u8,
         num_moe_layers: usize,
         start_moe_layer: usize,
     ) -> Result<(Vec<Vec<ExpertWeights>>, Vec<ExpertWeights>, usize), String> {
@@ -365,19 +440,42 @@ impl WeightStore {
         let index: SafetensorsIndex = serde_json::from_str(&index_str)
             .map_err(|e| format!("Failed to parse safetensors index: {e}"))?;
 
-        // Determine which shard files we need
-        let mut shard_names: Vec<String> = index.weight_map.values().cloned().collect();
+        // Determine which shard files we actually need for our layer range.
+        // Only open shards containing expert weights for layers in [start_moe_layer, start_moe_layer + num_moe_layers).
+        // This avoids mmapping all 64 shards when each PP rank only needs ~20.
+        let first_abs_layer = start_moe_layer + config.first_k_dense_replace;
+        let last_abs_layer = first_abs_layer + num_moe_layers; // exclusive
+        let mut needed_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (tensor_name, shard_name) in &index.weight_map {
+            // Check if this tensor belongs to a layer in our range
+            if let Some(layer_num) = parse_layer_number(tensor_name) {
+                if layer_num >= first_abs_layer && layer_num < last_abs_layer {
+                    needed_shards.insert(shard_name.clone());
+                }
+            }
+        }
+        let mut shard_names: Vec<String> = needed_shards.into_iter().collect();
         shard_names.sort();
-        shard_names.dedup();
 
-        // Open all shards
+        let all_shard_count: std::collections::HashSet<&String> = index.weight_map.values().collect();
+        log::info!(
+            "[DIAG-RUST] Filtered shards: {}/{} needed for layers [{first_abs_layer}..{last_abs_layer})",
+            shard_names.len(), all_shard_count.len(),
+        );
+        crate::syscheck::log_memory_usage("[DIAG-RUST] before mmap shards");
+
+        // Open only needed shards
         let mut shards: HashMap<String, MmapSafetensors> = HashMap::new();
-        for name in &shard_names {
+        for (i, name) in shard_names.iter().enumerate() {
             let path = model_dir.join(name);
             let st = MmapSafetensors::open(&path)
                 .map_err(|e| format!("Failed to open {name}: {e}"))?;
             shards.insert(name.clone(), st);
+            if (i + 1) % 10 == 0 || i + 1 == shard_names.len() {
+                log::info!("[DIAG-RUST] Opened {}/{} shards", i + 1, shard_names.len());
+            }
         }
+        crate::syscheck::log_memory_usage("[DIAG-RUST] after mmap filtered shards");
 
         // Auto-detect expert weight prefix pattern
         let layers_prefix = detect_expert_prefix(&index.weight_map)?;
@@ -386,9 +484,11 @@ impl WeightStore {
         // Detect pre-quantized vs BF16 weights
         let prequantized = is_prequantized(&index.weight_map);
         let effective_group_size = if prequantized {
-            let first_moe = config.first_k_dense_replace;
+            // Use the first layer THIS rank owns (not global first_moe) since we
+            // only opened shards for our layer range
+            let probe_layer = start_moe_layer + config.first_k_dense_replace;
             let native_gs = detect_prequant_group_size(
-                &index.weight_map, &shards, &layers_prefix, first_moe,
+                &index.weight_map, &shards, &layers_prefix, probe_layer,
             )?;
             if native_gs != group_size {
                 log::info!(
@@ -403,6 +503,10 @@ impl WeightStore {
         };
 
         let mut experts: Vec<Vec<ExpertWeights>> = Vec::with_capacity(num_moe_layers);
+        log::info!(
+            "[DIAG-RUST] Starting expert loading: {} layers × {} experts (MoE layers [{start_moe_layer}..{}))",
+            num_moe_layers, config.n_routed_experts, start_moe_layer + num_moe_layers,
+        );
 
         for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
             let layer_idx = moe_idx + config.first_k_dense_replace;
@@ -413,27 +517,21 @@ impl WeightStore {
                 let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
 
                 let (gate, up, down) = if prequantized {
-                    let g = load_prequantized_weight(
+                    // Pre-quantized models are always INT4 (compressed-tensors format)
+                    let g = QuantWeight::Int4(load_prequantized_weight(
                         &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
-                    )?;
-                    let u = load_prequantized_weight(
+                    )?);
+                    let u = QuantWeight::Int4(load_prequantized_weight(
                         &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
-                    )?;
-                    let d = load_prequantized_weight(
+                    )?);
+                    let d = QuantWeight::Int4(load_prequantized_weight(
                         &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
-                    )?;
+                    )?);
                     (g, u, d)
                 } else {
-                    let g = load_and_quantize_weight(
-                        &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
-                    )?;
-                    let u = load_and_quantize_weight(
-                        &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
-                    )?;
-                    let d = load_and_quantize_weight(
-                        &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
-                    )?;
-                    (g, u, d)
+                    load_and_quantize_expert(
+                        &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
+                    )?
                 };
 
                 layer_experts.push(ExpertWeights { gate, up, down });
@@ -441,15 +539,20 @@ impl WeightStore {
 
             let layer_elapsed = layer_start.elapsed();
             let action = if prequantized { "loaded" } else { "quantized" };
+            let layers_done = experts.len() + 1;
             log::info!(
-                "Layer {layer_idx}: {action} {} experts in {:.1}s",
+                "Layer {layer_idx}: {action} {} experts in {:.1}s [{layers_done}/{num_moe_layers}]",
                 config.n_routed_experts,
                 layer_elapsed.as_secs_f64(),
             );
             experts.push(layer_experts);
+            // Log memory every 5 layers
+            if layers_done % 5 == 0 || layers_done == num_moe_layers {
+                crate::syscheck::log_memory_usage(&format!("[DIAG-RUST] after loading {layers_done}/{num_moe_layers} layers"));
+            }
         }
 
-        // Load shared experts (always BF16, quantized to INT4 by us)
+        // Load shared experts (always BF16, quantized to INT4/INT8 like routed)
         let shared_experts = if config.n_shared_experts > 0 {
             let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
             log::info!(
@@ -460,14 +563,8 @@ impl WeightStore {
             for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
                 let layer_idx = moe_idx + config.first_k_dense_replace;
                 let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.shared_experts");
-                let gate = load_and_quantize_weight(
-                    &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
-                )?;
-                let up = load_and_quantize_weight(
-                    &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
-                )?;
-                let down = load_and_quantize_weight(
-                    &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                let (gate, up, down) = load_and_quantize_expert(
+                    &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
                 )?;
                 shared.push(ExpertWeights { gate, up, down });
             }
@@ -479,17 +576,15 @@ impl WeightStore {
 
         let total_bytes: usize = experts.iter().flat_map(|layer| {
             layer.iter().map(|e| {
-                (e.gate.packed.len() + e.up.packed.len() + e.down.packed.len()) * 4
-                    + (e.gate.scales.len() + e.up.scales.len() + e.down.scales.len()) * 2
+                e.gate.data_bytes() + e.up.data_bytes() + e.down.data_bytes()
             })
         }).sum();
         let shared_bytes: usize = shared_experts.iter().map(|e| {
-            (e.gate.packed.len() + e.up.packed.len() + e.down.packed.len()) * 4
-                + (e.gate.scales.len() + e.up.scales.len() + e.down.scales.len()) * 2
+            e.gate.data_bytes() + e.up.data_bytes() + e.down.data_bytes()
         }).sum();
 
         log::info!(
-            "Loaded {} MoE layers × {} experts = {:.1} GB INT4 (group_size={effective_group_size}), shared={:.1} MB",
+            "Loaded {} MoE layers × {} experts = {:.1} GB INT{num_bits} (group_size={effective_group_size}), shared={:.1} MB",
             num_moe_layers,
             config.n_routed_experts,
             total_bytes as f64 / 1e9,
@@ -568,11 +663,12 @@ impl WeightStore {
         Ok(())
     }
 
-    /// Load INT4 expert weights from cache file via mmap.
+    /// Load expert weights from cache file via mmap.
     fn load_cache(
         path: &Path,
         config: &ModelConfig,
         group_size: usize,
+        num_bits: u8,
         num_moe_layers: usize,
         config_hash: u64,
     ) -> Result<Self, String> {
@@ -582,7 +678,7 @@ impl WeightStore {
             .map_err(|e| format!("Failed to mmap cache: {e}"))?;
 
         // Validate size
-        let expected = expected_cache_size(config, group_size, num_moe_layers);
+        let expected = expected_cache_size(config, group_size, num_bits, num_moe_layers);
         if mmap.len() != expected {
             return Err(format!(
                 "Cache size mismatch: expected {} bytes, got {}",
@@ -620,8 +716,8 @@ impl WeightStore {
         }
 
         // Read expert data from mmap
-        log::info!("Loading from cache: {}", path.display());
-        let (gpb, gsb, dpb, dsb) = expert_byte_sizes(config, group_size);
+        log::info!("Loading from cache: {} (INT{})", path.display(), num_bits);
+        let (gpb, gsb, dpb, dsb) = expert_byte_sizes(config, group_size, num_bits);
         let h = config.hidden_size;
         let m = config.moe_intermediate_size;
         let mut offset = CACHE_HEADER_SIZE;
@@ -632,9 +728,9 @@ impl WeightStore {
         for layer_idx in 0..num_moe_layers {
             let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
             for _eidx in 0..config.n_routed_experts {
-                let gate = read_quantized(&mmap, &mut offset, m, h, group_size, gpb, gsb);
-                let up = read_quantized(&mmap, &mut offset, m, h, group_size, gpb, gsb);
-                let down = read_quantized(&mmap, &mut offset, h, m, group_size, dpb, dsb);
+                let gate = read_quantized(&mmap, &mut offset, m, h, group_size, num_bits, gpb, gsb);
+                let up = read_quantized(&mmap, &mut offset, m, h, group_size, num_bits, gpb, gsb);
+                let down = read_quantized(&mmap, &mut offset, h, m, group_size, num_bits, dpb, dsb);
                 layer_experts.push(ExpertWeights { gate, up, down });
             }
             experts.push(layer_experts);
@@ -652,14 +748,12 @@ impl WeightStore {
             mmap.len() as f64 / 1e9 / elapsed.as_secs_f64(),
         );
 
-        // Note: shared experts are NOT cached — they are loaded from safetensors
-        // on every startup. This is fast since there's only 1 per MoE layer.
-        // TODO: add shared experts to cache format in v2.
         Ok(WeightStore {
             experts,
             shared_experts: Vec::new(), // loaded separately after cache
             config: config.clone(),
             group_size,
+            num_bits,
         })
     }
 
@@ -669,6 +763,19 @@ impl WeightStore {
     pub fn migrate_numa(&mut self, map: &crate::numa::NumaExpertMap) -> usize {
         use crate::numa::migrate_vec_to_node;
 
+        fn migrate_quant_weight(w: &mut QuantWeight, node: usize) -> bool {
+            match w {
+                QuantWeight::Int4(q) => {
+                    migrate_vec_to_node(&mut q.packed, node)
+                        && migrate_vec_to_node(&mut q.scales, node)
+                }
+                QuantWeight::Int8(q) => {
+                    migrate_vec_to_node(&mut q.data, node)
+                        && migrate_vec_to_node(&mut q.scales, node)
+                }
+            }
+        }
+
         let start = std::time::Instant::now();
         let mut migrated = 0;
         let mut failed = 0;
@@ -677,13 +784,10 @@ impl WeightStore {
             for (expert_idx, expert) in layer.iter_mut().enumerate() {
                 let node = map.node_for(layer_idx, expert_idx);
 
-                // Migrate all 6 buffers (packed + scales for gate, up, down)
-                let ok = migrate_vec_to_node(&mut expert.gate.packed, node)
-                    && migrate_vec_to_node(&mut expert.gate.scales, node)
-                    && migrate_vec_to_node(&mut expert.up.packed, node)
-                    && migrate_vec_to_node(&mut expert.up.scales, node)
-                    && migrate_vec_to_node(&mut expert.down.packed, node)
-                    && migrate_vec_to_node(&mut expert.down.scales, node);
+                // Migrate all weight buffers for gate, up, down
+                let ok = migrate_quant_weight(&mut expert.gate, node)
+                    && migrate_quant_weight(&mut expert.up, node)
+                    && migrate_quant_weight(&mut expert.down, node);
 
                 if ok {
                     migrated += 1;
@@ -702,11 +806,12 @@ impl WeightStore {
         migrated
     }
 
-    /// Load shared expert weights from safetensors (always BF16, quantized to INT4).
+    /// Load shared expert weights from safetensors (BF16, quantized to INT4/INT8).
     fn load_shared_experts(
         model_dir: &Path,
         config: &ModelConfig,
         group_size: usize,
+        num_bits: u8,
         num_moe_layers: usize,
     ) -> Result<Vec<ExpertWeights>, String> {
         let index_path = model_dir.join("model.safetensors.index.json");
@@ -748,14 +853,8 @@ impl WeightStore {
         for moe_idx in 0..num_moe_layers {
             let layer_idx = moe_idx + config.first_k_dense_replace;
             let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.shared_experts");
-            let gate = load_and_quantize_weight(
-                &prefix, "gate_proj", &index.weight_map, &shards, group_size,
-            )?;
-            let up = load_and_quantize_weight(
-                &prefix, "up_proj", &index.weight_map, &shards, group_size,
-            )?;
-            let down = load_and_quantize_weight(
-                &prefix, "down_proj", &index.weight_map, &shards, group_size,
+            let (gate, up, down) = load_and_quantize_expert(
+                &prefix, &index.weight_map, &shards, group_size, num_bits,
             )?;
             shared.push(ExpertWeights { gate, up, down });
         }
@@ -764,6 +863,54 @@ impl WeightStore {
             shared.len(), start.elapsed().as_secs_f64(),
         );
         Ok(shared)
+    }
+
+    /// Quick check for pre-quantized group_size without loading full weights.
+    /// Returns Some(group_size) if model has pre-quantized experts, None otherwise.
+    fn detect_group_size_hint(model_dir: &Path, config: &ModelConfig) -> Option<usize> {
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let index_str = std::fs::read_to_string(&index_path).ok()?;
+        let index: SafetensorsIndex = serde_json::from_str(&index_str).ok()?;
+        let layers_prefix = detect_expert_prefix(&index.weight_map).ok()?;
+
+        let first_moe_layer = config.first_k_dense_replace;
+        let packed_name = format!(
+            "{layers_prefix}.layers.{first_moe_layer}.mlp.experts.0.gate_proj.weight_packed"
+        );
+
+        // If weight_packed exists, model is pre-quantized — detect group_size
+        let _shard_name = index.weight_map.get(&packed_name)?;
+
+        let scale_name = format!(
+            "{layers_prefix}.layers.{first_moe_layer}.mlp.experts.0.gate_proj.weight_scale"
+        );
+        let shape_name = format!(
+            "{layers_prefix}.layers.{first_moe_layer}.mlp.experts.0.gate_proj.weight_shape"
+        );
+
+        // Open just the shard(s) needed for scale and shape
+        let scale_shard_name = index.weight_map.get(&scale_name)?;
+        let shape_shard_name = index.weight_map.get(&shape_name)?;
+
+        let mut shards: HashMap<String, MmapSafetensors> = HashMap::new();
+        for name in [scale_shard_name, shape_shard_name] {
+            if !shards.contains_key(name) {
+                let path = model_dir.join(name);
+                let st = MmapSafetensors::open(&path).ok()?;
+                shards.insert(name.clone(), st);
+            }
+        }
+
+        match detect_prequant_group_size(&index.weight_map, &shards, &layers_prefix, first_moe_layer) {
+            Ok(gs) => {
+                log::info!("Detected pre-quantized group_size={gs} for cache path");
+                Some(gs)
+            }
+            Err(e) => {
+                log::warn!("Failed to detect pre-quantized group_size: {e}");
+                None
+            }
+        }
     }
 
     /// Get expert weights for a given MoE layer index and expert index.
@@ -784,30 +931,50 @@ impl WeightStore {
     }
 }
 
-/// Write a QuantizedInt4's packed + scales data to a writer.
-fn write_quantized<W: Write>(w: &mut W, q: &QuantizedInt4) -> Result<(), String> {
-    let packed_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            q.packed.as_ptr() as *const u8,
-            q.packed.len() * 4,
-        )
-    };
-    w.write_all(packed_bytes)
-        .map_err(|e| format!("Write packed error: {e}"))?;
-
-    let scales_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            q.scales.as_ptr() as *const u8,
-            q.scales.len() * 2,
-        )
-    };
-    w.write_all(scales_bytes)
-        .map_err(|e| format!("Write scales error: {e}"))?;
-
+/// Write a QuantWeight's data + scales to a writer.
+fn write_quantized<W: Write>(w: &mut W, q: &QuantWeight) -> Result<(), String> {
+    match q {
+        QuantWeight::Int4(q4) => {
+            let packed_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    q4.packed.as_ptr() as *const u8,
+                    q4.packed.len() * 4,
+                )
+            };
+            w.write_all(packed_bytes)
+                .map_err(|e| format!("Write packed error: {e}"))?;
+            let scales_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    q4.scales.as_ptr() as *const u8,
+                    q4.scales.len() * 2,
+                )
+            };
+            w.write_all(scales_bytes)
+                .map_err(|e| format!("Write scales error: {e}"))?;
+        }
+        QuantWeight::Int8(q8) => {
+            let data_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    q8.data.as_ptr() as *const u8,
+                    q8.data.len(),
+                )
+            };
+            w.write_all(data_bytes)
+                .map_err(|e| format!("Write data error: {e}"))?;
+            let scales_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    q8.scales.as_ptr() as *const u8,
+                    q8.scales.len() * 2,
+                )
+            };
+            w.write_all(scales_bytes)
+                .map_err(|e| format!("Write scales error: {e}"))?;
+        }
+    }
     Ok(())
 }
 
-/// Read a QuantizedInt4 from mmap'd cache data at the given offset.
+/// Read a QuantWeight from mmap'd cache data at the given offset.
 ///
 /// Uses direct memcpy — safe on x86_64 (little-endian, unaligned loads OK).
 fn read_quantized(
@@ -816,38 +983,82 @@ fn read_quantized(
     rows: usize,
     cols: usize,
     group_size: usize,
-    packed_bytes: usize,
+    num_bits: u8,
+    data_bytes: usize,
     scales_bytes: usize,
-) -> QuantizedInt4 {
-    let packed_count = packed_bytes / 4;
-    let mut packed = vec![0u32; packed_count];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr().add(*offset),
-            packed.as_mut_ptr() as *mut u8,
-            packed_bytes,
-        );
-    }
-    *offset += packed_bytes;
-
+) -> QuantWeight {
     let scales_count = scales_bytes / 2;
-    let mut scales = vec![0u16; scales_count];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr().add(*offset),
-            scales.as_mut_ptr() as *mut u8,
-            scales_bytes,
-        );
-    }
-    *offset += scales_bytes;
 
-    QuantizedInt4 {
-        packed,
-        scales,
-        rows,
-        cols,
-        group_size,
+    if num_bits == 4 {
+        let packed_count = data_bytes / 4;
+        let mut packed = vec![0u32; packed_count];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(*offset),
+                packed.as_mut_ptr() as *mut u8,
+                data_bytes,
+            );
+        }
+        *offset += data_bytes;
+
+        let mut scales = vec![0u16; scales_count];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(*offset),
+                scales.as_mut_ptr() as *mut u8,
+                scales_bytes,
+            );
+        }
+        *offset += scales_bytes;
+
+        QuantWeight::Int4(QuantizedInt4 {
+            packed,
+            scales,
+            rows,
+            cols,
+            group_size,
+        })
+    } else {
+        let mut weight_data = vec![0i8; data_bytes];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(*offset),
+                weight_data.as_mut_ptr() as *mut u8,
+                data_bytes,
+            );
+        }
+        *offset += data_bytes;
+
+        let mut scales = vec![0u16; scales_count];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(*offset),
+                scales.as_mut_ptr() as *mut u8,
+                scales_bytes,
+            );
+        }
+        *offset += scales_bytes;
+
+        QuantWeight::Int8(QuantizedInt8 {
+            data: weight_data,
+            scales,
+            rows,
+            cols,
+            group_size,
+        })
     }
+}
+
+/// Extract the layer number from a tensor name like "model.layers.42.mlp.experts.0.gate_proj.weight".
+/// Returns None if no ".layers.N." pattern is found.
+fn parse_layer_number(tensor_name: &str) -> Option<usize> {
+    let parts: Vec<&str> = tensor_name.split('.').collect();
+    for i in 0..parts.len().saturating_sub(1) {
+        if parts[i] == "layers" {
+            return parts[i + 1].parse().ok();
+        }
+    }
+    None
 }
 
 /// Auto-detect the expert weight prefix from the weight map.
@@ -993,6 +1204,49 @@ fn load_and_quantize_weight(
     Ok(quantize_int4(bf16_data, rows, cols, group_size))
 }
 
+/// Load a BF16 expert's gate/up/down projections and quantize to INT4 or INT8.
+fn load_and_quantize_expert(
+    prefix: &str,
+    weight_map: &HashMap<String, String>,
+    shards: &HashMap<String, MmapSafetensors>,
+    group_size: usize,
+    num_bits: u8,
+) -> Result<(QuantWeight, QuantWeight, QuantWeight), String> {
+    if num_bits == 4 {
+        let g = QuantWeight::Int4(load_and_quantize_weight(
+            prefix, "gate_proj", weight_map, shards, group_size,
+        )?);
+        let u = QuantWeight::Int4(load_and_quantize_weight(
+            prefix, "up_proj", weight_map, shards, group_size,
+        )?);
+        let d = QuantWeight::Int4(load_and_quantize_weight(
+            prefix, "down_proj", weight_map, shards, group_size,
+        )?);
+        Ok((g, u, d))
+    } else {
+        // INT8 path: load BF16 and quantize to INT8
+        let load_int8 = |proj_name: &str| -> Result<QuantWeight, String> {
+            let tensor_name = format!("{prefix}.{proj_name}.weight");
+            let shard_name = weight_map.get(&tensor_name)
+                .ok_or_else(|| format!("Tensor not found in index: {tensor_name}"))?;
+            let shard = shards.get(shard_name)
+                .ok_or_else(|| format!("Shard not loaded: {shard_name}"))?;
+            let info = shard.tensor_info(&tensor_name)
+                .ok_or_else(|| format!("Tensor not in shard: {tensor_name}"))?;
+            let rows = info.shape[0];
+            let cols = info.shape[1];
+            let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
+                .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+            Ok(QuantWeight::Int8(quantize_int8(bf16_data, rows, cols, group_size)))
+        };
+
+        let g = load_int8("gate_proj")?;
+        let u = load_int8("up_proj")?;
+        let d = load_int8("down_proj")?;
+        Ok((g, u, d))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,7 +1260,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
             .expect("Failed to load V2-Lite");
 
         // V2-Lite: 27 layers, layer 0 dense, layers 1-26 MoE = 26 MoE layers
@@ -1017,12 +1271,12 @@ mod tests {
 
         // Check expert dimensions
         let expert = store.get_expert(0, 0); // first MoE layer, expert 0
-        assert_eq!(expert.gate.rows, 1408);
-        assert_eq!(expert.gate.cols, 2048);
-        assert_eq!(expert.up.rows, 1408);
-        assert_eq!(expert.up.cols, 2048);
-        assert_eq!(expert.down.rows, 2048);
-        assert_eq!(expert.down.cols, 1408);
+        assert_eq!(expert.gate.rows(), 1408);
+        assert_eq!(expert.gate.cols(), 2048);
+        assert_eq!(expert.up.rows(), 1408);
+        assert_eq!(expert.up.cols(), 2048);
+        assert_eq!(expert.down.rows(), 2048);
+        assert_eq!(expert.down.cols(), 1408);
 
         eprintln!(
             "V2-Lite loaded: {} MoE layers × {} experts",
@@ -1031,7 +1285,7 @@ mod tests {
         );
 
         // Spot-check: dequantize one expert's gate_proj and verify SNR
-        let deq = marlin::dequantize_int4(&expert.gate);
+        let deq = marlin::dequantize_int4(expert.gate.as_int4());
         let mut sum_sq: f64 = 0.0;
         for &v in &deq {
             sum_sq += (v as f64).powi(2);
@@ -1051,27 +1305,28 @@ mod tests {
         }
 
         // Load (will use cache if available, or quantize + create cache)
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
             .expect("Failed to load V2-Lite");
 
         // Verify cache file exists
-        let cpath = cache_path(model_dir, DEFAULT_GROUP_SIZE);
+        let cpath = cache_path(model_dir, 4, DEFAULT_GROUP_SIZE);
         assert!(cpath.exists(), "Cache file should exist after load");
 
         let size = std::fs::metadata(&cpath).unwrap().len();
-        let expected = expected_cache_size(&store.config, store.group_size, store.num_moe_layers());
+        let expected = expected_cache_size(&store.config, store.group_size, store.num_bits, store.num_moe_layers());
         assert_eq!(size as usize, expected, "Cache file size mismatch");
 
         // Spot-check multiple experts across layers for non-zero data
         for layer in [0, 12, 25] {
             for eidx in [0, 31, 63] {
                 let expert = store.get_expert(layer, eidx);
+                let gate = expert.gate.as_int4();
                 assert!(
-                    expert.gate.packed.iter().any(|&v| v != 0),
+                    gate.packed.iter().any(|&v| v != 0),
                     "Layer {layer} expert {eidx} gate packed all zeros"
                 );
                 assert!(
-                    expert.gate.scales.iter().any(|&v| v != 0),
+                    gate.scales.iter().any(|&v| v != 0),
                     "Layer {layer} expert {eidx} gate scales all zeros"
                 );
             }
