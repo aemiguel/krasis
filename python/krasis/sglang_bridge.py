@@ -207,9 +207,10 @@ class KrasisMoEWrapper:
             sys.stderr.flush()
 
             # -- CRASH DIAGNOSTIC: fine-grained logging around engine creation --
-            logger.info("[DIAG] Creating KrasisEngine(parallel=True, num_threads=%d)...", num_threads)
+            logger.info("[DIAG] Creating KrasisEngine(parallel=True, num_threads=%d, skip_shared=True)...", num_threads)
             sys.stdout.flush()
-            engine = KrasisEngine(parallel=True, num_threads=num_threads)
+            # skip_shared_experts=True: SGLang handles shared experts on GPU
+            engine = KrasisEngine(parallel=True, num_threads=num_threads, skip_shared_experts=True)
             logger.info("[DIAG] KrasisEngine created OK, calling engine.load()...")
             sys.stdout.flush()
 

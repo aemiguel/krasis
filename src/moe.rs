@@ -662,6 +662,7 @@ fn moe_worker(
     result_tx: mpsc::SyncSender<Vec<u16>>,
     parallel: bool,
     numa_map: Option<crate::numa::NumaExpertMap>,
+    skip_shared_experts: bool,
 ) {
     let hidden = store.config.hidden_size;
     let intermediate = store.config.moe_intermediate_size;
@@ -675,7 +676,9 @@ fn moe_worker(
     let mut output_f32 = vec![0.0f32; hidden];
 
     // Shared expert scratch (different intermediate size: n_shared * moe_intermediate)
-    let mut shared_scratch = if store.config.n_shared_experts > 0 {
+    // When skip_shared_experts is true, the host framework (e.g. SGLang) handles
+    // shared experts on GPU, so we don't allocate scratch or compute them.
+    let mut shared_scratch = if store.config.n_shared_experts > 0 && !skip_shared_experts {
         let shared_intermediate = store.config.n_shared_experts * intermediate;
         Some(ExpertScratch::new(hidden, shared_intermediate, group_size))
     } else {
@@ -756,6 +759,8 @@ pub struct KrasisEngine {
     shared_scratch: Option<ExpertScratch>,
     output_buf: Vec<f32>,
     parallel: bool,
+    /// Skip shared expert computation (when host framework handles it, e.g. SGLang on GPU).
+    skip_shared_experts: bool,
     /// NUMA expert placement map (None if single-node or NUMA disabled).
     numa_map: Option<crate::numa::NumaExpertMap>,
     /// Async worker: channel to send work.
@@ -781,14 +786,17 @@ impl Drop for KrasisEngine {
 #[pymethods]
 impl KrasisEngine {
     #[new]
-    #[pyo3(signature = (parallel=true, num_threads=None))]
-    pub fn new(parallel: bool, num_threads: Option<usize>) -> Self {
+    #[pyo3(signature = (parallel=true, num_threads=None, skip_shared_experts=false))]
+    pub fn new(parallel: bool, num_threads: Option<usize>, skip_shared_experts: bool) -> Self {
         // Configure rayon thread pool (once, globally)
         if let Some(n) = num_threads {
             let _ = rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
                 .build_global();
             log::info!("Rayon thread pool: {n} threads");
+        }
+        if skip_shared_experts {
+            log::info!("Shared expert computation disabled (handled by host framework)");
         }
         KrasisEngine {
             store: None,
@@ -797,6 +805,7 @@ impl KrasisEngine {
             shared_scratch: None,
             output_buf: Vec::new(),
             parallel,
+            skip_shared_experts,
             numa_map: None,
             work_tx: None,
             result_rx: None,
@@ -938,10 +947,11 @@ impl KrasisEngine {
         let worker_store = store.clone();
         let worker_parallel = self.parallel;
         let worker_numa = numa_map.clone();
+        let worker_skip_shared = self.skip_shared_experts;
         let handle = std::thread::Builder::new()
             .name("krasis-moe-worker".to_string())
             .spawn(move || {
-                moe_worker(worker_store, work_rx, result_tx, worker_parallel, worker_numa);
+                moe_worker(worker_store, work_rx, result_tx, worker_parallel, worker_numa, worker_skip_shared);
             })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("Failed to spawn worker: {e}")
@@ -1013,12 +1023,19 @@ impl KrasisEngine {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
         let parallel = self.parallel;
 
+        // When skip_shared_experts is true, pass None to prevent shared expert computation
+        let shared_scratch_ref = if self.skip_shared_experts {
+            &mut None
+        } else {
+            &mut self.shared_scratch
+        };
+
         if store.has_unified() {
             moe_forward_unified(
                 store, moe_layer_idx, activation,
                 &expert_indices, &expert_weights,
                 &mut self.output_buf, scratch,
-                &mut self.scratch_pool, &mut self.shared_scratch,
+                &mut self.scratch_pool, shared_scratch_ref,
                 parallel, self.numa_map.as_ref(),
             );
         } else {
@@ -1026,7 +1043,7 @@ impl KrasisEngine {
                 store, moe_layer_idx, activation,
                 &expert_indices, &expert_weights,
                 &mut self.output_buf, scratch,
-                &mut self.scratch_pool, &mut self.shared_scratch,
+                &mut self.scratch_pool, shared_scratch_ref,
                 parallel, self.numa_map.as_ref(),
             );
         }
@@ -1852,7 +1869,7 @@ mod tests {
         let handle = std::thread::Builder::new()
             .name("test-worker".to_string())
             .spawn(move || {
-                moe_worker(worker_store, work_rx, result_tx, true, None);
+                moe_worker(worker_store, work_rx, result_tx, true, None, false);
             })
             .expect("Failed to spawn worker");
 

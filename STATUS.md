@@ -85,8 +85,9 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 - [x] **Engine-backed GPU prefill** — GpuPrefillManager reads weights from Rust engine, repacks to Marlin on GPU. Eliminates ~438 GB Python RAM cache for Kimi K2.5
 
 ### Multi-GPU
-- [x] **Pipeline parallelism** — PP=2 verified on Kimi K2.5 (GPU0: 31 layers, GPU1: 30 layers)
+- [x] **Pipeline parallelism** — PP=3 verified on Kimi K2.5 (GPU0: 20 layers, GPU1: 21 layers, GPU2: 20 layers)
 - [x] **PP communication** — CPU bounce for cross-GPU transfer (GPU P2P broken on RTX 2000 Ada)
+- [x] **Skip shared experts** — `skip_shared_experts` flag prevents double computation when host (SGLang) handles shared experts on GPU
 
 ### Advanced Optimizations
 - [ ] **CUDA graphs** — reduce kernel launch overhead (if compatible with dynamic routing)
@@ -111,17 +112,35 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 | Kimi K2.5 | PP=2, BF16 wt, BF16 KV | 1.55-1.87 tok/s | 12,063 MB | 11,105 MB | **3/3 PASS**, diag ON |
 | Kimi K2.5 | PP=2, INT8 wt, BF16 KV | 1.28-1.41 tok/s | 7,654 MB | 6,044 MB | **3/3 PASS** |
 | Kimi K2.5 | PP=2, INT8 wt, FP8 KV | 1.21-1.28 tok/s | 7,654+4,032 KV | 6,044+4,839 KV | **3/3 PASS**, ~4x context |
-| Kimi K2.5 | PP=2, INT8 wt, FP8 KV, GPU prefill | **CRASH** | — | — | CUDA illegal addr at L31 (PP boundary) |
+| Kimi K2.5 | SGLang PP=3, INT8 wt, FP8 KV, CPU decode | ~1.0 tok/s (debug ON) | ~6.8 GB | ~4.4 GB | **WORKING** — correct output verified |
 | Kimi K2.5 | KTransformers PP=2 | 4.0 tok/s | ~7.6 GB | ~7.6 GB | Production baseline |
 | Qwen3-235B | KTransformers PP=3 | 4.21 tok/s | — | — | With expert pinning |
 
-### Current Blockers
-- **GPU prefill crashes at PP boundary** — CUDA illegal memory access when Marlin kernel runs on GPU1 for first time (layer 31). Debugging with sync points + CUDA_LAUNCH_BLOCKING.
-- ~~**GPUs need reboot**~~ — FIXED: GPUs rebooted and operational
-- **Decode speed gap** — 1.2-1.9 tok/s vs 4.0 tok/s baseline (BF16 weights + diag overhead, not yet optimized)
-- ~~**OOM from dual weight copies**~~ — FIXED: unified weight format eliminates separate Python Marlin cache (~438 GB savings for Kimi K2.5)
-- ~~**OOM from conversion peak**~~ — FIXED: layer-by-layer conversion avoids holding old+new formats simultaneously
-- ~~**Stale v1 disk cache**~~ — FIXED: auto-migrates v1→v2 cache, stores unified format directly with shared experts
+### Current Status
+- **Kimi K2.5 WORKING** on SGLang PP=3 with Krasis CPU decode
+- Correct output verified (factual Q&A, reasoning, creative writing)
+- Decode speed ~1.0 tok/s with debug flags, testing without
+- GPU prefill not yet tested (CPU-only for short prompts)
+
+### Known Issues
+- **Decode speed gap** — ~1.0 tok/s vs 4.0 tok/s KTransformers baseline. Contributing factors: debug flags, non-unified format (partial load), CUDA_LAUNCH_BLOCKING, PP overhead
+- **Partial load skips v2 cache** — PP ranks use `load_and_quantize_all()` from safetensors instead of the fast v2 unified disk cache. Loading takes ~8 min vs ~2 min. Needs per-rank cache loading.
+- **3 copies of expert weights** — each PP rank process loads its own portion from safetensors. Total ~570 GB RSS for 3 ranks vs ~530 GB if shared.
+
+### Resolved Blockers
+- ~~**VRAM budget calculator broken**~~ — FIXED: redesigned with proper overhead estimation (2000 MB), context-length-as-hint approach
+- ~~**CUDA illegal memory access**~~ — FIXED: `correction_bias` was on CPU, moved to GPU in `select_experts()`
+- ~~**Garbage output**~~ — FIXED: shared experts were applied twice (CPU + GPU). Added `skip_shared_experts` flag.
+- ~~**GPU prefill was disabled**~~ — FIXED: GPU_PREFILL_THRESHOLD restored to 300
+- ~~**OOM from dual weight copies**~~ — FIXED: unified weight format eliminates ~438 GB duplicate
+- ~~**OOM from conversion peak**~~ — FIXED: streaming conversion processes one layer at a time
+- ~~**Stale v1 disk cache**~~ — FIXED: auto-migrates v1→v2 cache
+
+### Implemented: VRAM Budget Calculator
+Context length is now a **hint**. The calculator computes per-rank weight footprint, free VRAM,
+KV bytes/token, and allocates the minimum of (requested, max that fits). Measured overhead:
+1716-1912 MB per rank → uses 2000 MB conservative estimate.
+Result: 65K context on 16GB GPUs with INT8 weights + FP8 KV.
 
 ## Target Architecture
 
