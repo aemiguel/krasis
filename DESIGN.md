@@ -62,6 +62,45 @@ Hybrid LLM focused on minimal VRAM, always-on GPU prefill and efficient use of S
 
 
 
+**Unified Weight Format (implemented)**
+
+The original design stored expert weights as three separate matrices (gate, up, down) in
+`[N, K/8]` row-major layout. GPU prefill via Marlin required a completely separate copy
+of all expert weights in Marlin format, stored in a Python-side RAM cache. For Kimi K2.5
+(384 experts × 60 layers), this meant ~504 GB (Rust INT4) + ~438 GB (Python Marlin cache)
+= ~942 GB out of 995 GB total system RAM, which caused OOM crashes.
+
+Solution: **single unified weight format** shared by CPU decode and GPU prefill.
+
+- **Combined w13**: gate and up projections concatenated into a single w13 matrix
+  `[K/8, 2*N]` (first N columns are gate, next N columns are up)
+- **Transposed layout**: `[K/8, N]` where K is the reduction dimension and N is the
+  output dimension. Weight data is contiguous along N, enabling SIMD across the output
+  dimension without horizontal sum
+- **CPU decode kernel**: New AVX2 integer kernel (`_mm256_mullo_epi32`) that processes
+  8 output values in parallel. Uses `_mm256_srlv_epi32` for variable shifts and
+  `_mm256_permutevar8x32_ps` for activation broadcast. Two matmuls per expert (w13 + w2)
+  instead of three (gate + up + down)
+- **GPU prefill**: Will read raw packed data from Rust via PyO3, upload to GPU, and run
+  `gptq_marlin_repack` on-the-fly. Eliminates the entire Python Marlin cache (~438 GB)
+- **RAM budget check**: At startup, estimates total RAM needed and refuses to run if >95%
+  of MemTotal. Post-load RSS check warns if actual usage deviates >10% from estimate
+
+Design decisions:
+- `_mm256_madd_epi16` (3-cycle, original kernel) cannot be used with transposed layout
+  because it sums pairs of adjacent products, which would mix N outputs. We use
+  `_mm256_mullo_epi32` (10-cycle on Zen 2) instead — correct for SIMD-across-N approach.
+  Despite higher latency per instruction, the elimination of horizontal sum and better
+  memory access pattern compensates.
+- Conversion from old format to unified happens in-place at load time. The old weights
+  are dropped after conversion, so peak RAM is ~2x expert weights momentarily during
+  conversion (not ~2x permanently as before).
+
+Verified correct: unified forward produces identical results to original forward on both
+synthetic weights and real V2-Lite model (max abs diff = 0.000001 on full MoE layer).
+
+
+
 **Development and testing**
 
 - Develop by testing iteratively with a small MoE model:

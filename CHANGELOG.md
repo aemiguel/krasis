@@ -4,12 +4,138 @@
 
 | Suite | Count | Status | Last Run |
 |-------|-------|--------|----------|
-| Rust (`cargo test`) | 34 | ALL PASS | 2026-02-09 |
+| Rust (`cargo test`) | 41 | ALL PASS | 2026-02-11 |
 | Python bridge (`test_bridge.py`) | 3 | ALL PASS | 2026-02-09 |
 | GPU prefill (`test_gpu_prefill.py`) | 5 | ALL PASS | 2026-02-09 |
-| **Total** | **42** | **ALL PASS** | |
+| **Total** | **49** | **ALL PASS** | |
 
 Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
+
+---
+
+## On-the-fly GPU Repack + RAM Safety — 2026-02-11
+
+### OOM Root Cause
+Running Kimi K2.5 (PP=2) caused OOM at ~943 GB RSS. Two causes:
+1. **glibc arena retention**: `convert_to_unified()` freed ~507 GB of old-format weights, but glibc kept them in arenas, adding ~278 GB to RSS.
+2. **GPU prefill `_engine_cache`**: `_prepare_from_engine()` cached ALL experts as Marlin-repacked tensors in Python RAM — 9.5 GB/layer × 60 layers = 570 GB on top of the 572 GB unified weights.
+
+### Fix: On-the-fly Marlin Repack (Zero RAM Cache)
+GPU prefill now reads raw INT4 from Rust engine per-chunk and repacks to Marlin on GPU during `forward()`. No caching at all.
+
+**New methods in `gpu_prefill.py`:**
+- `_repack_chunk_from_engine()` — gets raw INT4 from Rust for one chunk, uploads + repacks on GPU
+- `_forward_engine()` — on-the-fly per-chunk forward path
+- `_forward_cached()` — legacy path for safetensors (unchanged)
+- `_repack_shared_expert()` — on-the-fly shared expert repack
+
+**Removed from `gpu_prefill.py`:**
+- `_engine_cache` dict (was storing ~570 GB of Marlin-repacked weights)
+- `_prepare_from_engine()` method
+
+### Fix: malloc_trim After Conversion
+Added `libc::malloc_trim(0)` in `src/weights/mod.rs` after `convert_to_unified()` to force glibc to return freed pages to OS. Reclaims ~278 GB.
+
+### Fix: Dynamic Group Size for GPU Buffers
+GPU buffer allocation and auto-chunk-sizing now use the engine's actual `group_size` (e.g., 32 for Kimi K2.5) instead of the hardcoded `GROUP_SIZE = 128`. Prevents buffer underallocation for scale tensors.
+
+### Fix: Shared Expert Intermediate Size
+`_repack_shared_expert()` was using `N = intermediate_size` but shared experts have `N = n_shared_experts * intermediate_size`. Fixed to use `shared_N`.
+
+### RAM Watchdog Thread
+Background daemon thread in `model.py` checks `/proc/meminfo` every second. Exits with code 137 if available memory drops below 5% of total. Prevents full system OOM that kills desktop processes.
+
+### PyO3 Range-Based Weight Access
+Updated all `get_expert_*` methods in `src/moe.rs` to accept optional `start`/`end` range parameters. Added `get_shared_expert_weights()` method. Enables per-chunk data retrieval without copying all experts.
+
+### Test Results (V2-Lite)
+- Sanity test (CPU decode): 2/2 PASS — "2+2=4", counting 1-10
+- GPU prefill test (threshold=10): 3/3 PASS — math, counting, 320-token prompt
+- RAM watchdog: started successfully, no false triggers
+
+**Files changed:**
+- `src/weights/mod.rs`: malloc_trim after conversion
+- `src/syscheck.rs`: `get_rss_gib()`, `get_available_gib()`, `get_total_gib()` helpers
+- `src/moe.rs`: range-based PyO3 methods + `get_shared_expert_weights()`
+- `python/krasis/gpu_prefill.py`: on-the-fly repack, removed RAM caching
+- `python/krasis/model.py`: RAM watchdog thread, `_check_system_ram()`
+
+---
+
+## V2 Unified Cache + OOM Fix — 2026-02-11
+
+### Bug Fix: convert_to_unified() OOM
+`convert_to_unified()` created ALL unified weights (~507 GB) before freeing old weights (~507 GB),
+causing peak RAM of ~1014 GB on a 995 GB system → OOM crash.
+
+**Fix:** Process one layer at a time using `std::mem::take()`. Convert layer N → free old layer N → next.
+Peak RAM stays at ~515 GB (old format for remaining layers + one layer of new format).
+
+### V2 Unified Disk Cache
+The v1 cache stored expert weights in the old separate gate/up/down format.
+Loading v1 required runtime conversion to unified format.
+
+**Changes:**
+1. **V2 cache format (version=2)** — Stores unified weights (combined w13, transposed layout) directly.
+   Includes shared experts. Path: `.krasis_cache/experts_unified_int4_g{gs}.bin`
+2. **Cache loading priority**: v2 unified → v1 (convert + save v2 + delete v1) → fresh quantize
+3. **Auto-migration**: When v1 cache loaded, automatically converts layer-by-layer and saves v2 cache.
+   Old v1 cache is deleted after successful v2 write.
+4. **Fresh quantize path**: Now also converts to unified and saves v2 cache immediately.
+5. **Shared experts in cache**: V2 format includes shared experts (V2-Lite: 2 shared, Kimi K2.5: 1 shared).
+
+### Test Updates
+Updated 5 tests to work with unified-first format:
+- `test_load_v2_lite`: checks unified dimensions and non-zero weights
+- `test_cache_bit_exact`: validates v2 unified cache path and size
+- `test_v2_lite_single_expert`: uses `expert_forward_unified()`
+- `test_v2_lite_moe_forward`: dispatches to `moe_forward_unified()` when unified available
+- `test_shared_expert_v2_lite`: checks unified shared expert format
+- `test_async_submit_sync`: reference computed via unified path
+
+**Files changed:**
+- `src/weights/mod.rs`: layer-by-layer conversion, v2 cache save/load, cache migration, helper functions
+- `src/moe.rs`: updated tests for unified-first format
+
+---
+
+## GPU Prefill Crash Fix + Decode Speed Optimization — 2026-02-11
+
+### Phase 1: Fix GPU Prefill Crash at PP Boundary
+
+Root cause: `forward()` lazily called `prepare_layer()` on the first forward pass for GPU1,
+triggering 384-expert quantization via `gptq_marlin_repack()` CUDA kernels (~95s/layer) while
+in the middle of a forward pass, likely causing VRAM exhaustion.
+
+**Changes:**
+1. **`gpu_prefill.py`: Added `prepare_all_layers()` method** — Pre-loads all MoE layers from
+   disk cache at startup, avoiding lazy quantization during forward()
+2. **`gpu_prefill.py`: Reduced VRAM budget** — 50%→40% of free VRAM, minus 100 MB for
+   kernel intermediate allocations (fused_marlin_moe workspace)
+3. **`gpu_prefill.py`: Added `torch.cuda.synchronize(device)` before first kernel launch**
+4. **`model.py`: Call `prepare_all_layers()` in `_init_gpu_prefill()`** — Eagerly prepares
+   layers on each device before any forward pass
+
+### Phase 2: Decode Speed Optimization (target: 1.8→3.5-4.0 tok/s)
+
+| Change | File | Impact |
+|--------|------|--------|
+| Threads 16→48 | `model.py` | ~2x (main bottleneck) |
+| Gate diagnostics behind `KRASIS_DIAG=1` | `layer.py`, `model.py` | Eliminates 180+ `.item()` GPU syncs |
+| Remove explicit `synchronize()` | `layer.py` | ~6-12ms/token saved |
+| BF16 attention default | `config.py` | ~12ms/token saved (no INT8 quantize/dequant at M=1) |
+| `import numpy` at module level | `layer.py` | Clean import |
+
+**Changes:**
+1. **`model.py`: Default `krasis_threads` 16→48** — Matches KTransformers config
+2. **`layer.py` + `model.py`: `_DIAG_ENABLED = os.environ.get("KRASIS_DIAG") == "1"`** —
+   All diagnostic blocks (MoE per-layer logging, embedding/layer/logits diagnostics)
+   gated behind env var. Set `KRASIS_DIAG=1` to re-enable.
+3. **`layer.py`: Removed `torch.cuda.current_stream(self.device).synchronize()`** from
+   `_routed_expert_forward()` — `.cpu()` calls on the tensors below already handle sync
+4. **`config.py`: `QuantConfig.attention` default `"int8"`→`"bf16"`** — INT8 quantize/pad/dequant
+   overhead at M=1 decode outweighs the VRAM savings (+2.7 GB/GPU, still fits 16GB with FP8 KV)
+5. **`layer.py`: Moved `import numpy as np` to module level**
 
 ---
 

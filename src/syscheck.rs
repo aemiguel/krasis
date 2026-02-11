@@ -259,6 +259,51 @@ pub fn log_memory_usage(label: &str) {
     );
 }
 
+/// Get current process RSS in GiB by reading /proc/self/status.
+pub fn get_rss_gib() -> f64 {
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(content) => {
+            for line in content.lines() {
+                if line.starts_with("VmRSS:") {
+                    return parse_meminfo_value(line) as f64 / 1024.0 / 1024.0;
+                }
+            }
+            0.0
+        }
+        Err(_) => 0.0,
+    }
+}
+
+/// Get system available memory in GiB by reading /proc/meminfo.
+pub fn get_available_gib() -> f64 {
+    match std::fs::read_to_string("/proc/meminfo") {
+        Ok(content) => {
+            for line in content.lines() {
+                if line.starts_with("MemAvailable:") {
+                    return parse_meminfo_value(line) as f64 / 1024.0 / 1024.0;
+                }
+            }
+            0.0
+        }
+        Err(_) => 0.0,
+    }
+}
+
+/// Get total system memory in GiB.
+pub fn get_total_gib() -> f64 {
+    match std::fs::read_to_string("/proc/meminfo") {
+        Ok(content) => {
+            for line in content.lines() {
+                if line.starts_with("MemTotal:") {
+                    return parse_meminfo_value(line) as f64 / 1024.0 / 1024.0;
+                }
+            }
+            0.0
+        }
+        Err(_) => 0.0,
+    }
+}
+
 /// Python-callable system check function.
 #[pyfunction]
 pub fn system_check() -> PyResult<()> {

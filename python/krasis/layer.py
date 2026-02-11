@@ -12,8 +12,10 @@ For MoE layers, shared expert and routed experts overlap on GPU and CPU respecti
 """
 
 import logging
+import os
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import flashinfer
 
@@ -22,6 +24,9 @@ from krasis.kv_cache import PagedKVCache, SequenceKVState
 from krasis.weight_loader import int8_linear
 
 logger = logging.getLogger(__name__)
+
+# Gate per-MoE-layer diagnostics behind env var to avoid GPU sync overhead
+_DIAG_ENABLED = os.environ.get("KRASIS_DIAG", "") == "1"
 
 
 def _linear(x: torch.Tensor, weight_data) -> torch.Tensor:
@@ -213,21 +218,23 @@ class TransformerLayer:
         topk_weights = topk_weights.to(torch.float32)
         topk_ids = topk_ids.to(torch.int32)
 
-        # DIAG: per-MoE-layer logging for first N calls
-        if not hasattr(self, '_moe_call_count'):
-            self._moe_call_count = 0
-        self._moe_call_count += 1
-        diag_moe = self._moe_call_count <= 3  # first 3 forward passes
-        if diag_moe and moe_layer_idx is not None and M == 1:
-            h_rms = hidden.float().pow(2).mean().sqrt().item()
-            ids_list = topk_ids[0].tolist()
-            wts_list = [f"{w:.4f}" for w in topk_weights[0].tolist()]
-            wt_sum = topk_weights[0].sum().item()
-            logger.info(
-                "MOE-DIAG L%d call#%d: in_rms=%.4f ids=%s wts=[%s] wt_sum=%.4f",
-                moe_layer_idx, self._moe_call_count,
-                h_rms, ids_list, ",".join(wts_list), wt_sum,
-            )
+        # DIAG: per-MoE-layer logging for first N calls (gated behind KRASIS_DIAG=1)
+        diag_moe = False
+        if _DIAG_ENABLED:
+            if not hasattr(self, '_moe_call_count'):
+                self._moe_call_count = 0
+            self._moe_call_count += 1
+            diag_moe = self._moe_call_count <= 3  # first 3 forward passes
+            if diag_moe and moe_layer_idx is not None and M == 1:
+                h_rms = hidden.float().pow(2).mean().sqrt().item()
+                ids_list = topk_ids[0].tolist()
+                wts_list = [f"{w:.4f}" for w in topk_weights[0].tolist()]
+                wt_sum = topk_weights[0].sum().item()
+                logger.info(
+                    "MOE-DIAG L%d call#%d: in_rms=%.4f ids=%s wts=[%s] wt_sum=%.4f",
+                    moe_layer_idx, self._moe_call_count,
+                    h_rms, ids_list, ",".join(wts_list), wt_sum,
+                )
 
         # ── Dispatch: GPU prefill (large M) vs CPU decode (small M) ──
         if (
@@ -240,7 +247,7 @@ class TransformerLayer:
             # CPU path: Krasis engine handles routing + shared expert
             output = self._routed_expert_forward(hidden, topk_ids, topk_weights, moe_layer_idx)
 
-        if diag_moe and moe_layer_idx is not None and M == 1:
+        if _DIAG_ENABLED and diag_moe and moe_layer_idx is not None and M == 1:
             o_rms = output.float().pow(2).mean().sqrt().item()
             logger.info(
                 "MOE-DIAG L%d call#%d: out_rms=%.4f",
@@ -280,17 +287,12 @@ class TransformerLayer:
             routed_scaling_factor * Σ(w_i * expert_i(x)) + shared_expert(x)
         So the Python side just returns the Rust output directly.
         """
-        import numpy as np
-
         if self.krasis_engine is None:
             raise RuntimeError("Krasis engine not set for MoE layer")
 
         M = hidden.shape[0]
 
-        # Synchronize GPU before CPU reads
-        torch.cuda.current_stream(self.device).synchronize()
-
-        # GPU → CPU transfer
+        # GPU → CPU transfer (implicit sync via .cpu())
         act_cpu = hidden.detach().cpu().contiguous()
         ids_cpu = topk_ids.detach().cpu().contiguous()
         wts_cpu = topk_weights.detach().cpu().contiguous()

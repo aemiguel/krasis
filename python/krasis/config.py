@@ -14,7 +14,7 @@ class QuantConfig:
     layernorms, gate weight. These are either too quality-critical or too small.
     """
     lm_head: str = "int8"          # "bf16" or "int8"
-    attention: str = "int8"        # "bf16" or "int8" (q_a, q_b, kv_a, o_proj)
+    attention: str = "bf16"        # "bf16" or "int8" (q_a, q_b, kv_a, o_proj)
     shared_expert: str = "int8"    # "bf16" or "int8"
     dense_mlp: str = "int8"        # "bf16" or "int8"
     gpu_expert_bits: int = 4       # 4 or 8 for Marlin kernel

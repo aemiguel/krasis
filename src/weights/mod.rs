@@ -167,6 +167,7 @@ impl QuantWeight {
 }
 
 /// Quantized weights for a single expert (gate + up + down projections).
+/// Legacy format — separate projections in [N, K/8] layout.
 pub struct ExpertWeights {
     /// gate_proj: [moe_intermediate_size, hidden_size]
     pub gate: QuantWeight,
@@ -174,6 +175,107 @@ pub struct ExpertWeights {
     pub up: QuantWeight,
     /// down_proj: [hidden_size, moe_intermediate_size]
     pub down: QuantWeight,
+}
+
+/// Unified expert weights with combined w13 (gate+up) in transposed layout.
+///
+/// Layout: [K/8, N] — K (reduction dim) is outer, N (output dim) is contiguous.
+/// This enables SIMD across the output dimension (no horizontal sum needed).
+///
+/// Single copy in RAM shared by CPU decode and GPU prefill.
+pub struct UnifiedExpertWeights {
+    /// w13 (gate+up concatenated, transposed): packed INT4 in [K/8, 2*N] layout.
+    /// K = hidden_size (reduction dim), N = intermediate_size (output dim per gate/up).
+    /// First N columns are gate, next N columns are up.
+    pub w13_packed: Vec<u32>,
+    /// w13 scales: [K/group_size, 2*N] as BF16.
+    pub w13_scales: Vec<u16>,
+
+    /// w2 (down, transposed): packed INT4 in [K_down/8, N_down] layout.
+    /// K_down = intermediate_size (reduction dim), N_down = hidden_size (output dim).
+    pub w2_packed: Vec<u32>,
+    /// w2 scales: [K_down/group_size, N_down] as BF16.
+    pub w2_scales: Vec<u16>,
+
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub group_size: usize,
+}
+
+impl UnifiedExpertWeights {
+    /// Convert from separate gate/up/down ExpertWeights (INT4 only) to unified transposed format.
+    ///
+    /// Concatenates gate+up into w13, transposes both w13 and w2 from [N, K/8] to [K/8, N].
+    /// This is a pure rearrangement of packed u32 and scale u16 values — no re-quantization.
+    pub fn from_expert_weights(ew: &ExpertWeights) -> Self {
+        let gate = ew.gate.as_int4();
+        let up = ew.up.as_int4();
+        let down = ew.down.as_int4();
+
+        let hidden = gate.cols;       // K for w13
+        let intermediate = gate.rows; // N for w13 (per gate/up)
+        let group_size = gate.group_size;
+
+        let packed_k = hidden / 8;
+        let num_groups = hidden / group_size;
+        let two_n = 2 * intermediate;
+
+        // w13: concatenate gate[N, K/8] + up[N, K/8] → [2*N, K/8], then transpose → [K/8, 2*N]
+        let mut w13_packed = vec![0u32; packed_k * two_n];
+        for k in 0..packed_k {
+            for n in 0..intermediate {
+                // Gate weights: first N columns
+                w13_packed[k * two_n + n] = gate.packed[n * packed_k + k];
+                // Up weights: next N columns
+                w13_packed[k * two_n + intermediate + n] = up.packed[n * packed_k + k];
+            }
+        }
+
+        // w13 scales: [2*N, K/gs] → transpose → [K/gs, 2*N]
+        let mut w13_scales = vec![0u16; num_groups * two_n];
+        for g in 0..num_groups {
+            for n in 0..intermediate {
+                w13_scales[g * two_n + n] = gate.scales[n * num_groups + g];
+                w13_scales[g * two_n + intermediate + n] = up.scales[n * num_groups + g];
+            }
+        }
+
+        // w2 (down): [hidden, intermediate/8] → transpose → [intermediate/8, hidden]
+        let down_k = down.cols;        // intermediate_size (reduction for down)
+        let down_n = down.rows;        // hidden_size (output for down)
+        let down_packed_k = down_k / 8;
+        let down_num_groups = down_k / group_size;
+
+        let mut w2_packed = vec![0u32; down_packed_k * down_n];
+        for k in 0..down_packed_k {
+            for n in 0..down_n {
+                w2_packed[k * down_n + n] = down.packed[n * down_packed_k + k];
+            }
+        }
+
+        let mut w2_scales = vec![0u16; down_num_groups * down_n];
+        for g in 0..down_num_groups {
+            for n in 0..down_n {
+                w2_scales[g * down_n + n] = down.scales[n * down_num_groups + g];
+            }
+        }
+
+        UnifiedExpertWeights {
+            w13_packed,
+            w13_scales,
+            w2_packed,
+            w2_scales,
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            group_size,
+        }
+    }
+
+    /// Total bytes of weight data (packed + scales for w13 + w2).
+    pub fn data_bytes(&self) -> usize {
+        self.w13_packed.len() * 4 + self.w13_scales.len() * 2
+            + self.w2_packed.len() * 4 + self.w2_scales.len() * 2
+    }
 }
 
 /// Manages loaded expert weights for all MoE layers.
@@ -187,6 +289,11 @@ pub struct WeightStore {
     /// Shared expert is a single concatenated MLP with
     /// intermediate_size = n_shared_experts × moe_intermediate_size.
     pub shared_experts: Vec<ExpertWeights>,
+    /// Unified expert weights (transposed, combined w13 format).
+    /// Primary format for CPU decode. Populated after load via convert_to_unified().
+    pub experts_unified: Vec<Vec<UnifiedExpertWeights>>,
+    /// Unified shared expert weights.
+    pub shared_experts_unified: Vec<UnifiedExpertWeights>,
     /// Model configuration.
     pub config: ModelConfig,
     /// Group size used for quantization.
@@ -224,6 +331,7 @@ struct SafetensorsIndex {
 
 const CACHE_MAGIC: &[u8; 4] = b"KRAS";
 const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION_UNIFIED: u32 = 2;
 const CACHE_HEADER_SIZE: usize = 64;
 
 /// FNV-1a hash for cache invalidation.
@@ -236,11 +344,57 @@ fn fnv1a(data: &[u8]) -> u64 {
     h
 }
 
-/// Cache file path for a given model directory, bit width, and group size.
+/// Cache file path for v1 format (separate gate/up/down, [N, K/8] layout).
 fn cache_path(model_dir: &Path, num_bits: u8, group_size: usize) -> PathBuf {
     model_dir
         .join(".krasis_cache")
         .join(format!("experts_int{num_bits}_g{group_size}.bin"))
+}
+
+/// Cache file path for v2 unified format (combined w13, transposed [K/8, N] layout).
+fn cache_path_unified(model_dir: &Path, num_bits: u8, group_size: usize) -> PathBuf {
+    model_dir
+        .join(".krasis_cache")
+        .join(format!("experts_unified_int{num_bits}_g{group_size}.bin"))
+}
+
+/// Compute per-expert byte sizes for unified format.
+/// Returns (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes).
+fn unified_expert_byte_sizes(config: &ModelConfig, group_size: usize) -> (usize, usize, usize, usize) {
+    let h = config.hidden_size;
+    let m = config.moe_intermediate_size;
+    // w13 (gate+up concat, transposed): [K/8, 2*N] as u32
+    let w13_packed_bytes = (h / 8) * (2 * m) * 4;
+    let w13_scales_bytes = (h / group_size) * (2 * m) * 2;
+    // w2 (down, transposed): [K_down/8, N_down] as u32
+    let w2_packed_bytes = (m / 8) * h * 4;
+    let w2_scales_bytes = (m / group_size) * h * 2;
+    (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes)
+}
+
+/// Expected total v2 unified cache file size.
+fn expected_unified_cache_size(
+    config: &ModelConfig, group_size: usize, num_moe_layers: usize,
+    n_shared_experts: usize, shared_intermediate: usize,
+) -> usize {
+    let (w13pb, w13sb, w2pb, w2sb) = unified_expert_byte_sizes(config, group_size);
+    let per_routed_expert = w13pb + w13sb + w2pb + w2sb;
+    let routed_total = num_moe_layers * config.n_routed_experts * per_routed_expert;
+
+    // Shared experts (may have different intermediate size)
+    let shared_total = if n_shared_experts > 0 {
+        let shared_m = shared_intermediate;
+        let h = config.hidden_size;
+        let s_w13p = (h / 8) * (2 * shared_m) * 4;
+        let s_w13s = (h / group_size) * (2 * shared_m) * 2;
+        let s_w2p = (shared_m / 8) * h * 4;
+        let s_w2s = (shared_m / group_size) * h * 2;
+        num_moe_layers * (s_w13p + s_w13s + s_w2p + s_w2s)
+    } else {
+        0
+    };
+
+    CACHE_HEADER_SIZE + routed_total + shared_total
 }
 
 /// Compute per-expert byte sizes from config.
@@ -279,6 +433,8 @@ impl WeightStore {
         WeightStore {
             experts: Vec::new(),
             shared_experts: Vec::new(),
+            experts_unified: Vec::new(),
+            shared_experts_unified: Vec::new(),
             config: ModelConfig {
                 hidden_size: 0,
                 moe_intermediate_size: 0,
@@ -357,12 +513,79 @@ impl WeightStore {
 
         // Try loading from cache (only for full model loads — no start_layer or max_layers)
         let partial = max_layers.is_some() || start_layer.is_some();
-        if !partial {
+        if !partial && num_bits == 4 {
+            // Try v2 unified cache first (directly loads transposed + combined w13 format)
+            let upath = cache_path_unified(model_dir, num_bits, cache_gs);
+            if upath.exists() {
+                match Self::load_cache_unified(&upath, &config, cache_gs, num_moe_layers, config_hash) {
+                    Ok(store) => {
+                        let elapsed = start.elapsed();
+                        log::info!(
+                            "Loaded from unified cache in {:.1}s: {} MoE layers × {} experts (+ {} shared)",
+                            elapsed.as_secs_f64(),
+                            num_moe_layers,
+                            config.n_routed_experts,
+                            store.shared_experts_unified.len(),
+                        );
+                        return Ok(store);
+                    }
+                    Err(e) => {
+                        log::warn!("Unified cache invalid: {e}");
+                    }
+                }
+            }
+
+            // Try v1 cache — load in old format, then convert + save v2
+            let v1path = cache_path(model_dir, num_bits, cache_gs);
+            if v1path.exists() {
+                match Self::load_cache(&v1path, &config, cache_gs, num_bits, num_moe_layers, config_hash) {
+                    Ok(mut store) => {
+                        // Shared experts not in v1 cache — load them now
+                        if config.n_shared_experts > 0 {
+                            store.shared_experts = Self::load_shared_experts(
+                                model_dir, &config, store.group_size, num_bits, num_moe_layers,
+                            )?;
+                        }
+                        log::info!(
+                            "Loaded from v1 cache, converting to unified format layer-by-layer..."
+                        );
+                        // Convert to unified (layer-by-layer to avoid 2x RAM peak)
+                        store.convert_to_unified();
+
+                        // Save v2 unified cache for next time
+                        match store.save_cache_unified(&upath, config_hash) {
+                            Ok(()) => {
+                                log::info!("Saved unified cache to {}", upath.display());
+                                // Delete old v1 cache (no longer needed)
+                                if let Err(e) = std::fs::remove_file(&v1path) {
+                                    log::warn!("Failed to delete v1 cache: {e}");
+                                } else {
+                                    log::info!("Deleted v1 cache: {}", v1path.display());
+                                }
+                            }
+                            Err(e) => log::warn!("Failed to save unified cache: {e}"),
+                        }
+
+                        let elapsed = start.elapsed();
+                        log::info!(
+                            "Loaded (v1→unified) in {:.1}s: {} MoE layers × {} experts",
+                            elapsed.as_secs_f64(),
+                            num_moe_layers,
+                            config.n_routed_experts,
+                        );
+                        return Ok(store);
+                    }
+                    Err(e) => {
+                        log::warn!("v1 cache invalid, re-quantizing: {e}");
+                    }
+                }
+            }
+        } else if !partial {
+            // INT8: use v1 cache path (unified is INT4-only)
             let cpath = cache_path(model_dir, num_bits, cache_gs);
             if cpath.exists() {
                 match Self::load_cache(&cpath, &config, cache_gs, num_bits, num_moe_layers, config_hash) {
                     Ok(mut store) => {
-                        // Shared experts not in cache — load them now
                         if config.n_shared_experts > 0 {
                             store.shared_experts = Self::load_shared_experts(
                                 model_dir, &config, store.group_size, num_bits, num_moe_layers,
@@ -392,9 +615,11 @@ impl WeightStore {
         log::info!("[DIAG-RUST] load_and_quantize_all completed OK");
         crate::syscheck::log_memory_usage("[DIAG-RUST] after load_and_quantize_all");
 
-        let store = WeightStore {
+        let mut store = WeightStore {
             experts,
             shared_experts,
+            experts_unified: Vec::new(),
+            shared_experts_unified: Vec::new(),
             config: config.clone(),
             group_size: effective_group_size,
             num_bits,
@@ -402,10 +627,21 @@ impl WeightStore {
 
         // Save cache for next time (only for full model loads)
         if !partial {
-            let cpath = cache_path(model_dir, num_bits, effective_group_size);
-            match store.save_cache(&cpath, config_hash) {
-                Ok(()) => log::info!("Saved INT{num_bits} cache to {}", cpath.display()),
-                Err(e) => log::warn!("Failed to save cache: {e}"),
+            if num_bits == 4 {
+                // Convert to unified and save v2 cache
+                store.convert_to_unified();
+                let upath = cache_path_unified(model_dir, num_bits, effective_group_size);
+                match store.save_cache_unified(&upath, config_hash) {
+                    Ok(()) => log::info!("Saved unified cache to {}", upath.display()),
+                    Err(e) => log::warn!("Failed to save unified cache: {e}"),
+                }
+            } else {
+                // INT8: save v1 cache
+                let cpath = cache_path(model_dir, num_bits, effective_group_size);
+                match store.save_cache(&cpath, config_hash) {
+                    Ok(()) => log::info!("Saved INT{num_bits} cache to {}", cpath.display()),
+                    Err(e) => log::warn!("Failed to save cache: {e}"),
+                }
             }
         }
 
@@ -751,9 +987,206 @@ impl WeightStore {
         Ok(WeightStore {
             experts,
             shared_experts: Vec::new(), // loaded separately after cache
+            experts_unified: Vec::new(),
+            shared_experts_unified: Vec::new(),
             config: config.clone(),
             group_size,
             num_bits,
+        })
+    }
+
+    /// Write unified expert weights to a v2 cache file.
+    /// Includes both routed and shared experts.
+    fn save_cache_unified(&self, path: &Path, config_hash: u64) -> Result<(), String> {
+        if self.experts_unified.is_empty() {
+            return Err("No unified weights to save".to_string());
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create cache dir: {e}"))?;
+        }
+
+        let num_moe_layers = self.experts_unified.len();
+
+        // Write to temp file then rename (atomic)
+        let tmp_path = path.with_extension("bin.tmp");
+        let file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create cache file: {e}"))?;
+        let mut w = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+
+        // Header (64 bytes) — same layout as v1, version=2
+        w.write_all(CACHE_MAGIC)
+            .map_err(|e| format!("Write error: {e}"))?;
+        w.write_all(&CACHE_VERSION_UNIFIED.to_le_bytes())
+            .map_err(|e| format!("Write error: {e}"))?;
+        w.write_all(&(self.config.hidden_size as u64).to_le_bytes())
+            .map_err(|e| format!("Write error: {e}"))?;
+        w.write_all(&(self.config.moe_intermediate_size as u64).to_le_bytes())
+            .map_err(|e| format!("Write error: {e}"))?;
+        w.write_all(&(self.config.n_routed_experts as u64).to_le_bytes())
+            .map_err(|e| format!("Write error: {e}"))?;
+        w.write_all(&(num_moe_layers as u64).to_le_bytes())
+            .map_err(|e| format!("Write error: {e}"))?;
+        w.write_all(&(self.group_size as u64).to_le_bytes())
+            .map_err(|e| format!("Write error: {e}"))?;
+        w.write_all(&config_hash.to_le_bytes())
+            .map_err(|e| format!("Write error: {e}"))?;
+        w.write_all(&(self.config.n_shared_experts as u64).to_le_bytes()) // was reserved in v1
+            .map_err(|e| format!("Write error: {e}"))?;
+
+        let write_start = std::time::Instant::now();
+
+        // Write routed experts: for each (layer, expert): w13_packed, w13_scales, w2_packed, w2_scales
+        for (layer_idx, layer) in self.experts_unified.iter().enumerate() {
+            for expert in layer {
+                write_vec_u32(&mut w, &expert.w13_packed)?;
+                write_vec_u16(&mut w, &expert.w13_scales)?;
+                write_vec_u32(&mut w, &expert.w2_packed)?;
+                write_vec_u16(&mut w, &expert.w2_scales)?;
+            }
+            if (layer_idx + 1) % 10 == 0 {
+                log::info!("  Unified cache write: {}/{} layers", layer_idx + 1, num_moe_layers);
+            }
+        }
+
+        // Write shared experts (one per layer)
+        for shared in &self.shared_experts_unified {
+            write_vec_u32(&mut w, &shared.w13_packed)?;
+            write_vec_u16(&mut w, &shared.w13_scales)?;
+            write_vec_u32(&mut w, &shared.w2_packed)?;
+            write_vec_u16(&mut w, &shared.w2_scales)?;
+        }
+
+        w.flush().map_err(|e| format!("Flush error: {e}"))?;
+        drop(w);
+
+        // Atomic rename
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| format!("Failed to rename cache file: {e}"))?;
+
+        let elapsed = write_start.elapsed();
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        log::info!(
+            "Unified cache written: {:.1} GB in {:.1}s ({:.1} GB/s)",
+            size as f64 / 1e9,
+            elapsed.as_secs_f64(),
+            size as f64 / 1e9 / elapsed.as_secs_f64(),
+        );
+
+        Ok(())
+    }
+
+    /// Load unified expert weights from v2 cache file via mmap.
+    /// Returns a WeightStore with experts_unified populated directly (no conversion needed).
+    fn load_cache_unified(
+        path: &Path,
+        config: &ModelConfig,
+        group_size: usize,
+        num_moe_layers: usize,
+        config_hash: u64,
+    ) -> Result<Self, String> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("Failed to open unified cache: {e}"))?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| format!("Failed to mmap unified cache: {e}"))?;
+
+        // Validate header
+        if mmap.len() < CACHE_HEADER_SIZE {
+            return Err("Unified cache too small for header".to_string());
+        }
+        if &mmap[0..4] != CACHE_MAGIC {
+            return Err("Bad magic in unified cache".to_string());
+        }
+        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        if version != CACHE_VERSION_UNIFIED {
+            return Err(format!("Cache version {version}, expected {CACHE_VERSION_UNIFIED}"));
+        }
+
+        let h_hidden = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
+        let h_intermediate = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
+        let h_n_experts = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+        let h_num_layers = u64::from_le_bytes(mmap[32..40].try_into().unwrap()) as usize;
+        let h_group_size = u64::from_le_bytes(mmap[40..48].try_into().unwrap()) as usize;
+        let h_config_hash = u64::from_le_bytes(mmap[48..56].try_into().unwrap());
+        let h_n_shared = u64::from_le_bytes(mmap[56..64].try_into().unwrap()) as usize;
+
+        if h_hidden != config.hidden_size
+            || h_intermediate != config.moe_intermediate_size
+            || h_n_experts != config.n_routed_experts
+            || h_num_layers != num_moe_layers
+            || h_group_size != group_size
+        {
+            return Err("Unified cache header dimensions don't match config".to_string());
+        }
+        if h_config_hash != config_hash {
+            return Err("Config hash mismatch in unified cache".to_string());
+        }
+        if h_n_shared != config.n_shared_experts {
+            return Err(format!(
+                "Shared expert count mismatch: cache={h_n_shared}, config={}",
+                config.n_shared_experts,
+            ));
+        }
+
+        // Validate total file size
+        let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+        let expected = expected_unified_cache_size(
+            config, group_size, num_moe_layers, config.n_shared_experts, shared_intermediate,
+        );
+        if mmap.len() != expected {
+            return Err(format!(
+                "Unified cache size mismatch: expected {} bytes, got {}",
+                expected, mmap.len(),
+            ));
+        }
+
+        log::info!("Loading unified cache: {} (INT4)", path.display());
+        let load_start = std::time::Instant::now();
+        let mut offset = CACHE_HEADER_SIZE;
+
+        let h = config.hidden_size;
+        let m = config.moe_intermediate_size;
+
+        // Read routed experts
+        let mut experts_unified: Vec<Vec<UnifiedExpertWeights>> = Vec::with_capacity(num_moe_layers);
+        for layer_idx in 0..num_moe_layers {
+            let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
+            for _eidx in 0..config.n_routed_experts {
+                let expert = read_unified_expert(&mmap, &mut offset, h, m, group_size);
+                layer_experts.push(expert);
+            }
+            experts_unified.push(layer_experts);
+            if (layer_idx + 1) % 10 == 0 {
+                log::info!("  Unified cache read: {}/{} layers", layer_idx + 1, num_moe_layers);
+            }
+        }
+
+        // Read shared experts
+        let mut shared_experts_unified = Vec::with_capacity(config.n_shared_experts.min(1) * num_moe_layers);
+        for _layer_idx in 0..num_moe_layers {
+            if config.n_shared_experts > 0 {
+                let shared = read_unified_expert(&mmap, &mut offset, h, shared_intermediate, group_size);
+                shared_experts_unified.push(shared);
+            }
+        }
+
+        let elapsed = load_start.elapsed();
+        log::info!(
+            "Unified cache loaded: {:.1} GB in {:.1}s ({:.1} GB/s)",
+            mmap.len() as f64 / 1e9,
+            elapsed.as_secs_f64(),
+            mmap.len() as f64 / 1e9 / elapsed.as_secs_f64(),
+        );
+
+        Ok(WeightStore {
+            experts: Vec::new(),
+            shared_experts: Vec::new(),
+            experts_unified,
+            shared_experts_unified,
+            config: config.clone(),
+            group_size,
+            num_bits: 4,
         })
     }
 
@@ -927,7 +1360,236 @@ impl WeightStore {
 
     /// Number of MoE layers loaded.
     pub fn num_moe_layers(&self) -> usize {
-        self.experts.len()
+        if !self.experts_unified.is_empty() {
+            self.experts_unified.len()
+        } else {
+            self.experts.len()
+        }
+    }
+
+    /// Whether unified weights have been populated.
+    pub fn has_unified(&self) -> bool {
+        !self.experts_unified.is_empty()
+    }
+
+    /// Get unified expert weights for a given MoE layer and expert index.
+    /// Panics if convert_to_unified() has not been called.
+    pub fn get_expert_unified(&self, moe_layer_idx: usize, expert_idx: usize) -> &UnifiedExpertWeights {
+        &self.experts_unified[moe_layer_idx][expert_idx]
+    }
+
+    /// Get unified shared expert weights for a given MoE layer index.
+    /// Returns None if no shared experts or unified conversion not done.
+    pub fn get_shared_expert_unified(&self, moe_layer_idx: usize) -> Option<&UnifiedExpertWeights> {
+        self.shared_experts_unified.get(moe_layer_idx)
+    }
+
+    /// Convert all experts from separate gate/up/down format to unified w13+w2 transposed format.
+    ///
+    /// After conversion, drops the old `experts` and `shared_experts` to free ~50% RAM
+    /// (unified format is same size but replaces old format rather than duplicating).
+    ///
+    /// This is INT4-only. INT8 experts are not converted (unified kernel only supports INT4).
+    pub fn convert_to_unified(&mut self) {
+        if self.num_bits != 4 {
+            log::warn!("convert_to_unified() only supports INT4, skipping (num_bits={})", self.num_bits);
+            return;
+        }
+        if self.has_unified() {
+            log::info!("Already converted to unified format, skipping");
+            return;
+        }
+
+        let start = std::time::Instant::now();
+        let num_layers = self.experts.len();
+        let mut old_bytes: usize = 0;
+        let mut new_bytes: usize = 0;
+
+        // Convert layer by layer, freeing old format after each layer to avoid
+        // holding both copies in RAM simultaneously (~507 GB each for Kimi K2.5).
+        // Peak RAM = old format (remaining layers) + new format (converted layers)
+        // ≈ old format + one layer overhead during conversion.
+        self.experts_unified = Vec::with_capacity(num_layers);
+        for layer_idx in 0..num_layers {
+            // Take ownership of this layer's old weights (replaces with empty Vec)
+            let old_layer = std::mem::take(&mut self.experts[layer_idx]);
+
+            let mut unified_experts = Vec::with_capacity(old_layer.len());
+            for expert in &old_layer {
+                old_bytes += expert.gate.data_bytes() + expert.up.data_bytes() + expert.down.data_bytes();
+                let unified = UnifiedExpertWeights::from_expert_weights(expert);
+                new_bytes += unified.data_bytes();
+                unified_experts.push(unified);
+            }
+            // old_layer dropped here, freeing ~8.3 GB (Kimi K2.5) immediately
+            drop(old_layer);
+            self.experts_unified.push(unified_experts);
+
+            if (layer_idx + 1) % 10 == 0 || layer_idx + 1 == num_layers {
+                log::info!("  Unified conversion: {}/{} layers", layer_idx + 1, num_layers);
+            }
+        }
+        // All old layer data is freed; clear the outer Vec
+        self.experts = Vec::new();
+
+        // Convert shared experts (small, no layer-by-layer needed)
+        self.shared_experts_unified = Vec::with_capacity(self.shared_experts.len());
+        for shared in &self.shared_experts {
+            old_bytes += shared.gate.data_bytes() + shared.up.data_bytes() + shared.down.data_bytes();
+            let unified = UnifiedExpertWeights::from_expert_weights(shared);
+            new_bytes += unified.data_bytes();
+            self.shared_experts_unified.push(unified);
+        }
+        self.shared_experts = Vec::new();
+
+        // Force glibc to return freed pages to OS. Without this, glibc's allocator
+        // retains the ~572 GB of freed old-format memory in its arenas, causing RSS
+        // to be ~850 GB instead of ~572 GB.
+        #[cfg(target_os = "linux")]
+        {
+            let rss_before = crate::syscheck::get_rss_gib();
+            unsafe { libc::malloc_trim(0); }
+            let rss_after = crate::syscheck::get_rss_gib();
+            log::info!(
+                "malloc_trim: RSS {:.1} GiB → {:.1} GiB (reclaimed {:.1} GiB)",
+                rss_before, rss_after, rss_before - rss_after
+            );
+        }
+
+        let elapsed = start.elapsed();
+        log::info!(
+            "Converted to unified format in {:.1}s: old={:.1} GB → new={:.1} GB (freed {:.1} GB)",
+            elapsed.as_secs_f64(),
+            old_bytes as f64 / 1e9,
+            new_bytes as f64 / 1e9,
+            old_bytes as f64 / 1e9,
+        );
+    }
+
+    /// Migrate unified expert weights to NUMA nodes.
+    /// Returns the number of successfully migrated experts.
+    pub fn migrate_numa_unified(&mut self, map: &crate::numa::NumaExpertMap) -> usize {
+        use crate::numa::migrate_vec_to_node;
+
+        let start = std::time::Instant::now();
+        let mut migrated = 0;
+        let mut failed = 0;
+
+        for (layer_idx, layer) in self.experts_unified.iter_mut().enumerate() {
+            for (expert_idx, expert) in layer.iter_mut().enumerate() {
+                let node = map.node_for(layer_idx, expert_idx);
+
+                let ok = migrate_vec_to_node(&mut expert.w13_packed, node)
+                    && migrate_vec_to_node(&mut expert.w13_scales, node)
+                    && migrate_vec_to_node(&mut expert.w2_packed, node)
+                    && migrate_vec_to_node(&mut expert.w2_scales, node);
+
+                if ok {
+                    migrated += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        }
+
+        let elapsed = start.elapsed();
+        log::info!(
+            "NUMA migration (unified): {migrated} experts migrated, {failed} failed, in {:.1}s",
+            elapsed.as_secs_f64(),
+        );
+
+        migrated
+    }
+}
+
+/// Write a Vec<u32> as raw bytes to a writer.
+fn write_vec_u32<W: Write>(w: &mut W, data: &[u32]) -> Result<(), String> {
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+    };
+    w.write_all(bytes).map_err(|e| format!("Write u32 error: {e}"))
+}
+
+/// Write a Vec<u16> as raw bytes to a writer.
+fn write_vec_u16<W: Write>(w: &mut W, data: &[u16]) -> Result<(), String> {
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
+    };
+    w.write_all(bytes).map_err(|e| format!("Write u16 error: {e}"))
+}
+
+/// Read a UnifiedExpertWeights from mmap'd cache data at the given offset.
+fn read_unified_expert(
+    data: &[u8],
+    offset: &mut usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    group_size: usize,
+) -> UnifiedExpertWeights {
+    let h = hidden_size;
+    let m = intermediate_size;
+    let packed_k = h / 8;
+    let num_groups = h / group_size;
+    let two_n = 2 * m;
+
+    // w13_packed: [K/8, 2*N] as u32
+    let w13_packed_count = packed_k * two_n;
+    let mut w13_packed = vec![0u32; w13_packed_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w13_packed.as_mut_ptr() as *mut u8,
+            w13_packed_count * 4,
+        );
+    }
+    *offset += w13_packed_count * 4;
+
+    // w13_scales: [K/gs, 2*N] as u16
+    let w13_scales_count = num_groups * two_n;
+    let mut w13_scales = vec![0u16; w13_scales_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w13_scales.as_mut_ptr() as *mut u8,
+            w13_scales_count * 2,
+        );
+    }
+    *offset += w13_scales_count * 2;
+
+    // w2_packed: [K_down/8, N_down] = [m/8, h] as u32
+    let down_packed_k = m / 8;
+    let w2_packed_count = down_packed_k * h;
+    let mut w2_packed = vec![0u32; w2_packed_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w2_packed.as_mut_ptr() as *mut u8,
+            w2_packed_count * 4,
+        );
+    }
+    *offset += w2_packed_count * 4;
+
+    // w2_scales: [K_down/gs, N_down] = [m/gs, h] as u16
+    let down_num_groups = m / group_size;
+    let w2_scales_count = down_num_groups * h;
+    let mut w2_scales = vec![0u16; w2_scales_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w2_scales.as_mut_ptr() as *mut u8,
+            w2_scales_count * 2,
+        );
+    }
+    *offset += w2_scales_count * 2;
+
+    UnifiedExpertWeights {
+        w13_packed,
+        w13_scales,
+        w2_packed,
+        w2_scales,
+        hidden_size,
+        intermediate_size,
+        group_size,
     }
 }
 
@@ -1269,30 +1931,50 @@ mod tests {
         assert_eq!(store.config.hidden_size, 2048);
         assert_eq!(store.config.moe_intermediate_size, 1408);
 
-        // Check expert dimensions
-        let expert = store.get_expert(0, 0); // first MoE layer, expert 0
-        assert_eq!(expert.gate.rows(), 1408);
-        assert_eq!(expert.gate.cols(), 2048);
-        assert_eq!(expert.up.rows(), 1408);
-        assert_eq!(expert.up.cols(), 2048);
-        assert_eq!(expert.down.rows(), 2048);
-        assert_eq!(expert.down.cols(), 1408);
-
         eprintln!(
-            "V2-Lite loaded: {} MoE layers × {} experts",
+            "V2-Lite loaded: {} MoE layers × {} experts, unified={}",
             store.num_moe_layers(),
             store.config.n_routed_experts,
+            store.has_unified(),
         );
 
-        // Spot-check: dequantize one expert's gate_proj and verify SNR
-        let deq = marlin::dequantize_int4(expert.gate.as_int4());
-        let mut sum_sq: f64 = 0.0;
-        for &v in &deq {
-            sum_sq += (v as f64).powi(2);
+        // Check expert dimensions via unified format
+        if store.has_unified() {
+            let expert = store.get_expert_unified(0, 0);
+            assert_eq!(expert.hidden_size, 2048);
+            assert_eq!(expert.intermediate_size, 1408);
+            // w13_packed: [K/8, 2*N] = [256, 2816]
+            assert_eq!(expert.w13_packed.len(), (2048 / 8) * (2 * 1408));
+            // w2_packed: [K_down/8, N_down] = [176, 2048]
+            assert_eq!(expert.w2_packed.len(), (1408 / 8) * 2048);
+
+            // Spot-check: non-zero weights
+            assert!(
+                expert.w13_packed.iter().any(|&v| v != 0),
+                "Expert 0 w13_packed all zeros"
+            );
+            assert!(
+                expert.w13_scales.iter().any(|&v| v != 0),
+                "Expert 0 w13_scales all zeros"
+            );
+        } else {
+            let expert = store.get_expert(0, 0);
+            assert_eq!(expert.gate.rows(), 1408);
+            assert_eq!(expert.gate.cols(), 2048);
+            assert_eq!(expert.up.rows(), 1408);
+            assert_eq!(expert.up.cols(), 2048);
+            assert_eq!(expert.down.rows(), 2048);
+            assert_eq!(expert.down.cols(), 1408);
+
+            let deq = marlin::dequantize_int4(expert.gate.as_int4());
+            let mut sum_sq: f64 = 0.0;
+            for &v in &deq {
+                sum_sq += (v as f64).powi(2);
+            }
+            let rms = (sum_sq / deq.len() as f64).sqrt();
+            eprintln!("  Expert 0 gate_proj RMS: {rms:.6}");
+            assert!(rms > 0.001, "Expert weights look empty");
         }
-        let rms = (sum_sq / deq.len() as f64).sqrt();
-        eprintln!("  Expert 0 gate_proj RMS: {rms:.6}");
-        assert!(rms > 0.001, "Expert weights look empty");
     }
 
     #[test]
@@ -1304,35 +1986,45 @@ mod tests {
             return;
         }
 
-        // Load (will use cache if available, or quantize + create cache)
+        // Load (will use v2 unified cache if available, or v1→convert, or quantize)
         let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
             .expect("Failed to load V2-Lite");
 
-        // Verify cache file exists
-        let cpath = cache_path(model_dir, 4, DEFAULT_GROUP_SIZE);
-        assert!(cpath.exists(), "Cache file should exist after load");
+        // Verify unified cache file exists (v2 format)
+        let upath = cache_path_unified(model_dir, 4, DEFAULT_GROUP_SIZE);
+        assert!(upath.exists(), "Unified cache file should exist after load");
 
-        let size = std::fs::metadata(&cpath).unwrap().len();
-        let expected = expected_cache_size(&store.config, store.group_size, store.num_bits, store.num_moe_layers());
-        assert_eq!(size as usize, expected, "Cache file size mismatch");
+        let size = std::fs::metadata(&upath).unwrap().len();
+        let shared_intermediate = store.config.n_shared_experts * store.config.moe_intermediate_size;
+        let expected = expected_unified_cache_size(
+            &store.config, store.group_size, store.num_moe_layers(),
+            store.config.n_shared_experts, shared_intermediate,
+        );
+        assert_eq!(size as usize, expected, "Unified cache file size mismatch");
+
+        // Store should have unified weights
+        assert!(store.has_unified(), "Store should have unified format");
 
         // Spot-check multiple experts across layers for non-zero data
         for layer in [0, 12, 25] {
             for eidx in [0, 31, 63] {
-                let expert = store.get_expert(layer, eidx);
-                let gate = expert.gate.as_int4();
+                let expert = store.get_expert_unified(layer, eidx);
                 assert!(
-                    gate.packed.iter().any(|&v| v != 0),
-                    "Layer {layer} expert {eidx} gate packed all zeros"
+                    expert.w13_packed.iter().any(|&v| v != 0),
+                    "Layer {layer} expert {eidx} w13_packed all zeros"
                 );
                 assert!(
-                    gate.scales.iter().any(|&v| v != 0),
-                    "Layer {layer} expert {eidx} gate scales all zeros"
+                    expert.w13_scales.iter().any(|&v| v != 0),
+                    "Layer {layer} expert {eidx} w13_scales all zeros"
+                );
+                assert!(
+                    expert.w2_packed.iter().any(|&v| v != 0),
+                    "Layer {layer} expert {eidx} w2_packed all zeros"
                 );
             }
         }
 
-        eprintln!("Cache bit-exact verified: {:.1} GB", size as f64 / 1e9);
+        eprintln!("Unified cache verified: {:.1} GB", size as f64 / 1e9);
     }
 
     #[test]

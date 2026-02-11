@@ -49,10 +49,29 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 - [x] **routed_scaling_factor** — scale routed output before adding shared (V2-Lite: 1.0, Kimi K2.5: 2.827)
 - [x] **Model support**: V2-Lite (2 shared), Kimi K2.5 (1 shared), Qwen3 (0 shared, no-op)
 
+### Unified Weight Format
+- [x] **Combined w13 (gate+up)** — single matrix `[K/8, 2*N]` transposed layout, eliminates one matmul per expert
+- [x] **Transposed AVX2 integer kernel** — `_mm256_mullo_epi32` SIMD across output dim (no horizontal sum)
+- [x] **Transposed AVX2 FMA kernel** — `_mm256_fmadd_ps` variant for verification/fallback
+- [x] **Parallel transposed kernels** — rayon split across N dimension, chunk_n=256
+- [x] **UnifiedExpertWeights** — in-place conversion from gate/up/down, drops old format after
+- [x] **Layer-by-layer conversion** — converts one layer at a time, frees old format immediately (avoids 2x RAM peak)
+- [x] **V2 unified disk cache** — stores unified weights directly (`.krasis_cache/experts_unified_int4_g{gs}.bin`), includes shared experts
+- [x] **V1→V2 cache migration** — loads v1 cache, converts layer-by-layer, saves v2, deletes v1 automatically
+- [x] **moe_forward_unified** — full MoE forward with unified weights (parallel, NUMA, shared experts)
+- [x] **NTA prefetch for unified** — prefetch w13+w2 packed+scales into L3
+- [x] **Auto-dispatch** — engine.load() converts to unified, moe_forward auto-dispatches
+- [x] **Verified correct** — V2-Lite real weights max_abs_diff=0.000001 unified vs original
+
+### Safety & Monitoring
+- [x] **System RAM budget check** — estimates RAM before loading, refuses if >95% MemTotal
+- [x] **Post-load RSS check** — warns if actual RSS deviates >10% from estimate
+- [x] **force_load parameter** — override RAM check for testing
+
 ### Infrastructure
 - [x] **System checks** — CPU governor, hugepages, memory budget, NUMA, SIMD
 - [x] **MoE benchmark script** — `bench_moe.py` for latency profiling
-- [x] **34 Rust tests** — unit + integration, all passing
+- [x] **41 Rust tests** — unit + integration, all passing
 - [x] **3 Python bridge tests** — engine roundtrip, wrapper interface, batch forward
 
 ### GPU Prefill
@@ -62,6 +81,8 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 - [x] **Chunked expert processing** — handles models with many experts (e.g. 384) in VRAM-sized chunks
 - [x] **Shared expert GPU path** — shared expert forward via Marlin kernel with weight=1.0
 - [x] **Pre-quantized weight support** — dequantize compressed-tensors INT4 before re-quantizing to Marlin format
+- [x] **PyO3 weight exposure** — `get_expert_w13_packed/scales/w2_packed/scales` methods on KrasisEngine
+- [x] **Engine-backed GPU prefill** — GpuPrefillManager reads weights from Rust engine, repacks to Marlin on GPU. Eliminates ~438 GB Python RAM cache for Kimi K2.5
 
 ### Multi-GPU
 - [x] **Pipeline parallelism** — PP=2 verified on Kimi K2.5 (GPU0: 31 layers, GPU1: 30 layers)
@@ -95,9 +116,12 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 | Qwen3-235B | KTransformers PP=3 | 4.21 tok/s | — | — | With expert pinning |
 
 ### Current Blockers
-- **GPU prefill crashes at PP boundary** — CUDA illegal memory access when Marlin kernel runs on GPU1 for first time (layer 31). Debugging with sync points + CUDA_LAUNCH_BLOCKING. See CHANGELOG for details.
-- **GPUs need reboot** — GPU0 in error state from crash, corrupted CUDA driver for all GPUs
+- **GPU prefill crashes at PP boundary** — CUDA illegal memory access when Marlin kernel runs on GPU1 for first time (layer 31). Debugging with sync points + CUDA_LAUNCH_BLOCKING.
+- ~~**GPUs need reboot**~~ — FIXED: GPUs rebooted and operational
 - **Decode speed gap** — 1.2-1.9 tok/s vs 4.0 tok/s baseline (BF16 weights + diag overhead, not yet optimized)
+- ~~**OOM from dual weight copies**~~ — FIXED: unified weight format eliminates separate Python Marlin cache (~438 GB savings for Kimi K2.5)
+- ~~**OOM from conversion peak**~~ — FIXED: layer-by-layer conversion avoids holding old+new formats simultaneously
+- ~~**Stale v1 disk cache**~~ — FIXED: auto-migrates v1→v2 cache, stores unified format directly with shared experts
 
 ## Target Architecture
 
