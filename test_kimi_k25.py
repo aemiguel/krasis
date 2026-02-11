@@ -42,14 +42,13 @@ def main():
     logger.info("Loading Kimi K2.5 PP=2...")
     t0 = time.perf_counter()
 
-    # Default QuantConfig: INT8 attention, INT8 shared expert, INT8 dense MLP, INT8 lm_head
-    # This is the production config — halves GPU VRAM vs BF16
-    qcfg = QuantConfig()  # all defaults: int8 everywhere
+    # Default QuantConfig: BF16 attention, INT8 shared expert, INT8 dense MLP, INT8 lm_head
+    qcfg = QuantConfig()  # defaults: bf16 attention, int8 elsewhere
     model = KrasisModel(
         model_path=MODEL_PATH,
         num_gpus=2,
         gpu_prefill=True,
-        krasis_threads=16,
+        # krasis_threads defaults to 48 (matching KTransformers)
         quant_cfg=qcfg,
         kv_dtype=torch.float8_e4m3fn,
     )

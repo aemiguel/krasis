@@ -102,6 +102,7 @@ class GpuPrefillManager:
         first_k_dense: int = 0,
         chunk_size: Optional[int] = None,
         num_bits: int = 4,
+        krasis_engine=None,
     ):
         self.model_path = model_path
         self.device = device
@@ -113,6 +114,14 @@ class GpuPrefillManager:
         self.routed_scaling_factor = routed_scaling_factor
         self.first_k_dense = first_k_dense
         self.num_bits = num_bits
+        self._engine = krasis_engine
+
+        # Use engine's group_size if available, else default 128
+        if krasis_engine is not None:
+            self._group_size = krasis_engine.group_size()
+        else:
+            self._group_size = GROUP_SIZE
+        logger.info("GPU prefill group_size=%d", self._group_size)
 
         # Chunk size: how many experts fit in one GPU buffer load
         if chunk_size is None:
@@ -121,9 +130,10 @@ class GpuPrefillManager:
         self.num_chunks = (num_experts + self.chunk_size - 1) // self.chunk_size
 
         # RAM cache: layer_idx -> {w13_packed, w13_scale, w2_packed, w2_scale}
+        # Only used when krasis_engine is None (legacy safetensors path)
         self._cache: dict[int, dict[str, torch.Tensor]] = {}
 
-        # Safetensors index (lazy loaded)
+        # Safetensors index (lazy loaded, legacy path only)
         self._weight_map: Optional[dict[str, str]] = None
         self._shards: dict[str, object] = {}
         self._layers_prefix: Optional[str] = None
@@ -137,13 +147,14 @@ class GpuPrefillManager:
         self._gpu_sort_idx: Optional[torch.Tensor] = None
         self._workspace: Optional[torch.Tensor] = None
 
-        # Shared expert GPU cache (separate from chunked buffer)
+        # Shared expert GPU cache (separate from chunked buffer, legacy path only)
         self._shared_cache: dict[int, dict[str, torch.Tensor]] = {}
 
+        mode = "engine" if self._engine is not None else "safetensors"
         logger.info(
-            "GpuPrefillManager: experts=%d, hidden=%d, intermediate=%d, "
+            "GpuPrefillManager(%s): experts=%d, hidden=%d, intermediate=%d, "
             "chunk_size=%d, num_chunks=%d, shared=%d, scale=%.3f, num_bits=%d",
-            num_experts, hidden_size, intermediate_size,
+            mode, num_experts, hidden_size, intermediate_size,
             self.chunk_size, self.num_chunks,
             n_shared_experts, routed_scaling_factor, num_bits,
         )
@@ -154,19 +165,22 @@ class GpuPrefillManager:
     def _auto_chunk_size(self) -> int:
         """Estimate chunk size that fits in available VRAM."""
         # Per-expert VRAM for Marlin:
-        # w13: [K//16, 2*N*(num_bits//2)] int32 + [K//128, 2*N] scale
-        # w2: [N//16, K*(num_bits//2)] int32 + [N//128, K] scale
+        # w13: [K//16, 2*N*(num_bits//2)] int32 + [K//gs, 2*N] scale
+        # w2: [N//16, K*(num_bits//2)] int32 + [N//gs, K] scale
         K = self.hidden_size
         N = self.intermediate_size
+        gs = self._group_size
         nb2 = self.num_bits // 2  # 2 for INT4, 4 for INT8
-        w13_bytes = (K // 16) * (2 * N * nb2) * 4 + (K // GROUP_SIZE) * (2 * N) * 2
-        w2_bytes = (N // 16) * (K * nb2) * 4 + (N // GROUP_SIZE) * K * 2
+        w13_bytes = (K // 16) * (2 * N * nb2) * 4 + (K // gs) * (2 * N) * 2
+        w2_bytes = (N // 16) * (K * nb2) * 4 + (N // gs) * K * 2
         per_expert = w13_bytes + w2_bytes
 
         try:
             free_vram = torch.cuda.mem_get_info(self.device)[0]
-            # Use at most 50% of free VRAM for expert buffer
-            budget = int(free_vram * 0.5)
+            # Use at most 40% of free VRAM for expert buffer,
+            # minus 100 MB for kernel intermediate allocations
+            # (fused_marlin_moe allocates M * topk * max(2N, K) * 2 bytes)
+            budget = int(free_vram * 0.4) - 100 * 1024 * 1024
             chunk = max(1, budget // per_expert)
             chunk = min(chunk, self.num_experts)
             logger.info(
@@ -177,6 +191,79 @@ class GpuPrefillManager:
         except Exception:
             # Fallback: 32 experts per chunk
             return min(32, self.num_experts)
+
+    def prepare_all_layers(self):
+        """Pre-prepare all MoE layers at startup.
+
+        Engine path: no-op. Weights are read from Rust engine and repacked
+        to Marlin on-the-fly per chunk during forward(). Zero RAM cache.
+
+        Legacy mode: loads from disk cache to avoid lazy quantization during
+        the first forward() call.
+        """
+        if self._engine is not None:
+            logger.info("Engine path: GPU prefill uses on-the-fly Marlin repack (zero RAM cache)")
+            return
+
+        first_k = self.first_k_dense
+        total_moe = self.num_experts  # This is num_experts, not num_moe_layers
+        # We need the caller to tell us how many MoE layers there are.
+        # Discover from disk cache:
+        cache_dir = Path(self.model_path) / ".marlin_cache" / f"b{self.num_bits}"
+        if not cache_dir.exists():
+            logger.warning("No Marlin disk cache found at %s — layers will be prepared lazily", cache_dir)
+            return
+
+        prepared = 0
+        failed = 0
+        for cache_file in sorted(cache_dir.glob("layer*_routed.pt")):
+            # Parse layer index from filename: layer{N}_routed.pt
+            name = cache_file.stem  # e.g. "layer1_routed"
+            try:
+                abs_layer_idx = int(name.split("_")[0].replace("layer", ""))
+                moe_layer_idx = abs_layer_idx - first_k
+            except (ValueError, IndexError):
+                continue
+
+            if moe_layer_idx < 0:
+                continue
+            if moe_layer_idx in self._cache:
+                prepared += 1
+                continue
+
+            disk_data = self._load_from_disk(moe_layer_idx)
+            if disk_data is not None:
+                self._cache[moe_layer_idx] = disk_data
+                prepared += 1
+            else:
+                failed += 1
+
+        # Also prepare shared experts
+        shared_prepared = 0
+        for cache_file in sorted(cache_dir.glob("layer*_shared.pt")):
+            name = cache_file.stem
+            try:
+                abs_layer_idx = int(name.split("_")[0].replace("layer", ""))
+                moe_layer_idx = abs_layer_idx - first_k
+            except (ValueError, IndexError):
+                continue
+
+            if moe_layer_idx < 0:
+                continue
+            if moe_layer_idx in self._shared_cache:
+                shared_prepared += 1
+                continue
+
+            disk_data = self._load_from_disk(moe_layer_idx, kind="shared")
+            if disk_data is not None:
+                self._shared_cache[moe_layer_idx] = disk_data
+                shared_prepared += 1
+
+        logger.info(
+            "prepare_all_layers: %d routed + %d shared layers loaded from disk cache "
+            "(%d failed) on %s",
+            prepared, shared_prepared, failed, self.device,
+        )
 
     def _ensure_index(self):
         """Load safetensors index and detect expert prefix (lazy)."""
@@ -251,6 +338,7 @@ class GpuPrefillManager:
         K = self.hidden_size
         N = self.intermediate_size
         E = self.chunk_size
+        gs = self._group_size
         nb2 = self.num_bits // 2  # 2 for INT4, 4 for INT8
 
         # w13 (gate+up combined): [E, K//16, 2*N*nb2]
@@ -258,9 +346,9 @@ class GpuPrefillManager:
             E, K // 16, 2 * N * nb2,
             dtype=torch.int32, device=self.device,
         )
-        # w13 scale: [E, K//GROUP_SIZE, 2*N]
+        # w13 scale: [E, K//gs, 2*N]
         self._gpu_w13_scale = torch.zeros(
-            E, K // GROUP_SIZE, 2 * N,
+            E, K // gs, 2 * N,
             dtype=self.params_dtype, device=self.device,
         )
         # w2 (down): [E, N//16, K*nb2]
@@ -268,9 +356,9 @@ class GpuPrefillManager:
             E, N // 16, K * nb2,
             dtype=torch.int32, device=self.device,
         )
-        # w2 scale: [E, N//GROUP_SIZE, K]
+        # w2 scale: [E, N//gs, K]
         self._gpu_w2_scale = torch.zeros(
-            E, N // GROUP_SIZE, K,
+            E, N // gs, K,
             dtype=self.params_dtype, device=self.device,
         )
         # Empty g_idx and sort_indices (no activation ordering)
@@ -331,6 +419,9 @@ class GpuPrefillManager:
         if disk_data is not None:
             self._cache[moe_layer_idx] = disk_data
             return
+
+        # Set device for CUDA kernel calls (gptq_marlin_repack)
+        torch.cuda.set_device(self.device)
 
         self._ensure_index()
         layer_idx = moe_layer_idx + self.first_k_dense
@@ -430,6 +521,9 @@ class GpuPrefillManager:
             self._shared_cache[moe_layer_idx] = disk_data
             return
 
+        # Set device for CUDA kernel calls (gptq_marlin_repack)
+        torch.cuda.set_device(self.device)
+
         self._ensure_index()
         layer_idx = moe_layer_idx + self.first_k_dense
 
@@ -500,13 +594,12 @@ class GpuPrefillManager:
             fused_marlin_moe,
         )
 
+        # sgl_kernel's moe_sum_reduce launches on the current CUDA device,
+        # not the tensor's device. Must set device explicitly for multi-GPU.
+        torch.cuda.set_device(self.device)
+
         self._allocate_gpu_buffer()
 
-        # Ensure this layer is prepared
-        if moe_layer_idx not in self._cache:
-            self.prepare_layer(moe_layer_idx)
-
-        cache = self._cache[moe_layer_idx]
         M = hidden_states.shape[0]
         x = hidden_states
 
@@ -514,26 +607,184 @@ class GpuPrefillManager:
         debug_sync = os.environ.get("KRASIS_DEBUG_SYNC", "") == "1"
 
         if debug_sync:
-            # Verify all inputs are on the correct device
             for name, t in [("hidden", x), ("topk_ids", topk_ids), ("topk_weights", topk_weights)]:
                 if t.device != self.device:
                     logger.error("DEVICE MISMATCH: %s on %s, expected %s", name, t.device, self.device)
             logger.info("forward() moe_layer=%d M=%d device=%s chunks=%d",
                         moe_layer_idx, M, self.device, self.num_chunks)
 
+        torch.cuda.synchronize(self.device)
+
+        if self._engine is not None:
+            output = self._forward_engine(moe_layer_idx, x, topk_ids, topk_weights, debug_sync)
+        else:
+            # Legacy safetensors path with RAM cache
+            if moe_layer_idx not in self._cache:
+                self.prepare_layer(moe_layer_idx)
+            cache = self._cache[moe_layer_idx]
+            output = self._forward_cached(cache, x, topk_ids, topk_weights, debug_sync)
+
+        # Apply routed scaling factor and add shared expert
+        if self.n_shared_experts > 0:
+            if debug_sync:
+                torch.cuda.synchronize(self.device)
+                logger.info("  pre-shared-expert sync OK")
+            shared_output = self._shared_expert_forward(moe_layer_idx, x)
+            if debug_sync:
+                torch.cuda.synchronize(self.device)
+                logger.info("  post-shared-expert sync OK")
+            output = self.routed_scaling_factor * output + shared_output
+        elif self.routed_scaling_factor != 1.0:
+            output *= self.routed_scaling_factor
+
+        return output
+
+    def _repack_chunk_from_engine(
+        self,
+        moe_layer_idx: int,
+        chunk_start: int,
+        chunk_end: int,
+    ):
+        """Get raw INT4 packed data from Rust engine for a chunk of experts,
+        repack to Marlin format on GPU, and load into GPU buffer.
+
+        This is called per-chunk during forward() with ZERO caching.
+        Temporary CPU data is freed immediately after GPU upload.
+        """
+        from sglang.srt.layers.quantization.gptq import gptq_marlin_repack
+        from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
+
+        K = self.hidden_size
+        N = self.intermediate_size
+        gs = self._engine.group_size()
+        actual = chunk_end - chunk_start
+
+        # Get raw bytes from Rust for just this chunk (zero-copy Rust→Python)
+        w13_packed_bytes = self._engine.get_expert_w13_packed(moe_layer_idx, chunk_start, chunk_end)
+        w13_scales_bytes = self._engine.get_expert_w13_scales(moe_layer_idx, chunk_start, chunk_end)
+        w2_packed_bytes = self._engine.get_expert_w2_packed(moe_layer_idx, chunk_start, chunk_end)
+        w2_scales_bytes = self._engine.get_expert_w2_scales(moe_layer_idx, chunk_start, chunk_end)
+
+        # Reshape into CPU tensors
+        w13_packed_cpu = torch.frombuffer(
+            bytearray(w13_packed_bytes), dtype=torch.int32
+        ).reshape(actual, K // 8, 2 * N)
+        w13_scales_cpu = torch.frombuffer(
+            bytearray(w13_scales_bytes), dtype=torch.bfloat16
+        ).reshape(actual, K // gs, 2 * N)
+        w2_packed_cpu = torch.frombuffer(
+            bytearray(w2_packed_bytes), dtype=torch.int32
+        ).reshape(actual, N // 8, K)
+        w2_scales_cpu = torch.frombuffer(
+            bytearray(w2_scales_bytes), dtype=torch.bfloat16
+        ).reshape(actual, N // gs, K)
+
+        perm = torch.empty(0, dtype=torch.int32, device=self.device)
+
+        # Repack each expert directly into GPU buffer
+        for i in range(actual):
+            w13_gpu = w13_packed_cpu[i].to(self.device)
+            w13_repacked = gptq_marlin_repack(w13_gpu, perm, K, 2 * N, self.num_bits)
+            w13_scale_gpu = w13_scales_cpu[i].to(self.device)
+            w13_scale_perm = marlin_permute_scales(w13_scale_gpu, K, 2 * N, gs)
+
+            self._gpu_w13_packed[i].copy_(w13_repacked)
+            self._gpu_w13_scale[i].copy_(w13_scale_perm)
+
+            w2_gpu = w2_packed_cpu[i].to(self.device)
+            w2_repacked = gptq_marlin_repack(w2_gpu, perm, N, K, self.num_bits)
+            w2_scale_gpu = w2_scales_cpu[i].to(self.device)
+            w2_scale_perm = marlin_permute_scales(w2_scale_gpu, N, K, gs)
+
+            self._gpu_w2_packed[i].copy_(w2_repacked)
+            self._gpu_w2_scale[i].copy_(w2_scale_perm)
+        # CPU tensors freed when function returns
+
+    def _forward_engine(
+        self,
+        moe_layer_idx: int,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        debug_sync: bool,
+    ) -> torch.Tensor:
+        """Forward using on-the-fly Marlin repack from Rust engine. Zero RAM cache."""
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
+        M = x.shape[0]
+        output = torch.zeros(M, self.hidden_size, dtype=x.dtype, device=self.device)
+        gating_output = torch.empty(M, self.chunk_size, device=self.device)
+
+        for chunk_idx in range(self.num_chunks):
+            start = chunk_idx * self.chunk_size
+            end = min(start + self.chunk_size, self.num_experts)
+            actual = end - start
+
+            # Repack this chunk from engine → GPU buffer (on-the-fly, no caching)
+            self._repack_chunk_from_engine(moe_layer_idx, start, end)
+
+            # Remap expert IDs for this chunk
+            chunk_mask = (topk_ids >= start) & (topk_ids < end)
+            chunk_ids = torch.where(chunk_mask, topk_ids - start, torch.zeros_like(topk_ids))
+            chunk_weights = torch.where(chunk_mask, topk_weights, torch.zeros_like(topk_weights))
+
+            self._workspace.zero_()
+
+            if debug_sync:
+                torch.cuda.synchronize(self.device)
+                logger.info("  chunk %d/%d: actual=%d, pre-kernel sync OK",
+                            chunk_idx, self.num_chunks, actual)
+
+            chunk_output = fused_marlin_moe(
+                hidden_states=x,
+                w1=self._gpu_w13_packed[:actual],
+                w2=self._gpu_w2_packed[:actual],
+                w1_scale=self._gpu_w13_scale[:actual],
+                w2_scale=self._gpu_w2_scale[:actual],
+                gating_output=gating_output[:, :actual],
+                topk_weights=chunk_weights,
+                topk_ids=chunk_ids,
+                global_num_experts=actual,
+                expert_map=None,
+                g_idx1=self._gpu_g_idx[:actual],
+                g_idx2=self._gpu_g_idx[:actual],
+                sort_indices1=self._gpu_sort_idx[:actual],
+                sort_indices2=self._gpu_sort_idx[:actual],
+                workspace=self._workspace,
+                num_bits=self.num_bits,
+                is_k_full=True,
+            ).to(x.dtype)
+
+            if debug_sync:
+                torch.cuda.synchronize(self.device)
+                logger.info("  chunk %d/%d: post-kernel sync OK", chunk_idx, self.num_chunks)
+
+            output += chunk_output
+
+        return output
+
+    def _forward_cached(
+        self,
+        cache: dict,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        debug_sync: bool,
+    ) -> torch.Tensor:
+        """Forward using pre-cached Marlin weights in RAM (legacy path)."""
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
+        M = x.shape[0]
+
         if self.num_chunks == 1:
-            # Fast path: all experts fit in one buffer
             self._gpu_w13_packed.copy_(cache["w13_packed"])
             self._gpu_w13_scale.copy_(cache["w13_scale"])
             self._gpu_w2_packed.copy_(cache["w2_packed"])
             self._gpu_w2_scale.copy_(cache["w2_scale"])
 
-            # Fake gating_output (only used for shape assertion inside kernel)
             gating_output = torch.empty(M, self.num_experts, device=self.device)
-
-            if debug_sync:
-                torch.cuda.synchronize(self.device)
-                logger.info("  pre-kernel sync OK (1-chunk)")
 
             output = fused_marlin_moe(
                 hidden_states=x,
@@ -554,12 +805,7 @@ class GpuPrefillManager:
                 num_bits=self.num_bits,
                 is_k_full=True,
             ).to(x.dtype)
-
-            if debug_sync:
-                torch.cuda.synchronize(self.device)
-                logger.info("  post-kernel sync OK (1-chunk)")
         else:
-            # Multi-chunk: process experts in chunks, accumulate output
             output = torch.zeros(M, self.hidden_size, dtype=x.dtype, device=self.device)
             gating_output = torch.empty(M, self.chunk_size, device=self.device)
 
@@ -568,24 +814,16 @@ class GpuPrefillManager:
                 end = min(start + self.chunk_size, self.num_experts)
                 actual = end - start
 
-                # Load chunk into GPU buffer
                 self._gpu_w13_packed[:actual].copy_(cache["w13_packed"][start:end])
                 self._gpu_w13_scale[:actual].copy_(cache["w13_scale"][start:end])
                 self._gpu_w2_packed[:actual].copy_(cache["w2_packed"][start:end])
                 self._gpu_w2_scale[:actual].copy_(cache["w2_scale"][start:end])
 
-                # Remap expert IDs for this chunk
                 chunk_mask = (topk_ids >= start) & (topk_ids < end)
                 chunk_ids = torch.where(chunk_mask, topk_ids - start, torch.zeros_like(topk_ids))
                 chunk_weights = torch.where(chunk_mask, topk_weights, torch.zeros_like(topk_weights))
 
-                # Zero workspace between chunks to avoid stale state
                 self._workspace.zero_()
-
-                if debug_sync:
-                    torch.cuda.synchronize(self.device)
-                    logger.info("  chunk %d/%d: actual=%d, pre-kernel sync OK",
-                                chunk_idx, self.num_chunks, actual)
 
                 chunk_output = fused_marlin_moe(
                     hidden_states=x,
@@ -607,24 +845,7 @@ class GpuPrefillManager:
                     is_k_full=True,
                 ).to(x.dtype)
 
-                if debug_sync:
-                    torch.cuda.synchronize(self.device)
-                    logger.info("  chunk %d/%d: post-kernel sync OK", chunk_idx, self.num_chunks)
-
                 output += chunk_output
-
-        # Apply routed scaling factor and add shared expert
-        if self.n_shared_experts > 0:
-            if debug_sync:
-                torch.cuda.synchronize(self.device)
-                logger.info("  pre-shared-expert sync OK")
-            shared_output = self._shared_expert_forward(moe_layer_idx, x)
-            if debug_sync:
-                torch.cuda.synchronize(self.device)
-                logger.info("  post-shared-expert sync OK")
-            output = self.routed_scaling_factor * output + shared_output
-        elif self.routed_scaling_factor != 1.0:
-            output *= self.routed_scaling_factor
 
         return output
 
@@ -641,17 +862,19 @@ class GpuPrefillManager:
             marlin_make_workspace,
         )
 
-        if moe_layer_idx not in self._shared_cache:
-            self.prepare_shared_expert(moe_layer_idx)
-
-        cache = self._shared_cache[moe_layer_idx]
         M = hidden_states.shape[0]
 
-        # Load shared expert to GPU (single expert)
-        w13_packed = cache["w13_packed"].to(self.device)
-        w13_scale = cache["w13_scale"].to(self.device)
-        w2_packed = cache["w2_packed"].to(self.device)
-        w2_scale = cache["w2_scale"].to(self.device)
+        if self._engine is not None:
+            # On-the-fly repack from engine (single expert, tiny)
+            w13_packed, w13_scale, w2_packed, w2_scale = self._repack_shared_expert(moe_layer_idx)
+        else:
+            if moe_layer_idx not in self._shared_cache:
+                self.prepare_shared_expert(moe_layer_idx)
+            cache = self._shared_cache[moe_layer_idx]
+            w13_packed = cache["w13_packed"].to(self.device)
+            w13_scale = cache["w13_scale"].to(self.device)
+            w2_packed = cache["w2_packed"].to(self.device)
+            w2_scale = cache["w2_scale"].to(self.device)
 
         g_idx = torch.empty(1, 0, dtype=torch.int32, device=self.device)
         sort_idx = torch.empty(1, 0, dtype=torch.int32, device=self.device)
@@ -683,6 +906,32 @@ class GpuPrefillManager:
         ).to(hidden_states.dtype)
 
         return output
+
+    def _repack_shared_expert(self, moe_layer_idx: int):
+        """Repack shared expert from engine to Marlin on GPU. No caching."""
+        from sglang.srt.layers.quantization.gptq import gptq_marlin_repack
+        from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
+
+        K = self.hidden_size
+        # Shared expert intermediate = n_shared_experts * intermediate_size
+        shared_N = self.n_shared_experts * self.intermediate_size
+        gs = self._engine.group_size()
+
+        w13p_bytes, w13s_bytes, w2p_bytes, w2s_bytes = self._engine.get_shared_expert_weights(moe_layer_idx)
+
+        w13p = torch.frombuffer(bytearray(w13p_bytes), dtype=torch.int32).reshape(K // 8, 2 * shared_N)
+        w13s = torch.frombuffer(bytearray(w13s_bytes), dtype=torch.bfloat16).reshape(K // gs, 2 * shared_N)
+        w2p = torch.frombuffer(bytearray(w2p_bytes), dtype=torch.int32).reshape(shared_N // 8, K)
+        w2s = torch.frombuffer(bytearray(w2s_bytes), dtype=torch.bfloat16).reshape(shared_N // gs, K)
+
+        perm = torch.empty(0, dtype=torch.int32, device=self.device)
+
+        w13_packed = gptq_marlin_repack(w13p.to(self.device), perm, K, 2 * shared_N, self.num_bits).unsqueeze(0)
+        w13_scale = marlin_permute_scales(w13s.to(self.device), K, 2 * shared_N, gs).unsqueeze(0)
+        w2_packed = gptq_marlin_repack(w2p.to(self.device), perm, shared_N, K, self.num_bits).unsqueeze(0)
+        w2_scale = marlin_permute_scales(w2s.to(self.device), shared_N, K, gs).unsqueeze(0)
+
+        return w13_packed, w13_scale, w2_packed, w2_scale
 
     def is_layer_cached(self, moe_layer_idx: int) -> bool:
         """Check if a layer is already prepared in RAM cache."""
