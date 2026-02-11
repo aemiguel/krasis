@@ -1790,18 +1790,26 @@ mod tests {
         // so we test with None here. Full test below tests shared.
         let mut shared_scratch: Option<ExpertScratch> = None;
 
-        // Time MoE forward
+        // Time MoE forward (auto-dispatch unified vs old format)
         let start = std::time::Instant::now();
-        moe_forward(
-            &store, 0, &activation, &expert_indices, &expert_weights,
-            &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None,
-        );
+        if store.has_unified() {
+            moe_forward_unified(
+                &store, 0, &activation, &expert_indices, &expert_weights,
+                &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None,
+            );
+        } else {
+            moe_forward(
+                &store, 0, &activation, &expert_indices, &expert_weights,
+                &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None,
+            );
+        }
         let moe_us = start.elapsed().as_micros();
 
         let rms = (output.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / hidden as f64).sqrt();
         let nonzero = output.iter().filter(|&&v| v.abs() > 1e-10).count();
 
-        eprintln!("Kimi K2.5 MoE forward (1 layer, top-{top_k}, group_size={group_size}):");
+        eprintln!("Kimi K2.5 MoE forward (1 layer, top-{top_k}, group_size={group_size}, unified={}):",
+            store.has_unified());
         eprintln!("  Time: {moe_us} μs ({:.1} ms)", moe_us as f64 / 1000.0);
         eprintln!("  Output RMS: {rms:.6}, nonzero: {nonzero}/{hidden}");
         eprintln!("  Per-expert: {:.0} μs", moe_us as f64 / top_k as f64);

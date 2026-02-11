@@ -510,61 +510,77 @@ impl WeightStore {
         // Detect effective group_size for pre-quantized models (needed for correct cache path)
         let effective_gs_hint = Self::detect_group_size_hint(model_dir, &config);
         let cache_gs = effective_gs_hint.unwrap_or(group_size);
-
-        // Try loading from cache (only for full model loads — no start_layer or max_layers)
         let partial = max_layers.is_some() || start_layer.is_some();
-        if !partial && num_bits == 4 {
-            // Try v2 unified cache first (directly loads transposed + combined w13 format)
+
+        // ── INT4: try v2 unified cache (supports both full and partial/range loads) ──
+        if num_bits == 4 {
             let upath = cache_path_unified(model_dir, num_bits, cache_gs);
-            if upath.exists() {
-                match Self::load_cache_unified(&upath, &config, cache_gs, num_moe_layers, config_hash) {
-                    Ok(store) => {
-                        let elapsed = start.elapsed();
-                        log::info!(
-                            "Loaded from unified cache in {:.1}s: {} MoE layers × {} experts (+ {} shared)",
-                            elapsed.as_secs_f64(),
-                            num_moe_layers,
-                            config.n_routed_experts,
-                            store.shared_experts_unified.len(),
-                        );
-                        return Ok(store);
+
+            // Ensure cache exists: build or wait if another process is building
+            if !upath.exists() {
+                // Try v1 → v2 streaming conversion first
+                let v1path = cache_path(model_dir, num_bits, cache_gs);
+                if v1path.exists() {
+                    log::info!("Found v1 cache, converting to v2 unified format...");
+                    match Self::streaming_v1_to_unified_cache(
+                        model_dir, &config, cache_gs, total_moe_layers, &v1path, &upath, config_hash,
+                    ) {
+                        Ok(()) => log::info!("v1→v2 conversion complete"),
+                        Err(e) => log::warn!("v1→v2 conversion failed: {e}"),
                     }
-                    Err(e) => {
-                        log::warn!("Unified cache invalid: {e}");
+                }
+
+                // Still no cache? Build from safetensors (with lock for multi-process safety)
+                if !upath.exists() {
+                    let built_gs = Self::build_unified_cache_locked(
+                        model_dir, &config, group_size, total_moe_layers, &upath, config_hash,
+                    )?;
+                    // Handle effective_group_size mismatch (rename if needed)
+                    if built_gs != cache_gs {
+                        let actual_upath = cache_path_unified(model_dir, num_bits, built_gs);
+                        if actual_upath.exists() && actual_upath != upath {
+                            log::info!(
+                                "Cache built with group_size={built_gs} (detected), loading from {}",
+                                actual_upath.display(),
+                            );
+                        }
                     }
                 }
             }
 
-            // Try v1 cache — stream-convert to v2 on disk, then load v2
-            let v1path = cache_path(model_dir, num_bits, cache_gs);
-            if v1path.exists() {
-                match Self::streaming_v1_to_unified_cache(
-                    model_dir, &config, cache_gs, num_moe_layers, &v1path, &upath, config_hash,
-                ) {
-                    Ok(()) => {
-                        match Self::load_cache_unified(&upath, &config, cache_gs, num_moe_layers, config_hash) {
-                            Ok(store) => {
-                                let elapsed = start.elapsed();
-                                log::info!(
-                                    "Loaded (v1→v2 streaming) in {:.1}s: {} MoE layers × {} experts",
-                                    elapsed.as_secs_f64(),
-                                    num_moe_layers,
-                                    config.n_routed_experts,
-                                );
-                                return Ok(store);
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to load freshly-built v2 cache: {e}");
+            // Try loading the range from the v2 cache
+            // Check both cache_gs path and common group sizes in case detection differed
+            for try_gs in &[cache_gs, group_size, 32, 64, 128] {
+                let try_path = cache_path_unified(model_dir, num_bits, *try_gs);
+                if try_path.exists() {
+                    match Self::load_cache_unified(
+                        &try_path, &config, *try_gs, total_moe_layers, config_hash,
+                        moe_start, num_moe_layers,
+                    ) {
+                        Ok(store) => {
+                            let elapsed = start.elapsed();
+                            log::info!(
+                                "Loaded from unified cache in {:.1}s: layers [{}-{}), {} experts (+ {} shared)",
+                                elapsed.as_secs_f64(),
+                                moe_start, moe_start + num_moe_layers,
+                                config.n_routed_experts,
+                                store.shared_experts_unified.len(),
+                            );
+                            return Ok(store);
+                        }
+                        Err(e) => {
+                            if *try_gs == cache_gs {
+                                log::warn!("Unified cache invalid (gs={}): {e}", try_gs);
                             }
                         }
                     }
-                    Err(e) => {
-                        log::warn!("v1→v2 streaming conversion failed: {e}");
-                    }
                 }
             }
-        } else if !partial {
-            // INT8: use v1 cache path (unified is INT4-only)
+            log::warn!("All unified cache attempts failed, falling back to safetensors");
+        }
+
+        // ── INT8: use v1 cache path (unified is INT4-only, full loads only) ──
+        if !partial && num_bits == 8 {
             let cpath = cache_path(model_dir, num_bits, cache_gs);
             if cpath.exists() {
                 match Self::load_cache(&cpath, &config, cache_gs, num_bits, num_moe_layers, config_hash) {
@@ -590,29 +606,7 @@ impl WeightStore {
             }
         }
 
-        // Full INT4 load (no cache available): stream-build unified cache, then load
-        if !partial && num_bits == 4 {
-            let upath = cache_path_unified(model_dir, num_bits, cache_gs);
-            let effective_group_size = Self::streaming_build_unified_cache(
-                model_dir, &config, group_size, num_moe_layers, moe_start, &upath, config_hash,
-            )?;
-            // The cache was built with effective_group_size (may differ from cache_gs for pre-quantized)
-            // If it differs, rename the file to the correct path
-            let final_upath = cache_path_unified(model_dir, num_bits, effective_group_size);
-            if final_upath != upath {
-                std::fs::rename(&upath, &final_upath)
-                    .map_err(|e| format!("Failed to rename cache for correct group_size: {e}"))?;
-            }
-            let store = Self::load_cache_unified(&final_upath, &config, effective_group_size, num_moe_layers, config_hash)?;
-            let total_elapsed = start.elapsed();
-            log::info!(
-                "Loaded {} MoE layers (streaming build + load) in {:.1}s",
-                num_moe_layers, total_elapsed.as_secs_f64(),
-            );
-            return Ok(store);
-        }
-
-        // Fallback: partial loads or INT8 — use original load_and_quantize_all path
+        // ── Fallback: load from safetensors (partial loads or INT8 without cache) ──
         log::info!("[DIAG-RUST] Starting load_and_quantize_all: {} MoE layers, start={}, bits={}", num_moe_layers, moe_start, num_bits);
         crate::syscheck::log_memory_usage("[DIAG-RUST] before load_and_quantize_all");
         let (experts, shared_experts, effective_group_size) =
@@ -1057,12 +1051,19 @@ impl WeightStore {
 
     /// Load unified expert weights from v2 cache file via mmap.
     /// Returns a WeightStore with experts_unified populated directly (no conversion needed).
+    /// Load unified cache, optionally reading only a range of layers.
+    ///
+    /// `total_moe_layers`: total MoE layers expected in the cache file.
+    /// `start_moe_layer`: first MoE layer to load (0-based, default 0).
+    /// `num_layers_to_load`: how many layers to load (must be <= total - start).
     fn load_cache_unified(
         path: &Path,
         config: &ModelConfig,
         group_size: usize,
-        num_moe_layers: usize,
+        total_moe_layers: usize,
         config_hash: u64,
+        start_moe_layer: usize,
+        num_layers_to_load: usize,
     ) -> Result<Self, String> {
         let file = std::fs::File::open(path)
             .map_err(|e| format!("Failed to open unified cache: {e}"))?;
@@ -1092,10 +1093,15 @@ impl WeightStore {
         if h_hidden != config.hidden_size
             || h_intermediate != config.moe_intermediate_size
             || h_n_experts != config.n_routed_experts
-            || h_num_layers != num_moe_layers
+            || h_num_layers != total_moe_layers
             || h_group_size != group_size
         {
-            return Err("Unified cache header dimensions don't match config".to_string());
+            return Err(format!(
+                "Unified cache header mismatch: file has {}h/{}m/{}e/{}L/g{}, expected {}h/{}m/{}e/{}L/g{}",
+                h_hidden, h_intermediate, h_n_experts, h_num_layers, h_group_size,
+                config.hidden_size, config.moe_intermediate_size, config.n_routed_experts,
+                total_moe_layers, group_size,
+            ));
         }
         if h_config_hash != config_hash {
             return Err("Config hash mismatch in unified cache".to_string());
@@ -1107,10 +1113,18 @@ impl WeightStore {
             ));
         }
 
+        // Validate range
+        if start_moe_layer + num_layers_to_load > total_moe_layers {
+            return Err(format!(
+                "Range [{}, {}) exceeds total MoE layers {}",
+                start_moe_layer, start_moe_layer + num_layers_to_load, total_moe_layers,
+            ));
+        }
+
         // Validate total file size
         let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
         let expected = expected_unified_cache_size(
-            config, group_size, num_moe_layers, config.n_shared_experts, shared_intermediate,
+            config, group_size, total_moe_layers, config.n_shared_experts, shared_intermediate,
         );
         if mmap.len() != expected {
             return Err(format!(
@@ -1119,42 +1133,83 @@ impl WeightStore {
             ));
         }
 
-        log::info!("Loading unified cache: {} (INT4)", path.display());
+        let is_partial = start_moe_layer > 0 || num_layers_to_load < total_moe_layers;
+        if is_partial {
+            log::info!(
+                "Loading unified cache (partial): layers [{}-{}), {} of {} (INT4, {})",
+                start_moe_layer, start_moe_layer + num_layers_to_load,
+                num_layers_to_load, total_moe_layers, path.display(),
+            );
+        } else {
+            log::info!("Loading unified cache: {} (INT4)", path.display());
+        }
         let load_start = std::time::Instant::now();
-        let mut offset = CACHE_HEADER_SIZE;
 
         let h = config.hidden_size;
         let m = config.moe_intermediate_size;
 
-        // Read routed experts
-        let mut experts_unified: Vec<Vec<UnifiedExpertWeights>> = Vec::with_capacity(num_moe_layers);
-        for layer_idx in 0..num_moe_layers {
+        // Compute per-expert and per-layer byte sizes for seeking
+        let (w13pb, w13sb, w2pb, w2sb) = unified_expert_byte_sizes(config, group_size);
+        let per_routed_expert = w13pb + w13sb + w2pb + w2sb;
+        let per_routed_layer = config.n_routed_experts * per_routed_expert;
+
+        // Compute offset for routed experts: skip first start_moe_layer layers
+        let mut offset = CACHE_HEADER_SIZE + start_moe_layer * per_routed_layer;
+
+        // Read routed experts for the requested range
+        let mut experts_unified: Vec<Vec<UnifiedExpertWeights>> = Vec::with_capacity(num_layers_to_load);
+        for i in 0..num_layers_to_load {
             let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
             for _eidx in 0..config.n_routed_experts {
                 let expert = read_unified_expert(&mmap, &mut offset, h, m, group_size);
                 layer_experts.push(expert);
             }
             experts_unified.push(layer_experts);
-            if (layer_idx + 1) % 10 == 0 {
-                log::info!("  Unified cache read: {}/{} layers", layer_idx + 1, num_moe_layers);
+            if (i + 1) % 10 == 0 {
+                log::info!("  Unified cache read: {}/{} layers", i + 1, num_layers_to_load);
             }
         }
 
-        // Read shared experts
-        let mut shared_experts_unified = Vec::with_capacity(config.n_shared_experts.min(1) * num_moe_layers);
-        for _layer_idx in 0..num_moe_layers {
-            if config.n_shared_experts > 0 {
+        // Read shared experts for the requested range
+        let mut shared_experts_unified = Vec::with_capacity(
+            config.n_shared_experts.min(1) * num_layers_to_load,
+        );
+        if config.n_shared_experts > 0 {
+            // Shared experts are stored after ALL routed experts in the cache file.
+            // Compute the per-shared-expert byte size (may differ from routed due to different intermediate_size).
+            let s_w13p = (h / 8) * (2 * shared_intermediate) * 4;
+            let s_w13s = (h / group_size) * (2 * shared_intermediate) * 2;
+            let s_w2p = (shared_intermediate / 8) * h * 4;
+            let s_w2s = (shared_intermediate / group_size) * h * 2;
+            let per_shared_expert = s_w13p + s_w13s + s_w2p + s_w2s;
+
+            let routed_total = total_moe_layers * per_routed_layer;
+            offset = CACHE_HEADER_SIZE + routed_total + start_moe_layer * per_shared_expert;
+
+            for _i in 0..num_layers_to_load {
                 let shared = read_unified_expert(&mmap, &mut offset, h, shared_intermediate, group_size);
                 shared_experts_unified.push(shared);
             }
         }
 
         let elapsed = load_start.elapsed();
+        let bytes_loaded = num_layers_to_load as f64
+            * (per_routed_layer as f64
+                + if config.n_shared_experts > 0 {
+                    let s_w13p = (h / 8) * (2 * shared_intermediate) * 4;
+                    let s_w13s = (h / group_size) * (2 * shared_intermediate) * 2;
+                    let s_w2p = (shared_intermediate / 8) * h * 4;
+                    let s_w2s = (shared_intermediate / group_size) * h * 2;
+                    (s_w13p + s_w13s + s_w2p + s_w2s) as f64
+                } else {
+                    0.0
+                });
         log::info!(
-            "Unified cache loaded: {:.1} GB in {:.1}s ({:.1} GB/s)",
-            mmap.len() as f64 / 1e9,
+            "Unified cache loaded: {:.1} GB in {:.1}s ({:.1} GB/s){}",
+            bytes_loaded / 1e9,
             elapsed.as_secs_f64(),
-            mmap.len() as f64 / 1e9 / elapsed.as_secs_f64(),
+            bytes_loaded / 1e9 / elapsed.as_secs_f64(),
+            if is_partial { format!(" [layers {}-{})", start_moe_layer, start_moe_layer + num_layers_to_load) } else { String::new() },
         );
 
         Ok(WeightStore {
@@ -1463,6 +1518,112 @@ impl WeightStore {
         crate::syscheck::log_memory_usage("after streaming_build_unified_cache");
 
         Ok(effective_group_size)
+    }
+
+    /// Build unified cache with a file lock for multi-process safety.
+    ///
+    /// When multiple PP rank processes start simultaneously, only one builds the cache
+    /// while others wait. Uses an exclusive `.bin.lock` file as a mutex.
+    /// Always builds ALL MoE layers so the cache works for any PP partition.
+    fn build_unified_cache_locked(
+        model_dir: &Path,
+        config: &ModelConfig,
+        group_size: usize,
+        total_moe_layers: usize,
+        cache_path: &Path,
+        config_hash: u64,
+    ) -> Result<usize, String> {
+        use std::fs::OpenOptions;
+
+        // Double-check: another process may have finished between our check and here
+        if cache_path.exists() {
+            log::info!("Cache appeared while preparing to build (another rank finished)");
+            // Return group_size as a guess — caller will validate via load_cache_unified
+            return Ok(group_size);
+        }
+
+        let lock_path = cache_path.with_extension("bin.lock");
+
+        // Try to acquire exclusive lock
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(mut lock_file) => {
+                // We hold the lock — build the full cache
+                log::info!(
+                    "Acquired cache build lock, building {} MoE layers...",
+                    total_moe_layers,
+                );
+                // Write our PID to the lock file for debugging
+                let _ = write!(lock_file, "{}", std::process::id());
+                drop(lock_file);
+
+                let result = Self::streaming_build_unified_cache(
+                    model_dir, config, group_size, total_moe_layers,
+                    0, // always start from layer 0 for full cache
+                    cache_path, config_hash,
+                );
+
+                // Release lock (remove file) regardless of result
+                let _ = std::fs::remove_file(&lock_path);
+
+                match result {
+                    Ok(effective_gs) => {
+                        // Handle group_size mismatch (rename cache to correct path)
+                        let expected_path = cache_path_unified(model_dir, 4, effective_gs);
+                        if expected_path != *cache_path {
+                            std::fs::rename(cache_path, &expected_path)
+                                .map_err(|e| format!("Failed to rename cache: {e}"))?;
+                            log::info!(
+                                "Renamed cache to {} (effective gs={})",
+                                expected_path.display(), effective_gs,
+                            );
+                        }
+                        Ok(effective_gs)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Another process is building — wait for the cache to appear
+                log::info!("Another process is building unified cache, waiting...");
+                let wait_start = std::time::Instant::now();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+
+                    // Check if cache appeared (any group_size variant)
+                    for try_gs in &[group_size, 32, 64, 128] {
+                        let try_path = cache_path_unified(model_dir, 4, *try_gs);
+                        if try_path.exists() {
+                            let waited = wait_start.elapsed();
+                            log::info!(
+                                "Unified cache ready after {:.0}s wait (gs={})",
+                                waited.as_secs_f64(), try_gs,
+                            );
+                            return Ok(*try_gs);
+                        }
+                    }
+
+                    // Check if lock was released without cache (build failed)
+                    if !lock_path.exists() && !cache_path.exists() {
+                        return Err("Cache build by another process failed (lock released, no cache)".to_string());
+                    }
+
+                    let waited = wait_start.elapsed();
+                    if waited > std::time::Duration::from_secs(7200) {
+                        return Err("Timed out waiting for cache build (2 hours)".to_string());
+                    }
+                    if waited.as_secs() % 60 < 5 {
+                        log::info!("Still waiting for cache build ({:.0}s)...", waited.as_secs_f64());
+                    }
+                }
+            }
+            Err(e) => {
+                Err(format!("Failed to create cache lock file: {e}"))
+            }
+        }
     }
 
     /// Stream-convert from a v1 cache file to a v2 unified cache on disk.

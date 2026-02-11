@@ -13,6 +13,27 @@ Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
 
 ---
 
+## Partial v2 Cache Loading + License Change — 2026-02-11
+
+### Features
+- **Range-aware unified cache loading** — `load_cache_unified()` now accepts `start_moe_layer`
+  and `num_layers_to_load` parameters. PP ranks can load just their layer range from the
+  single full-model cache file. No more re-converting from safetensors every launch.
+- **Multi-process cache build lock** — `build_unified_cache_locked()` uses an exclusive
+  `.bin.lock` file so only one PP rank builds the cache while others wait.
+- **License changed** from MIT to Apache 2.0.
+
+### Changes
+- `load_from_hf()` restructured: INT4 partial loads now use v2 unified cache instead of
+  falling back to slow `load_and_quantize_all()` from safetensors.
+- Cache is always built for ALL MoE layers, usable by any PP partition.
+- Kimi K2.5 MoE test updated to auto-dispatch unified vs old format.
+
+### Test Results
+- 41/41 Rust tests pass
+
+---
+
 ## Kimi K2.5 SGLang Integration Fixes — 2026-02-11
 
 ### Bugs Fixed

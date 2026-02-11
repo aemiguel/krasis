@@ -90,4 +90,4 @@ See `run_kimi_krasis.sh` for a complete launch script.
 
 ## License
 
-MIT
+Apache 2.0

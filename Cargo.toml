@@ -3,7 +3,7 @@ name = "krasis"
 version = "0.1.0"
 edition = "2021"
 description = "Hybrid LLM runtime — minimal VRAM, always-on GPU prefill, optimised CPU inference"
-license = "MIT"
+license = "Apache-2.0"
 
 [lib]
 name = "krasis"
