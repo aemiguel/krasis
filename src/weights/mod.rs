@@ -535,48 +535,31 @@ impl WeightStore {
                 }
             }
 
-            // Try v1 cache — load in old format, then convert + save v2
+            // Try v1 cache — stream-convert to v2 on disk, then load v2
             let v1path = cache_path(model_dir, num_bits, cache_gs);
             if v1path.exists() {
-                match Self::load_cache(&v1path, &config, cache_gs, num_bits, num_moe_layers, config_hash) {
-                    Ok(mut store) => {
-                        // Shared experts not in v1 cache — load them now
-                        if config.n_shared_experts > 0 {
-                            store.shared_experts = Self::load_shared_experts(
-                                model_dir, &config, store.group_size, num_bits, num_moe_layers,
-                            )?;
-                        }
-                        log::info!(
-                            "Loaded from v1 cache, converting to unified format layer-by-layer..."
-                        );
-                        // Convert to unified (layer-by-layer to avoid 2x RAM peak)
-                        store.convert_to_unified();
-
-                        // Save v2 unified cache for next time
-                        match store.save_cache_unified(&upath, config_hash) {
-                            Ok(()) => {
-                                log::info!("Saved unified cache to {}", upath.display());
-                                // Delete old v1 cache (no longer needed)
-                                if let Err(e) = std::fs::remove_file(&v1path) {
-                                    log::warn!("Failed to delete v1 cache: {e}");
-                                } else {
-                                    log::info!("Deleted v1 cache: {}", v1path.display());
-                                }
+                match Self::streaming_v1_to_unified_cache(
+                    model_dir, &config, cache_gs, num_moe_layers, &v1path, &upath, config_hash,
+                ) {
+                    Ok(()) => {
+                        match Self::load_cache_unified(&upath, &config, cache_gs, num_moe_layers, config_hash) {
+                            Ok(store) => {
+                                let elapsed = start.elapsed();
+                                log::info!(
+                                    "Loaded (v1→v2 streaming) in {:.1}s: {} MoE layers × {} experts",
+                                    elapsed.as_secs_f64(),
+                                    num_moe_layers,
+                                    config.n_routed_experts,
+                                );
+                                return Ok(store);
                             }
-                            Err(e) => log::warn!("Failed to save unified cache: {e}"),
+                            Err(e) => {
+                                log::warn!("Failed to load freshly-built v2 cache: {e}");
+                            }
                         }
-
-                        let elapsed = start.elapsed();
-                        log::info!(
-                            "Loaded (v1→unified) in {:.1}s: {} MoE layers × {} experts",
-                            elapsed.as_secs_f64(),
-                            num_moe_layers,
-                            config.n_routed_experts,
-                        );
-                        return Ok(store);
                     }
                     Err(e) => {
-                        log::warn!("v1 cache invalid, re-quantizing: {e}");
+                        log::warn!("v1→v2 streaming conversion failed: {e}");
                     }
                 }
             }
@@ -607,7 +590,29 @@ impl WeightStore {
             }
         }
 
-        // Load from safetensors and quantize (or load pre-quantized)
+        // Full INT4 load (no cache available): stream-build unified cache, then load
+        if !partial && num_bits == 4 {
+            let upath = cache_path_unified(model_dir, num_bits, cache_gs);
+            let effective_group_size = Self::streaming_build_unified_cache(
+                model_dir, &config, group_size, num_moe_layers, moe_start, &upath, config_hash,
+            )?;
+            // The cache was built with effective_group_size (may differ from cache_gs for pre-quantized)
+            // If it differs, rename the file to the correct path
+            let final_upath = cache_path_unified(model_dir, num_bits, effective_group_size);
+            if final_upath != upath {
+                std::fs::rename(&upath, &final_upath)
+                    .map_err(|e| format!("Failed to rename cache for correct group_size: {e}"))?;
+            }
+            let store = Self::load_cache_unified(&final_upath, &config, effective_group_size, num_moe_layers, config_hash)?;
+            let total_elapsed = start.elapsed();
+            log::info!(
+                "Loaded {} MoE layers (streaming build + load) in {:.1}s",
+                num_moe_layers, total_elapsed.as_secs_f64(),
+            );
+            return Ok(store);
+        }
+
+        // Fallback: partial loads or INT8 — use original load_and_quantize_all path
         log::info!("[DIAG-RUST] Starting load_and_quantize_all: {} MoE layers, start={}, bits={}", num_moe_layers, moe_start, num_bits);
         crate::syscheck::log_memory_usage("[DIAG-RUST] before load_and_quantize_all");
         let (experts, shared_experts, effective_group_size) =
@@ -615,7 +620,7 @@ impl WeightStore {
         log::info!("[DIAG-RUST] load_and_quantize_all completed OK");
         crate::syscheck::log_memory_usage("[DIAG-RUST] after load_and_quantize_all");
 
-        let mut store = WeightStore {
+        let store = WeightStore {
             experts,
             shared_experts,
             experts_unified: Vec::new(),
@@ -627,21 +632,11 @@ impl WeightStore {
 
         // Save cache for next time (only for full model loads)
         if !partial {
-            if num_bits == 4 {
-                // Convert to unified and save v2 cache
-                store.convert_to_unified();
-                let upath = cache_path_unified(model_dir, num_bits, effective_group_size);
-                match store.save_cache_unified(&upath, config_hash) {
-                    Ok(()) => log::info!("Saved unified cache to {}", upath.display()),
-                    Err(e) => log::warn!("Failed to save unified cache: {e}"),
-                }
-            } else {
-                // INT8: save v1 cache
-                let cpath = cache_path(model_dir, num_bits, effective_group_size);
-                match store.save_cache(&cpath, config_hash) {
-                    Ok(()) => log::info!("Saved INT{num_bits} cache to {}", cpath.display()),
-                    Err(e) => log::warn!("Failed to save cache: {e}"),
-                }
+            // INT8: save v1 cache
+            let cpath = cache_path(model_dir, num_bits, effective_group_size);
+            match store.save_cache(&cpath, config_hash) {
+                Ok(()) => log::info!("Saved INT{num_bits} cache to {}", cpath.display()),
+                Err(e) => log::warn!("Failed to save cache: {e}"),
             }
         }
 
@@ -1016,24 +1011,7 @@ impl WeightStore {
         let mut w = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
 
         // Header (64 bytes) — same layout as v1, version=2
-        w.write_all(CACHE_MAGIC)
-            .map_err(|e| format!("Write error: {e}"))?;
-        w.write_all(&CACHE_VERSION_UNIFIED.to_le_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-        w.write_all(&(self.config.hidden_size as u64).to_le_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-        w.write_all(&(self.config.moe_intermediate_size as u64).to_le_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-        w.write_all(&(self.config.n_routed_experts as u64).to_le_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-        w.write_all(&(num_moe_layers as u64).to_le_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-        w.write_all(&(self.group_size as u64).to_le_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-        w.write_all(&config_hash.to_le_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-        w.write_all(&(self.config.n_shared_experts as u64).to_le_bytes()) // was reserved in v1
-            .map_err(|e| format!("Write error: {e}"))?;
+        write_unified_cache_header(&mut w, &self.config, self.group_size, num_moe_layers, config_hash)?;
 
         let write_start = std::time::Instant::now();
 
@@ -1298,6 +1276,364 @@ impl WeightStore {
         Ok(shared)
     }
 
+    /// Stream-convert from safetensors (or pre-quantized) to a v2 unified cache on disk.
+    ///
+    /// Processes one MoE layer at a time: load expert weights → convert to unified → write
+    /// to disk → drop. Peak RAM is ~16 GB (one layer of routed + shared experts) instead
+    /// of ~488 GB (all layers).
+    ///
+    /// Returns the effective group_size (may differ from requested if model is pre-quantized).
+    fn streaming_build_unified_cache(
+        model_dir: &Path,
+        config: &ModelConfig,
+        group_size: usize,
+        num_moe_layers: usize,
+        start_moe_layer: usize,
+        cache_path: &Path,
+        config_hash: u64,
+    ) -> Result<usize, String> {
+        log::info!(
+            "Streaming build unified cache: {} MoE layers from safetensors → {}",
+            num_moe_layers, cache_path.display(),
+        );
+        crate::syscheck::log_memory_usage("before streaming_build_unified_cache");
+
+        // Parse safetensors index
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let index_str = std::fs::read_to_string(&index_path)
+            .map_err(|e| format!("Failed to read safetensors index: {e}"))?;
+        let index: SafetensorsIndex = serde_json::from_str(&index_str)
+            .map_err(|e| format!("Failed to parse safetensors index: {e}"))?;
+
+        // Determine which shard files we need for our layer range
+        let first_abs_layer = start_moe_layer + config.first_k_dense_replace;
+        let last_abs_layer = first_abs_layer + num_moe_layers;
+        let mut needed_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (tensor_name, shard_name) in &index.weight_map {
+            if let Some(layer_num) = parse_layer_number(tensor_name) {
+                if layer_num >= first_abs_layer && layer_num < last_abs_layer {
+                    needed_shards.insert(shard_name.clone());
+                }
+            }
+        }
+        let mut shard_names: Vec<String> = needed_shards.into_iter().collect();
+        shard_names.sort();
+
+        log::info!(
+            "Opening {}/{} safetensors shards (mmap, near-zero RAM)",
+            shard_names.len(),
+            index.weight_map.values().collect::<std::collections::HashSet<_>>().len(),
+        );
+
+        // Open shards via mmap (near-zero RSS)
+        let mut shards: HashMap<String, MmapSafetensors> = HashMap::new();
+        for (i, name) in shard_names.iter().enumerate() {
+            let path = model_dir.join(name);
+            let st = MmapSafetensors::open(&path)
+                .map_err(|e| format!("Failed to open {name}: {e}"))?;
+            shards.insert(name.clone(), st);
+            if (i + 1) % 10 == 0 || i + 1 == shard_names.len() {
+                log::info!("  Opened {}/{} shards", i + 1, shard_names.len());
+            }
+        }
+
+        // Detect prefix and quantization format
+        let layers_prefix = detect_expert_prefix(&index.weight_map)?;
+        let prequantized = is_prequantized(&index.weight_map);
+        let effective_group_size = if prequantized {
+            let probe_layer = start_moe_layer + config.first_k_dense_replace;
+            let native_gs = detect_prequant_group_size(
+                &index.weight_map, &shards, &layers_prefix, probe_layer,
+            )?;
+            if native_gs != group_size {
+                log::info!(
+                    "Pre-quantized model has group_size={native_gs}, overriding requested {group_size}"
+                );
+            }
+            native_gs
+        } else {
+            group_size
+        };
+
+        // Create cache directory + temp file
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create cache dir: {e}"))?;
+        }
+        let tmp_path = cache_path.with_extension("bin.tmp");
+        let file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create cache file: {e}"))?;
+        let mut w = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+
+        // Write header
+        write_unified_cache_header(&mut w, config, effective_group_size, num_moe_layers, config_hash)?;
+
+        let overall_start = std::time::Instant::now();
+
+        // Stream routed experts layer by layer
+        for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
+            let layer_idx = moe_idx + config.first_k_dense_replace;
+            let layer_start = std::time::Instant::now();
+
+            for eidx in 0..config.n_routed_experts {
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
+
+                let (gate, up, down) = if prequantized {
+                    let g = QuantWeight::Int4(load_prequantized_weight(
+                        &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
+                    )?);
+                    let u = QuantWeight::Int4(load_prequantized_weight(
+                        &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                    )?);
+                    let d = QuantWeight::Int4(load_prequantized_weight(
+                        &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                    )?);
+                    (g, u, d)
+                } else {
+                    load_and_quantize_expert(
+                        &prefix, &index.weight_map, &shards, effective_group_size, 4,
+                    )?
+                };
+
+                let ew = ExpertWeights { gate, up, down };
+                let unified = UnifiedExpertWeights::from_expert_weights(&ew);
+
+                // Write unified data to cache
+                write_vec_u32(&mut w, &unified.w13_packed)?;
+                write_vec_u16(&mut w, &unified.w13_scales)?;
+                write_vec_u32(&mut w, &unified.w2_packed)?;
+                write_vec_u16(&mut w, &unified.w2_scales)?;
+
+                // ew + unified dropped here → ~0 persistent RAM per expert
+            }
+
+            let layers_done = moe_idx - start_moe_layer + 1;
+            let layer_elapsed = layer_start.elapsed();
+            if layers_done % 5 == 0 || layers_done == num_moe_layers {
+                crate::syscheck::log_memory_usage(&format!(
+                    "streaming convert: {layers_done}/{num_moe_layers} layers ({:.1}s/layer)",
+                    layer_elapsed.as_secs_f64(),
+                ));
+            } else {
+                log::info!(
+                    "  Layer {layer_idx}: converted {} experts in {:.1}s [{layers_done}/{num_moe_layers}]",
+                    config.n_routed_experts,
+                    layer_elapsed.as_secs_f64(),
+                );
+            }
+        }
+
+        // Stream shared experts (one per MoE layer)
+        if config.n_shared_experts > 0 {
+            log::info!("Streaming shared experts ({} layers)...", num_moe_layers);
+            for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
+                let layer_idx = moe_idx + config.first_k_dense_replace;
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.shared_experts");
+                let (gate, up, down) = load_and_quantize_expert(
+                    &prefix, &index.weight_map, &shards, effective_group_size, 4,
+                )?;
+                let ew = ExpertWeights { gate, up, down };
+                let unified = UnifiedExpertWeights::from_expert_weights(&ew);
+
+                write_vec_u32(&mut w, &unified.w13_packed)?;
+                write_vec_u16(&mut w, &unified.w13_scales)?;
+                write_vec_u32(&mut w, &unified.w2_packed)?;
+                write_vec_u16(&mut w, &unified.w2_scales)?;
+            }
+        }
+
+        // Flush + atomic rename
+        w.flush().map_err(|e| format!("Flush error: {e}"))?;
+        drop(w);
+        std::fs::rename(&tmp_path, cache_path)
+            .map_err(|e| format!("Failed to rename cache file: {e}"))?;
+
+        // Return freed pages to OS
+        #[cfg(target_os = "linux")]
+        unsafe { libc::malloc_trim(0); }
+
+        let elapsed = overall_start.elapsed();
+        let size = std::fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
+        log::info!(
+            "Streaming unified cache built: {:.1} GB in {:.1}s ({:.1} GB/s)",
+            size as f64 / 1e9,
+            elapsed.as_secs_f64(),
+            size as f64 / 1e9 / elapsed.as_secs_f64(),
+        );
+        crate::syscheck::log_memory_usage("after streaming_build_unified_cache");
+
+        Ok(effective_group_size)
+    }
+
+    /// Stream-convert from a v1 cache file to a v2 unified cache on disk.
+    ///
+    /// The v1 file is mmap'd (zero-copy read), and each layer's experts are read,
+    /// converted to unified format, written to the v2 temp file, then freed.
+    /// Peak RAM is ~16 GB (one layer) instead of loading the entire v1 cache.
+    ///
+    /// Shared experts are NOT stored in v1 cache, so they must be loaded from safetensors.
+    fn streaming_v1_to_unified_cache(
+        model_dir: &Path,
+        config: &ModelConfig,
+        group_size: usize,
+        num_moe_layers: usize,
+        v1_path: &Path,
+        v2_path: &Path,
+        config_hash: u64,
+    ) -> Result<(), String> {
+        log::info!(
+            "Streaming v1→v2 conversion: {} → {}",
+            v1_path.display(), v2_path.display(),
+        );
+        crate::syscheck::log_memory_usage("before streaming_v1_to_unified_cache");
+
+        // mmap the v1 cache (zero-copy)
+        let v1_file = std::fs::File::open(v1_path)
+            .map_err(|e| format!("Failed to open v1 cache: {e}"))?;
+        let v1_mmap = unsafe { Mmap::map(&v1_file) }
+            .map_err(|e| format!("Failed to mmap v1 cache: {e}"))?;
+
+        // Validate v1 header
+        let expected_v1 = expected_cache_size(config, group_size, 4, num_moe_layers);
+        if v1_mmap.len() != expected_v1 {
+            return Err(format!(
+                "v1 cache size mismatch: expected {expected_v1}, got {}", v1_mmap.len(),
+            ));
+        }
+        if &v1_mmap[0..4] != CACHE_MAGIC {
+            return Err("Bad magic in v1 cache".to_string());
+        }
+        let version = u32::from_le_bytes(v1_mmap[4..8].try_into().unwrap());
+        if version != CACHE_VERSION {
+            return Err(format!("v1 cache version {version}, expected {CACHE_VERSION}"));
+        }
+        let h_config_hash = u64::from_le_bytes(v1_mmap[48..56].try_into().unwrap());
+        if h_config_hash != config_hash {
+            return Err("Config hash mismatch in v1 cache".to_string());
+        }
+
+        // Create v2 temp file
+        if let Some(parent) = v2_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create cache dir: {e}"))?;
+        }
+        let tmp_path = v2_path.with_extension("bin.tmp");
+        let file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create v2 cache file: {e}"))?;
+        let mut w = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+
+        // Write v2 header
+        write_unified_cache_header(&mut w, config, group_size, num_moe_layers, config_hash)?;
+
+        let overall_start = std::time::Instant::now();
+        let h = config.hidden_size;
+        let m = config.moe_intermediate_size;
+        let (gpb, gsb, dpb, dsb) = expert_byte_sizes(config, group_size, 4);
+        let mut v1_offset = CACHE_HEADER_SIZE;
+
+        // Stream layer by layer from v1 mmap
+        for layer_idx in 0..num_moe_layers {
+            for _eidx in 0..config.n_routed_experts {
+                // Read old-format expert from v1 mmap
+                let gate = read_quantized(&v1_mmap, &mut v1_offset, m, h, group_size, 4, gpb, gsb);
+                let up = read_quantized(&v1_mmap, &mut v1_offset, m, h, group_size, 4, gpb, gsb);
+                let down = read_quantized(&v1_mmap, &mut v1_offset, h, m, group_size, 4, dpb, dsb);
+                let ew = ExpertWeights { gate, up, down };
+
+                // Convert + write
+                let unified = UnifiedExpertWeights::from_expert_weights(&ew);
+                write_vec_u32(&mut w, &unified.w13_packed)?;
+                write_vec_u16(&mut w, &unified.w13_scales)?;
+                write_vec_u32(&mut w, &unified.w2_packed)?;
+                write_vec_u16(&mut w, &unified.w2_scales)?;
+
+                // ew + unified dropped here
+            }
+
+            let layers_done = layer_idx + 1;
+            if layers_done % 5 == 0 || layers_done == num_moe_layers {
+                crate::syscheck::log_memory_usage(&format!(
+                    "v1→v2 streaming: {layers_done}/{num_moe_layers} layers",
+                ));
+            }
+        }
+
+        // Shared experts: load from safetensors (v1 doesn't store them)
+        if config.n_shared_experts > 0 {
+            log::info!("Loading shared experts from safetensors for v2 cache...");
+            let index_path = model_dir.join("model.safetensors.index.json");
+            let index_str = std::fs::read_to_string(&index_path)
+                .map_err(|e| format!("Failed to read safetensors index: {e}"))?;
+            let index: SafetensorsIndex = serde_json::from_str(&index_str)
+                .map_err(|e| format!("Failed to parse safetensors index: {e}"))?;
+            let layers_prefix = detect_expert_prefix(&index.weight_map)?;
+
+            // Open only needed shards for shared experts
+            let mut shard_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for moe_idx in 0..num_moe_layers {
+                let layer_idx = moe_idx + config.first_k_dense_replace;
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.shared_experts");
+                for proj in &["gate_proj", "up_proj", "down_proj"] {
+                    let name = format!("{prefix}.{proj}.weight");
+                    if let Some(shard) = index.weight_map.get(&name) {
+                        shard_names.insert(shard.clone());
+                    }
+                }
+            }
+            let mut shards: HashMap<String, MmapSafetensors> = HashMap::new();
+            for name in &shard_names {
+                let path = model_dir.join(name);
+                let st = MmapSafetensors::open(&path)
+                    .map_err(|e| format!("Failed to open {name}: {e}"))?;
+                shards.insert(name.clone(), st);
+            }
+
+            for moe_idx in 0..num_moe_layers {
+                let layer_idx = moe_idx + config.first_k_dense_replace;
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.shared_experts");
+                let (gate, up, down) = load_and_quantize_expert(
+                    &prefix, &index.weight_map, &shards, group_size, 4,
+                )?;
+                let ew = ExpertWeights { gate, up, down };
+                let unified = UnifiedExpertWeights::from_expert_weights(&ew);
+
+                write_vec_u32(&mut w, &unified.w13_packed)?;
+                write_vec_u16(&mut w, &unified.w13_scales)?;
+                write_vec_u32(&mut w, &unified.w2_packed)?;
+                write_vec_u16(&mut w, &unified.w2_scales)?;
+            }
+        }
+
+        // Flush + atomic rename
+        w.flush().map_err(|e| format!("Flush error: {e}"))?;
+        drop(w);
+        std::fs::rename(&tmp_path, v2_path)
+            .map_err(|e| format!("Failed to rename v2 cache file: {e}"))?;
+
+        // Drop v1 mmap, delete v1 file
+        drop(v1_mmap);
+        drop(v1_file);
+        if let Err(e) = std::fs::remove_file(v1_path) {
+            log::warn!("Failed to delete v1 cache: {e}");
+        } else {
+            log::info!("Deleted v1 cache: {}", v1_path.display());
+        }
+
+        // Return freed pages to OS
+        #[cfg(target_os = "linux")]
+        unsafe { libc::malloc_trim(0); }
+
+        let elapsed = overall_start.elapsed();
+        let size = std::fs::metadata(v2_path).map(|m| m.len()).unwrap_or(0);
+        log::info!(
+            "v1→v2 streaming conversion done: {:.1} GB in {:.1}s",
+            size as f64 / 1e9, elapsed.as_secs_f64(),
+        );
+        crate::syscheck::log_memory_usage("after streaming_v1_to_unified_cache");
+
+        Ok(())
+    }
+
     /// Quick check for pre-quantized group_size without loading full weights.
     /// Returns Some(group_size) if model has pre-quantized experts, None otherwise.
     fn detect_group_size_hint(model_dir: &Path, config: &ModelConfig) -> Option<usize> {
@@ -1500,6 +1836,35 @@ impl WeightStore {
 
         migrated
     }
+}
+
+/// Write the 64-byte unified (v2) cache header.
+fn write_unified_cache_header<W: Write>(
+    w: &mut W,
+    config: &ModelConfig,
+    group_size: usize,
+    num_moe_layers: usize,
+    config_hash: u64,
+) -> Result<(), String> {
+    w.write_all(CACHE_MAGIC)
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&CACHE_VERSION_UNIFIED.to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(config.hidden_size as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(config.moe_intermediate_size as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(config.n_routed_experts as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(num_moe_layers as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(group_size as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&config_hash.to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(config.n_shared_experts as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    Ok(())
 }
 
 /// Write a Vec<u32> as raw bytes to a writer.
