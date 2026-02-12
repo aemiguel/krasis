@@ -291,9 +291,13 @@ class KrasisModel:
         quant_cfg: QuantConfig = None,
         force_load: bool = False,
         expert_divisor: int = 1,
+        gguf_path: Optional[str] = None,
+        gguf_native: bool = False,
     ):
         self.cfg = ModelConfig.from_model_path(model_path)
         self.quant_cfg = quant_cfg or QuantConfig()
+        self.gguf_path = gguf_path
+        self.gguf_native = gguf_native
 
         # Determine PP partition
         if pp_partition is None:
@@ -421,7 +425,19 @@ class KrasisModel:
         cpu_bits = self.quant_cfg.cpu_expert_bits
         gpu_bits = self.quant_cfg.gpu_expert_bits
         engine = KrasisEngine(parallel=True, num_threads=self.krasis_threads)
-        engine.load(self.cfg.model_path, cpu_num_bits=cpu_bits, gpu_num_bits=gpu_bits)
+
+        if self.gguf_path:
+            logger.info("Loading CPU experts from GGUF: %s (native=%s)", self.gguf_path, self.gguf_native)
+            engine.load(
+                self.cfg.model_path,
+                cpu_num_bits=cpu_bits,
+                gpu_num_bits=gpu_bits,
+                gguf_path=self.gguf_path,
+                gguf_native=self.gguf_native,
+            )
+        else:
+            engine.load(self.cfg.model_path, cpu_num_bits=cpu_bits, gpu_num_bits=gpu_bits)
+
         self.krasis_engine = engine
 
         # Wire engine to all MoE layers

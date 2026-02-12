@@ -4,12 +4,53 @@
 
 | Suite | Count | Status | Last Run |
 |-------|-------|--------|----------|
-| Rust (`cargo test`) | 48 | 40 PASS, 8 SKIP (model files) | 2026-02-12 |
+| Rust (`cargo test`) | 52 | 44 PASS, 8 SKIP (model files) | 2026-02-12 |
 | Python bridge (`test_bridge.py`) | 3 | ALL PASS | 2026-02-09 |
 | GPU prefill (`test_gpu_prefill.py`) | 5 | ALL PASS | 2026-02-09 |
 | **Total** | **56** | **40+ PASS** | |
 
 Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
+
+---
+
+## GGUF → AVX2 Transposed CPU Cache — 2026-02-12
+
+**New: GGUF files are now dequantized and re-quantized to our fast AVX2 transposed format with disk caching. 2.6× faster decode than raw GGUF-native path.**
+
+### What Changed
+- **`src/weights/mod.rs`**: Added `streaming_build_cpu_cache_from_gguf()` — reads GGUF, dequants experts to f32, requants to AVX2 transposed INT4/INT8, writes v5 disk cache. Per-projection mixed precision: `w2_bits` field added to `UnifiedExpertWeights` for separate gate/up vs down precision.
+- **`src/moe.rs`**: w2 dispatch uses `expert.w2_bits` (was `expert.num_bits`). Added `gguf_native` parameter.
+- **`src/gguf.rs`**: Added public `dequantize_raw_data()` for standalone dequantization.
+- **`python/krasis/model.py`**: Added `gguf_native` parameter (default False = use AVX2 cache).
+- **Per-layer GGUF type detection**: Handles Q4_K_M mixed types across layers (e.g. Q5_0 + Q8_0 for down).
+- **Warnings for non-exact conversions**: Q5_0→INT8, Q6_K→INT8, etc. are logged but proceed.
+
+### Cache Format
+- v5 cache: `.krasis_cache/experts_gguf_avx2_g{gs}.bin` — separate from safetensors caches
+- Mixed precision header: w13_bits and w2_bits stored independently
+- First run: build + cache (24s for V2-Lite), subsequent runs: load from disk (6s)
+
+### GGUF Type → Target Precision
+| GGUF Type | Target | Exact? |
+|-----------|--------|--------|
+| Q4_0, Q4_K | INT4 | Yes |
+| Q5_0, Q5_K | INT4 | No (round down) |
+| Q6_K | INT8 | No (round up) |
+| Q8_0 | INT8 | Yes |
+| F16, BF16, F32 | INT8 | No (quantize) |
+
+### V2-Lite Q4_K_M Results
+- **2+2 = "4"**: PASS, **Capital = "Paris"**: PASS
+- **GGUF types**: gate/up=[Q4_K] → INT4, down=[Q5_0, Q8_0] → INT8 (mixed precision)
+- **Cache build**: 26 layers × 64 experts in 24.3s, 10.1 GB
+- **Cache load**: 5.9s from disk
+- **Decode**: 4.77 tok/s (up from 1.83 tok/s GGUF-native — **2.6× speedup**)
+- **Prefill**: 169 tok/s (GPU Marlin persistent, unchanged)
+
+### Previous: Native GGUF (kept as `gguf_native=True` fallback)
+- **Decode**: 1.83 tok/s (AVX2 INT16×INT4/INT8 direct on GGUF blocks)
+- **Load**: 11.5s (raw block copy, no conversion)
+- Useful when you want fastest load time and don't need best decode speed
 
 ---
 

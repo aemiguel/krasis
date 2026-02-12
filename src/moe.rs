@@ -17,8 +17,9 @@ use crate::kernel::avx2::{
     MarlinTileMap, MarlinScaleMap,
     quantize_activation_int16,
 };
+use crate::gguf_kernels::{expert_forward_gguf, GgufScratch};
 use crate::weights::marlin::{f32_to_bf16, DEFAULT_GROUP_SIZE};
-use crate::weights::{ExpertWeights, QuantWeight, UnifiedExpertWeights, WeightStore};
+use crate::weights::{ExpertWeights, GgufExpertWeights, QuantWeight, UnifiedExpertWeights, WeightStore};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::path::Path;
@@ -223,7 +224,8 @@ pub fn expert_forward_unified(
     );
 
     // w2 matmul: expert_out[hidden_size] = hidden[N] @ w2[N, hidden_size]
-    match expert.num_bits {
+    // Use w2_bits (may differ from num_bits for mixed-precision GGUF sources)
+    match expert.w2_bits {
         4 => {
             let matmul_fn = if parallel {
                 matmul_int4_transposed_integer_parallel
@@ -250,7 +252,7 @@ pub fn expert_forward_unified(
                 n, k, gs,
             );
         }
-        _ => panic!("Unsupported num_bits: {}", expert.num_bits),
+        _ => panic!("Unsupported w2_bits: {}", expert.w2_bits),
     }
 }
 
@@ -585,6 +587,157 @@ pub fn moe_forward_unified(
     scratch.input_act_scales = act_scales;
 }
 
+/// Scratch buffers for GGUF expert computation (reused across calls).
+/// Full MoE forward using native GGUF weights (no dequant→requant).
+///
+/// Uses raw GGUF blocks directly with AVX2 INT16×INTn SIMD for Q4_K/Q8_0/Q4_0,
+/// scalar f32 fallback for Q5_0/Q6_K.
+pub fn moe_forward_gguf(
+    store: &WeightStore,
+    moe_layer_idx: usize,
+    activation: &[u16],
+    expert_indices: &[usize],
+    expert_weights: &[f32],
+    output: &mut [f32],
+    scratch: &mut GgufScratch,
+    scratch_pool: &mut [GgufScratch],
+    shared_scratch: &mut Option<GgufScratch>,
+    parallel: bool,
+    numa_map: Option<&crate::numa::NumaExpertMap>,
+) {
+    assert_eq!(expert_indices.len(), expert_weights.len());
+    assert_eq!(activation.len(), store.config.hidden_size);
+    assert_eq!(output.len(), store.config.hidden_size);
+
+    output.fill(0.0);
+
+    let n = expert_indices.len();
+    let hidden = store.config.hidden_size;
+
+    if parallel && n > 1 && scratch_pool.len() >= n {
+        use rayon::prelude::*;
+
+        if let Some(nmap) = numa_map {
+            if nmap.num_nodes > 1 {
+                // NUMA-aware dispatch
+                let groups = nmap.group_by_node(moe_layer_idx, expert_indices);
+                let mut node_order: Vec<usize> = groups.keys().cloned().collect();
+                node_order.sort();
+
+                for node in &node_order {
+                    let expert_group = &groups[node];
+                    let pool_slices: Vec<(usize, usize)> = expert_group
+                        .iter()
+                        .map(|&(pos, eidx)| (pos, eidx))
+                        .collect();
+
+                    let pool_base = scratch_pool.as_mut_ptr() as usize;
+                    let target_node = *node;
+                    pool_slices.par_iter().for_each(|&(pos, eidx)| {
+                        crate::numa::pin_thread_to_node(target_node);
+                        let expert = store.get_expert_gguf(moe_layer_idx, eidx);
+                        let local_scratch = unsafe {
+                            &mut *(pool_base as *mut GgufScratch).add(pos)
+                        };
+                        expert_forward_gguf(
+                            expert, activation, local_scratch,
+                        );
+                        crate::numa::unpin_thread();
+                    });
+                }
+
+                // Weighted sum
+                for i in 0..n {
+                    let weight = expert_weights[i];
+                    let expert_out = &scratch_pool[i].expert_out;
+                    for j in 0..hidden {
+                        output[j] += weight * expert_out[j];
+                    }
+                }
+
+                return;
+            }
+        }
+
+        // Non-NUMA parallel path
+        let pool = &mut scratch_pool[..n];
+        pool.par_iter_mut().enumerate().for_each(|(i, local_scratch)| {
+            let eidx = expert_indices[i];
+            let expert = store.get_expert_gguf(moe_layer_idx, eidx);
+            expert_forward_gguf(
+                expert, activation, local_scratch,
+            );
+        });
+
+        // Weighted sum
+        for i in 0..n {
+            let weight = expert_weights[i];
+            let expert_out = &scratch_pool[i].expert_out;
+            for j in 0..hidden {
+                output[j] += weight * expert_out[j];
+            }
+        }
+    } else {
+        // Sequential with NTA prefetch
+        for i in 0..n {
+            let eidx = expert_indices[i];
+            let weight = expert_weights[i];
+            let expert = store.get_expert_gguf(moe_layer_idx, eidx);
+
+            if i + 1 < n {
+                let next_expert = store.get_expert_gguf(moe_layer_idx, expert_indices[i + 1]);
+                prefetch_gguf_expert_nta(next_expert);
+            }
+
+            expert_forward_gguf(
+                expert, activation, scratch,
+            );
+
+            for j in 0..output.len() {
+                output[j] += weight * scratch.expert_out[j];
+            }
+        }
+    }
+
+    // Apply shared expert if present (GGUF format)
+    if let Some(shared_expert) = store.get_shared_expert_gguf(moe_layer_idx) {
+        if let Some(ss) = shared_scratch.as_mut() {
+            expert_forward_gguf(
+                shared_expert, activation, ss,
+            );
+
+            let scale = store.config.routed_scaling_factor;
+            for j in 0..hidden {
+                output[j] = scale * output[j] + ss.expert_out[j];
+            }
+        }
+    }
+}
+
+/// Prefetch GGUF expert weights into L3 cache using NTA hints.
+#[cfg(target_arch = "x86_64")]
+fn prefetch_gguf_expert_nta(expert: &GgufExpertWeights) {
+    const STRIDE: usize = 512;
+
+    unsafe fn prefetch_buf(ptr: *const u8, bytes: usize) {
+        let ptr = ptr as *const i8;
+        let mut off = 0;
+        while off < bytes {
+            _mm_prefetch(ptr.add(off), _MM_HINT_NTA);
+            off += STRIDE;
+        }
+    }
+
+    unsafe {
+        prefetch_buf(expert.gate_data.as_ptr(), expert.gate_data.len());
+        prefetch_buf(expert.up_data.as_ptr(), expert.up_data.len());
+        prefetch_buf(expert.down_data.as_ptr(), expert.down_data.len());
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn prefetch_gguf_expert_nta(_expert: &GgufExpertWeights) {}
+
 /// Prefetch unified expert weights into L3 cache using NTA hints.
 #[cfg(target_arch = "x86_64")]
 fn prefetch_expert_unified_nta(expert: &UnifiedExpertWeights) {
@@ -695,19 +848,31 @@ fn moe_worker(
     let intermediate = store.config.moe_intermediate_size;
     let group_size = store.group_size;
     let topk_max = store.config.num_experts_per_tok;
+    let use_gguf = store.has_gguf();
 
+    // Allocate scratch buffers based on which weight format is loaded
     let mut scratch = ExpertScratch::new(hidden, intermediate, group_size);
     let mut scratch_pool: Vec<ExpertScratch> = (0..topk_max)
         .map(|_| ExpertScratch::new(hidden, intermediate, group_size))
         .collect();
+
+    let mut gguf_scratch = GgufScratch::new(hidden, intermediate);
+    let mut gguf_scratch_pool: Vec<GgufScratch> = (0..topk_max)
+        .map(|_| GgufScratch::new(hidden, intermediate))
+        .collect();
+
     let mut output_f32 = vec![0.0f32; hidden];
 
     // Shared expert scratch (different intermediate size: n_shared * moe_intermediate)
-    // When skip_shared_experts is true, the host framework (e.g. SGLang) handles
-    // shared experts on GPU, so we don't allocate scratch or compute them.
     let mut shared_scratch = if store.config.n_shared_experts > 0 && !skip_shared_experts {
         let shared_intermediate = store.config.n_shared_experts * intermediate;
         Some(ExpertScratch::new(hidden, shared_intermediate, group_size))
+    } else {
+        None
+    };
+    let mut gguf_shared_scratch = if store.config.n_shared_experts > 0 && !skip_shared_experts {
+        let shared_intermediate = store.config.n_shared_experts * intermediate;
+        Some(GgufScratch::new(hidden, shared_intermediate))
     } else {
         None
     };
@@ -737,7 +902,15 @@ fn moe_worker(
             }
 
             output_f32.fill(0.0);
-            if store.has_unified() {
+            if use_gguf {
+                moe_forward_gguf(
+                    &store, work.moe_layer_idx, act,
+                    &expert_indices, &expert_weights,
+                    &mut output_f32, &mut gguf_scratch, &mut gguf_scratch_pool,
+                    &mut gguf_shared_scratch,
+                    parallel, numa_map.as_ref(),
+                );
+            } else if store.has_unified() {
                 moe_forward_unified(
                     &store, work.moe_layer_idx, act,
                     &expert_indices, &expert_weights,
@@ -784,6 +957,10 @@ pub struct KrasisEngine {
     scratch_pool: Vec<ExpertScratch>,
     /// Scratch buffer for shared expert (different intermediate size). None if no shared experts.
     shared_scratch: Option<ExpertScratch>,
+    /// GGUF scratch buffers (used when native GGUF weights are loaded).
+    gguf_scratch: Option<GgufScratch>,
+    gguf_scratch_pool: Vec<GgufScratch>,
+    gguf_shared_scratch: Option<GgufScratch>,
     output_buf: Vec<f32>,
     parallel: bool,
     /// Skip shared expert computation (when host framework handles it, e.g. SGLang on GPU).
@@ -828,6 +1005,9 @@ impl KrasisEngine {
         KrasisEngine {
             store: None,
             scratch: None,
+            gguf_scratch: None,
+            gguf_scratch_pool: Vec::new(),
+            gguf_shared_scratch: None,
             scratch_pool: Vec::new(),
             shared_scratch: None,
             output_buf: Vec::new(),
@@ -848,8 +1028,12 @@ impl KrasisEngine {
     /// `cpu_num_bits`: 4 or 8, quantization for CPU decode experts. Default: 4.
     /// `gpu_num_bits`: 4 (Marlin INT4 for GPU prefill). Default: 4.
     /// `num_bits`: Legacy param — sets cpu_num_bits (backward compat).
-    #[pyo3(signature = (model_dir, group_size=None, max_layers=None, start_layer=None, num_bits=None, cpu_num_bits=None, gpu_num_bits=None))]
-    pub fn load(&mut self, model_dir: &str, group_size: Option<usize>, max_layers: Option<usize>, start_layer: Option<usize>, num_bits: Option<u8>, cpu_num_bits: Option<u8>, gpu_num_bits: Option<u8>) -> PyResult<()> {
+    /// `gguf_path`: If set, load CPU expert weights from this GGUF file instead of
+    ///              building from safetensors. GPU Marlin cache still from safetensors.
+    /// `gguf_native`: If true, use raw GGUF blocks for CPU decode (slower but no conversion).
+    ///                 Default false: dequant GGUF → re-quantize to fast AVX2 transposed format.
+    #[pyo3(signature = (model_dir, group_size=None, max_layers=None, start_layer=None, num_bits=None, cpu_num_bits=None, gpu_num_bits=None, gguf_path=None, gguf_native=false))]
+    pub fn load(&mut self, model_dir: &str, group_size: Option<usize>, max_layers: Option<usize>, start_layer: Option<usize>, num_bits: Option<u8>, cpu_num_bits: Option<u8>, gpu_num_bits: Option<u8>, gguf_path: Option<&str>, gguf_native: bool) -> PyResult<()> {
         let cpu_bits = cpu_num_bits.or(num_bits).unwrap_or(4);
         let gpu_bits = gpu_num_bits.unwrap_or(4);
         if cpu_bits != 4 && cpu_bits != 8 {
@@ -863,7 +1047,10 @@ impl KrasisEngine {
             ));
         }
         let bits = cpu_bits; // For backward-compat logging and memory estimation
-        log::info!("[DIAG-RUST] load() called: model_dir={}, start_layer={:?}, max_layers={:?}, cpu_bits={}, gpu_bits={}", model_dir, start_layer, max_layers, cpu_bits, gpu_bits);
+        log::info!(
+            "[DIAG-RUST] load() called: model_dir={}, start_layer={:?}, max_layers={:?}, cpu_bits={}, gpu_bits={}, gguf={:?}",
+            model_dir, start_layer, max_layers, cpu_bits, gpu_bits, gguf_path,
+        );
         crate::syscheck::log_memory_usage("[DIAG-RUST] load() entry");
         let gs = group_size.unwrap_or(DEFAULT_GROUP_SIZE);
         let path = Path::new(model_dir);
@@ -898,12 +1085,25 @@ impl KrasisEngine {
             }
         }
 
-        log::info!("[DIAG-RUST] Calling WeightStore::load_from_hf (cpu_bits={}, gpu_bits={})...", cpu_bits, gpu_bits);
-        crate::syscheck::log_memory_usage("[DIAG-RUST] before load_from_hf");
-        let mut store = WeightStore::load_from_hf(path, gs, max_layers, start_layer, cpu_bits, gpu_bits)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        log::info!("[DIAG-RUST] WeightStore::load_from_hf completed OK");
-        crate::syscheck::log_memory_usage("[DIAG-RUST] after load_from_hf");
+        // Load weights: either from GGUF (CPU experts) or from HF safetensors (both)
+        let mut store = if let Some(gguf) = gguf_path {
+            log::info!("[DIAG-RUST] Loading CPU experts from GGUF: {} (native={})", gguf, gguf_native);
+            crate::syscheck::log_memory_usage("[DIAG-RUST] before load_from_gguf");
+            let s = WeightStore::load_from_gguf(
+                path, Path::new(gguf), gs, max_layers, start_layer, cpu_bits, gpu_bits, gguf_native,
+            ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            log::info!("[DIAG-RUST] WeightStore::load_from_gguf completed OK");
+            crate::syscheck::log_memory_usage("[DIAG-RUST] after load_from_gguf");
+            s
+        } else {
+            log::info!("[DIAG-RUST] Calling WeightStore::load_from_hf (cpu_bits={}, gpu_bits={})...", cpu_bits, gpu_bits);
+            crate::syscheck::log_memory_usage("[DIAG-RUST] before load_from_hf");
+            let s = WeightStore::load_from_hf(path, gs, max_layers, start_layer, cpu_bits, gpu_bits)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            log::info!("[DIAG-RUST] WeightStore::load_from_hf completed OK");
+            crate::syscheck::log_memory_usage("[DIAG-RUST] after load_from_hf");
+            s
+        };
 
         // Use the effective group_size from the loaded store (may differ for pre-quantized models)
         let effective_gs = store.group_size;
@@ -934,11 +1134,26 @@ impl KrasisEngine {
             None
         };
 
+        // GGUF scratch buffers (when native GGUF weights are loaded)
+        let (gguf_scratch, gguf_scratch_pool, gguf_shared_scratch) = if store.has_gguf() {
+            let gs = GgufScratch::new(store.config.hidden_size, store.config.moe_intermediate_size);
+            let pool: Vec<GgufScratch> = (0..top_k)
+                .map(|_| GgufScratch::new(store.config.hidden_size, store.config.moe_intermediate_size))
+                .collect();
+            let shared = if store.config.n_shared_experts > 0 {
+                let shared_intermediate = store.config.n_shared_experts * store.config.moe_intermediate_size;
+                Some(GgufScratch::new(store.config.hidden_size, shared_intermediate))
+            } else {
+                None
+            };
+            log::info!("[DIAG-RUST] GGUF scratch pools allocated (native GGUF path)");
+            (Some(gs), pool, shared)
+        } else {
+            (None, Vec::new(), None)
+        };
+
         log::info!("[DIAG-RUST] Scratch pools allocated, detecting NUMA...");
         crate::syscheck::log_memory_usage("[DIAG-RUST] after scratch alloc");
-
-        // INT4 Marlin: weights already loaded in unified format from cache
-        // INT8: uses separate ExpertWeights (no conversion needed)
 
         // Detect NUMA topology and migrate expert weights if multi-node
         let topo = crate::numa::NumaTopology::detect();
@@ -996,6 +1211,9 @@ impl KrasisEngine {
         self.output_buf = vec![0.0f32; store.config.hidden_size];
         self.scratch_pool = scratch_pool;
         self.shared_scratch = shared_scratch;
+        self.gguf_scratch = gguf_scratch;
+        self.gguf_scratch_pool = gguf_scratch_pool;
+        self.gguf_shared_scratch = gguf_shared_scratch;
         self.work_tx = Some(work_tx);
         self.result_rx = Some(Mutex::new(result_rx));
         self.worker_handle = Some(Mutex::new(handle));
@@ -1051,34 +1269,54 @@ impl KrasisEngine {
             )
         };
 
-        // Split borrows: store (immutable), scratch + output_buf (mutable)
-        let scratch = self.scratch.as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
         let parallel = self.parallel;
 
-        // When skip_shared_experts is true, pass None to prevent shared expert computation
-        let shared_scratch_ref = if self.skip_shared_experts {
-            &mut None
-        } else {
-            &mut self.shared_scratch
-        };
+        if store.has_gguf() {
+            // Native GGUF path — no INT16 quantization needed
+            let gguf_scratch = self.gguf_scratch.as_mut()
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("GGUF scratch not initialized"))?;
 
-        if store.has_unified() {
-            moe_forward_unified(
+            let gguf_shared_ref = if self.skip_shared_experts {
+                &mut None
+            } else {
+                &mut self.gguf_shared_scratch
+            };
+
+            moe_forward_gguf(
                 store, moe_layer_idx, activation,
                 &expert_indices, &expert_weights,
-                &mut self.output_buf, scratch,
-                &mut self.scratch_pool, shared_scratch_ref,
+                &mut self.output_buf, gguf_scratch,
+                &mut self.gguf_scratch_pool, gguf_shared_ref,
                 parallel, self.numa_map.as_ref(),
             );
         } else {
-            moe_forward(
-                store, moe_layer_idx, activation,
-                &expert_indices, &expert_weights,
-                &mut self.output_buf, scratch,
-                &mut self.scratch_pool, shared_scratch_ref,
-                parallel, self.numa_map.as_ref(),
-            );
+            // INT16-quantized path (unified or legacy)
+            let scratch = self.scratch.as_mut()
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
+
+            let shared_scratch_ref = if self.skip_shared_experts {
+                &mut None
+            } else {
+                &mut self.shared_scratch
+            };
+
+            if store.has_unified() {
+                moe_forward_unified(
+                    store, moe_layer_idx, activation,
+                    &expert_indices, &expert_weights,
+                    &mut self.output_buf, scratch,
+                    &mut self.scratch_pool, shared_scratch_ref,
+                    parallel, self.numa_map.as_ref(),
+                );
+            } else {
+                moe_forward(
+                    store, moe_layer_idx, activation,
+                    &expert_indices, &expert_weights,
+                    &mut self.output_buf, scratch,
+                    &mut self.scratch_pool, shared_scratch_ref,
+                    parallel, self.numa_map.as_ref(),
+                );
+            }
         }
 
         // Return output as f32 bytes
@@ -1151,6 +1389,13 @@ impl KrasisEngine {
         let store = self.store.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
         Ok(store.has_unified())
+    }
+
+    /// Whether native GGUF weights are loaded (for CPU decode).
+    pub fn has_gguf(&self) -> PyResult<bool> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
+        Ok(store.has_gguf())
     }
 
     /// Group size used for quantization.
