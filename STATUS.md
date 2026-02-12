@@ -49,19 +49,16 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 - [x] **routed_scaling_factor** — scale routed output before adding shared (V2-Lite: 1.0, Kimi K2.5: 2.827)
 - [x] **Model support**: V2-Lite (2 shared), Kimi K2.5 (1 shared), Qwen3 (0 shared, no-op)
 
-### Unified Weight Format
-- [x] **Combined w13 (gate+up)** — single matrix `[K/8, 2*N]` transposed layout, eliminates one matmul per expert
-- [x] **Transposed AVX2 integer kernel** — `_mm256_mullo_epi32` SIMD across output dim (no horizontal sum)
-- [x] **Transposed AVX2 FMA kernel** — `_mm256_fmadd_ps` variant for verification/fallback
-- [x] **Parallel transposed kernels** — rayon split across N dimension, chunk_n=256
-- [x] **UnifiedExpertWeights** — in-place conversion from gate/up/down, drops old format after
-- [x] **Layer-by-layer conversion** — converts one layer at a time, frees old format immediately (avoids 2x RAM peak)
-- [x] **V2 unified disk cache** — stores unified weights directly (`.krasis_cache/experts_unified_int4_g{gs}.bin`), includes shared experts
-- [x] **V1→V2 cache migration** — loads v1 cache, converts layer-by-layer, saves v2, deletes v1 automatically
-- [x] **moe_forward_unified** — full MoE forward with unified weights (parallel, NUMA, shared experts)
-- [x] **NTA prefetch for unified** — prefetch w13+w2 packed+scales into L3
-- [x] **Auto-dispatch** — engine.load() converts to unified, moe_forward auto-dispatches
-- [x] **Verified correct** — V2-Lite real weights max_abs_diff=0.000001 unified vs original
+### Dual Weight Format (replacing unified single-format)
+- [x] **Marlin GPU cache** — tile-permuted Marlin format for fused_marlin_moe, DMA from RAM
+- [x] **Marlin CPU kernel** — reads Marlin data directly (SLOW: 0.55 tok/s due to tile indirection)
+- [ ] **CPU-optimized cache** — sequential row-major layout for AVX2 cache locality (TODO)
+- [ ] **Dual cache build** — write both GPU + CPU caches on first run (TODO)
+- [ ] **Independent precision** — GPU and CPU bits configurable separately (TODO)
+- [x] **Combined w13 (gate+up)** — single matrix layout, eliminates one matmul per expert
+- [x] **Streaming cache build** — one layer at a time, ~16 GB peak RAM
+- [x] **NTA prefetch** — prefetch w13+w2 packed+scales into L3
+- [x] **Verified correct** — V2-Lite + Kimi K2.5 generation tests pass
 
 ### Safety & Monitoring
 - [x] **System RAM budget check** — estimates RAM before loading, refuses if >95% MemTotal
@@ -117,15 +114,18 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 | Qwen3-235B | KTransformers PP=3 | 4.21 tok/s | — | — | With expert pinning |
 
 ### Current Status
-- **Kimi K2.5 WORKING** on SGLang PP=3 with Krasis CPU decode
-- Correct output verified (factual Q&A, reasoning, creative writing)
-- Decode speed ~1.0 tok/s with debug flags, testing without
-- GPU prefill not yet tested (CPU-only for short prompts)
+- **Kimi K2.5 Marlin cache build COMPLETE** — 572 GB, 60 layers, 25 min with fused transpose
+- Kimi K2.5 3/3 correctness tests PASS with Marlin INT4 (but CPU decode only 0.55 tok/s due to Marlin tile layout)
+- **Architecture change**: Moving from single Marlin format to DUAL format (GPU Marlin + CPU-optimized)
+  - Marlin tile permutation destroys CPU cache locality → 3x slower than native CPU layout
+  - New plan: two separate caches with independently configurable precision
+- Next model: Qwen3-Coder-480B-A35B (qwen3_moe, 62 layers, 160 experts)
+- Monitor tool (`krasis_monitor.py`): terminal UI with vertical bar charts, resource bars, process tracking
 
 ### Known Issues
-- **Decode speed gap** — ~1.0 tok/s vs 4.0 tok/s KTransformers baseline. Contributing factors: debug flags, non-unified format (partial load), CUDA_LAUNCH_BLOCKING, PP overhead
-- **Partial load skips v2 cache** — PP ranks use `load_and_quantize_all()` from safetensors instead of the fast v2 unified disk cache. Loading takes ~8 min vs ~2 min. Needs per-rank cache loading.
-- **3 copies of expert weights** — each PP rank process loads its own portion from safetensors. Total ~570 GB RSS for 3 ranks vs ~530 GB if shared.
+- **First-run cache build** — ~25 min for Kimi K2.5 (572 GB) with fused transpose optimization. Subsequent runs load from cache.
+- **Decode speed with Marlin format** — 0.55 tok/s (Marlin) vs 1.55 tok/s (BF16) on Kimi K2.5. Root cause: Marlin tile layout poor CPU cache locality. Fix: dual-format architecture (in progress).
+- **Kimi K2.5 too slow for production** — 0.55 tok/s decode unacceptable. Moving to Qwen3-Coder-480B.
 
 ### Resolved Blockers
 - ~~**VRAM budget calculator broken**~~ — FIXED: redesigned with proper overhead estimation (2000 MB), context-length-as-hint approach
@@ -133,8 +133,12 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 - ~~**Garbage output**~~ — FIXED: shared experts were applied twice (CPU + GPU). Added `skip_shared_experts` flag.
 - ~~**GPU prefill was disabled**~~ — FIXED: GPU_PREFILL_THRESHOLD restored to 300
 - ~~**OOM from dual weight copies**~~ — FIXED: unified weight format eliminates ~438 GB duplicate
-- ~~**OOM from conversion peak**~~ — FIXED: streaming conversion processes one layer at a time
+- ~~**OOM from conversion peak**~~ — FIXED: streaming conversion processes one layer at a time (~16 GB peak)
 - ~~**Stale v1 disk cache**~~ — FIXED: auto-migrates v1→v2 cache
+- ~~**Cache directory missing on first run**~~ — FIXED: `create_dir_all()` before lock file creation
+- ~~**RAM watchdog too late**~~ — FIXED: moved to before Phase 1 (protects during loading)
+- ~~**YaRN RoPE backwards**~~ — FIXED: frequency assignment was inverted
+- ~~**Missing de-interleave before RoPE**~~ — FIXED
 
 ### Implemented: VRAM Budget Calculator
 Context length is now a **hint**. The calculator computes per-rank weight footprint, free VRAM,

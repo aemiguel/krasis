@@ -21,9 +21,11 @@ Hybrid LLM focused on minimal VRAM, always-on GPU prefill and efficient use of S
 
 **What we expect in System RAM**
 
-  - INT4 packed weights: int32 — 8,064 MB/layer (97%)
-  - BF16 scales: bfloat16 — 252 MB/layer (3%)
-  - Total: 8,316 MB/layer × 60 layers = 488 GB
+  Two separate cached weight formats, independently configurable precision:
+  - **(A) GPU cache (Marlin format)**: INT4 or INT8 per params — for GPU prefill via fused_marlin_moe
+  - **(B) CPU cache (CPU-optimized format)**: INT4 or INT8 per params — for CPU decode via AVX2 kernels
+  - Layout optimized per target: Marlin tile-permuted for GPU, sequential row-major for CPU
+  - Total RAM depends on model size and chosen precisions
 
 
 
@@ -35,10 +37,15 @@ Hybrid LLM focused on minimal VRAM, always-on GPU prefill and efficient use of S
 - Check cores and NPS, warn if not NPS4
 - Calculate memory budget at startup, refuse to run if it doesn't fit (optional param to force run anyway and risk OOM), at runtime always verify the memory budget calculations were accurate and warn that they need refactoring if not
 - Take HF native model
-- Produce Marlin INT8 or INT4 weights (as specified by params), cache to disk and load next time, allows for models to be run at INT8 or INT4 as preferred
-- Load all into system RAM, model in RAM is Marlin weights only, CPU will un-permute as necessary and bear the compute cost as it is memory bandwidth bound anyway
-- Load into GPU directly from model held in system RAM, perform one-time quantize of attention weights and shared expert to precision specified per runtime params (INT8, INT4 etc).
-  - Precision specified per component, e.g.  --kv-b-proj-quant int8 --shared-expert-quant int
+- Produce TWO cached formats on first run, streaming one layer at a time:
+  - (A) Marlin cache (INT4 or INT8 per params): for GPU prefill — `.krasis_cache/experts_marlin_g{gs}.bin`
+  - (B) CPU cache (INT4 or INT8 per params): for CPU decode — `.krasis_cache/experts_cpu_{bits}_g{gs}.bin`
+- GPU and CPU precision independently configurable (e.g. `--gpu-expert-bits 4 --cpu-expert-bits 8`)
+- Load both caches into system RAM on subsequent runs
+- GPU prefill: DMA copy Marlin weights from RAM → GPU → fused_marlin_moe (zero conversion)
+- CPU decode: read CPU-optimized weights directly — sequential memory access for AVX2 cache locality
+- Load attention/shared expert to GPU, quantize per runtime params (INT8, INT4 etc).
+  - Precision specified per component, e.g.  --kv-b-proj-quant int8 --shared-expert-quant int4
 - Retain other optimisations like divided expert buffer on GPU, KV cache compression etc
 - Automatic pinning of experts to NUMA nodes
 - No expert pinning to GPU for now (we proved gains were minimal or negative)
@@ -62,42 +69,27 @@ Hybrid LLM focused on minimal VRAM, always-on GPU prefill and efficient use of S
 
 
 
-**Unified Weight Format (implemented)**
+**Dual Weight Format (current architecture)**
 
-The original design stored expert weights as three separate matrices (gate, up, down) in
-`[N, K/8]` row-major layout. GPU prefill via Marlin required a completely separate copy
-of all expert weights in Marlin format, stored in a Python-side RAM cache. For Kimi K2.5
-(384 experts × 60 layers), this meant ~504 GB (Rust INT4) + ~438 GB (Python Marlin cache)
-= ~942 GB out of 995 GB total system RAM, which caused OOM crashes.
+Two separate cached formats, each independently configurable precision (INT4 or INT8):
 
-Solution: **single unified weight format** shared by CPU decode and GPU prefill.
+- **(A) GPU cache (Marlin format)**: Tile-permuted, bit-interleaved layout optimized for
+  `fused_marlin_moe` CUDA kernel. DMA copy from RAM → GPU with zero conversion.
+  On disk: `.krasis_cache/experts_marlin_g{gs}.bin`
 
-- **Combined w13**: gate and up projections concatenated into a single w13 matrix
-  `[K/8, 2*N]` (first N columns are gate, next N columns are up)
-- **Transposed layout**: `[K/8, N]` where K is the reduction dimension and N is the
-  output dimension. Weight data is contiguous along N, enabling SIMD across the output
-  dimension without horizontal sum
-- **CPU decode kernel**: New AVX2 integer kernel (`_mm256_mullo_epi32`) that processes
-  8 output values in parallel. Uses `_mm256_srlv_epi32` for variable shifts and
-  `_mm256_permutevar8x32_ps` for activation broadcast. Two matmuls per expert (w13 + w2)
-  instead of three (gate + up + down)
-- **GPU prefill**: Will read raw packed data from Rust via PyO3, upload to GPU, and run
-  `gptq_marlin_repack` on-the-fly. Eliminates the entire Python Marlin cache (~438 GB)
-- **RAM budget check**: At startup, estimates total RAM needed and refuses to run if >95%
-  of MemTotal. Post-load RSS check warns if actual usage deviates >10% from estimate
+- **(B) CPU cache (CPU-optimized format)**: Sequential row-major layout optimized for
+  AVX2 cache locality and hardware prefetcher. Combined w13 (gate+up) with contiguous
+  access patterns.
+  On disk: `.krasis_cache/experts_cpu_{bits}_g{gs}.bin`
 
-Design decisions:
-- `_mm256_madd_epi16` (3-cycle, original kernel) cannot be used with transposed layout
-  because it sums pairs of adjacent products, which would mix N outputs. We use
-  `_mm256_mullo_epi32` (10-cycle on Zen 2) instead — correct for SIMD-across-N approach.
-  Despite higher latency per instruction, the elimination of horizontal sum and better
-  memory access pattern compensates.
-- Conversion from old format to unified happens in-place at load time. The old weights
-  are dropped after conversion, so peak RAM is ~2x expert weights momentarily during
-  conversion (not ~2x permanently as before).
+This replaced the earlier single-format approach (Marlin everywhere) after testing showed
+Marlin's tile permutation destroyed CPU cache locality (0.55 tok/s vs 1.55 tok/s on Kimi K2.5).
 
-Verified correct: unified forward produces identical results to original forward on both
-synthetic weights and real V2-Lite model (max abs diff = 0.000001 on full MoE layer).
+- **CPU decode kernel**: AVX2 integer kernel with sequential weight access — no tile
+  indirection, no permutation overhead
+- **GPU prefill**: DMA copy Marlin weights from RAM → GPU → fused_marlin_moe (zero conversion)
+- **RAM budget check**: At startup, estimates total RAM needed for both caches and refuses
+  to run if >95% of MemTotal. Post-load RSS check warns if actual usage deviates >10%.
 
 
 

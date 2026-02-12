@@ -16,10 +16,10 @@ SGLang (Python)
 └── CPU decode: Krasis AVX2 INT4 kernel (token-by-token)
 
 Krasis (Rust + PyO3)
-├── ONE weight format: GPU-native Marlin INT4 (disk = RAM = GPU, no conversion)
-├── First run: BF16 safetensors → INT4 quantize → Marlin repack → disk cache
-├── Every run: load Marlin cache → RAM. GPU DMA copies directly. CPU reads directly.
-├── AVX2 Marlin-native CPU kernel for decode
+├── TWO weight formats: GPU (Marlin) + CPU-optimized, independently configurable INT4/INT8
+├── First run: BF16 safetensors → quantize → write both GPU + CPU disk caches
+├── Every run: load both caches → RAM. GPU DMA copies Marlin. CPU reads native format.
+├── AVX2 CPU-optimized kernel for decode (sequential access, no tile indirection)
 ├── Expert-level + intra-expert parallelism (rayon)
 ├── NUMA-aware weight placement + thread pinning
 ├── Zero-allocation scratch pool, NTA prefetch
@@ -76,9 +76,10 @@ See `run_kimi_krasis.sh` for a complete launch script.
 
 ## Key Features
 
-- **GPU-native Marlin INT4 — the ONLY weight format** — same bytes on disk, in RAM, on GPU. No conversion anywhere. CPU and GPU both read the same Marlin-packed data.
-- **Streaming cache build** — first-run quantization streams one expert at a time (~128 MB peak)
+- **Dual weight format** — separate GPU (Marlin) and CPU-optimized caches, each independently configurable as INT4 or INT8
+- **Streaming cache build** — first-run quantization streams one expert at a time (~128 MB peak), writes both GPU + CPU caches
 - **Zero-conversion GPU prefill** — DMA copy Marlin weights from RAM to GPU, run fused_marlin_moe instantly
+- **CPU-optimized decode** — sequential row-major layout for AVX2 cache locality (no Marlin tile indirection)
 - **FP8 KV cache** — 2x VRAM savings with negligible precision loss
 - **INT8 non-expert weights** — halves attention VRAM via per-channel quantization
 - **skip_shared_experts** — prevents double computation when host handles shared experts on GPU

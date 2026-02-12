@@ -13,6 +13,33 @@ Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
 
 ---
 
+## Architecture Change: Dual-Format Cache — 2026-02-12
+
+**Moving from single Marlin format to dual GPU + CPU format**
+
+### Problem
+Kimi K2.5 with Marlin-only format: 0.55 tok/s CPU decode vs 1.55 tok/s with BF16 native layout.
+Marlin's tile permutation destroys sequential memory access patterns, causing ~3x CPU slowdown
+due to cache misses and MarlinTileMap indirection overhead.
+
+### Solution
+Two separate cached formats, each independently configurable precision (INT4 or INT8):
+- **(A) GPU cache (Marlin format)**: tile-permuted for `fused_marlin_moe` CUDA kernel
+- **(B) CPU cache (CPU-optimized format)**: sequential row-major for AVX2 cache locality
+
+GPU and CPU precision independently configurable via Krasis params. Krasis can run any
+model at any precision combo (e.g. INT4 GPU + INT8 CPU).
+
+### Also in this change
+- Fused transpose optimization: cache build 25 min (was 3+ hours) for Kimi K2.5
+- Removed hardcoded GROUP_SIZE in gpu_prefill.py (now reads from engine)
+- Dynamic diagnostic layer indices in model.py (calculates from num_hidden_layers)
+- Monitor script improvements: auto-detect model config, layer-based ETA, GPU filtering
+- Kimi K2.5 3/3 correctness tests PASS with Marlin INT4 format
+- Kimi K2.5 retired (0.55 tok/s unacceptable), moving to Qwen3-Coder-480B
+
+---
+
 ## RAM watchdog fix — 2026-02-11
 
 - **Bug**: RAM watchdog started AFTER model fully loaded (line 328)
