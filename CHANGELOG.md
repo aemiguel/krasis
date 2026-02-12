@@ -17,27 +17,36 @@ Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
 
 **Full GPU prefill scaling + CPU decode timing analysis.**
 
-### GPU Prefill Scaling
-| Tokens | Wall Time | tok/s | ms/tok |
+### GPU Prefill Scaling (chunked, 2048 tok/chunk)
+| Tokens | Chunks | Wall Time | tok/s |
 |:---:|:---:|:---:|:---:|
-| 100 | 11.13s | 9.0 | 111.3 |
-| 500 | 10.61s | 47.1 | 21.2 |
-| 1,000 | 10.69s | 93.6 | 10.7 |
-| 2,000 | 10.96s | 182.5 | 5.5 |
-| 5,000 | 11.97s | 417.9 | 2.4 |
-| 9,903 | 14.28s | **693.3** | 1.4 |
+| 512 | 1 | 11.17s | 45.8 |
+| 1,024 | 1 | 10.71s | 95.7 |
+| 2,031 | 1 | 11.01s | 184.4 |
+| 4,047 | 2 | 22.12s | 183.0 |
+| 8,079 | 4 | 45.79s | 176.4 |
+| 9,903 | 5 | 57.26s | **173.0** |
 
-Fixed overhead ~10.5s (DMA 7.3 GB per pass), marginal compute ~3,100 tok/s.
+~11s fixed overhead per chunk (DMA 7.3 GB expert weights per layer).
 
-### CPU Decode by Context Length
-| Context | Avg | P50 | tok/s |
-|:---:|:---:|:---:|:---:|
-| 100 | 177ms | 175ms | 5.6 |
-| 1,000 | 177ms | 176ms | 5.7 |
-| 10,000 | 202ms | 201ms | 4.9 |
+### CPU Decode (100 tokens after 2K prefill)
+| Metric | Value |
+|--------|------:|
+| Avg | 170.2ms (5.9 tok/s) |
+| P50 | 170.5ms |
+| P90 | 173.5ms |
+| Min | 158.9ms |
+| Max | 175.1ms |
 
-Test scripts: `test_v2lite_10k.py`, `test_v2lite_timing.py`
-Full analysis: `PERFORMANCE_ANALYSIS.md`
+### Decode vs Context Length
+| Context | Avg | tok/s |
+|:---:|:---:|:---:|
+| 512 | 168.8ms | 5.9 |
+| 2,031 | 167.7ms | 6.0 |
+| 8,079 | 173.1ms | 5.8 |
+
+Test scripts: `test_v2lite_10k.py`, `test_v2lite_profile.py`
+Full analysis: `PERFORMANCE_ANALYSIS.md`, `BENCHMARKS.md`
 
 ---
 

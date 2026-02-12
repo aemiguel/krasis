@@ -105,7 +105,7 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 
 | Model | Config | Decode | GPU0 VRAM | GPU1 VRAM | Notes |
 |-------|--------|--------|-----------|-----------|-------|
-| V2-Lite | Standalone PP=1, INT4 GPU prefill | 3.3 tok/s | 424 tok/s prefill | — | Test model, 5/6 gen tests pass |
+| V2-Lite | Standalone PP=1, INT4 dual-format | 5.9 tok/s | 173-184 tok/s prefill | 2,924 MB | **VERIFIED** — dual format, 10K bench |
 | Kimi K2.5 | PP=2, BF16 wt, BF16 KV | 1.55-1.87 tok/s | 12,063 MB | 11,105 MB | **3/3 PASS**, diag ON |
 | Kimi K2.5 | PP=2, INT8 wt, BF16 KV | 1.28-1.41 tok/s | 7,654 MB | 6,044 MB | **3/3 PASS** |
 | Kimi K2.5 | PP=2, INT8 wt, FP8 KV | 1.21-1.28 tok/s | 7,654+4,032 KV | 6,044+4,839 KV | **3/3 PASS**, ~4x context |
@@ -118,9 +118,10 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 **Phase 1: V2-Lite — dual-format cache validation** ✓ COMPLETE
 - [x] Build both caches (GPU Marlin 7.2 GB + CPU INT4 7.0 GB), cached load 5.9s
 - [x] Load both formats, verify correctness: "2+2"→"4", "Capital of France"→"Paris"
-- [x] GPU prefill: **693 tok/s** (10K tokens), 77 tok/s (825 tokens)
-- [x] CPU decode: **5.6 tok/s** (177ms short context), **4.9 tok/s** (202ms at 10K context)
-- [x] In-depth timing analysis: prefill scales from 9→693 tok/s (100→10K tokens), ~10.5s fixed overhead per pass
+- [x] GPU prefill: **184 tok/s** (2K tokens, 1 chunk), **173 tok/s** (10K tokens, 5 chunks)
+- [x] CPU decode: **5.9 tok/s** (170ms avg, P50=170.5ms, P90=173.5ms)
+- [x] Decode vs context: flat 5.8-6.0 tok/s from 512 to 8K context
+- [x] In-depth timing analysis: ~11s fixed overhead per chunk (DMA dominated)
 - [x] Performance analysis MD: `PERFORMANCE_ANALYSIS.md`, benchmarks tracking: `BENCHMARKS.md`
 
 **Phase 2: Qwen3-Coder-Next**
