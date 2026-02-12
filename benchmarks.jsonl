@@ -1,0 +1,2 @@
+{"date": "2026-02-12 02:37", "model": "DeepSeek-V2-Lite", "prompt_tokens": 9903, "gpu_prefill_tps": 663.3, "gpu_prefill_time_s": 14.93, "decode_tps": 5.1, "decode_avg_ms": 196.1, "decode_p50_ms": 195.8, "decode_min_ms": 191.0, "decode_max_ms": 203.8, "decode_tokens": 49}
+{"date": "2026-02-12 02:39", "model": "DeepSeek-V2-Lite", "prompt_tokens": 9903, "gpu_prefill_tps": 173.6, "gpu_prefill_time_s": 57.049, "decode_tps": 5.1, "decode_avg_ms": 197.3, "decode_p50_ms": 198.4, "decode_min_ms": 170.8, "decode_max_ms": 203.2, "decode_tokens": 49}

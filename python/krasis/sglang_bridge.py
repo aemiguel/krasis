@@ -233,7 +233,8 @@ class KrasisMoEWrapper:
                 model_path,
                 start_layer=start_layer,
                 max_layers=max_layers,
-                num_bits=cls.cpu_expert_bits,
+                cpu_num_bits=cls.cpu_expert_bits,
+                gpu_num_bits=4,  # Marlin INT4 for GPU prefill
             )
 
             logger.info("[DIAG] engine.load() returned OK!")

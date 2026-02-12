@@ -1197,6 +1197,215 @@ pub fn matmul_int4_transposed_integer_parallel(
     });
 }
 
+// ── Transposed layout INT8 kernels (for CPU-optimized weight format) ────
+//
+// Weight layout: [K, N] — K is reduction dimension (outer), N is output
+// dimension (inner, contiguous). Same SIMD-across-N approach as INT4 transposed.
+//
+// INT8 is simpler than INT4: no nibble extraction, direct i8 loads.
+// Uses _mm256_madd_epi16 to process 2 K positions per iteration by
+// interleaving weights from adjacent K rows.
+
+/// AVX2 integer transposed INT8 matmul using `_mm256_madd_epi16`.
+///
+/// Weight layout: data[K, N] as i8, scales[K/group_size, N] as BF16.
+/// Processes 8 N-outputs at a time, 2 K positions per iteration.
+///
+/// # Safety
+/// Requires AVX2 + FMA. All pointers must be valid.
+/// `group_size` must be even and divisible by 2.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn expert_matmul_int8_transposed_integer(
+    data: *const i8,           // [K, n_stride] raw INT8 weights
+    weight_scales: *const u16, // [K/group_size, n_stride] BF16 scales
+    act_int16: *const i16,     // [K] quantized INT16 activations
+    act_scales: *const f32,    // [K/group_size] activation scales
+    output: *mut f32,          // [n_out]
+    k: usize,
+    n_stride: usize,
+    n_start: usize,
+    n_out: usize,
+    group_size: usize,
+) {
+    let num_groups = k / group_size;
+    let pairs_per_group = group_size / 2;
+
+    let n_blocks = n_out / 8;
+    let n_rem = n_out % 8;
+
+    for nb in 0..n_blocks {
+        let n_base = n_start + nb * 8;
+        let mut float_acc = _mm256_setzero_ps();
+
+        for g in 0..num_groups {
+            let mut int_acc = _mm256_setzero_si256();
+
+            for p in 0..pairs_per_group {
+                let k0 = g * group_size + p * 2;
+                let k1 = k0 + 1;
+
+                // Load 8 i8 values from each K row (64 bits each)
+                let row0 = _mm_loadl_epi64(
+                    data.add(k0 * n_stride + n_base) as *const __m128i,
+                );
+                let row1 = _mm_loadl_epi64(
+                    data.add(k1 * n_stride + n_base) as *const __m128i,
+                );
+
+                // Interleave bytes: [w[k0,0], w[k1,0], w[k0,1], w[k1,1], ...]
+                let interleaved = _mm_unpacklo_epi8(row0, row1);
+
+                // Sign-extend to INT16: 16 values in 256-bit register
+                let w16 = _mm256_cvtepi8_epi16(interleaved);
+
+                // Activation pair broadcast: [act[k0], act[k1]] repeated 8 times
+                let a0 = *act_int16.add(k0) as u16;
+                let a1 = *act_int16.add(k1) as u16;
+                let combined = (a0 as u32) | ((a1 as u32) << 16);
+                let act_pair = _mm256_set1_epi32(combined as i32);
+
+                // madd_epi16: 16 (INT16 × INT16) → 8 INT32 partial sums
+                let dot = _mm256_madd_epi16(w16, act_pair);
+                int_acc = _mm256_add_epi32(int_acc, dot);
+            }
+
+            // Convert INT32 → f32, apply combined weight × activation scale
+            let group_f32 = _mm256_cvtepi32_ps(int_acc);
+            let w_scales_bf16 = _mm_loadu_si128(
+                weight_scales.add(g * n_stride + n_base) as *const __m128i,
+            );
+            let w_scales_u32 = _mm256_cvtepu16_epi32(w_scales_bf16);
+            let w_scale_vec = _mm256_castsi256_ps(_mm256_slli_epi32(w_scales_u32, 16));
+            let a_scale = _mm256_set1_ps(*act_scales.add(g));
+            let combined = _mm256_mul_ps(w_scale_vec, a_scale);
+
+            float_acc = _mm256_fmadd_ps(group_f32, combined, float_acc);
+        }
+
+        _mm256_storeu_ps(output.add(nb * 8), float_acc);
+    }
+
+    // Handle remainder N positions with scalar code
+    if n_rem > 0 {
+        let rem_start = n_blocks * 8;
+        for r in 0..n_rem {
+            let n_pos = n_start + rem_start + r;
+            let mut acc: f32 = 0.0;
+            for g in 0..num_groups {
+                let w_scale = bf16_to_f32(*weight_scales.add(g * n_stride + n_pos));
+                let a_scale = *act_scales.add(g);
+                let combined = w_scale * a_scale;
+                let mut group_sum: i32 = 0;
+                for ki in 0..group_size {
+                    let k_pos = g * group_size + ki;
+                    let w_val = *data.add(k_pos * n_stride + n_pos) as i32;
+                    let a_val = *act_int16.add(k_pos) as i32;
+                    group_sum += w_val * a_val;
+                }
+                acc += group_sum as f32 * combined;
+            }
+            *output.add(rem_start + r) = acc;
+        }
+    }
+}
+
+/// Safe wrapper for AVX2 integer transposed INT8 matmul.
+///
+/// Weight layout: data as i8 packed into u32 in [K, N] layout, scales [K/gs, N] as BF16.
+/// The u32 vec is just a byte container — actual data is i8.
+pub fn matmul_int8_transposed_integer(
+    data_u32: &[u32],     // [K, N] as i8 packed into u32 (byte container)
+    scales: &[u16],        // [K/group_size, N] BF16
+    act_int16: &[i16],     // [K]
+    act_scales: &[f32],    // [K/group_size]
+    output: &mut [f32],    // [N]
+    k: usize,
+    n: usize,
+    group_size: usize,
+) {
+    assert_eq!(act_int16.len(), k);
+    assert_eq!(act_scales.len(), k / group_size);
+    assert_eq!(output.len(), n);
+    // INT8: K*N bytes = K*N/4 u32s
+    assert_eq!(data_u32.len(), (k * n + 3) / 4, "data_u32 len mismatch: expected {}, got {}", (k * n + 3) / 4, data_u32.len());
+    assert_eq!(scales.len(), (k / group_size) * n);
+    assert!(k % group_size == 0);
+    assert!(group_size % 2 == 0, "Transposed INT8 kernel requires even group_size");
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    unsafe {
+        expert_matmul_int8_transposed_integer(
+            data_u32.as_ptr() as *const i8,
+            scales.as_ptr(), act_int16.as_ptr(),
+            act_scales.as_ptr(), output.as_mut_ptr(),
+            k, n, 0, n, group_size,
+        );
+    }
+}
+
+/// Parallel AVX2 integer transposed INT8 matmul.
+///
+/// Splits work by N columns across rayon threads (same strategy as INT4 transposed).
+pub fn matmul_int8_transposed_integer_parallel(
+    data_u32: &[u32],
+    scales: &[u16],
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+    k: usize,
+    n: usize,
+    group_size: usize,
+) {
+    use rayon::prelude::*;
+
+    assert_eq!(act_int16.len(), k);
+    assert_eq!(act_scales.len(), k / group_size);
+    assert_eq!(output.len(), n);
+    assert!(k % group_size == 0);
+    assert!(group_size % 2 == 0);
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    if n <= 64 {
+        unsafe {
+            expert_matmul_int8_transposed_integer(
+                data_u32.as_ptr() as *const i8,
+                scales.as_ptr(), act_int16.as_ptr(),
+                act_scales.as_ptr(), output.as_mut_ptr(),
+                k, n, 0, n, group_size,
+            );
+        }
+        return;
+    }
+
+    let chunk_n = 256;
+    let data_addr = data_u32.as_ptr() as usize;
+    let scales_addr = scales.as_ptr() as usize;
+    let act_addr = act_int16.as_ptr() as usize;
+    let act_scales_addr = act_scales.as_ptr() as usize;
+
+    output.par_chunks_mut(chunk_n).enumerate().for_each(|(chunk_idx, chunk)| {
+        let n_start = chunk_idx * chunk_n;
+        let n_count = chunk.len();
+
+        unsafe {
+            expert_matmul_int8_transposed_integer(
+                data_addr as *const i8,
+                scales_addr as *const u16,
+                act_addr as *const i16,
+                act_scales_addr as *const f32,
+                chunk.as_mut_ptr(),
+                k, n, n_start, n_count, group_size,
+            );
+        }
+    });
+}
+
 // ============================================================================
 // Marlin-native INT4 kernel — reads GPU-native Marlin-packed data directly
 // ============================================================================
@@ -2345,6 +2554,153 @@ mod tests {
             .fold(0.0f32, f32::max);
         eprintln!("Transposed integer parallel vs serial: max_diff={max_diff_int:.8}");
         assert!(max_diff_int == 0.0, "Transposed integer parallel should be bit-identical");
+    }
+
+    #[test]
+    fn test_transposed_int8_matches_nontransposed() {
+        use crate::weights::marlin::quantize_int8;
+
+        // Test transposed INT8 kernel against non-transposed INT8 kernel
+        let n = 32;
+        let k = 256;
+        let group_size = 128;
+
+        // Generate BF16 weights [N, K]
+        let mut weight_bf16 = vec![0u16; n * k];
+        for i in 0..weight_bf16.len() {
+            let val = ((i * 3 + 7) as f32 / weight_bf16.len() as f32 - 0.5) * 0.4;
+            weight_bf16[i] = f32_to_bf16(val);
+        }
+
+        // Quantize to INT8 [N, K]
+        let q8 = quantize_int8(&weight_bf16, n, k, group_size);
+
+        // Non-transposed INT8 kernel (reference)
+        let mut activation = vec![0u16; k];
+        for i in 0..k {
+            let val = ((i * 11 + 3) as f32 / k as f32 - 0.5) * 0.5;
+            activation[i] = f32_to_bf16(val);
+        }
+
+        let mut act_int16 = vec![0i16; k];
+        let mut act_scales = vec![0.0f32; k / group_size];
+        quantize_activation_int16(&activation, group_size, &mut act_int16, &mut act_scales);
+
+        let mut nontransposed_out = vec![0.0f32; n];
+        matmul_int8_integer(&q8, &act_int16, &act_scales, &mut nontransposed_out);
+
+        // Transpose INT8 data: [N, K] → [K, N]
+        let mut transposed_i8 = vec![0i8; k * n];
+        for row in 0..n {
+            for col in 0..k {
+                transposed_i8[col * n + row] = q8.data[row * k + col];
+            }
+        }
+        // Transpose scales: [N, K/gs] → [K/gs, N]
+        let num_groups = k / group_size;
+        let mut transposed_scales = vec![0u16; num_groups * n];
+        for row in 0..n {
+            for g in 0..num_groups {
+                transposed_scales[g * n + row] = q8.scales[row * num_groups + g];
+            }
+        }
+
+        // Pack i8 data into u32 container
+        let u32_count = (k * n + 3) / 4;
+        let mut data_u32 = vec![0u32; u32_count];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                transposed_i8.as_ptr() as *const u8,
+                data_u32.as_mut_ptr() as *mut u8,
+                k * n,
+            );
+        }
+
+        let mut transposed_out = vec![0.0f32; n];
+        matmul_int8_transposed_integer(
+            &data_u32, &transposed_scales, &act_int16, &act_scales,
+            &mut transposed_out, k, n, group_size,
+        );
+
+        let mut max_diff: f32 = 0.0;
+        for i in 0..n {
+            let diff = (nontransposed_out[i] - transposed_out[i]).abs();
+            max_diff = max_diff.max(diff);
+        }
+        eprintln!(
+            "Transposed INT8 vs non-transposed [{n}×{k}]: max_diff={max_diff:.8}"
+        );
+        // Small difference expected from different FMA accumulation ordering
+        assert!(max_diff < 0.001, "Transposed INT8 should match non-transposed closely: {max_diff}");
+    }
+
+    #[test]
+    fn test_transposed_int8_parallel_correctness() {
+        use crate::weights::marlin::quantize_int8;
+
+        let n = 1408;
+        let k = 2048;
+        let group_size = 128;
+
+        let mut weight_bf16 = vec![0u16; n * k];
+        for i in 0..weight_bf16.len() {
+            let val = ((i * 37 + 11) as f32 / weight_bf16.len() as f32 - 0.5) * 0.1;
+            weight_bf16[i] = f32_to_bf16(val);
+        }
+
+        let q8 = quantize_int8(&weight_bf16, n, k, group_size);
+
+        let mut activation = vec![0u16; k];
+        for i in 0..k {
+            let val = ((i * 7 + 3) as f32 / k as f32 - 0.5) * 0.2;
+            activation[i] = f32_to_bf16(val);
+        }
+
+        let mut act_int16 = vec![0i16; k];
+        let mut act_scales = vec![0.0f32; k / group_size];
+        quantize_activation_int16(&activation, group_size, &mut act_int16, &mut act_scales);
+
+        // Transpose to [K, N]
+        let mut transposed_i8 = vec![0i8; k * n];
+        for row in 0..n {
+            for col in 0..k {
+                transposed_i8[col * n + row] = q8.data[row * k + col];
+            }
+        }
+        let num_groups = k / group_size;
+        let mut transposed_scales = vec![0u16; num_groups * n];
+        for row in 0..n {
+            for g in 0..num_groups {
+                transposed_scales[g * n + row] = q8.scales[row * num_groups + g];
+            }
+        }
+        let u32_count = (k * n + 3) / 4;
+        let mut data_u32 = vec![0u32; u32_count];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                transposed_i8.as_ptr() as *const u8,
+                data_u32.as_mut_ptr() as *mut u8,
+                k * n,
+            );
+        }
+
+        let mut serial_out = vec![0.0f32; n];
+        matmul_int8_transposed_integer(
+            &data_u32, &transposed_scales, &act_int16, &act_scales,
+            &mut serial_out, k, n, group_size,
+        );
+
+        let mut parallel_out = vec![0.0f32; n];
+        matmul_int8_transposed_integer_parallel(
+            &data_u32, &transposed_scales, &act_int16, &act_scales,
+            &mut parallel_out, k, n, group_size,
+        );
+
+        let max_diff: f32 = (0..n)
+            .map(|i| (serial_out[i] - parallel_out[i]).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("Transposed INT8 parallel vs serial [{n}×{k}]: max_diff={max_diff:.8}");
+        assert!(max_diff == 0.0, "Transposed INT8 parallel should be bit-identical");
     }
 
     #[test]

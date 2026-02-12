@@ -4,12 +4,98 @@
 
 | Suite | Count | Status | Last Run |
 |-------|-------|--------|----------|
-| Rust (`cargo test`) | 38/46 | 38 PASS, 8 SKIP (model files) | 2026-02-11 |
+| Rust (`cargo test`) | 48 | 40 PASS, 8 SKIP (model files) | 2026-02-12 |
 | Python bridge (`test_bridge.py`) | 3 | ALL PASS | 2026-02-09 |
 | GPU prefill (`test_gpu_prefill.py`) | 5 | ALL PASS | 2026-02-09 |
-| **Total** | **46** | **38 PASS** | |
+| **Total** | **56** | **40+ PASS** | |
 
 Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
+
+---
+
+## V2-Lite In-Depth Performance Analysis — 2026-02-12
+
+**Full GPU prefill scaling + CPU decode timing analysis.**
+
+### GPU Prefill Scaling
+| Tokens | Wall Time | tok/s | ms/tok |
+|:---:|:---:|:---:|:---:|
+| 100 | 11.13s | 9.0 | 111.3 |
+| 500 | 10.61s | 47.1 | 21.2 |
+| 1,000 | 10.69s | 93.6 | 10.7 |
+| 2,000 | 10.96s | 182.5 | 5.5 |
+| 5,000 | 11.97s | 417.9 | 2.4 |
+| 9,903 | 14.28s | **693.3** | 1.4 |
+
+Fixed overhead ~10.5s (DMA 7.3 GB per pass), marginal compute ~3,100 tok/s.
+
+### CPU Decode by Context Length
+| Context | Avg | P50 | tok/s |
+|:---:|:---:|:---:|:---:|
+| 100 | 177ms | 175ms | 5.6 |
+| 1,000 | 177ms | 176ms | 5.7 |
+| 10,000 | 202ms | 201ms | 4.9 |
+
+Test scripts: `test_v2lite_10k.py`, `test_v2lite_timing.py`
+Full analysis: `PERFORMANCE_ANALYSIS.md`
+
+---
+
+## V2-Lite Dual-Format Validation — 2026-02-12
+
+**All tests PASS. Both GPU Marlin + CPU INT4 caches working end-to-end.**
+
+### Results
+| Metric | Value |
+|--------|-------|
+| Correctness | 2/2 PASS ("2+2"→"4", "Capital of France"→"Paris") |
+| GPU Marlin cache | 7.2 GB on disk |
+| CPU INT4 cache | 7.0 GB on disk |
+| First-run cache build | 256.7s |
+| Cached load | **5.9s** |
+| GPU prefill (825 tok) | **77.2 tok/s** |
+| CPU decode | **5.5 tok/s** (181ms/tok) |
+
+Test script: `test_v2lite_dual_format.py`
+
+---
+
+## Dual-Format Cache Implementation Complete — 2026-02-12
+
+**Fully implemented: dual GPU + CPU cached weight formats**
+
+### What's New
+
+#### Transposed INT8 Kernel (`src/kernel/avx2.rs`)
+- New `expert_matmul_int8_transposed_integer()` — AVX2 kernel for INT8 CPU decode
+- Uses `_mm256_madd_epi16` with byte interleaving via `_mm_unpacklo_epi8`
+- Parallel wrapper `matmul_int8_transposed_integer_parallel()` with N=256 chunking
+- 2 new tests: matches non-transposed INT8, parallel correctness
+
+#### WeightStore Dual Storage (`src/weights/mod.rs`)
+- `experts_unified` → `experts_cpu` (CPU transposed) + `experts_gpu` (GPU Marlin)
+- `UnifiedExpertWeights` gains `num_bits: u8` field for kernel dispatch
+- `from_expert_weights_int8()` for INT8 transposed format (i8 packed into Vec<u32>)
+- `cpu_num_bits` + `gpu_num_bits` independently configurable
+- Backward compat: `has_unified()`, `get_expert_unified()`, `get_shared_expert_unified()`
+
+#### Dual Disk Cache Build & Load (`src/weights/mod.rs`)
+- `streaming_build_cpu_cache()` — streams safetensors → transposed format, layer by layer
+- `load_cpu_cache()` — loads v4 CPU cache from disk with INT4/INT8 dispatch
+- Cache version 4 header encodes `num_bits` in packed metadata
+- `load_from_hf()` now loads BOTH GPU (Marlin) and CPU (transposed) caches
+- File paths: `.krasis_cache/experts_cpu_int{4|8}_g{gs}.bin`
+
+#### CPU Forward Dispatch (`src/moe.rs`)
+- `expert_forward_unified()` dispatches on `expert.num_bits`: 4→transposed INT4, 8→transposed INT8
+- PyO3 getters read from `experts_gpu` for GPU prefill DMA
+- New `cpu_num_bits()` and `gpu_num_bits()` PyO3 properties
+- `load()` accepts `cpu_num_bits` + `gpu_num_bits` (backward compat via `num_bits`)
+
+#### Python Updates
+- `model.py`: passes `cpu_num_bits`/`gpu_num_bits` to Rust engine
+- `sglang_bridge.py`: passes `cpu_num_bits`/`gpu_num_bits` to Rust engine
+- `gpu_prefill.py`: unchanged (already uses `num_bits` param for GPU path)
 
 ---
 
@@ -36,7 +122,7 @@ model at any precision combo (e.g. INT4 GPU + INT8 CPU).
 - Dynamic diagnostic layer indices in model.py (calculates from num_hidden_layers)
 - Monitor script improvements: auto-detect model config, layer-based ETA, GPU filtering
 - Kimi K2.5 3/3 correctness tests PASS with Marlin INT4 format
-- Kimi K2.5 retired (0.55 tok/s unacceptable), moving to Qwen3-Coder-480B
+- Kimi K2.5 retired (0.55 tok/s unacceptable), moving to Qwen3-Coder-Next
 
 ---
 

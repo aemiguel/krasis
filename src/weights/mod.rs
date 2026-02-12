@@ -178,22 +178,28 @@ pub struct ExpertWeights {
     pub down: QuantWeight,
 }
 
-/// Unified expert weights with combined w13 (gate+up) in transposed layout.
+/// Unified expert weights with combined w13 (gate+up) in a packed layout.
 ///
-/// Layout: [K/8, N] — K (reduction dim) is outer, N (output dim) is contiguous.
-/// This enables SIMD across the output dimension (no horizontal sum needed).
+/// Used for both CPU (transposed) and GPU (Marlin) weight formats.
+/// The actual data layout depends on how the weights were created:
 ///
-/// Single copy in RAM shared by CPU decode and GPU prefill.
+/// **CPU transposed format** (`from_expert_weights` / `from_expert_weights_int8`):
+///   INT4: [K/8, N] packed u32 — K outer, N contiguous → SIMD across N
+///   INT8: [K, N] as i8 packed into u32 — K outer, N contiguous → SIMD across N
+///
+/// **GPU Marlin format** (`from_expert_weights_marlin`):
+///   INT4: Marlin tile-permuted [K/8, N] → optimized for fused_marlin_moe CUDA kernel
 pub struct UnifiedExpertWeights {
-    /// w13 (gate+up concatenated, transposed): packed INT4 in [K/8, 2*N] layout.
-    /// K = hidden_size (reduction dim), N = intermediate_size (output dim per gate/up).
-    /// First N columns are gate, next N columns are up.
+    /// w13 (gate+up concatenated): packed data as u32.
+    /// CPU INT4: [K/8, 2*N] transposed packed. CPU INT8: [K, 2*N] i8 in u32.
+    /// GPU Marlin: [K/8, 2*N] Marlin tile-permuted.
     pub w13_packed: Vec<u32>,
     /// w13 scales: [K/group_size, 2*N] as BF16.
     pub w13_scales: Vec<u16>,
 
-    /// w2 (down, transposed): packed INT4 in [K_down/8, N_down] layout.
-    /// K_down = intermediate_size (reduction dim), N_down = hidden_size (output dim).
+    /// w2 (down): packed data as u32.
+    /// CPU INT4: [K_down/8, N_down] transposed. CPU INT8: [K_down, N_down] i8 in u32.
+    /// GPU Marlin: [K_down/8, N_down] Marlin tile-permuted.
     pub w2_packed: Vec<u32>,
     /// w2 scales: [K_down/group_size, N_down] as BF16.
     pub w2_scales: Vec<u16>,
@@ -201,6 +207,8 @@ pub struct UnifiedExpertWeights {
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub group_size: usize,
+    /// Quantization bit width: 4 or 8.
+    pub num_bits: u8,
 }
 
 impl UnifiedExpertWeights {
@@ -269,6 +277,97 @@ impl UnifiedExpertWeights {
             hidden_size: hidden,
             intermediate_size: intermediate,
             group_size,
+            num_bits: 4,
+        }
+    }
+
+    /// Convert from separate gate/up/down ExpertWeights (INT8) to unified transposed format.
+    ///
+    /// Concatenates gate+up into w13, transposes from [N, K] to [K, N].
+    /// i8 data packed into Vec<u32> as byte container.
+    pub fn from_expert_weights_int8(ew: &ExpertWeights) -> Self {
+        let gate = match &ew.gate { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 gate weight") };
+        let up = match &ew.up { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 up weight") };
+        let down = match &ew.down { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 down weight") };
+
+        let hidden = gate.cols;       // K for w13
+        let intermediate = gate.rows; // N for w13 (per gate/up)
+        let group_size = gate.group_size;
+        let num_groups = hidden / group_size;
+        let two_n = 2 * intermediate;
+
+        // w13: concatenate gate[N, K] + up[N, K] → [2*N, K], then transpose → [K, 2*N]
+        let w13_byte_count = hidden * two_n;
+        let w13_u32_count = (w13_byte_count + 3) / 4;
+        let mut w13_bytes = vec![0i8; w13_u32_count * 4]; // pad to u32 boundary
+
+        for k in 0..hidden {
+            for n in 0..intermediate {
+                w13_bytes[k * two_n + n] = gate.data[n * hidden + k];
+                w13_bytes[k * two_n + intermediate + n] = up.data[n * hidden + k];
+            }
+        }
+
+        let w13_packed: Vec<u32> = unsafe {
+            let mut v = vec![0u32; w13_u32_count];
+            std::ptr::copy_nonoverlapping(
+                w13_bytes.as_ptr() as *const u8,
+                v.as_mut_ptr() as *mut u8,
+                w13_u32_count * 4,
+            );
+            v
+        };
+
+        // w13 scales: [2*N, K/gs] → transpose → [K/gs, 2*N]
+        let mut w13_scales = vec![0u16; num_groups * two_n];
+        for g in 0..num_groups {
+            for n in 0..intermediate {
+                w13_scales[g * two_n + n] = gate.scales[n * num_groups + g];
+                w13_scales[g * two_n + intermediate + n] = up.scales[n * num_groups + g];
+            }
+        }
+
+        // w2 (down): [hidden, intermediate] → transpose → [intermediate, hidden]
+        let down_k = down.cols;        // intermediate_size
+        let down_n = down.rows;        // hidden_size
+        let down_num_groups = down_k / group_size;
+
+        let w2_byte_count = down_k * down_n;
+        let w2_u32_count = (w2_byte_count + 3) / 4;
+        let mut w2_bytes = vec![0i8; w2_u32_count * 4];
+
+        for k in 0..down_k {
+            for n in 0..down_n {
+                w2_bytes[k * down_n + n] = down.data[n * down_k + k];
+            }
+        }
+
+        let w2_packed: Vec<u32> = unsafe {
+            let mut v = vec![0u32; w2_u32_count];
+            std::ptr::copy_nonoverlapping(
+                w2_bytes.as_ptr() as *const u8,
+                v.as_mut_ptr() as *mut u8,
+                w2_u32_count * 4,
+            );
+            v
+        };
+
+        let mut w2_scales = vec![0u16; down_num_groups * down_n];
+        for g in 0..down_num_groups {
+            for n in 0..down_n {
+                w2_scales[g * down_n + n] = down.scales[n * down_num_groups + g];
+            }
+        }
+
+        UnifiedExpertWeights {
+            w13_packed,
+            w13_scales,
+            w2_packed,
+            w2_scales,
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            group_size,
+            num_bits: 8,
         }
     }
 
@@ -315,6 +414,7 @@ impl UnifiedExpertWeights {
             hidden_size: hidden,
             intermediate_size: intermediate,
             group_size,
+            num_bits: 4,
         }
     }
 
@@ -330,25 +430,31 @@ impl UnifiedExpertWeights {
 pub struct WeightStore {
     /// Expert weights indexed as [moe_layer_index][expert_index].
     /// moe_layer_index is 0-based within MoE layers only (skips dense layers).
+    /// Legacy format (separate gate/up/down). Used for INT8 fallback path.
     pub experts: Vec<Vec<ExpertWeights>>,
-    /// Shared expert weights indexed as [moe_layer_index].
-    /// Empty if n_shared_experts == 0.
-    /// Shared expert is a single concatenated MLP with
-    /// intermediate_size = n_shared_experts × moe_intermediate_size.
+    /// Shared expert weights (legacy format).
     pub shared_experts: Vec<ExpertWeights>,
-    /// Unified expert weights (Marlin-native format).
-    /// Primary format for CPU decode. Populated during cache loading.
-    pub experts_unified: Vec<Vec<UnifiedExpertWeights>>,
-    /// Unified shared expert weights.
-    pub shared_experts_unified: Vec<UnifiedExpertWeights>,
+
+    /// CPU decode weights — transposed layout, optimized for sequential access.
+    /// INT4: [K/8, N] packed. INT8: [K, N] as i8 in u32.
+    pub experts_cpu: Vec<Vec<UnifiedExpertWeights>>,
+    /// CPU shared expert weights (transposed).
+    pub shared_experts_cpu: Vec<UnifiedExpertWeights>,
+
+    /// GPU prefill weights — Marlin tile-permuted layout for fused_marlin_moe.
+    /// Always INT4 Marlin format. Empty if GPU prefill not enabled.
+    pub experts_gpu: Vec<Vec<UnifiedExpertWeights>>,
+    /// GPU shared expert weights (Marlin).
+    pub shared_experts_gpu: Vec<UnifiedExpertWeights>,
+
     /// Model configuration.
     pub config: ModelConfig,
     /// Group size used for quantization.
     pub group_size: usize,
-    /// Quantization bit width (4 or 8).
-    pub num_bits: u8,
-    /// Whether weights are in GPU-native Marlin format (v3 cache) vs old transposed format (v2).
-    pub marlin_format: bool,
+    /// CPU expert quantization bit width (4 or 8).
+    pub cpu_num_bits: u8,
+    /// GPU expert quantization bit width (4 for Marlin).
+    pub gpu_num_bits: u8,
 }
 
 /// Safetensors shard index: maps tensor names to shard filenames.
@@ -379,8 +485,10 @@ struct SafetensorsIndex {
 //   down_scales [N_down * K_down/group_size u16s as bytes]
 
 const CACHE_MAGIC: &[u8; 4] = b"KRAS";
+#[allow(dead_code)]
 const CACHE_VERSION: u32 = 1;
 const CACHE_VERSION_MARLIN: u32 = 3;
+const CACHE_VERSION_CPU: u32 = 4;
 const CACHE_HEADER_SIZE: usize = 64;
 
 /// FNV-1a hash for cache invalidation.
@@ -394,17 +502,25 @@ fn fnv1a(data: &[u8]) -> u64 {
 }
 
 /// Cache file path for v1 format (separate gate/up/down, [N, K/8] layout).
+#[allow(dead_code)]
 fn cache_path(model_dir: &Path, num_bits: u8, group_size: usize) -> PathBuf {
     model_dir
         .join(".krasis_cache")
         .join(format!("experts_int{num_bits}_g{group_size}.bin"))
 }
 
-/// Cache file path for v3 Marlin format (GPU-native Marlin INT4, THE ONLY FORMAT).
+/// Cache file path for v3 Marlin format (GPU-native Marlin INT4).
 fn cache_path_marlin(model_dir: &Path, group_size: usize) -> PathBuf {
     model_dir
         .join(".krasis_cache")
         .join(format!("experts_marlin_g{group_size}.bin"))
+}
+
+/// Cache file path for CPU-optimized transposed format (INT4 or INT8).
+fn cache_path_cpu(model_dir: &Path, num_bits: u8, group_size: usize) -> PathBuf {
+    model_dir
+        .join(".krasis_cache")
+        .join(format!("experts_cpu_int{num_bits}_g{group_size}.bin"))
 }
 
 /// Compute per-expert byte sizes for unified format.
@@ -419,6 +535,68 @@ fn unified_expert_byte_sizes(config: &ModelConfig, group_size: usize) -> (usize,
     let w2_packed_bytes = (m / 8) * h * 4;
     let w2_scales_bytes = (m / group_size) * h * 2;
     (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes)
+}
+
+/// Compute per-expert byte sizes for CPU transposed format.
+/// INT4 has same sizes as Marlin (same u32 packing, different layout).
+/// INT8 has larger packed data (1 byte per element vs 0.5 for INT4).
+/// Returns (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes).
+fn cpu_expert_byte_sizes(config: &ModelConfig, group_size: usize, num_bits: u8) -> (usize, usize, usize, usize) {
+    let h = config.hidden_size;
+    let m = config.moe_intermediate_size;
+    let two_n = 2 * m;
+
+    if num_bits == 4 {
+        // INT4 transposed: same byte counts as Marlin (u32-packed nibbles)
+        unified_expert_byte_sizes(config, group_size)
+    } else {
+        // INT8 transposed: [K, N] as i8 packed into u32 (1 byte per element)
+        let w13_byte_count = h * two_n;
+        let w13_packed_bytes = ((w13_byte_count + 3) / 4) * 4; // round up to u32 boundary
+        let w13_scales_bytes = (h / group_size) * two_n * 2;
+        let w2_byte_count = m * h;
+        let w2_packed_bytes = ((w2_byte_count + 3) / 4) * 4;
+        let w2_scales_bytes = (m / group_size) * h * 2;
+        (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes)
+    }
+}
+
+/// Expected total CPU transposed cache file size.
+fn expected_cpu_cache_size(
+    config: &ModelConfig, group_size: usize, num_bits: u8, num_moe_layers: usize,
+    n_shared_experts: usize, shared_intermediate: usize,
+) -> usize {
+    let (w13pb, w13sb, w2pb, w2sb) = cpu_expert_byte_sizes(config, group_size, num_bits);
+    let per_routed_expert = w13pb + w13sb + w2pb + w2sb;
+    let routed_total = num_moe_layers * config.n_routed_experts * per_routed_expert;
+
+    let shared_total = if n_shared_experts > 0 {
+        let shared_m = shared_intermediate;
+        let h = config.hidden_size;
+        let two_shared_n = 2 * shared_m;
+        let (s_w13pb, s_w13sb, s_w2pb, s_w2sb) = if num_bits == 4 {
+            (
+                (h / 8) * two_shared_n * 4,
+                (h / group_size) * two_shared_n * 2,
+                (shared_m / 8) * h * 4,
+                (shared_m / group_size) * h * 2,
+            )
+        } else {
+            let s_w13_bytes = h * two_shared_n;
+            let s_w2_bytes = shared_m * h;
+            (
+                ((s_w13_bytes + 3) / 4) * 4,
+                (h / group_size) * two_shared_n * 2,
+                ((s_w2_bytes + 3) / 4) * 4,
+                (shared_m / group_size) * h * 2,
+            )
+        };
+        num_moe_layers * (s_w13pb + s_w13sb + s_w2pb + s_w2sb)
+    } else {
+        0
+    };
+
+    CACHE_HEADER_SIZE + routed_total + shared_total
 }
 
 /// Expected total v2 unified cache file size.
@@ -446,8 +624,9 @@ fn expected_unified_cache_size(
     CACHE_HEADER_SIZE + routed_total + shared_total
 }
 
-/// Compute per-expert byte sizes from config.
+/// Compute per-expert byte sizes from config (legacy v1 format).
 /// Returns (gate_data_bytes, gate_scales_bytes, down_data_bytes, down_scales_bytes).
+#[allow(dead_code)]
 fn expert_byte_sizes(config: &ModelConfig, group_size: usize, num_bits: u8) -> (usize, usize, usize, usize) {
     let h = config.hidden_size;
     let m = config.moe_intermediate_size;
@@ -468,7 +647,8 @@ fn expert_byte_sizes(config: &ModelConfig, group_size: usize, num_bits: u8) -> (
     (gate_data_bytes, gate_scales_bytes, down_data_bytes, down_scales_bytes)
 }
 
-/// Expected total cache file size.
+/// Expected total cache file size (legacy v1 format).
+#[allow(dead_code)]
 fn expected_cache_size(config: &ModelConfig, group_size: usize, num_bits: u8, num_moe_layers: usize) -> usize {
     let (gpb, gsb, dpb, dsb) = expert_byte_sizes(config, group_size, num_bits);
     let per_expert = gpb + gsb + gpb + gsb + dpb + dsb; // gate + up + down
@@ -482,8 +662,10 @@ impl WeightStore {
         WeightStore {
             experts: Vec::new(),
             shared_experts: Vec::new(),
-            experts_unified: Vec::new(),
-            shared_experts_unified: Vec::new(),
+            experts_cpu: Vec::new(),
+            shared_experts_cpu: Vec::new(),
+            experts_gpu: Vec::new(),
+            shared_experts_gpu: Vec::new(),
             config: ModelConfig {
                 hidden_size: 0,
                 moe_intermediate_size: 0,
@@ -495,8 +677,8 @@ impl WeightStore {
                 routed_scaling_factor: 1.0,
             },
             group_size: DEFAULT_GROUP_SIZE,
-            num_bits: 4,
-            marlin_format: false,
+            cpu_num_bits: 4,
+            gpu_num_bits: 4,
         }
     }
 }
@@ -504,20 +686,21 @@ impl WeightStore {
 impl WeightStore {
     /// Load expert weights from a HF model directory, using disk cache if available.
     ///
-    /// First checks for a cached `.krasis_cache/experts_int{bits}_g{group_size}.bin`.
-    /// If valid, loads directly from cache (mmap + copy, ~1-2s for V2-Lite).
-    /// Otherwise, reads BF16 safetensors, quantizes, and writes cache.
+    /// Loads DUAL format caches:
+    ///   - GPU: Marlin INT4 cache → `experts_gpu` (for GPU prefill)
+    ///   - CPU: Transposed INT4/INT8 cache → `experts_cpu` (for CPU decode)
     ///
-    /// If `max_layers` is Some(n), only load n MoE layers (skips cache).
-    /// If `start_layer` is Some(s), start loading from MoE layer s (0-based, skips cache).
-    /// Combined: loads MoE layers [start_layer .. start_layer + max_layers).
-    /// `num_bits`: 4 for INT4 (default), 8 for INT8.
+    /// If `max_layers` is Some(n), only load n MoE layers.
+    /// If `start_layer` is Some(s), start loading from MoE layer s (0-based).
+    /// `cpu_num_bits`: 4 or 8 for CPU decode format.
+    /// `gpu_num_bits`: 4 (Marlin, always INT4).
     pub fn load_from_hf(
         model_dir: &Path,
         group_size: usize,
         max_layers: Option<usize>,
         start_layer: Option<usize>,
-        num_bits: u8,
+        cpu_num_bits: u8,
+        gpu_num_bits: u8,
     ) -> Result<Self, String> {
         let start = std::time::Instant::now();
 
@@ -531,9 +714,10 @@ impl WeightStore {
             .map_err(|e| format!("Failed to extract MoE config: {e}"))?;
 
         log::info!(
-            "Model config: hidden={}, moe_intermediate={}, experts={}, top-{}, layers={}, first_dense={}",
+            "Model config: hidden={}, moe_intermediate={}, experts={}, top-{}, layers={}, first_dense={}, cpu_bits={}, gpu_bits={}",
             config.hidden_size, config.moe_intermediate_size, config.n_routed_experts,
             config.num_experts_per_tok, config.num_hidden_layers, config.first_k_dense_replace,
+            cpu_num_bits, gpu_num_bits,
         );
 
         let total_moe_layers = config.num_hidden_layers - config.first_k_dense_replace;
@@ -560,36 +744,54 @@ impl WeightStore {
         // Detect effective group_size for pre-quantized models (needed for correct cache path)
         let effective_gs_hint = Self::detect_group_size_hint(model_dir, &config);
         let cache_gs = effective_gs_hint.unwrap_or(group_size);
-        let partial = max_layers.is_some() || start_layer.is_some();
 
-        // ── INT4: try v3 Marlin cache first (GPU-native format, THE ONLY FORMAT) ──
-        if num_bits == 4 {
-            let mpath = cache_path_marlin(model_dir, cache_gs);
+        // ── Phase 1: Load/build GPU Marlin cache → experts_gpu ──
+        let mut experts_gpu: Vec<Vec<UnifiedExpertWeights>> = Vec::new();
+        let mut shared_experts_gpu: Vec<UnifiedExpertWeights> = Vec::new();
+        let mut effective_gs = cache_gs;
 
-            // Try loading v3 Marlin cache
-            if mpath.exists() {
+        // Try loading existing Marlin cache
+        let mut gpu_loaded = false;
+        for try_gs in &[cache_gs, group_size, 32, 64, 128] {
+            if gpu_loaded { break; }
+            let try_path = cache_path_marlin(model_dir, *try_gs);
+            if try_path.exists() {
                 match Self::load_marlin_cache(
-                    &mpath, &config, cache_gs, total_moe_layers, config_hash,
+                    &try_path, &config, *try_gs, total_moe_layers, config_hash,
                     moe_start, num_moe_layers,
                 ) {
                     Ok(store) => {
-                        let elapsed = start.elapsed();
                         log::info!(
-                            "Loaded from MARLIN cache in {:.1}s: layers [{}-{}), {} experts (+ {} shared)",
-                            elapsed.as_secs_f64(),
-                            moe_start, moe_start + num_moe_layers,
-                            config.n_routed_experts,
-                            store.shared_experts_unified.len(),
+                            "Loaded GPU Marlin cache in {:.1}s (gs={}): {} layers, {} experts (+ {} shared)",
+                            start.elapsed().as_secs_f64(), try_gs,
+                            num_moe_layers, config.n_routed_experts, store.shared_experts_gpu.len(),
                         );
-                        return Ok(store);
+                        experts_gpu = store.experts_gpu;
+                        shared_experts_gpu = store.shared_experts_gpu;
+                        effective_gs = *try_gs;
+                        gpu_loaded = true;
                     }
-                    Err(e) => log::warn!("Marlin cache invalid (gs={}): {e}", cache_gs),
+                    Err(e) => {
+                        if *try_gs == cache_gs {
+                            log::warn!("Marlin cache invalid (gs={}): {e}", try_gs);
+                        }
+                    }
                 }
             }
+        }
 
-            // Also check other group sizes for v3 Marlin cache
-            for try_gs in &[group_size, 32, 64, 128] {
-                if *try_gs == cache_gs { continue; }
+        // Build Marlin cache if not found
+        if !gpu_loaded {
+            let mpath = cache_path_marlin(model_dir, cache_gs);
+            log::info!("No v3 Marlin cache found, building from safetensors...");
+            let built_gs = Self::build_marlin_cache_locked(
+                model_dir, &config, group_size, total_moe_layers, &mpath, config_hash,
+            )?;
+            effective_gs = built_gs;
+
+            // Load the just-built cache
+            for try_gs in &[built_gs, cache_gs, group_size, 32, 64, 128] {
+                if gpu_loaded { break; }
                 let try_path = cache_path_marlin(model_dir, *try_gs);
                 if try_path.exists() {
                     match Self::load_marlin_cache(
@@ -597,137 +799,116 @@ impl WeightStore {
                         moe_start, num_moe_layers,
                     ) {
                         Ok(store) => {
-                            let elapsed = start.elapsed();
                             log::info!(
-                                "Loaded from MARLIN cache in {:.1}s (gs={}): layers [{}-{})",
-                                elapsed.as_secs_f64(), try_gs,
-                                moe_start, moe_start + num_moe_layers,
+                                "Loaded GPU Marlin cache in {:.1}s (built gs={})",
+                                start.elapsed().as_secs_f64(), try_gs,
                             );
-                            return Ok(store);
+                            experts_gpu = store.experts_gpu;
+                            shared_experts_gpu = store.shared_experts_gpu;
+                            effective_gs = *try_gs;
+                            gpu_loaded = true;
                         }
                         Err(_) => {}
                     }
                 }
             }
 
-            // No v3 Marlin cache — build it from safetensors
-            if !mpath.exists() {
-                log::info!("No v3 Marlin cache found, building from safetensors...");
-                let built_gs = Self::build_marlin_cache_locked(
-                    model_dir, &config, group_size, total_moe_layers, &mpath, config_hash,
-                )?;
-                // Handle effective_group_size mismatch
-                if built_gs != cache_gs {
-                    let actual_mpath = cache_path_marlin(model_dir, built_gs);
-                    if actual_mpath.exists() {
-                        match Self::load_marlin_cache(
-                            &actual_mpath, &config, built_gs, total_moe_layers, config_hash,
-                            moe_start, num_moe_layers,
-                        ) {
-                            Ok(store) => {
-                                let elapsed = start.elapsed();
-                                log::info!(
-                                    "Loaded from MARLIN cache in {:.1}s (built gs={})",
-                                    elapsed.as_secs_f64(), built_gs,
-                                );
-                                return Ok(store);
-                            }
-                            Err(e) => log::warn!("Failed to load built Marlin cache: {e}"),
-                        }
-                    }
-                }
-            }
-
-            // Try loading the v3 cache we just built
-            for try_gs in &[cache_gs, group_size, 32, 64, 128] {
-                let try_path = cache_path_marlin(model_dir, *try_gs);
-                if try_path.exists() {
-                    match Self::load_marlin_cache(
-                        &try_path, &config, *try_gs, total_moe_layers, config_hash,
-                        moe_start, num_moe_layers,
-                    ) {
-                        Ok(store) => {
-                            let elapsed = start.elapsed();
-                            log::info!(
-                                "Loaded from MARLIN cache in {:.1}s: layers [{}-{})",
-                                elapsed.as_secs_f64(),
-                                moe_start, moe_start + num_moe_layers,
-                            );
-                            return Ok(store);
-                        }
-                        Err(e) => {
-                            if *try_gs == cache_gs {
-                                log::warn!("Marlin cache invalid (gs={}): {e}", try_gs);
-                            }
-                        }
-                    }
-                }
-            }
-
-            log::warn!("All Marlin cache attempts failed, falling back to safetensors");
-        }
-
-        // ── INT8: use v1 cache path (unified is INT4-only, full loads only) ──
-        if !partial && num_bits == 8 {
-            let cpath = cache_path(model_dir, num_bits, cache_gs);
-            if cpath.exists() {
-                match Self::load_cache(&cpath, &config, cache_gs, num_bits, num_moe_layers, config_hash) {
-                    Ok(mut store) => {
-                        if config.n_shared_experts > 0 {
-                            store.shared_experts = Self::load_shared_experts(
-                                model_dir, &config, store.group_size, num_bits, num_moe_layers,
-                            )?;
-                        }
-                        let elapsed = start.elapsed();
-                        log::info!(
-                            "Loaded from cache in {:.1}s: {} MoE layers × {} experts",
-                            elapsed.as_secs_f64(),
-                            num_moe_layers,
-                            config.n_routed_experts,
-                        );
-                        return Ok(store);
-                    }
-                    Err(e) => {
-                        log::warn!("Cache invalid, re-quantizing: {e}");
-                    }
-                }
+            if !gpu_loaded {
+                log::warn!("All Marlin cache attempts failed — GPU prefill will not be available");
             }
         }
 
-        // ── Fallback: load from safetensors (partial loads or INT8 without cache) ──
-        log::info!("[DIAG-RUST] Starting load_and_quantize_all: {} MoE layers, start={}, bits={}", num_moe_layers, moe_start, num_bits);
-        crate::syscheck::log_memory_usage("[DIAG-RUST] before load_and_quantize_all");
-        let (experts, shared_experts, effective_group_size) =
-            Self::load_and_quantize_all(model_dir, &config, group_size, num_bits, num_moe_layers, moe_start)?;
-        log::info!("[DIAG-RUST] load_and_quantize_all completed OK");
-        crate::syscheck::log_memory_usage("[DIAG-RUST] after load_and_quantize_all");
+        // ── Phase 2: Load/build CPU transposed cache → experts_cpu ──
+        let mut experts_cpu: Vec<Vec<UnifiedExpertWeights>> = Vec::new();
+        let mut shared_experts_cpu: Vec<UnifiedExpertWeights> = Vec::new();
+        let mut cpu_loaded = false;
 
+        // Try loading existing CPU cache
+        let cpu_path = cache_path_cpu(model_dir, cpu_num_bits, effective_gs);
+        if cpu_path.exists() {
+            match Self::load_cpu_cache(
+                &cpu_path, &config, effective_gs, total_moe_layers, config_hash,
+                moe_start, num_moe_layers, cpu_num_bits,
+            ) {
+                Ok((cpu_exp, cpu_shared)) => {
+                    log::info!(
+                        "Loaded CPU INT{} cache in {:.1}s: {} layers, {} experts (+ {} shared)",
+                        cpu_num_bits, start.elapsed().as_secs_f64(),
+                        num_moe_layers, config.n_routed_experts, cpu_shared.len(),
+                    );
+                    experts_cpu = cpu_exp;
+                    shared_experts_cpu = cpu_shared;
+                    cpu_loaded = true;
+                }
+                Err(e) => log::warn!("CPU cache invalid: {e}"),
+            }
+        }
+
+        // Build CPU cache if not found
+        if !cpu_loaded {
+            log::info!("No CPU INT{} cache found, building from safetensors...", cpu_num_bits);
+            let built_gs = Self::streaming_build_cpu_cache(
+                model_dir, &config, group_size, total_moe_layers,
+                0, &cpu_path, config_hash, cpu_num_bits,
+            )?;
+
+            // effective_gs may have been updated by the CPU build
+            let actual_cpu_path = cache_path_cpu(model_dir, cpu_num_bits, built_gs);
+            if built_gs != effective_gs && cpu_path != actual_cpu_path {
+                // CPU build detected a different group_size — rename cache
+                if cpu_path.exists() {
+                    let _ = std::fs::rename(&cpu_path, &actual_cpu_path);
+                }
+            }
+            let load_path = if actual_cpu_path.exists() { &actual_cpu_path } else { &cpu_path };
+
+            match Self::load_cpu_cache(
+                load_path, &config, built_gs, total_moe_layers, config_hash,
+                moe_start, num_moe_layers, cpu_num_bits,
+            ) {
+                Ok((cpu_exp, cpu_shared)) => {
+                    log::info!(
+                        "Loaded CPU INT{} cache after build in {:.1}s",
+                        cpu_num_bits, start.elapsed().as_secs_f64(),
+                    );
+                    experts_cpu = cpu_exp;
+                    shared_experts_cpu = cpu_shared;
+                    cpu_loaded = true;
+                    if built_gs != effective_gs {
+                        effective_gs = built_gs;
+                    }
+                }
+                Err(e) => log::warn!("Failed to load built CPU cache: {e}"),
+            }
+        }
+
+        if !cpu_loaded {
+            log::warn!("CPU cache not loaded — CPU decode will use legacy path if available");
+        }
+
+        // ── Build final WeightStore ──
         let store = WeightStore {
-            experts,
-            shared_experts,
-            experts_unified: Vec::new(),
-            shared_experts_unified: Vec::new(),
+            experts: Vec::new(),
+            shared_experts: Vec::new(),
+            experts_cpu,
+            shared_experts_cpu,
+            experts_gpu,
+            shared_experts_gpu,
             config: config.clone(),
-            group_size: effective_group_size,
-            num_bits,
-            marlin_format: false,
+            group_size: effective_gs,
+            cpu_num_bits,
+            gpu_num_bits,
         };
-
-        // Save cache for next time (only for full model loads)
-        if !partial {
-            // INT8: save v1 cache
-            let cpath = cache_path(model_dir, num_bits, effective_group_size);
-            match store.save_cache(&cpath, config_hash) {
-                Ok(()) => log::info!("Saved INT{num_bits} cache to {}", cpath.display()),
-                Err(e) => log::warn!("Failed to save cache: {e}"),
-            }
-        }
 
         let total_elapsed = start.elapsed();
         log::info!(
-            "Loaded {} MoE layers in {:.1}s",
-            num_moe_layers,
+            "Dual cache loaded in {:.1}s: {} MoE layers, GPU={} CPU=INT{}{}, gs={}",
             total_elapsed.as_secs_f64(),
+            num_moe_layers,
+            if gpu_loaded { "Marlin" } else { "none" },
+            cpu_num_bits,
+            if cpu_loaded { "" } else { "(none)" },
+            effective_gs,
         );
 
         Ok(store)
@@ -735,9 +916,11 @@ impl WeightStore {
 
     /// Load from safetensors shards and quantize to INT4/INT8 (or load pre-quantized).
     /// Returns (routed_experts, shared_experts, effective_group_size).
+    /// Legacy function — used by save_cache/load_cache paths.
     ///
     /// `start_moe_layer`: 0-based offset into MoE layers (skips first N MoE layers).
     /// `num_moe_layers`: how many MoE layers to load starting from `start_moe_layer`.
+    #[allow(dead_code)]
     /// `num_bits`: 4 for INT4, 8 for INT8.
     fn load_and_quantize_all(
         model_dir: &Path,
@@ -908,7 +1091,8 @@ impl WeightStore {
         Ok((experts, shared_experts, effective_group_size))
     }
 
-    /// Write INT4 expert weights to a cache file.
+    /// Write INT4 expert weights to a cache file (legacy v1 format).
+    #[allow(dead_code)]
     fn save_cache(&self, path: &Path, config_hash: u64) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -977,7 +1161,8 @@ impl WeightStore {
         Ok(())
     }
 
-    /// Load expert weights from cache file via mmap.
+    /// Load expert weights from cache file via mmap (legacy v1 format).
+    #[allow(dead_code)]
     fn load_cache(
         path: &Path,
         config: &ModelConfig,
@@ -1065,12 +1250,14 @@ impl WeightStore {
         Ok(WeightStore {
             experts,
             shared_experts: Vec::new(), // loaded separately after cache
-            experts_unified: Vec::new(),
-            shared_experts_unified: Vec::new(),
+            experts_cpu: Vec::new(),
+            shared_experts_cpu: Vec::new(),
+            experts_gpu: Vec::new(),
+            shared_experts_gpu: Vec::new(),
             config: config.clone(),
             group_size,
-            num_bits,
-            marlin_format: false,
+            cpu_num_bits: num_bits,
+            gpu_num_bits: 4,
         })
     }
 
@@ -1123,7 +1310,8 @@ impl WeightStore {
         migrated
     }
 
-    /// Load shared expert weights from safetensors (BF16, quantized to INT4/INT8).
+    /// Load shared expert weights from safetensors (BF16, quantized to INT4/INT8). Legacy.
+    #[allow(dead_code)]
     fn load_shared_experts(
         model_dir: &Path,
         config: &ModelConfig,
@@ -1638,13 +1826,13 @@ impl WeightStore {
         let mut offset = CACHE_HEADER_SIZE + start_moe_layer * per_routed_layer;
 
         // Load routed experts
-        let mut experts_unified = Vec::with_capacity(num_layers_to_load);
+        let mut experts_gpu = Vec::with_capacity(num_layers_to_load);
         for layer_idx in 0..num_layers_to_load {
             let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
             for _eidx in 0..config.n_routed_experts {
                 layer_experts.push(read_unified_expert(&mmap, &mut offset, h, m, group_size));
             }
-            experts_unified.push(layer_experts);
+            experts_gpu.push(layer_experts);
 
             if (layer_idx + 1) % 10 == 0 || layer_idx + 1 == num_layers_to_load {
                 log::info!(
@@ -1656,7 +1844,7 @@ impl WeightStore {
         }
 
         // Load shared experts
-        let mut shared_experts_unified = Vec::new();
+        let mut shared_experts_gpu = Vec::new();
         if config.n_shared_experts > 0 {
             let routed_total = total_moe_layers * per_routed_layer;
             let shared_m = config.n_shared_experts * config.moe_intermediate_size;
@@ -1672,7 +1860,7 @@ impl WeightStore {
             offset = shared_base;
 
             for _i in 0..num_layers_to_load {
-                shared_experts_unified.push(
+                shared_experts_gpu.push(
                     read_unified_expert(&mmap, &mut offset, h, shared_m, group_size),
                 );
             }
@@ -1684,22 +1872,419 @@ impl WeightStore {
             "MARLIN cache loaded in {:.1}s: {} layers × {} experts (+ {} shared), {:.1} GB",
             elapsed.as_secs_f64(),
             num_layers_to_load, config.n_routed_experts,
-            shared_experts_unified.len(),
+            shared_experts_gpu.len(),
             offset as f64 / 1e9,
         );
 
         Ok(WeightStore {
             experts: Vec::new(),
             shared_experts: Vec::new(),
-            experts_unified,
-            shared_experts_unified,
+            experts_cpu: Vec::new(),
+            shared_experts_cpu: Vec::new(),
+            experts_gpu,
+            shared_experts_gpu,
             config: config.clone(),
             group_size,
-            num_bits: 4,
-            marlin_format: true, // v3 Marlin = GPU-native format
+            cpu_num_bits: 4,
+            gpu_num_bits: 4,
         })
     }
 
+
+    /// Streaming build CPU transposed cache from safetensors.
+    ///
+    /// Reads expert weights layer by layer, transposes to CPU-optimized format,
+    /// writes to disk cache. Supports both INT4 and INT8 via `cpu_num_bits`.
+    fn streaming_build_cpu_cache(
+        model_dir: &Path,
+        config: &ModelConfig,
+        group_size: usize,
+        num_moe_layers: usize,
+        start_moe_layer: usize,
+        cache_path: &Path,
+        config_hash: u64,
+        cpu_num_bits: u8,
+    ) -> Result<usize, String> {
+        log::info!(
+            "Streaming build CPU INT{} cache: {} MoE layers from safetensors → {}",
+            cpu_num_bits, num_moe_layers, cache_path.display(),
+        );
+        crate::syscheck::log_memory_usage("before streaming_build_cpu_cache");
+
+        // Parse safetensors index
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let index_str = std::fs::read_to_string(&index_path)
+            .map_err(|e| format!("Failed to read safetensors index: {e}"))?;
+        let index: SafetensorsIndex = serde_json::from_str(&index_str)
+            .map_err(|e| format!("Failed to parse safetensors index: {e}"))?;
+
+        // Determine needed shards
+        let first_abs_layer = start_moe_layer + config.first_k_dense_replace;
+        let last_abs_layer = first_abs_layer + num_moe_layers;
+        let mut needed_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (tensor_name, shard_name) in &index.weight_map {
+            if let Some(layer_num) = parse_layer_number(tensor_name) {
+                if layer_num >= first_abs_layer && layer_num < last_abs_layer {
+                    needed_shards.insert(shard_name.clone());
+                }
+            }
+        }
+        let mut shard_names: Vec<String> = needed_shards.into_iter().collect();
+        shard_names.sort();
+
+        log::info!(
+            "Opening {}/{} safetensors shards for CPU cache build",
+            shard_names.len(),
+            index.weight_map.values().collect::<std::collections::HashSet<_>>().len(),
+        );
+
+        let mut shards: HashMap<String, MmapSafetensors> = HashMap::new();
+        for (i, name) in shard_names.iter().enumerate() {
+            let path = model_dir.join(name);
+            let st = MmapSafetensors::open(&path)
+                .map_err(|e| format!("Failed to open {name}: {e}"))?;
+            shards.insert(name.clone(), st);
+            if (i + 1) % 10 == 0 || i + 1 == shard_names.len() {
+                log::info!("  Opened {}/{} shards", i + 1, shard_names.len());
+            }
+        }
+
+        // Detect prefix and quantization format
+        let layers_prefix = detect_expert_prefix(&index.weight_map)?;
+        let prequantized = is_prequantized(&index.weight_map);
+        let effective_group_size = if prequantized {
+            let probe_layer = start_moe_layer + config.first_k_dense_replace;
+            let native_gs = detect_prequant_group_size(
+                &index.weight_map, &shards, &layers_prefix, probe_layer,
+            )?;
+            if native_gs != group_size {
+                log::info!(
+                    "Pre-quantized model has group_size={native_gs}, overriding requested {group_size}"
+                );
+            }
+            native_gs
+        } else {
+            group_size
+        };
+
+        // Create cache directory + temp file
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create cache dir: {e}"))?;
+        }
+        let tmp_path = cache_path.with_extension("bin.tmp");
+        let file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create CPU cache file: {e}"))?;
+        let mut w = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+
+        // Write header (version 4 = CPU transposed format)
+        write_cpu_cache_header(&mut w, config, effective_group_size, num_moe_layers, config_hash, cpu_num_bits)?;
+
+        let overall_start = std::time::Instant::now();
+
+        // Stream routed experts layer by layer
+        for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
+            let layer_idx = moe_idx + config.first_k_dense_replace;
+            let layer_start = std::time::Instant::now();
+
+            // Phase 1: Sequential I/O — load expert weights from safetensors
+            let io_start = std::time::Instant::now();
+            let mut expert_data: Vec<ExpertWeights> = Vec::with_capacity(config.n_routed_experts);
+            for eidx in 0..config.n_routed_experts {
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
+                let (gate, up, down) = if prequantized {
+                    // Pre-quantized models are always INT4 — if cpu_num_bits=8, we'd need
+                    // to dequantize and re-quantize. For now, only support INT4 for pre-quantized.
+                    if cpu_num_bits != 4 {
+                        return Err(format!(
+                            "CPU INT{cpu_num_bits} cache not supported for pre-quantized INT4 models (would need dequant+requant)"
+                        ));
+                    }
+                    let g = QuantWeight::Int4(load_prequantized_weight(
+                        &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
+                    )?);
+                    let u = QuantWeight::Int4(load_prequantized_weight(
+                        &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                    )?);
+                    let d = QuantWeight::Int4(load_prequantized_weight(
+                        &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                    )?);
+                    (g, u, d)
+                } else {
+                    load_and_quantize_expert(
+                        &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                    )?
+                };
+                expert_data.push(ExpertWeights { gate, up, down });
+            }
+            let io_elapsed = io_start.elapsed();
+
+            // Phase 2: Parallel CPU transpose across all cores
+            let repack_start = std::time::Instant::now();
+            let expert_results: Vec<UnifiedExpertWeights> = expert_data
+                .into_par_iter()
+                .map(|ew| {
+                    if cpu_num_bits == 8 {
+                        UnifiedExpertWeights::from_expert_weights_int8(&ew)
+                    } else {
+                        UnifiedExpertWeights::from_expert_weights(&ew)
+                    }
+                })
+                .collect();
+            let repack_elapsed = repack_start.elapsed();
+
+            // Phase 3: Sequential write
+            for cpu_exp in &expert_results {
+                write_vec_u32(&mut w, &cpu_exp.w13_packed)?;
+                write_vec_u16(&mut w, &cpu_exp.w13_scales)?;
+                write_vec_u32(&mut w, &cpu_exp.w2_packed)?;
+                write_vec_u16(&mut w, &cpu_exp.w2_scales)?;
+            }
+            drop(expert_results);
+
+            let layers_done = moe_idx - start_moe_layer + 1;
+            let layer_elapsed = layer_start.elapsed();
+            if layers_done % 5 == 0 || layers_done == num_moe_layers {
+                crate::syscheck::log_memory_usage(&format!(
+                    "CPU cache: {layers_done}/{num_moe_layers} layers ({:.1}s/layer, io={:.1}s transpose={:.1}s)",
+                    layer_elapsed.as_secs_f64(),
+                    io_elapsed.as_secs_f64(),
+                    repack_elapsed.as_secs_f64(),
+                ));
+            } else {
+                log::info!(
+                    "  Layer {layer_idx}: {} experts in {:.1}s (io={:.1}s transpose={:.1}s) [{layers_done}/{num_moe_layers}]",
+                    config.n_routed_experts,
+                    layer_elapsed.as_secs_f64(),
+                    io_elapsed.as_secs_f64(),
+                    repack_elapsed.as_secs_f64(),
+                );
+            }
+        }
+
+        // Stream shared experts
+        if config.n_shared_experts > 0 {
+            log::info!("Streaming shared experts for CPU cache ({} layers)...", num_moe_layers);
+            for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
+                let layer_idx = moe_idx + config.first_k_dense_replace;
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.shared_experts");
+                let (gate, up, down) = load_and_quantize_expert(
+                    &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                )?;
+                let ew = ExpertWeights { gate, up, down };
+                let cpu_exp = if cpu_num_bits == 8 {
+                    UnifiedExpertWeights::from_expert_weights_int8(&ew)
+                } else {
+                    UnifiedExpertWeights::from_expert_weights(&ew)
+                };
+
+                write_vec_u32(&mut w, &cpu_exp.w13_packed)?;
+                write_vec_u16(&mut w, &cpu_exp.w13_scales)?;
+                write_vec_u32(&mut w, &cpu_exp.w2_packed)?;
+                write_vec_u16(&mut w, &cpu_exp.w2_scales)?;
+            }
+        }
+
+        // Flush + atomic rename
+        w.flush().map_err(|e| format!("Flush error: {e}"))?;
+        drop(w);
+        std::fs::rename(&tmp_path, cache_path)
+            .map_err(|e| format!("Failed to rename CPU cache file: {e}"))?;
+
+        // Free safetensors mmaps and reclaim RAM
+        drop(shards);
+        #[cfg(target_os = "linux")]
+        unsafe { libc::malloc_trim(0); }
+
+        let elapsed = overall_start.elapsed();
+        let size = std::fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
+        log::info!(
+            "CPU INT{} cache built: {:.1} GB in {:.1}s ({:.1} GB/s)",
+            cpu_num_bits,
+            size as f64 / 1e9,
+            elapsed.as_secs_f64(),
+            size as f64 / 1e9 / elapsed.as_secs_f64(),
+        );
+        crate::syscheck::log_memory_usage("after streaming_build_cpu_cache");
+
+        Ok(effective_group_size)
+    }
+
+    /// Load v4 CPU transposed cache from disk.
+    fn load_cpu_cache(
+        path: &Path,
+        config: &ModelConfig,
+        group_size: usize,
+        total_moe_layers: usize,
+        config_hash: u64,
+        start_moe_layer: usize,
+        num_layers_to_load: usize,
+        expected_bits: u8,
+    ) -> Result<(Vec<Vec<UnifiedExpertWeights>>, Vec<UnifiedExpertWeights>), String> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("Failed to open CPU cache: {e}"))?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| format!("Failed to mmap CPU cache: {e}"))?;
+
+        // Validate header
+        if mmap.len() < CACHE_HEADER_SIZE {
+            return Err("CPU cache too small for header".to_string());
+        }
+        if &mmap[0..4] != CACHE_MAGIC {
+            return Err("Bad magic in CPU cache".to_string());
+        }
+        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        if version != CACHE_VERSION_CPU {
+            return Err(format!("Cache version {version}, expected {CACHE_VERSION_CPU} (CPU)"));
+        }
+
+        let h_hidden = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
+        let h_intermediate = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
+        let h_n_experts = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+        let h_num_layers = u64::from_le_bytes(mmap[32..40].try_into().unwrap()) as usize;
+        let h_group_size = u64::from_le_bytes(mmap[40..48].try_into().unwrap()) as usize;
+        let h_config_hash = u64::from_le_bytes(mmap[48..56].try_into().unwrap());
+        let packed_meta = u64::from_le_bytes(mmap[56..64].try_into().unwrap());
+        let h_n_shared = (packed_meta & 0xFFFFFFFF) as usize;
+        let h_num_bits = ((packed_meta >> 32) & 0xFF) as u8;
+
+        if h_hidden != config.hidden_size
+            || h_intermediate != config.moe_intermediate_size
+            || h_n_experts != config.n_routed_experts
+            || h_num_layers != total_moe_layers
+            || h_group_size != group_size
+        {
+            return Err(format!(
+                "CPU cache header mismatch: file has {}h/{}m/{}e/{}L/g{}, expected {}h/{}m/{}e/{}L/g{}",
+                h_hidden, h_intermediate, h_n_experts, h_num_layers, h_group_size,
+                config.hidden_size, config.moe_intermediate_size, config.n_routed_experts,
+                total_moe_layers, group_size,
+            ));
+        }
+        if h_config_hash != config_hash {
+            return Err("Config hash mismatch in CPU cache".to_string());
+        }
+        if h_n_shared != config.n_shared_experts {
+            return Err(format!(
+                "Shared expert count mismatch: cache={h_n_shared}, config={}",
+                config.n_shared_experts,
+            ));
+        }
+        if h_num_bits != expected_bits {
+            return Err(format!(
+                "CPU cache num_bits mismatch: cache=INT{h_num_bits}, expected INT{expected_bits}",
+            ));
+        }
+
+        if start_moe_layer + num_layers_to_load > total_moe_layers {
+            return Err(format!(
+                "Range [{}, {}) exceeds total MoE layers {}",
+                start_moe_layer, start_moe_layer + num_layers_to_load, total_moe_layers,
+            ));
+        }
+
+        // Validate file size
+        let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+        let expected = expected_cpu_cache_size(
+            config, group_size, expected_bits, total_moe_layers,
+            config.n_shared_experts, shared_intermediate,
+        );
+        if mmap.len() != expected {
+            return Err(format!(
+                "CPU cache size mismatch: expected {} bytes, got {}",
+                expected, mmap.len(),
+            ));
+        }
+
+        let is_partial = start_moe_layer > 0 || num_layers_to_load < total_moe_layers;
+        if is_partial {
+            log::info!(
+                "Loading CPU INT{} cache (partial): layers [{}-{}), {} of {} ({})",
+                expected_bits, start_moe_layer, start_moe_layer + num_layers_to_load,
+                num_layers_to_load, total_moe_layers, path.display(),
+            );
+        } else {
+            log::info!("Loading CPU INT{} cache: {} (all {} layers)", expected_bits, path.display(), total_moe_layers);
+        }
+        let load_start = std::time::Instant::now();
+
+        let h = config.hidden_size;
+        let m = config.moe_intermediate_size;
+
+        // Per-expert byte sizes for this cpu_num_bits
+        let (w13pb, w13sb, w2pb, w2sb) = cpu_expert_byte_sizes(config, group_size, expected_bits);
+        let per_routed_expert = w13pb + w13sb + w2pb + w2sb;
+        let per_routed_layer = config.n_routed_experts * per_routed_expert;
+
+        let mut offset = CACHE_HEADER_SIZE + start_moe_layer * per_routed_layer;
+
+        // Load routed experts
+        let mut experts_cpu = Vec::with_capacity(num_layers_to_load);
+        for layer_idx in 0..num_layers_to_load {
+            let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
+            for _eidx in 0..config.n_routed_experts {
+                layer_experts.push(read_unified_expert_cpu(
+                    &mmap, &mut offset, h, m, group_size, expected_bits,
+                ));
+            }
+            experts_cpu.push(layer_experts);
+
+            if (layer_idx + 1) % 10 == 0 || layer_idx + 1 == num_layers_to_load {
+                log::info!(
+                    "  CPU cache loaded: {}/{} layers ({:.1} GB)",
+                    layer_idx + 1, num_layers_to_load,
+                    offset as f64 / 1e9,
+                );
+            }
+        }
+
+        // Load shared experts
+        let mut shared_experts_cpu = Vec::new();
+        if config.n_shared_experts > 0 {
+            let routed_total = total_moe_layers * per_routed_layer;
+            let shared_m = config.n_shared_experts * config.moe_intermediate_size;
+            let (s_w13pb, s_w13sb, s_w2pb, s_w2sb) = if expected_bits == 4 {
+                (
+                    (h / 8) * (2 * shared_m) * 4,
+                    (h / group_size) * (2 * shared_m) * 2,
+                    (shared_m / 8) * h * 4,
+                    (shared_m / group_size) * h * 2,
+                )
+            } else {
+                let s_w13_bytes = h * (2 * shared_m);
+                let s_w2_bytes = shared_m * h;
+                (
+                    ((s_w13_bytes + 3) / 4) * 4,
+                    (h / group_size) * (2 * shared_m) * 2,
+                    ((s_w2_bytes + 3) / 4) * 4,
+                    (shared_m / group_size) * h * 2,
+                )
+            };
+            let per_shared = s_w13pb + s_w13sb + s_w2pb + s_w2sb;
+
+            let shared_base = CACHE_HEADER_SIZE + routed_total + start_moe_layer * per_shared;
+            offset = shared_base;
+
+            for _i in 0..num_layers_to_load {
+                shared_experts_cpu.push(
+                    read_unified_expert_cpu(&mmap, &mut offset, h, shared_m, group_size, expected_bits),
+                );
+            }
+            log::info!("  Loaded {} shared experts (CPU INT{})", num_layers_to_load, expected_bits);
+        }
+
+        let elapsed = load_start.elapsed();
+        log::info!(
+            "CPU INT{} cache loaded in {:.1}s: {} layers × {} experts (+ {} shared), {:.1} GB",
+            expected_bits,
+            elapsed.as_secs_f64(),
+            num_layers_to_load, config.n_routed_experts,
+            shared_experts_cpu.len(),
+            offset as f64 / 1e9,
+        );
+
+        Ok((experts_cpu, shared_experts_cpu))
+    }
 
     /// Quick check for pre-quantized group_size without loading full weights.
     /// Returns Some(group_size) if model has pre-quantized experts, None otherwise.
@@ -1763,33 +2348,69 @@ impl WeightStore {
 
     /// Number of MoE layers loaded.
     pub fn num_moe_layers(&self) -> usize {
-        if !self.experts_unified.is_empty() {
-            self.experts_unified.len()
+        if !self.experts_cpu.is_empty() {
+            self.experts_cpu.len()
+        } else if !self.experts_gpu.is_empty() {
+            self.experts_gpu.len()
         } else {
             self.experts.len()
         }
     }
 
-    /// Whether unified weights have been populated.
+    /// Whether CPU decode weights (transposed format) have been populated.
+    pub fn has_cpu_weights(&self) -> bool {
+        !self.experts_cpu.is_empty()
+    }
+
+    /// Whether GPU prefill weights (Marlin format) have been populated.
+    pub fn has_gpu_weights(&self) -> bool {
+        !self.experts_gpu.is_empty()
+    }
+
+    /// Backward compat: `has_unified()` returns true when either CPU or GPU weights exist.
     pub fn has_unified(&self) -> bool {
-        !self.experts_unified.is_empty()
+        self.has_cpu_weights() || self.has_gpu_weights()
     }
 
-    /// Get unified expert weights for a given MoE layer and expert index.
-    /// Panics if convert_to_unified() has not been called.
+    /// Get CPU decode expert weights for a given MoE layer and expert index.
+    pub fn get_expert_cpu(&self, moe_layer_idx: usize, expert_idx: usize) -> &UnifiedExpertWeights {
+        &self.experts_cpu[moe_layer_idx][expert_idx]
+    }
+
+    /// Get GPU prefill expert weights for a given MoE layer and expert index.
+    pub fn get_expert_gpu(&self, moe_layer_idx: usize, expert_idx: usize) -> &UnifiedExpertWeights {
+        &self.experts_gpu[moe_layer_idx][expert_idx]
+    }
+
+    /// Get CPU decode shared expert weights for a given MoE layer index.
+    pub fn get_shared_expert_cpu(&self, moe_layer_idx: usize) -> Option<&UnifiedExpertWeights> {
+        self.shared_experts_cpu.get(moe_layer_idx)
+    }
+
+    /// Get GPU prefill shared expert weights for a given MoE layer index.
+    pub fn get_shared_expert_gpu(&self, moe_layer_idx: usize) -> Option<&UnifiedExpertWeights> {
+        self.shared_experts_gpu.get(moe_layer_idx)
+    }
+
+    /// Backward compat: returns CPU expert ref (used by moe_forward_unified).
     pub fn get_expert_unified(&self, moe_layer_idx: usize, expert_idx: usize) -> &UnifiedExpertWeights {
-        &self.experts_unified[moe_layer_idx][expert_idx]
+        if self.has_cpu_weights() {
+            self.get_expert_cpu(moe_layer_idx, expert_idx)
+        } else {
+            self.get_expert_gpu(moe_layer_idx, expert_idx)
+        }
     }
 
-    /// Get unified shared expert weights for a given MoE layer index.
-    /// Returns None if no shared experts or unified conversion not done.
+    /// Backward compat: returns CPU shared expert ref.
     pub fn get_shared_expert_unified(&self, moe_layer_idx: usize) -> Option<&UnifiedExpertWeights> {
-        self.shared_experts_unified.get(moe_layer_idx)
+        if self.has_cpu_weights() {
+            self.get_shared_expert_cpu(moe_layer_idx)
+        } else {
+            self.get_shared_expert_gpu(moe_layer_idx)
+        }
     }
 
-    /// Convert all experts from separate gate/up/down format to unified w13+w2 transposed format.
-    ///
-    /// Migrate unified expert weights to NUMA nodes.
+    /// Migrate CPU expert weights to NUMA nodes.
     /// Returns the number of successfully migrated experts.
     pub fn migrate_numa_unified(&mut self, map: &crate::numa::NumaExpertMap) -> usize {
         use crate::numa::migrate_vec_to_node;
@@ -1798,7 +2419,7 @@ impl WeightStore {
         let mut migrated = 0;
         let mut failed = 0;
 
-        for (layer_idx, layer) in self.experts_unified.iter_mut().enumerate() {
+        for (layer_idx, layer) in self.experts_cpu.iter_mut().enumerate() {
             for (expert_idx, expert) in layer.iter_mut().enumerate() {
                 let node = map.node_for(layer_idx, expert_idx);
 
@@ -1817,7 +2438,7 @@ impl WeightStore {
 
         let elapsed = start.elapsed();
         log::info!(
-            "NUMA migration (unified): {migrated} experts migrated, {failed} failed, in {:.1}s",
+            "NUMA migration (CPU experts): {migrated} experts migrated, {failed} failed, in {:.1}s",
             elapsed.as_secs_f64(),
         );
 
@@ -1850,6 +2471,38 @@ fn write_marlin_cache_header<W: Write>(
     w.write_all(&config_hash.to_le_bytes())
         .map_err(|e| format!("Write error: {e}"))?;
     w.write_all(&(config.n_shared_experts as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    Ok(())
+}
+
+/// Write v4 CPU cache header (same layout, version=4, reserved[56..64] encodes num_bits).
+fn write_cpu_cache_header<W: Write>(
+    w: &mut W,
+    config: &ModelConfig,
+    group_size: usize,
+    num_moe_layers: usize,
+    config_hash: u64,
+    num_bits: u8,
+) -> Result<(), String> {
+    w.write_all(CACHE_MAGIC)
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&CACHE_VERSION_CPU.to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(config.hidden_size as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(config.moe_intermediate_size as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(config.n_routed_experts as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(num_moe_layers as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(group_size as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&config_hash.to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    // Byte 56..64: pack n_shared_experts (low 32) + num_bits (high 32)
+    let packed_meta = (config.n_shared_experts as u64) | ((num_bits as u64) << 32);
+    w.write_all(&packed_meta.to_le_bytes())
         .map_err(|e| format!("Write error: {e}"))?;
     Ok(())
 }
@@ -1942,10 +2595,94 @@ fn read_unified_expert(
         hidden_size,
         intermediate_size,
         group_size,
+        num_bits: 4, // Marlin cache is always INT4
     }
 }
 
-/// Write a QuantWeight's data + scales to a writer.
+/// Read a UnifiedExpertWeights from mmap'd CPU cache data at the given offset.
+/// Supports both INT4 and INT8 transposed formats.
+fn read_unified_expert_cpu(
+    data: &[u8],
+    offset: &mut usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    group_size: usize,
+    num_bits: u8,
+) -> UnifiedExpertWeights {
+    let h = hidden_size;
+    let m = intermediate_size;
+    let two_n = 2 * m;
+    let num_groups = h / group_size;
+
+    let (w13_packed_count, w2_packed_count) = if num_bits == 4 {
+        // INT4: [K/8, N] as u32
+        ((h / 8) * two_n, (m / 8) * h)
+    } else {
+        // INT8: [K, N] as i8 packed into u32 → ceil(bytes/4) u32s
+        (((h * two_n) + 3) / 4, ((m * h) + 3) / 4)
+    };
+
+    // w13_packed
+    let mut w13_packed = vec![0u32; w13_packed_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w13_packed.as_mut_ptr() as *mut u8,
+            w13_packed_count * 4,
+        );
+    }
+    *offset += w13_packed_count * 4;
+
+    // w13_scales: [K/gs, 2*N] as u16
+    let w13_scales_count = num_groups * two_n;
+    let mut w13_scales = vec![0u16; w13_scales_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w13_scales.as_mut_ptr() as *mut u8,
+            w13_scales_count * 2,
+        );
+    }
+    *offset += w13_scales_count * 2;
+
+    // w2_packed
+    let mut w2_packed = vec![0u32; w2_packed_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w2_packed.as_mut_ptr() as *mut u8,
+            w2_packed_count * 4,
+        );
+    }
+    *offset += w2_packed_count * 4;
+
+    // w2_scales: [K_down/gs, N_down] = [m/gs, h] as u16
+    let down_num_groups = m / group_size;
+    let w2_scales_count = down_num_groups * h;
+    let mut w2_scales = vec![0u16; w2_scales_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w2_scales.as_mut_ptr() as *mut u8,
+            w2_scales_count * 2,
+        );
+    }
+    *offset += w2_scales_count * 2;
+
+    UnifiedExpertWeights {
+        w13_packed,
+        w13_scales,
+        w2_packed,
+        w2_scales,
+        hidden_size,
+        intermediate_size,
+        group_size,
+        num_bits,
+    }
+}
+
+/// Write a QuantWeight's data + scales to a writer (legacy v1 format).
+#[allow(dead_code)]
 fn write_quantized<W: Write>(w: &mut W, q: &QuantWeight) -> Result<(), String> {
     match q {
         QuantWeight::Int4(q4) => {
@@ -1988,9 +2725,10 @@ fn write_quantized<W: Write>(w: &mut W, q: &QuantWeight) -> Result<(), String> {
     Ok(())
 }
 
-/// Read a QuantWeight from mmap'd cache data at the given offset.
+/// Read a QuantWeight from mmap'd cache data at the given offset (legacy v1 format).
 ///
 /// Uses direct memcpy — safe on x86_64 (little-endian, unaligned loads OK).
+#[allow(dead_code)]
 fn read_quantized(
     data: &[u8],
     offset: &mut usize,
@@ -2295,7 +3033,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4)
             .expect("Failed to load V2-Lite");
 
         // V2-Lite: 27 layers, layer 0 dense, layers 1-26 MoE = 26 MoE layers
@@ -2360,7 +3098,7 @@ mod tests {
         }
 
         // Load (will use v2 unified cache if available, or v1→convert, or quantize)
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4)
             .expect("Failed to load V2-Lite");
 
         // Verify Marlin cache file exists (v3 format)

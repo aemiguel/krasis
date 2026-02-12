@@ -6,10 +6,13 @@
 //!   3. For each selected expert: gate+up matmul → SiLU → down matmul
 //!   4. Weighted sum of expert outputs returned to SGLang
 
+#[allow(unused_imports)]
 use crate::kernel::avx2::{
     matmul_int4_integer, matmul_int4_integer_parallel,
     matmul_int8_integer, matmul_int8_integer_parallel,
     matmul_int4_marlin, matmul_int4_marlin_parallel,
+    matmul_int4_transposed_integer, matmul_int4_transposed_integer_parallel,
+    matmul_int8_transposed_integer, matmul_int8_transposed_integer_parallel,
     build_marlin_tile_map, build_marlin_scale_map,
     MarlinTileMap, MarlinScaleMap,
     quantize_activation_int16,
@@ -22,11 +25,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
 
-/// Lazily-initialized Marlin tile map (computed once, reused for all forward passes).
+/// Lazily-initialized Marlin tile map (kept for GPU prefill path and debugging).
+#[allow(dead_code)]
 static MARLIN_TILE_MAP: OnceLock<MarlinTileMap> = OnceLock::new();
 /// Lazily-initialized Marlin scale map.
+#[allow(dead_code)]
 static MARLIN_SCALE_MAP: OnceLock<MarlinScaleMap> = OnceLock::new();
 
+#[allow(dead_code)]
 fn get_marlin_maps() -> (&'static MarlinTileMap, &'static MarlinScaleMap) {
     let tile_map = MARLIN_TILE_MAP.get_or_init(build_marlin_tile_map);
     let scale_map = MARLIN_SCALE_MAP.get_or_init(build_marlin_scale_map);
@@ -142,13 +148,15 @@ pub fn expert_forward_integer(
     matmul_fn(&expert.down, &scratch.hidden_int16, &scratch.hidden_scales, &mut scratch.expert_out);
 }
 
-/// Compute a single expert's output using the unified transposed format.
+/// Compute a single expert's output using the CPU transposed format.
 ///
-/// Uses combined w13 (gate+up) in [K/8, 2*N] transposed layout and the
-/// AVX2 integer kernel that SIMDs across the N (output) dimension.
+/// Dispatches to INT4 or INT8 transposed kernels based on expert.num_bits.
+/// Uses combined w13 (gate+up) in transposed layout:
+///   INT4: [K/8, 2*N] packed u32
+///   INT8: [K, 2*N] as i8 in u32
 ///
 /// # Arguments
-/// * `expert` - Unified expert weights (Marlin-native packed format)
+/// * `expert` - CPU-format expert weights (transposed layout)
 /// * `act_int16` - Pre-quantized input activation [hidden_size] as INT16
 /// * `act_scales` - Per-group scales for the input activation
 /// * `scratch` - Reusable intermediate buffers (result in scratch.expert_out)
@@ -165,20 +173,36 @@ pub fn expert_forward_unified(
     let two_n = 2 * n;
     let gs = expert.group_size;
 
-    // Marlin-native kernel: reads GPU-native Marlin-packed data directly
-    let (tile_map, scale_map) = get_marlin_maps();
-    let marlin_fn = if parallel {
-        matmul_int4_marlin_parallel
-    } else {
-        matmul_int4_marlin
-    };
-    // w13 matmul: w13_out[2*N] = act[K] @ w13_marlin
-    marlin_fn(
-        &expert.w13_packed, &expert.w13_scales,
-        act_int16, act_scales,
-        &mut scratch.w13_out,
-        k, two_n, gs, tile_map, scale_map,
-    );
+    // Dispatch based on weight precision
+    match expert.num_bits {
+        4 => {
+            let matmul_fn = if parallel {
+                matmul_int4_transposed_integer_parallel
+            } else {
+                matmul_int4_transposed_integer
+            };
+            matmul_fn(
+                &expert.w13_packed, &expert.w13_scales,
+                act_int16, act_scales,
+                &mut scratch.w13_out,
+                k, two_n, gs,
+            );
+        }
+        8 => {
+            let matmul_fn = if parallel {
+                matmul_int8_transposed_integer_parallel
+            } else {
+                matmul_int8_transposed_integer
+            };
+            matmul_fn(
+                &expert.w13_packed, &expert.w13_scales,
+                act_int16, act_scales,
+                &mut scratch.w13_out,
+                k, two_n, gs,
+            );
+        }
+        _ => panic!("Unsupported num_bits: {}", expert.num_bits),
+    }
 
     // Split w13_out into gate[N] and up[N], apply SiLU activation
     // hidden = SiLU(gate) * up → BF16 [intermediate_size]
@@ -199,12 +223,35 @@ pub fn expert_forward_unified(
     );
 
     // w2 matmul: expert_out[hidden_size] = hidden[N] @ w2[N, hidden_size]
-    marlin_fn(
-        &expert.w2_packed, &expert.w2_scales,
-        &scratch.hidden_int16, &scratch.hidden_scales,
-        &mut scratch.expert_out,
-        n, k, gs, tile_map, scale_map,
-    );
+    match expert.num_bits {
+        4 => {
+            let matmul_fn = if parallel {
+                matmul_int4_transposed_integer_parallel
+            } else {
+                matmul_int4_transposed_integer
+            };
+            matmul_fn(
+                &expert.w2_packed, &expert.w2_scales,
+                &scratch.hidden_int16, &scratch.hidden_scales,
+                &mut scratch.expert_out,
+                n, k, gs,
+            );
+        }
+        8 => {
+            let matmul_fn = if parallel {
+                matmul_int8_transposed_integer_parallel
+            } else {
+                matmul_int8_transposed_integer
+            };
+            matmul_fn(
+                &expert.w2_packed, &expert.w2_scales,
+                &scratch.hidden_int16, &scratch.hidden_scales,
+                &mut scratch.expert_out,
+                n, k, gs,
+            );
+        }
+        _ => panic!("Unsupported num_bits: {}", expert.num_bits),
+    }
 }
 
 /// Full MoE forward for a single token on one layer.
@@ -798,16 +845,25 @@ impl KrasisEngine {
     /// Reads config.json, opens safetensors shards, quantizes BF16 → INT4/INT8.
     /// Runs startup system checks (CPU governor, hugepages, memory budget).
     ///
-    /// `num_bits`: 4 for INT4 (default), 8 for INT8 (2x precision, 2x memory).
-    #[pyo3(signature = (model_dir, group_size=None, max_layers=None, start_layer=None, num_bits=None))]
-    pub fn load(&mut self, model_dir: &str, group_size: Option<usize>, max_layers: Option<usize>, start_layer: Option<usize>, num_bits: Option<u8>) -> PyResult<()> {
-        let bits = num_bits.unwrap_or(4);
-        if bits != 4 && bits != 8 {
+    /// `cpu_num_bits`: 4 or 8, quantization for CPU decode experts. Default: 4.
+    /// `gpu_num_bits`: 4 (Marlin INT4 for GPU prefill). Default: 4.
+    /// `num_bits`: Legacy param — sets cpu_num_bits (backward compat).
+    #[pyo3(signature = (model_dir, group_size=None, max_layers=None, start_layer=None, num_bits=None, cpu_num_bits=None, gpu_num_bits=None))]
+    pub fn load(&mut self, model_dir: &str, group_size: Option<usize>, max_layers: Option<usize>, start_layer: Option<usize>, num_bits: Option<u8>, cpu_num_bits: Option<u8>, gpu_num_bits: Option<u8>) -> PyResult<()> {
+        let cpu_bits = cpu_num_bits.or(num_bits).unwrap_or(4);
+        let gpu_bits = gpu_num_bits.unwrap_or(4);
+        if cpu_bits != 4 && cpu_bits != 8 {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("num_bits must be 4 or 8, got {bits}")
+                format!("cpu_num_bits must be 4 or 8, got {cpu_bits}")
             ));
         }
-        log::info!("[DIAG-RUST] load() called: model_dir={}, start_layer={:?}, max_layers={:?}, num_bits={}", model_dir, start_layer, max_layers, bits);
+        if gpu_bits != 4 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("gpu_num_bits must be 4 (Marlin), got {gpu_bits}")
+            ));
+        }
+        let bits = cpu_bits; // For backward-compat logging and memory estimation
+        log::info!("[DIAG-RUST] load() called: model_dir={}, start_layer={:?}, max_layers={:?}, cpu_bits={}, gpu_bits={}", model_dir, start_layer, max_layers, cpu_bits, gpu_bits);
         crate::syscheck::log_memory_usage("[DIAG-RUST] load() entry");
         let gs = group_size.unwrap_or(DEFAULT_GROUP_SIZE);
         let path = Path::new(model_dir);
@@ -842,9 +898,9 @@ impl KrasisEngine {
             }
         }
 
-        log::info!("[DIAG-RUST] Calling WeightStore::load_from_hf (INT{})...", bits);
+        log::info!("[DIAG-RUST] Calling WeightStore::load_from_hf (cpu_bits={}, gpu_bits={})...", cpu_bits, gpu_bits);
         crate::syscheck::log_memory_usage("[DIAG-RUST] before load_from_hf");
-        let mut store = WeightStore::load_from_hf(path, gs, max_layers, start_layer, bits)
+        let mut store = WeightStore::load_from_hf(path, gs, max_layers, start_layer, cpu_bits, gpu_bits)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
         log::info!("[DIAG-RUST] WeightStore::load_from_hf completed OK");
         crate::syscheck::log_memory_usage("[DIAG-RUST] after load_from_hf");
@@ -1042,6 +1098,20 @@ impl KrasisEngine {
         Ok(store.num_moe_layers())
     }
 
+    /// CPU expert quantization bit width (4 or 8).
+    pub fn cpu_num_bits(&self) -> PyResult<u8> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
+        Ok(store.cpu_num_bits)
+    }
+
+    /// GPU expert quantization bit width (4 for Marlin).
+    pub fn gpu_num_bits(&self) -> PyResult<u8> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
+        Ok(store.gpu_num_bits)
+    }
+
     /// Hidden size of the model.
     pub fn hidden_size(&self) -> PyResult<usize> {
         let store = self.store.as_ref()
@@ -1068,12 +1138,12 @@ impl KrasisEngine {
         self.parallel
     }
 
-    /// Whether weights are in GPU-native Marlin format (v3 cache).
+    /// Whether GPU-native Marlin weights are loaded.
     /// When true, GPU prefill can DMA copy weights directly — no repacking needed.
     pub fn is_marlin_format(&self) -> PyResult<bool> {
         let store = self.store.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
-        Ok(store.marlin_format)
+        Ok(store.has_gpu_weights())
     }
 
     /// Whether unified weights are loaded.
@@ -1109,11 +1179,11 @@ impl KrasisEngine {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let store = self.store.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
-        if !store.has_unified() {
+        if !store.has_gpu_weights() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Unified weights not available — call convert_to_unified() first"));
+                "GPU weights not available"));
         }
-        let layer = &store.experts_unified[moe_layer_idx];
+        let layer = &store.experts_gpu[moe_layer_idx];
         let s = start.unwrap_or(0);
         let e = end.unwrap_or(layer.len());
         let per_expert = layer[0].w13_packed.len() * 4;
@@ -1141,11 +1211,11 @@ impl KrasisEngine {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let store = self.store.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
-        if !store.has_unified() {
+        if !store.has_gpu_weights() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Unified weights not available"));
+                "GPU weights not available"));
         }
-        let layer = &store.experts_unified[moe_layer_idx];
+        let layer = &store.experts_gpu[moe_layer_idx];
         let s = start.unwrap_or(0);
         let e = end.unwrap_or(layer.len());
         let per_expert = layer[0].w13_scales.len() * 2;
@@ -1173,11 +1243,11 @@ impl KrasisEngine {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let store = self.store.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
-        if !store.has_unified() {
+        if !store.has_gpu_weights() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Unified weights not available"));
+                "GPU weights not available"));
         }
-        let layer = &store.experts_unified[moe_layer_idx];
+        let layer = &store.experts_gpu[moe_layer_idx];
         let s = start.unwrap_or(0);
         let e = end.unwrap_or(layer.len());
         let per_expert = layer[0].w2_packed.len() * 4;
@@ -1205,11 +1275,11 @@ impl KrasisEngine {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let store = self.store.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
-        if !store.has_unified() {
+        if !store.has_gpu_weights() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Unified weights not available"));
+                "GPU weights not available"));
         }
-        let layer = &store.experts_unified[moe_layer_idx];
+        let layer = &store.experts_gpu[moe_layer_idx];
         let s = start.unwrap_or(0);
         let e = end.unwrap_or(layer.len());
         let per_expert = layer[0].w2_scales.len() * 2;
@@ -1236,10 +1306,10 @@ impl KrasisEngine {
     ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>, Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
         let store = self.store.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
-        if store.shared_experts_unified.is_empty() {
+        if store.shared_experts_gpu.is_empty() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err("No shared experts"));
         }
-        let expert = &store.shared_experts_unified[moe_layer_idx];
+        let expert = &store.shared_experts_gpu[moe_layer_idx];
         let w13p = PyBytes::new(py, unsafe {
             std::slice::from_raw_parts(
                 expert.w13_packed.as_ptr() as *const u8,
@@ -1452,9 +1522,9 @@ mod tests {
     }
 
     #[test]
-    fn test_marlin_forward_matches_integer() {
-        // Compare expert_forward_unified (Marlin) vs expert_forward_integer on same weights.
-        // Dimensions must satisfy K > group_size for Marlin grouped scale permutation.
+    fn test_transposed_forward_matches_integer() {
+        // Compare expert_forward_unified (CPU transposed) vs expert_forward_integer on same weights.
+        // expert_forward_unified now dispatches to transposed kernels (not Marlin).
         let hidden = 512;
         let intermediate = 256;
         let group_size = 128;
@@ -1477,8 +1547,8 @@ mod tests {
             down: QuantWeight::Int4(quantize_int4(&down_bf16, hidden, intermediate, group_size)),
         };
 
-        // Convert to Marlin format
-        let marlin = UnifiedExpertWeights::from_expert_weights_marlin(&expert);
+        // Convert to CPU transposed format (not Marlin — expert_forward_unified uses transposed kernels)
+        let transposed = UnifiedExpertWeights::from_expert_weights(&expert);
 
         // Synthetic activation
         let mut activation = vec![0u16; hidden];
@@ -1493,29 +1563,29 @@ mod tests {
         quantize_activation_int16(&activation, group_size, &mut act_int16, &mut act_scales);
         expert_forward_integer(&expert, &act_int16, &act_scales, &mut scratch_orig, false);
 
-        // Run Marlin kernel
-        let mut scratch_marlin = ExpertScratch::new(hidden, intermediate, group_size);
-        expert_forward_unified(&marlin, &act_int16, &act_scales, &mut scratch_marlin, false);
+        // Run transposed kernel (CPU decode path)
+        let mut scratch_transposed = ExpertScratch::new(hidden, intermediate, group_size);
+        expert_forward_unified(&transposed, &act_int16, &act_scales, &mut scratch_transposed, false);
 
         // Compare outputs
         let mut max_diff: f32 = 0.0;
         let mut max_rel_err: f64 = 0.0;
         for i in 0..hidden {
             let orig = scratch_orig.expert_out[i];
-            let mar = scratch_marlin.expert_out[i];
-            let diff = (orig - mar).abs();
+            let trans = scratch_transposed.expert_out[i];
+            let diff = (orig - trans).abs();
             max_diff = max_diff.max(diff);
             let denom = orig.abs().max(1e-10);
             max_rel_err = max_rel_err.max((diff / denom) as f64);
         }
 
         eprintln!(
-            "Marlin vs integer: max_diff={max_diff:.6}, max_rel_err={max_rel_err:.6}"
+            "Transposed vs integer: max_diff={max_diff:.6}, max_rel_err={max_rel_err:.6}"
         );
-        // Different kernel implementations (Marlin tile-permuted vs madd_epi16),
-        // so exact match is not expected, but should be very close.
-        assert!(max_diff < 0.1, "Max diff too large: {max_diff}");
-        assert!(max_rel_err < 0.1, "Max relative error too large: {max_rel_err}");
+        // Different kernel implementations (transposed vs non-transposed integer),
+        // same quantized data — should be very close.
+        assert!(max_diff < 0.01, "Max diff too large: {max_diff}");
+        assert!(max_rel_err < 0.01, "Max relative error too large: {max_rel_err}");
     }
 
     #[test]
@@ -1584,7 +1654,7 @@ mod tests {
         }
 
         // Load just enough to test one expert
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -1647,7 +1717,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -1723,7 +1793,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4)
             .expect("Failed to load");
 
         assert!(store.has_unified(), "Store should have unified format");
@@ -1802,7 +1872,7 @@ mod tests {
         }
 
         // Load just 1 MoE layer (384 experts × 1 layer ≈ 9.5 GB)
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, Some(1), None, 4)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, Some(1), None, 4, 4)
             .expect("Failed to load Kimi K2.5");
 
         assert_eq!(store.num_moe_layers(), 1);
@@ -1876,7 +1946,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -2024,7 +2094,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4)
             .expect("Failed to load");
 
         // V2-Lite has 2 shared experts with routed_scaling_factor=1.0
@@ -2039,7 +2109,7 @@ mod tests {
 
         // Check shared expert availability via unified format
         if store.has_unified() {
-            assert_eq!(store.shared_experts_unified.len(), store.num_moe_layers());
+            assert_eq!(store.shared_experts_gpu.len(), store.num_moe_layers());
             let shared_exp = store.get_shared_expert_unified(0).expect("Should have shared expert");
             assert_eq!(shared_exp.hidden_size, hidden);
             assert_eq!(shared_exp.intermediate_size, shared_intermediate);

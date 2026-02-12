@@ -113,19 +113,31 @@ for SGLang. Targets AMD EPYC (AVX2) + NVIDIA GPUs.
 | Kimi K2.5 | KTransformers PP=2 | 4.0 tok/s | ~7.6 GB | ~7.6 GB | Production baseline |
 | Qwen3-235B | KTransformers PP=3 | 4.21 tok/s | — | — | With expert pinning |
 
+### Execution Plan
+
+**Phase 1: V2-Lite — dual-format cache validation** ✓ COMPLETE
+- [x] Build both caches (GPU Marlin 7.2 GB + CPU INT4 7.0 GB), cached load 5.9s
+- [x] Load both formats, verify correctness: "2+2"→"4", "Capital of France"→"Paris"
+- [x] GPU prefill: **693 tok/s** (10K tokens), 77 tok/s (825 tokens)
+- [x] CPU decode: **5.6 tok/s** (177ms short context), **4.9 tok/s** (202ms at 10K context)
+- [x] In-depth timing analysis: prefill scales from 9→693 tok/s (100→10K tokens), ~10.5s fixed overhead per pass
+- [x] Performance analysis MD: `PERFORMANCE_ANALYSIS.md`, benchmarks tracking: `BENCHMARKS.md`
+
+**Phase 2: Qwen3-Coder-Next**
+- [ ] Get model running on Krasis standalone (no debug flags)
+- [ ] Measure GPU prefill speed
+- [ ] Measure CPU decode speed
+- [ ] Report final production numbers
+
 ### Current Status
-- **Kimi K2.5 Marlin cache build COMPLETE** — 572 GB, 60 layers, 25 min with fused transpose
-- Kimi K2.5 3/3 correctness tests PASS with Marlin INT4 (but CPU decode only 0.55 tok/s due to Marlin tile layout)
-- **Architecture change**: Moving from single Marlin format to DUAL format (GPU Marlin + CPU-optimized)
-  - Marlin tile permutation destroys CPU cache locality → 3x slower than native CPU layout
-  - New plan: two separate caches with independently configurable precision
-- Next model: Qwen3-Coder-480B-A35B (qwen3_moe, 62 layers, 160 experts)
+- **Dual-format architecture implemented** — GPU Marlin + CPU-optimized caches, independently configurable
+- Kimi K2.5 retired (0.55 tok/s Marlin-only CPU decode unacceptable)
 - Monitor tool (`krasis_monitor.py`): terminal UI with vertical bar charts, resource bars, process tracking
 
 ### Known Issues
 - **First-run cache build** — ~25 min for Kimi K2.5 (572 GB) with fused transpose optimization. Subsequent runs load from cache.
 - **Decode speed with Marlin format** — 0.55 tok/s (Marlin) vs 1.55 tok/s (BF16) on Kimi K2.5. Root cause: Marlin tile layout poor CPU cache locality. Fix: dual-format architecture (in progress).
-- **Kimi K2.5 too slow for production** — 0.55 tok/s decode unacceptable. Moving to Qwen3-Coder-480B.
+- **Kimi K2.5 too slow for production** — 0.55 tok/s decode unacceptable. Retired.
 
 ### Resolved Blockers
 - ~~**VRAM budget calculator broken**~~ — FIXED: redesigned with proper overhead estimation (2000 MB), context-length-as-hint approach

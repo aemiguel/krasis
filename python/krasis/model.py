@@ -359,9 +359,10 @@ class KrasisModel:
         """Load expert weights into Krasis Rust engine."""
         from krasis import KrasisEngine
 
-        bits = self.quant_cfg.cpu_expert_bits
+        cpu_bits = self.quant_cfg.cpu_expert_bits
+        gpu_bits = self.quant_cfg.gpu_expert_bits
         engine = KrasisEngine(parallel=True, num_threads=self.krasis_threads)
-        engine.load(self.cfg.model_path, num_bits=bits)
+        engine.load(self.cfg.model_path, cpu_num_bits=cpu_bits, gpu_num_bits=gpu_bits)
         self.krasis_engine = engine
 
         # Wire engine to all MoE layers
@@ -579,6 +580,9 @@ class KrasisModel:
         )
 
         # ── LM head ──
+        # Only compute logits for last token during prefill (saves ~4 GB VRAM at 10K tokens)
+        if M > 1:
+            hidden = hidden[-1:, :]
         logits = _linear(hidden, self.lm_head_data)
         logits = logits.float()
 
