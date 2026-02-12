@@ -1,3 +1,5 @@
+pub mod gguf;
+pub mod gguf_kernels;
 pub mod kernel;
 pub mod moe;
 pub mod numa;

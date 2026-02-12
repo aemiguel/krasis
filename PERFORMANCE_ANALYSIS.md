@@ -4,6 +4,18 @@
 **Hardware**: AMD EPYC 7742 (64c, AVX2) + 1x RTX 2000 Ada (16 GB)
 **Config**: INT4 GPU (Marlin) + INT4 CPU (optimized), BF16 attention, PP=1
 
+## GGUF → AVX2 CPU Cache (2026-02-12)
+
+| Source | Prefill (5K tok) | Decode | Load Time | Cache Size |
+|--------|:-:|:-:|:-:|:-:|
+| BF16 safetensors → INT4 CPU | 2,494 tok/s | **5.8 tok/s** | 6.0s (cached) | 7.7 GB |
+| **GGUF Q4_K_M → AVX2 (new)** | 2,388 tok/s | **4.77 tok/s** | 5.9s (cached) | 10.1 GB |
+| GGUF-native (raw blocks) | 156 tok/s | 1.83 tok/s | 11.5s | N/A (no cache) |
+
+Prefill uses GPU Marlin persistent mode (expert_divisor=1, all experts in VRAM). Prefill speed is the same regardless of CPU source since it uses the Marlin cache from safetensors.
+
+The GGUF→AVX2 pipeline dequants GGUF to f32, requants to our transposed AVX2 format, and disk-caches. Mixed precision: gate/up=INT4 (from Q4_K), down=INT8 (from Q5_0/Q8_0). The 4.77 vs 5.8 tok/s decode gap is from INT8 down projection (2× more bytes than INT4 from safetensors).
+
 ## Summary
 
 | Metric | Chunked (before) | Persistent (after) |

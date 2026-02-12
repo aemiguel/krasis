@@ -19,6 +19,28 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
+/// Map GGUF quantization type to target CPU bit width for AVX2 transposed format.
+///
+/// Returns (target_bits, is_exact) where is_exact indicates whether the conversion
+/// is lossless (exact match) or requires rounding.
+pub fn gguf_type_to_cpu_bits(dtype: crate::gguf::GgmlType) -> (u8, bool) {
+    use crate::gguf::GgmlType;
+    match dtype {
+        // Exact 4-bit matches
+        GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q4_K => (4, true),
+        // 5-bit → round down to 4 (we have no 5-bit kernel)
+        GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q5_K => (4, false),
+        // 6-bit → round up to 8 (lossless)
+        GgmlType::Q6_K => (8, false),
+        // Exact 8-bit matches
+        GgmlType::Q8_0 | GgmlType::Q8_1 | GgmlType::Q8_K => (8, true),
+        // High precision → best available (INT8)
+        GgmlType::F16 | GgmlType::BF16 | GgmlType::F32 => (8, false),
+        // Low precision → INT4
+        GgmlType::Q2_K | GgmlType::Q3_K => (4, false),
+    }
+}
+
 /// Model configuration (subset of config.json relevant to MoE).
 ///
 /// Supports multiple architectures:
@@ -178,6 +200,34 @@ pub struct ExpertWeights {
     pub down: QuantWeight,
 }
 
+/// Raw GGUF expert weights — stored as-is from the GGUF file, no conversion.
+///
+/// Gate, up, down projections stored as raw GGUF block data (Q4_K, Q5_K, Q6_K, etc.).
+/// The matmul kernels consume these blocks directly.
+/// Note: gate/up and down may use DIFFERENT quantization types (e.g. Q4_K vs Q6_K in Q4_K_M).
+pub struct GgufExpertWeights {
+    /// gate_proj raw GGUF data (Q4_K blocks etc.)
+    pub gate_data: Vec<u8>,
+    /// up_proj raw GGUF data
+    pub up_data: Vec<u8>,
+    /// down_proj raw GGUF data
+    pub down_data: Vec<u8>,
+    /// GGML quantization type for gate/up projections
+    pub gate_up_type: crate::gguf::GgmlType,
+    /// GGML quantization type for down projection (may differ from gate/up)
+    pub down_type: crate::gguf::GgmlType,
+    /// gate/up: [intermediate_size, hidden_size]
+    pub intermediate_size: usize,
+    pub hidden_size: usize,
+}
+
+impl GgufExpertWeights {
+    /// Total bytes of raw weight data.
+    pub fn data_bytes(&self) -> usize {
+        self.gate_data.len() + self.up_data.len() + self.down_data.len()
+    }
+}
+
 /// Unified expert weights with combined w13 (gate+up) in a packed layout.
 ///
 /// Used for both CPU (transposed) and GPU (Marlin) weight formats.
@@ -207,8 +257,12 @@ pub struct UnifiedExpertWeights {
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub group_size: usize,
-    /// Quantization bit width: 4 or 8.
+    /// Quantization bit width for w13 (gate+up): 4 or 8.
     pub num_bits: u8,
+    /// Quantization bit width for w2 (down): 4 or 8.
+    /// Usually same as num_bits, but may differ for GGUF-sourced mixed precision
+    /// (e.g. Q4_K gate/up → INT4, Q6_K down → INT8).
+    pub w2_bits: u8,
 }
 
 impl UnifiedExpertWeights {
@@ -278,6 +332,7 @@ impl UnifiedExpertWeights {
             intermediate_size: intermediate,
             group_size,
             num_bits: 4,
+            w2_bits: 4,
         }
     }
 
@@ -368,6 +423,7 @@ impl UnifiedExpertWeights {
             intermediate_size: intermediate,
             group_size,
             num_bits: 8,
+            w2_bits: 8,
         }
     }
 
@@ -415,7 +471,163 @@ impl UnifiedExpertWeights {
             intermediate_size: intermediate,
             group_size,
             num_bits: 4,
+            w2_bits: 4,
         }
+    }
+
+    /// Convert from separate gate/up/down ExpertWeights with mixed precision.
+    ///
+    /// gate/up use `w13_bits`, down uses `w2_bits`. This handles GGUF models where
+    /// gate/up and down projections use different quantization types (e.g. Q4_K_M:
+    /// gate/up=Q4_K → INT4, down=Q6_K → INT8).
+    pub fn from_expert_weights_mixed(ew: &ExpertWeights, w13_bits: u8, w2_bits: u8) -> Self {
+        // Build w13 (gate+up) at w13_bits precision
+        let mut result = if w13_bits == 4 {
+            let gate = ew.gate.as_int4();
+            let up = ew.up.as_int4();
+
+            let hidden = gate.cols;
+            let intermediate = gate.rows;
+            let group_size = gate.group_size;
+            let packed_k = hidden / 8;
+            let num_groups = hidden / group_size;
+            let two_n = 2 * intermediate;
+
+            let mut w13_packed = vec![0u32; packed_k * two_n];
+            for k in 0..packed_k {
+                for n in 0..intermediate {
+                    w13_packed[k * two_n + n] = gate.packed[n * packed_k + k];
+                    w13_packed[k * two_n + intermediate + n] = up.packed[n * packed_k + k];
+                }
+            }
+
+            let mut w13_scales = vec![0u16; num_groups * two_n];
+            for g in 0..num_groups {
+                for n in 0..intermediate {
+                    w13_scales[g * two_n + n] = gate.scales[n * num_groups + g];
+                    w13_scales[g * two_n + intermediate + n] = up.scales[n * num_groups + g];
+                }
+            }
+
+            UnifiedExpertWeights {
+                w13_packed,
+                w13_scales,
+                w2_packed: Vec::new(),
+                w2_scales: Vec::new(),
+                hidden_size: hidden,
+                intermediate_size: intermediate,
+                group_size,
+                num_bits: 4,
+                w2_bits,
+            }
+        } else {
+            // INT8 gate/up
+            let gate = match &ew.gate { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 gate for w13_bits=8") };
+            let up = match &ew.up { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 up for w13_bits=8") };
+
+            let hidden = gate.cols;
+            let intermediate = gate.rows;
+            let group_size = gate.group_size;
+            let num_groups = hidden / group_size;
+            let two_n = 2 * intermediate;
+
+            let w13_byte_count = hidden * two_n;
+            let w13_u32_count = (w13_byte_count + 3) / 4;
+            let mut w13_bytes = vec![0i8; w13_u32_count * 4];
+            for k in 0..hidden {
+                for n in 0..intermediate {
+                    w13_bytes[k * two_n + n] = gate.data[n * hidden + k];
+                    w13_bytes[k * two_n + intermediate + n] = up.data[n * hidden + k];
+                }
+            }
+            let w13_packed: Vec<u32> = unsafe {
+                let mut v = vec![0u32; w13_u32_count];
+                std::ptr::copy_nonoverlapping(
+                    w13_bytes.as_ptr() as *const u8,
+                    v.as_mut_ptr() as *mut u8,
+                    w13_u32_count * 4,
+                );
+                v
+            };
+
+            let mut w13_scales = vec![0u16; num_groups * two_n];
+            for g in 0..num_groups {
+                for n in 0..intermediate {
+                    w13_scales[g * two_n + n] = gate.scales[n * num_groups + g];
+                    w13_scales[g * two_n + intermediate + n] = up.scales[n * num_groups + g];
+                }
+            }
+
+            UnifiedExpertWeights {
+                w13_packed,
+                w13_scales,
+                w2_packed: Vec::new(),
+                w2_scales: Vec::new(),
+                hidden_size: hidden,
+                intermediate_size: intermediate,
+                group_size,
+                num_bits: 8,
+                w2_bits,
+            }
+        };
+
+        // Build w2 (down) at w2_bits precision
+        if w2_bits == 4 {
+            let down = ew.down.as_int4();
+            let down_k = down.cols;
+            let down_n = down.rows;
+            let down_packed_k = down_k / 8;
+            let down_num_groups = down_k / result.group_size;
+
+            let mut w2_packed = vec![0u32; down_packed_k * down_n];
+            for k in 0..down_packed_k {
+                for n in 0..down_n {
+                    w2_packed[k * down_n + n] = down.packed[n * down_packed_k + k];
+                }
+            }
+            let mut w2_scales = vec![0u16; down_num_groups * down_n];
+            for g in 0..down_num_groups {
+                for n in 0..down_n {
+                    w2_scales[g * down_n + n] = down.scales[n * down_num_groups + g];
+                }
+            }
+            result.w2_packed = w2_packed;
+            result.w2_scales = w2_scales;
+        } else {
+            // INT8 down
+            let down = match &ew.down { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 down for w2_bits=8") };
+            let down_k = down.cols;
+            let down_n = down.rows;
+            let down_num_groups = down_k / result.group_size;
+
+            let w2_byte_count = down_k * down_n;
+            let w2_u32_count = (w2_byte_count + 3) / 4;
+            let mut w2_bytes = vec![0i8; w2_u32_count * 4];
+            for k in 0..down_k {
+                for n in 0..down_n {
+                    w2_bytes[k * down_n + n] = down.data[n * down_k + k];
+                }
+            }
+            let w2_packed: Vec<u32> = unsafe {
+                let mut v = vec![0u32; w2_u32_count];
+                std::ptr::copy_nonoverlapping(
+                    w2_bytes.as_ptr() as *const u8,
+                    v.as_mut_ptr() as *mut u8,
+                    w2_u32_count * 4,
+                );
+                v
+            };
+            let mut w2_scales = vec![0u16; down_num_groups * down_n];
+            for g in 0..down_num_groups {
+                for n in 0..down_n {
+                    w2_scales[g * down_n + n] = down.scales[n * down_num_groups + g];
+                }
+            }
+            result.w2_packed = w2_packed;
+            result.w2_scales = w2_scales;
+        }
+
+        result
     }
 
     /// Total bytes of weight data (packed + scales for w13 + w2).
@@ -446,6 +658,12 @@ pub struct WeightStore {
     pub experts_gpu: Vec<Vec<UnifiedExpertWeights>>,
     /// GPU shared expert weights (Marlin).
     pub shared_experts_gpu: Vec<UnifiedExpertWeights>,
+
+    /// Raw GGUF expert weights — loaded as-is from GGUF file, no conversion.
+    /// When populated, used for CPU decode INSTEAD of experts_cpu.
+    pub experts_gguf: Vec<Vec<GgufExpertWeights>>,
+    /// GGUF shared expert weights.
+    pub shared_experts_gguf: Vec<GgufExpertWeights>,
 
     /// Model configuration.
     pub config: ModelConfig,
@@ -489,6 +707,7 @@ const CACHE_MAGIC: &[u8; 4] = b"KRAS";
 const CACHE_VERSION: u32 = 1;
 const CACHE_VERSION_MARLIN: u32 = 3;
 const CACHE_VERSION_CPU: u32 = 4;
+const CACHE_VERSION_CPU_GGUF: u32 = 5;
 const CACHE_HEADER_SIZE: usize = 64;
 
 /// FNV-1a hash for cache invalidation.
@@ -521,6 +740,13 @@ fn cache_path_cpu(model_dir: &Path, num_bits: u8, group_size: usize) -> PathBuf 
     model_dir
         .join(".krasis_cache")
         .join(format!("experts_cpu_int{num_bits}_g{group_size}.bin"))
+}
+
+/// Cache file path for GGUF-sourced AVX2 transposed CPU cache.
+fn cache_path_gguf_avx2(model_dir: &Path, group_size: usize) -> PathBuf {
+    model_dir
+        .join(".krasis_cache")
+        .join(format!("experts_gguf_avx2_g{group_size}.bin"))
 }
 
 /// Compute per-expert byte sizes for unified format.
@@ -559,6 +785,52 @@ fn cpu_expert_byte_sizes(config: &ModelConfig, group_size: usize, num_bits: u8) 
         let w2_scales_bytes = (m / group_size) * h * 2;
         (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes)
     }
+}
+
+/// Compute per-expert byte sizes for mixed-precision CPU transposed format.
+/// w13_bits for gate/up, w2_bits for down — may differ.
+/// Returns (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes).
+fn cpu_expert_byte_sizes_mixed(h: usize, m: usize, group_size: usize, w13_bits: u8, w2_bits: u8) -> (usize, usize, usize, usize) {
+    let two_n = 2 * m;
+    let w13_packed_bytes = if w13_bits == 4 {
+        (h / 8) * two_n * 4
+    } else {
+        (((h * two_n) + 3) / 4) * 4
+    };
+    let w13_scales_bytes = (h / group_size) * two_n * 2;
+
+    let w2_packed_bytes = if w2_bits == 4 {
+        (m / 8) * h * 4
+    } else {
+        (((m * h) + 3) / 4) * 4
+    };
+    let w2_scales_bytes = (m / group_size) * h * 2;
+
+    (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes)
+}
+
+/// Expected total v5 GGUF-sourced CPU cache file size (mixed precision).
+fn expected_gguf_cpu_cache_size(
+    config: &ModelConfig, group_size: usize, w13_bits: u8, w2_bits: u8,
+    num_moe_layers: usize, n_shared_experts: usize, shared_intermediate: usize,
+) -> usize {
+    let h = config.hidden_size;
+    let m = config.moe_intermediate_size;
+
+    let (w13pb, w13sb, w2pb, w2sb) = cpu_expert_byte_sizes_mixed(h, m, group_size, w13_bits, w2_bits);
+    let per_routed_expert = w13pb + w13sb + w2pb + w2sb;
+    let routed_total = num_moe_layers * config.n_routed_experts * per_routed_expert;
+
+    let shared_total = if n_shared_experts > 0 {
+        let (s13p, s13s, s2p, s2s) = cpu_expert_byte_sizes_mixed(
+            h, shared_intermediate, group_size, w13_bits, w2_bits,
+        );
+        num_moe_layers * (s13p + s13s + s2p + s2s)
+    } else {
+        0
+    };
+
+    CACHE_HEADER_SIZE + routed_total + shared_total
 }
 
 /// Expected total CPU transposed cache file size.
@@ -666,6 +938,8 @@ impl WeightStore {
             shared_experts_cpu: Vec::new(),
             experts_gpu: Vec::new(),
             shared_experts_gpu: Vec::new(),
+            experts_gguf: Vec::new(),
+            shared_experts_gguf: Vec::new(),
             config: ModelConfig {
                 hidden_size: 0,
                 moe_intermediate_size: 0,
@@ -894,6 +1168,8 @@ impl WeightStore {
             shared_experts_cpu,
             experts_gpu,
             shared_experts_gpu,
+            experts_gguf: Vec::new(),
+            shared_experts_gguf: Vec::new(),
             config: config.clone(),
             group_size: effective_gs,
             cpu_num_bits,
@@ -1254,6 +1530,8 @@ impl WeightStore {
             shared_experts_cpu: Vec::new(),
             experts_gpu: Vec::new(),
             shared_experts_gpu: Vec::new(),
+            experts_gguf: Vec::new(),
+            shared_experts_gguf: Vec::new(),
             config: config.clone(),
             group_size,
             cpu_num_bits: num_bits,
@@ -1883,6 +2161,8 @@ impl WeightStore {
             shared_experts_cpu: Vec::new(),
             experts_gpu,
             shared_experts_gpu,
+            experts_gguf: Vec::new(),
+            shared_experts_gguf: Vec::new(),
             config: config.clone(),
             group_size,
             cpu_num_bits: 4,
@@ -2348,7 +2628,9 @@ impl WeightStore {
 
     /// Number of MoE layers loaded.
     pub fn num_moe_layers(&self) -> usize {
-        if !self.experts_cpu.is_empty() {
+        if !self.experts_gguf.is_empty() {
+            self.experts_gguf.len()
+        } else if !self.experts_cpu.is_empty() {
             self.experts_cpu.len()
         } else if !self.experts_gpu.is_empty() {
             self.experts_gpu.len()
@@ -2410,6 +2692,21 @@ impl WeightStore {
         }
     }
 
+    /// Whether native GGUF expert weights are loaded (for CPU decode).
+    pub fn has_gguf(&self) -> bool {
+        !self.experts_gguf.is_empty()
+    }
+
+    /// Get native GGUF expert weights for a given MoE layer and expert index.
+    pub fn get_expert_gguf(&self, moe_layer_idx: usize, expert_idx: usize) -> &GgufExpertWeights {
+        &self.experts_gguf[moe_layer_idx][expert_idx]
+    }
+
+    /// Get native GGUF shared expert weights for a given MoE layer index.
+    pub fn get_shared_expert_gguf(&self, moe_layer_idx: usize) -> Option<&GgufExpertWeights> {
+        self.shared_experts_gguf.get(moe_layer_idx)
+    }
+
     /// Migrate CPU expert weights to NUMA nodes.
     /// Returns the number of successfully migrated experts.
     pub fn migrate_numa_unified(&mut self, map: &crate::numa::NumaExpertMap) -> usize {
@@ -2443,6 +2740,876 @@ impl WeightStore {
         );
 
         migrated
+    }
+
+    /// Load CPU expert weights from a GGUF file (dequant → BF16 → re-quantize to our format).
+    ///
+    /// The GGUF file provides pre-quantized expert weights (Q4_K, Q5_K, Q6_K, etc.)
+    /// which we dequantize to FP32, convert to BF16, then re-quantize to our INT4/INT8
+    /// CPU transposed format. GPU Marlin cache is NOT loaded here — it's still built
+    /// from BF16 safetensors by the normal `load_from_hf` path.
+    ///
+    /// This populates `experts_cpu` and `shared_experts_cpu`.
+    ///
+    /// `model_dir`: path to HF model directory (for config.json)
+    /// `gguf_path`: path to the GGUF file
+    /// `group_size`: quantization group size (128 default)
+    /// `cpu_num_bits`: 4 or 8 for CPU decode format
+    /// `gpu_num_bits`: for GPU (Marlin), still loaded from safetensors
+    /// `max_layers`: optional limit on number of MoE layers to load
+    /// `start_layer`: optional start MoE layer index
+    pub fn load_from_gguf(
+        model_dir: &Path,
+        gguf_path: &Path,
+        group_size: usize,
+        max_layers: Option<usize>,
+        start_layer: Option<usize>,
+        cpu_num_bits: u8,
+        gpu_num_bits: u8,
+        gguf_native: bool,
+    ) -> Result<Self, String> {
+        let start = std::time::Instant::now();
+
+        // Parse config.json from HF model dir
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config.json: {e}"))?;
+        let raw_json: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| format!("Failed to parse config.json: {e}"))?;
+        let config = ModelConfig::from_json(&raw_json)
+            .map_err(|e| format!("Failed to extract MoE config: {e}"))?;
+
+        log::info!(
+            "GGUF loading: hidden={}, intermediate={}, experts={}, top-{}, layers={}, cpu_bits={}",
+            config.hidden_size, config.moe_intermediate_size, config.n_routed_experts,
+            config.num_experts_per_tok, config.num_hidden_layers, cpu_num_bits,
+        );
+
+        let total_moe_layers = config.num_hidden_layers - config.first_k_dense_replace;
+        let moe_start = start_layer.unwrap_or(0);
+        let remaining = total_moe_layers - moe_start;
+        let num_moe_layers = match max_layers {
+            Some(n) => n.min(remaining),
+            None => remaining,
+        };
+        let config_hash = fnv1a(config_str.as_bytes());
+
+        // Open GGUF file
+        log::info!("Opening GGUF: {}", gguf_path.display());
+        let gguf = crate::gguf::GgufFile::open(gguf_path)?;
+
+        let merged = gguf.has_merged_experts();
+        log::info!(
+            "GGUF expert format: {}",
+            if merged { "merged (ffn_gate_exps)" } else { "per-expert (ffn_gate.E)" },
+        );
+
+        // ── Phase 1: Load GPU Marlin cache from safetensors (unchanged) ──
+        let effective_gs_hint = Self::detect_group_size_hint(model_dir, &config);
+        let cache_gs = effective_gs_hint.unwrap_or(group_size);
+        let mut experts_gpu: Vec<Vec<UnifiedExpertWeights>> = Vec::new();
+        let mut shared_experts_gpu: Vec<UnifiedExpertWeights> = Vec::new();
+        let mut effective_gs = cache_gs;
+        let mut gpu_loaded = false;
+
+        // Try loading existing Marlin cache
+        for try_gs in &[cache_gs, group_size, 32, 64, 128] {
+            if gpu_loaded { break; }
+            let try_path = cache_path_marlin(model_dir, *try_gs);
+            if try_path.exists() {
+                match Self::load_marlin_cache(
+                    &try_path, &config, *try_gs, total_moe_layers, config_hash,
+                    moe_start, num_moe_layers,
+                ) {
+                    Ok(store) => {
+                        log::info!(
+                            "Loaded GPU Marlin cache in {:.1}s (gs={})",
+                            start.elapsed().as_secs_f64(), try_gs,
+                        );
+                        experts_gpu = store.experts_gpu;
+                        shared_experts_gpu = store.shared_experts_gpu;
+                        effective_gs = *try_gs;
+                        gpu_loaded = true;
+                    }
+                    Err(e) => {
+                        if *try_gs == cache_gs {
+                            log::warn!("Marlin cache invalid (gs={}): {e}", try_gs);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build Marlin cache if not found
+        if !gpu_loaded {
+            let mpath = cache_path_marlin(model_dir, cache_gs);
+            log::info!("No Marlin cache found, building from safetensors...");
+            let built_gs = Self::build_marlin_cache_locked(
+                model_dir, &config, group_size, total_moe_layers, &mpath, config_hash,
+            )?;
+            effective_gs = built_gs;
+
+            for try_gs in &[built_gs, cache_gs, group_size, 32, 64, 128] {
+                if gpu_loaded { break; }
+                let try_path = cache_path_marlin(model_dir, *try_gs);
+                if try_path.exists() {
+                    if let Ok(store) = Self::load_marlin_cache(
+                        &try_path, &config, *try_gs, total_moe_layers, config_hash,
+                        moe_start, num_moe_layers,
+                    ) {
+                        experts_gpu = store.experts_gpu;
+                        shared_experts_gpu = store.shared_experts_gpu;
+                        effective_gs = *try_gs;
+                        gpu_loaded = true;
+                    }
+                }
+            }
+        }
+
+        // ── Phase 2: CPU experts — try AVX2 cache first, then build from GGUF ──
+        let mut experts_cpu: Vec<Vec<UnifiedExpertWeights>> = Vec::new();
+        let mut shared_experts_cpu: Vec<UnifiedExpertWeights> = Vec::new();
+        let mut experts_gguf: Vec<Vec<GgufExpertWeights>> = Vec::new();
+        let mut shared_experts_gguf: Vec<GgufExpertWeights> = Vec::new();
+        let mut cpu_loaded = false;
+
+        if gguf_native {
+            log::info!("GGUF native mode — bypassing AVX2 cache, loading raw GGUF blocks");
+        }
+
+        // Step 1: Try loading existing GGUF→AVX2 cache (unless gguf_native)
+        if !gguf_native {
+            let avx2_cache_path = cache_path_gguf_avx2(model_dir, effective_gs);
+            if avx2_cache_path.exists() {
+                match Self::load_gguf_cpu_cache(
+                    &avx2_cache_path, &config, effective_gs, total_moe_layers, config_hash,
+                    moe_start, num_moe_layers,
+                ) {
+                    Ok((cpu_exp, cpu_shared, w13b, w2b)) => {
+                        log::info!(
+                            "Loaded GGUF→AVX2 CPU cache in {:.1}s: w13=INT{}, w2=INT{}, {} layers",
+                            start.elapsed().as_secs_f64(), w13b, w2b, num_moe_layers,
+                        );
+                        experts_cpu = cpu_exp;
+                        shared_experts_cpu = cpu_shared;
+                        cpu_loaded = true;
+                    }
+                    Err(e) => log::warn!("GGUF AVX2 cache invalid: {e}"),
+                }
+            }
+        }
+
+        // Step 2: Build AVX2 cache from GGUF if needed (unless gguf_native)
+        if !cpu_loaded && !gguf_native {
+            let avx2_cache_path = cache_path_gguf_avx2(model_dir, effective_gs);
+            log::info!("No GGUF→AVX2 cache found, building from GGUF...");
+            let (w13b, w2b) = Self::streaming_build_cpu_cache_from_gguf(
+                model_dir, gguf_path, &config, effective_gs,
+                total_moe_layers, &avx2_cache_path, config_hash,
+            )?;
+
+            // Load the just-built cache
+            match Self::load_gguf_cpu_cache(
+                &avx2_cache_path, &config, effective_gs, total_moe_layers, config_hash,
+                moe_start, num_moe_layers,
+            ) {
+                Ok((cpu_exp, cpu_shared, _, _)) => {
+                    log::info!(
+                        "Loaded GGUF→AVX2 cache after build in {:.1}s: w13=INT{}, w2=INT{}",
+                        start.elapsed().as_secs_f64(), w13b, w2b,
+                    );
+                    experts_cpu = cpu_exp;
+                    shared_experts_cpu = cpu_shared;
+                    cpu_loaded = true;
+                }
+                Err(e) => log::warn!("Failed to load built GGUF AVX2 cache: {e}"),
+            }
+        }
+
+        // Step 3: Fall back to raw GGUF native if requested or if AVX2 cache failed
+        if !cpu_loaded {
+            log::info!(
+                "Loading CPU experts from GGUF native ({} layers × {} experts)...",
+                num_moe_layers, config.n_routed_experts,
+            );
+
+            let h = config.hidden_size;
+            let m = config.moe_intermediate_size;
+            let n_experts = config.n_routed_experts;
+
+            for moe_idx in moe_start..(moe_start + num_moe_layers) {
+                let abs_layer = moe_idx + config.first_k_dense_replace;
+                let layer_start = std::time::Instant::now();
+                let mut layer_experts = Vec::with_capacity(n_experts);
+
+                if merged {
+                    let gate_name = format!("blk.{abs_layer}.ffn_gate_exps.weight");
+                    let up_name = format!("blk.{abs_layer}.ffn_up_exps.weight");
+                    let down_name = format!("blk.{abs_layer}.ffn_down_exps.weight");
+
+                    let gate_info = gguf.tensors.get(&gate_name)
+                        .ok_or_else(|| format!("Missing tensor: {gate_name}"))?;
+                    let up_info = gguf.tensors.get(&up_name)
+                        .ok_or_else(|| format!("Missing tensor: {up_name}"))?;
+                    let down_info = gguf.tensors.get(&down_name)
+                        .ok_or_else(|| format!("Missing tensor: {down_name}"))?;
+
+                    let gate_data = gguf.tensor_data(gate_info)?;
+                    let up_data = gguf.tensor_data(up_info)?;
+                    let down_data = gguf.tensor_data(down_info)?;
+
+                    let gate_type = gate_info.dtype;
+                    let gate_expert_elements = m * h;
+                    let gate_expert_blocks = gate_expert_elements / gate_type.block_size();
+                    let gate_expert_bytes = gate_expert_blocks * gate_type.block_bytes();
+
+                    let down_type = down_info.dtype;
+                    let down_expert_elements = h * m;
+                    let down_expert_blocks = down_expert_elements / down_type.block_size();
+                    let down_expert_bytes = down_expert_blocks * down_type.block_bytes();
+
+                    let up_expert_bytes = gate_expert_bytes;
+
+                    if moe_idx == moe_start {
+                        log::info!(
+                            "GGUF expert layout: gate/up={} ({} bytes/expert), down={} ({} bytes/expert)",
+                            gate_type.name(), gate_expert_bytes, down_type.name(), down_expert_bytes,
+                        );
+                    }
+
+                    for eidx in 0..n_experts {
+                        let gate_start = eidx * gate_expert_bytes;
+                        let up_start = eidx * up_expert_bytes;
+                        let down_start = eidx * down_expert_bytes;
+
+                        layer_experts.push(GgufExpertWeights {
+                            gate_data: gate_data[gate_start..gate_start + gate_expert_bytes].to_vec(),
+                            up_data: up_data[up_start..up_start + up_expert_bytes].to_vec(),
+                            down_data: down_data[down_start..down_start + down_expert_bytes].to_vec(),
+                            gate_up_type: gate_type,
+                            down_type,
+                            intermediate_size: m,
+                            hidden_size: h,
+                        });
+                    }
+                } else {
+                    for eidx in 0..n_experts {
+                        let gate_name = format!("blk.{abs_layer}.ffn_gate.{eidx}.weight");
+                        let up_name = format!("blk.{abs_layer}.ffn_up.{eidx}.weight");
+                        let down_name = format!("blk.{abs_layer}.ffn_down.{eidx}.weight");
+
+                        let gate_info = gguf.tensors.get(&gate_name)
+                            .ok_or_else(|| format!("Missing tensor: {gate_name}"))?;
+                        let up_info = gguf.tensors.get(&up_name)
+                            .ok_or_else(|| format!("Missing tensor: {up_name}"))?;
+                        let down_info = gguf.tensors.get(&down_name)
+                            .ok_or_else(|| format!("Missing tensor: {down_name}"))?;
+
+                        layer_experts.push(GgufExpertWeights {
+                            gate_data: gguf.tensor_data(gate_info)?.to_vec(),
+                            up_data: gguf.tensor_data(up_info)?.to_vec(),
+                            down_data: gguf.tensor_data(down_info)?.to_vec(),
+                            gate_up_type: gate_info.dtype,
+                            down_type: down_info.dtype,
+                            intermediate_size: m,
+                            hidden_size: h,
+                        });
+                    }
+                }
+
+                let elapsed = layer_start.elapsed();
+                let layers_done = experts_gguf.len() + 1;
+                log::info!(
+                    "GGUF layer {abs_layer}: {} experts copied in {:.1}s [{layers_done}/{num_moe_layers}]",
+                    n_experts, elapsed.as_secs_f64(),
+                );
+                experts_gguf.push(layer_experts);
+
+                if layers_done % 5 == 0 || layers_done == num_moe_layers {
+                    crate::syscheck::log_memory_usage(
+                        &format!("[GGUF] after {layers_done}/{num_moe_layers} layers"),
+                    );
+                }
+            }
+
+            // Load shared experts from GGUF (if present)
+            if config.n_shared_experts > 0 {
+                let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+                log::info!(
+                    "Loading shared experts from GGUF: n_shared={}, intermediate={}",
+                    config.n_shared_experts, shared_intermediate,
+                );
+
+                for moe_idx in moe_start..(moe_start + num_moe_layers) {
+                    let abs_layer = moe_idx + config.first_k_dense_replace;
+
+                    if let Some((gate_name, up_name, down_name)) = gguf.find_shared_expert_tensors(abs_layer) {
+                        let gate_info = gguf.tensors.get(&gate_name)
+                            .ok_or_else(|| format!("Missing shared tensor: {gate_name}"))?;
+                        let up_info = gguf.tensors.get(&up_name)
+                            .ok_or_else(|| format!("Missing shared tensor: {up_name}"))?;
+                        let down_info = gguf.tensors.get(&down_name)
+                            .ok_or_else(|| format!("Missing shared tensor: {down_name}"))?;
+
+                        shared_experts_gguf.push(GgufExpertWeights {
+                            gate_data: gguf.tensor_data(gate_info)?.to_vec(),
+                            up_data: gguf.tensor_data(up_info)?.to_vec(),
+                            down_data: gguf.tensor_data(down_info)?.to_vec(),
+                            gate_up_type: gate_info.dtype,
+                            down_type: down_info.dtype,
+                            intermediate_size: shared_intermediate,
+                            hidden_size: h,
+                        });
+                    }
+                }
+                log::info!("Loaded {} shared expert layers from GGUF", shared_experts_gguf.len());
+            }
+        }
+
+        let total_elapsed = start.elapsed();
+        let mode = if cpu_loaded { "AVX2" } else { "native" };
+        log::info!(
+            "GGUF loading done ({mode}) in {:.1}s: {} MoE layers, GPU={}",
+            total_elapsed.as_secs_f64(), num_moe_layers,
+            if gpu_loaded { "Marlin" } else { "none" },
+        );
+
+        Ok(WeightStore {
+            experts: Vec::new(),
+            shared_experts: Vec::new(),
+            experts_cpu,
+            shared_experts_cpu,
+            experts_gpu,
+            shared_experts_gpu,
+            experts_gguf,
+            shared_experts_gguf,
+            config: config.clone(),
+            group_size: effective_gs,
+            cpu_num_bits,
+            gpu_num_bits,
+        })
+    }
+
+    /// Build GGUF-sourced AVX2 transposed CPU cache (v5).
+    ///
+    /// Reads GGUF file, dequantizes each expert to FP32, re-quantizes to AVX2
+    /// transposed format at the same bit width as the GGUF source, and writes
+    /// to a disk cache. Returns (w13_bits, w2_bits).
+    fn streaming_build_cpu_cache_from_gguf(
+        _model_dir: &Path,
+        gguf_path: &Path,
+        config: &ModelConfig,
+        group_size: usize,
+        total_moe_layers: usize,
+        cache_path: &Path,
+        config_hash: u64,
+    ) -> Result<(u8, u8), String> {
+        use crate::gguf;
+
+        log::info!(
+            "Building GGUF→AVX2 CPU cache: {} MoE layers → {}",
+            total_moe_layers, cache_path.display(),
+        );
+        crate::syscheck::log_memory_usage("before streaming_build_cpu_cache_from_gguf");
+
+        // Open GGUF
+        let gguf_file = gguf::GgufFile::open(gguf_path)?;
+        let merged = gguf_file.has_merged_experts();
+        let h = config.hidden_size;
+        let m = config.moe_intermediate_size;
+        let n_experts = config.n_routed_experts;
+
+        // Scan ALL layers to determine target precision (Q4_K_M has mixed types across layers)
+        let mut w13_bits: u8 = 4;
+        let mut w2_bits: u8 = 4;
+        let mut gate_types = std::collections::BTreeSet::new();
+        let mut down_types = std::collections::BTreeSet::new();
+        for moe_idx in 0..total_moe_layers {
+            let abs_layer = moe_idx + config.first_k_dense_replace;
+            if merged {
+                let gate_name = format!("blk.{abs_layer}.ffn_gate_exps.weight");
+                let down_name = format!("blk.{abs_layer}.ffn_down_exps.weight");
+                if let Some(gt) = gguf_file.tensors.get(&gate_name) {
+                    let (bits, _) = gguf_type_to_cpu_bits(gt.dtype);
+                    w13_bits = w13_bits.max(bits);
+                    gate_types.insert(gt.dtype.name().to_string());
+                }
+                if let Some(dt) = gguf_file.tensors.get(&down_name) {
+                    let (bits, _) = gguf_type_to_cpu_bits(dt.dtype);
+                    w2_bits = w2_bits.max(bits);
+                    down_types.insert(dt.dtype.name().to_string());
+                }
+            } else {
+                let gate_name = format!("blk.{abs_layer}.ffn_gate.0.weight");
+                let down_name = format!("blk.{abs_layer}.ffn_down.0.weight");
+                if let Some(gt) = gguf_file.tensors.get(&gate_name) {
+                    let (bits, _) = gguf_type_to_cpu_bits(gt.dtype);
+                    w13_bits = w13_bits.max(bits);
+                    gate_types.insert(gt.dtype.name().to_string());
+                }
+                if let Some(dt) = gguf_file.tensors.get(&down_name) {
+                    let (bits, _) = gguf_type_to_cpu_bits(dt.dtype);
+                    w2_bits = w2_bits.max(bits);
+                    down_types.insert(dt.dtype.name().to_string());
+                }
+            }
+        }
+
+        // Warn about non-exact conversions
+        let gate_types_str: Vec<_> = gate_types.iter().collect();
+        let down_types_str: Vec<_> = down_types.iter().collect();
+        for gt_name in &gate_types_str {
+            // Find this type and check exactness
+            for moe_idx in 0..total_moe_layers {
+                let abs_layer = moe_idx + config.first_k_dense_replace;
+                let name = if merged {
+                    format!("blk.{abs_layer}.ffn_gate_exps.weight")
+                } else {
+                    format!("blk.{abs_layer}.ffn_gate.0.weight")
+                };
+                if let Some(t) = gguf_file.tensors.get(&name) {
+                    if t.dtype.name() == gt_name.as_str() {
+                        let (_, exact) = gguf_type_to_cpu_bits(t.dtype);
+                        if !exact {
+                            log::warn!(
+                                "GGUF gate/up type {} will be rounded to INT{} (not an exact match)",
+                                gt_name, w13_bits,
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        for dt_name in &down_types_str {
+            for moe_idx in 0..total_moe_layers {
+                let abs_layer = moe_idx + config.first_k_dense_replace;
+                let name = if merged {
+                    format!("blk.{abs_layer}.ffn_down_exps.weight")
+                } else {
+                    format!("blk.{abs_layer}.ffn_down.0.weight")
+                };
+                if let Some(t) = gguf_file.tensors.get(&name) {
+                    if t.dtype.name() == dt_name.as_str() {
+                        let (_, exact) = gguf_type_to_cpu_bits(t.dtype);
+                        if !exact {
+                            log::warn!(
+                                "GGUF down type {} will be rounded to INT{} (not an exact match)",
+                                dt_name, w2_bits,
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        log::info!(
+            "GGUF types: gate/up=[{}] → INT{}, down=[{}] → INT{}{}",
+            gate_types_str.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+            w13_bits,
+            down_types_str.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+            w2_bits,
+            if w13_bits == w2_bits { String::new() } else { " (mixed precision)".to_string() },
+        );
+
+        // Create cache directory + temp file
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create cache dir: {e}"))?;
+        }
+        let tmp_path = cache_path.with_extension("bin.tmp");
+        let file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create GGUF CPU cache file: {e}"))?;
+        let mut w = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+
+        // Write v5 header
+        write_cpu_cache_header_v5(&mut w, config, group_size, total_moe_layers, config_hash, w13_bits, w2_bits)?;
+
+        let overall_start = std::time::Instant::now();
+
+        // Stream routed experts layer by layer
+        for moe_idx in 0..total_moe_layers {
+            let abs_layer = moe_idx + config.first_k_dense_replace;
+            let layer_start = std::time::Instant::now();
+
+            if merged {
+                // Merged expert tensors: dequant whole tensor, slice per-expert
+                let gate_name = format!("blk.{abs_layer}.ffn_gate_exps.weight");
+                let up_name = format!("blk.{abs_layer}.ffn_up_exps.weight");
+                let down_name = format!("blk.{abs_layer}.ffn_down_exps.weight");
+
+                let gate_info = gguf_file.tensors.get(&gate_name)
+                    .ok_or_else(|| format!("Missing tensor: {gate_name}"))?;
+                let up_info = gguf_file.tensors.get(&up_name)
+                    .ok_or_else(|| format!("Missing tensor: {up_name}"))?;
+                let down_info = gguf_file.tensors.get(&down_name)
+                    .ok_or_else(|| format!("Missing tensor: {down_name}"))?;
+
+                let gate_data = gguf_file.tensor_data(gate_info)?;
+                let up_data = gguf_file.tensor_data(up_info)?;
+                let down_data = gguf_file.tensor_data(down_info)?;
+
+                // Use per-tensor dtypes (Q4_K_M has mixed types across layers)
+                let layer_gate_type = gate_info.dtype;
+                let layer_up_type = up_info.dtype;
+                let layer_down_type = down_info.dtype;
+
+                let gate_expert_elements = m * h;
+                let gate_expert_blocks = gate_expert_elements / layer_gate_type.block_size();
+                let gate_expert_bytes = gate_expert_blocks * layer_gate_type.block_bytes();
+
+                let up_expert_elements = m * h;
+                let up_expert_blocks = up_expert_elements / layer_up_type.block_size();
+                let up_expert_bytes = up_expert_blocks * layer_up_type.block_bytes();
+
+                let down_expert_elements = h * m;
+                let down_expert_blocks = down_expert_elements / layer_down_type.block_size();
+                let down_expert_bytes = down_expert_blocks * layer_down_type.block_bytes();
+
+                // Parallel: dequant + requant each expert
+                let expert_results: Vec<UnifiedExpertWeights> = (0..n_experts)
+                    .into_par_iter()
+                    .map(|eidx| {
+                        let gate_slice = &gate_data[eidx * gate_expert_bytes..(eidx + 1) * gate_expert_bytes];
+                        let up_slice = &up_data[eidx * up_expert_bytes..(eidx + 1) * up_expert_bytes];
+                        let down_slice = &down_data[eidx * down_expert_bytes..(eidx + 1) * down_expert_bytes];
+
+                        let gate_f32 = gguf::dequantize_raw_data(layer_gate_type, gate_slice, gate_expert_elements)
+                            .expect("Failed to dequant gate");
+                        let up_f32 = gguf::dequantize_raw_data(layer_up_type, up_slice, up_expert_elements)
+                            .expect("Failed to dequant up");
+                        let down_f32 = gguf::dequantize_raw_data(layer_down_type, down_slice, down_expert_elements)
+                            .expect("Failed to dequant down");
+
+                        Self::gguf_expert_from_f32(
+                            &gate_f32, &up_f32, &down_f32,
+                            m, h, group_size, w13_bits, w2_bits,
+                        )
+                    })
+                    .collect();
+
+                for cpu_exp in &expert_results {
+                    write_vec_u32(&mut w, &cpu_exp.w13_packed)?;
+                    write_vec_u16(&mut w, &cpu_exp.w13_scales)?;
+                    write_vec_u32(&mut w, &cpu_exp.w2_packed)?;
+                    write_vec_u16(&mut w, &cpu_exp.w2_scales)?;
+                }
+            } else {
+                // Per-expert tensors
+                let expert_results: Vec<UnifiedExpertWeights> = (0..n_experts)
+                    .into_par_iter()
+                    .map(|eidx| {
+                        let gate_name = format!("blk.{abs_layer}.ffn_gate.{eidx}.weight");
+                        let up_name = format!("blk.{abs_layer}.ffn_up.{eidx}.weight");
+                        let down_name = format!("blk.{abs_layer}.ffn_down.{eidx}.weight");
+
+                        let gate_info = gguf_file.tensors.get(&gate_name)
+                            .unwrap_or_else(|| panic!("Missing tensor: {gate_name}"));
+                        let up_info = gguf_file.tensors.get(&up_name)
+                            .unwrap_or_else(|| panic!("Missing tensor: {up_name}"));
+                        let down_info = gguf_file.tensors.get(&down_name)
+                            .unwrap_or_else(|| panic!("Missing tensor: {down_name}"));
+
+                        let gate_f32 = gguf_file.dequantize_tensor(gate_info)
+                            .expect("Failed to dequant gate");
+                        let up_f32 = gguf_file.dequantize_tensor(up_info)
+                            .expect("Failed to dequant up");
+                        let down_f32 = gguf_file.dequantize_tensor(down_info)
+                            .expect("Failed to dequant down");
+
+                        Self::gguf_expert_from_f32(
+                            &gate_f32, &up_f32, &down_f32,
+                            m, h, group_size, w13_bits, w2_bits,
+                        )
+                    })
+                    .collect();
+
+                for cpu_exp in &expert_results {
+                    write_vec_u32(&mut w, &cpu_exp.w13_packed)?;
+                    write_vec_u16(&mut w, &cpu_exp.w13_scales)?;
+                    write_vec_u32(&mut w, &cpu_exp.w2_packed)?;
+                    write_vec_u16(&mut w, &cpu_exp.w2_scales)?;
+                }
+            }
+
+            let layers_done = moe_idx + 1;
+            let layer_elapsed = layer_start.elapsed();
+            if layers_done % 5 == 0 || layers_done == total_moe_layers {
+                crate::syscheck::log_memory_usage(&format!(
+                    "GGUF→AVX2 cache: {layers_done}/{total_moe_layers} layers ({:.1}s/layer)",
+                    layer_elapsed.as_secs_f64(),
+                ));
+            } else {
+                log::info!(
+                    "  Layer {abs_layer}: {} experts in {:.1}s [{layers_done}/{total_moe_layers}]",
+                    n_experts, layer_elapsed.as_secs_f64(),
+                );
+            }
+        }
+
+        // Stream shared experts
+        if config.n_shared_experts > 0 {
+            let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+            log::info!("Streaming shared experts for GGUF cache ({} layers)...", total_moe_layers);
+
+            for moe_idx in 0..total_moe_layers {
+                let abs_layer = moe_idx + config.first_k_dense_replace;
+
+                if let Some((gate_name, up_name, down_name)) = gguf_file.find_shared_expert_tensors(abs_layer) {
+                    let gate_info = gguf_file.tensors.get(&gate_name)
+                        .ok_or_else(|| format!("Missing shared tensor: {gate_name}"))?;
+                    let up_info = gguf_file.tensors.get(&up_name)
+                        .ok_or_else(|| format!("Missing shared tensor: {up_name}"))?;
+                    let down_info = gguf_file.tensors.get(&down_name)
+                        .ok_or_else(|| format!("Missing shared tensor: {down_name}"))?;
+
+                    let gate_f32 = gguf_file.dequantize_tensor(gate_info)?;
+                    let up_f32 = gguf_file.dequantize_tensor(up_info)?;
+                    let down_f32 = gguf_file.dequantize_tensor(down_info)?;
+
+                    let cpu_exp = Self::gguf_expert_from_f32(
+                        &gate_f32, &up_f32, &down_f32,
+                        shared_intermediate, h, group_size, w13_bits, w2_bits,
+                    );
+
+                    write_vec_u32(&mut w, &cpu_exp.w13_packed)?;
+                    write_vec_u16(&mut w, &cpu_exp.w13_scales)?;
+                    write_vec_u32(&mut w, &cpu_exp.w2_packed)?;
+                    write_vec_u16(&mut w, &cpu_exp.w2_scales)?;
+                } else {
+                    return Err(format!(
+                        "Missing shared expert tensors for layer {abs_layer}"
+                    ));
+                }
+            }
+        }
+
+        // Flush + atomic rename
+        w.flush().map_err(|e| format!("Flush error: {e}"))?;
+        drop(w);
+        std::fs::rename(&tmp_path, cache_path)
+            .map_err(|e| format!("Failed to rename GGUF CPU cache file: {e}"))?;
+
+        // Free GGUF mmap and reclaim RAM
+        drop(gguf_file);
+        #[cfg(target_os = "linux")]
+        unsafe { libc::malloc_trim(0); }
+
+        let elapsed = overall_start.elapsed();
+        let size = std::fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
+        log::info!(
+            "GGUF→AVX2 cache built: {:.1} GB in {:.1}s ({:.1} GB/s), w13=INT{}, w2=INT{}",
+            size as f64 / 1e9,
+            elapsed.as_secs_f64(),
+            size as f64 / 1e9 / elapsed.as_secs_f64(),
+            w13_bits, w2_bits,
+        );
+        crate::syscheck::log_memory_usage("after streaming_build_cpu_cache_from_gguf");
+
+        Ok((w13_bits, w2_bits))
+    }
+
+    /// Load v5 GGUF-sourced CPU cache from disk.
+    fn load_gguf_cpu_cache(
+        path: &Path,
+        config: &ModelConfig,
+        group_size: usize,
+        total_moe_layers: usize,
+        config_hash: u64,
+        start_moe_layer: usize,
+        num_layers_to_load: usize,
+    ) -> Result<(Vec<Vec<UnifiedExpertWeights>>, Vec<UnifiedExpertWeights>, u8, u8), String> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("Failed to open GGUF CPU cache: {e}"))?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| format!("Failed to mmap GGUF CPU cache: {e}"))?;
+
+        // Validate header
+        if mmap.len() < CACHE_HEADER_SIZE {
+            return Err("GGUF CPU cache too small for header".to_string());
+        }
+        if &mmap[0..4] != CACHE_MAGIC {
+            return Err("Bad magic in GGUF CPU cache".to_string());
+        }
+        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        if version != CACHE_VERSION_CPU_GGUF {
+            return Err(format!("Cache version {version}, expected {CACHE_VERSION_CPU_GGUF} (GGUF CPU)"));
+        }
+
+        let h_hidden = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
+        let h_intermediate = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
+        let h_n_experts = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+        let h_num_layers = u64::from_le_bytes(mmap[32..40].try_into().unwrap()) as usize;
+        let h_group_size = u64::from_le_bytes(mmap[40..48].try_into().unwrap()) as usize;
+        let h_config_hash = u64::from_le_bytes(mmap[48..56].try_into().unwrap());
+        let packed_meta = u64::from_le_bytes(mmap[56..64].try_into().unwrap());
+        let h_n_shared = (packed_meta & 0xFFFF) as usize;
+        let h_w13_bits = ((packed_meta >> 48) & 0xFF) as u8;
+        let h_w2_bits = ((packed_meta >> 56) & 0xFF) as u8;
+
+        if h_hidden != config.hidden_size
+            || h_intermediate != config.moe_intermediate_size
+            || h_n_experts != config.n_routed_experts
+            || h_num_layers != total_moe_layers
+            || h_group_size != group_size
+        {
+            return Err(format!(
+                "GGUF CPU cache header mismatch: file has {}h/{}m/{}e/{}L/g{}, expected {}h/{}m/{}e/{}L/g{}",
+                h_hidden, h_intermediate, h_n_experts, h_num_layers, h_group_size,
+                config.hidden_size, config.moe_intermediate_size, config.n_routed_experts,
+                total_moe_layers, group_size,
+            ));
+        }
+        if h_config_hash != config_hash {
+            return Err("Config hash mismatch in GGUF CPU cache".to_string());
+        }
+        if h_n_shared != config.n_shared_experts {
+            return Err(format!(
+                "Shared expert count mismatch: cache={h_n_shared}, config={}",
+                config.n_shared_experts,
+            ));
+        }
+        if h_w13_bits != 4 && h_w13_bits != 8 {
+            return Err(format!("Invalid w13_bits in cache: {h_w13_bits}"));
+        }
+        if h_w2_bits != 4 && h_w2_bits != 8 {
+            return Err(format!("Invalid w2_bits in cache: {h_w2_bits}"));
+        }
+
+        // Validate file size
+        let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+        let expected = expected_gguf_cpu_cache_size(
+            config, group_size, h_w13_bits, h_w2_bits,
+            total_moe_layers, config.n_shared_experts, shared_intermediate,
+        );
+        if mmap.len() != expected {
+            return Err(format!(
+                "GGUF CPU cache size mismatch: expected {} bytes, got {}",
+                expected, mmap.len(),
+            ));
+        }
+
+        log::info!(
+            "Loading GGUF→AVX2 CPU cache: w13=INT{}, w2=INT{}, {} layers ({})",
+            h_w13_bits, h_w2_bits, num_layers_to_load, path.display(),
+        );
+        let load_start = std::time::Instant::now();
+
+        let h = config.hidden_size;
+        let m = config.moe_intermediate_size;
+
+        // Compute per-expert byte sizes
+        let (w13pb, w13sb, w2pb, w2sb) = cpu_expert_byte_sizes_mixed(h, m, group_size, h_w13_bits, h_w2_bits);
+        let per_routed_expert = w13pb + w13sb + w2pb + w2sb;
+        let per_routed_layer = config.n_routed_experts * per_routed_expert;
+
+        let mut offset = CACHE_HEADER_SIZE + start_moe_layer * per_routed_layer;
+
+        // Load routed experts
+        let mut experts_cpu = Vec::with_capacity(num_layers_to_load);
+        for layer_idx in 0..num_layers_to_load {
+            let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
+            for _eidx in 0..config.n_routed_experts {
+                layer_experts.push(read_unified_expert_cpu_mixed(
+                    &mmap, &mut offset, h, m, group_size, h_w13_bits, h_w2_bits,
+                ));
+            }
+            experts_cpu.push(layer_experts);
+
+            if (layer_idx + 1) % 10 == 0 || layer_idx + 1 == num_layers_to_load {
+                log::info!(
+                    "  GGUF CPU cache loaded: {}/{} layers ({:.1} GB)",
+                    layer_idx + 1, num_layers_to_load, offset as f64 / 1e9,
+                );
+            }
+        }
+
+        // Load shared experts
+        let mut shared_experts_cpu = Vec::new();
+        if config.n_shared_experts > 0 {
+            let routed_total = total_moe_layers * per_routed_layer;
+            let shared_m = config.n_shared_experts * config.moe_intermediate_size;
+            let (s13p, s13s, s2p, s2s) = cpu_expert_byte_sizes_mixed(h, shared_m, group_size, h_w13_bits, h_w2_bits);
+            let per_shared = s13p + s13s + s2p + s2s;
+
+            let shared_base = CACHE_HEADER_SIZE + routed_total + start_moe_layer * per_shared;
+            offset = shared_base;
+
+            for _i in 0..num_layers_to_load {
+                shared_experts_cpu.push(
+                    read_unified_expert_cpu_mixed(&mmap, &mut offset, h, shared_m, group_size, h_w13_bits, h_w2_bits),
+                );
+            }
+            log::info!("  Loaded {} shared experts (GGUF→AVX2)", num_layers_to_load);
+        }
+
+        let elapsed = load_start.elapsed();
+        log::info!(
+            "GGUF→AVX2 CPU cache loaded in {:.1}s: {} layers × {} experts (+ {} shared), {:.1} GB",
+            elapsed.as_secs_f64(),
+            num_layers_to_load, config.n_routed_experts,
+            shared_experts_cpu.len(),
+            offset as f64 / 1e9,
+        );
+
+        Ok((experts_cpu, shared_experts_cpu, h_w13_bits, h_w2_bits))
+    }
+
+    /// Convert FP32 gate/up/down expert data to our CPU-optimized UnifiedExpertWeights.
+    ///
+    /// FP32 → BF16 → quantize to INT4/INT8 → transpose to CPU format.
+    /// Supports per-projection precision: `w13_bits` for gate/up, `w2_bits` for down.
+    fn gguf_expert_from_f32(
+        gate_f32: &[f32],
+        up_f32: &[f32],
+        down_f32: &[f32],
+        intermediate_size: usize,
+        hidden_size: usize,
+        group_size: usize,
+        w13_bits: u8,
+        w2_bits: u8,
+    ) -> UnifiedExpertWeights {
+        use crate::weights::marlin::{f32_to_bf16, quantize_int4, quantize_int8};
+
+        let m = intermediate_size;
+        let h = hidden_size;
+
+        // Convert FP32 → BF16
+        let gate_bf16: Vec<u16> = gate_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+        let up_bf16: Vec<u16> = up_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+        let down_bf16: Vec<u16> = down_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+        // Quantize gate/up at w13_bits precision
+        let gate_q = if w13_bits == 4 {
+            QuantWeight::Int4(quantize_int4(&gate_bf16, m, h, group_size))
+        } else {
+            QuantWeight::Int8(quantize_int8(&gate_bf16, m, h, group_size))
+        };
+        let up_q = if w13_bits == 4 {
+            QuantWeight::Int4(quantize_int4(&up_bf16, m, h, group_size))
+        } else {
+            QuantWeight::Int8(quantize_int8(&up_bf16, m, h, group_size))
+        };
+        // Quantize down at w2_bits precision
+        let down_q = if w2_bits == 4 {
+            QuantWeight::Int4(quantize_int4(&down_bf16, h, m, group_size))
+        } else {
+            QuantWeight::Int8(quantize_int8(&down_bf16, h, m, group_size))
+        };
+
+        let ew = ExpertWeights { gate: gate_q, up: up_q, down: down_q };
+
+        // Use mixed-precision constructor if bits differ, otherwise fast path
+        if w13_bits == w2_bits {
+            if w13_bits == 4 {
+                UnifiedExpertWeights::from_expert_weights(&ew)
+            } else {
+                UnifiedExpertWeights::from_expert_weights_int8(&ew)
+            }
+        } else {
+            UnifiedExpertWeights::from_expert_weights_mixed(&ew, w13_bits, w2_bits)
+        }
     }
 }
 
@@ -2502,6 +3669,44 @@ fn write_cpu_cache_header<W: Write>(
         .map_err(|e| format!("Write error: {e}"))?;
     // Byte 56..64: pack n_shared_experts (low 32) + num_bits (high 32)
     let packed_meta = (config.n_shared_experts as u64) | ((num_bits as u64) << 32);
+    w.write_all(&packed_meta.to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    Ok(())
+}
+
+/// Write v5 GGUF-sourced CPU cache header.
+///
+/// Same 64-byte layout, version=5.
+/// Byte 56..64 packs: n_shared_experts (low 16) | w13_bits (byte 6) | w2_bits (byte 7).
+fn write_cpu_cache_header_v5<W: Write>(
+    w: &mut W,
+    config: &ModelConfig,
+    group_size: usize,
+    num_moe_layers: usize,
+    config_hash: u64,
+    w13_bits: u8,
+    w2_bits: u8,
+) -> Result<(), String> {
+    w.write_all(CACHE_MAGIC)
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&CACHE_VERSION_CPU_GGUF.to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(config.hidden_size as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(config.moe_intermediate_size as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(config.n_routed_experts as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(num_moe_layers as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&(group_size as u64).to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    w.write_all(&config_hash.to_le_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    // Byte 56..64: n_shared_experts (low 16) | w13_bits (byte 6) | w2_bits (byte 7) | reserved (byte 7)
+    let packed_meta = (config.n_shared_experts as u64)
+        | ((w13_bits as u64) << 48)
+        | ((w2_bits as u64) << 56);
     w.write_all(&packed_meta.to_le_bytes())
         .map_err(|e| format!("Write error: {e}"))?;
     Ok(())
@@ -2596,6 +3801,7 @@ fn read_unified_expert(
         intermediate_size,
         group_size,
         num_bits: 4, // Marlin cache is always INT4
+        w2_bits: 4,
     }
 }
 
@@ -2678,6 +3884,93 @@ fn read_unified_expert_cpu(
         intermediate_size,
         group_size,
         num_bits,
+        w2_bits: num_bits,
+    }
+}
+
+/// Read a UnifiedExpertWeights from mmap'd v5 GGUF cache data with mixed precision.
+/// w13_bits may differ from w2_bits (e.g. Q4_K gate/up → INT4, Q6_K down → INT8).
+fn read_unified_expert_cpu_mixed(
+    data: &[u8],
+    offset: &mut usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    group_size: usize,
+    w13_bits: u8,
+    w2_bits: u8,
+) -> UnifiedExpertWeights {
+    let h = hidden_size;
+    let m = intermediate_size;
+    let two_n = 2 * m;
+    let num_groups = h / group_size;
+
+    // w13 packed size depends on w13_bits
+    let w13_packed_count = if w13_bits == 4 {
+        (h / 8) * two_n
+    } else {
+        ((h * two_n) + 3) / 4
+    };
+
+    let mut w13_packed = vec![0u32; w13_packed_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w13_packed.as_mut_ptr() as *mut u8,
+            w13_packed_count * 4,
+        );
+    }
+    *offset += w13_packed_count * 4;
+
+    let w13_scales_count = num_groups * two_n;
+    let mut w13_scales = vec![0u16; w13_scales_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w13_scales.as_mut_ptr() as *mut u8,
+            w13_scales_count * 2,
+        );
+    }
+    *offset += w13_scales_count * 2;
+
+    // w2 packed size depends on w2_bits
+    let down_num_groups = m / group_size;
+    let w2_packed_count = if w2_bits == 4 {
+        (m / 8) * h
+    } else {
+        ((m * h) + 3) / 4
+    };
+
+    let mut w2_packed = vec![0u32; w2_packed_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w2_packed.as_mut_ptr() as *mut u8,
+            w2_packed_count * 4,
+        );
+    }
+    *offset += w2_packed_count * 4;
+
+    let w2_scales_count = down_num_groups * h;
+    let mut w2_scales = vec![0u16; w2_scales_count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(*offset),
+            w2_scales.as_mut_ptr() as *mut u8,
+            w2_scales_count * 2,
+        );
+    }
+    *offset += w2_scales_count * 2;
+
+    UnifiedExpertWeights {
+        w13_packed,
+        w13_scales,
+        w2_packed,
+        w2_scales,
+        hidden_size,
+        intermediate_size,
+        group_size,
+        num_bits: w13_bits,
+        w2_bits,
     }
 }
 
