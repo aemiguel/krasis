@@ -1,0 +1,80 @@
+{
+  "date": "2026-02-12 02:45",
+  "model": "DeepSeek-V2-Lite",
+  "prefill_scaling": [
+    {
+      "tokens": 512,
+      "total_time_s": 11.16892920799728,
+      "tok_per_s": 45.84145807221994,
+      "num_chunks": 1
+    },
+    {
+      "tokens": 1024,
+      "total_time_s": 10.705688404996181,
+      "tok_per_s": 95.65008444689227,
+      "num_chunks": 1
+    },
+    {
+      "tokens": 2031,
+      "total_time_s": 11.014266390004195,
+      "tok_per_s": 184.39721067970524,
+      "num_chunks": 1
+    },
+    {
+      "tokens": 4047,
+      "total_time_s": 22.12016534799477,
+      "tok_per_s": 182.95523276307097,
+      "num_chunks": 2
+    },
+    {
+      "tokens": 8079,
+      "total_time_s": 45.791232059011236,
+      "tok_per_s": 176.43115585072223,
+      "num_chunks": 4
+    }
+  ],
+  "chunk_breakdown_10k": [
+    {
+      "chunk_idx": 0,
+      "start_pos": 0,
+      "num_tokens": 2048,
+      "time_s": 11.467699422006262,
+      "tok_per_s": 178.588566427712
+    },
+    {
+      "chunk_idx": 1,
+      "start_pos": 2048,
+      "num_tokens": 2048,
+      "time_s": 11.193265179012087,
+      "tok_per_s": 182.967165277215
+    },
+    {
+      "chunk_idx": 2,
+      "start_pos": 4096,
+      "num_tokens": 2048,
+      "time_s": 11.410628333993373,
+      "tok_per_s": 179.48179013935706
+    },
+    {
+      "chunk_idx": 3,
+      "start_pos": 6144,
+      "num_tokens": 2048,
+      "time_s": 11.69225478899898,
+      "tok_per_s": 175.15868726423275
+    },
+    {
+      "chunk_idx": 4,
+      "start_pos": 8192,
+      "num_tokens": 1711,
+      "time_s": 11.490727420008625,
+      "tok_per_s": 148.90267060209456
+    }
+  ],
+  "decode_distribution": {
+    "avg_ms": 170.2,
+    "p50_ms": 170.5,
+    "p90_ms": 173.5,
+    "min_ms": 158.9,
+    "max_ms": 175.1
+  }
+}
