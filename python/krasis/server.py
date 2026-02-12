@@ -19,6 +19,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from krasis.config import QuantConfig
 from krasis.model import KrasisModel
 from krasis.scheduler import GenerationRequest, Scheduler
 
@@ -159,10 +160,30 @@ def main():
                         help="Number of GPUs (auto-detected if omitted)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--krasis-threads", type=int, default=16,
+    parser.add_argument("--krasis-threads", type=int, default=48,
                         help="CPU threads for expert computation")
-    parser.add_argument("--kv-dtype", default="bf16",
+    parser.add_argument("--kv-dtype", default="fp8_e4m3",
                         choices=["fp8_e4m3", "bf16"])
+    parser.add_argument("--expert-divisor", type=int, default=1,
+                        help="Expert loading: 0=chunked, 1=persistent, >=2=layer-grouped")
+    parser.add_argument("--gpu-expert-bits", type=int, default=4, choices=[4, 8],
+                        help="Marlin quantization bits for GPU prefill experts")
+    parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
+                        help="Quantization bits for CPU decode experts")
+    parser.add_argument("--attention-quant", default="int8", choices=["bf16", "int8"],
+                        help="Quantization for attention weights")
+    parser.add_argument("--shared-expert-quant", default="int8", choices=["bf16", "int8"],
+                        help="Quantization for shared expert weights")
+    parser.add_argument("--dense-mlp-quant", default="int8", choices=["bf16", "int8"],
+                        help="Quantization for dense MLP weights")
+    parser.add_argument("--lm-head-quant", default="int8", choices=["bf16", "int8"],
+                        help="Quantization for lm_head weights")
+    parser.add_argument("--gpu-prefill-threshold", type=int, default=300,
+                        help="Min tokens to trigger GPU prefill (default: 300)")
+    parser.add_argument("--gguf-path", default=None,
+                        help="Path to GGUF file for CPU experts")
+    parser.add_argument("--force-load", action="store_true",
+                        help="Force reload of cached weights")
     parser.add_argument("--temperature", type=float, default=0.6)
     args = parser.parse_args()
 
@@ -180,6 +201,15 @@ def main():
 
     kv_dtype = torch.float8_e4m3fn if args.kv_dtype == "fp8_e4m3" else torch.bfloat16
 
+    quant_cfg = QuantConfig(
+        lm_head=args.lm_head_quant,
+        attention=args.attention_quant,
+        shared_expert=args.shared_expert_quant,
+        dense_mlp=args.dense_mlp_quant,
+        gpu_expert_bits=args.gpu_expert_bits,
+        cpu_expert_bits=args.cpu_expert_bits,
+    )
+
     _model_name = args.model_path.rstrip("/").split("/")[-1]
 
     _model = KrasisModel(
@@ -188,6 +218,11 @@ def main():
         num_gpus=args.num_gpus,
         kv_dtype=kv_dtype,
         krasis_threads=args.krasis_threads,
+        quant_cfg=quant_cfg,
+        expert_divisor=args.expert_divisor,
+        gguf_path=args.gguf_path,
+        force_load=args.force_load,
+        gpu_prefill_threshold=args.gpu_prefill_threshold,
     )
 
     logger.info("Loading model...")

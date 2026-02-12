@@ -1,0 +1,815 @@
+#!/usr/bin/env bash
+#
+# Krasis — Interactive launcher for the Krasis MoE inference server.
+#
+# Usage:
+#   ./krasis                        Interactive setup + launch
+#   ./krasis --non-interactive      Use saved/default config, launch immediately
+#   ./krasis --skip-setup           Skip venv/build checks
+#   ./krasis --help                 Show this help
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/.krasis_config"
+VENV_DIR="$SCRIPT_DIR/.venv"
+HF_MODELS_DIR="$HOME/Documents/Claude/hf-models"
+
+# --- Defaults ---
+NON_INTERACTIVE=false
+SKIP_SETUP=false
+MODEL_PATH=""
+
+# CLI overrides (empty = not set)
+CLI_PP_PARTITION=""
+CLI_NUM_GPUS=""
+CLI_EXPERT_DIVISOR=""
+CLI_KV_DTYPE=""
+CLI_GPU_EXPERT_BITS=""
+CLI_CPU_EXPERT_BITS=""
+CLI_ATTENTION_QUANT=""
+CLI_SHARED_EXPERT_QUANT=""
+CLI_DENSE_MLP_QUANT=""
+CLI_LM_HEAD_QUANT=""
+CLI_KRASIS_THREADS=""
+CLI_HOST=""
+CLI_PORT=""
+CLI_GGUF_PATH=""
+CLI_GPU_PREFILL_THRESHOLD=""
+CLI_FORCE_LOAD=""
+
+# ═══════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}✓${NC} $*"; }
+warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
+err()   { echo -e "${RED}✗${NC} $*" >&2; }
+header() { echo -e "\n${BOLD}${BLUE}═══ $* ═══${NC}\n"; }
+
+confirm_yn() {
+    local prompt="$1" default="${2:-y}"
+    if $NON_INTERACTIVE; then
+        [[ "$default" == "y" ]]
+        return $?
+    fi
+    local yn
+    if [[ "$default" == "y" ]]; then
+        read -rp "$(echo -e "${CYAN}?${NC} $prompt ${DIM}[Y/n]${NC} ")" yn
+        yn="${yn:-y}"
+    else
+        read -rp "$(echo -e "${CYAN}?${NC} $prompt ${DIM}[y/N]${NC} ")" yn
+        yn="${yn:-n}"
+    fi
+    [[ "$yn" =~ ^[Yy] ]]
+}
+
+prompt_value() {
+    local prompt="$1" default="$2"
+    if $NON_INTERACTIVE; then
+        echo "$default"
+        return
+    fi
+    local val
+    read -rp "$(echo -e "${CYAN}?${NC} $prompt ${DIM}[$default]${NC}: ")" val
+    echo "${val:-$default}"
+}
+
+prompt_choice() {
+    local prompt="$1" default="$2"
+    shift 2
+    local choices=("$@")
+
+    if $NON_INTERACTIVE; then
+        echo "$default"
+        return
+    fi
+
+    echo -e "${CYAN}?${NC} $prompt ${DIM}(default: $default)${NC}"
+    local i=1
+    for c in "${choices[@]}"; do
+        if [[ "$c" == "$default" ]]; then
+            echo -e "  ${BOLD}$i)${NC} $c ${GREEN}← default${NC}"
+        else
+            echo -e "  ${DIM}$i)${NC} $c"
+        fi
+        ((i++))
+    done
+
+    local sel
+    read -rp "$(echo -e "  ${DIM}Enter choice [1-${#choices[@]}]:${NC} ")" sel
+    if [[ -z "$sel" ]]; then
+        echo "$default"
+    elif [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#choices[@]} )); then
+        echo "${choices[$((sel-1))]}"
+    else
+        echo "$default"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Argument Parsing
+# ═══════════════════════════════════════════════════════════════════════
+
+usage() {
+    cat <<'EOF'
+Krasis — Interactive MoE inference server launcher
+
+Usage:
+  ./krasis [OPTIONS]
+
+Options:
+  --non-interactive       Use saved/default config without prompts
+  --skip-setup            Skip venv/build dependency checks
+  --model-path PATH       Path to HuggingFace model directory
+  --pp-partition P        Comma-separated layer counts (e.g. "9,9,9")
+  --num-gpus N            Number of GPUs to use
+  --expert-divisor N      Expert loading: 0=chunked, 1=persistent, >=2=layer-grouped
+  --kv-dtype DTYPE        KV cache dtype: fp8_e4m3 or bf16
+  --gpu-expert-bits N     GPU Marlin expert bits: 4 or 8
+  --cpu-expert-bits N     CPU expert bits: 4 or 8
+  --attention-quant Q     Attention weight quant: bf16 or int8
+  --shared-expert-quant Q Shared expert quant: bf16 or int8
+  --dense-mlp-quant Q    Dense MLP quant: bf16 or int8
+  --lm-head-quant Q      LM head quant: bf16 or int8
+  --krasis-threads N      CPU threads for expert computation
+  --host HOST             Server bind address (default: 0.0.0.0)
+  --port PORT             Server port (default: 8080)
+  --gguf-path PATH        Path to GGUF file for CPU experts
+  --gpu-prefill-threshold N  Min tokens for GPU prefill (default: 300)
+  --force-load            Force reload cached weights
+  --help                  Show this help
+
+Config is saved to .krasis_config for quick relaunch.
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --non-interactive) NON_INTERACTIVE=true; shift ;;
+        --skip-setup)      SKIP_SETUP=true; shift ;;
+        --model-path)      MODEL_PATH="$2"; shift 2 ;;
+        --pp-partition)    CLI_PP_PARTITION="$2"; shift 2 ;;
+        --num-gpus)        CLI_NUM_GPUS="$2"; shift 2 ;;
+        --expert-divisor)  CLI_EXPERT_DIVISOR="$2"; shift 2 ;;
+        --kv-dtype)        CLI_KV_DTYPE="$2"; shift 2 ;;
+        --gpu-expert-bits) CLI_GPU_EXPERT_BITS="$2"; shift 2 ;;
+        --cpu-expert-bits) CLI_CPU_EXPERT_BITS="$2"; shift 2 ;;
+        --attention-quant) CLI_ATTENTION_QUANT="$2"; shift 2 ;;
+        --shared-expert-quant) CLI_SHARED_EXPERT_QUANT="$2"; shift 2 ;;
+        --dense-mlp-quant) CLI_DENSE_MLP_QUANT="$2"; shift 2 ;;
+        --lm-head-quant)   CLI_LM_HEAD_QUANT="$2"; shift 2 ;;
+        --krasis-threads)  CLI_KRASIS_THREADS="$2"; shift 2 ;;
+        --host)            CLI_HOST="$2"; shift 2 ;;
+        --port)            CLI_PORT="$2"; shift 2 ;;
+        --gguf-path)       CLI_GGUF_PATH="$2"; shift 2 ;;
+        --gpu-prefill-threshold) CLI_GPU_PREFILL_THRESHOLD="$2"; shift 2 ;;
+        --force-load)      CLI_FORCE_LOAD="1"; shift ;;
+        --help|-h)         usage ;;
+        *) err "Unknown option: $1"; usage ;;
+    esac
+done
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 1: Setup
+# ═══════════════════════════════════════════════════════════════════════
+
+phase_setup() {
+    if $SKIP_SETUP; then
+        info "Skipping setup checks (--skip-setup)"
+        # Still need to activate venv if it exists
+        if [[ -f "$VENV_DIR/bin/activate" ]]; then
+            source "$VENV_DIR/bin/activate"
+        fi
+        return 0
+    fi
+
+    header "Phase 1: Setup"
+
+    # Python 3.10+
+    local py_version
+    if ! command -v python3 &>/dev/null; then
+        err "python3 not found. Install Python 3.10+."
+        exit 1
+    fi
+    py_version=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    local py_major py_minor
+    py_major=$(echo "$py_version" | cut -d. -f1)
+    py_minor=$(echo "$py_version" | cut -d. -f2)
+    if (( py_major < 3 || (py_major == 3 && py_minor < 10) )); then
+        err "Python $py_version found, but 3.10+ is required."
+        exit 1
+    fi
+    info "Python $py_version"
+
+    # Venv
+    if [[ ! -d "$VENV_DIR" ]]; then
+        info "Creating virtual environment at $VENV_DIR ..."
+        python3 -m venv "$VENV_DIR"
+    fi
+    source "$VENV_DIR/bin/activate"
+    info "Venv active: $(which python3)"
+
+    # Check krasis importable
+    if ! python3 -c "from krasis import KrasisEngine" 2>/dev/null; then
+        warn "Krasis not installed — building from source..."
+
+        if ! command -v cargo &>/dev/null; then
+            err "cargo not found. Install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+            exit 1
+        fi
+        info "cargo found: $(cargo --version)"
+
+        if ! python3 -c "import maturin" 2>/dev/null; then
+            info "Installing maturin..."
+            pip install maturin
+        fi
+
+        info "Building krasis (pip install -e .) — this may take a few minutes..."
+        (cd "$SCRIPT_DIR" && pip install -e .)
+        info "Krasis built successfully"
+    else
+        info "Krasis importable"
+    fi
+
+    # torch — don't auto-install, just check
+    if ! python3 -c "import torch" 2>/dev/null; then
+        err "PyTorch not installed. Install with:"
+        echo "  pip install torch --index-url https://download.pytorch.org/whl/cu126"
+        exit 1
+    fi
+    info "PyTorch $(python3 -c 'import torch; print(torch.__version__)')"
+
+    # flashinfer — warn only
+    if ! python3 -c "import flashinfer" 2>/dev/null; then
+        warn "flashinfer not installed — GPU attention will fall back to manual implementation"
+    else
+        info "flashinfer available"
+    fi
+
+    # Small deps — auto-install
+    local missing_deps=()
+    for dep in uvicorn fastapi safetensors; do
+        if ! python3 -c "import $dep" 2>/dev/null; then
+            missing_deps+=("$dep")
+        fi
+    done
+    if (( ${#missing_deps[@]} > 0 )); then
+        info "Installing: ${missing_deps[*]}"
+        pip install -q "${missing_deps[@]}"
+    fi
+    info "All dependencies satisfied"
+
+    # System checks (read-only, advisory)
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+        local gov
+        gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+        if [[ "$gov" != "performance" ]]; then
+            warn "CPU governor is '$gov' (not 'performance') — may reduce throughput"
+        fi
+    fi
+
+    if [[ -f /proc/sys/vm/nr_hugepages ]]; then
+        local hp
+        hp=$(cat /proc/sys/vm/nr_hugepages)
+        if (( hp == 0 )); then
+            warn "Huge pages not enabled — may reduce memory bandwidth"
+        fi
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 2: Hardware Detection
+# ═══════════════════════════════════════════════════════════════════════
+
+GPU_COUNT=0
+GPU_MODEL=""
+GPU_VRAM_MB=0
+CPU_MODEL=""
+CPU_CORES=0
+HAS_AVX2=false
+HAS_FMA=false
+TOTAL_RAM_GB=0
+NUMA_NODES=1
+
+phase_hardware() {
+    header "Phase 2: Hardware Detection"
+
+    # GPUs
+    if command -v nvidia-smi &>/dev/null; then
+        local gpu_info
+        gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null || true)
+        if [[ -n "$gpu_info" ]]; then
+            GPU_COUNT=$(echo "$gpu_info" | wc -l)
+            GPU_MODEL=$(echo "$gpu_info" | head -1 | cut -d',' -f1 | xargs)
+            GPU_VRAM_MB=$(echo "$gpu_info" | head -1 | cut -d',' -f2 | xargs)
+        fi
+    fi
+
+    # CPU
+    if [[ -f /proc/cpuinfo ]]; then
+        CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)
+    fi
+    if command -v lscpu &>/dev/null; then
+        # Physical cores only (not logical/hyperthreads)
+        local cores_per_socket sockets
+        cores_per_socket=$(lscpu | grep "^Core(s) per socket:" | awk '{print $NF}')
+        sockets=$(lscpu | grep "^Socket(s):" | awk '{print $NF}')
+        CPU_CORES=$(( cores_per_socket * sockets ))
+    fi
+
+    # CPU flags
+    if grep -q ' avx2 ' /proc/cpuinfo 2>/dev/null; then HAS_AVX2=true; fi
+    if grep -q ' fma ' /proc/cpuinfo 2>/dev/null; then HAS_FMA=true; fi
+
+    # RAM
+    if [[ -f /proc/meminfo ]]; then
+        local mem_kb
+        mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+        TOTAL_RAM_GB=$(( mem_kb / 1024 / 1024 ))
+    fi
+
+    # NUMA
+    NUMA_NODES=$(ls -d /sys/devices/system/node/node* 2>/dev/null | wc -l)
+    (( NUMA_NODES == 0 )) && NUMA_NODES=1
+
+    # Summary
+    echo -e "  ${BOLD}GPU${NC}:  ${GPU_COUNT}x ${GPU_MODEL} (${GPU_VRAM_MB} MB each, $(( GPU_COUNT * GPU_VRAM_MB )) MB total)"
+    echo -e "  ${BOLD}CPU${NC}:  ${CPU_MODEL}"
+    echo -e "  ${BOLD}Cores${NC}: ${CPU_CORES} physical"
+    echo -e "  ${BOLD}ISA${NC}:  AVX2=$(if $HAS_AVX2; then echo yes; else echo NO; fi)  FMA=$(if $HAS_FMA; then echo yes; else echo NO; fi)"
+    echo -e "  ${BOLD}RAM${NC}:  ${TOTAL_RAM_GB} GB"
+    echo -e "  ${BOLD}NUMA${NC}: ${NUMA_NODES} node(s)"
+
+    if ! $HAS_AVX2; then
+        warn "No AVX2 detected — CPU expert performance will be poor"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 3: Model Selection
+# ═══════════════════════════════════════════════════════════════════════
+
+# Model metadata (populated by phase_model)
+MODEL_TYPE=""
+MODEL_LAYERS=0
+MODEL_EXPERTS=0
+MODEL_SHARED_EXPERTS=0
+MODEL_HIDDEN=0
+MODEL_INTER=0
+
+phase_model() {
+    header "Phase 3: Model Selection"
+
+    # If --model-path was given, use it directly
+    if [[ -n "$MODEL_PATH" ]]; then
+        if [[ ! -f "$MODEL_PATH/config.json" ]]; then
+            err "No config.json found at $MODEL_PATH"
+            exit 1
+        fi
+        info "Using model: $MODEL_PATH"
+        _parse_model_config "$MODEL_PATH"
+        return 0
+    fi
+
+    # Scan for models
+    local models=()
+    local model_dirs=()
+
+    if [[ -d "$HF_MODELS_DIR" ]]; then
+        while IFS= read -r -d '' dir; do
+            if [[ -f "$dir/config.json" ]]; then
+                models+=("$dir")
+            fi
+        done < <(find "$HF_MODELS_DIR" -maxdepth 1 -mindepth 1 -type d -print0 | sort -z)
+    fi
+
+    if (( ${#models[@]} == 0 )); then
+        err "No models found in $HF_MODELS_DIR"
+        err "Download a model and place it there, or use --model-path"
+        exit 1
+    fi
+
+    # Parse and display each model
+    echo -e "  Available models:\n"
+    local i=1
+    local model_infos=()
+    for mdir in "${models[@]}"; do
+        local mname
+        mname=$(basename "$mdir")
+        local minfo
+        minfo=$(_get_model_info "$mdir" 2>/dev/null || echo "? | ? layers | ? experts")
+
+        # Check for GGUF sidecar
+        local gguf_tag=""
+        if ls "${mdir}"/*.gguf &>/dev/null || ls "${mdir}-GGUF"/*.gguf &>/dev/null 2>&1; then
+            gguf_tag=" ${DIM}[GGUF available]${NC}"
+        fi
+
+        model_infos+=("$minfo")
+        echo -e "    ${BOLD}$i)${NC} ${CYAN}$mname${NC}"
+        echo -e "       $minfo${gguf_tag}"
+        ((i++))
+    done
+
+    if $NON_INTERACTIVE; then
+        # Pick first model in non-interactive mode
+        MODEL_PATH="${models[0]}"
+        info "Auto-selected: $(basename "$MODEL_PATH")"
+    else
+        echo ""
+        local sel
+        read -rp "$(echo -e "${CYAN}?${NC} Select model ${DIM}[1-${#models[@]}]${NC} or enter path: ")" sel
+
+        if [[ -z "$sel" ]]; then
+            sel=1
+        fi
+
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#models[@]} )); then
+            MODEL_PATH="${models[$((sel-1))]}"
+        elif [[ -d "$sel" && -f "$sel/config.json" ]]; then
+            MODEL_PATH="$sel"
+        else
+            err "Invalid selection: $sel"
+            exit 1
+        fi
+    fi
+
+    info "Selected: $(basename "$MODEL_PATH")"
+    _parse_model_config "$MODEL_PATH"
+}
+
+_get_model_info() {
+    local mdir="$1"
+    python3 -c "
+import json, os
+with open(os.path.join('$mdir', 'config.json')) as f:
+    raw = json.load(f)
+cfg = raw.get('text_config', raw)
+arch = cfg.get('model_type', '?')
+layers = cfg.get('num_hidden_layers', '?')
+experts = cfg.get('n_routed_experts', cfg.get('num_experts', 0))
+shared = cfg.get('n_shared_experts', 0)
+hidden = cfg.get('hidden_size', 0)
+inter = cfg.get('moe_intermediate_size', cfg.get('intermediate_size', 0))
+
+# Estimate expert RAM: 3 matrices × hidden × inter × 2 bytes (bf16) × experts
+if experts and hidden and inter:
+    expert_bytes = 3 * hidden * inter * 2 * experts
+    ram_gb = expert_bytes / (1024**3)
+    expert_str = f'{experts} experts (+{shared} shared)' if shared else f'{experts} experts'
+    print(f'{arch} | {layers} layers | {expert_str} | ~{ram_gb:.0f} GB expert RAM (BF16)')
+else:
+    print(f'{arch} | {layers} layers | dense')
+"
+}
+
+_parse_model_config() {
+    local mdir="$1"
+    eval "$(python3 -c "
+import json, os
+with open(os.path.join('$mdir', 'config.json')) as f:
+    raw = json.load(f)
+cfg = raw.get('text_config', raw)
+print(f'MODEL_TYPE={cfg.get(\"model_type\", \"unknown\")}')
+print(f'MODEL_LAYERS={cfg.get(\"num_hidden_layers\", 0)}')
+print(f'MODEL_EXPERTS={cfg.get(\"n_routed_experts\", cfg.get(\"num_experts\", 0))}')
+print(f'MODEL_SHARED_EXPERTS={cfg.get(\"n_shared_experts\", 0)}')
+print(f'MODEL_HIDDEN={cfg.get(\"hidden_size\", 0)}')
+print(f'MODEL_INTER={cfg.get(\"moe_intermediate_size\", cfg.get(\"intermediate_size\", 0))}')
+")"
+
+    echo -e "  Type: ${MODEL_TYPE}, Layers: ${MODEL_LAYERS}, Experts: ${MODEL_EXPERTS} (+${MODEL_SHARED_EXPERTS} shared)"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 4: Interactive Parameter Configuration
+# ═══════════════════════════════════════════════════════════════════════
+
+# Config values (set to defaults, then overridden by saved/interactive)
+CFG_PP_PARTITION=""
+CFG_EXPERT_DIVISOR=1
+CFG_KV_DTYPE="fp8_e4m3"
+CFG_GPU_EXPERT_BITS=4
+CFG_CPU_EXPERT_BITS=4
+CFG_ATTENTION_QUANT="int8"
+CFG_SHARED_EXPERT_QUANT="int8"
+CFG_DENSE_MLP_QUANT="int8"
+CFG_LM_HEAD_QUANT="int8"
+CFG_KRASIS_THREADS=48
+CFG_HOST="0.0.0.0"
+CFG_PORT=8080
+CFG_GGUF_PATH=""
+CFG_GPU_PREFILL_THRESHOLD=300
+CFG_FORCE_LOAD=""
+
+_load_saved_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+        return 0
+    fi
+    return 1
+}
+
+_save_config() {
+    cat > "$CONFIG_FILE" <<EOF
+# Krasis saved configuration — $(date -Iseconds)
+# Re-generated by ./krasis on each launch
+MODEL_PATH="$MODEL_PATH"
+CFG_PP_PARTITION="$CFG_PP_PARTITION"
+CFG_EXPERT_DIVISOR=$CFG_EXPERT_DIVISOR
+CFG_KV_DTYPE="$CFG_KV_DTYPE"
+CFG_GPU_EXPERT_BITS=$CFG_GPU_EXPERT_BITS
+CFG_CPU_EXPERT_BITS=$CFG_CPU_EXPERT_BITS
+CFG_ATTENTION_QUANT="$CFG_ATTENTION_QUANT"
+CFG_SHARED_EXPERT_QUANT="$CFG_SHARED_EXPERT_QUANT"
+CFG_DENSE_MLP_QUANT="$CFG_DENSE_MLP_QUANT"
+CFG_LM_HEAD_QUANT="$CFG_LM_HEAD_QUANT"
+CFG_KRASIS_THREADS=$CFG_KRASIS_THREADS
+CFG_HOST="$CFG_HOST"
+CFG_PORT=$CFG_PORT
+CFG_GGUF_PATH="$CFG_GGUF_PATH"
+CFG_GPU_PREFILL_THRESHOLD=$CFG_GPU_PREFILL_THRESHOLD
+CFG_FORCE_LOAD="$CFG_FORCE_LOAD"
+EOF
+    info "Config saved to $CONFIG_FILE"
+}
+
+_compute_default_pp() {
+    local nlayers="$1" ngpus="$2"
+    if (( ngpus == 0 )); then
+        echo "$nlayers"
+        return
+    fi
+    local base=$(( nlayers / ngpus ))
+    local remainder=$(( nlayers % ngpus ))
+    local parts=()
+    for (( i=0; i<ngpus; i++ )); do
+        if (( i < remainder )); then
+            parts+=("$(( base + 1 ))")
+        else
+            parts+=("$base")
+        fi
+    done
+    local IFS=','
+    echo "${parts[*]}"
+}
+
+_estimate_expert_vram_mb() {
+    # Per-expert: 3 matrices × hidden × inter × bytes_per_param
+    # INT4 = 0.5 bytes, INT8 = 1 byte
+    local bits="$1"
+    local bytes_per
+    if (( bits == 4 )); then bytes_per=0.5; else bytes_per=1; fi
+
+    local per_expert_bytes
+    per_expert_bytes=$(python3 -c "print(int(3 * $MODEL_HIDDEN * $MODEL_INTER * $bytes_per))")
+    local total_bytes=$(( per_expert_bytes * MODEL_EXPERTS ))
+    echo $(( total_bytes / 1024 / 1024 ))
+}
+
+_estimate_expert_ram_gb() {
+    local bits="$1"
+    local bytes_per
+    if (( bits == 4 )); then bytes_per=0.5; else bytes_per=1; fi
+
+    python3 -c "
+per_expert = 3 * $MODEL_HIDDEN * $MODEL_INTER * $bytes_per
+total = per_expert * $MODEL_EXPERTS * $MODEL_LAYERS
+print(f'{total / (1024**3):.1f}')
+" 2>/dev/null || echo "?"
+}
+
+phase_config() {
+    header "Phase 4: Configuration"
+
+    # Try loading saved config
+    local have_saved=false
+    if _load_saved_config; then
+        have_saved=true
+    fi
+
+    if $have_saved && ! $NON_INTERACTIVE; then
+        echo -e "  ${DIM}Saved config found (.krasis_config)${NC}"
+        if confirm_yn "Use saved configuration?" "y"; then
+            # Apply CLI overrides on top of saved
+            _apply_cli_overrides
+            return 0
+        fi
+    elif $have_saved && $NON_INTERACTIVE; then
+        info "Using saved configuration"
+        _apply_cli_overrides
+        return 0
+    fi
+
+    # Compute smart defaults
+    local default_pp
+    default_pp=$(_compute_default_pp "$MODEL_LAYERS" "$GPU_COUNT")
+
+    local default_threads
+    default_threads=$(( CPU_CORES < 48 ? CPU_CORES : 48 ))
+
+    local default_divisor=1
+
+    # --- 1. Pipeline Parallelism ---
+    echo -e "\n${BOLD}1. Pipeline Parallelism${NC} (--pp-partition)"
+    echo -e "   ${DIM}Splits model layers across GPUs. Each GPU holds a contiguous subset.${NC}"
+    echo -e "   ${DIM}Auto: $default_pp (${MODEL_LAYERS} layers ÷ ${GPU_COUNT} GPUs)${NC}"
+    CFG_PP_PARTITION=$(prompt_value "PP partition" "$default_pp")
+    # Validate sum
+    local pp_sum=0
+    IFS=',' read -ra pp_arr <<< "$CFG_PP_PARTITION"
+    for v in "${pp_arr[@]}"; do pp_sum=$(( pp_sum + v )); done
+    if (( pp_sum != MODEL_LAYERS )); then
+        warn "Partition sum ($pp_sum) ≠ model layers ($MODEL_LAYERS) — auto-correcting to $default_pp"
+        CFG_PP_PARTITION="$default_pp"
+    fi
+
+    # --- 2. Expert Divisor ---
+    echo -e "\n${BOLD}2. Expert Loading Strategy${NC} (--expert-divisor)"
+    echo -e "   ${DIM}Controls how MoE experts are loaded to GPU for prefill:${NC}"
+    echo -e "   ${DIM}  1 = Persistent: ALL experts pre-loaded in VRAM → fastest prefill (zero DMA)${NC}"
+    echo -e "   ${DIM}  2 = Layer-grouped: experts loaded in groups → fixed DMA, 2x more KV capacity${NC}"
+    echo -e "   ${DIM}  0 = Chunked: per-layer-per-forward → lowest VRAM, slowest prefill${NC}"
+    CFG_EXPERT_DIVISOR=$(prompt_choice "Expert divisor" "$default_divisor" "1" "2" "0")
+
+    # --- 3. KV Cache Dtype ---
+    echo -e "\n${BOLD}3. KV Cache Dtype${NC} (--kv-dtype)"
+    echo -e "   ${DIM}FP8 halves KV cache VRAM → 2x more context. Quality: cosine sim 1.0000 vs BF16.${NC}"
+    CFG_KV_DTYPE=$(prompt_choice "KV dtype" "fp8_e4m3" "fp8_e4m3" "bf16")
+
+    # --- 4. GPU Expert Bits ---
+    echo -e "\n${BOLD}4. GPU Expert Quantization${NC} (--gpu-expert-bits)"
+    echo -e "   ${DIM}INT4 Marlin for GPU prefill — half the VRAM of INT8. INT8 for higher quality.${NC}"
+    CFG_GPU_EXPERT_BITS=$(prompt_choice "GPU expert bits" "4" "4" "8")
+
+    # --- 5. CPU Expert Bits ---
+    local cpu4_ram cpu8_ram
+    cpu4_ram=$(_estimate_expert_ram_gb 4)
+    cpu8_ram=$(_estimate_expert_ram_gb 8)
+    echo -e "\n${BOLD}5. CPU Expert Quantization${NC} (--cpu-expert-bits)"
+    echo -e "   ${DIM}INT4: ~${cpu4_ram} GB RAM. INT8: ~${cpu8_ram} GB RAM — slightly better quality.${NC}"
+    CFG_CPU_EXPERT_BITS=$(prompt_choice "CPU expert bits" "4" "4" "8")
+
+    # --- 6. Attention Quant ---
+    echo -e "\n${BOLD}6. Attention Weight Quantization${NC} (--attention-quant)"
+    echo -e "   ${DIM}INT8 halves attention VRAM. Use BF16 only if you see quality issues.${NC}"
+    CFG_ATTENTION_QUANT=$(prompt_choice "Attention quant" "int8" "int8" "bf16")
+
+    # --- 7. CPU Threads ---
+    echo -e "\n${BOLD}7. CPU Threads${NC} (--krasis-threads)"
+    echo -e "   ${DIM}Physical cores only. Hyperthreads hurt: 128→1.9 tok/s vs 48→5.9 tok/s.${NC}"
+    CFG_KRASIS_THREADS=$(prompt_value "Threads" "$default_threads")
+
+    # --- 8. Host/Port ---
+    echo -e "\n${BOLD}8. Server Bind${NC} (--host, --port)"
+    CFG_HOST=$(prompt_value "Host" "0.0.0.0")
+    CFG_PORT=$(prompt_value "Port" "8080")
+
+    # --- 9. GGUF (only if detected) ---
+    local gguf_detected=""
+    if ls "${MODEL_PATH}"/*.gguf &>/dev/null 2>&1; then
+        gguf_detected="${MODEL_PATH}"
+    elif ls "${MODEL_PATH}-GGUF"/*.gguf &>/dev/null 2>&1; then
+        gguf_detected="${MODEL_PATH}-GGUF"
+    fi
+
+    if [[ -n "$gguf_detected" ]]; then
+        local gguf_file
+        gguf_file=$(ls "$gguf_detected"/*.gguf 2>/dev/null | head -1)
+        echo -e "\n${BOLD}9. GGUF File${NC} (--gguf-path)"
+        echo -e "   ${DIM}GGUF detected: $gguf_file${NC}"
+        echo -e "   ${DIM}Use for pre-quantized CPU experts instead of building from safetensors.${NC}"
+        if confirm_yn "Use GGUF?" "n"; then
+            CFG_GGUF_PATH="$gguf_file"
+        fi
+    fi
+
+    # Apply CLI overrides (they take priority over interactive choices)
+    _apply_cli_overrides
+}
+
+_apply_cli_overrides() {
+    [[ -n "$CLI_PP_PARTITION" ]]         && CFG_PP_PARTITION="$CLI_PP_PARTITION"         || true
+    [[ -n "$CLI_EXPERT_DIVISOR" ]]       && CFG_EXPERT_DIVISOR="$CLI_EXPERT_DIVISOR"     || true
+    [[ -n "$CLI_KV_DTYPE" ]]             && CFG_KV_DTYPE="$CLI_KV_DTYPE"                 || true
+    [[ -n "$CLI_GPU_EXPERT_BITS" ]]      && CFG_GPU_EXPERT_BITS="$CLI_GPU_EXPERT_BITS"   || true
+    [[ -n "$CLI_CPU_EXPERT_BITS" ]]      && CFG_CPU_EXPERT_BITS="$CLI_CPU_EXPERT_BITS"   || true
+    [[ -n "$CLI_ATTENTION_QUANT" ]]      && CFG_ATTENTION_QUANT="$CLI_ATTENTION_QUANT"   || true
+    [[ -n "$CLI_SHARED_EXPERT_QUANT" ]]  && CFG_SHARED_EXPERT_QUANT="$CLI_SHARED_EXPERT_QUANT" || true
+    [[ -n "$CLI_DENSE_MLP_QUANT" ]]      && CFG_DENSE_MLP_QUANT="$CLI_DENSE_MLP_QUANT"  || true
+    [[ -n "$CLI_LM_HEAD_QUANT" ]]        && CFG_LM_HEAD_QUANT="$CLI_LM_HEAD_QUANT"      || true
+    [[ -n "$CLI_KRASIS_THREADS" ]]       && CFG_KRASIS_THREADS="$CLI_KRASIS_THREADS"     || true
+    [[ -n "$CLI_HOST" ]]                 && CFG_HOST="$CLI_HOST"                         || true
+    [[ -n "$CLI_PORT" ]]                 && CFG_PORT="$CLI_PORT"                         || true
+    [[ -n "$CLI_GGUF_PATH" ]]            && CFG_GGUF_PATH="$CLI_GGUF_PATH"              || true
+    [[ -n "$CLI_GPU_PREFILL_THRESHOLD" ]] && CFG_GPU_PREFILL_THRESHOLD="$CLI_GPU_PREFILL_THRESHOLD" || true
+    [[ -n "$CLI_FORCE_LOAD" ]]           && CFG_FORCE_LOAD="$CLI_FORCE_LOAD"             || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 5: Launch
+# ═══════════════════════════════════════════════════════════════════════
+
+phase_launch() {
+    header "Phase 5: Launch"
+
+    local model_name
+    model_name=$(basename "$MODEL_PATH")
+
+    # Estimate RAM usage
+    local cpu_ram_gb
+    cpu_ram_gb=$(_estimate_expert_ram_gb "$CFG_CPU_EXPERT_BITS")
+
+    # Build the command
+    local cmd_args=(
+        -m krasis.server
+        --model-path "$MODEL_PATH"
+        --pp-partition "$CFG_PP_PARTITION"
+        --num-gpus "$GPU_COUNT"
+        --expert-divisor "$CFG_EXPERT_DIVISOR"
+        --kv-dtype "$CFG_KV_DTYPE"
+        --gpu-expert-bits "$CFG_GPU_EXPERT_BITS"
+        --cpu-expert-bits "$CFG_CPU_EXPERT_BITS"
+        --attention-quant "$CFG_ATTENTION_QUANT"
+        --shared-expert-quant "$CFG_SHARED_EXPERT_QUANT"
+        --dense-mlp-quant "$CFG_DENSE_MLP_QUANT"
+        --lm-head-quant "$CFG_LM_HEAD_QUANT"
+        --krasis-threads "$CFG_KRASIS_THREADS"
+        --host "$CFG_HOST"
+        --port "$CFG_PORT"
+        --gpu-prefill-threshold "$CFG_GPU_PREFILL_THRESHOLD"
+    )
+
+    if [[ -n "$CFG_GGUF_PATH" ]]; then
+        cmd_args+=(--gguf-path "$CFG_GGUF_PATH")
+    fi
+
+    if [[ -n "$CFG_FORCE_LOAD" ]]; then
+        cmd_args+=(--force-load)
+    fi
+
+    # Summary box
+    echo -e "  ┌─────────────────────────────────────────────────────────┐"
+    echo -e "  │ ${BOLD}Krasis Launch Configuration${NC}                              │"
+    echo -e "  ├─────────────────────────────────────────────────────────┤"
+    printf  "  │ %-20s %-36s │\n" "Model:" "$model_name"
+    printf  "  │ %-20s %-36s │\n" "Type:" "$MODEL_TYPE ($MODEL_LAYERS layers, $MODEL_EXPERTS experts)"
+    printf  "  │ %-20s %-36s │\n" "PP partition:" "$CFG_PP_PARTITION"
+    printf  "  │ %-20s %-36s │\n" "Expert divisor:" "$CFG_EXPERT_DIVISOR"
+    printf  "  │ %-20s %-36s │\n" "KV dtype:" "$CFG_KV_DTYPE"
+    printf  "  │ %-20s %-36s │\n" "GPU expert bits:" "$CFG_GPU_EXPERT_BITS"
+    printf  "  │ %-20s %-36s │\n" "CPU expert bits:" "$CFG_CPU_EXPERT_BITS"
+    printf  "  │ %-20s %-36s │\n" "Attention quant:" "$CFG_ATTENTION_QUANT"
+    printf  "  │ %-20s %-36s │\n" "CPU threads:" "$CFG_KRASIS_THREADS"
+    printf  "  │ %-20s %-36s │\n" "Server:" "${CFG_HOST}:${CFG_PORT}"
+    echo -e "  ├─────────────────────────────────────────────────────────┤"
+    printf  "  │ %-20s %-36s │\n" "Est. expert RAM:" "~${cpu_ram_gb} GB (CPU, INT${CFG_CPU_EXPERT_BITS})"
+    printf  "  │ %-20s %-36s │\n" "GPUs:" "${GPU_COUNT}x ${GPU_MODEL} (${GPU_VRAM_MB} MB each)"
+    printf  "  │ %-20s %-36s │\n" "System RAM:" "${TOTAL_RAM_GB} GB"
+    echo -e "  └─────────────────────────────────────────────────────────┘"
+
+    if ! confirm_yn "Launch now?" "y"; then
+        info "Aborted. Config saved — rerun ./krasis to use it."
+        _save_config
+        exit 0
+    fi
+
+    _save_config
+
+    # Determine python binary
+    local python_bin="python3"
+    if [[ -f "$VENV_DIR/bin/python" ]]; then
+        python_bin="$VENV_DIR/bin/python"
+    fi
+
+    echo -e "\n${GREEN}Starting Krasis server...${NC}\n"
+    echo -e "${DIM}$ $python_bin ${cmd_args[*]}${NC}\n"
+
+    exec "$python_bin" "${cmd_args[@]}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
+
+echo -e "\n${BOLD}╔═══════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║         ${CYAN}Krasis${NC}${BOLD} MoE Server             ║${NC}"
+echo -e "${BOLD}╚═══════════════════════════════════════╝${NC}"
+
+phase_setup
+phase_hardware
+phase_model
+phase_config
+phase_launch
