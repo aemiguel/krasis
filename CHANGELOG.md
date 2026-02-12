@@ -13,6 +13,16 @@ Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
 
 ---
 
+## Documentation Consolidation — 2026-02-12
+
+Consolidated 9 markdown files into 3:
+- **README.md** — absorbed DESIGN.md (architecture) + STATUS.md (features, supported models)
+- **RESEARCH.md** (new) — absorbed PERFORMANCE_ANALYSIS.md + BENCHMARKS.md + EFFICIENCY_REPORT.md + research-findings.md
+- **CHANGELOG.md** — kept as-is (audit trail)
+- Deleted: DESIGN.md, STATUS.md, BENCHMARKS.md, EFFICIENCY_REPORT.md, research-findings.md, gguf-feature.md, PERFORMANCE_ANALYSIS.md
+
+---
+
 ## GLM-4.7 Support (GQA Enhancements) — 2026-02-12
 
 **Added partial RoPE and attention bias support for GLM-4.7 (glm4_moe) architecture.**
