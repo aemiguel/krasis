@@ -2,7 +2,7 @@
 
 Rust + PyO3 MoE runtime for large mixture-of-experts LLMs. Runs 350B+ parameter models on commodity hardware with full GPU prefill and efficient CPU decode.
 
-If you wish to contact me about something other than reporting an issue or technical support you can contact me via https://forms.gle/ue4nvyvNNHtUZ7MQ7
+Contact: see the Google Forms link on my GitHub profile
 
 ## What It Does
 

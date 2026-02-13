@@ -93,17 +93,19 @@ Reasoning:
 
 ### Results Table
 
-| Tool | GPUs | ngl/PP | Prefill (tok/s) | Decode (tok/s) | GPU VRAM (MB) | RAM (GB) | Notes |
-|------|------|--------|----------------|----------------|---------------|----------|-------|
-| llama.cpp | 1 | ngl=5 | 30.1 | 3.5 | 11,839 | 228 | |
-| llama.cpp | 2 | ngl=10 | 31.6 | 3.7 | 13,763+11,152 | 218 | |
-| llama.cpp | 3 | ngl=16 | - | - | - | - | pending |
-| KTransformers | 1 | PP=1 | - | - | - | - | pending |
-| KTransformers | 2 | PP=2 | - | - | - | - | pending |
-| KTransformers | 3 | PP=3 | - | - | - | - | pending |
-| Krasis | 1 | div=? | - | - | - | - | pending |
-| Krasis | 2 | div=? | - | - | - | - | pending |
-| Krasis | 3 | div=? | - | - | - | - | pending |
+TTFT (Time to First Token) estimated as ~8,600 prompt tokens / prefill rate (model already loaded).
+
+| Tool | GPUs | Config | Prefill (tok/s) | Decode (tok/s) | TTFT (s) | GPU VRAM (MB) | RAM (GB) | Notes |
+|------|------|--------|----------------|----------------|----------|---------------|----------|-------|
+| llama.cpp | 1 | ngl=5 | 30.1 | 3.5 | ~286 | 11,839 | 228 | |
+| llama.cpp | 2 | ngl=10 | 31.6 | 3.7 | ~272 | 13,763+11,152 | 218 | |
+| llama.cpp | 3 | ngl=14 | 32.9 | 3.8 | ~261 | 13,763+12,939+8,598 | 208 | ngl=16 OOM |
+| KTransformers | 1 | PP=1 | - | - | - | - | - | pending |
+| KTransformers | 2 | PP=2 | - | - | - | - | - | pending |
+| KTransformers | 3 | PP=3 | - | - | - | - | - | pending |
+| Krasis | 1 | div=? | - | - | - | - | - | pending |
+| Krasis | 2 | div=? | - | - | - | - | - | pending |
+| Krasis | 3 | div=? | - | - | - | - | - | pending |
 
 ## Conclusions
 
