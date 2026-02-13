@@ -315,10 +315,13 @@ class KrasisModel:
         self.force_load = force_load
         self.expert_divisor = expert_divisor
 
+        hybrid_info = ""
+        if self.cfg.is_hybrid:
+            hybrid_info = f", hybrid={self.cfg.num_full_attention_layers} full + {self.cfg.num_hidden_layers - self.cfg.num_full_attention_layers} linear"
         logger.info(
-            "KrasisModel: %d layers, PP=%s, %d GPUs, attn=%s",
+            "KrasisModel: %d layers, PP=%s, %d GPUs, attn=%s%s",
             self.cfg.num_hidden_layers, pp_partition, len(self.ranks),
-            attention_backend,
+            attention_backend, hybrid_info,
         )
 
         # Will be populated by load()
@@ -331,6 +334,26 @@ class KrasisModel:
         self.gpu_prefill_managers: dict = {}  # device -> GpuPrefillManager
         self.tokenizer: Optional[Tokenizer] = None
         self._loaded = False
+
+        # For hybrid models: maps absolute layer idx → KV cache layer offset
+        # within its rank's cache. Linear attention layers get -1 (no KV).
+        self._kv_layer_offsets: dict = {}  # layer_idx -> offset or -1
+
+        # Detect shared_expert_gate from weight map (Qwen3-Next)
+        self._has_shared_expert_gate = self._detect_shared_expert_gate()
+
+    def _detect_shared_expert_gate(self) -> bool:
+        """Check if model has shared_expert_gate weights (Qwen3-Next sigmoid gate)."""
+        import json
+        index_path = os.path.join(self.cfg.model_path, "model.safetensors.index.json")
+        try:
+            with open(index_path) as f:
+                weight_map = json.load(f)["weight_map"]
+            # Check layer 0 for shared_expert_gate
+            gate_key = f"{self.cfg.layers_prefix}.layers.0.mlp.shared_expert_gate.weight"
+            return gate_key in weight_map
+        except (OSError, KeyError):
+            return False
 
     def load(self):
         """Load all weights: GPU (streaming INT8) + CPU (Krasis INT4 experts)."""
@@ -424,7 +447,13 @@ class KrasisModel:
 
         cpu_bits = self.quant_cfg.cpu_expert_bits
         gpu_bits = self.quant_cfg.gpu_expert_bits
-        engine = KrasisEngine(parallel=True, num_threads=self.krasis_threads)
+
+        # If model has shared_expert_gate, Python/GPU handles shared expert with gate
+        # → tell Rust engine to skip shared experts to avoid double-counting
+        skip_shared = self._has_shared_expert_gate
+        if skip_shared:
+            logger.info("shared_expert_gate detected — Rust engine will skip shared experts (handled on GPU)")
+        engine = KrasisEngine(parallel=True, num_threads=self.krasis_threads, skip_shared_experts=skip_shared)
 
         if self.gguf_path:
             logger.info("Loading CPU experts from GGUF: %s (native=%s)", self.gguf_path, self.gguf_native)
@@ -477,6 +506,7 @@ class KrasisModel:
                     krasis_engine=engine_ref,
                     num_moe_layers=num_moe_layers,
                     expert_divisor=self.expert_divisor,
+                    skip_shared_experts=self._has_shared_expert_gate,
                 )
                 self.gpu_prefill_managers[dev_str] = manager
                 logger.info("GPU prefill manager created for %s", dev_str)
@@ -532,19 +562,72 @@ class KrasisModel:
         logger.info("RAM watchdog started: will exit if < %.1f%% free", floor_pct)
 
     def _init_kv_caches(self):
-        """Allocate paged KV caches per GPU."""
+        """Allocate paged KV caches per GPU.
+
+        For hybrid models, only full attention layers need KV cache.
+        Builds _kv_layer_offsets mapping absolute layer idx → offset within
+        the rank's KV cache (-1 for linear attention layers).
+        """
         self.kv_caches = []
+        self._kv_layer_offsets = {}
         use_combined = (self.attention_backend == "trtllm")
+
+        # Compute VRAM reservation for layer-grouped expert buffers
+        # so the KV cache auto-sizer doesn't over-allocate.
+        # Use per-rank MoE layer count (not total) since each GPU only loads its rank's layers.
+        vram_reserve = 0
+        if self.expert_divisor >= 2 and self.gpu_prefill_enabled and self.cfg.n_routed_experts > 0:
+            # Find max per-rank MoE layer count
+            max_rank_moe = max(
+                sum(1 for li in rank.layer_range if self.cfg.is_moe_layer(li))
+                for rank in self.ranks
+            )
+            for dev_str, manager in self.gpu_prefill_managers.items():
+                per_expert = manager._per_expert_vram_bytes()
+                moe_per_group = ceil(max_rank_moe / self.expert_divisor)
+                vram_reserve = per_expert * self.cfg.n_routed_experts * moe_per_group
+                logger.info(
+                    "VRAM reservation for layer-grouped prefill: %.1f MB "
+                    "(moe_per_group=%d, %d experts, %.1f MB/expert)",
+                    vram_reserve / 1e6, moe_per_group,
+                    self.cfg.n_routed_experts, per_expert / 1e6,
+                )
+                break  # same reservation per GPU
+
         for rank in self.ranks:
             dev = torch.device(rank.device)
-            cache = PagedKVCache(
-                self.cfg,
-                num_layers=rank.num_layers,
-                device=dev,
-                kv_dtype=self.kv_dtype,
-                combined=use_combined,
-            )
+
+            # Count full attention layers in this rank
+            kv_offset = 0
+            for layer_idx in rank.layer_range:
+                if self.cfg.is_full_attention_layer(layer_idx):
+                    self._kv_layer_offsets[layer_idx] = kv_offset
+                    kv_offset += 1
+                else:
+                    self._kv_layer_offsets[layer_idx] = -1
+
+            num_kv_layers = kv_offset
+
+            if num_kv_layers > 0:
+                cache = PagedKVCache(
+                    self.cfg,
+                    num_layers=num_kv_layers,
+                    device=dev,
+                    kv_dtype=self.kv_dtype,
+                    combined=use_combined,
+                    vram_reserve_bytes=vram_reserve,
+                )
+            else:
+                cache = None
             self.kv_caches.append(cache)
+
+        if self.cfg.is_hybrid:
+            total_kv = sum(1 for v in self._kv_layer_offsets.values() if v >= 0)
+            total_linear = sum(1 for v in self._kv_layer_offsets.values() if v < 0)
+            logger.info(
+                "Hybrid model: %d full attention layers (KV cache), %d linear attention layers",
+                total_kv, total_linear,
+            )
 
     def _get_rank_for_layer(self, global_layer_idx: int) -> int:
         """Get the PP rank index that owns a given layer."""
@@ -611,7 +694,8 @@ class KrasisModel:
             seq_state = seq_states[rank_idx]
 
             # Ensure KV cache capacity for new tokens (once per rank, not per layer)
-            seq_state.ensure_capacity(M)
+            if seq_state is not None:
+                seq_state.ensure_capacity(M)
 
             # Transfer hidden state to this rank's device (CPU bounce if P2P broken)
             hidden = _to_device(hidden, dev)
@@ -621,8 +705,8 @@ class KrasisModel:
             # Transfer positions once per rank
             rank_positions = _to_device(positions, dev)
 
-            for layer_offset in range(rank.num_layers):
-                abs_layer_idx = rank.layer_start + layer_offset
+            for local_offset in range(rank.num_layers):
+                abs_layer_idx = rank.layer_start + local_offset
                 layer = self.layers[layer_global_idx]
 
                 # MoE layer index for Krasis engine
@@ -630,16 +714,22 @@ class KrasisModel:
                 if layer.is_moe:
                     moe_layer_idx = abs_layer_idx - first_k
 
-                hidden, residual = layer.forward(
-                    hidden,
-                    residual,
-                    rank_positions,
-                    kv_cache,
-                    seq_state,
-                    layer_offset,
-                    moe_layer_idx,
-                    num_new_tokens=M,
-                )
+                # KV layer offset: -1 for linear attention layers
+                kv_layer_offset = self._kv_layer_offsets.get(abs_layer_idx, local_offset)
+
+                if kv_layer_offset < 0:
+                    # Linear attention layer: no KV cache
+                    hidden, residual = layer.forward(
+                        hidden, residual, rank_positions,
+                        None, None, -1,
+                        moe_layer_idx, num_new_tokens=M,
+                    )
+                else:
+                    hidden, residual = layer.forward(
+                        hidden, residual, rank_positions,
+                        kv_cache, seq_state, kv_layer_offset,
+                        moe_layer_idx, num_new_tokens=M,
+                    )
 
                 if _DIAG_ENABLED and diag and abs_layer_idx in (0, 1, self.cfg.num_hidden_layers // 2, self.cfg.num_hidden_layers - 1):
                     h = hidden[-1] if hidden.shape[0] > 1 else hidden[0]
@@ -652,7 +742,8 @@ class KrasisModel:
                 layer_global_idx += 1
 
             # Advance KV cache seq_len (once per rank, after all layers processed)
-            seq_state.advance(M)
+            if seq_state is not None:
+                seq_state.advance(M)
 
         # ── Final norm ──
         last_dev = torch.device(self.ranks[-1].device)
@@ -717,7 +808,8 @@ class KrasisModel:
 
         # ── Pre-allocate KV pages for all ranks ──
         for seq_state in seq_states:
-            seq_state.ensure_capacity(M)
+            if seq_state is not None:
+                seq_state.ensure_capacity(M)
 
         # ── Chunk tokens ──
         chunk_size = 2048
@@ -773,36 +865,46 @@ class KrasisModel:
                     chunk_M = h.shape[0]
 
                     for abs_layer_idx in group_layers:
-                        layer_offset = abs_layer_idx - rank.layer_start
-                        global_idx = rank_layer_base + layer_offset
+                        local_offset = abs_layer_idx - rank.layer_start
+                        global_idx = rank_layer_base + local_offset
                         layer = self.layers[global_idx]
 
                         moe_layer_idx = None
                         if layer.is_moe:
                             moe_layer_idx = abs_layer_idx - first_k
 
-                        h, r = layer.forward(
-                            h, r, pos,
-                            kv_cache, seq_state,
-                            layer_offset, moe_layer_idx,
-                            num_new_tokens=chunk_M,
-                        )
+                        kv_layer_offset = self._kv_layer_offsets.get(abs_layer_idx, local_offset)
+
+                        if kv_layer_offset < 0:
+                            h, r = layer.forward(
+                                h, r, pos,
+                                None, None, -1,
+                                moe_layer_idx, num_new_tokens=chunk_M,
+                            )
+                        else:
+                            h, r = layer.forward(
+                                h, r, pos,
+                                kv_cache, seq_state, kv_layer_offset,
+                                moe_layer_idx, num_new_tokens=chunk_M,
+                            )
 
                     # Save hidden/residual for this chunk
                     chunk_hidden[c] = h
                     chunk_residual[c] = r
 
                     # Advance seq_state: these layers have now seen chunk_M more tokens
-                    seq_state.advance(chunk_M)
+                    if seq_state is not None:
+                        seq_state.advance(chunk_M)
 
                 # Free experts for this group
                 if manager and group_moe_indices:
                     manager.free_layer_group()
 
             # After all groups, seq_state.seq_len should equal M
-            assert seq_state.seq_len == M, (
-                f"seq_len mismatch after rank {rank_idx}: {seq_state.seq_len} != {M}"
-            )
+            if seq_state is not None:
+                assert seq_state.seq_len == M, (
+                    f"seq_len mismatch after rank {rank_idx}: {seq_state.seq_len} != {M}"
+                )
 
         # ── Final norm (last chunk only, contains last token) ──
         last_dev = torch.device(self.ranks[-1].device)
@@ -848,7 +950,16 @@ class KrasisModel:
             stop_token_ids = [self.cfg.eos_token_id]
 
         # Create per-rank sequence states (one per KV cache / GPU)
-        seq_states_per_rank = [SequenceKVState(c, seq_id=0) for c in self.kv_caches]
+        seq_states_per_rank = [
+            SequenceKVState(c, seq_id=0) if c is not None else None
+            for c in self.kv_caches
+        ]
+
+        # Reset linear attention states for new sequence
+        if self.cfg.is_hybrid:
+            for layer in self.layers:
+                if layer.layer_type == "linear_attention":
+                    layer.attention.reset_state()
 
         device = torch.device(self.ranks[0].device)
         generated = []
@@ -884,7 +995,8 @@ class KrasisModel:
         finally:
             # Free KV cache pages
             for s in seq_states_per_rank:
-                s.free()
+                if s is not None:
+                    s.free()
 
         return generated
 

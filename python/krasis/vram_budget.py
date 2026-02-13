@@ -181,13 +181,310 @@ def _kv_bytes_per_token_per_layer(cfg: Dict[str, Any], kv_cache_dtype: str) -> i
         return 2 * n_kv_heads * head_dim * dtype_bytes
 
 
-def _expert_bytes_per_expert(cfg: Dict[str, Any]) -> int:
+def _is_hybrid(cfg: Dict[str, Any]) -> bool:
+    """True if model has a mix of linear and full attention layers."""
+    return cfg.get("full_attention_interval", 0) > 0
+
+
+def _num_full_attention_layers(cfg: Dict[str, Any]) -> int:
+    """Number of layers that use full attention (need KV cache)."""
+    interval = cfg.get("full_attention_interval", 0)
+    if interval <= 0:
+        return cfg["num_hidden_layers"]
+    return sum(
+        1 for i in range(cfg["num_hidden_layers"])
+        if (i + 1) % interval == 0
+    )
+
+
+def _linear_attention_bytes_per_layer(cfg: Dict[str, Any], quantization: str) -> int:
+    """Weight bytes for one linear attention (Gated DeltaNet) layer."""
+    hidden = cfg["hidden_size"]
+    nk = cfg.get("linear_num_key_heads", 16)
+    nv = cfg.get("linear_num_value_heads", 32)
+    dk = cfg.get("linear_key_head_dim", 128)
+    dv = cfg.get("linear_value_head_dim", 128)
+    kernel = cfg.get("linear_conv_kernel_dim", 4)
+
+    q_dim = nk * dk
+    k_dim = nk * dk
+    v_dim = nv * dv
+    z_dim = nv * dv
+    conv_dim = q_dim + k_dim + v_dim
+
+    # Quantizable: in_proj_qkvz, in_proj_ba, out_proj
+    qkvz_params = hidden * (q_dim + k_dim + v_dim + z_dim)
+    ba_params = hidden * (nv + nv)  # beta + alpha, one per value head each
+    out_params = (nv * dv) * hidden
+    quantizable_params = qkvz_params + ba_params + out_params
+
+    # Always BF16: conv1d.weight, A_log, dt_bias, norm.weight
+    bf16_params = conv_dim * kernel + nv + nv + dv
+
+    return _weight_bytes(quantizable_params, quantization) + bf16_params * 2
+
+
+def _expert_bytes_per_expert(cfg: Dict[str, Any], bits: int = 4) -> int:
+    """Expert buffer size for Marlin INT4/INT8 on GPU."""
     hidden = cfg["hidden_size"]
     intermediate = cfg.get("moe_intermediate_size", 0)
     total_params = 3 * hidden * intermediate
-    packed = total_params // 2
-    scales = (total_params // 128) * 2
+    if bits == 4:
+        packed = total_params // 2
+        scales = (total_params // 128) * 2
+    else:  # INT8
+        packed = total_params
+        scales = (total_params // 128) * 2
     return packed + scales
+
+
+def _component_weight_bytes(params: int, quant: str) -> int:
+    """Weight bytes for per-component quant ("int8" or "bf16")."""
+    if quant == "int8":
+        return params  # 1 byte per param
+    return params * 2  # BF16
+
+
+def _cpu_expert_bytes_per_expert(cfg: Dict[str, Any], bits: int = 4) -> int:
+    """CPU expert size (INT4 or INT8 with group scales)."""
+    hidden = cfg["hidden_size"]
+    intermediate = cfg.get("moe_intermediate_size", 0)
+    total_params = 3 * hidden * intermediate
+    if bits == 4:
+        return total_params // 2 + (total_params // 128) * 2
+    else:  # INT8
+        return total_params + (total_params // 128) * 2
+
+
+def _detect_total_ram_gb() -> int:
+    """Auto-detect total system RAM in GB."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal"):
+                    kb = int(line.split()[1])
+                    return kb // (1024 * 1024)
+    except (FileNotFoundError, ValueError):
+        pass
+    return 0
+
+
+def compute_launcher_budget(
+    model_path: str,
+    pp_partition: List[int],
+    expert_divisor: int = 1,
+    kv_dtype: str = "fp8_e4m3",
+    gpu_expert_bits: int = 4,
+    cpu_expert_bits: int = 4,
+    attention_quant: str = "int8",
+    shared_expert_quant: str = "int8",
+    dense_mlp_quant: str = "int8",
+    lm_head_quant: str = "int8",
+    gpu_vram_mb: int = 0,
+    total_ram_gb: int = 0,
+) -> Dict[str, Any]:
+    """Compute VRAM + RAM budget for the launcher TUI.
+
+    Supports per-component quantization and expert_divisor modes.
+    Returns a dict with worst-case rank breakdown for display.
+    """
+    import math
+
+    cfg = _read_model_config(model_path)
+
+    if gpu_vram_mb <= 0:
+        gpu_vram_mb = _detect_gpu_vram_bytes() // (1024 * 1024)
+    if total_ram_gb <= 0:
+        total_ram_gb = _detect_total_ram_gb()
+
+    num_ranks = len(pp_partition)
+    total_layers = cfg["num_hidden_layers"]
+    is_mla = _is_mla(cfg)
+    hybrid = _is_hybrid(cfg)
+    n_experts = cfg.get("n_routed_experts", cfg.get("num_experts", 0))
+
+    if "first_k_dense_replace" in cfg:
+        first_k_dense = cfg["first_k_dense_replace"]
+    elif "decoder_sparse_step" in cfg:
+        step = cfg["decoder_sparse_step"]
+        first_k_dense = 0 if step <= 1 else step
+    else:
+        first_k_dense = 0
+
+    # Pre-compute hybrid layer types
+    full_attn_interval = cfg.get("full_attention_interval", 0)
+
+    # Linear attention weight bytes per layer (hybrid only)
+    linear_attn_bpl = _linear_attention_bytes_per_layer(cfg, attention_quant) if hybrid else 0
+
+    # Attention params per layer
+    if is_mla:
+        q_lora = cfg.get("q_lora_rank", 0)
+        kv_lora = cfg["kv_lora_rank"]
+        n_heads = cfg["num_attention_heads"]
+        qk_nope = cfg["qk_nope_head_dim"]
+        qk_rope = cfg["qk_rope_head_dim"]
+        v_head = cfg["v_head_dim"]
+        if q_lora:
+            q_params = cfg["hidden_size"] * q_lora + q_lora * n_heads * (qk_nope + qk_rope)
+        else:
+            q_params = cfg["hidden_size"] * n_heads * (qk_nope + qk_rope)
+        kv_a_params = cfg["hidden_size"] * (kv_lora + qk_rope)
+        kv_b_params = kv_lora * n_heads * (qk_nope + v_head)
+        o_params = n_heads * v_head * cfg["hidden_size"]
+        attn_params_per_layer = q_params + kv_a_params + kv_b_params + o_params
+    else:
+        hidden = cfg["hidden_size"]
+        n_heads = cfg["num_attention_heads"]
+        n_kv_heads = cfg.get("num_key_value_heads", n_heads)
+        head_dim = cfg.get("head_dim", hidden // n_heads)
+        attn_params_per_layer = (
+            hidden * n_heads * head_dim +          # Q
+            hidden * n_kv_heads * head_dim +        # K
+            hidden * n_kv_heads * head_dim +        # V
+            n_heads * head_dim * hidden             # O
+        )
+
+    # Expert buffer bytes per expert (GPU Marlin format)
+    expert_buf_bytes = _expert_bytes_per_expert(cfg, gpu_expert_bits) if n_experts > 0 else 0
+
+    # Shared expert params per MoE layer
+    hidden = cfg["hidden_size"]
+    n_shared = cfg.get("n_shared_experts", 0)
+    shared_inter = cfg.get("shared_expert_intermediate_size", 0)
+    if not shared_inter and n_shared:
+        shared_inter = n_shared * cfg.get("moe_intermediate_size", 0)
+    shared_params_per_moe = 3 * hidden * shared_inter if shared_inter else 0
+
+    # Dense MLP params per dense layer
+    dense_inter = cfg.get("intermediate_size", cfg.get("moe_intermediate_size", 0))
+    dense_mlp_params_per_layer = 3 * hidden * dense_inter
+
+    # KV bytes per token per layer
+    kv_b = _kv_dtype_bytes(kv_dtype)
+    if is_mla:
+        kv_ptl = (cfg["kv_lora_rank"] + cfg["qk_rope_head_dim"]) * kv_b
+    else:
+        n_kv_heads = cfg.get("num_key_value_heads", cfg["num_attention_heads"])
+        head_dim = cfg.get("head_dim", cfg["hidden_size"] // cfg["num_attention_heads"])
+        kv_ptl = 2 * n_kv_heads * head_dim * kv_b
+
+    cuda_overhead = SGLANG_OVERHEAD_MB
+
+    # Per-rank budget
+    ranks = []
+    for rank_idx in range(num_ranks):
+        rank_start = sum(pp_partition[:rank_idx])
+        rank_end = rank_start + pp_partition[rank_idx]
+        n_layers = pp_partition[rank_idx]
+
+        dn = max(0, min(rank_end, first_k_dense) - rank_start)
+        mn = n_layers - dn
+
+        # Count full vs linear attention layers in this rank
+        if hybrid:
+            full_attn_in_rank = sum(
+                1 for i in range(rank_start, rank_end)
+                if (i + 1) % full_attn_interval == 0
+            )
+            linear_attn_in_rank = n_layers - full_attn_in_rank
+        else:
+            full_attn_in_rank = n_layers
+            linear_attn_in_rank = 0
+
+        # Component bytes
+        attn_bytes = _component_weight_bytes(attn_params_per_layer, attention_quant) * full_attn_in_rank
+        attn_bytes += linear_attn_bpl * linear_attn_in_rank  # linear attention weights
+        shared_bytes = _component_weight_bytes(shared_params_per_moe, shared_expert_quant) * mn if shared_params_per_moe else 0
+        dense_bytes = _component_weight_bytes(dense_mlp_params_per_layer, dense_mlp_quant) * dn if dn else 0
+
+        embed_bytes = cfg["vocab_size"] * hidden * 2 if rank_idx == 0 else 0  # always BF16
+        if rank_idx == num_ranks - 1 and not cfg.get("tie_word_embeddings", True):
+            lmhead_bytes = _component_weight_bytes(cfg["vocab_size"] * hidden, lm_head_quant)
+        else:
+            lmhead_bytes = 0
+
+        gate_bytes = hidden * n_experts * 2 * mn  # always BF16
+        norm_bytes = 2 * hidden * 2 * n_layers    # always BF16
+
+        # Expert buffers (GPU side)
+        if mn > 0 and n_experts > 0:
+            if expert_divisor == 1:
+                # Persistent: all experts for all MoE layers in rank
+                ebuf_bytes = expert_buf_bytes * n_experts * mn
+                emode = "persistent"
+            elif expert_divisor >= 2:
+                # Layer-grouped: only one group at a time
+                group_size = math.ceil(mn / expert_divisor)
+                ebuf_bytes = expert_buf_bytes * n_experts * group_size
+                emode = f"grouped({expert_divisor})"
+            else:
+                # Chunked (divisor=0): one layer at a time
+                ebuf_bytes = expert_buf_bytes * n_experts
+                emode = "chunked"
+        else:
+            ebuf_bytes = 0
+            emode = "n/a"
+
+        total_bytes = (
+            attn_bytes + shared_bytes + dense_bytes +
+            embed_bytes + lmhead_bytes + gate_bytes + norm_bytes +
+            ebuf_bytes + cuda_overhead * 1024 * 1024
+        )
+        free_bytes = gpu_vram_mb * 1024 * 1024 - total_bytes
+        kv_layers_in_rank = full_attn_in_rank  # Only full attention layers need KV
+        kv_per_rank = kv_ptl * kv_layers_in_rank
+        kv_tokens = max(0, int(free_bytes // kv_per_rank)) if kv_per_rank > 0 and free_bytes > 0 else 0
+
+        MB = 1024 * 1024
+        ranks.append({
+            "rank": rank_idx,
+            "n_layers": n_layers,
+            "moe_layers": mn,
+            "dense_layers": dn,
+            "attention_mb": attn_bytes / MB,
+            "shared_expert_mb": shared_bytes / MB,
+            "dense_mlp_mb": dense_bytes / MB,
+            "expert_buffer_mb": ebuf_bytes / MB,
+            "expert_mode": emode,
+            "embed_lmhead_mb": (embed_bytes + lmhead_bytes) / MB,
+            "norms_gates_mb": (gate_bytes + norm_bytes) / MB,
+            "cuda_overhead_mb": cuda_overhead,
+            "total_mb": total_bytes / MB,
+            "free_mb": free_bytes / MB,
+            "kv_tokens": kv_tokens,
+        })
+
+    # Find worst-case rank
+    worst = max(ranks, key=lambda r: r["total_mb"])
+    over_budget = worst["total_mb"] > gpu_vram_mb
+
+    # CPU expert RAM
+    cpu_expert_bytes_each = _cpu_expert_bytes_per_expert(cfg, cpu_expert_bits) if n_experts > 0 else 0
+    total_moe_layers = total_layers - first_k_dense
+    cpu_expert_gb = (cpu_expert_bytes_each * n_experts * total_moe_layers) / (1024 ** 3)
+
+    arch = "MLA" if is_mla else "GQA"
+    if hybrid:
+        arch += "+DeltaNet"
+
+    return {
+        "model_type": cfg.get("model_type", "unknown"),
+        "architecture": arch,
+        "num_layers": total_layers,
+        "n_experts": n_experts,
+        "n_shared_experts": n_shared,
+        "first_k_dense": first_k_dense,
+        "gpu_vram_mb": gpu_vram_mb,
+        "total_ram_gb": total_ram_gb,
+        "ranks": ranks,
+        "worst_rank": worst["rank"],
+        "over_budget": over_budget,
+        "cpu_expert_gb": cpu_expert_gb,
+        "kv_dtype": kv_dtype,
+        "hybrid": hybrid,
+        "num_full_attention_layers": _num_full_attention_layers(cfg) if hybrid else total_layers,
+    }
 
 
 def compute_vram_budget(
@@ -224,6 +521,8 @@ def compute_vram_budget(
     num_ranks = len(pp_partition)
     total_layers = cfg["num_hidden_layers"]
     is_mla = _is_mla(cfg)
+    hybrid = _is_hybrid(cfg)
+    full_attn_interval = cfg.get("full_attention_interval", 0)
 
     if "first_k_dense_replace" in cfg:
         first_k_dense = cfg["first_k_dense_replace"]
@@ -238,6 +537,7 @@ def compute_vram_budget(
     overhead_bytes = SGLANG_OVERHEAD_MB * 1024 * 1024
 
     expert_bytes = _expert_bytes_per_expert(cfg) if num_gpu_experts > 0 else 0
+    linear_attn_bpl = _linear_attention_bytes_per_layer(cfg, quantization) if hybrid else 0
 
     ranks = []
     for rank_idx in range(num_ranks):
@@ -248,11 +548,22 @@ def compute_vram_budget(
         dense_layers_in_rank = max(0, min(rank_end, first_k_dense) - rank_start)
         moe_layers_in_rank = num_layers - dense_layers_in_rank
 
+        # Hybrid: count full vs linear attention layers
+        if hybrid:
+            full_attn_in_rank = sum(
+                1 for i in range(rank_start, rank_end)
+                if (i + 1) % full_attn_interval == 0
+            )
+            linear_attn_in_rank = num_layers - full_attn_in_rank
+        else:
+            full_attn_in_rank = num_layers
+            linear_attn_in_rank = 0
+
         if is_mla:
             attn_per_layer = _mla_attention_bytes_per_layer(cfg, quantization)
         else:
             attn_per_layer = _gqa_attention_bytes_per_layer(cfg, quantization)
-        attn_total = attn_per_layer * num_layers
+        attn_total = attn_per_layer * full_attn_in_rank + linear_attn_bpl * linear_attn_in_rank
 
         dense_mlp_total = _dense_mlp_bytes_per_layer(cfg, quantization) * dense_layers_in_rank
         shared_expert_total = _shared_expert_bytes_per_moe_layer(cfg, quantization) * moe_layers_in_rank
@@ -268,7 +579,8 @@ def compute_vram_budget(
             pinned_expert_total
         )
 
-        kv_per_token = _kv_bytes_per_token_per_layer(cfg, kv_cache_dtype) * num_layers
+        # Only full attention layers need KV cache
+        kv_per_token = _kv_bytes_per_token_per_layer(cfg, kv_cache_dtype) * full_attn_in_rank
 
         # Free VRAM = total - weights - SGLang overhead - headroom
         free_bytes = gpu_vram_bytes - weight_total - overhead_bytes - headroom_bytes
@@ -323,10 +635,14 @@ def compute_vram_budget(
     # Clamp to [0.1, 0.95] — never reserve more than 95%
     mem_fraction = max(0.1, min(0.95, mem_fraction))
 
+    arch = "MLA" if is_mla else "GQA"
+    if hybrid:
+        arch += "+DeltaNet"
+
     return {
         "model_path": model_path,
         "model_type": cfg.get("model_type", "unknown"),
-        "architecture": "MLA" if is_mla else "GQA",
+        "architecture": arch,
         "num_hidden_layers": total_layers,
         "first_k_dense": first_k_dense,
         "pp_partition": pp_partition,

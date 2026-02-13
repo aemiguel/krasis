@@ -376,8 +376,18 @@ class GQAAttention:
         # Scale factor: 1/sqrt(head_dim)
         self.sm_scale = 1.0 / math.sqrt(self.head_dim)
 
+        # Detect gated attention: q_proj outputs 2x (query + gate)
+        # Qwen3-Coder-Next: q_proj is [num_heads * head_dim * 2, hidden]
+        q_weight = weights["q_proj"]
+        q_out_dim = q_weight[0].shape[0] if isinstance(q_weight, tuple) else q_weight.shape[0]
+        expected_q_dim = self.num_heads * self.head_dim
+        self.gated_attention = (q_out_dim == 2 * expected_q_dim)
+        if self.gated_attention:
+            logger.info("Layer %d: gated attention detected (q_proj dim=%d, expected=%d)",
+                        layer_idx, q_out_dim, expected_q_dim)
+
         # Projections (INT8 or BF16)
-        self.q_proj = weights["q_proj"]  # [num_heads * head_dim, hidden]
+        self.q_proj = weights["q_proj"]  # [num_heads * head_dim (* 2 if gated), hidden]
         self.k_proj = weights["k_proj"]  # [num_kv_heads * head_dim, hidden]
         self.v_proj = weights["v_proj"]  # [num_kv_heads * head_dim, hidden]
         self.o_proj = weights["o_proj"]  # [hidden, num_heads * head_dim]
@@ -481,20 +491,31 @@ class GQAAttention:
         M = hidden.shape[0]
 
         # ── Step 1: Q/K/V projections ──
-        q = _linear(hidden, self.q_proj)  # [M, num_heads * head_dim]
+        q_raw = _linear(hidden, self.q_proj)  # [M, num_heads * head_dim (* 2 if gated)]
         k = _linear(hidden, self.k_proj)  # [M, num_kv_heads * head_dim]
         v = _linear(hidden, self.v_proj)  # [M, num_kv_heads * head_dim]
 
+        # Gated attention: split q_proj output into query + gate
+        if self.gated_attention:
+            # Reshape to [M, num_heads, head_dim * 2], then chunk
+            q_raw = q_raw.view(M, self.num_heads, self.head_dim * 2)
+            q, attn_gate = q_raw.chunk(2, dim=-1)  # each [M, num_heads, head_dim]
+            attn_gate = attn_gate.reshape(M, self.num_heads * self.head_dim)  # [M, num_heads * head_dim]
+        else:
+            q = q_raw
+
         # Apply attention biases if present (GLM-4.7)
-        if self.q_proj_bias is not None:
-            q = q + self.q_proj_bias
+        if not self.gated_attention:
+            if self.q_proj_bias is not None:
+                q = q + self.q_proj_bias
         if self.k_proj_bias is not None:
             k = k + self.k_proj_bias
         if self.v_proj_bias is not None:
             v = v + self.v_proj_bias
 
         # Reshape to per-head
-        q = q.reshape(M, self.num_heads, self.head_dim)
+        if not self.gated_attention:
+            q = q.reshape(M, self.num_heads, self.head_dim)
         k = k.reshape(M, self.num_kv_heads, self.head_dim)
         v = v.reshape(M, self.num_kv_heads, self.head_dim)
 
@@ -574,6 +595,11 @@ class GQAAttention:
 
         # ── Step 6: O projection ──
         attn_flat = attn_out.reshape(M, self.num_heads * self.head_dim)
+
+        # Gated attention: apply sigmoid(gate) to attention output before o_proj
+        if self.gated_attention:
+            attn_flat = attn_flat * torch.sigmoid(attn_gate)
+
         output = _linear(attn_flat, self.o_proj)
         if self.o_proj_bias is not None:
             output = output + self.o_proj_bias

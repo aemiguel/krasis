@@ -105,6 +105,7 @@ class GpuPrefillManager:
         krasis_engine=None,
         num_moe_layers: int = 0,
         expert_divisor: int = 1,
+        skip_shared_experts: bool = False,
     ):
         self.model_path = model_path
         self.device = device
@@ -112,7 +113,8 @@ class GpuPrefillManager:
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.params_dtype = params_dtype
-        self.n_shared_experts = n_shared_experts
+        # If skip_shared_experts, Python layer handles shared expert with gate
+        self.n_shared_experts = 0 if skip_shared_experts else n_shared_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.first_k_dense = first_k_dense
         self.num_bits = num_bits
@@ -987,7 +989,8 @@ class GpuPrefillManager:
 
         torch.cuda.synchronize(self.device)
 
-        if self._prefill_mode in ("persistent", "layer_grouped"):
+        if self._prefill_mode in ("persistent", "layer_grouped") and \
+                self._persistent and moe_layer_idx in self._persistent:
             output = self._forward_persistent(moe_layer_idx, x, topk_ids, topk_weights)
         elif self._engine is not None:
             self._allocate_gpu_buffer()

@@ -13,6 +13,313 @@ Re-run needed after: any change to `src/`, `python/krasis/`, or test files.
 
 ---
 
+## Enable GPU prefill for Qwen3-Coder-Next — 2026-02-13
+
+**GPU prefill with Marlin MoE kernel now works for hybrid linear+GQA models.**
+
+### Performance (PP=2, INT4 Marlin GPU, INT4 CPU, FP8 KV, 48 threads):
+
+| Mode | Prompt | Prefill speed | KV context | Notes |
+|------|--------|-------------|------------|-------|
+| Layer-grouped (divisor=4) | 5008 tok | **~78 tok/s** | 745K tokens | 4 groups/GPU, ~7s DMA each, 88% DMA overhead |
+| Layer-grouped (divisor=4) | 1170 tok | ~23 tok/s | 745K tokens | DMA dominates at small prompts |
+| Chunked (divisor=0) | 1170 tok | ~22 tok/s | 1M+ tokens | 1 chunk/layer, 48 DMA ops/GPU |
+| CPU-only (no GPU prefill) | — | ~8 tok/s | — | Baseline |
+
+- Raw GPU Marlin compute: **~640 tok/s** (DMA-free estimate from 5008-token run)
+- Decode: **~2.0 tok/s** (CPU MoE)
+- All 512 experts fit in 1 chunk (830 MB), num_chunks=1 → single kernel call per layer
+- KV cache only for 12 full-attention layers (not 48)
+- DMA throughput ~715 MB/s (4983 MB in ~7s) — bottleneck for prompts under ~5K tokens
+
+### Changes:
+- **`gpu_prefill.py`**: Fixed fallback bug — when persistent mode OOMs and falls back to
+  layer_grouped, but model uses regular forward(), the manager now gracefully falls through
+  to engine chunked path instead of crashing on empty persistent buffers
+- **`kv_cache.py`**: Added `vram_reserve_bytes` parameter to auto-sizer, subtracted from
+  free VRAM before computing KV cache budget (prevents OOM with layer-grouped prefill)
+- **`model.py`**: Added VRAM reservation for layer-grouped prefill using per-rank MoE layer
+  count (not total), so KV cache correctly sizes around expert group VRAM
+- **`test_qwen3_next_generate.py`**: Updated to use `gpu_prefill=True, expert_divisor=0`
+- **`test_qwen3_next_prefill_speed.py`**: GPU prefill benchmark with ~5000-token prompt (8 tokens decode)
+
+### VRAM budget (per GPU, layer-grouped divisor=4):
+- GPU weights: ~2.4 GB (INT8 attention + embedding/norm)
+- Expert group buffer: ~5 GB (6 layers × 512 experts × 1.6 MB Marlin INT4)
+- KV cache: ~4.5 GB (6 layers, 745K tokens)
+- Total: ~12 GB of 16 GB
+
+---
+
+## Fix Qwen3-Coder-Next empty responses — 2026-02-13
+
+**Root cause**: 7 bugs in the Gated DeltaNet linear attention, GQA attention, and RMSNorm implementation.
+
+### Bug 1: QKVZ interleaving (CRITICAL)
+`in_proj_qkvz` output is interleaved per key-head group, not sequential.
+Added `_fix_query_key_value_ordering()` to un-interleave Q,K,V,Z by reshaping
+to `[M, num_k_heads, group_dim]` and splitting within each group.
+Without this, all 36 linear attention layers produced garbage activations.
+
+### Bug 2: BA interleaving (CRITICAL)
+Same issue for `in_proj_ba` — beta and alpha were mixed up across heads.
+Fixed in the same `_fix_query_key_value_ordering()` function.
+
+### Bug 3: Conv1d state update order
+State was updated BEFORE computing conv output, losing oldest element and
+double-counting the new token. Now uses proper `F.conv1d` with state+new
+concatenation, then updates state to last `kernel_dim` tokens.
+Conv state size also fixed: `kernel_dim` (4) not `kernel_dim-1` (3).
+
+### Bug 4: Missing query scale factor
+HF reference applies `scale = 1/sqrt(head_dim)` to query AFTER L2 normalization.
+Added `self.scale = 1.0 / (k_head_dim ** 0.5)` and `q *= scale`.
+
+### Bug 5: Missing `shared_expert_gate`
+Qwen3-Coder-Next has `mlp.shared_expert_gate.weight` [1, hidden_size] — a sigmoid
+gate that scales shared expert output: `sigmoid(gate @ hidden) * shared_expert_out`.
+- Added loading in `weight_loader.py:load_shared_expert()`
+- Added application in `layer.py:_shared_expert_forward()`
+- Set `skip_shared_experts=True` on Rust engine and GpuPrefillManager when gate exists
+  (Python/GPU handles shared expert with gate; avoids double-counting)
+
+### Bug 6: Missing gated attention in GQA
+Qwen3-Coder-Next's `q_proj` outputs `num_heads * head_dim * 2` — the second half
+is a sigmoid gate applied to the attention output before `o_proj`:
+`attn_output * sigmoid(gate)`. Auto-detected from q_proj weight dimensions.
+
+### Bug 7: RMSNorm convention mismatch (CRITICAL)
+Qwen3-Coder-Next uses `Qwen3NextRMSNorm` which computes `(1 + weight) * norm(x)` where
+weight is initialized to **zeros**. Standard RMSNorm computes `weight * norm(x)` where
+weight is initialized to **ones**. Our `flashinfer.norm.rmsnorm` uses the standard formula.
+Without +1.0 correction, all layer norms multiply by near-zero → activations collapse
+to zero by layer 47 (hidden std 0.004).
+- Added `norm_bias_one` config flag, set True for `qwen3_next` model_type
+- Apply `weight + 1.0` at load time for: input_layernorm, post_attention_layernorm,
+  q_norm, k_norm, final_norm (NOT the gated norm in linear attention which uses standard convention)
+- Linear attention comparison test: cos_sim=0.999996 vs HF (verified correct)
+
+### Additional fixes:
+- Chunked prefill algorithm ported from HF `torch_chunk_gated_delta_rule` (was buggy custom impl)
+- L2 norm matches FLA library: `rsqrt(x²·sum + eps)` not `F.normalize`
+- Gated RMSNorm: gate converted to float32 before SiLU (numerical stability)
+- BF16 cast before out_proj in linear attention (recurrent + chunked paths)
+
+### Test results:
+- `test_qwen3_next_generate.py`: PASS (2/2 tests, "2+2=4" and "count 1-5")
+- `test_linear_attn_compare.py`: cos_sim=0.999996 vs HF reference
+- Prefill: 21 tokens in ~2.7s, decode: ~0.5s/token (CPU-only, no GPU prefill)
+
+### Files modified:
+- `python/krasis/config.py` — `norm_bias_one` flag, detect `qwen3_next` model_type
+- `python/krasis/linear_attention.py` — near-complete rewrite, BF16 cast fix
+- `python/krasis/weight_loader.py` — load shared_expert_gate, apply norm +1.0 correction
+- `python/krasis/layer.py` — apply shared_expert_gate, add shared expert on GPU when gate exists
+- `python/krasis/model.py` — detect shared_expert_gate, set skip_shared on engine + prefill manager
+- `python/krasis/gpu_prefill.py` — skip_shared_experts parameter
+- `python/krasis/attention.py` — gated attention support
+
+---
+
+## Move models to krasis/models/ — 2026-02-13
+
+Models now live in `krasis/models/` instead of `~/Documents/Claude/hf-models/`.
+
+- Created `models/` directory in krasis repo root
+- Moved all 6 model directories (DeepSeek-V2-Lite, DeepSeek-V2-Lite-GGUF, GLM-4.7, Qwen3-235B-A22B, Qwen3-235B-A22B-Thinking-2507, Qwen3-Coder-Next)
+- Added `models/` and `.krasis_config` to `.gitignore`
+- Left symlink at old location (`~/Documents/Claude/hf-models/` → `krasis/models/`)
+- Updated launcher to scan `models/` relative to repo root (was hardcoded `~/Documents/Claude/hf-models/`)
+- Updated saved config with new paths
+
+---
+
+## Krasis Chat — interactive terminal chat client — 2026-02-12
+
+New `krasis-chat` script and `python/krasis/chat.py` module.
+
+**Features:**
+- Auto-discovers running Krasis servers by scanning localhost:8080-8090
+- Arrow-key server selection screen (if multiple servers found)
+- Streaming SSE chat with token-by-token display
+- Multi-turn conversation history
+- Commands: `/new` (clear history), `/system <msg>` (set system prompt), `/exit`
+- Stats after each response (approximate tokens, time, tok/s)
+- Uses only stdlib (`http.client` for streaming, `urllib` for discovery, `readline` for input)
+
+**Usage:**
+```
+./krasis-chat                                    # auto-discover
+./krasis-chat --port 8080                        # specific port
+./krasis-chat --url http://host:8080             # direct URL
+./krasis-chat --system "You are a coding assistant."
+```
+
+### New: `python/krasis/chat.py`
+### New: `krasis-chat` (bash wrapper)
+
+---
+
+## Split model selection: native + CPU expert source — 2026-02-12
+
+Launcher now has a 4-screen interactive flow (always shown, with saved config pre-selected):
+
+1. **Select native model** — shows only HF models with safetensors files
+2. **Select CPU expert source** — build INT4/INT8 from native, or pick a GGUF file
+3. **Select GPUs** — toggle individual GPUs on/off
+4. **Config screen** — fine-tune all parameters with live VRAM budget
+
+### Changed: `python/krasis/launcher.py`
+- `scan_models()`: added `native_only` param — filters to directories with `.safetensors` files
+- `scan_gguf_files()`: **new** — scans all subdirectories for `.gguf` files, returns name/path/size
+- `CpuExpertChoice`: **new** dataclass — result of CPU expert selection (source, bits, gguf_path)
+- `_cpu_expert_selection_screen()`: **new** — shows "Build INT4" / "Build INT8" + available GGUF files
+- `_model_selection_screen()`: added `preselected_path` param; removed `has_gguf` display tag
+- `run_interactive()`: 4-screen flow (model → CPU experts → GPUs → config)
+- `print_summary()`: shows CPU expert source (GGUF or build INT4/8)
+- Removed `has_gguf` field from model dicts (no longer needed)
+
+---
+
+## Fix Ctrl-C server exit — 2026-02-12
+
+**Fixed**: Ctrl-C during active generation would hang instead of exiting.
+
+Root cause: uvicorn's graceful shutdown waits for active HTTP connections to close,
+but the generation thread is blocked in the Rust/CUDA forward pass and never finishes.
+
+Fix: Use `uvicorn.Server` directly with a patched `handle_exit` that sets `force_exit=True`
+on first Ctrl-C (skip waiting for connections), and `os._exit(0)` on second Ctrl-C.
+
+### Changed: `python/krasis/server.py`
+- Replaced `uvicorn.run()` with `uvicorn.Server` + patched `handle_exit`
+- First Ctrl-C: sets `should_exit + force_exit`, server exits within ~1s
+- Second Ctrl-C: `os._exit(0)` for immediate kill if still stuck
+
+---
+
+## Gated DeltaNet (Linear Attention) Support — 2026-02-12
+
+**Added support for hybrid Transformer-Mamba models (Qwen3-Coder-Next).**
+
+Qwen3-Coder-Next uses 36 linear attention layers (Gated DeltaNet) + 12 standard GQA layers.
+Linear attention layers maintain a small recurrent state (~1 MB) + conv state (~48 KB) on GPU
+instead of KV cache. This reduces KV cache from 48 layers to just 12 → 4x VRAM savings for KV.
+
+### New: `python/krasis/linear_attention.py`
+- `GatedDeltaNetAttention` class: pure PyTorch Gated DeltaNet implementation
+- Recurrent decode (M=1): sequential state update per token
+- Chunked prefill (M>1): parallel-within-chunk, recurrent-across-chunks
+- Internal conv state and recurrent state (lazy-initialized, auto-reset between sequences)
+- Gated RMSNorm output with learnable per-head weight
+
+### Modified: `python/krasis/config.py`
+- Added hybrid model fields: `full_attention_interval`, `layer_types`, linear attention dimensions
+- Added `shared_expert_intermediate_size` for Qwen3-Next naming convention
+- Added properties: `is_hybrid`, `is_linear_attention_layer()`, `is_full_attention_layer()`, `num_full_attention_layers`, `effective_shared_expert_intermediate`
+- Auto-compute `layer_types` from `full_attention_interval`
+- Handle `decoder_sparse_step` → `first_k_dense_replace` conversion
+
+### Modified: `python/krasis/weight_loader.py`
+- Added `load_linear_attention_weights()` for DeltaNet weights (in_proj_qkvz, in_proj_ba, conv1d, out_proj, A_log, dt_bias, norm)
+- Branch in `load_layer()` based on `layer_type` (linear_attention vs full_attention)
+- Handle both `shared_experts` (plural, DeepSeek) and `shared_expert` (singular, Qwen3-Next)
+
+### Modified: `python/krasis/layer.py`
+- Branch `__init__` on `layer_type`: creates `GatedDeltaNetAttention` for linear layers
+- Branch `forward()`: linear layers pass `is_decode` flag instead of KV cache args
+
+### Modified: `python/krasis/model.py`
+- KV cache allocates only for full attention layers (`num_full_attention_layers`)
+- Built `_kv_layer_offsets` mapping: global layer idx → KV cache offset (-1 for linear layers)
+- Reset linear attention states between sequences in `generate()`
+- Handle `None` seq_states/kv_caches throughout forward paths
+
+### Modified: `python/krasis/vram_budget.py`
+- Added `_linear_attention_bytes_per_layer()`, `_is_hybrid()`, `_num_full_attention_layers()`
+- KV budget uses only full attention layer count (4x improvement for Qwen3-Coder-Next)
+- Architecture string shows "GQA+DeltaNet" for hybrid models
+- Both `compute_launcher_budget` and `compute_vram_budget` updated for hybrid
+
+---
+
+## Python TUI Launcher — 2026-02-12
+
+**Moved interactive launcher from bash into Python with arrow-key-driven TUI.**
+
+### New: `python/krasis/launcher.py`
+- Arrow-key model selection screen (scans `~/Documents/Claude/hf-models/`)
+- **GPU selection screen**: toggle individual GPUs on/off with space bar, shows per-GPU name/VRAM
+- 13-option config screen with live VRAM/RAM budget updates on every change
+- Quality annotations on each quant option: shows native dtype → selected (e.g. `bf16 → int8 — ~lossless`)
+- Default CPU threads = physical cores (no longer capped at 48)
+- Raw terminal mode via `tty`/`termios` — no external dependencies
+- Hardware auto-detection: per-GPU info (index, name, VRAM), CPU cores, RAM from /proc
+- PP partition auto-recomputes when selected GPU count changes
+- `CUDA_VISIBLE_DEVICES` set automatically from selected GPUs at launch
+- Config saved to `.krasis_config` (backward-compatible KEY=VALUE format, now includes `CFG_SELECTED_GPUS`)
+- `--non-interactive` mode: prints summary + launches server directly
+- `--selected-gpus 0,2` CLI arg to pre-select specific GPUs
+- All CLI args from bash version supported via argparse
+
+### New: `compute_launcher_budget()` in `vram_budget.py`
+- Per-component quantization (attention, shared expert, dense MLP, LM head)
+- Expert divisor modes: persistent (1), grouped (2-4), chunked (0)
+- Per-rank VRAM breakdown + worst-case rank detection
+- CPU expert RAM estimate with configurable INT4/INT8
+- Separate `_cpu_expert_bytes_per_expert()` and `_detect_total_ram_gb()` helpers
+
+### Modified: `./krasis` Bash Wrapper
+- Reduced from 1,019 lines to 175 lines
+- Keeps Phase 1 only (venv creation, dependency checking, Krasis native build)
+- All args passed through to `python -m krasis.launcher`
+- Removed: hardware detection, model selection, config steps, budget calculator, launch logic
+
+### Tests Run
+- `python -m krasis.launcher --help` — all args visible, PASS
+- `compute_launcher_budget()` V2-Lite (MLA, 64 experts, persistent) — 4,919 MB / 16,380 MB, ~2.3M KV tokens
+- `compute_launcher_budget()` Qwen3-235B (GQA, 128 experts, persistent) — over budget 43,412 MB (correct)
+- `compute_launcher_budget()` Qwen3-235B (chunked) — fits, 6,584 MB, 313K tokens
+- `scan_models()` — detected all 5 models with correct arch/layers/experts
+- Non-interactive summary with V2-Lite — correct PP partition, budget, CPU expert RAM
+- Config backward compatibility — loaded existing bash `.krasis_config`, round-trip save/load OK
+
+---
+
+## VRAM/RAM Budget Estimates + Back-Navigation in Launcher — 2026-02-12
+
+**Added live VRAM/RAM budget calculator to `./krasis` interactive launcher.**
+
+### New: `_show_budget` Function
+- Computes per-GPU VRAM breakdown: attention weights, shared experts, expert buffers, embedding/LM head, norms/gates, CUDA overhead
+- Shows worst-case rank with remaining VRAM for KV cache (token capacity estimate)
+- Shows system RAM for CPU experts
+- Handles both MLA (DeepSeek V2, Kimi K2.5) and GQA (Qwen3, GLM-4.7) attention formulas
+- Handles dense layers (`first_k_dense_replace`), shared experts, tied embeddings
+- Over-budget warning when total exceeds GPU VRAM
+
+### New: Step-Loop with Back-Navigation
+- Phase 4 refactored from sequential code into 9 numbered step functions
+- After each step, user can press Enter to advance or `b` to go back
+- Budget displayed after each memory-affecting step (1-6) in interactive mode
+- Non-interactive mode: budget shown once in Phase 5 summary only
+
+### Extended Model Metadata
+- `_parse_model_config` now extracts 14 additional fields: vocab, dense layers, KV LoRA rank, QK dims, head counts, head dims, MLA detection, tie embeddings, shared expert intermediate size
+- Supports all 5 model architectures: deepseek_v2, qwen3_moe, qwen3_next, glm4_moe
+
+### Phase 5 Enhanced
+- Replaced rough "Est. expert RAM" line with full VRAM/RAM budget breakdown from `_show_budget`
+
+### Tests Run
+- `./krasis --non-interactive --skip-setup --model-path .../DeepSeek-V2-Lite` — budget correct, 4,845/16,380 MB, ~2333K tokens
+- `./krasis --non-interactive --skip-setup --model-path .../Qwen3-235B-A22B` — correctly shows OVER BUDGET (persistent 36,864 MB)
+- `./krasis --non-interactive --skip-setup --model-path .../GLM-4.7` — dense layers handled, rank 1 worst-case
+- `./krasis --non-interactive --skip-setup --model-path .../Qwen3-Coder-Next` — 512 experts, 15,250/16,380 MB
+- `bash -n ./krasis` — syntax check PASS
+
+---
+
 ## Interactive Launcher + server.py CLI Args — 2026-02-12
 
 **Added `./krasis` executable launcher script and full CLI arg support in `server.py`.**
