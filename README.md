@@ -4,9 +4,42 @@ Rust + PyO3 MoE runtime for large mixture-of-experts LLMs. Runs 350B+ parameter 
 
 ## What It Does
 
-Runs MoE models (DeepSeek V2, Kimi K2.5, Qwen3-235B, GLM-4.7) on 3x 16GB GPUs + 1TB system RAM. GPUs handle attention, norms, routing, and expert prefill; Krasis handles MoE expert decode on CPU with AVX2 INT4/INT8 kernels.
+Krasis runs large language models — the kind with 350 billion+ parameters — on hardware you can actually buy. Three consumer GPUs and a lot of system RAM is all you need. No datacenter, no $100k GPU rental.
 
-**Key idea**: GPU prefill is always ON. Prompts process at hundreds-to-thousands of tokens per second on GPU, then CPU handles token-by-token decode. This makes IDE integration practical (10K prompt in 4s instead of 57s).
+These models use a trick called Mixture of Experts (MoE): instead of running every parameter on every token, they pick a small subset of "expert" sub-networks per token. This means a 350B model might only activate 20B parameters at a time, making it feasible to run — if your software is smart about where to put the weights.
+
+### Why GPU prefill matters
+
+When you type a message to an LLM, two things happen. First, the model reads your entire prompt at once — this is **prefill**. Then it generates a response one token at a time — this is **decode**. Prefill is embarrassingly parallel (all tokens processed simultaneously), so GPUs are orders of magnitude faster at it than CPUs.
+
+This matters a lot in practice. An IDE like Cursor or OpenCode sends 10,000+ tokens of context with every request. If prefill runs on CPU at 25 tokens/second, you're waiting 7 minutes before the model even starts responding. If prefill runs on GPU at 2,400 tokens/second, that same prompt processes in 4 seconds. That's the difference between a usable tool and a paperweight.
+
+Krasis keeps GPU prefill **always on**. Prompts process at hundreds to thousands of tokens per second on GPU, then CPU handles the slower token-by-token generation. You wait a few seconds for the model to "read" your prompt, then tokens stream out at a steady 2-6 tok/s depending on the model.
+
+### How other tools handle GPU offloading
+
+**llama.cpp** splits the model by layers. You tell it "put the first 10 layers on GPU, the rest on CPU." During both prefill and decode, each token flows through the GPU layers (fast), then the CPU layers (slow). The problem: if only 25% of the model fits on GPU, 75% of every computation still happens on CPU. Your GPU sits idle while the CPU grinds through its layers. Prefill speed is capped by the slowest link in the chain.
+
+**KTransformers** is smarter — it puts attention and routing on GPU but keeps all expert weights on CPU. During decode this works well because only a few experts activate per token, and CPU handles that fine. But during prefill, when you're processing thousands of tokens, all those expert computations still happen on CPU. You're leaving the GPU's parallel compute power on the table for the most latency-sensitive part of inference.
+
+**Krasis** takes a different approach. During prefill, it copies expert weights to GPU in bulk and runs everything — attention, routing, AND experts — on GPU using quantized Marlin kernels. During decode, it switches to CPU for experts (where the per-token workload is small enough that CPU keeps up). This means prefill gets full GPU acceleration on every layer, not just the attention layers.
+
+### Technical comparison
+
+The key architectural difference is how expert weights reach the GPU during prefill:
+
+| System | Prefill strategy | Expert compute | Typical prefill speed (5K tokens) |
+|--------|-----------------|----------------|:-:|
+| **llama.cpp** | Layer split (fixed GPU/CPU partition) | Layers on GPU run fast, layers on CPU run slow | ~30 tok/s (75% CPU) |
+| **KTransformers** | GPU attention + CPU experts | Attention on GPU, all experts always on CPU | ~25 tok/s |
+| **Krasis (persistent)** | All experts pre-loaded in VRAM | Everything on GPU, zero weight transfers | **2,400 tok/s** |
+| **Krasis (layer-grouped)** | Expert groups cycled through VRAM | All compute on GPU, a few bulk DMA transfers | **400-600 tok/s** |
+
+When experts fit entirely in VRAM (small models, or big GPUs), Krasis pre-loads them once and runs with zero weight transfers — this is the persistent mode. When they don't fit (the common case with 350B+ models), Krasis uses layer-grouped mode: it loads a group of layers' experts into VRAM, processes ALL prompt tokens through those layers, frees the VRAM, and loads the next group. The DMA cost is fixed regardless of prompt length, so longer prompts amortize it better.
+
+Even in the worst case — layer-grouped with only 25% of experts fitting at once — Krasis prefill is 15-20x faster than llama.cpp or KTransformers, because every multiply-accumulate happens on GPU hardware designed for exactly this workload.
+
+For decode (token-by-token generation), all three systems perform similarly at 2-6 tok/s, because the bottleneck shifts to memory bandwidth and only a handful of experts activate per token. This is where Krasis's CPU path with hand-tuned AVX2 INT4 kernels handles the work efficiently.
 
 ## Architecture
 
