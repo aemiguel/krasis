@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 import uuid
@@ -231,7 +232,24 @@ def main():
 
     _scheduler = Scheduler(_model)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    # Use uvicorn.Server directly so we can patch handle_exit.
+    # Default uvicorn graceful shutdown waits for active connections,
+    # but generation threads block in Rust/CUDA and never finish.
+    config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+    server = uvicorn.Server(config)
+
+    def _handle_exit(sig, frame):
+        if server.should_exit:
+            # Second Ctrl-C — force kill immediately
+            logger.info("Forcing exit...")
+            os._exit(0)
+        # First Ctrl-C — tell uvicorn to stop, skip waiting for connections
+        server.should_exit = True
+        server.force_exit = True
+        logger.info("Shutting down (press Ctrl-C again to force)...")
+
+    server.handle_exit = _handle_exit
+    server.run()
 
 
 if __name__ == "__main__":

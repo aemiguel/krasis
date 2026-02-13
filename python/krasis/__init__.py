@@ -19,7 +19,7 @@ except ImportError:
     pass
 
 try:
-    from krasis.vram_budget import compute_vram_budget
+    from krasis.vram_budget import compute_vram_budget, compute_launcher_budget
 except ImportError:
     pass
 

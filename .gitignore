@@ -8,3 +8,5 @@ __pycache__/
 *.gguf
 *.safetensors
 !tests/fixtures/*.safetensors
+models/
+.krasis_config

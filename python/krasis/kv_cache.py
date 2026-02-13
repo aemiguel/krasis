@@ -44,6 +44,7 @@ class PagedKVCache:
         kv_dtype: torch.dtype = torch.float8_e4m3fn,
         page_size: int = PAGE_SIZE,
         combined: bool = False,
+        vram_reserve_bytes: int = 0,
     ):
         self.cfg = cfg
         self.num_layers = num_layers
@@ -71,6 +72,7 @@ class PagedKVCache:
         # Auto-size: use 50% of free VRAM for KV cache
         if max_pages is None:
             free_bytes = torch.cuda.mem_get_info(device)[0]
+            free_bytes = max(0, free_bytes - vram_reserve_bytes)
             bytes_per_page = self._bytes_per_page()
             budget = int(free_bytes * 0.5)
             max_pages = max(64, budget // bytes_per_page)

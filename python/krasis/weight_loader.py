@@ -155,7 +155,10 @@ class WeightLoader:
         """Load final RMSNorm weight (BF16, tiny)."""
         name = f"{self.cfg.layers_prefix}.norm.weight"
         logger.info("Loading final norm: %s", name)
-        return self._load_bf16(name, device)
+        w = self._load_bf16(name, device)
+        if self.cfg.norm_bias_one:
+            w = w + 1.0  # Qwen3NextRMSNorm convention: (1 + weight) * x
+        return w
 
     def load_lm_head(self, device: torch.device):
         """Load LM head weight.
@@ -245,9 +248,15 @@ class WeightLoader:
         q_norm_name = f"{prefix}.q_norm.weight"
         k_norm_name = f"{prefix}.k_norm.weight"
         if q_norm_name in self._weight_map:
-            weights["q_norm"] = self._load_bf16(q_norm_name, device)
+            w = self._load_bf16(q_norm_name, device)
+            if self.cfg.norm_bias_one:
+                w = w + 1.0  # Qwen3NextRMSNorm convention
+            weights["q_norm"] = w
         if k_norm_name in self._weight_map:
-            weights["k_norm"] = self._load_bf16(k_norm_name, device)
+            w = self._load_bf16(k_norm_name, device)
+            if self.cfg.norm_bias_one:
+                w = w + 1.0  # Qwen3NextRMSNorm convention
+            weights["k_norm"] = w
 
         return weights
 
@@ -256,12 +265,17 @@ class WeightLoader:
     ) -> Dict[str, torch.Tensor]:
         """Load input_layernorm and post_attention_layernorm (BF16)."""
         prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}"
-        return {
+        norms = {
             "input_layernorm": self._load_bf16(
                 f"{prefix}.input_layernorm.weight", device),
             "post_attention_layernorm": self._load_bf16(
                 f"{prefix}.post_attention_layernorm.weight", device),
         }
+        if self.cfg.norm_bias_one:
+            # Qwen3NextRMSNorm convention: (1 + weight) * x
+            for k in norms:
+                norms[k] = norms[k] + 1.0
+        return norms
 
     def load_dense_mlp(
         self, layer_idx: int, device: torch.device
@@ -298,14 +312,57 @@ class WeightLoader:
         """Load shared expert MLP weights for a MoE layer.
 
         Uses quant_cfg.shared_expert ("int8" or "bf16").
+        Handles both naming conventions:
+        - "shared_experts" (plural, DeepSeek/Kimi)
+        - "shared_expert" (singular, Qwen3-Next)
         """
-        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.shared_experts"
+        # Detect naming convention from weight map
+        prefix_plural = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.shared_experts"
+        prefix_singular = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.shared_expert"
+        if f"{prefix_plural}.gate_proj.weight" in self._weight_map:
+            prefix = prefix_plural
+        else:
+            prefix = prefix_singular
+
         load = self._load_and_quantize if self.quant_cfg.shared_expert == "int8" else self._load_bf16
-        return {
+        result = {
             "gate_proj": load(f"{prefix}.gate_proj.weight", device),
             "up_proj": load(f"{prefix}.up_proj.weight", device),
             "down_proj": load(f"{prefix}.down_proj.weight", device),
         }
+
+        # Shared expert gate (Qwen3-Next): sigmoid gate on shared expert output
+        # Weight: [1, hidden_size] — projects hidden → scalar per token
+        gate_name = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.shared_expert_gate.weight"
+        if gate_name in self._weight_map:
+            result["shared_expert_gate"] = self._load_bf16(gate_name, device)
+
+        return result
+
+    def load_linear_attention_weights(
+        self, layer_idx: int, device: torch.device
+    ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor] | torch.Tensor]:
+        """Load Gated DeltaNet linear attention weights for one layer.
+
+        Loads: in_proj_qkvz, in_proj_ba, out_proj (quantizable),
+               conv1d.weight, A_log, dt_bias, norm.weight (always BF16).
+        """
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.linear_attn"
+        weights = {}
+        load_proj = self._load_and_quantize if self.quant_cfg.attention == "int8" else self._load_bf16
+
+        # Quantizable projections
+        weights["in_proj_qkvz"] = load_proj(f"{prefix}.in_proj_qkvz.weight", device)
+        weights["in_proj_ba"] = load_proj(f"{prefix}.in_proj_ba.weight", device)
+        weights["out_proj"] = load_proj(f"{prefix}.out_proj.weight", device)
+
+        # Small/critical weights — always BF16
+        weights["conv1d_weight"] = self._load_bf16(f"{prefix}.conv1d.weight", device)
+        weights["A_log"] = self._load_bf16(f"{prefix}.A_log", device)
+        weights["dt_bias"] = self._load_bf16(f"{prefix}.dt_bias", device)
+        weights["norm_weight"] = self._load_bf16(f"{prefix}.norm.weight", device)
+
+        return weights
 
     def load_layer(
         self, layer_idx: int, device: torch.device
@@ -314,17 +371,27 @@ class WeightLoader:
 
         Returns a dict with:
         - "norms": {input_layernorm, post_attention_layernorm}
-        - "attention": {q_a_proj, q_b_proj, kv_a_proj_with_mqa, o_proj, w_kc, w_vc, ...}
+        - "attention" or "linear_attention": attention weights
+        - "layer_type": "linear_attention" or "full_attention"
         - "mlp": dense MLP weights (if dense layer) OR MoE gate + shared expert
         - "is_moe": bool
         """
         start = time.perf_counter()
 
+        is_linear = self.cfg.is_linear_attention_layer(layer_idx)
+        layer_type = "linear_attention" if is_linear else "full_attention"
+
         result = {
             "norms": self.load_layer_norms(layer_idx, device),
-            "attention": self.load_attention_weights(layer_idx, device),
             "is_moe": self.cfg.is_moe_layer(layer_idx),
+            "layer_type": layer_type,
         }
+
+        # Load attention weights based on layer type
+        if is_linear:
+            result["linear_attention"] = self.load_linear_attention_weights(layer_idx, device)
+        else:
+            result["attention"] = self.load_attention_weights(layer_idx, device)
 
         if result["is_moe"]:
             result["gate"] = self.load_moe_gate(layer_idx, device)
@@ -336,8 +403,8 @@ class WeightLoader:
         elapsed = time.perf_counter() - start
         alloc_mb = torch.cuda.memory_allocated(device) / (1024**2)
         logger.info(
-            "Layer %d loaded in %.1fs (GPU alloc: %.0f MB, moe=%s)",
-            layer_idx, elapsed, alloc_mb, result["is_moe"],
+            "Layer %d loaded in %.1fs (GPU alloc: %.0f MB, moe=%s, type=%s)",
+            layer_idx, elapsed, alloc_mb, result["is_moe"], layer_type,
         )
         return result
 
