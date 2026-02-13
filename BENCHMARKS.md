@@ -85,7 +85,25 @@ Reasoning:
 
 ## Benchmark Results
 
-TODO 
+### Test Configuration
+- **Model**: Qwen3-235B-A22B (Q8_0 GGUF for llama.cpp/KTransformers, BF16 safetensors for Krasis)
+- **Prompt**: ~10K tokens (12 technical sections covering distributed systems, compilers, databases, etc.)
+- **Decode tokens**: 50 (including thinking tokens for Qwen3)
+- **Hardware**: AMD EPYC 7742 (48 threads), 995 GB RAM, 3x RTX 2000 Ada 16GB
+
+### Results Table
+
+| Tool | GPUs | ngl/PP | Prefill (tok/s) | Decode (tok/s) | GPU VRAM (MB) | RAM (GB) | Notes |
+|------|------|--------|----------------|----------------|---------------|----------|-------|
+| llama.cpp | 1 | ngl=5 | 30.1 | 3.5 | 11,839 | 228 | |
+| llama.cpp | 2 | ngl=10 | 31.6 | 3.7 | 13,763+11,152 | 218 | |
+| llama.cpp | 3 | ngl=16 | - | - | - | - | pending |
+| KTransformers | 1 | PP=1 | - | - | - | - | pending |
+| KTransformers | 2 | PP=2 | - | - | - | - | pending |
+| KTransformers | 3 | PP=3 | - | - | - | - | pending |
+| Krasis | 1 | div=? | - | - | - | - | pending |
+| Krasis | 2 | div=? | - | - | - | - | pending |
+| Krasis | 3 | div=? | - | - | - | - | pending |
 
 ## Conclusions
 
