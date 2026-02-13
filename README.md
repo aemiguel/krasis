@@ -37,8 +37,8 @@ quality or decrease system RAM to get the model to fit.  Krasis always needs to 
 
 It uses this to build the GPU-optimised in-memory model and the CPU-optimised in-memory model.  These are cached to disk so you'll typically need **3x the disk space for the model.**
 
-The fundamental tradeoff is using more system RAM (which is drastically cheaper than VRAM) and more disk (which is much cheaper than both) to allow models that would
-otherwise be unusable to run on non-datacenter hardware.
+**The fundamental tradeoff is using more system RAM** (which is drastically cheaper than VRAM) **and more disk** (which is much cheaper than both) to allow models that would
+**otherwise be unusable to run on non-datacenter hardware.**
 
 If you prefer you can also give Krasis the native model for GPU and an optimised (e.g. unsloth) Q4_K_S or similar GGUF model for the CPU to take advantage of more advanced quantization schemes.
 
