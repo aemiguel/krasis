@@ -478,7 +478,7 @@ class ConfigOption:
 OPTIONS = [
     ConfigOption("PP partition", "pp_partition", opt_type="text", affects_budget=True),
     ConfigOption("Expert divisor", "expert_divisor",
-                 choices=[1, 2, 3, 4, 0], affects_budget=True,
+                 choices=[1, 2, 3, 4, 8, 16, 32, 0], affects_budget=True,
                  suffix=" ({desc})"),
     ConfigOption("KV dtype", "kv_dtype",
                  choices=["fp8_e4m3", "bf16"], affects_budget=True),
@@ -508,6 +508,9 @@ DIVISOR_DESCRIPTIONS = {
     2: "grouped(2)",
     3: "grouped(3)",
     4: "grouped(4)",
+    8: "grouped(8)",
+    16: "grouped(16)",
+    32: "grouped(32)",
 }
 
 
