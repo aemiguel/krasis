@@ -6,11 +6,11 @@ It's goal is to investigate and demonstrate the benefits of Krasis' approach to 
 
 ## Test LLM Model
 
-Target Model: Qwen3-235B-A22B (MoE, 658GB)
+Target Model: **Qwen3-235B-A22B (MoE, 658GB)**
 
-Llama model used: Unsloth Qwen3-235B-A22B Q8 (8-bit quantized)
-KTransformers model used: Unsloth Qwen3-235B-A22B Q8 (8-bit quantized)
-Krasis model used: Unsloth Qwen3-235B-A22B Q8 (8-bit quantized) + Original BF16 model weights
+- Llama model used: Unsloth Qwen3-235B-A22B Q8 (8-bit quantized)
+- KTransformers model used: Unsloth Qwen3-235B-A22B Q8 (8-bit quantized)
+- Krasis models used: Unsloth Qwen3-235B-A22B Q8 (8-bit quantized) + Original BF16 model weights
 
 ## Methodology
 
@@ -24,9 +24,9 @@ We pass in the same large ~10,000 token prompt to each tool and measure both pre
 
 ## Test Hardware
 
-Epyc 7742 (single CPU, 64 cores)
-1TB DDR4 2666Mhz (8 channels)
-3x RTX Ada 2000 GPUs
+- Epyc 7742 (single CPU, 64 cores)
+- 1TB DDR4 2666Mhz (8 channels)
+- 3x RTX Ada 2000 GPUs
 
 ## Tool Configurations
 
