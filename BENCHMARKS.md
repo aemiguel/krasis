@@ -87,21 +87,21 @@ Reasoning:
 
 ### Test Configuration
 - **Model**: Qwen3-235B-A22B (Q8_0 GGUF for llama.cpp/KTransformers, BF16 safetensors for Krasis)
-- **Prompt**: ~10K tokens (12 technical sections covering distributed systems, compilers, databases, etc.)
+- **Prompt**: 44,916 chars / 6,650 words / ~8,600 tokens (12 technical sections covering distributed systems, compilers, databases, etc.)
 - **Decode tokens**: 50 (including thinking tokens for Qwen3)
 - **Hardware**: AMD EPYC 7742 (48 threads), 995 GB RAM, 3x RTX 2000 Ada 16GB
 
 ### Results Table
 
-TTFT (Time to First Token) estimated as ~8,600 prompt tokens / prefill rate (model already loaded).
+TTFT (Time to First Token) measured wall-clock from request to first token (KTransformers, Krasis) or estimated as ~8,600 tokens / prefill rate (llama.cpp).
 
 | Tool | GPUs | Config | Prefill (tok/s) | Decode (tok/s) | TTFT (s) | GPU VRAM (MB) | RAM (GB) | Notes |
 |------|------|--------|----------------|----------------|----------|---------------|----------|-------|
 | llama.cpp | 1 | ngl=5 | 30.1 | 3.5 | ~286 | 11,839 | 228 | |
 | llama.cpp | 2 | ngl=10 | 31.6 | 3.7 | ~272 | 13,763+11,152 | 218 | |
 | llama.cpp | 3 | ngl=14 | 32.9 | 3.8 | ~261 | 13,763+12,939+8,598 | 208 | ngl=16 OOM |
-| KTransformers | 1 | PP=1 | - | - | - | - | - | pending |
-| KTransformers | 2 | PP=2 | - | - | - | - | - | pending |
+| KTransformers | 1 | TP=1 INT8 attn | 49.7 | 4.85 | 173.0 | 14,735 | 275 | INT8 attn needed to fit on 1 GPU |
+| KTransformers | 2 | PP=2 | 57.5 | 3.60 | 149.5 | 14,895+13,707 | 275 | |
 | KTransformers | 3 | PP=3 | - | - | - | - | - | pending |
 | Krasis | 1 | div=? | - | - | - | - | - | pending |
 | Krasis | 2 | div=? | - | - | - | - | - | pending |
