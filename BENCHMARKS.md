@@ -105,7 +105,7 @@ TTFT (Time to First Token) measured wall-clock from request to first token (KTra
 | KTransformers | 3 | PP=3 | 57.3 | 3.29 | 150.1 | 14,129+14,287+13,132 | 278 | |
 | Krasis | 1 | div=? | - | - | - | - | - | pending |
 | Krasis | 2 | div=? | - | - | - | - | - | pending |
-| Krasis | 3 | div=? | - | - | - | - | - | pending |
+| Krasis | 3 | PP=3 div=4 | 26.3 | 1.45 | 327.3 | 5,435+4,941+5,484 | 264 | Layer-grouped GPU prefill |
 
 ## Conclusions
 
