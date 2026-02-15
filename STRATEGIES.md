@@ -194,6 +194,22 @@ Per MoE layer:
 
 ---
 
+## Design Philosophy: Prefill First
+
+**GPU prefill speed is the top priority.** The whole point of Krasis is that CPU decode is the unavoidable bottleneck — you're always waiting for it. What you CAN control is how fast prompts are processed (TTFT). A slow TTFT makes the tool unusable in interactive settings (IDE integration, chat).
+
+Therefore:
+1. **Prefill gets first claim on VRAM.** The best prefill strategy (HCS or layer_grouped) is selected first, and its VRAM requirements are satisfied.
+2. **Decode strategy uses whatever VRAM is left.** If HCS prefill needs 2.5 GB for hot expert buffers, decode gets what remains. If that means decode can only use LRU with fewer slots, or falls back to active_only — so be it.
+3. **Never sacrifice prefill for decode.** A 10% decode improvement that costs 50% prefill speed is a bad trade. Decode is CPU-bound anyway (~10 tok/s ceiling on our hardware).
+
+This means the auto-optimiser should:
+- Select the fastest prefill strategy first
+- Then find the best decode strategy within the remaining VRAM budget
+- Never let decode strategy choices reduce prefill throughput
+
+---
+
 ## Strategy Selection Guide
 
 | Model Size | Experts | VRAM | Recommended |

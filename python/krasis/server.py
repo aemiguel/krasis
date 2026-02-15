@@ -251,7 +251,9 @@ def main():
         _model.load()
 
         from krasis.auto_optimise import auto_optimise_or_load
-        auto_optimise_or_load(_model, force=args.force_optimize)
+        # --benchmark always forces fresh auto-optimise (never use cache)
+        force = args.force_optimize or args.benchmark
+        auto_optimise_or_load(_model, force=force)
 
     else:
         # ── Manual strategy: existing behavior ──
