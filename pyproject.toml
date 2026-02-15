@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "krasis"
-version = "0.1.5"
+version = "0.1.6"
 description = "Hybrid LLM runtime — minimal VRAM, always-on GPU prefill, optimised CPU inference"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
@@ -37,6 +37,7 @@ Repository = "https://github.com/brontoguana/krasis"
 
 [project.scripts]
 krasis = "krasis.launcher:main"
+krasis-chat = "krasis.chat:main"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

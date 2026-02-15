@@ -1,5 +1,22 @@
 # Krasis Changelog
 
+## Chat Client Improvements — 2026-02-15
+
+### Channel filter for GPT OSS structured output
+- GPT OSS outputs `<|channel|>analysis<|message|>...<|end|>...<|channel|>final<|message|>...`
+- Added `ChannelFilter` state machine that strips non-final channels during streaming
+- Shows "(thinking...)" indicator while model generates analysis, erased when final response starts
+- Non-channel models (Qwen3, V2-Lite) pass through unchanged — no impact
+
+### Streaming fix: select() replaces socket timeout
+- `sock.settimeout(0.5)` permanently corrupted http.client's chunked transfer reader
+  after first timeout during slow prefill
+- Replaced with `select.select()` polling (1s intervals) for Ctrl-C interruptibility
+
+### Conversation history
+- Full message history sent with every request (already working)
+- Clean display text stored in history (channel markers stripped), not raw model output
+
 ## Prefill OOM Recovery — 2026-02-15
 
 ### Bug Fix: Prefill OOM crash with HCS + CUDA graphs
