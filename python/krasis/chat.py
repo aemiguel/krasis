@@ -198,6 +198,108 @@ def _read_key() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Channel filter for structured model output (GPT OSS)
+# ═══════════════════════════════════════════════════════════════════════
+
+class ChannelFilter:
+    """Filters channel-formatted output for display.
+
+    Some models (e.g. GPT OSS) output structured channels:
+        <|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>...
+
+    Only the 'final' channel content is shown to the user.
+    For models without channel markers, all text passes through unchanged.
+    """
+
+    _MARKERS = ['<|channel|>', '<|message|>', '<|end|>', '<|start|>',
+                '<|endofprompt|>']
+
+    def __init__(self):
+        self._buf = ""
+        self._channel: Optional[str] = None
+        self._reading_channel = False
+        self._reading_role = False
+        self._display = True
+        self._has_channels = False
+        self._in_hidden = False
+
+    def feed(self, text: str) -> str:
+        """Feed new text. Returns portion that should be displayed."""
+        self._buf += text
+        return self._drain()
+
+    def flush(self) -> str:
+        """Flush buffer at end of stream."""
+        if not self._buf:
+            return ""
+        out = self._buf if (self._display or not self._has_channels) else ""
+        self._buf = ""
+        return out
+
+    @property
+    def has_channels(self) -> bool:
+        return self._has_channels
+
+    @property
+    def is_hidden(self) -> bool:
+        """True when content is being suppressed (analysis channel etc.)."""
+        return self._in_hidden
+
+    def _drain(self) -> str:
+        parts = []
+        while self._buf:
+            # Try exact marker match
+            matched = None
+            for tok in self._MARKERS:
+                if self._buf.startswith(tok):
+                    matched = tok
+                    break
+
+            # Try partial marker match (need more data)
+            if matched is None:
+                partial = False
+                for tok in self._MARKERS:
+                    if len(self._buf) < len(tok) and tok.startswith(self._buf):
+                        partial = True
+                        break
+                if partial:
+                    break
+
+            if matched:
+                self._has_channels = True
+                self._buf = self._buf[len(matched):]
+                if matched == '<|channel|>':
+                    self._reading_channel = True
+                    self._channel = ""
+                    self._display = False
+                elif matched == '<|message|>':
+                    self._reading_channel = False
+                    self._reading_role = False
+                    is_final = (self._channel == "final")
+                    self._display = is_final
+                    self._in_hidden = not is_final
+                elif matched in ('<|end|>', '<|endofprompt|>'):
+                    self._display = False
+                    self._reading_channel = False
+                    self._reading_role = False
+                    self._in_hidden = False
+                elif matched == '<|start|>':
+                    self._reading_role = True
+                    self._display = False
+            else:
+                ch = self._buf[0]
+                self._buf = self._buf[1:]
+                if self._reading_channel:
+                    self._channel = (self._channel or "") + ch
+                elif self._reading_role:
+                    pass
+                elif self._display or not self._has_channels:
+                    parts.append(ch)
+
+        return "".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Server discovery
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -319,8 +421,12 @@ def stream_chat(
     temperature: float = 0.6,
     max_tokens: int = 4096,
     top_p: float = 0.95,
-) -> str:
-    """Send streaming chat request. Prints tokens as they arrive. Returns full text."""
+) -> tuple:
+    """Send streaming chat request. Prints tokens as they arrive.
+
+    Returns (display_text, raw_text) — display_text has channel markers
+    stripped (only 'final' channel shown). raw_text is the full model output.
+    """
     host, port, ssl = _parse_host_port(url)
 
     body = json.dumps({
@@ -348,17 +454,27 @@ def stream_chat(
             error_body = resp.read().decode(errors="replace")
             raise RuntimeError(f"HTTP {resp.status}: {error_body[:500]}")
 
-        full_text = ""
-        # Set a short socket timeout so readline() yields to KeyboardInterrupt
+        raw_text = ""
+        display_text = ""
+        cf = ChannelFilter()
+        _THINKING = "(thinking...) "
+        _thinking_shown = False
+
+        # Use select() for interruptibility instead of socket timeout.
+        # Socket timeout corrupts http.client's chunked transfer reader
+        # if the first readline() times out during a slow prefill.
         sock = resp.fp.raw._sock if hasattr(resp.fp, 'raw') else None
-        if sock is not None:
-            sock.settimeout(0.5)
 
         while True:
+            # Wait for data with 1s polls so Ctrl-C can interrupt
+            if sock is not None:
+                while True:
+                    ready, _, _ = select.select([sock], [], [], 1.0)
+                    if ready:
+                        break
             try:
                 raw_line = resp.readline()
             except (TimeoutError, OSError):
-                # Socket timeout — check for interrupt and retry
                 continue
             if not raw_line:
                 break
@@ -385,14 +501,39 @@ def stream_chat(
             delta = choices[0].get("delta", {})
             content = delta.get("content", "")
             if content:
-                sys.stdout.write(content)
-                sys.stdout.flush()
-                full_text += content
+                raw_text += content
+                visible = cf.feed(content)
+
+                # Show thinking indicator while in hidden channel
+                if cf.has_channels and cf.is_hidden and not _thinking_shown:
+                    sys.stdout.write(f"{DIM}{_THINKING}{NC}")
+                    sys.stdout.flush()
+                    _thinking_shown = True
+
+                if visible:
+                    # Erase thinking indicator if shown
+                    if _thinking_shown:
+                        n = len(_THINKING)
+                        sys.stdout.write("\b" * n + " " * n + "\b" * n)
+                        _thinking_shown = False
+                    sys.stdout.write(visible)
+                    sys.stdout.flush()
+                    display_text += visible
 
             if choices[0].get("finish_reason"):
                 break
 
-        return full_text
+        # Flush any remaining buffered text
+        remaining = cf.flush()
+        if remaining:
+            if _thinking_shown:
+                n = len(_THINKING)
+                sys.stdout.write("\b" * n + " " * n + "\b" * n)
+            sys.stdout.write(remaining)
+            sys.stdout.flush()
+            display_text += remaining
+
+        return display_text, raw_text
     finally:
         conn.close()
 
@@ -466,15 +607,16 @@ def chat_loop(
 
             try:
                 t0 = time.perf_counter()
-                response_text = stream_chat(
+                display_text, raw_text = stream_chat(
                     url, messages, temperature, max_tokens,
                 )
                 elapsed = time.perf_counter() - t0
 
-                messages.append({"role": "assistant", "content": response_text})
+                # Store clean display text in history (not raw channel markers)
+                messages.append({"role": "assistant", "content": display_text})
 
                 # Rough token estimate for stats
-                approx_tokens = max(1, len(response_text) // 4)
+                approx_tokens = max(1, len(display_text) // 4)
                 if elapsed > 0:
                     tps = approx_tokens / elapsed
                     print(
