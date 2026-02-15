@@ -104,7 +104,7 @@ TTFT (Time to First Token) measured wall-clock from request to first token (KTra
 | KTransformers | 2 | PP=2 | 57.5 | 3.60 | 149.5 | 14,895+13,707 | 275 | |
 | KTransformers | 3 | PP=3 | 57.3 | 3.29 | 150.1 | 14,129+14,287+13,132 | 278 | |
 | **Krasis** | **2** | **PP=2 HCS hybrid** | **198.1** | **1.65** | **43.9** | **12,963+12,968** | **223** | **Qwen3-235B-A22B** |
-| **Krasis** | **2** | **PP=2 HCS hybrid** | **621** | **TBD** | **15.5** | **13,115+13,112** | **125** | **Qwen3-Coder-Next** |
+| **Krasis** | **2** | **PP=2 HCS hybrid** | **621** | **7.2** | **15.5** | **13,115+13,112** | **125** | **Qwen3-Coder-Next** |
 
 ### Qwen3-235B-A22B (PP=2, HCS Hybrid) — Krasis vs Others (Same Model)
 
