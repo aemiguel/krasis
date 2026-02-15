@@ -231,6 +231,89 @@ The auto-optimiser was run on DeepSeek-V2-Lite (27 MoE layers, 64 experts, top-6
 6. **HCS uses more VRAM** (12.8 GB vs 9.3 GB) for hot expert pinning, but doesn't help decode on this model
 7. **LRU uses excessive VRAM** (14.4 GB) without any decode benefit over compact
 
+### Qwen3-Coder-Next — Auto-Optimiser Strategy Comparison (2 GPUs)
+
+The auto-optimiser was run on Qwen3-Coder-Next (48 MoE layers, 512 experts, top-10, hybrid linear+GQA attention) with PP=[24,24] across 2 GPUs. Each strategy was tested with 3 runs, 10K token prefill prompt, 64 decode tokens.
+
+**Quantization**: INT4 Marlin GPU experts, INT4 CPU experts, FP8 KV cache, INT8 attention weights.
+
+**Prefill strategies** (ranked by tok/s):
+
+| Strategy | Avg tok/s | Avg TTFT (s) | VRAM (MB) | Divisor |
+|----------|----------|-------------|-----------|---------|
+| layer_grouped_4 | 618.8 | 16.17 | 9,389+9,234 | 4 |
+| hcs_prefill | 603.0 | 16.59 | 12,606+12,597 | -3 |
+| chunked | 154.7 | 64.63 | 10,202+10,045 | 0 |
+| active_only | 121.0 | 82.66 | 10,211+10,054 | -1 |
+| persistent | CUDA OOM | — | — | 1 |
+| layer_grouped_2 | CUDA OOM | — | — | 2 |
+
+**Decode strategies** (ranked by tok/s):
+
+| Strategy | Avg tok/s | VRAM (MB) | Divisor |
+|----------|----------|-----------|---------||
+| **pure_cpu** | **7.26** | **9,371+9,215** | null |
+| hcs_hybrid | 7.02 | 12,271+12,271 | -3 |
+| compact | 4.99 | 10,202+10,045 | -1 |
+| lru | 4.90 | 14,099+14,104 | -2 |
+
+**Winner**: layer_grouped_4 prefill (618.8 tok/s) + pure_cpu decode (7.26 tok/s)
+
+#### Key Observations (Coder-Next)
+
+1. **Layer-grouped(4) barely beats HCS prefill** (619 vs 603 tok/s, 3%) — both achieve ~600+ tok/s
+2. **Persistent and layer_grouped(2) OOM** — 512 experts × 48 MoE layers is too large for 16GB VRAM at divisor ≤ 2
+3. **pure_cpu decode is fastest** (7.26 tok/s) — beats HCS hybrid (7.02) by only 3%, but uses less VRAM
+4. **Compact/LRU decode is ~30% slower** (5.0/4.9 tok/s) — GPU kernel launch overhead dominates at M=1 with small experts
+5. **Chunked and active_only prefill are 4-5x slower** than the best — per-layer DMA overhead with 512 experts is crippling
+
+### Qwen3-235B-A22B — Auto-Optimiser Strategy Comparison (2 GPUs)
+
+The auto-optimiser was run on Qwen3-235B-A22B (94 MoE layers, 128 experts, top-8, MLA attention) with PP=[47,47] across 2 GPUs. Each strategy was tested with 3 runs, 10K token prefill prompt, 64 decode tokens.
+
+**Quantization**: INT4 Marlin GPU experts, INT4 CPU experts, FP8 KV cache, INT8 attention weights.
+
+**Prefill strategies** (ranked by tok/s):
+
+| Strategy | Avg tok/s | Avg TTFT (s) | VRAM (MB) | Divisor |
+|----------|----------|-------------|-----------|---------|
+| hcs_prefill | 210.8 | 47.45 | 12,790+12,800 | -3 |
+| chunked | 55.9 | 178.87 | 13,325+13,014 | 0 |
+| active_only | 47.3 | 211.80 | 13,325+13,014 | -1 |
+| persistent | CUDA OOM | — | — | 1 |
+| layer_grouped_2 | CUDA OOM | — | — | 2 |
+| layer_grouped_4 | CUDA OOM | — | — | 4 |
+
+**Decode strategies** (ranked by tok/s):
+
+| Strategy | Avg tok/s | VRAM (MB) | Divisor |
+|----------|----------|-----------|---------||
+| **pure_cpu** | **1.81** | **12,079+11,768** | null |
+| hcs_hybrid | 1.77 | 12,780+12,800 | -3 |
+| compact | 0.23 | 13,325+13,014 | -1 |
+| lru | 0.23 | 16,030+14,427 | -2 |
+
+**Winner**: hcs_prefill (210.8 tok/s) + pure_cpu decode (1.81 tok/s)
+
+#### Key Observations (Qwen3-235B-A22B)
+
+1. **HCS prefill is the ONLY viable strategy** — all layer_grouped and persistent OOM due to enormous expert size (128 × 3072 intermediate = 9.7 MB/expert × 94 layers = 117 GB total)
+2. **HCS achieves 3.8x better prefill** than chunked (211 vs 56 tok/s) by pinning hot experts and using 1-layer groups
+3. **pure_cpu and hcs_hybrid decode are nearly tied** (1.81 vs 1.77 tok/s) — both far superior to compact/LRU
+4. **Compact/LRU decode is catastrophically slow** (0.23 tok/s, 8x slower!) — only 6 compact layers fit in the AO buffer, so 88 of 94 layers do full per-expert DMA every token
+5. **Large expert size is the key differentiator** — 235B's 9.7 MB/expert (vs Coder-Next's 1.6 MB) makes DMA-based decode strategies unviable
+
+### Cross-Model Strategy Summary
+
+| Model | Best Prefill | Prefill tok/s | Best Decode | Decode tok/s | Key Factor |
+|-------|-------------|---------------|-------------|--------------|------------|
+| V2-Lite (1 GPU) | persistent | 1,757 | pure_cpu | 6.98 | Small experts → everything fits |
+| V2-Lite (2 GPU) | layer_grouped_2 | 1,729 | pure_cpu | 6.69 | 2nd GPU adds overhead |
+| Coder-Next (2 GPU) | layer_grouped_4 | 619 | pure_cpu | 7.26 | Medium experts, top-10, many layers |
+| 235B-A22B (2 GPU) | hcs_prefill | 211 | pure_cpu | 1.81 | Large experts, only HCS fits |
+
+**Universal finding**: pure_cpu decode wins on all models — GPU Marlin kernel launch overhead at M=1 exceeds any benefit from having experts on GPU.
+
 ## Conclusions
 
 TODO

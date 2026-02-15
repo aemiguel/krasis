@@ -1,5 +1,24 @@
 # Krasis Changelog
 
+## Qwen3-Coder-Next & Qwen3-235B Auto-Optimiser Benchmark — 2026-02-15
+
+### Benchmark
+Ran auto-optimiser on Qwen3-Coder-Next (48 layers, 512 experts) and Qwen3-235B-A22B (94 layers, 128 experts) with PP=2 across 2 GPUs. Tested all 6 prefill and 4 decode strategies with 3 runs each (10K prefill, 64 decode tokens).
+
+### Results
+- **Coder-Next**: layer_grouped_4 prefill (619 tok/s, TTFT 16.2s) + pure_cpu decode (7.26 tok/s)
+  - persistent/layer_grouped_2 OOM (512 experts too large)
+  - Optimise time: 834s
+- **235B-A22B**: hcs_prefill (211 tok/s, TTFT 47.4s) + pure_cpu decode (1.81 tok/s)
+  - persistent/layer_grouped_2/layer_grouped_4 ALL OOM (128×3072 experts = 9.7 MB each)
+  - compact/LRU decode catastrophically slow (0.23 tok/s) — only 6 compact layers fit
+  - Optimise time: 4124s
+- **Universal finding**: pure_cpu decode wins on ALL models (V2-Lite, Coder-Next, 235B)
+- Results saved to `tests/qwen3_coder_next_auto_2gpu.json` and `tests/qwen3_235b_a22b_auto_2gpu.json`
+- BENCHMARKS.md updated with full strategy comparison tables and cross-model summary
+
+---
+
 ## V2-Lite Auto-Optimiser Benchmark — 2026-02-15
 
 ### Benchmark
