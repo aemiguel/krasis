@@ -208,6 +208,47 @@ For comparison: SGLang ~200K lines, KTransformers ~50K lines. Krasis replaces bo
 
 ---
 
+## Strategy Analysis
+
+Auto-optimiser results comparing prefill/decode strategies across models. Each strategy tested with 3 runs (10K prefill, 64 decode tokens).
+
+### DeepSeek-V2-Lite — 1 GPU
+
+Winner: persistent (1,757 tok/s) + pure_cpu (6.98 tok/s)
+
+| Prefill | tok/s | Decode | tok/s |
+|---------|-------|--------|-------|
+| persistent | 1,757 | pure_cpu | 6.98 |
+| layer_grouped_2 | 1,746 | hcs_hybrid | 4.88 |
+| chunked | 792 | compact | 3.31 |
+| active_only | 303 | lru | 3.31 |
+
+### Qwen3-Coder-Next — 2 GPUs
+
+Winner: layer_grouped_4 (619 tok/s) + pure_cpu (7.26 tok/s)
+
+| Prefill | tok/s | Decode | tok/s |
+|---------|-------|--------|-------|
+| layer_grouped_4 | 619 | pure_cpu | 7.26 |
+| hcs_prefill | 603 | hcs_hybrid | 7.02 |
+| chunked | 155 | compact | 4.99 |
+| persistent | OOM | lru | 4.90 |
+
+### Qwen3-235B-A22B — 2 GPUs
+
+Winner: hcs_prefill (211 tok/s) + pure_cpu (1.81 tok/s)
+
+| Prefill | tok/s | Decode | tok/s |
+|---------|-------|--------|-------|
+| hcs_prefill | 211 | pure_cpu | 1.81 |
+| chunked | 56 | hcs_hybrid | 1.77 |
+| active_only | 47 | compact | 0.23 |
+| persistent | OOM | lru | 0.23 |
+
+**Universal finding**: pure_cpu decode wins on all models — GPU Marlin kernel launch overhead at M=1 exceeds any benefit from having experts on GPU.
+
+---
+
 ## What Would Help Most
 
 1. **DDR5 / Zen 4**: 2x memory bandwidth → ~8 tok/s decode
