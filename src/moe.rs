@@ -18,7 +18,7 @@ use crate::kernel::avx2::{
     quantize_activation_int16,
 };
 use crate::gguf_kernels::{expert_forward_gguf, GgufScratch};
-use crate::weights::marlin::{f32_to_bf16, DEFAULT_GROUP_SIZE};
+use crate::weights::marlin::{bf16_to_f32, f32_to_bf16, DEFAULT_GROUP_SIZE};
 use crate::weights::{ExpertWeights, GgufExpertWeights, QuantWeight, UnifiedExpertWeights, WeightStore};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes};
@@ -949,6 +949,24 @@ fn moe_worker(
 /// engine.load("/path/to/model", group_size=128)
 /// output = engine.moe_forward(0, activation_bf16_bytes, [1, 5, 12], [0.3, 0.5, 0.2])
 /// ```
+/// Per-layer routing weights for fused routing+MoE in Rust.
+struct LayerRouting {
+    /// Gate weight BF16 [n_experts, hidden_size] row-major
+    gate_weight: Vec<u16>,
+    /// Optional correction bias FP32 [n_experts] (Kimi K2.5)
+    correction_bias: Option<Vec<f32>>,
+}
+
+/// Routing config shared across all layers.
+#[derive(Clone)]
+struct RoutingConfig {
+    scoring_func: String,    // "sigmoid" or "softmax"
+    norm_topk_prob: bool,
+    topk: usize,
+    n_experts: usize,
+    hidden_size: usize,
+}
+
 #[pyclass]
 pub struct KrasisEngine {
     store: Option<Arc<WeightStore>>,
@@ -973,6 +991,14 @@ pub struct KrasisEngine {
     result_rx: Option<Mutex<mpsc::Receiver<Vec<u16>>>>,
     /// Async worker: thread handle (Mutex for Sync).
     worker_handle: Option<Mutex<JoinHandle<()>>>,
+    /// Per-layer routing weights for fused routing+MoE (indexed by moe_layer_idx).
+    layer_routing: Vec<Option<LayerRouting>>,
+    /// Routing config (set once via set_routing_config).
+    routing_config: Option<RoutingConfig>,
+    /// Pre-allocated scratch for routing: logits [n_experts] f32
+    routing_logits: Vec<f32>,
+    /// Pre-allocated scratch for routing: scores [n_experts] f32
+    routing_scores: Vec<f32>,
 }
 
 impl Drop for KrasisEngine {
@@ -1017,6 +1043,10 @@ impl KrasisEngine {
             work_tx: None,
             result_rx: None,
             worker_handle: None,
+            layer_routing: Vec::new(),
+            routing_config: None,
+            routing_logits: Vec::new(),
+            routing_scores: Vec::new(),
         }
     }
 
@@ -1214,6 +1244,7 @@ impl KrasisEngine {
         self.gguf_scratch = gguf_scratch;
         self.gguf_scratch_pool = gguf_scratch_pool;
         self.gguf_shared_scratch = gguf_shared_scratch;
+        self.numa_map = numa_map;
         self.work_tx = Some(work_tx);
         self.result_rx = Some(Mutex::new(result_rx));
         self.worker_handle = Some(Mutex::new(handle));
@@ -1986,6 +2017,371 @@ impl KrasisEngine {
         };
 
         Ok(PyBytes::new(py, output_bytes))
+    }
+
+    /// Synchronous MoE forward — runs compute directly on the calling thread.
+    ///
+    /// Unlike submit_forward + sync_forward, this:
+    /// - Makes ONE PyO3 boundary crossing instead of TWO
+    /// - Runs compute on the calling thread (no channel send/recv overhead)
+    /// - Reads input and writes output via raw pointers (no Vec allocation or copy)
+    ///
+    /// The caller passes data pointers from pre-allocated pinned CPU tensors.
+    /// `output_ptr` must point to batch_size × hidden_size × 2 bytes of writable memory.
+    ///
+    /// For M=1 decode, this eliminates ~0.5ms of overhead per layer.
+    pub fn forward_moe_direct(
+        &mut self,
+        _py: Python<'_>,
+        moe_layer_idx: usize,
+        activation_ptr: usize,  // *const u16, BF16 [batch_size, hidden]
+        topk_ids_ptr: usize,    // *const i32, [batch_size, topk]
+        topk_weights_ptr: usize, // *const f32, [batch_size, topk]
+        output_ptr: usize,      // *mut u16, BF16 [batch_size, hidden]
+        batch_size: usize,
+        topk: usize,
+    ) -> PyResult<()> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Model not loaded — call load() first"))?;
+
+        let hidden = store.config.hidden_size;
+        let use_gguf = store.has_gguf();
+
+        // Reinterpret raw pointers to typed slices (caller guarantees validity)
+        let activations: &[u16] = unsafe {
+            std::slice::from_raw_parts(activation_ptr as *const u16, batch_size * hidden)
+        };
+        let topk_ids: &[i32] = unsafe {
+            std::slice::from_raw_parts(topk_ids_ptr as *const i32, batch_size * topk)
+        };
+        let topk_weights: &[f32] = unsafe {
+            std::slice::from_raw_parts(topk_weights_ptr as *const f32, batch_size * topk)
+        };
+        let output_bf16: &mut [u16] = unsafe {
+            std::slice::from_raw_parts_mut(output_ptr as *mut u16, batch_size * hidden)
+        };
+
+        // Zero output
+        output_bf16.fill(0);
+
+        // Get mutable refs to scratch buffers on self
+        let output_f32 = &mut self.output_buf;
+        let scratch = self.scratch.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Scratch buffer not initialized"))?;
+        let scratch_pool = &mut self.scratch_pool;
+        let shared_scratch = &mut self.shared_scratch;
+        let mut gguf_scratch = self.gguf_scratch.as_mut();
+        let gguf_scratch_pool = &mut self.gguf_scratch_pool;
+        let gguf_shared_scratch = &mut self.gguf_shared_scratch;
+        let parallel = self.parallel;
+        let numa_map = self.numa_map.as_ref();
+        let _skip_shared = self.skip_shared_experts;
+
+        for b in 0..batch_size {
+            let act = &activations[b * hidden..(b + 1) * hidden];
+            let ids_raw = &topk_ids[b * topk..(b + 1) * topk];
+            let weights_raw = &topk_weights[b * topk..(b + 1) * topk];
+
+            // Filter masked experts (id == -1 means GPU-handled)
+            let mut expert_indices = Vec::with_capacity(topk);
+            let mut expert_weights = Vec::with_capacity(topk);
+            for j in 0..topk {
+                if ids_raw[j] >= 0 {
+                    expert_indices.push(ids_raw[j] as usize);
+                    expert_weights.push(weights_raw[j]);
+                }
+            }
+
+            if expert_indices.is_empty() {
+                continue;
+            }
+
+            output_f32.fill(0.0);
+            if use_gguf {
+                if let Some(ref mut gs) = gguf_scratch {
+                    moe_forward_gguf(
+                        store, moe_layer_idx, act,
+                        &expert_indices, &expert_weights,
+                        output_f32, gs, gguf_scratch_pool,
+                        gguf_shared_scratch,
+                        parallel, numa_map,
+                    );
+                }
+            } else if store.has_unified() {
+                moe_forward_unified(
+                    store, moe_layer_idx, act,
+                    &expert_indices, &expert_weights,
+                    output_f32, scratch, scratch_pool,
+                    shared_scratch,
+                    parallel, numa_map,
+                );
+            } else {
+                moe_forward(
+                    store, moe_layer_idx, act,
+                    &expert_indices, &expert_weights,
+                    output_f32, scratch, scratch_pool,
+                    shared_scratch,
+                    parallel, numa_map,
+                );
+            }
+
+            // Convert f32 → BF16
+            let out_slice = &mut output_bf16[b * hidden..(b + 1) * hidden];
+            for j in 0..hidden {
+                out_slice[j] = f32_to_bf16(output_f32[j]);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set routing config (scoring function, normalization, topk).
+    /// Must be called before set_routing_weights or forward_moe_routed.
+    pub fn set_routing_config(
+        &mut self,
+        _py: Python<'_>,
+        scoring_func: &str,
+        norm_topk_prob: bool,
+        topk: usize,
+        n_experts: usize,
+        hidden_size: usize,
+        num_moe_layers: usize,
+    ) -> PyResult<()> {
+        self.routing_config = Some(RoutingConfig {
+            scoring_func: scoring_func.to_string(),
+            norm_topk_prob,
+            topk,
+            n_experts,
+            hidden_size,
+        });
+        self.layer_routing = (0..num_moe_layers).map(|_| None).collect();
+        self.routing_logits = vec![0.0f32; n_experts];
+        self.routing_scores = vec![0.0f32; n_experts];
+        log::info!(
+            "Routing config set: scoring={}, norm_topk={}, topk={}, n_experts={}, hidden={}",
+            scoring_func, norm_topk_prob, topk, n_experts, hidden_size,
+        );
+        Ok(())
+    }
+
+    /// Set gate weights for a specific MoE layer.
+    /// gate_weight_bf16: [n_experts * hidden_size * 2] bytes, BF16 row-major.
+    /// correction_bias_f32: optional [n_experts * 4] bytes, FP32.
+    #[pyo3(signature = (moe_layer_idx, gate_weight_bf16, correction_bias_f32=None))]
+    pub fn set_routing_weights(
+        &mut self,
+        _py: Python<'_>,
+        moe_layer_idx: usize,
+        gate_weight_bf16: &[u8],
+        correction_bias_f32: Option<&[u8]>,
+    ) -> PyResult<()> {
+        let rcfg = self.routing_config.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Call set_routing_config first"))?;
+
+        let expected = rcfg.n_experts * rcfg.hidden_size * 2;
+        if gate_weight_bf16.len() != expected {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Expected {} gate bytes, got {}", expected, gate_weight_bf16.len())
+            ));
+        }
+
+        let gate: &[u16] = unsafe {
+            std::slice::from_raw_parts(
+                gate_weight_bf16.as_ptr() as *const u16,
+                rcfg.n_experts * rcfg.hidden_size,
+            )
+        };
+
+        let bias = if let Some(bias_bytes) = correction_bias_f32 {
+            let expected_bias = rcfg.n_experts * 4;
+            if bias_bytes.len() != expected_bias {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("Expected {} bias bytes, got {}", expected_bias, bias_bytes.len())
+                ));
+            }
+            let b: &[f32] = unsafe {
+                std::slice::from_raw_parts(
+                    bias_bytes.as_ptr() as *const f32,
+                    rcfg.n_experts,
+                )
+            };
+            Some(b.to_vec())
+        } else {
+            None
+        };
+
+        if moe_layer_idx >= self.layer_routing.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("moe_layer_idx {} >= num_moe_layers {}", moe_layer_idx, self.layer_routing.len())
+            ));
+        }
+
+        self.layer_routing[moe_layer_idx] = Some(LayerRouting {
+            gate_weight: gate.to_vec(),
+            correction_bias: bias,
+        });
+        Ok(())
+    }
+
+    /// Fused routing + MoE forward — single PyO3 call for M=1 decode.
+    ///
+    /// Takes only hidden state. Does gate matmul, topk, expert dispatch, returns output.
+    /// Eliminates: GPU routing kernels, topk_ids/weights transfer, Python routing code.
+    pub fn forward_moe_routed(
+        &mut self,
+        _py: Python<'_>,
+        moe_layer_idx: usize,
+        activation_ptr: usize,  // *const u16, BF16 [1, hidden]
+        output_ptr: usize,      // *mut u16, BF16 [1, hidden]
+    ) -> PyResult<()> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Model not loaded"))?;
+        let rcfg = self.routing_config.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Routing config not set"))?
+            .clone();
+
+        let routing = self.layer_routing.get(moe_layer_idx)
+            .and_then(|r| r.as_ref())
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Routing weights not set for layer {}", moe_layer_idx)))?;
+
+        let hidden = rcfg.hidden_size;
+        let n_experts = rcfg.n_experts;
+        let topk = rcfg.topk;
+
+        let activation: &[u16] = unsafe {
+            std::slice::from_raw_parts(activation_ptr as *const u16, hidden)
+        };
+        let output_bf16: &mut [u16] = unsafe {
+            std::slice::from_raw_parts_mut(output_ptr as *mut u16, hidden)
+        };
+
+        // ── Gate matmul: [1, hidden] × [n_experts, hidden]^T → [n_experts] ──
+        // Convert activation BF16 → F32
+        let logits = &mut self.routing_logits;
+        let scores = &mut self.routing_scores;
+        let gate = &routing.gate_weight;
+
+        // Dot product for each expert
+        for e in 0..n_experts {
+            let row = &gate[e * hidden..(e + 1) * hidden];
+            let mut sum = 0.0f32;
+            // AVX2-friendly loop — compiler will auto-vectorize
+            for j in 0..hidden {
+                sum += bf16_to_f32(activation[j]) * bf16_to_f32(row[j]);
+            }
+            logits[e] = sum;
+        }
+
+        // ── Scoring ──
+        if rcfg.scoring_func == "sigmoid" {
+            for e in 0..n_experts {
+                scores[e] = 1.0 / (1.0 + (-logits[e]).exp());
+            }
+        } else {
+            // Softmax
+            let max_val = logits[..n_experts].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f32;
+            for e in 0..n_experts {
+                scores[e] = (logits[e] - max_val).exp();
+                sum_exp += scores[e];
+            }
+            for e in 0..n_experts {
+                scores[e] /= sum_exp;
+            }
+        }
+
+        // ── Correction bias + TopK selection ──
+        // If bias exists, add it to scores for SELECTION only
+        let mut selection_scores = scores.clone();
+        if let Some(ref bias) = routing.correction_bias {
+            for e in 0..n_experts {
+                selection_scores[e] += bias[e];
+            }
+        }
+
+        // Find topk by partial sort
+        let mut top_indices = Vec::with_capacity(topk);
+        let mut top_weights = Vec::with_capacity(topk);
+        let mut used = vec![false; n_experts];
+
+        for _ in 0..topk {
+            let mut best_idx = 0;
+            let mut best_score = f32::NEG_INFINITY;
+            for e in 0..n_experts {
+                if !used[e] && selection_scores[e] > best_score {
+                    best_score = selection_scores[e];
+                    best_idx = e;
+                }
+            }
+            used[best_idx] = true;
+            top_indices.push(best_idx);
+            // Use ORIGINAL scores (without bias) for weights
+            top_weights.push(scores[best_idx]);
+        }
+
+        // ── Normalize weights ──
+        if rcfg.norm_topk_prob {
+            let sum: f32 = top_weights.iter().sum();
+            if sum > 0.0 {
+                for w in top_weights.iter_mut() {
+                    *w /= sum;
+                }
+            }
+        }
+
+        // ── MoE forward ──
+        output_bf16.fill(0);
+        let output_f32 = &mut self.output_buf;
+        let scratch = self.scratch.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Scratch not initialized"))?;
+        let scratch_pool = &mut self.scratch_pool;
+        let shared_scratch = &mut self.shared_scratch;
+        let use_gguf = store.has_gguf();
+        let parallel = self.parallel;
+        let numa_map = self.numa_map.as_ref();
+
+        output_f32.fill(0.0);
+        if use_gguf {
+            if let Some(ref mut gs) = self.gguf_scratch {
+                moe_forward_gguf(
+                    store, moe_layer_idx, activation,
+                    &top_indices, &top_weights,
+                    output_f32, gs, &mut self.gguf_scratch_pool,
+                    &mut self.gguf_shared_scratch,
+                    parallel, numa_map,
+                );
+            }
+        } else if store.has_unified() {
+            moe_forward_unified(
+                store, moe_layer_idx, activation,
+                &top_indices, &top_weights,
+                output_f32, scratch, scratch_pool,
+                shared_scratch,
+                parallel, numa_map,
+            );
+        } else {
+            moe_forward(
+                store, moe_layer_idx, activation,
+                &top_indices, &top_weights,
+                output_f32, scratch, scratch_pool,
+                shared_scratch,
+                parallel, numa_map,
+            );
+        }
+
+        // Convert f32 → BF16
+        for j in 0..hidden {
+            output_bf16[j] = f32_to_bf16(output_f32[j]);
+        }
+
+        Ok(())
     }
 }
 

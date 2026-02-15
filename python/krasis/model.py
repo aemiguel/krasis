@@ -16,6 +16,7 @@ import time
 from math import ceil
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from krasis.timing import TIMING
@@ -498,16 +499,46 @@ class KrasisModel:
 
         self.krasis_engine = engine
 
-        # Wire engine to all MoE layers
+        # Wire engine to all MoE layers + allocate pinned buffers for fused dispatch
         first_k = self.cfg.first_k_dense_replace
         for layer in self.layers:
             if layer.is_moe:
                 layer.krasis_engine = engine
+                # Allocate pinned CPU buffers for zero-alloc M=1 dispatch
+                if layer._cpu_act_buf is None:
+                    layer._cpu_act_buf = torch.empty(1, self.cfg.hidden_size, dtype=torch.bfloat16, pin_memory=True)
+                    layer._cpu_ids_buf = torch.empty(1, self.cfg.num_experts_per_tok, dtype=torch.int32, pin_memory=True)
+                    layer._cpu_wts_buf = torch.empty(1, self.cfg.num_experts_per_tok, dtype=torch.float32, pin_memory=True)
+                    layer._cpu_out_buf = torch.empty(1, self.cfg.hidden_size, dtype=torch.bfloat16, pin_memory=True)
+                    layer._gpu_out_buf = torch.empty(1, self.cfg.hidden_size, dtype=torch.bfloat16, device=layer.device)
 
         logger.info(
             "Krasis engine: %d MoE layers, %d experts, hidden=%d",
             engine.num_moe_layers(), engine.num_experts(), engine.hidden_size(),
         )
+
+        # ── Send routing weights to Rust for fused routing+MoE (M=1 decode) ──
+        num_moe_layers = self.cfg.num_hidden_layers - self.cfg.first_k_dense_replace
+        engine.set_routing_config(
+            scoring_func=self.cfg.scoring_func,
+            norm_topk_prob=self.cfg.norm_topk_prob,
+            topk=self.cfg.num_experts_per_tok,
+            n_experts=self.cfg.n_routed_experts,
+            hidden_size=self.cfg.hidden_size,
+            num_moe_layers=num_moe_layers,
+        )
+        moe_idx = 0
+        for layer in self.layers:
+            if layer.is_moe:
+                gw = layer.gate_weight.cpu().contiguous()
+                gw_bytes = gw.view(torch.uint16).numpy().view(np.uint8).tobytes()
+                bias_bytes = None
+                if layer.e_score_correction_bias is not None:
+                    bias = layer.e_score_correction_bias.cpu().float().contiguous()
+                    bias_bytes = bias.numpy().view(np.uint8).tobytes()
+                engine.set_routing_weights(moe_idx, gw_bytes, bias_bytes)
+                moe_idx += 1
+        logger.info("Routing weights sent to Rust engine (%d MoE layers)", moe_idx)
 
     def _init_gpu_prefill(self):
         """Create GpuPrefillManager per device and wire to MoE layers."""
