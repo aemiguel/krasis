@@ -892,8 +892,14 @@ class Launcher:
         self.script_dir = os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)
         )))  # krasis repo root
-        self.config_file = os.path.join(self.script_dir, ".krasis_config")
-        self.models_dir = os.path.join(self.script_dir, "models")
+        self.krasis_home = os.environ.get(
+            "KRASIS_HOME",
+            os.path.join(os.path.expanduser("~"), ".krasis"),
+        )
+        os.makedirs(self.krasis_home, exist_ok=True)
+        self.config_file = os.path.join(self.krasis_home, "config")
+        self.models_dir = os.path.join(self.krasis_home, "models")
+        os.makedirs(self.models_dir, exist_ok=True)
         self.hw = detect_hardware()
         self.cfg = LauncherConfig()
         self.model_info: Optional[Dict[str, Any]] = None
@@ -1087,10 +1093,16 @@ class Launcher:
             print("Error: interactive mode requires a Unix terminal", file=sys.stderr)
             return False
 
+        print(f"Krasis home: {self.krasis_home}")
+        print(f"Models dir:  {self.models_dir}")
+        print(f"(Set KRASIS_HOME to change, caches can grow large)\n")
+
         # Step 1: Native model selection (safetensors only)
         models = scan_models(self.models_dir, native_only=True)
         if not models:
             print(f"No native models found in {self.models_dir}", file=sys.stderr)
+            print(f"Download a model with: huggingface-cli download <model> --local-dir {self.models_dir}/<name>",
+                  file=sys.stderr)
             return False
 
         _hide_cursor()
@@ -1241,6 +1253,8 @@ class Launcher:
         """Print non-interactive launch summary."""
         model_name = os.path.basename(self.cfg.model_path)
         print(f"\n{BOLD}Krasis Launch Configuration{NC}")
+        print(f"  Krasis home:     {self.krasis_home}")
+        print(f"  Models dir:      {self.models_dir}")
         print(f"  Model:           {model_name}")
         if self.cfg.gguf_path:
             print(f"  CPU experts:     GGUF ({os.path.basename(self.cfg.gguf_path)})")

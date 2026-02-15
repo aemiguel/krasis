@@ -30,8 +30,8 @@ Config: PP=[27], persistent prefill, pure_cpu decode, FP8 KV, INT8 attention
 
 | GPUs | GPU Quant | CPU Quant | Prefill (tok/s) | TTFT (s) | Decode (tok/s) | ms/tok | Log |
 |------|-----------|-----------|-----------------|----------|----------------|--------|-----|
-| 1 | INT4 | INT4 | 55.2 | 181.2 | 10.00 | 100 | [log](benchmarks/Qwen3-Coder-Next_native_1gpu_int4gpu_int4cpu.log) |
-| 1 | INT4 | INT8 | 55.0 | 181.7 | 5.99 | 167 | [log](benchmarks/Qwen3-Coder-Next_native_1gpu_int4gpu_int8cpu.log) |
+| 1 | INT4 | INT4 | 570 | 17.6 | 10.26 | 97 | [log](benchmarks/Qwen3-Coder-Next_native_1gpu_int4gpu_int4cpu.log) |
+| 1 | INT4 | INT8 | 570 | 17.5 | 6.32 | 158 | [log](benchmarks/Qwen3-Coder-Next_native_1gpu_int4gpu_int8cpu.log) |
 | 2 | INT4 | INT4 | 546 | 18.6 | 10.03 | 100 | [log](benchmarks/Qwen3-Coder-Next_native_2gpu_int4gpu_int4cpu.log) |
 | 2 | INT4 | INT8 | 546 | 18.6 | 6.32 | 160 | [log](benchmarks/Qwen3-Coder-Next_native_2gpu_int4gpu_int8cpu.log) |
 
