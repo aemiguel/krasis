@@ -9,6 +9,9 @@ Contact: see the Google Forms link on my GitHub profile
 ## Quick Start
 
 ```bash
+# Prerequisites (Ubuntu/Debian)
+sudo apt update && sudo apt install python3.12-venv
+
 # Clone and run — everything else is automatic
 git clone https://github.com/brontoguana/krasis.git
 cd krasis

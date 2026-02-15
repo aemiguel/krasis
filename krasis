@@ -16,6 +16,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 
+# Detect platform: Windows (Git Bash/MSYS/Cygwin) uses Scripts/, Unix uses bin/
+if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
+    VENV_BIN="Scripts"
+else
+    VENV_BIN="bin"
+fi
+
 # ═══════════════════════════════════════════════════════════════════════
 # Utilities
 # ═══════════════════════════════════════════════════════════════════════
@@ -58,8 +65,8 @@ done
 phase_setup() {
     if $SKIP_SETUP; then
         info "Skipping setup checks (--skip-setup)"
-        if [[ -f "$VENV_DIR/bin/activate" ]]; then
-            source "$VENV_DIR/bin/activate"
+        if [[ -f "$VENV_DIR/$VENV_BIN/activate" ]]; then
+            source "$VENV_DIR/$VENV_BIN/activate"
         fi
         return 0
     fi
@@ -83,11 +90,26 @@ phase_setup() {
     info "Python $py_version"
 
     # Venv
-    if [[ ! -d "$VENV_DIR" ]]; then
+    if [[ ! -d "$VENV_DIR" ]] || [[ ! -f "$VENV_DIR/$VENV_BIN/activate" ]]; then
+        # Clean up partial venv if activate is missing
+        if [[ -d "$VENV_DIR" ]] && [[ ! -f "$VENV_DIR/$VENV_BIN/activate" ]]; then
+            warn "Incomplete venv detected, recreating..."
+            rm -rf "$VENV_DIR"
+        fi
         info "Creating virtual environment at $VENV_DIR ..."
-        python3 -m venv "$VENV_DIR"
+        if ! python3 -m venv "$VENV_DIR" 2>&1; then
+            err "Failed to create virtual environment."
+            err "On Ubuntu/Debian, install: sudo apt install python${py_version}-venv"
+            exit 1
+        fi
+        if [[ ! -f "$VENV_DIR/$VENV_BIN/activate" ]]; then
+            err "Virtual environment created but activate script is missing."
+            err "On Ubuntu/Debian, install: sudo apt install python${py_version}-venv"
+            rm -rf "$VENV_DIR"
+            exit 1
+        fi
     fi
-    source "$VENV_DIR/bin/activate"
+    source "$VENV_DIR/$VENV_BIN/activate"
     info "Venv active: $(which python3)"
 
     # Check krasis importable
@@ -166,8 +188,8 @@ phase_setup
 
 # Determine python binary
 PYTHON_BIN="python3"
-if [[ -f "$VENV_DIR/bin/python" ]]; then
-    PYTHON_BIN="$VENV_DIR/bin/python"
+if [[ -f "$VENV_DIR/$VENV_BIN/python" ]]; then
+    PYTHON_BIN="$VENV_DIR/$VENV_BIN/python"
 fi
 
 # Hand off to Python launcher for everything else
