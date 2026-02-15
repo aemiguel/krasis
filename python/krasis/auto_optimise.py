@@ -566,10 +566,10 @@ def _load_cached(model) -> Optional[Dict]:
 def _apply_result(model, result: Dict):
     """Configure a loaded KrasisModel based on auto-optimise results.
 
-    Strategy selection logic:
-    - Use decode winner's divisor (decode is sustained user experience)
-    - Unless it severely hurts prefill (>3x slower TTFT)
-    - For pure_cpu decode: keep GPU prefill enabled but with best prefill divisor
+    Strategy selection: GPU PREFILL FIRST.
+    - Prefill latency (TTFT) is the primary user-facing bottleneck
+    - Decode differences between strategies are typically <5%
+    - Pick the best prefill strategy, then use the decode mode it provides
     """
     best_decode = result["best_decode"]
     best_prefill = result["best_prefill"]
@@ -592,22 +592,17 @@ def _apply_result(model, result: Dict):
     gc.collect()
     torch.cuda.empty_cache()
 
-    if best_decode == "pure_cpu":
-        # CPU decode: use GPU for prefill only (large prompts)
-        # Keep prefill divisor for GPU prefill, threshold high so M=1 stays CPU
-        model.gpu_prefill_enabled = True
-        model.expert_divisor = prefill_divisor if prefill_divisor is not None else 0
-        model.gpu_prefill_threshold = 300
-        model._init_gpu_prefill()
-        logger.info(
-            "Strategy: pure_cpu decode, GPU prefill with divisor=%d, threshold=%d",
-            model.expert_divisor, model.gpu_prefill_threshold,
-        )
-    elif best_decode == "hcs_hybrid":
-        # HCS: hot experts on GPU (static), cold on CPU (parallel)
+    # ── PREFILL-FIRST strategy selection ──
+    # The prefill winner determines the GPU infrastructure;
+    # decode uses whatever that infrastructure provides for M=1.
+
+    if best_prefill == "hcs_prefill":
+        # HCS won prefill — use HCS for both prefill and decode.
+        # HCS prefill: hot experts pre-loaded + layer-grouped DMA for cold → 500+ tok/s
+        # HCS decode: hot experts from VRAM, cold DMA'd per token → competitive decode
         model.gpu_prefill_enabled = True
         model.expert_divisor = -3
-        model.gpu_prefill_threshold = 1  # GPU handles all, including M=1
+        model.gpu_prefill_threshold = 1
         model._init_gpu_prefill()
 
         # Initialize HCS with heatmap
@@ -615,34 +610,77 @@ def _apply_result(model, result: Dict):
             manager._init_hot_cached_static(
                 heatmap_path=heatmap_path if os.path.exists(heatmap_path) else None,
             )
-        logger.info("Strategy: hcs_hybrid, threshold=1, heatmap=%s", heatmap_path)
+        logger.info(
+            "Strategy: HCS (prefill winner), threshold=1, heatmap=%s",
+            heatmap_path,
+        )
 
-    elif best_decode == "compact":
-        # Compact: cross-token LRU caching in per-layer VRAM slots
+    elif best_prefill in ("persistent", "layer_grouped_2", "layer_grouped_4"):
+        # Layer-grouped or persistent won prefill — use that for prefill,
+        # then pick decode: if decode winner needs GPU (lru/compact/hcs), use it;
+        # otherwise pure_cpu decode with GPU prefill for large prompts.
         model.gpu_prefill_enabled = True
-        model.expert_divisor = -1
-        model.gpu_prefill_threshold = 1
-        model._init_gpu_prefill()
-        logger.info("Strategy: compact (active_only with cross-token caching), threshold=1")
+        model.expert_divisor = prefill_divisor if prefill_divisor is not None else 4
 
-    elif best_decode == "lru":
-        # LRU: cross-layer LRU expert caching
-        model.gpu_prefill_enabled = True
-        model.expert_divisor = -2
-        model.gpu_prefill_threshold = 1
+        if best_decode in ("lru", "compact", "hcs_hybrid"):
+            # Decode wants GPU — but we can't run two modes simultaneously.
+            # Use the prefill divisor for large prompts, CPU for M=1.
+            model.gpu_prefill_threshold = 300
+            logger.info(
+                "Strategy: %s prefill (div=%d), pure_cpu decode (threshold=300) "
+                "[decode winner %s incompatible with prefill mode]",
+                best_prefill, model.expert_divisor, best_decode,
+            )
+        else:
+            # pure_cpu decode — straightforward
+            model.gpu_prefill_threshold = 300
+            logger.info(
+                "Strategy: %s prefill (div=%d), pure_cpu decode (threshold=300)",
+                best_prefill, model.expert_divisor,
+            )
         model._init_gpu_prefill()
-        logger.info("Strategy: lru, threshold=1")
 
     else:
-        # Fallback: use decode divisor directly
-        if decode_divisor is not None:
-            model.gpu_prefill_enabled = True
-            model.expert_divisor = decode_divisor
+        # Fallback: chunked/active_only prefill, or unknown.
+        # Use decode winner's mode if it provides GPU decode.
+        model.gpu_prefill_enabled = True
+
+        if best_decode == "lru":
+            model.expert_divisor = -2
             model.gpu_prefill_threshold = 1
             model._init_gpu_prefill()
+            logger.info("Strategy: lru (fallback — no strong prefill winner)")
+
+        elif best_decode == "compact":
+            model.expert_divisor = -1
+            model.gpu_prefill_threshold = 1
+            model._init_gpu_prefill()
+            logger.info("Strategy: compact (fallback — no strong prefill winner)")
+
+        elif best_decode == "hcs_hybrid":
+            model.expert_divisor = -3
+            model.gpu_prefill_threshold = 1
+            model._init_gpu_prefill()
+            for manager in model.gpu_prefill_managers.values():
+                manager._init_hot_cached_static(
+                    heatmap_path=heatmap_path if os.path.exists(heatmap_path) else None,
+                )
+            logger.info("Strategy: hcs_hybrid (fallback — no strong prefill winner)")
+
+        elif best_decode == "pure_cpu":
+            model.expert_divisor = prefill_divisor if prefill_divisor is not None else 0
+            model.gpu_prefill_threshold = 300
+            model._init_gpu_prefill()
+            logger.info("Strategy: pure_cpu decode, prefill div=%d", model.expert_divisor)
+
         else:
-            model.gpu_prefill_enabled = False
-        logger.info("Strategy: fallback divisor=%s", decode_divisor)
+            if decode_divisor is not None:
+                model.expert_divisor = decode_divisor
+                model.gpu_prefill_threshold = 1
+                model._init_gpu_prefill()
+            else:
+                model.gpu_prefill_enabled = False
+            logger.info("Strategy: fallback divisor=%s", decode_divisor)
 
 
 # ══════════════════════════════════════════════════════════════════
