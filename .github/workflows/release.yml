@@ -21,13 +21,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libnuma-dev
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
-          before-script-linux: yum install -y numactl-devel
+          before-script-linux: |
+            yum install -y numactl-devel 2>/dev/null || dnf install -y numactl-devel 2>/dev/null || apt-get install -y libnuma-dev 2>/dev/null || true
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
