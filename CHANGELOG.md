@@ -1,5 +1,25 @@
 # Krasis Changelog
 
+## Qwen3-235B PP=2 HCS Hybrid Benchmark — 2026-02-15
+
+### Benchmark
+Ran Qwen3-235B-A22B with PP=2 (47+47 layers) HCS hybrid on 2x RTX 2000 Ada 16GB.
+Direct comparison with KTransformers and llama.cpp on the same model.
+
+### Results
+- Prefill: 198.1 tok/s avg (3.4x faster than KTransformers' 57.5, 6.0x faster than llama.cpp's 32.9)
+- TTFT: 43.9s avg (3.4x faster than KTransformers' 149.5s)
+- Decode: 1.65 tok/s avg (lower than KT's 4.85, expected with large expert dims)
+- 86 hot experts pinned (cuda:0=27, cuda:1=59)
+- VRAM: GPU0=12,963 MB, GPU1=12,968 MB, RAM: 223 GB
+
+### Files Changed
+- `tests/bench_qwen235b_pp2.py`: New PP=2 benchmark script
+- `BENCHMARKS.md`: Added PP=2 Krasis result + direct comparison table
+- `CHANGELOG.md`: This entry
+
+---
+
 ## Qwen3-235B HCS Hybrid Benchmark — 2026-02-14
 
 ### Benchmark

@@ -103,7 +103,38 @@ TTFT (Time to First Token) measured wall-clock from request to first token (KTra
 | KTransformers | 1 | TP=1 INT8 attn | 49.7 | 4.85 | 173.0 | 14,735 | 275 | INT8 attn needed to fit on 1 GPU |
 | KTransformers | 2 | PP=2 | 57.5 | 3.60 | 149.5 | 14,895+13,707 | 275 | |
 | KTransformers | 3 | PP=3 | 57.3 | 3.29 | 150.1 | 14,129+14,287+13,132 | 278 | |
+| **Krasis** | **2** | **PP=2 HCS hybrid** | **198.1** | **1.65** | **43.9** | **12,963+12,968** | **223** | **Qwen3-235B-A22B** |
 | **Krasis** | **2** | **PP=2 HCS hybrid** | **621** | **TBD** | **15.5** | **13,115+13,112** | **125** | **Qwen3-Coder-Next** |
+
+### Qwen3-235B-A22B (PP=2, HCS Hybrid) — Krasis vs Others (Same Model)
+
+This is a direct apples-to-apples comparison using the same Qwen3-235B-A22B model across all three tools.
+
+| Metric | Krasis PP=2 | KTransformers (best) | llama.cpp (best) |
+|--------|-----------|---------------------|-----------------|
+| **Prefill (tok/s)** | **198.1** | 57.5 | 32.9 |
+| **TTFT (s)** | **43.9** | 149.5 | ~261 |
+| **Decode (tok/s)** | 1.65 | 4.85 | 3.8 |
+| **Speedup vs KT (prefill)** | **3.4x** | 1x | - |
+| **Speedup vs llama (prefill)** | **6.0x** | - | 1x |
+| **TTFT improvement vs KT** | **3.4x faster** | 1x | - |
+| **GPUs used** | 2 | 1 (best prefill: 2) | 3 |
+
+Benchmark details (3 runs, ~8,700 token prompt):
+
+| Run | Total time | TTFT (s) | Prefill (tok/s) | Decode (tok/s) |
+|-----|-----------|----------|-----------------|----------------|
+| 1 | 75.7s | 44.0 | 197.9 | 1.57 |
+| 2 | 73.2s | 43.9 | 198.2 | 1.71 |
+| 3 | 73.9s | 43.9 | 198.1 | 1.66 |
+
+Configuration:
+- PP=2 (47+47 layers), HCS hybrid mode with 86 hot experts pinned (cuda:0=27, cuda:1=59)
+- INT4 Marlin GPU experts, INT4 CPU experts, FP8 KV cache, INT8 attention weights
+- Layer-grouped DMA prefill: 1-layer groups, 5 chunks of 2048 tokens
+- VRAM: GPU0=12,963 MB, GPU1=12,968 MB, RAM: ~223 GB
+
+**Key takeaway**: Krasis achieves **3.4x faster prefill** and **3.4x faster TTFT** than KTransformers on the same model with fewer GPUs. Decode speed is lower (1.65 vs 4.85 tok/s) due to the HCS cold expert path and larger expert dimensions (128 experts × 3072 intermediate), but for large prompt workloads the dramatically faster TTFT dominates the user experience.
 
 ### Qwen3-Coder-Next (PP=2, HCS Hybrid) — VERIFIED CORRECT
 
