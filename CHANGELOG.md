@@ -1,5 +1,20 @@
 # Krasis Changelog
 
+## v0.1.4: Server warmup + chat Ctrl-C fix — 2026-02-15
+
+### Server warmup
+- Server now runs a short generation (prefill + 5 decode tokens) before accepting requests
+- Eliminates ~80s cold-start penalty on first request (GPU kernel compilation, first DMA, etc.)
+- Health endpoint returns "loading" during warmup, "ok" only when truly ready
+- Warmup failure is non-fatal — server still starts
+
+### Chat client: Ctrl-C fix
+- Added SIGINT handler so Ctrl-C always exits cleanly
+- Set 0.5s socket timeout on streaming reads so KeyboardInterrupt propagates during generation
+- Previously Ctrl-C was swallowed by blocking `resp.readline()` during streaming
+
+---
+
 ## Feature: PyPI Publishing (pip install krasis) — 2026-02-15
 
 ### Changes

@@ -152,6 +152,36 @@ async def _blocking_response(request: GenerationRequest):
     }
 
 
+def _warmup_model(model: KrasisModel):
+    """Run a short generation to warm up GPU kernels, expert DMA, and CUDA caches.
+
+    This ensures the first real user request runs at normal speed instead of
+    paying cold-start penalties (kernel compilation, first DMA, etc.).
+    """
+    import torch
+
+    logger.info("Warming up model (short generation)...")
+    t0 = time.time()
+
+    try:
+        # Use generate() which handles all state setup/cleanup (KV, linear attn, etc.)
+        warmup_tokens = model.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Hi"}]
+        )
+        with torch.inference_mode():
+            model.generate(
+                warmup_tokens,
+                max_new_tokens=5,
+                temperature=0.6,
+            )
+
+        elapsed = time.time() - t0
+        logger.info("Warmup complete (%.1fs) — server ready at full speed", elapsed)
+    except Exception as e:
+        logger.warning("Warmup failed (non-fatal): %s", e)
+        # generate() cleans up its own state in its finally block
+
+
 def main():
     parser = argparse.ArgumentParser(description="Krasis standalone LLM server")
     parser.add_argument("--model-path", required=True, help="Path to HF model")
@@ -323,6 +353,9 @@ def main():
         from krasis.benchmark import KrasisBenchmark
         bench = KrasisBenchmark(_model)
         bench.run()
+
+    # ── Warmup: run a short generation so first real request is fast ──
+    _warmup_model(_model)
 
     logger.info("Model loaded, starting server on %s:%d", args.host, args.port)
 

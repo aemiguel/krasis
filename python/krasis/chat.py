@@ -13,6 +13,7 @@ import argparse
 import http.client
 import json
 import os
+import signal
 import sys
 import time
 import urllib.error
@@ -247,8 +248,17 @@ def stream_chat(
             raise RuntimeError(f"HTTP {resp.status}: {error_body[:500]}")
 
         full_text = ""
+        # Set a short socket timeout so readline() yields to KeyboardInterrupt
+        sock = resp.fp.raw._sock if hasattr(resp.fp, 'raw') else None
+        if sock is not None:
+            sock.settimeout(0.5)
+
         while True:
-            raw_line = resp.readline()
+            try:
+                raw_line = resp.readline()
+            except (TimeoutError, OSError):
+                # Socket timeout — check for interrupt and retry
+                continue
             if not raw_line:
                 break
 
@@ -397,6 +407,9 @@ def chat_loop(
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
+    # Ensure Ctrl-C always terminates cleanly (even during blocking I/O)
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+
     parser = argparse.ArgumentParser(
         description="Krasis Chat \u2014 interactive streaming chat client",
     )
