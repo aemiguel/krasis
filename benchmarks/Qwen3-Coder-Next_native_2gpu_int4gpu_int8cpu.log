@@ -1,0 +1,55 @@
+================================================================
+Krasis Benchmark — 2026-02-15 12:41:53
+================================================================
+Model:            Qwen3-Coder-Next
+Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
+PP Partition:     [24, 24] (2 GPUs)
+
+Hardware:
+  CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
+  RAM:            995 GB total, 114.2 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 6389 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 6240 MB allocated
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
+
+Quantization:
+  GPU experts:    INT4 (Marlin)
+  CPU experts:    INT8
+  Attention:      INT8
+  Shared expert:  INT8
+  Dense MLP:      INT8
+  LM head:        INT8
+  KV cache:       FP8 E4M3
+
+Strategy:
+  Expert divisor: 4 (layer_grouped(4))
+  Prefill threshold: 300
+  Mode:           pure_cpu decode, layer_grouped(4) prefill
+
+Prefill (10000 tokens, 3 runs):
+  Run 1:  461.8 tok/s, TTFT=21.65s
+  Run 2:  587.7 tok/s, TTFT=17.01s
+  Run 3:  587.6 tok/s, TTFT=17.02s
+  Average: 545.7 tok/s, TTFT=18.56s
+
+Decode (64 tokens, 3 runs):
+  Run 1:  6.98 tok/s (143.3ms/tok)
+  Run 2:  6.44 tok/s (155.4ms/tok)
+  Run 3:  5.54 tok/s (180.4ms/tok)
+  Average: 6.32 tok/s (159.7ms/tok)
+
+Verification:
+  Prefill prompt: user
+Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Describe database transaction isolation levels and their trade-offs. Discuss compiler optimization passes such as dead co... [63136 chars total]
+  Decode prompt:  Write a poem about recursion in programming.
+  Generated output (64 tokens):
+    **The Recursive Ladder**  
+    
+    A function calls itself—soft and low,  
+    A whisper in the code’s deep flow.  
+    Not chaos, but a pattern spun:  
+    A mirror held beneath the sun.  
+    
+    *“What is the sum of numbers, N?”*  
+    It asks, then splits the path
+================================================================

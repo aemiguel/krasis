@@ -1,0 +1,50 @@
+================================================================
+Krasis Benchmark — 2026-02-15 12:54:34
+================================================================
+Model:            Qwen3-235B-A22B
+Architecture:     qwen3_moe, 94 layers, 128 experts, top-8
+PP Partition:     [47, 47] (2 GPUs)
+
+Hardware:
+  CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
+  RAM:            995 GB total, 220.6 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 10441 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 10144 MB allocated
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
+
+Quantization:
+  GPU experts:    INT4 (Marlin)
+  CPU experts:    INT4
+  Attention:      INT8
+  Shared expert:  INT8
+  Dense MLP:      INT8
+  LM head:        INT8
+  KV cache:       FP8 E4M3
+
+Strategy:
+  Expert divisor: -3 (hot_cached_static)
+  Prefill threshold: 1
+  Mode:           gpu_decode (hot_cached_static)
+
+Prefill (10000 tokens, 3 runs):
+  Run 1:  195.6 tok/s, TTFT=51.13s
+  Run 2:  196.2 tok/s, TTFT=50.96s
+  Run 3:  195.9 tok/s, TTFT=51.05s
+  Average: 195.9 tok/s, TTFT=51.05s
+
+Decode (64 tokens, 3 runs):
+  Run 1:  1.36 tok/s (735.6ms/tok)
+  Run 2:  1.35 tok/s (741.7ms/tok)
+  Run 3:  1.39 tok/s (721.6ms/tok)
+  Average: 1.37 tok/s (733.0ms/tok)
+
+Verification:
+  Prefill prompt: user
+Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Describe database transaction isolation levels and their trade-offs. Discuss compiler optimization passes such as dead co... [63136 chars total]
+  Decode prompt:  Write a poem about recursion in programming.
+  Generated output (64 tokens):
+    <think>
+    Okay, I need to write a poem about recursion in programming. Hmm, recursion is when a function calls itself, right? So the poem should explain that concept in a creative way. Let me start by thinking of metaphors or imagery that represent recursion.
+    
+    Maybe like peeling an onion, layers upon layers?
+================================================================
