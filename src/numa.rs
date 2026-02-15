@@ -86,9 +86,12 @@ impl NumaAlloc {
 
 // ── libnuma FFI ─────────────────────────────────────────────────────
 //
-// We dynamically check if libnuma is available rather than linking at
-// compile time, so the binary works on systems without libnuma.
+// When built with libnuma (default on Linux with libnuma-dev installed),
+// we link directly. When built without (CI, minimal containers), the
+// cfg(no_numa) stubs return "not available" so everything falls back
+// to standard allocation.
 
+#[cfg(not(no_numa))]
 extern "C" {
     fn numa_available() -> libc::c_int;
     fn numa_max_node() -> libc::c_int;
@@ -98,6 +101,22 @@ extern "C" {
     fn numa_num_configured_cpus() -> libc::c_int;
     fn numa_run_on_node(node: libc::c_int) -> libc::c_int;
 }
+
+// Stubs when libnuma is not available at build time
+#[cfg(no_numa)]
+unsafe fn numa_available() -> libc::c_int { -1 }
+#[cfg(no_numa)]
+unsafe fn numa_max_node() -> libc::c_int { 0 }
+#[cfg(no_numa)]
+unsafe fn numa_alloc_onnode(_size: libc::size_t, _node: libc::c_int) -> *mut libc::c_void { std::ptr::null_mut() }
+#[cfg(no_numa)]
+unsafe fn numa_free(_start: *mut libc::c_void, _size: libc::size_t) {}
+#[cfg(no_numa)]
+unsafe fn numa_node_of_cpu(_cpu: libc::c_int) -> libc::c_int { 0 }
+#[cfg(no_numa)]
+unsafe fn numa_num_configured_cpus() -> libc::c_int { 1 }
+#[cfg(no_numa)]
+unsafe fn numa_run_on_node(_node: libc::c_int) -> libc::c_int { -1 }
 
 /// Check if libnuma is available and functional.
 fn numa_is_available() -> bool {
