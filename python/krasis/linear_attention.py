@@ -19,12 +19,14 @@ Ported from HF transformers Qwen3NextGatedDeltaNet — fixes:
 
 import logging
 import math
+import time
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from krasis.config import ModelConfig
+from krasis.timing import TIMING
 from krasis.weight_loader import int8_linear
 
 logger = logging.getLogger(__name__)
@@ -105,10 +107,20 @@ class GatedDeltaNetAttention:
         self._conv_state: Optional[torch.Tensor] = None    # [1, conv_dim, kernel_dim]
         self._recurrent_state: Optional[torch.Tensor] = None  # [1, num_v_heads, k_head_dim, v_head_dim]
 
+        # CUDA graph for M=1 recurrent decode
+        self._la_graph: Optional[torch.cuda.CUDAGraph] = None
+        self._la_input: Optional[torch.Tensor] = None    # [1, hidden_size] static input
+        self._la_output: Optional[torch.Tensor] = None   # [1, hidden_size] static output
+        self._la_stream = torch.cuda.Stream(device=device)  # non-default stream for graph capture
+
     def reset_state(self):
         """Reset recurrent and conv state (e.g. between sequences)."""
         self._conv_state = None
         self._recurrent_state = None
+        # Invalidate CUDA graph — it references old state tensor addresses
+        self._la_graph = None
+        self._la_input = None
+        self._la_output = None
 
     def _init_state(self, batch_size: int = 1):
         """Initialize conv and recurrent states to zero."""
@@ -123,6 +135,123 @@ class GatedDeltaNetAttention:
                 batch_size, self.num_v_heads, self.k_head_dim, self.v_head_dim,
                 dtype=torch.float32, device=self.device,
             )
+
+    def _capture_la_graph(self):
+        """Capture CUDA graph for entire M=1 linear attention recurrent forward.
+
+        Eliminates ~60+ kernel launches (conv1d, INT8 quantize/pad/matmul/dequant,
+        element-wise ops) with a single graph replay. First called on second M=1
+        forward (after one warmup iteration to settle allocations).
+
+        State is saved before warmup/capture and restored after, so the graph
+        capture doesn't corrupt the model's recurrent state.
+        """
+        self._la_input = torch.empty(1, self.hidden_size, dtype=torch.bfloat16, device=self.device)
+        self._la_output = torch.empty(1, self.hidden_size, dtype=torch.bfloat16, device=self.device)
+
+        # Save state before warmup (warmup iterations would corrupt it)
+        conv_saved = self._conv_state.clone()
+        recur_saved = self._recurrent_state.clone()
+
+        # Must capture on a non-default stream (CUDA graph requirement)
+        stream = self._la_stream
+
+        # Warmup iterations on the capture stream (let CUDA allocator settle)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                out = self._forward_recurrent_inplace(self._la_input)
+                self._la_output.copy_(out)
+        torch.cuda.synchronize()
+
+        # Capture the graph on the same stream
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=stream):
+            out = self._forward_recurrent_inplace(self._la_input)
+            self._la_output.copy_(out)
+
+        # Restore state after capture
+        self._conv_state.copy_(conv_saved)
+        self._recurrent_state.copy_(recur_saved)
+
+        self._la_graph = g
+        logger.debug("Captured linear attention CUDA graph for layer %d", self.layer_idx)
+
+    def _forward_recurrent_inplace(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Graph-compatible M=1 recurrent forward using in-place state updates.
+
+        Same computation as _forward_recurrent but:
+        - _conv_state updated via copy_ (not reassignment)
+        - _recurrent_state updated via mul_/add_ (not reassignment)
+        This makes the operation compatible with CUDA graph replay since
+        state tensors keep their memory addresses.
+        """
+        M = hidden.shape[0]
+
+        # Project to qkvz and ba
+        qkvz = _linear(hidden, self.in_proj_qkvz)
+        ba = _linear(hidden, self.in_proj_ba)
+
+        # Un-interleave
+        q, k, v, z, b, a = self._fix_query_key_value_ordering(qkvz, ba)
+
+        q_flat = q.reshape(M, self.key_dim)
+        k_flat = k.reshape(M, self.key_dim)
+        v_flat = v.reshape(M, self.value_dim)
+
+        # Conv1d: cat state + new token, update state in-place
+        mixed_qkv = torch.cat([q_flat, k_flat, v_flat], dim=-1).unsqueeze(0).transpose(1, 2)
+        conv_input = torch.cat([self._conv_state, mixed_qkv], dim=-1)
+        self._conv_state.copy_(conv_input[:, :, -self.kernel_dim:])
+
+        conv_out = F.conv1d(
+            conv_input.to(self.conv1d_weight.dtype),
+            self.conv1d_weight, bias=None, padding=0, groups=self.conv_dim,
+        )
+        conv_out = F.silu(conv_out[:, :, -M:]).to(hidden.dtype)
+        conv_out = conv_out.transpose(1, 2).squeeze(0)
+
+        # Split to q, k, v heads
+        q_out = conv_out[:, :self.key_dim].reshape(M, self.num_k_heads, self.k_head_dim)
+        k_out = conv_out[:, self.key_dim:self.key_dim * 2].reshape(M, self.num_k_heads, self.k_head_dim)
+        v_out = conv_out[:, self.key_dim * 2:].reshape(M, self.num_v_heads, self.v_head_dim)
+
+        # Gating parameters
+        beta = torch.sigmoid(b)
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+        # Repeat-interleave k heads to match value heads
+        if self.head_ratio > 1:
+            q_out = q_out.repeat_interleave(self.head_ratio, dim=1)
+            k_out = k_out.repeat_interleave(self.head_ratio, dim=1)
+
+        q_out = _l2norm(q_out, dim=-1) * self.scale
+        k_out = _l2norm(k_out, dim=-1)
+
+        # Recurrent update (M=1, single step) — ALL state updates in-place
+        q_t = q_out[0]       # [nv, dk]
+        k_t = k_out[0]       # [nv, dk]
+        v_t = v_out[0]       # [nv, dv]
+        g_t = g[0].exp()     # [nv]
+        beta_t = beta[0]     # [nv]
+
+        # In-place decay: state *= g_t
+        self._recurrent_state.mul_(g_t.unsqueeze(-1).unsqueeze(-1))
+
+        # Delta update
+        kv_mem = (self._recurrent_state.squeeze(0) * k_t.unsqueeze(-1)).sum(dim=-2)
+        delta = (v_t - kv_mem) * beta_t.unsqueeze(-1)
+        self._recurrent_state.add_(
+            k_t.unsqueeze(-1).unsqueeze(0) * delta.unsqueeze(-2).unsqueeze(0)
+        )
+
+        # Output: state @ q
+        out_t = (self._recurrent_state.squeeze(0) * q_t.unsqueeze(-1)).sum(dim=-2)
+
+        # Gated RMSNorm + output projection
+        attn_out = self._gated_rmsnorm(out_t.unsqueeze(0), z)
+        attn_flat = attn_out.reshape(1, self.num_v_heads * self.v_head_dim).to(torch.bfloat16)
+        return _linear(attn_flat, self.out_proj)
 
     def _fix_query_key_value_ordering(
         self,
@@ -191,8 +320,39 @@ class GatedDeltaNetAttention:
         self._init_state()
 
         if is_decode:
-            return self._forward_recurrent(hidden)
+            # CUDA graph path for M=1: eliminates ~60+ kernel launches
+            if self._la_graph is not None:
+                # Sync: ensure hidden is ready, then replay on capture stream
+                self._la_stream.wait_stream(torch.cuda.current_stream(self.device))
+                self._la_input.copy_(hidden)
+                self._la_graph.replay()
+                # Sync: wait for graph to finish before returning output
+                torch.cuda.current_stream(self.device).wait_stream(self._la_stream)
+                return self._la_output.clone()
+            elif self._la_input is None and not (TIMING.decode or TIMING.prefill):
+                # First M=1 call: run normally (warmup), capture graph next call
+                self._la_input = "pending"  # sentinel: capture on next call
+                return self._forward_recurrent(hidden)
+            elif self._la_input == "pending":
+                # Second M=1 call: capture the graph
+                try:
+                    self._capture_la_graph()
+                    self._la_input.copy_(hidden)
+                    self._la_graph.replay()
+                    return self._la_output.clone()
+                except Exception as e:
+                    logger.warning("CUDA graph capture failed for LA layer %d: %s", self.layer_idx, e)
+                    self._la_input = None  # disable graph attempts
+                    return self._forward_recurrent(hidden)
+            else:
+                return self._forward_recurrent(hidden)
         else:
+            # Invalidate graph state tracking when switching to prefill
+            # (conv_state and recurrent_state get modified by chunked path)
+            if self._la_graph is not None:
+                self._la_graph = None
+                self._la_input = None
+                self._la_output = None
             return self._forward_chunked(hidden)
 
     def _forward_recurrent(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -201,10 +361,19 @@ class GatedDeltaNetAttention:
         Matches HF torch_recurrent_gated_delta_rule exactly.
         """
         M = hidden.shape[0]
+        timing = TIMING.decode and M == 1
+
+        if timing:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
 
         # Project to qkvz and ba
         qkvz = _linear(hidden, self.in_proj_qkvz)  # [M, q+k+v+z]
         ba = _linear(hidden, self.in_proj_ba)       # [M, b+a]
+
+        if timing:
+            torch.cuda.synchronize()
+            _t1 = time.perf_counter()
 
         # Un-interleave
         q, k, v, z, b, a = self._fix_query_key_value_ordering(qkvz, ba)
@@ -239,6 +408,10 @@ class GatedDeltaNetAttention:
         conv_out = conv_out.to(hidden.dtype)
         conv_out = conv_out.transpose(1, 2).squeeze(0)  # [M, conv_dim]
 
+        if timing:
+            torch.cuda.synchronize()
+            _t2 = time.perf_counter()
+
         # Split back to q, k, v and reshape to heads
         q_out = conv_out[:, :self.key_dim].reshape(M, self.num_k_heads, self.k_head_dim)
         k_out = conv_out[:, self.key_dim:self.key_dim * 2].reshape(M, self.num_k_heads, self.k_head_dim)
@@ -259,6 +432,10 @@ class GatedDeltaNetAttention:
 
         # Scale query
         q_out = q_out * self.scale
+
+        if timing:
+            torch.cuda.synchronize()
+            _t3 = time.perf_counter()
 
         # Recurrent delta rule (matches HF torch_recurrent_gated_delta_rule)
         outputs = []
@@ -281,6 +458,10 @@ class GatedDeltaNetAttention:
             out_t = (self._recurrent_state.squeeze(0) * q_t.unsqueeze(-1)).sum(dim=-2)  # [nv, dv]
             outputs.append(out_t)
 
+        if timing:
+            torch.cuda.synchronize()
+            _t4 = time.perf_counter()
+
         # Stack outputs: [M, nv, dv]
         attn_out = torch.stack(outputs, dim=0)
 
@@ -289,7 +470,23 @@ class GatedDeltaNetAttention:
 
         # Flatten and project (cast back to BF16 for out_proj)
         attn_flat = attn_out.reshape(M, self.num_v_heads * self.v_head_dim).to(torch.bfloat16)
-        return _linear(attn_flat, self.out_proj)  # [M, hidden]
+        result = _linear(attn_flat, self.out_proj)  # [M, hidden]
+
+        if timing:
+            torch.cuda.synchronize()
+            _t5 = time.perf_counter()
+            logger.info(
+                "  LA-DETAIL L%d: proj=%.2fms conv=%.2fms prep=%.2fms recur=%.2fms norm+out=%.2fms total=%.2fms",
+                self.layer_idx,
+                (_t1 - _t0) * 1000,
+                (_t2 - _t1) * 1000,
+                (_t3 - _t2) * 1000,
+                (_t4 - _t3) * 1000,
+                (_t5 - _t4) * 1000,
+                (_t5 - _t0) * 1000,
+            )
+
+        return result
 
     def _forward_chunked(self, hidden: torch.Tensor) -> torch.Tensor:
         """Chunked prefill: matches HF torch_chunk_gated_delta_rule.

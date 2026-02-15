@@ -111,6 +111,24 @@ class TransformerLayer:
         # Krasis CPU engine for routed experts
         self.krasis_engine = krasis_engine
 
+        # Pre-cached FP32 gate weights to avoid per-call .float() conversions
+        self._gate_weight_f32 = self.gate_weight.float() if self.gate_weight is not None else None
+        self._e_score_correction_bias_f32 = (
+            self.e_score_correction_bias.float()
+            if self.is_moe and self.e_score_correction_bias is not None
+            else None
+        )
+
+        # Pre-allocated pinned CPU buffers for zero-alloc MoE dispatch (M=1)
+        if self.is_moe and krasis_engine is not None:
+            self._cpu_act_buf = torch.empty(1, cfg.hidden_size, dtype=torch.bfloat16, pin_memory=True)
+            self._cpu_ids_buf = torch.empty(1, cfg.num_experts_per_tok, dtype=torch.int32, pin_memory=True)
+            self._cpu_wts_buf = torch.empty(1, cfg.num_experts_per_tok, dtype=torch.float32, pin_memory=True)
+            self._cpu_out_buf = torch.empty(1, cfg.hidden_size, dtype=torch.bfloat16, pin_memory=True)
+            self._gpu_out_buf = torch.empty(1, cfg.hidden_size, dtype=torch.bfloat16, device=device)
+        else:
+            self._cpu_act_buf = None
+
         # GPU prefill manager for large batches (INT4 Marlin)
         self.gpu_prefill_manager = gpu_prefill_manager
         self.gpu_prefill_threshold = gpu_prefill_threshold
@@ -119,6 +137,11 @@ class TransformerLayer:
         self._shared_stream = None
         if self.is_moe and self.shared_expert_gate is not None:
             self._shared_stream = torch.cuda.Stream(device=device)
+
+        # CUDA graph for shared expert (M=1 decode): replaces 6+ kernel launches with 1 graph replay
+        self._se_graph = None
+        self._se_input = None
+        self._se_output = None
 
     def forward(
         self,
@@ -197,7 +220,109 @@ class TransformerLayer:
             t_after_norm2 = time.perf_counter()
 
         # ── MLP ──
-        if self.is_moe:
+        # Fast inlined path: M=1 pure_cpu MoE decode
+        # Saves ~2 function calls + attribute lookups vs _moe_forward → _routed_expert_forward
+        # Condition: M=1, MoE layer, NOT routing M=1 through GPU decode (threshold > 1),
+        # and pinned buffers ready. GPU prefill still used for M >= threshold.
+        if (M == 1 and self.is_moe
+                and self.gpu_prefill_threshold > 1
+                and self._cpu_act_buf is not None):
+            mlp_timing = TIMING.decode
+
+            if mlp_timing:
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
+
+            # Routing on GPU (fast: ~0.1ms)
+            router_logits = torch.matmul(hidden.float(), self._gate_weight_f32.t())
+            if self.cfg.scoring_func == "sigmoid":
+                scores = torch.sigmoid(router_logits)
+            else:
+                scores = torch.softmax(router_logits, dim=-1)
+            if self._e_score_correction_bias_f32 is not None:
+                topk_weights, topk_ids = torch.topk(
+                    scores + self._e_score_correction_bias_f32,
+                    self.cfg.num_experts_per_tok, dim=-1,
+                )
+                topk_weights = scores.gather(1, topk_ids)
+            else:
+                topk_weights, topk_ids = torch.topk(
+                    scores, self.cfg.num_experts_per_tok, dim=-1,
+                )
+            if self.cfg.norm_topk_prob:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+            if mlp_timing:
+                torch.cuda.synchronize()
+                _t1 = time.perf_counter()
+
+            # Launch shared expert on GPU stream (overlaps with CPU MoE)
+            # Use CUDA graph if captured (0.05ms vs 0.64ms per layer)
+            has_shared = self._shared_stream is not None and self.shared_expert is not None
+            if has_shared:
+                # Capture CUDA graph on first M=1 call
+                if self._se_graph is None:
+                    self._capture_shared_expert_graph()
+
+                if self._se_graph is not None:
+                    # CUDA graph path: copy input → replay graph on shared stream
+                    self._se_input.copy_(hidden)
+                    self._shared_stream.wait_stream(torch.cuda.current_stream(self.device))
+                    self._se_graph.replay()
+                else:
+                    # Fallback: launch kernels individually
+                    self._shared_stream.wait_stream(torch.cuda.current_stream(self.device))
+                    with torch.cuda.stream(self._shared_stream):
+                        self._se_output = self._shared_expert_forward(hidden)
+
+            if mlp_timing:
+                _t2 = time.perf_counter()
+
+            # GPU → pinned CPU + Rust MoE + CPU → GPU (single direct PyO3 call)
+            self._cpu_act_buf.copy_(hidden, non_blocking=True)
+            self._cpu_ids_buf.copy_(topk_ids.to(torch.int32), non_blocking=True)
+            self._cpu_wts_buf.copy_(topk_weights.float(), non_blocking=True)
+            torch.cuda.current_stream(self.device).synchronize()
+
+            if mlp_timing:
+                _t3 = time.perf_counter()
+
+            self.krasis_engine.forward_moe_direct(
+                moe_layer_idx,
+                self._cpu_act_buf.data_ptr(),
+                self._cpu_ids_buf.data_ptr(),
+                self._cpu_wts_buf.data_ptr(),
+                self._cpu_out_buf.data_ptr(),
+                1, self.cfg.num_experts_per_tok,
+            )
+
+            if mlp_timing:
+                _t4 = time.perf_counter()
+
+            self._gpu_out_buf.copy_(self._cpu_out_buf, non_blocking=True)
+
+            # Add shared expert result
+            if has_shared:
+                torch.cuda.current_stream(self.device).wait_stream(self._shared_stream)
+                mlp_out = self._gpu_out_buf + self._se_output
+            else:
+                mlp_out = self._gpu_out_buf
+
+            if mlp_timing:
+                torch.cuda.synchronize()
+                _t5 = time.perf_counter()
+                logger.info(
+                    "  MLP-DETAIL L%s: routing=%.2fms launch_shared=%.2fms dma+sync=%.2fms rust=%.2fms add_shared=%.2fms total=%.2fms",
+                    moe_layer_idx,
+                    (_t1 - _t0) * 1000,
+                    (_t2 - _t1) * 1000,
+                    (_t3 - _t2) * 1000,
+                    (_t4 - _t3) * 1000,
+                    (_t5 - _t4) * 1000,
+                    (_t5 - _t0) * 1000,
+                )
+
+        elif self.is_moe:
             mlp_out = self._moe_forward(hidden, moe_layer_idx)
         else:
             mlp_out = self._dense_mlp_forward(hidden)
@@ -218,6 +343,40 @@ class TransformerLayer:
             )
 
         return mlp_out, residual
+
+    def _capture_shared_expert_graph(self):
+        """Capture a CUDA graph for the shared expert forward (M=1).
+
+        Replaces ~6 kernel launches (0.64ms Python overhead) with a single
+        graph replay (~0.05ms). Only called once, on first M=1 decode.
+        """
+        if self._shared_stream is None or self.shared_expert is None:
+            return
+
+        stream = self._shared_stream
+        device = self.device
+        hidden_size = self.cfg.hidden_size
+
+        # Static input/output buffers (must not move after capture)
+        self._se_input = torch.empty(1, hidden_size, dtype=torch.bfloat16, device=device)
+        self._se_output = torch.empty(1, hidden_size, dtype=torch.bfloat16, device=device)
+
+        # Warmup: run a few iterations to let CUDA allocator settle
+        torch.cuda.synchronize()
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                out = self._shared_expert_forward(self._se_input)
+                self._se_output.copy_(out)
+        torch.cuda.synchronize()
+
+        # Capture the graph on the shared stream
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=stream):
+            out = self._shared_expert_forward(self._se_input)
+            self._se_output.copy_(out)
+
+        self._se_graph = g
+        logger.debug("Captured shared expert CUDA graph for layer %d", self.layer_idx)
 
     def _dense_mlp_forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Dense MLP: gate_proj + up_proj → SiLU(gate) * up → down_proj."""
@@ -419,6 +578,12 @@ class TransformerLayer:
         The Rust engine computes:
             routed_scaling_factor * Σ(w_i * expert_i(x)) + shared_expert(x)
         So the Python side just returns the Rust output directly.
+
+        For M=1, uses forward_moe_direct: single PyO3 call with pre-allocated
+        pinned buffers and pointer passing. Eliminates:
+        - 2nd PyO3 boundary crossing (was submit + sync, now one call)
+        - All .tobytes() / bytearray / frombuffer allocations
+        - Channel send/recv overhead (runs on calling thread)
         """
         if self.krasis_engine is None:
             raise RuntimeError("Krasis engine not set for MoE layer")
@@ -426,55 +591,71 @@ class TransformerLayer:
         M = hidden.shape[0]
         timing = TIMING.decode and M == 1
 
+        # Fast path: M=1 with pre-allocated buffers + direct pointer passing
+        if M == 1 and self._cpu_act_buf is not None:
+            if timing:
+                t0 = time.perf_counter()
+
+            # GPU → pinned CPU: batch 3 non-blocking copies + single sync
+            self._cpu_act_buf.copy_(hidden, non_blocking=True)
+            self._cpu_ids_buf.copy_(topk_ids, non_blocking=True)
+            self._cpu_wts_buf.copy_(topk_weights, non_blocking=True)
+            torch.cuda.current_stream(self.device).synchronize()
+
+            if timing:
+                t1 = time.perf_counter()
+
+            # Single PyO3 call: Rust reads input / writes output via pointers
+            self.krasis_engine.forward_moe_direct(
+                moe_layer_idx,
+                self._cpu_act_buf.data_ptr(),
+                self._cpu_ids_buf.data_ptr(),
+                self._cpu_wts_buf.data_ptr(),
+                self._cpu_out_buf.data_ptr(),
+                1,  # batch_size
+                self.cfg.num_experts_per_tok,
+            )
+
+            if timing:
+                t2 = time.perf_counter()
+
+            # Pinned CPU → pre-allocated GPU buffer (avoids tensor allocation)
+            self._gpu_out_buf.copy_(self._cpu_out_buf, non_blocking=True)
+
+            if timing:
+                torch.cuda.current_stream(self.device).synchronize()
+                t3 = time.perf_counter()
+                logger.info(
+                    "  CPU-EXPERT L%s: gpu→cpu=%.1fms rust=%.1fms cpu→gpu=%.1fms total=%.1fms",
+                    moe_layer_idx,
+                    (t1 - t0) * 1000,
+                    (t2 - t1) * 1000,
+                    (t3 - t2) * 1000,
+                    (t3 - t0) * 1000,
+                )
+
+            return self._gpu_out_buf
+
+        # Fallback: M>1 batch path (uses bytes + worker thread)
         if timing:
             t0 = time.perf_counter()
 
-        # GPU → CPU transfer (implicit sync via .cpu())
         act_cpu = hidden.detach().cpu().contiguous()
         ids_cpu = topk_ids.detach().cpu().contiguous()
         wts_cpu = topk_weights.detach().cpu().contiguous()
 
-        if timing:
-            t1 = time.perf_counter()
-
-        # Convert to bytes for Rust engine
         act_bytes = act_cpu.view(torch.uint16).numpy().view(np.uint8).tobytes()
         ids_bytes = ids_cpu.numpy().view(np.uint8).tobytes()
         wts_bytes = wts_cpu.numpy().view(np.uint8).tobytes()
 
-        if timing:
-            t2 = time.perf_counter()
-
-        # Submit async
         self.krasis_engine.submit_forward(
             moe_layer_idx, act_bytes, ids_bytes, wts_bytes, M
         )
-
-        # Sync — blocks until CPU experts finish
         output_bytes = self.krasis_engine.sync_forward()
 
-        if timing:
-            t3 = time.perf_counter()
-
-        # Convert BF16 output bytes → tensor
-        # Rust engine already applied: routed_scaling_factor * routed + shared_expert
         output = torch.frombuffer(
             bytearray(output_bytes), dtype=torch.bfloat16
         ).reshape(M, self.cfg.hidden_size)
-
-        # CPU → GPU
         output = output.to(self.device)
-
-        if timing:
-            t4 = time.perf_counter()
-            logger.info(
-                "  CPU-EXPERT L%s: gpu→cpu=%.1fms bytes=%.1fms rust=%.1fms cpu→gpu=%.1fms total=%.1fms",
-                moe_layer_idx,
-                (t1 - t0) * 1000,
-                (t2 - t1) * 1000,
-                (t3 - t2) * 1000,
-                (t4 - t3) * 1000,
-                (t4 - t0) * 1000,
-            )
 
         return output

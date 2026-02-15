@@ -1,5 +1,56 @@
 # Krasis Changelog
 
+## Decode Optimization: CUDA Graph Linear Attention — 2026-02-15
+
+### Optimization
+5. **CUDA graph for linear attention**: Capture entire M=1 recurrent forward as CUDA graph.
+   Eliminates ~60+ kernel launches per layer (INT8 quantize/pad/matmul/dequant + conv1d +
+   element-wise ops) → 1 graph replay. Saves ~0.3ms per layer × 36 layers = ~11ms.
+   - In-place state updates (`mul_`/`add_`/`copy_`) for graph compatibility
+   - State save/restore around graph capture to prevent warmup corruption
+   - Non-default stream for graph capture (CUDA requirement)
+   - Graph invalidated on `reset_state()` and prefill mode transitions
+   - Re-captured automatically after each prefill (new state tensor addresses)
+
+### Results (Qwen3-Coder-Next, PP=2, 2 GPUs)
+- **Decode: 10.49-10.63 tok/s** (was 9.34 tok/s) — +12% improvement
+- **Prefill: 579 tok/s, TTFT=15.0s** — unchanged
+- **Optimal config**: expert_divisor=4, gpu_prefill_threshold=300
+
+### Tests Run
+- test_la_inplace.py: verified inplace forward matches original (bit-identical)
+- test_la_graph.py: verified CUDA graph output matches no-graph (bit-identical)
+- bench_decode_quick.py: 3 runs, clean (10.53-10.63 tok/s)
+- bench_combined.py: 8K prefill + decode (579 tok/s prefill, 10.49 tok/s decode)
+
+---
+
+## Decode Optimization: CUDA Graph Shared Expert + Inlined Dispatch — 2026-02-15
+
+### Optimizations
+1. **Inlined M=1 dispatch**: Merged routing + CPU MoE dispatch directly into `forward()`,
+   eliminating 2 Python function calls per layer (48 layers × ~0.28ms = 13.4ms savings)
+2. **Pre-cached FP32 gate weights**: Avoid `.float()` conversion each forward call
+3. **CUDA graph for shared expert**: Capture shared expert as CUDA graph (6+ kernel launches
+   → 1 graph replay), reducing launch overhead from 0.64ms → 0.05ms per layer (28ms savings)
+4. **Fixed inlined path condition**: Works with `gpu_prefill_threshold > 1` (not just
+   `gpu_prefill_manager is None`), enabling GPU prefill + CPU decode combo
+
+### Results (Qwen3-Coder-Next, PP=2, 2 GPUs)
+- **Decode: 9.34-9.58 tok/s** (was 7.25 tok/s HCS hybrid) — +29% improvement
+- **Prefill: 580 tok/s, TTFT=15.0s** with layer_grouped(4) — unchanged from baseline
+- **Optimal config**: expert_divisor=4, gpu_prefill_threshold=300
+
+### Optimization History
+2.14 → 2.23 (FP8) → 3.41 (DMA) → 5.23 (compact) → 5.44 (slots) → 6.07 → 7.25 (HCS) → 7.75 (inline) → 9.42 (SE graph) → **10.5 (LA graph)**
+
+### Tests Run
+- bench_decode_quick.py: 5 runs × 16/32 tokens, instrumented + clean
+- bench_combined.py: 8K prefill + 32-token decode
+- bench_prefill_order.py: verified no prefill regression (ordering effect)
+
+---
+
 ## Qwen3-Coder-Next & Qwen3-235B Auto-Optimiser Benchmark — 2026-02-15
 
 ### Benchmark
