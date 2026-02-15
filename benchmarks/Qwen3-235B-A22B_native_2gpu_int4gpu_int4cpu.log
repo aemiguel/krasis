@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-15 12:54:34
+Krasis Benchmark — 2026-02-15 21:21:38
 ================================================================
 Model:            Qwen3-235B-A22B
 Architecture:     qwen3_moe, 94 layers, 128 experts, top-8
@@ -7,9 +7,9 @@ PP Partition:     [47, 47] (2 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            995 GB total, 220.6 GB used by process
-  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 10441 MB allocated
-  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 10144 MB allocated
+  RAM:            995 GB total, 220.9 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 12255 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 12256 MB allocated
   GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
 
 Quantization:
@@ -27,16 +27,16 @@ Strategy:
   Mode:           gpu_decode (hot_cached_static)
 
 Prefill (10000 tokens, 3 runs):
-  Run 1:  195.6 tok/s, TTFT=51.13s
-  Run 2:  196.2 tok/s, TTFT=50.96s
-  Run 3:  195.9 tok/s, TTFT=51.05s
-  Average: 195.9 tok/s, TTFT=51.05s
+  Run 1:  194.9 tok/s, TTFT=51.31s
+  Run 2:  195.6 tok/s, TTFT=51.13s
+  Run 3:  195.0 tok/s, TTFT=51.29s
+  Average: 195.2 tok/s, TTFT=51.24s
 
 Decode (64 tokens, 3 runs):
-  Run 1:  1.36 tok/s (735.6ms/tok)
-  Run 2:  1.35 tok/s (741.7ms/tok)
-  Run 3:  1.39 tok/s (721.6ms/tok)
-  Average: 1.37 tok/s (733.0ms/tok)
+  Run 1:  1.48 tok/s (673.6ms/tok)
+  Run 2:  1.51 tok/s (664.1ms/tok)
+  Run 3:  1.42 tok/s (706.0ms/tok)
+  Average: 1.47 tok/s (681.2ms/tok)
 
 Verification:
   Prefill prompt: user
@@ -44,7 +44,7 @@ Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Descri
   Decode prompt:  Write a poem about recursion in programming.
   Generated output (64 tokens):
     <think>
-    Okay, I need to write a poem about recursion in programming. Hmm, recursion is when a function calls itself, right? So the poem should explain that concept in a creative way. Let me start by thinking of metaphors or imagery that represent recursion.
+    Okay, the user wants a poem about recursion in programming. Hmm, recursion is a programming concept where a function calls itself. I need to make sure the poem captures that essence. Let me think about the key elements of recursion.
     
-    Maybe like peeling an onion, layers upon layers?
+    First, the structure of a recursive function: it has a base case and a
 ================================================================

@@ -61,6 +61,12 @@ pub struct ModelConfig {
     /// Scaling factor applied to routed expert output before adding shared expert output.
     /// DeepSeek V2-Lite: 1.0, Kimi K2.5: 2.827, Qwen3: N/A (no shared experts).
     pub routed_scaling_factor: f32,
+    /// SwiGLU output clamping limit. 0.0 = standard SiLU (no clamping).
+    /// GPT OSS: 7.0 — enables custom activation: gate*sigmoid(gate*alpha)*(up+1).
+    pub swiglu_limit: f32,
+    /// Sigmoid scaling factor for custom activation. Only used when swiglu_limit > 0.
+    /// GPT OSS: 1.702.
+    pub activation_alpha: f32,
 }
 
 impl ModelConfig {
@@ -79,24 +85,29 @@ impl ModelConfig {
             .ok_or("Missing hidden_size")? as usize;
 
         let moe_intermediate_size = cfg.get("moe_intermediate_size")
+            .or_else(|| cfg.get("intermediate_size"))
             .and_then(|v| v.as_u64())
-            .ok_or("Missing moe_intermediate_size")? as usize;
+            .ok_or("Missing moe_intermediate_size or intermediate_size")? as usize;
 
-        // n_routed_experts (DeepSeek/Kimi) OR num_experts (Qwen3)
+        // n_routed_experts (DeepSeek/Kimi) OR num_experts (Qwen3) OR num_local_experts (GPT OSS)
         let n_routed_experts = cfg.get("n_routed_experts")
             .or_else(|| cfg.get("num_experts"))
+            .or_else(|| cfg.get("num_local_experts"))
             .and_then(|v| v.as_u64())
-            .ok_or("Missing n_routed_experts or num_experts")? as usize;
+            .ok_or("Missing n_routed_experts, num_experts, or num_local_experts")? as usize;
 
+        // num_experts_per_tok (DeepSeek/Qwen3) OR experts_per_token (GPT OSS)
         let num_experts_per_tok = cfg.get("num_experts_per_tok")
+            .or_else(|| cfg.get("experts_per_token"))
             .and_then(|v| v.as_u64())
-            .ok_or("Missing num_experts_per_tok")? as usize;
+            .ok_or("Missing num_experts_per_tok or experts_per_token")? as usize;
 
         let num_hidden_layers = cfg.get("num_hidden_layers")
             .and_then(|v| v.as_u64())
             .ok_or("Missing num_hidden_layers")? as usize;
 
         // first_k_dense_replace (DeepSeek/Kimi) OR derive from decoder_sparse_step (Qwen3)
+        // Default to 0 when neither field exists (e.g. GPT OSS: all layers are MoE)
         let first_k_dense_replace = if let Some(v) = cfg.get("first_k_dense_replace") {
             v.as_u64().ok_or("first_k_dense_replace not a number")? as usize
         } else if let Some(step) = cfg.get("decoder_sparse_step") {
@@ -111,7 +122,7 @@ impl ModelConfig {
                 ));
             }
         } else {
-            return Err("Missing first_k_dense_replace or decoder_sparse_step".to_string());
+            0
         };
 
         // Shared experts (optional — Qwen3 has none)
@@ -123,6 +134,15 @@ impl ModelConfig {
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0) as f32;
 
+        // GPT OSS: swiglu_limit enables custom activation gate*sigmoid(gate*alpha)*(up+1)
+        let swiglu_limit = cfg.get("swiglu_limit")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32;
+
+        // GPT OSS activation alpha (hardcoded in HF reference: 1.702)
+        // Not in config.json — always 1.702 when swiglu_limit > 0
+        let activation_alpha = if swiglu_limit > 0.0 { 1.702 } else { 0.0 };
+
         Ok(ModelConfig {
             hidden_size,
             moe_intermediate_size,
@@ -132,6 +152,8 @@ impl ModelConfig {
             first_k_dense_replace,
             n_shared_experts,
             routed_scaling_factor,
+            swiglu_limit,
+            activation_alpha,
         })
     }
 }
@@ -263,6 +285,14 @@ pub struct UnifiedExpertWeights {
     /// Usually same as num_bits, but may differ for GGUF-sourced mixed precision
     /// (e.g. Q4_K gate/up → INT4, Q6_K down → INT8).
     pub w2_bits: u8,
+
+    /// Optional per-expert biases (GPT OSS). Applied after matmul, before activation.
+    /// gate_bias: [intermediate_size] f32 — added to gate output after w13 matmul
+    pub gate_bias: Option<Vec<f32>>,
+    /// up_bias: [intermediate_size] f32 — added to up output after w13 matmul
+    pub up_bias: Option<Vec<f32>>,
+    /// down_bias: [hidden_size] f32 — added to down output after w2 matmul
+    pub down_bias: Option<Vec<f32>>,
 }
 
 impl UnifiedExpertWeights {
@@ -333,6 +363,9 @@ impl UnifiedExpertWeights {
             group_size,
             num_bits: 4,
             w2_bits: 4,
+            gate_bias: None,
+            up_bias: None,
+            down_bias: None,
         }
     }
 
@@ -424,6 +457,9 @@ impl UnifiedExpertWeights {
             group_size,
             num_bits: 8,
             w2_bits: 8,
+            gate_bias: None,
+            up_bias: None,
+            down_bias: None,
         }
     }
 
@@ -460,7 +496,29 @@ impl UnifiedExpertWeights {
         };
 
         let w13 = marlin_repack(&combined);
-        let w2 = marlin_repack(down);
+
+        // Pad down_proj output dimension if needed for Marlin kernel compatibility
+        let padded_hidden = marlin_w2_padded_n(hidden, intermediate);
+        let w2 = if padded_hidden != hidden {
+            // Pad down's rows (output dim) from hidden to padded_hidden
+            let pad_rows = padded_hidden - hidden;
+            let cols_per_row_packed = down.cols / 8;
+            let scales_per_row = down.cols / down.group_size;
+            let mut padded_packed = down.packed.clone();
+            padded_packed.extend(std::iter::repeat(0u32).take(pad_rows * cols_per_row_packed));
+            let mut padded_scales = down.scales.clone();
+            padded_scales.extend(std::iter::repeat(0u16).take(pad_rows * scales_per_row));
+            let padded_down = QuantizedInt4 {
+                packed: padded_packed,
+                scales: padded_scales,
+                rows: padded_hidden,
+                cols: down.cols,
+                group_size: down.group_size,
+            };
+            marlin_repack(&padded_down)
+        } else {
+            marlin_repack(down)
+        };
 
         UnifiedExpertWeights {
             w13_packed: w13.packed,
@@ -472,6 +530,9 @@ impl UnifiedExpertWeights {
             group_size,
             num_bits: 4,
             w2_bits: 4,
+            gate_bias: None,
+            up_bias: None,
+            down_bias: None,
         }
     }
 
@@ -519,6 +580,9 @@ impl UnifiedExpertWeights {
                 group_size,
                 num_bits: 4,
                 w2_bits,
+                gate_bias: None,
+                up_bias: None,
+                down_bias: None,
             }
         } else {
             // INT8 gate/up
@@ -568,6 +632,9 @@ impl UnifiedExpertWeights {
                 group_size,
                 num_bits: 8,
                 w2_bits,
+                gate_bias: None,
+                up_bias: None,
+                down_bias: None,
             }
         };
 
@@ -749,17 +816,34 @@ fn cache_path_gguf_avx2(model_dir: &Path, group_size: usize) -> PathBuf {
         .join(format!("experts_gguf_avx2_g{group_size}.bin"))
 }
 
+/// Compute padded output dimension for Marlin w2 (down_proj).
+///
+/// The `moe_wna16_marlin_gemm` kernel's thread config lookup fails when both
+/// K and N dimensions are 2880 (the down_proj GEMM: K=intermediate, N=hidden).
+/// The first GEMM (gate_up) has N=2*intermediate which is always different and works.
+/// We pad w2's N dimension by one group_size quantum (64) when hidden==intermediate,
+/// empirically verified: 2944 passes the kernel's thread config while 2880 fails.
+pub fn marlin_w2_padded_n(hidden: usize, intermediate: usize) -> usize {
+    if hidden == intermediate && hidden % 256 != 0 {
+        // Pad by 64 (one group_size quantum) to break the K==N symmetry
+        hidden + 64
+    } else {
+        hidden
+    }
+}
+
 /// Compute per-expert byte sizes for unified format.
 /// Returns (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes).
 fn unified_expert_byte_sizes(config: &ModelConfig, group_size: usize) -> (usize, usize, usize, usize) {
     let h = config.hidden_size;
     let m = config.moe_intermediate_size;
+    let h_w2 = marlin_w2_padded_n(h, m);
     // w13 (gate+up concat, transposed): [K/8, 2*N] as u32
     let w13_packed_bytes = (h / 8) * (2 * m) * 4;
     let w13_scales_bytes = (h / group_size) * (2 * m) * 2;
-    // w2 (down, transposed): [K_down/8, N_down] as u32
-    let w2_packed_bytes = (m / 8) * h * 4;
-    let w2_scales_bytes = (m / group_size) * h * 2;
+    // w2 (down, transposed): [K_down/8, N_down] as u32 (N may be padded)
+    let w2_packed_bytes = (m / 8) * h_w2 * 4;
+    let w2_scales_bytes = (m / group_size) * h_w2 * 2;
     (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes)
 }
 
@@ -773,8 +857,13 @@ fn cpu_expert_byte_sizes(config: &ModelConfig, group_size: usize, num_bits: u8) 
     let two_n = 2 * m;
 
     if num_bits == 4 {
-        // INT4 transposed: same byte counts as Marlin (u32-packed nibbles)
-        unified_expert_byte_sizes(config, group_size)
+        // INT4 transposed: same u32 packing as Marlin but NO w2 padding
+        // (Marlin needs padding for kernel thread config, CPU does not)
+        let w13_packed_bytes = (h / 8) * two_n * 4;
+        let w13_scales_bytes = (h / group_size) * two_n * 2;
+        let w2_packed_bytes = (m / 8) * h * 4;
+        let w2_scales_bytes = (m / group_size) * h * 2;
+        (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes)
     } else {
         // INT8 transposed: [K, N] as i8 packed into u32 (1 byte per element)
         let w13_byte_count = h * two_n;
@@ -949,6 +1038,8 @@ impl WeightStore {
                 first_k_dense_replace: 0,
                 n_shared_experts: 0,
                 routed_scaling_factor: 1.0,
+                swiglu_limit: 0.0,
+                activation_alpha: 0.0,
             },
             group_size: DEFAULT_GROUP_SIZE,
             cpu_num_bits: 4,
@@ -1710,7 +1801,8 @@ impl WeightStore {
 
         // Detect prefix and quantization format
         let layers_prefix = detect_expert_prefix(&index.weight_map)?;
-        let prequantized = is_prequantized(&index.weight_map);
+        let mxfp4 = is_mxfp4(&index.weight_map);
+        let prequantized = !mxfp4 && is_prequantized(&index.weight_map);
         let effective_group_size = if prequantized {
             let probe_layer = start_moe_layer + config.first_k_dense_replace;
             let native_gs = detect_prequant_group_size(
@@ -1723,8 +1815,24 @@ impl WeightStore {
             }
             native_gs
         } else {
-            group_size
+            // MXFP4 dequants to BF16 first, so use requested group_size
+            // but verify it divides the model dimensions (hidden_size and intermediate_size)
+            let mut gs = group_size;
+            let min_dim = std::cmp::min(config.hidden_size, config.moe_intermediate_size);
+            while gs > 32 && (min_dim % gs != 0) {
+                gs /= 2;
+            }
+            if gs != group_size {
+                log::info!(
+                    "Adjusted group_size {group_size} → {gs} (model dimensions not divisible by {group_size})"
+                );
+            }
+            gs
         };
+
+        if mxfp4 {
+            log::info!("Detected MXFP4 pre-quantized experts — will dequant to BF16 then quantize to INT4");
+        }
 
         // Create cache directory + temp file
         if let Some(parent) = cache_path.parent() {
@@ -1749,7 +1857,7 @@ impl WeightStore {
         let overall_start = std::time::Instant::now();
 
         // Prefetch first layer's expert data asynchronously
-        {
+        if !mxfp4 {
             let first_layer_idx = start_moe_layer + config.first_k_dense_replace;
             let proj_names = if prequantized {
                 vec!["gate_proj.weight_packed", "gate_proj.weight_scale",
@@ -1771,6 +1879,21 @@ impl WeightStore {
                 }
             }
             log::info!("Issued MADV_WILLNEED prefetch for layer {first_layer_idx} experts");
+        } else {
+            // MXFP4: prefetch bulk tensors for first layer
+            let first_layer_idx = start_moe_layer + config.first_k_dense_replace;
+            for suffix in &["gate_up_proj_blocks", "gate_up_proj_scales",
+                            "down_proj_blocks", "down_proj_scales"] {
+                let tensor_name = format!(
+                    "{layers_prefix}.layers.{first_layer_idx}.mlp.experts.{suffix}"
+                );
+                if let Some(shard_name) = index.weight_map.get(&tensor_name) {
+                    if let Some(shard) = shards.get(shard_name) {
+                        shard.prefetch_tensor(&tensor_name);
+                    }
+                }
+            }
+            log::info!("Issued MXFP4 prefetch for layer {first_layer_idx} bulk tensors");
         }
 
         // Stream routed experts layer by layer
@@ -1778,52 +1901,72 @@ impl WeightStore {
             let layer_idx = moe_idx + config.first_k_dense_replace;
             let layer_start = std::time::Instant::now();
 
-            // 2-phase pipeline: sequential I/O then parallel compute.
-            // Phase 1 does sequential mmap reads (optimal for kernel readahead).
-            // Phase 2 does parallel Marlin repack (CPU-bound, scales with cores).
+            // Phase 1: Load expert weights
             let io_start = std::time::Instant::now();
-            let mut expert_data: Vec<ExpertWeights> = Vec::with_capacity(config.n_routed_experts);
-            for eidx in 0..config.n_routed_experts {
-                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
-                let (gate, up, down) = if prequantized {
-                    let g = QuantWeight::Int4(load_prequantized_weight(
-                        &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
-                    )?);
-                    let u = QuantWeight::Int4(load_prequantized_weight(
-                        &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
-                    )?);
-                    let d = QuantWeight::Int4(load_prequantized_weight(
-                        &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
-                    )?);
-                    (g, u, d)
-                } else {
-                    load_and_quantize_expert(
-                        &prefix, &index.weight_map, &shards, effective_group_size, 4,
-                    )?
-                };
-                expert_data.push(ExpertWeights { gate, up, down });
-            }
+            let expert_data: Vec<ExpertWeights> = if mxfp4 {
+                load_mxfp4_layer_experts(
+                    layer_idx, &layers_prefix, &index.weight_map, &shards,
+                    config, effective_group_size, 4,
+                )?
+            } else {
+                let mut data = Vec::with_capacity(config.n_routed_experts);
+                for eidx in 0..config.n_routed_experts {
+                    let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
+                    let (gate, up, down) = if prequantized {
+                        let g = QuantWeight::Int4(load_prequantized_weight(
+                            &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        let u = QuantWeight::Int4(load_prequantized_weight(
+                            &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        let d = QuantWeight::Int4(load_prequantized_weight(
+                            &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        (g, u, d)
+                    } else {
+                        load_and_quantize_expert(
+                            &prefix, &index.weight_map, &shards, effective_group_size, 4,
+                        )?
+                    };
+                    data.push(ExpertWeights { gate, up, down });
+                }
+                data
+            };
             let io_elapsed = io_start.elapsed();
 
             // Prefetch next layer's data while we do CPU-bound Marlin repack
             let next_moe_idx = moe_idx + 1;
             if next_moe_idx < start_moe_layer + num_moe_layers {
                 let next_layer_idx = next_moe_idx + config.first_k_dense_replace;
-                let proj_names: &[&str] = if prequantized {
-                    &["gate_proj.weight_packed", "gate_proj.weight_scale",
-                      "up_proj.weight_packed", "up_proj.weight_scale",
-                      "down_proj.weight_packed", "down_proj.weight_scale"]
-                } else {
-                    &["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
-                };
-                for eidx in 0..config.n_routed_experts {
-                    for proj in proj_names {
+                if mxfp4 {
+                    for suffix in &["gate_up_proj_blocks", "gate_up_proj_scales",
+                                    "down_proj_blocks", "down_proj_scales"] {
                         let tensor_name = format!(
-                            "{layers_prefix}.layers.{next_layer_idx}.mlp.experts.{eidx}.{proj}"
+                            "{layers_prefix}.layers.{next_layer_idx}.mlp.experts.{suffix}"
                         );
                         if let Some(shard_name) = index.weight_map.get(&tensor_name) {
                             if let Some(shard) = shards.get(shard_name) {
                                 shard.prefetch_tensor(&tensor_name);
+                            }
+                        }
+                    }
+                } else {
+                    let proj_names: &[&str] = if prequantized {
+                        &["gate_proj.weight_packed", "gate_proj.weight_scale",
+                          "up_proj.weight_packed", "up_proj.weight_scale",
+                          "down_proj.weight_packed", "down_proj.weight_scale"]
+                    } else {
+                        &["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
+                    };
+                    for eidx in 0..config.n_routed_experts {
+                        for proj in proj_names {
+                            let tensor_name = format!(
+                                "{layers_prefix}.layers.{next_layer_idx}.mlp.experts.{eidx}.{proj}"
+                            );
+                            if let Some(shard_name) = index.weight_map.get(&tensor_name) {
+                                if let Some(shard) = shards.get(shard_name) {
+                                    shard.prefetch_tensor(&tensor_name);
+                                }
                             }
                         }
                     }
@@ -2245,7 +2388,8 @@ impl WeightStore {
 
         // Detect prefix and quantization format
         let layers_prefix = detect_expert_prefix(&index.weight_map)?;
-        let prequantized = is_prequantized(&index.weight_map);
+        let mxfp4 = is_mxfp4(&index.weight_map);
+        let prequantized = !mxfp4 && is_prequantized(&index.weight_map);
         let effective_group_size = if prequantized {
             let probe_layer = start_moe_layer + config.first_k_dense_replace;
             let native_gs = detect_prequant_group_size(
@@ -2258,8 +2402,23 @@ impl WeightStore {
             }
             native_gs
         } else {
-            group_size
+            // Verify group_size divides model dimensions
+            let mut gs = group_size;
+            let min_dim = std::cmp::min(config.hidden_size, config.moe_intermediate_size);
+            while gs > 32 && (min_dim % gs != 0) {
+                gs /= 2;
+            }
+            if gs != group_size {
+                log::info!(
+                    "CPU cache: adjusted group_size {group_size} → {gs} (model dimensions not divisible)"
+                );
+            }
+            gs
         };
+
+        if mxfp4 {
+            log::info!("Detected MXFP4 experts — will dequant to BF16 then quantize to CPU INT{cpu_num_bits}");
+        }
 
         // Create cache directory + temp file
         if let Some(parent) = cache_path.parent() {
@@ -2283,34 +2442,40 @@ impl WeightStore {
 
             // Phase 1: Sequential I/O — load expert weights from safetensors
             let io_start = std::time::Instant::now();
-            let mut expert_data: Vec<ExpertWeights> = Vec::with_capacity(config.n_routed_experts);
-            for eidx in 0..config.n_routed_experts {
-                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
-                let (gate, up, down) = if prequantized {
-                    // Pre-quantized models are always INT4 — if cpu_num_bits=8, we'd need
-                    // to dequantize and re-quantize. For now, only support INT4 for pre-quantized.
-                    if cpu_num_bits != 4 {
-                        return Err(format!(
-                            "CPU INT{cpu_num_bits} cache not supported for pre-quantized INT4 models (would need dequant+requant)"
-                        ));
-                    }
-                    let g = QuantWeight::Int4(load_prequantized_weight(
-                        &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
-                    )?);
-                    let u = QuantWeight::Int4(load_prequantized_weight(
-                        &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
-                    )?);
-                    let d = QuantWeight::Int4(load_prequantized_weight(
-                        &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
-                    )?);
-                    (g, u, d)
-                } else {
-                    load_and_quantize_expert(
-                        &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
-                    )?
-                };
-                expert_data.push(ExpertWeights { gate, up, down });
-            }
+            let expert_data: Vec<ExpertWeights> = if mxfp4 {
+                load_mxfp4_layer_experts(
+                    layer_idx, &layers_prefix, &index.weight_map, &shards,
+                    config, effective_group_size, cpu_num_bits,
+                )?
+            } else {
+                let mut data = Vec::with_capacity(config.n_routed_experts);
+                for eidx in 0..config.n_routed_experts {
+                    let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
+                    let (gate, up, down) = if prequantized {
+                        if cpu_num_bits != 4 {
+                            return Err(format!(
+                                "CPU INT{cpu_num_bits} cache not supported for pre-quantized INT4 models (would need dequant+requant)"
+                            ));
+                        }
+                        let g = QuantWeight::Int4(load_prequantized_weight(
+                            &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        let u = QuantWeight::Int4(load_prequantized_weight(
+                            &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        let d = QuantWeight::Int4(load_prequantized_weight(
+                            &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        (g, u, d)
+                    } else {
+                        load_and_quantize_expert(
+                            &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                        )?
+                    };
+                    data.push(ExpertWeights { gate, up, down });
+                }
+                data
+            };
             let io_elapsed = io_start.elapsed();
 
             // Phase 2: Parallel CPU transpose across all cores
@@ -2596,6 +2761,19 @@ impl WeightStore {
         let index: SafetensorsIndex = serde_json::from_str(&index_str).ok()?;
         let layers_prefix = detect_expert_prefix(&index.weight_map).ok()?;
 
+        // MXFP4: no weight_packed, but has gate_up_proj_blocks
+        // Compute best group_size from model dimensions
+        if is_mxfp4(&index.weight_map) {
+            let min_dim = std::cmp::min(config.hidden_size, config.moe_intermediate_size);
+            let mut gs = 128;
+            while gs > 32 && (min_dim % gs != 0) {
+                gs /= 2;
+            }
+            log::info!("MXFP4 model: using group_size={gs} (hidden={}, intermediate={})",
+                       config.hidden_size, config.moe_intermediate_size);
+            return Some(gs);
+        }
+
         let first_moe_layer = config.first_k_dense_replace;
         let packed_name = format!(
             "{layers_prefix}.layers.{first_moe_layer}.mlp.experts.0.gate_proj.weight_packed"
@@ -2727,6 +2905,78 @@ impl WeightStore {
     /// Get native GGUF shared expert weights for a given MoE layer index.
     pub fn get_shared_expert_gguf(&self, moe_layer_idx: usize) -> Option<&GgufExpertWeights> {
         self.shared_experts_gguf.get(moe_layer_idx)
+    }
+
+    /// Load expert biases from safetensors and attach to all CPU/GPU expert weights.
+    /// Only needed for GPT OSS models (with gate_up_proj_bias/down_proj_bias).
+    /// Must be called after cache loading. No-op if biases not found.
+    pub fn attach_expert_biases(&mut self, model_dir: &Path) {
+        if self.config.swiglu_limit <= 0.0 {
+            return; // Not a GPT OSS model
+        }
+
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let index_str = match std::fs::read_to_string(&index_path) {
+            Ok(s) => s,
+            Err(e) => { log::warn!("Cannot read index for biases: {e}"); return; }
+        };
+        let index: SafetensorsIndex = match serde_json::from_str(&index_str) {
+            Ok(i) => i,
+            Err(e) => { log::warn!("Cannot parse index for biases: {e}"); return; }
+        };
+        let layers_prefix = match detect_expert_prefix(&index.weight_map) {
+            Ok(p) => p,
+            Err(e) => { log::warn!("Cannot detect prefix for biases: {e}"); return; }
+        };
+
+        // Open safetensors shards needed for bias tensors
+        let mut shards: HashMap<String, MmapSafetensors> = HashMap::new();
+        for (tensor_name, shard_name) in &index.weight_map {
+            if tensor_name.contains("_bias") && !shards.contains_key(shard_name) {
+                let shard_path = model_dir.join(shard_name);
+                if let Ok(s) = MmapSafetensors::open(&shard_path) {
+                    shards.insert(shard_name.clone(), s);
+                }
+            }
+        }
+
+        let first_k = self.config.first_k_dense_replace;
+        let num_cpu = self.experts_cpu.len();
+        let num_gpu = self.experts_gpu.len();
+        let mut attached_count = 0;
+
+        for moe_idx in 0..std::cmp::max(num_cpu, num_gpu) {
+            let layer_idx = moe_idx + first_k;
+            let biases = match load_mxfp4_expert_biases(
+                layer_idx, &layers_prefix, &index.weight_map, &shards, &self.config,
+            ) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            // Attach to CPU experts
+            if moe_idx < num_cpu {
+                for eidx in 0..self.experts_cpu[moe_idx].len() {
+                    self.experts_cpu[moe_idx][eidx].gate_bias = Some(biases.gate_bias[eidx].clone());
+                    self.experts_cpu[moe_idx][eidx].up_bias = Some(biases.up_bias[eidx].clone());
+                    self.experts_cpu[moe_idx][eidx].down_bias = Some(biases.down_bias[eidx].clone());
+                }
+            }
+
+            // Attach to GPU experts
+            if moe_idx < num_gpu {
+                for eidx in 0..self.experts_gpu[moe_idx].len() {
+                    self.experts_gpu[moe_idx][eidx].gate_bias = Some(biases.gate_bias[eidx].clone());
+                    self.experts_gpu[moe_idx][eidx].up_bias = Some(biases.up_bias[eidx].clone());
+                    self.experts_gpu[moe_idx][eidx].down_bias = Some(biases.down_bias[eidx].clone());
+                }
+            }
+            attached_count += 1;
+        }
+
+        if attached_count > 0 {
+            log::info!("Attached expert biases for {attached_count} MoE layers");
+        }
     }
 
     /// Migrate CPU expert weights to NUMA nodes.
@@ -3794,9 +4044,10 @@ fn read_unified_expert(
     }
     *offset += w13_scales_count * 2;
 
-    // w2_packed: [K_down/8, N_down] = [m/8, h] as u32
+    // w2_packed: [K_down/8, N_down] as u32 — N_down may be padded for Marlin kernel compat
+    let h_w2 = marlin_w2_padded_n(h, m);
     let down_packed_k = m / 8;
-    let w2_packed_count = down_packed_k * h;
+    let w2_packed_count = down_packed_k * h_w2;
     let mut w2_packed = vec![0u32; w2_packed_count];
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -3807,9 +4058,9 @@ fn read_unified_expert(
     }
     *offset += w2_packed_count * 4;
 
-    // w2_scales: [K_down/gs, N_down] = [m/gs, h] as u16
+    // w2_scales: [K_down/gs, N_down] as u16
     let down_num_groups = m / group_size;
-    let w2_scales_count = down_num_groups * h;
+    let w2_scales_count = down_num_groups * h_w2;
     let mut w2_scales = vec![0u16; w2_scales_count];
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -3830,6 +4081,9 @@ fn read_unified_expert(
         group_size,
         num_bits: 4, // Marlin cache is always INT4
         w2_bits: 4,
+        gate_bias: None,
+        up_bias: None,
+        down_bias: None,
     }
 }
 
@@ -3913,6 +4167,9 @@ fn read_unified_expert_cpu(
         group_size,
         num_bits,
         w2_bits: num_bits,
+        gate_bias: None,
+        up_bias: None,
+        down_bias: None,
     }
 }
 
@@ -3999,6 +4256,9 @@ fn read_unified_expert_cpu_mixed(
         group_size,
         num_bits: w13_bits,
         w2_bits,
+        gate_bias: None,
+        up_bias: None,
+        down_bias: None,
     }
 }
 
@@ -4172,6 +4432,251 @@ fn detect_expert_prefix(weight_map: &HashMap<String, String>) -> Result<String, 
 /// Returns true if pre-quantized (weight_packed tensors found).
 fn is_prequantized(weight_map: &HashMap<String, String>) -> bool {
     weight_map.keys().any(|k| k.ends_with(".weight_packed"))
+}
+
+/// Detect MXFP4 pre-quantized format (GPT OSS).
+/// These models store all experts in a single tensor per projection per layer,
+/// with _blocks/_scales suffixes (e.g. `experts.gate_up_proj_blocks`).
+fn is_mxfp4(weight_map: &HashMap<String, String>) -> bool {
+    weight_map.keys().any(|k| k.ends_with(".gate_up_proj_blocks"))
+}
+
+/// FP4 E2M1 lookup table for MXFP4 dequantization (OCP MX format).
+const FP4_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// Dequantize MXFP4 blocks + E8M0 scales to BF16 for a single projection.
+///
+/// # Arguments
+/// - `blocks`: contiguous [out_features, num_blocks, 16] u8 (each byte = 2 FP4 nibbles)
+/// - `scales`: contiguous [out_features, num_blocks] u8 (E8M0: 2^(byte-127))
+/// - `out_features`: number of output rows
+/// - `num_blocks`: blocks per row (in_features = num_blocks * 32)
+///
+/// # Returns
+/// BF16 [out_features, in_features] as Vec<u16>
+fn dequantize_mxfp4_to_bf16(
+    blocks: &[u8],
+    scales: &[u8],
+    out_features: usize,
+    num_blocks: usize,
+) -> Vec<u16> {
+    let in_features = num_blocks * 32;
+    let mut output = vec![0u16; out_features * in_features];
+
+    for row in 0..out_features {
+        for blk in 0..num_blocks {
+            // E8M0 scale: 2^(byte - 127) via IEEE 754 float construction
+            let scale_byte = scales[row * num_blocks + blk];
+            let scale = f32::from_bits((scale_byte as u32) << 23);
+
+            let block_offset = (row * num_blocks + blk) * 16;
+            let out_col_base = blk * 32;
+
+            for i in 0..16 {
+                let byte = blocks[block_offset + i];
+                let lo = (byte & 0x0F) as usize;
+                let hi = (byte >> 4) as usize;
+
+                let val_lo = FP4_LUT[lo] * scale;
+                let val_hi = FP4_LUT[hi] * scale;
+
+                let out_idx = row * in_features + out_col_base + i * 2;
+                output[out_idx] = (val_lo.to_bits() >> 16) as u16;
+                output[out_idx + 1] = (val_hi.to_bits() >> 16) as u16;
+            }
+        }
+    }
+
+    output
+}
+
+/// Load raw bytes for a tensor from mmapped safetensors shards.
+fn load_u8_tensor<'a>(
+    name: &str,
+    weight_map: &HashMap<String, String>,
+    shards: &'a HashMap<String, MmapSafetensors>,
+) -> Result<&'a [u8], String> {
+    let shard_name = weight_map.get(name)
+        .ok_or_else(|| format!("Tensor not found: {name}"))?;
+    let shard = shards.get(shard_name)
+        .ok_or_else(|| format!("Shard not loaded: {shard_name}"))?;
+    shard.tensor_data(name)
+        .map_err(|e| format!("Failed to read {name}: {e}"))
+}
+
+/// Per-expert biases loaded from safetensors (GPT OSS).
+/// Stored as f32 for direct use in expert_forward_unified.
+pub struct ExpertBiases {
+    /// gate_bias[expert_idx]: [intermediate_size] f32 (deinterleaved from gate_up_proj_bias)
+    pub gate_bias: Vec<Vec<f32>>,
+    /// up_bias[expert_idx]: [intermediate_size] f32 (deinterleaved from gate_up_proj_bias)
+    pub up_bias: Vec<Vec<f32>>,
+    /// down_bias[expert_idx]: [hidden_size] f32
+    pub down_bias: Vec<Vec<f32>>,
+}
+
+/// Load BF16 bias tensor from safetensors as f32 slice.
+fn load_bf16_tensor_as_f32(
+    name: &str,
+    weight_map: &HashMap<String, String>,
+    shards: &HashMap<String, MmapSafetensors>,
+) -> Result<Vec<f32>, String> {
+    let shard_name = weight_map.get(name)
+        .ok_or_else(|| format!("Tensor not found: {name}"))?;
+    let shard = shards.get(shard_name)
+        .ok_or_else(|| format!("Shard not loaded: {shard_name}"))?;
+    let bf16_data: &[u16] = shard.tensor_as_slice(name)
+        .map_err(|e| format!("Failed to read {name}: {e}"))?;
+    Ok(bf16_data.iter().map(|&v| marlin::bf16_to_f32(v)).collect())
+}
+
+/// Load expert biases for a single MXFP4 layer (GPT OSS).
+/// Returns None if bias tensors not found (non-GPT-OSS model).
+fn load_mxfp4_expert_biases(
+    layer_idx: usize,
+    layers_prefix: &str,
+    weight_map: &HashMap<String, String>,
+    shards: &HashMap<String, MmapSafetensors>,
+    config: &ModelConfig,
+) -> Option<ExpertBiases> {
+    let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts");
+    let gu_bias_name = format!("{prefix}.gate_up_proj_bias");
+    let dn_bias_name = format!("{prefix}.down_proj_bias");
+
+    // Check if bias tensors exist
+    if !weight_map.contains_key(&gu_bias_name) {
+        return None;
+    }
+
+    let gu_bias_f32 = match load_bf16_tensor_as_f32(&gu_bias_name, weight_map, shards) {
+        Ok(v) => v,
+        Err(e) => { log::warn!("Failed to load {gu_bias_name}: {e}"); return None; }
+    };
+    let dn_bias_f32 = match load_bf16_tensor_as_f32(&dn_bias_name, weight_map, shards) {
+        Ok(v) => v,
+        Err(e) => { log::warn!("Failed to load {dn_bias_name}: {e}"); return None; }
+    };
+
+    let n = config.n_routed_experts;
+    let inter = config.moe_intermediate_size;
+    let hidden = config.hidden_size;
+    let two_inter = 2 * inter;
+
+    let mut gate_bias = Vec::with_capacity(n);
+    let mut up_bias = Vec::with_capacity(n);
+    let mut down_bias = Vec::with_capacity(n);
+
+    for eidx in 0..n {
+        // gate_up_proj_bias is [n_experts, 2*intermediate], interleaved: even=gate, odd=up
+        let gu_start = eidx * two_inter;
+        let mut gb = vec![0.0f32; inter];
+        let mut ub = vec![0.0f32; inter];
+        for i in 0..inter {
+            gb[i] = gu_bias_f32[gu_start + 2 * i];     // even indices = gate
+            ub[i] = gu_bias_f32[gu_start + 2 * i + 1];  // odd indices = up
+        }
+        gate_bias.push(gb);
+        up_bias.push(ub);
+
+        // down_proj_bias is [n_experts, hidden_size]
+        let dn_start = eidx * hidden;
+        down_bias.push(dn_bias_f32[dn_start..dn_start + hidden].to_vec());
+    }
+
+    log::info!("Loaded expert biases for layer {layer_idx}: {n} experts, inter={inter}, hidden={hidden}");
+    Some(ExpertBiases { gate_bias, up_bias, down_bias })
+}
+
+/// Load all experts for a single layer from MXFP4 format, dequantize to BF16,
+/// then quantize to INT4/INT8.
+///
+/// MXFP4 stores all experts in a single tensor per projection per layer:
+/// - `gate_up_proj_blocks`: [n_experts, 2*intermediate, num_blocks, 16] u8
+/// - `gate_up_proj_scales`: [n_experts, 2*intermediate, num_blocks] u8
+/// - `down_proj_blocks`: [n_experts, hidden, num_blocks_down, 16] u8
+/// - `down_proj_scales`: [n_experts, hidden, num_blocks_down] u8
+fn load_mxfp4_layer_experts(
+    layer_idx: usize,
+    layers_prefix: &str,
+    weight_map: &HashMap<String, String>,
+    shards: &HashMap<String, MmapSafetensors>,
+    config: &ModelConfig,
+    group_size: usize,
+    num_bits: u8,
+) -> Result<Vec<ExpertWeights>, String> {
+    let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts");
+
+    // Load bulk tensors
+    let gu_blocks = load_u8_tensor(&format!("{prefix}.gate_up_proj_blocks"), weight_map, shards)?;
+    let gu_scales = load_u8_tensor(&format!("{prefix}.gate_up_proj_scales"), weight_map, shards)?;
+    let dn_blocks = load_u8_tensor(&format!("{prefix}.down_proj_blocks"), weight_map, shards)?;
+    let dn_scales = load_u8_tensor(&format!("{prefix}.down_proj_scales"), weight_map, shards)?;
+
+    let n = config.n_routed_experts;
+    let inter = config.moe_intermediate_size;
+    let hidden = config.hidden_size;
+    let gate_up_out = 2 * inter; // gate + up concatenated in output dim
+    let num_blocks_gu = hidden / 32; // blocks along input (hidden) dimension
+    let num_blocks_down = inter / 32; // blocks along input (intermediate) dimension
+
+    let gu_blocks_per_expert = gate_up_out * num_blocks_gu * 16;
+    let gu_scales_per_expert = gate_up_out * num_blocks_gu;
+    let dn_blocks_per_expert = hidden * num_blocks_down * 16;
+    let dn_scales_per_expert = hidden * num_blocks_down;
+
+    log::info!(
+        "MXFP4 layer {layer_idx}: {} experts, gate_up=[{gate_up_out},{hidden}], down=[{hidden},{inter}]",
+        n,
+    );
+
+    let mut experts = Vec::with_capacity(n);
+
+    for eidx in 0..n {
+        // Slice this expert's data from bulk tensors
+        let gu_b = &gu_blocks[eidx * gu_blocks_per_expert..(eidx + 1) * gu_blocks_per_expert];
+        let gu_s = &gu_scales[eidx * gu_scales_per_expert..(eidx + 1) * gu_scales_per_expert];
+        let dn_b = &dn_blocks[eidx * dn_blocks_per_expert..(eidx + 1) * dn_blocks_per_expert];
+        let dn_s = &dn_scales[eidx * dn_scales_per_expert..(eidx + 1) * dn_scales_per_expert];
+
+        // Dequantize to BF16
+        let gate_up_bf16 = dequantize_mxfp4_to_bf16(gu_b, gu_s, gate_up_out, num_blocks_gu);
+        let down_bf16 = dequantize_mxfp4_to_bf16(dn_b, dn_s, hidden, num_blocks_down);
+
+        // Deinterleave gate/up: GPT OSS interleaves gate and up in the output dim.
+        // gate_up_bf16 is [2*intermediate, hidden] — even rows = gate, odd rows = up.
+        let mut gate_bf16 = vec![0u16; inter * hidden];
+        let mut up_bf16_vec = vec![0u16; inter * hidden];
+        for i in 0..inter {
+            let src_gate_row = 2 * i;       // even rows → gate
+            let src_up_row = 2 * i + 1;     // odd rows → up
+            gate_bf16[i * hidden..(i + 1) * hidden]
+                .copy_from_slice(&gate_up_bf16[src_gate_row * hidden..(src_gate_row + 1) * hidden]);
+            up_bf16_vec[i * hidden..(i + 1) * hidden]
+                .copy_from_slice(&gate_up_bf16[src_up_row * hidden..(src_up_row + 1) * hidden]);
+        }
+
+        // Quantize to INT4 or INT8
+        let (gate, up, down) = if num_bits == 4 {
+            (
+                QuantWeight::Int4(quantize_int4(&gate_bf16, inter, hidden, group_size)),
+                QuantWeight::Int4(quantize_int4(&up_bf16_vec, inter, hidden, group_size)),
+                QuantWeight::Int4(quantize_int4(&down_bf16, hidden, inter, group_size)),
+            )
+        } else {
+            (
+                QuantWeight::Int8(quantize_int8(&gate_bf16, inter, hidden, group_size)),
+                QuantWeight::Int8(quantize_int8(&up_bf16_vec, inter, hidden, group_size)),
+                QuantWeight::Int8(quantize_int8(&down_bf16, hidden, inter, group_size)),
+            )
+        };
+
+        experts.push(ExpertWeights { gate, up, down });
+    }
+
+    Ok(experts)
 }
 
 /// Detect the native group_size from a pre-quantized model's weight_scale dimensions.

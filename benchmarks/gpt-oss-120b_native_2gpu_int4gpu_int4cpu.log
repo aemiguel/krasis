@@ -1,0 +1,54 @@
+================================================================
+Krasis Benchmark — 2026-02-15 21:27:11
+================================================================
+Model:            gpt-oss-120b
+Architecture:     gpt_oss, 36 layers, 128 experts, top-4, 36 GQA + 0 linear
+PP Partition:     [18, 18] (2 GPUs)
+
+Hardware:
+  CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
+  RAM:            995 GB total, 115.8 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 4838 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 4562 MB allocated
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
+
+Quantization:
+  GPU experts:    INT4 (Marlin)
+  CPU experts:    INT4
+  Attention:      INT8
+  Shared expert:  INT8
+  Dense MLP:      INT8
+  LM head:        INT8
+  KV cache:       FP8 E4M3
+
+Strategy:
+  Expert divisor: 4 (layer_grouped(4))
+  Prefill threshold: 300
+  Mode:           pure_cpu decode, layer_grouped(4) prefill
+
+Prefill (10000 tokens, 3 runs):
+  Run 1:  398.4 tok/s, TTFT=25.10s
+  Run 2:  524.4 tok/s, TTFT=19.07s
+  Run 3:  528.0 tok/s, TTFT=18.94s
+  Average: 483.6 tok/s, TTFT=21.04s
+
+Decode (64 tokens, 3 runs):
+  Run 1:  4.62 tok/s (216.6ms/tok)
+  Run 2:  4.77 tok/s (209.7ms/tok)
+  Run 3:  5.14 tok/s (194.6ms/tok)
+  Average: 4.84 tok/s (207.0ms/tok)
+
+Verification:
+  Prefill prompt: systemYou are ChatGPT, a large language model trained by OpenAI.
+Knowledge cutoff: 2024-06
+Current date: 2026-02-15
+
+Reasoning: medium
+
+# Valid channels: analysis, commentary, final. Channel must be i... [61984 chars total]
+  Decode prompt:  Write a poem about recursion in programming.
+  Generated output (64 tokens):
+    analysisWe need to write a poem about recursion in programming. Likely creative, perhaps with code snippets, references to base case, infinite loop, stack overflow, etc. Should be poetic. Let's produce a poem.assistantfinal**Recursion**  
+    
+    In the quiet cathedral of a silicon mind
+================================================================

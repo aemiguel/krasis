@@ -81,6 +81,7 @@ class TransformerLayer:
         # MLP weights
         if self.is_moe:
             self.gate_weight = weights["gate"]["weight"]  # [n_experts, hidden]
+            self.gate_bias = weights["gate"].get("bias")  # [n_experts] or None (GPT OSS)
             self.e_score_correction_bias = weights["gate"].get("e_score_correction_bias")
             self.shared_expert = weights.get("shared_expert")  # {gate_proj, up_proj, down_proj}
             # Fuse gate_proj + up_proj into single matmul to save kernel launch
@@ -113,6 +114,11 @@ class TransformerLayer:
 
         # Pre-cached FP32 gate weights to avoid per-call .float() conversions
         self._gate_weight_f32 = self.gate_weight.float() if self.gate_weight is not None else None
+        self._gate_bias_f32 = (
+            self.gate_bias.float()
+            if self.is_moe and self.gate_bias is not None
+            else None
+        )
         self._e_score_correction_bias_f32 = (
             self.e_score_correction_bias.float()
             if self.is_moe and self.e_score_correction_bias is not None
@@ -235,22 +241,43 @@ class TransformerLayer:
 
             # Routing on GPU (fast: ~0.1ms)
             router_logits = torch.matmul(hidden.float(), self._gate_weight_f32.t())
-            if self.cfg.scoring_func == "sigmoid":
+            if self._gate_bias_f32 is not None:
+                router_logits = router_logits + self._gate_bias_f32
+
+            if self.cfg.swiglu_limit > 0:
+                # GPT OSS: topk on raw logits, softmax on selected values
+                topk_weights, topk_ids = torch.topk(
+                    router_logits, self.cfg.num_experts_per_tok, dim=-1,
+                )
+                topk_weights = torch.softmax(topk_weights, dim=-1)
+            elif self.cfg.scoring_func == "sigmoid":
                 scores = torch.sigmoid(router_logits)
+                if self._e_score_correction_bias_f32 is not None:
+                    topk_weights, topk_ids = torch.topk(
+                        scores + self._e_score_correction_bias_f32,
+                        self.cfg.num_experts_per_tok, dim=-1,
+                    )
+                    topk_weights = scores.gather(1, topk_ids)
+                else:
+                    topk_weights, topk_ids = torch.topk(
+                        scores, self.cfg.num_experts_per_tok, dim=-1,
+                    )
+                if self.cfg.norm_topk_prob:
+                    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
             else:
                 scores = torch.softmax(router_logits, dim=-1)
-            if self._e_score_correction_bias_f32 is not None:
-                topk_weights, topk_ids = torch.topk(
-                    scores + self._e_score_correction_bias_f32,
-                    self.cfg.num_experts_per_tok, dim=-1,
-                )
-                topk_weights = scores.gather(1, topk_ids)
-            else:
-                topk_weights, topk_ids = torch.topk(
-                    scores, self.cfg.num_experts_per_tok, dim=-1,
-                )
-            if self.cfg.norm_topk_prob:
-                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+                if self._e_score_correction_bias_f32 is not None:
+                    topk_weights, topk_ids = torch.topk(
+                        scores + self._e_score_correction_bias_f32,
+                        self.cfg.num_experts_per_tok, dim=-1,
+                    )
+                    topk_weights = scores.gather(1, topk_ids)
+                else:
+                    topk_weights, topk_ids = torch.topk(
+                        scores, self.cfg.num_experts_per_tok, dim=-1,
+                    )
+                if self.cfg.norm_topk_prob:
+                    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
             if mlp_timing:
                 torch.cuda.synchronize()
@@ -429,29 +456,36 @@ class TransformerLayer:
         # ── Routing ──
         # gate: [M, hidden] @ [n_experts, hidden]^T → [M, n_experts]
         router_logits = torch.matmul(hidden.float(), self.gate_weight.float().t())
+        if self.gate_bias is not None:
+            router_logits = router_logits + self.gate_bias.float()
 
-        # Sigmoid scoring (Kimi K2.5)
-        if self.cfg.scoring_func == "sigmoid":
-            scores = torch.sigmoid(router_logits)
-        else:
-            scores = torch.softmax(router_logits, dim=-1)
-
-        # Add correction bias before top-k selection
-        if self.e_score_correction_bias is not None:
-            scores_for_selection = scores + self.e_score_correction_bias.float()
-        else:
-            scores_for_selection = scores
-
-        # Top-k selection
         topk = self.cfg.num_experts_per_tok
-        topk_weights, topk_ids = torch.topk(scores_for_selection, topk, dim=-1)
 
-        # Use original scores (without bias) for the selected experts' weights
-        topk_weights = scores.gather(1, topk_ids)
-
-        # Normalize weights
-        if self.cfg.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        if self.cfg.swiglu_limit > 0:
+            # GPT OSS routing: topk on raw logits, then softmax on selected values
+            topk_weights, topk_ids = torch.topk(router_logits, topk, dim=-1)
+            topk_weights = torch.softmax(topk_weights, dim=-1)
+        elif self.cfg.scoring_func == "sigmoid":
+            # Kimi K2.5: sigmoid scoring + correction bias
+            scores = torch.sigmoid(router_logits)
+            scores_for_selection = scores
+            if self.e_score_correction_bias is not None:
+                scores_for_selection = scores + self.e_score_correction_bias.float()
+            topk_weights, topk_ids = torch.topk(scores_for_selection, topk, dim=-1)
+            # Use original scores (without bias) for the selected experts' weights
+            topk_weights = scores.gather(1, topk_ids)
+            if self.cfg.norm_topk_prob:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        else:
+            # Standard: softmax over all experts, then topk
+            scores = torch.softmax(router_logits, dim=-1)
+            scores_for_selection = scores
+            if self.e_score_correction_bias is not None:
+                scores_for_selection = scores + self.e_score_correction_bias.float()
+            topk_weights, topk_ids = torch.topk(scores_for_selection, topk, dim=-1)
+            topk_weights = scores.gather(1, topk_ids)
+            if self.cfg.norm_topk_prob:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
         topk_weights = topk_weights.to(torch.float32)
         topk_ids = topk_ids.to(torch.int32)

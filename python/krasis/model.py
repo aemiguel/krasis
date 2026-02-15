@@ -536,6 +536,10 @@ class KrasisModel:
                 if layer.e_score_correction_bias is not None:
                     bias = layer.e_score_correction_bias.cpu().float().contiguous()
                     bias_bytes = bias.numpy().view(np.uint8).tobytes()
+                elif self.cfg.swiglu_limit > 0 and layer.gate_bias is not None:
+                    # GPT OSS: send gate bias as correction_bias for Rust routing fallback
+                    bias = layer.gate_bias.cpu().float().contiguous()
+                    bias_bytes = bias.numpy().view(np.uint8).tobytes()
                 engine.set_routing_weights(moe_idx, gw_bytes, bias_bytes)
                 moe_idx += 1
         logger.info("Routing weights sent to Rust engine (%d MoE layers)", moe_idx)
@@ -567,6 +571,7 @@ class KrasisModel:
                     num_moe_layers=num_moe_layers,
                     expert_divisor=self.expert_divisor,
                     skip_shared_experts=self._has_shared_expert_gate,
+                    swiglu_limit=self.cfg.swiglu_limit,
                 )
                 self.gpu_prefill_managers[dev_str] = manager
                 logger.info("GPU prefill manager created for %s", dev_str)
@@ -731,7 +736,7 @@ class KrasisModel:
             and self.gpu_prefill_enabled
             and self.cfg.n_routed_experts > 0
         ):
-            return self.forward_prefill_layer_grouped(token_ids, positions, seq_states)
+            return self._forward_prefill_with_oom_retry(token_ids, positions, seq_states)
 
         # ── Embedding (GPU0) ──
         first_dev = torch.device(self.ranks[0].device)
@@ -859,11 +864,94 @@ class KrasisModel:
 
         return logits
 
+    def _forward_prefill_with_oom_retry(
+        self,
+        token_ids: torch.Tensor,
+        positions: torch.Tensor,
+        seq_states: List[SequenceKVState],
+    ) -> torch.Tensor:
+        """Wrapper around forward_prefill_layer_grouped with OOM recovery.
+
+        On CUDA OOM:
+        1. Halve the max chunk size (forces smaller chunks on retry)
+        2. Free CUDA graphs if present (reclaims ~1 GB)
+        3. Reset KV state and retry
+        4. If minimum chunk still OOMs, raise the error
+        """
+        max_chunk_override = None
+        max_retries = 3
+        freed_graphs = False
+
+        for attempt in range(max_retries + 1):
+            try:
+                result = self.forward_prefill_layer_grouped(
+                    token_ids, positions, seq_states,
+                    max_chunk_override=max_chunk_override,
+                )
+
+                # Re-capture CUDA graphs if we freed them during OOM recovery.
+                # Prefill is done so the activation VRAM is free again.
+                if freed_graphs:
+                    for manager in self.gpu_prefill_managers.values():
+                        if manager._hcs_initialized and manager._hcs_buffers:
+                            try:
+                                torch.cuda.empty_cache()
+                                manager._init_cuda_graphs()
+                                logger.info("CUDA graphs re-captured after OOM recovery")
+                            except torch.OutOfMemoryError:
+                                logger.warning(
+                                    "Could not re-capture CUDA graphs after OOM recovery "
+                                    "(decode will use non-graphed path)"
+                                )
+
+                return result
+            except torch.OutOfMemoryError:
+                if attempt >= max_retries:
+                    raise
+
+                # Determine new chunk size
+                old_chunk = max_chunk_override or token_ids.shape[0]
+                new_chunk = max(128, old_chunk // 2)
+
+                if new_chunk == max_chunk_override:
+                    # Already at minimum, can't shrink further
+                    raise
+
+                logger.warning(
+                    "Prefill OOM (attempt %d/%d): reducing chunk_size %d → %d",
+                    attempt + 1, max_retries, old_chunk, new_chunk,
+                )
+
+                # Free CUDA intermediates
+                torch.cuda.empty_cache()
+
+                # Free CUDA graphs if present (reclaims ~1 GB)
+                if not freed_graphs:
+                    for manager in self.gpu_prefill_managers.values():
+                        if manager._hcs_cuda_graphs:
+                            logger.warning(
+                                "Freeing %d CUDA graphs to reclaim VRAM for prefill",
+                                len(manager._hcs_cuda_graphs),
+                            )
+                            manager._hcs_cuda_graphs.clear()
+                            manager._hcs_graph_io.clear()
+                            manager._hcs_cuda_graphs_enabled = False
+                            freed_graphs = True
+                            torch.cuda.empty_cache()
+
+                # Reset KV state for retry (prefill will re-fill from scratch)
+                for seq_state in seq_states:
+                    if seq_state is not None:
+                        seq_state.seq_len = 0
+
+                max_chunk_override = new_chunk
+
     def forward_prefill_layer_grouped(
         self,
         token_ids: torch.Tensor,
         positions: torch.Tensor,
         seq_states: List[SequenceKVState],
+        max_chunk_override: int = None,
     ) -> torch.Tensor:
         """GPU prefill with layer-grouped expert loading.
 
@@ -902,36 +990,50 @@ class KrasisModel:
         K_moe = self.cfg.hidden_size
         dtype_size = 2  # BF16
         intermediate_per_token = topk * (N_moe + max(2 * N_moe, K_moe)) * dtype_size
+        # Hidden state + residual per token (carried through layers)
+        hidden_per_token = K_moe * dtype_size * 2  # hidden + residual
 
         # Estimate available VRAM for activation intermediates.
-        # Subtract 1-layer expert group (worst case for HCS) + headroom from free VRAM.
+        # Include both CUDA driver-level free memory AND PyTorch's reserved-but-unallocated
+        # pool (memory PyTorch pre-reserved from CUDA but hasn't assigned to tensors).
+        # This gives a more accurate picture of what PyTorch can actually allocate.
         try:
-            free_per_dev = {
-                str(torch.device(r.device)): torch.cuda.mem_get_info(torch.device(r.device))[0]
-                for r in self.ranks
-            }
+            free_per_dev = {}
+            for r in self.ranks:
+                dev = torch.device(r.device)
+                cuda_free = torch.cuda.mem_get_info(dev)[0]
+                pytorch_pool = torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+                free_per_dev[str(dev)] = cuda_free + max(0, pytorch_pool)
             min_free = min(free_per_dev.values())
             first_dev_str = str(torch.device(self.ranks[0].device))
             first_manager = self.gpu_prefill_managers.get(first_dev_str)
             if first_manager and intermediate_per_token > 0:
                 per_expert = first_manager._per_expert_vram_bytes()
                 # 1-layer expert group VRAM (including shared experts)
-                expert_group_bytes = self.cfg.num_local_experts * per_expert
+                expert_group_bytes = self.cfg.n_routed_experts * per_expert
                 if self.cfg.n_shared_experts > 0:
                     expert_group_bytes += per_expert  # ~1 shared expert worth
-                headroom = 512 * 1024 * 1024  # 512 MB for KV cache growth, etc.
-                activation_budget = min_free - expert_group_bytes - headroom
+                # Safety margin: kernel workspace, PyTorch allocator fragmentation,
+                # attention intermediates, hidden states between chunks.
+                # Use 2x safety factor on the per-token estimate to account for
+                # peak memory during kernel execution (multiple concurrent buffers).
+                safety_factor = 2.0
+                total_per_token = (intermediate_per_token + hidden_per_token) * safety_factor
+                activation_budget = min_free - expert_group_bytes
                 if activation_budget > 0:
-                    max_chunk = int(activation_budget / intermediate_per_token)
-                    chunk_size = max(512, min(M, max_chunk))
+                    max_chunk = int(activation_budget / total_per_token)
+                    chunk_size = max(256, min(M, max_chunk))
                 else:
-                    chunk_size = 2048
+                    chunk_size = 512
                 logger.info(
                     "Chunk calc: free=%s, min_free=%.0f MB, expert_group=%.0f MB, "
-                    "headroom=%.0f MB, budget=%.0f MB, max_chunk=%d → chunk_size=%d",
+                    "per_tok=%.0f KB (%.0f KB intermediate + %.0f KB hidden, %.1fx safety), "
+                    "budget=%.0f MB, max_chunk=%d → chunk_size=%d",
                     {k: f"{v/1e6:.0f}MB" for k, v in free_per_dev.items()},
                     min_free / 1e6, expert_group_bytes / 1e6,
-                    headroom / 1e6, activation_budget / 1e6 if activation_budget > 0 else 0,
+                    total_per_token / 1024, intermediate_per_token / 1024,
+                    hidden_per_token / 1024, safety_factor,
+                    activation_budget / 1e6 if activation_budget > 0 else 0,
                     max_chunk if activation_budget > 0 else 0, chunk_size,
                 )
             else:
@@ -941,6 +1043,11 @@ class KrasisModel:
         except Exception as e:
             chunk_size = 2048
             logger.warning("Chunk calc exception: %s, defaulting to %d", e, chunk_size)
+
+        # Apply OOM retry override (from _forward_prefill_with_oom_retry)
+        if max_chunk_override is not None and max_chunk_override < chunk_size:
+            logger.info("Chunk size capped by OOM retry: %d → %d", chunk_size, max_chunk_override)
+            chunk_size = max_chunk_override
 
         num_chunks = ceil(M / chunk_size)
         logger.info(

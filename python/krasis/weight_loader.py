@@ -258,6 +258,11 @@ class WeightLoader:
                 w = w + 1.0  # Qwen3NextRMSNorm convention
             weights["k_norm"] = w
 
+        # Attention sinks (GPT OSS: learnable logits for attention normalization)
+        sinks_name = f"{prefix}.sinks"
+        if sinks_name in self._weight_map:
+            weights["sinks"] = self._load_bf16(sinks_name, device)
+
         return weights
 
     def load_layer_norms(
@@ -295,15 +300,30 @@ class WeightLoader:
     def load_moe_gate(
         self, layer_idx: int, device: torch.device
     ) -> Dict[str, torch.Tensor]:
-        """Load MoE router gate weight and correction bias (BF16)."""
-        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.gate"
+        """Load MoE router gate weight and optional biases (BF16).
+
+        Supports both naming conventions:
+        - "mlp.gate" (DeepSeek/Kimi/Qwen3)
+        - "mlp.router" (GPT OSS)
+        """
+        # Detect naming: "gate" vs "router"
+        prefix_gate = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.gate"
+        prefix_router = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.router"
+        if f"{prefix_gate}.weight" in self._weight_map:
+            prefix = prefix_gate
+        else:
+            prefix = prefix_router
         result = {
             "weight": self._load_bf16(f"{prefix}.weight", device),
         }
-        # e_score_correction_bias may exist (Kimi K2.5)
-        bias_name = f"{prefix}.e_score_correction_bias"
+        # Router bias (GPT OSS)
+        bias_name = f"{prefix}.bias"
         if bias_name in self._weight_map:
-            result["e_score_correction_bias"] = self._load_bf16(bias_name, device)
+            result["bias"] = self._load_bf16(bias_name, device)
+        # e_score_correction_bias (Kimi K2.5)
+        corr_name = f"{prefix}.e_score_correction_bias"
+        if corr_name in self._weight_map:
+            result["e_score_correction_bias"] = self._load_bf16(corr_name, device)
         return result
 
     def load_shared_expert(
@@ -379,7 +399,12 @@ class WeightLoader:
         start = time.perf_counter()
 
         is_linear = self.cfg.is_linear_attention_layer(layer_idx)
-        layer_type = "linear_attention" if is_linear else "full_attention"
+        if is_linear:
+            layer_type = "linear_attention"
+        elif self.cfg.is_sliding_attention_layer(layer_idx):
+            layer_type = "sliding_attention"
+        else:
+            layer_type = "full_attention"
 
         result = {
             "norms": self.load_layer_norms(layer_idx, device),

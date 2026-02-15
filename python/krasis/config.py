@@ -75,7 +75,12 @@ class ModelConfig:
     partial_rotary_factor: float = 1.0  # GLM-4.7 uses 0.5 (only half of head_dim gets RoPE)
 
     # Attention
-    attention_bias: bool = False       # GLM-4.7 has bias on Q/K/V projections
+    attention_bias: bool = False       # GLM-4.7, GPT OSS have bias on Q/K/V projections
+    sliding_window: int = 0            # GPT OSS: 128 tokens for sliding_attention layers
+
+    # Pre-quantized experts
+    expert_quant_method: str = ""      # "mxfp4" for GPT OSS, "" for standard BF16
+    swiglu_limit: float = 0.0         # GPT OSS: 7.0 — clamp SwiGLU output to [-limit, limit]
 
     # Norm convention: Qwen3NextRMSNorm uses (1 + weight) * x, stored weights are ~0
     # Standard RMSNorm uses weight * x, stored weights are ~1
@@ -114,11 +119,15 @@ class ModelConfig:
         else:
             first_k_dense = 0
 
-        # Hybrid model: compute layer_types from full_attention_interval
+        # Hybrid model: compute layer_types
         full_attn_interval = cfg.get("full_attention_interval", 0)
         num_layers = cfg["num_hidden_layers"]
         layer_types = None
-        if full_attn_interval > 0:
+        if "layer_types" in cfg:
+            # GPT OSS: explicit layer_types array (sliding_attention / full_attention)
+            layer_types = cfg["layer_types"]
+        elif full_attn_interval > 0:
+            # Qwen3-Next: compute from full_attention_interval
             layer_types = [
                 "full_attention" if (i + 1) % full_attn_interval == 0
                 else "linear_attention"
@@ -137,11 +146,32 @@ class ModelConfig:
         if n_shared == 0 and shared_inter > 0:
             n_shared = 1  # infer single shared expert
 
+        # Expert count: n_routed_experts (DeepSeek) / num_experts (Qwen3) / num_local_experts (GPT OSS)
+        n_experts = cfg.get("n_routed_experts",
+                           cfg.get("num_experts",
+                                  cfg.get("num_local_experts", 0)))
+        # Experts per token: num_experts_per_tok (DeepSeek/Qwen3) / experts_per_token (GPT OSS)
+        experts_per_tok = cfg.get("num_experts_per_tok",
+                                 cfg.get("experts_per_token", 0))
+
+        # MoE intermediate size: moe_intermediate_size (Qwen3) / intermediate_size (GPT OSS)
+        moe_inter = cfg.get("moe_intermediate_size", cfg.get("intermediate_size", 0))
+
+        # Sliding window (GPT OSS: 128 tokens for sliding_attention layers)
+        sliding_window = cfg.get("sliding_window", 0)
+
+        # Pre-quantized expert format (GPT OSS uses MXFP4)
+        quant_config = cfg.get("quantization_config", {})
+        expert_quant_method = quant_config.get("quant_method", "")
+
+        # SwiGLU activation limit (GPT OSS clamps SwiGLU output)
+        swiglu_limit = cfg.get("swiglu_limit", 0.0)
+
         return cls(
             model_path=model_path,
             hidden_size=cfg["hidden_size"],
             intermediate_size=cfg.get("intermediate_size", cfg.get("moe_intermediate_size", 0)),
-            moe_intermediate_size=cfg.get("moe_intermediate_size", 0),
+            moe_intermediate_size=moe_inter,
             num_hidden_layers=num_layers,
             num_attention_heads=cfg["num_attention_heads"],
             num_key_value_heads=cfg.get("num_key_value_heads", cfg["num_attention_heads"]),
@@ -163,8 +193,8 @@ class ModelConfig:
             linear_value_head_dim=cfg.get("linear_value_head_dim", 128),
             linear_num_value_heads=cfg.get("linear_num_value_heads", 32),
             # MoE
-            n_routed_experts=cfg.get("n_routed_experts", cfg.get("num_experts", 0)),
-            num_experts_per_tok=cfg.get("num_experts_per_tok", 0),
+            n_routed_experts=n_experts,
+            num_experts_per_tok=experts_per_tok,
             n_shared_experts=n_shared,
             shared_expert_intermediate_size=shared_inter,
             first_k_dense_replace=first_k_dense,
@@ -179,6 +209,9 @@ class ModelConfig:
             max_position_embeddings=cfg.get("max_position_embeddings", 131072),
             partial_rotary_factor=cfg.get("partial_rotary_factor", 1.0),
             attention_bias=cfg.get("attention_bias", False),
+            sliding_window=sliding_window,
+            expert_quant_method=expert_quant_method,
+            swiglu_limit=swiglu_limit,
             norm_bias_one=norm_bias_one,
             tie_word_embeddings=tie,
             bos_token_id=raw.get("bos_token_id", cfg.get("bos_token_id", 0)),
@@ -244,18 +277,24 @@ class ModelConfig:
             return False
         return self.layer_types[layer_idx] == "linear_attention"
 
+    def is_sliding_attention_layer(self, layer_idx: int) -> bool:
+        """True if this layer uses sliding window attention (GPT OSS)."""
+        if self.layer_types is None:
+            return False
+        return self.layer_types[layer_idx] == "sliding_attention"
+
     def is_full_attention_layer(self, layer_idx: int) -> bool:
         """True if this layer uses standard full attention (GQA/MLA)."""
         if self.layer_types is None:
             return True
-        return self.layer_types[layer_idx] == "full_attention"
+        return self.layer_types[layer_idx] in ("full_attention", "sliding_attention")
 
     @property
     def num_full_attention_layers(self) -> int:
-        """Number of layers that use full attention (need KV cache)."""
+        """Number of layers that need KV cache (full + sliding attention)."""
         if self.layer_types is None:
             return self.num_hidden_layers
-        return sum(1 for t in self.layer_types if t == "full_attention")
+        return sum(1 for t in self.layer_types if t in ("full_attention", "sliding_attention"))
 
     @property
     def effective_shared_expert_intermediate(self) -> int:

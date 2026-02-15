@@ -403,11 +403,19 @@ class GQAAttention:
         self.v_proj = weights["v_proj"]  # [num_kv_heads * head_dim, hidden]
         self.o_proj = weights["o_proj"]  # [hidden, num_heads * head_dim]
 
-        # Attention biases (optional, GLM-4.7 has these)
+        # Attention biases (optional, GLM-4.7 / GPT OSS have these)
         self.q_proj_bias = weights.get("q_proj_bias")  # [num_heads * head_dim]
         self.k_proj_bias = weights.get("k_proj_bias")  # [num_kv_heads * head_dim]
         self.v_proj_bias = weights.get("v_proj_bias")  # [num_kv_heads * head_dim]
         self.o_proj_bias = weights.get("o_proj_bias")  # [hidden]
+
+        # Attention sinks (GPT OSS: per-head learnable logit for softmax normalization)
+        self.sinks = weights.get("sinks")  # [num_heads]
+
+        # Sliding window (GPT OSS: 128 for sliding_attention layers)
+        self.sliding_window = None
+        if cfg.is_sliding_attention_layer(layer_idx):
+            self.sliding_window = cfg.sliding_window
 
         # QKNorm (per-head RMSNorm, optional)
         self.q_norm = weights.get("q_norm")  # [head_dim]
@@ -584,7 +592,7 @@ class GQAAttention:
         # (hundreds of MB) when only a few pages are accessed.
         kv_dtype = k_layer.dtype
 
-        self._prefill_wrapper.plan(
+        plan_kwargs = dict(
             qo_indptr=qo_indptr,
             paged_kv_indptr=kv_indptr,
             paged_kv_indices=kv_indices,
@@ -598,12 +606,32 @@ class GQAAttention:
             q_data_type=torch.bfloat16,
             kv_data_type=kv_dtype,
         )
+        if self.sliding_window is not None:
+            plan_kwargs["window_left"] = self.sliding_window - 1
+        self._prefill_wrapper.plan(**plan_kwargs)
 
-        # attn_out: [M, num_heads, head_dim]
-        attn_out = self._prefill_wrapper.run(
+        # Request LSE (log-sum-exp) if sinks are present — needed for post-correction
+        run_kwargs = dict(
             q=q.to(torch.bfloat16),
             paged_kv_cache=(k_layer, v_layer),
         )
+        if self.sinks is not None:
+            run_kwargs["return_lse"] = True
+
+        run_result = self._prefill_wrapper.run(**run_kwargs)
+
+        if self.sinks is not None:
+            # Sinks: learnable logit per head concatenated to attention weights.
+            # After FlashInfer computes output with LSE, we adjust:
+            #   adjusted_output = output * sigmoid(lse - sink)
+            # This is mathematically equivalent to adding a sink logit to softmax.
+            attn_out, lse = run_result  # lse: [M, num_heads]
+            sink = self.sinks.view(1, -1)  # [1, num_heads]
+            scale = torch.sigmoid(lse - sink)  # [M, num_heads]
+            attn_out = attn_out * scale.unsqueeze(-1)  # [M, num_heads, head_dim]
+        else:
+            # attn_out: [M, num_heads, head_dim]
+            attn_out = run_result
 
         # ── Step 6: O projection ──
         attn_flat = attn_out.reshape(M, self.num_heads * self.head_dim)
@@ -611,6 +639,10 @@ class GQAAttention:
         # Gated attention: apply sigmoid(gate) to attention output before o_proj
         if self.gated_attention:
             attn_flat = attn_flat * torch.sigmoid(attn_gate)
+
+        # Ensure BF16 for linear (sinks path can produce float32 via sigmoid)
+        if attn_flat.dtype != torch.bfloat16:
+            attn_flat = attn_flat.to(torch.bfloat16)
 
         output = _linear(attn_flat, self.o_proj)
         if self.o_proj_bias is not None:

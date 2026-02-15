@@ -168,6 +168,8 @@ pub fn expert_forward_unified(
     act_scales: &[f32],
     scratch: &mut ExpertScratch,
     parallel: bool,
+    swiglu_limit: f32,
+    activation_alpha: f32,
 ) {
     let k = expert.hidden_size;
     let n = expert.intermediate_size;
@@ -205,14 +207,42 @@ pub fn expert_forward_unified(
         _ => panic!("Unsupported num_bits: {}", expert.num_bits),
     }
 
-    // Split w13_out into gate[N] and up[N], apply SiLU activation
-    // hidden = SiLU(gate) * up → BF16 [intermediate_size]
-    for i in 0..n {
-        let gate = scratch.w13_out[i];
-        let up = scratch.w13_out[n + i];
-        let silu = gate * fast_sigmoid(gate);
-        let hidden = silu * up;
-        scratch.hidden_bf16[i] = f32_to_bf16(hidden);
+    // Apply gate/up biases if present (GPT OSS)
+    if let Some(ref gate_bias) = expert.gate_bias {
+        for i in 0..n {
+            scratch.w13_out[i] += gate_bias[i];
+        }
+    }
+    if let Some(ref up_bias) = expert.up_bias {
+        for i in 0..n {
+            scratch.w13_out[n + i] += up_bias[i];
+        }
+    }
+
+    // Split w13_out into gate[N] and up[N], apply activation
+    if swiglu_limit > 0.0 {
+        // GPT OSS activation: gate*sigmoid(gate*alpha)*(up+1) with clamping
+        let alpha = activation_alpha;
+        for i in 0..n {
+            let mut gate = scratch.w13_out[i];
+            let mut up = scratch.w13_out[n + i];
+            // Clamp: gate ≤ limit, -limit ≤ up ≤ limit
+            if gate > swiglu_limit { gate = swiglu_limit; }
+            if up > swiglu_limit { up = swiglu_limit; }
+            if up < -swiglu_limit { up = -swiglu_limit; }
+            let glu = gate * fast_sigmoid(gate * alpha);
+            let hidden = (up + 1.0) * glu;
+            scratch.hidden_bf16[i] = f32_to_bf16(hidden);
+        }
+    } else {
+        // Standard SiLU: SiLU(gate) * up
+        for i in 0..n {
+            let gate = scratch.w13_out[i];
+            let up = scratch.w13_out[n + i];
+            let silu = gate * fast_sigmoid(gate);
+            let hidden = silu * up;
+            scratch.hidden_bf16[i] = f32_to_bf16(hidden);
+        }
     }
 
     // Quantize intermediate hidden state to INT16 for down projection
@@ -253,6 +283,13 @@ pub fn expert_forward_unified(
             );
         }
         _ => panic!("Unsupported w2_bits: {}", expert.w2_bits),
+    }
+
+    // Apply down_proj bias if present (GPT OSS)
+    if let Some(ref down_bias) = expert.down_bias {
+        for j in 0..k {
+            scratch.expert_out[j] += down_bias[j];
+        }
     }
 }
 
@@ -505,6 +542,7 @@ pub fn moe_forward_unified(
                         };
                         expert_forward_unified(
                             expert, &act_int16, &act_scales, local_scratch, true,
+                            store.config.swiglu_limit, store.config.activation_alpha,
                         );
                         crate::numa::unpin_thread();
                     });
@@ -530,7 +568,8 @@ pub fn moe_forward_unified(
         pool.par_iter_mut().enumerate().for_each(|(i, local_scratch)| {
             let eidx = expert_indices[i];
             let expert = store.get_expert_unified(moe_layer_idx, eidx);
-            expert_forward_unified(expert, &act_int16, &act_scales, local_scratch, true);
+            expert_forward_unified(expert, &act_int16, &act_scales, local_scratch, true,
+                store.config.swiglu_limit, store.config.activation_alpha);
         });
 
         for i in 0..n {
@@ -552,7 +591,8 @@ pub fn moe_forward_unified(
                 prefetch_expert_unified_nta(next_expert);
             }
 
-            expert_forward_unified(expert, &act_int16, &act_scales, scratch, false);
+            expert_forward_unified(expert, &act_int16, &act_scales, scratch, false,
+                store.config.swiglu_limit, store.config.activation_alpha);
 
             for j in 0..output.len() {
                 output[j] += weight * scratch.expert_out[j];
@@ -571,7 +611,8 @@ pub fn moe_forward_unified(
             ss_act_scales.clear();
             ss_act_scales.extend_from_slice(&act_scales);
 
-            expert_forward_unified(shared_expert, &ss_act_int16, &ss_act_scales, ss, parallel);
+            expert_forward_unified(shared_expert, &ss_act_int16, &ss_act_scales, ss, parallel,
+                store.config.swiglu_limit, store.config.activation_alpha);
 
             let scale = store.config.routed_scaling_factor;
             for j in 0..hidden {
@@ -1208,6 +1249,9 @@ impl KrasisEngine {
             None
         };
 
+        // Attach expert biases for GPT OSS models (gate_up + down biases per expert)
+        store.attach_expert_biases(Path::new(path));
+
         // Wrap store in Arc for sharing with worker thread
         let store = Arc::new(store);
 
@@ -1441,6 +1485,17 @@ impl KrasisEngine {
         let store = self.store.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
         Ok(store.config.moe_intermediate_size)
+    }
+
+    /// Padded hidden size for Marlin w2 (down_proj) kernel compatibility.
+    /// Returns hidden_size if no padding needed, otherwise padded value.
+    pub fn marlin_w2_padded_n(&self) -> PyResult<usize> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
+        Ok(crate::weights::marlin_w2_padded_n(
+            store.config.hidden_size,
+            store.config.moe_intermediate_size,
+        ))
     }
 
     /// Get w13 (gate+up) packed INT4 data for a range of experts in a layer.
@@ -2278,7 +2333,100 @@ impl KrasisEngine {
             logits[e] = sum;
         }
 
-        // ── Scoring ──
+        // ── Scoring + TopK selection ──
+        let swiglu_limit = store.config.swiglu_limit;
+
+        if swiglu_limit > 0.0 {
+            // GPT OSS routing: topk on raw logits, then softmax on selected values
+            // (NOT full softmax then topk — that divides weights by sum of all 128 experts)
+            // Add router bias if present (sent as correction_bias for GPT OSS)
+            if let Some(ref bias) = routing.correction_bias {
+                for e in 0..n_experts {
+                    logits[e] += bias[e];
+                }
+            }
+
+            // Find topk by partial sort on RAW logits
+            let mut top_indices = Vec::with_capacity(topk);
+            let mut top_logits = Vec::with_capacity(topk);
+            let mut used = vec![false; n_experts];
+
+            for _ in 0..topk {
+                let mut best_idx = 0;
+                let mut best_val = f32::NEG_INFINITY;
+                for e in 0..n_experts {
+                    if !used[e] && logits[e] > best_val {
+                        best_val = logits[e];
+                        best_idx = e;
+                    }
+                }
+                used[best_idx] = true;
+                top_indices.push(best_idx);
+                top_logits.push(logits[best_idx]);
+            }
+
+            // Softmax only over selected top-k logits
+            let max_val = top_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f32;
+            let mut top_weights = Vec::with_capacity(topk);
+            for &l in &top_logits {
+                let e = (l - max_val).exp();
+                top_weights.push(e);
+                sum_exp += e;
+            }
+            for w in top_weights.iter_mut() {
+                *w /= sum_exp;
+            }
+
+            // ── MoE forward (inline, same as standard path below) ──
+            output_bf16.fill(0);
+            let output_f32 = &mut self.output_buf;
+            let scratch = self.scratch.as_mut()
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                    "Scratch not initialized"))?;
+            let scratch_pool = &mut self.scratch_pool;
+            let shared_scratch = &mut self.shared_scratch;
+            let use_gguf = store.has_gguf();
+            let parallel = self.parallel;
+            let numa_map = self.numa_map.as_ref();
+
+            output_f32.fill(0.0);
+            if use_gguf {
+                if let Some(ref mut gs) = self.gguf_scratch {
+                    moe_forward_gguf(
+                        store, moe_layer_idx, activation,
+                        &top_indices, &top_weights,
+                        output_f32, gs, &mut self.gguf_scratch_pool,
+                        &mut self.gguf_shared_scratch,
+                        parallel, numa_map,
+                    );
+                }
+            } else if store.has_unified() {
+                moe_forward_unified(
+                    store, moe_layer_idx, activation,
+                    &top_indices, &top_weights,
+                    output_f32, scratch, scratch_pool,
+                    shared_scratch,
+                    parallel, numa_map,
+                );
+            } else {
+                moe_forward(
+                    store, moe_layer_idx, activation,
+                    &top_indices, &top_weights,
+                    output_f32, scratch, scratch_pool,
+                    shared_scratch,
+                    parallel, numa_map,
+                );
+            }
+
+            // Convert f32 → BF16
+            for j in 0..hidden {
+                output_bf16[j] = f32_to_bf16(output_f32[j]);
+            }
+
+            return Ok(());
+        }
+
         if rcfg.scoring_func == "sigmoid" {
             for e in 0..n_experts {
                 scores[e] = 1.0 / (1.0 + (-logits[e]).exp());
@@ -2491,7 +2639,7 @@ mod tests {
 
         // Run transposed kernel (CPU decode path)
         let mut scratch_transposed = ExpertScratch::new(hidden, intermediate, group_size);
-        expert_forward_unified(&transposed, &act_int16, &act_scales, &mut scratch_transposed, false);
+        expert_forward_unified(&transposed, &act_int16, &act_scales, &mut scratch_transposed, false, 0.0, 0.0);
 
         // Compare outputs
         let mut max_diff: f32 = 0.0;
@@ -2555,7 +2703,7 @@ mod tests {
 
         // Run Marlin forward
         let mut scratch = ExpertScratch::new(hidden, intermediate, group_size);
-        expert_forward_unified(&marlin, &act_int16, &act_scales, &mut scratch, false);
+        expert_forward_unified(&marlin, &act_int16, &act_scales, &mut scratch, false, 0.0, 0.0);
 
         // Verify output is non-trivial
         let mut rms: f64 = 0.0;
@@ -2605,13 +2753,13 @@ mod tests {
 
         // Test single expert forward (serial)
         let start = std::time::Instant::now();
-        expert_forward_unified(expert, &act_int16, &act_scales, &mut scratch, false);
+        expert_forward_unified(expert, &act_int16, &act_scales, &mut scratch, false, 0.0, 0.0);
         let serial_us = start.elapsed().as_micros();
         let output_serial: Vec<f32> = scratch.expert_out.clone();
 
         // Test single expert forward (parallel)
         let start = std::time::Instant::now();
-        expert_forward_unified(expert, &act_int16, &act_scales, &mut scratch, true);
+        expert_forward_unified(expert, &act_int16, &act_scales, &mut scratch, true, 0.0, 0.0);
         let parallel_us = start.elapsed().as_micros();
         let output_parallel: Vec<f32> = scratch.expert_out.clone();
 

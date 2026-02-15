@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-15 15:27:58
+Krasis Benchmark — 2026-02-15 21:56:29
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,18 +7,18 @@ PP Partition:     [48] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            995 GB total, 77.5 GB used by process
-  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 10814 MB allocated
-  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
-  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
+  RAM:            995 GB total, 76.7 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 12282 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
 
 Quantization:
   GPU experts:    INT4 (Marlin)
   CPU experts:    INT4
-  Attention:      INT8
-  Shared expert:  INT8
-  Dense MLP:      INT8
-  LM head:        INT8
+  Attention:      W8A8_INT8
+  Shared expert:  W8A8_INT8
+  Dense MLP:      W8A8_INT8
+  LM head:        W8A8_INT8
   KV cache:       FP8 E4M3
 
 Strategy:
@@ -27,29 +27,28 @@ Strategy:
   Mode:           gpu_decode (hot_cached_static)
 
 Prefill (10000 tokens, 3 runs):
-  Run 1:  572.5 tok/s, TTFT=17.47s
-  Run 2:  573.6 tok/s, TTFT=17.43s
-  Run 3:  573.2 tok/s, TTFT=17.45s
-  Average: 573.1 tok/s, TTFT=17.45s
+  Run 1:  571.7 tok/s, TTFT=17.49s
+  Run 2:  578.2 tok/s, TTFT=17.29s
+  Run 3:  588.6 tok/s, TTFT=16.99s
+  Average: 579.5 tok/s, TTFT=17.26s
 
 Decode (64 tokens, 3 runs):
-  Run 1:  10.11 tok/s (98.9ms/tok)
-  Run 2:  10.03 tok/s (99.7ms/tok)
-  Run 3:  10.17 tok/s (98.4ms/tok)
-  Average: 10.10 tok/s (99.0ms/tok)
+  Run 1:  9.93 tok/s (100.7ms/tok)
+  Run 2:  10.08 tok/s (99.2ms/tok)
+  Run 3:  10.25 tok/s (97.5ms/tok)
+  Average: 10.09 tok/s (99.1ms/tok)
 
 Verification:
   Prefill prompt: user
 Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Describe database transaction isolation levels and their trade-offs. Discuss compiler optimization passes such as dead co... [63136 chars total]
   Decode prompt:  Write a poem about recursion in programming.
   Generated output (64 tokens):
-    ## The Function's Lament
+    **The Labyrinth of Self-Reference**  
     
-    It calls itself—yet how?  
-    A spiral drawn in logic’s light,  
-    A mirror held to shadowed space,  
-    Where *this* is *that*, and *that* is *this*—  
-    A dance of names, a recursive waltz.
+    A function stands, both bold and small,  
+    It calls itself—*and yet, it stands tall*.  
+    Not broken, but *recursive*—a spiral drawn in code,  
+    A mirror maze where truths unfold.  
     
-    *"Call
+    Its base case whispers, soft and clear
 ================================================================

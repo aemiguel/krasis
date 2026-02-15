@@ -32,6 +32,202 @@ from krasis.timing import TIMING
 GROUP_SIZE = 128
 
 
+def _gpt_oss_activation(gate_up: torch.Tensor, output: torch.Tensor, limit: float, alpha: float):
+    """GPT OSS custom activation replacing silu_and_mul.
+
+    Formula: gate * sigmoid(gate * alpha) * (up + 1)
+    with gate clamped to (-inf, limit] and up clamped to [-limit, limit].
+
+    Args:
+        gate_up: [T, 2N] where first N columns = gate, last N columns = up
+        output: [T, N] pre-allocated output buffer
+        limit: clamping limit (7.0 for GPT OSS)
+        alpha: activation alpha (1.702 for GPT OSS)
+    """
+    N = output.shape[-1]
+    gate = gate_up[..., :N].clamp(max=limit)
+    up = gate_up[..., N:].clamp(min=-limit, max=limit)
+    output[:] = gate * torch.sigmoid(gate * alpha) * (up + 1.0)
+
+
+def _fused_marlin_moe_gpt_oss(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gate_up_bias: Optional[torch.Tensor],
+    down_bias: Optional[torch.Tensor],
+    swiglu_limit: float,
+    activation_alpha: float,
+    global_num_experts: int = -1,
+    expert_map: Optional[torch.Tensor] = None,
+    g_idx1: Optional[torch.Tensor] = None,
+    g_idx2: Optional[torch.Tensor] = None,
+    sort_indices1: Optional[torch.Tensor] = None,
+    sort_indices2: Optional[torch.Tensor] = None,
+    w1_zeros: Optional[torch.Tensor] = None,
+    w2_zeros: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+    num_bits: int = 4,
+    is_k_full: bool = True,
+    inplace: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+) -> torch.Tensor:
+    """GPT OSS variant of fused_marlin_moe with custom activation and expert biases.
+
+    Mirrors sglang's fused_marlin_moe but replaces silu_and_mul with:
+    gate * sigmoid(gate * 1.702) * (up + 1), with clamping.
+    Also supports per-expert biases via b_bias_or_none.
+    """
+    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+    from sgl_kernel import moe_sum_reduce
+
+    assert hidden_states.is_contiguous()
+
+    M, K = hidden_states.shape
+    E = w1.shape[0]
+    N = w2.shape[1] * 16  # intermediate_size (input dim for second GEMM)
+    topk = topk_ids.shape[1]
+    # Detect Marlin w2 padding: actual output dim from w2 packed shape
+    nb2 = num_bits // 2
+    K_out = w2.shape[2] // nb2  # may be > K if padded (e.g., 2944 vs 2880)
+    w2_padded = K_out != K
+
+    # Block size selection (same as original)
+    for block_size_m in [8, 16, 32, 48, 64]:
+        if M * topk / E / block_size_m < 0.9:
+            break
+
+    if global_num_experts == -1:
+        global_num_experts = E
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, global_num_experts
+    )
+
+    if workspace is None:
+        max_workspace_size = (max(2 * N, K_out) // 64) * (
+            sorted_token_ids.size(0) // block_size_m
+        )
+        device = hidden_states.device
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        max_workspace_size = min(max_workspace_size, sms * 4)
+        workspace = torch.zeros(
+            max_workspace_size, dtype=torch.int, device=device, requires_grad=False
+        )
+
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import get_scalar_type
+    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
+    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
+
+    intermediate_cache2 = torch.empty(
+        (M * topk, N), device=hidden_states.device, dtype=hidden_states.dtype,
+    )
+    intermediate_cache13 = torch.empty(
+        (M * topk * max(2 * N, K_out),), device=hidden_states.device, dtype=hidden_states.dtype,
+    )
+    intermediate_cache1 = intermediate_cache13[: M * topk * 2 * N].view(-1, 2 * N)
+    intermediate_cache3 = intermediate_cache13[: M * topk * K_out].view(-1, K_out)
+
+    use_atomic_add = (
+        hidden_states.dtype == torch.half
+        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+    )
+
+    # First GEMM: hidden → gate_up (with optional bias)
+    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+        hidden_states,
+        intermediate_cache1,
+        w1,
+        gate_up_bias,
+        w1_scale,
+        None,
+        w1_zeros,
+        g_idx1,
+        sort_indices1,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_size_m,
+        top_k=topk,
+        mul_topk_weights=False,
+        is_ep=expert_map is not None,
+        b_q_type_id=scalar_type1.id,
+        size_m=M,
+        size_n=2 * N,
+        size_k=K,
+        is_k_full=is_k_full,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=True,
+        is_zp_float=False,
+    )
+
+    # GPT OSS custom activation (replaces silu_and_mul)
+    _gpt_oss_activation(
+        intermediate_cache1.view(-1, 2 * N),
+        intermediate_cache2,
+        swiglu_limit,
+        activation_alpha,
+    )
+
+    if expert_map is not None:
+        intermediate_cache3.zero_()
+
+    # Pad down_bias if w2 is padded (bias shape must match output dim)
+    if w2_padded and down_bias is not None:
+        pad_size = K_out - K
+        down_bias = torch.nn.functional.pad(down_bias, (0, pad_size))
+
+    # Second GEMM: activated → output (with optional bias)
+    # K_out may be > K if w2 was padded for Marlin kernel compatibility
+    intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+        intermediate_cache2,
+        intermediate_cache3,
+        w2,
+        down_bias,
+        w2_scale,
+        None,
+        w2_zeros,
+        g_idx2,
+        sort_indices2,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_size_m,
+        top_k=1,
+        mul_topk_weights=True,
+        is_ep=expert_map is not None,
+        b_q_type_id=scalar_type2.id,
+        size_m=M * topk,
+        size_n=K_out,
+        size_k=N,
+        is_k_full=is_k_full,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=True,
+        is_zp_float=False,
+    )
+
+    # Slice off padding columns if w2 was padded
+    if w2_padded:
+        intermediate_cache3 = intermediate_cache3[:, :K].contiguous()
+    intermediate_cache3 = intermediate_cache3.view(-1, topk, K)
+
+    output = hidden_states if inplace else torch.empty_like(hidden_states)
+
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
+
+    moe_sum_reduce(intermediate_cache3, output, routed_scaling_factor)
+    return output
+
+
 def _quantize_and_pack_gpu(w: torch.Tensor, group_size: int = GROUP_SIZE, num_bits: int = 4):
     """Quantize [K, N] weight to INT4 or INT8 packed on GPU.
 
@@ -109,6 +305,7 @@ class GpuPrefillManager:
         num_moe_layers: int = 0,
         expert_divisor: int = 1,
         skip_shared_experts: bool = False,
+        swiglu_limit: float = 0.0,
     ):
         self.model_path = model_path
         self.device = device
@@ -124,6 +321,10 @@ class GpuPrefillManager:
         self._engine = krasis_engine
         self._num_moe_layers = num_moe_layers
         self._expert_divisor = expert_divisor
+        self.swiglu_limit = swiglu_limit
+        self.activation_alpha = 1.702 if swiglu_limit > 0 else 0.0
+        # Per-layer expert biases for GPT OSS: {moe_layer_idx: {gate_up_bias, down_bias}}
+        self._expert_biases: dict[int, dict[str, torch.Tensor]] = {}
 
         # Use engine's group_size if available, else default 128
         if krasis_engine is not None:
@@ -131,6 +332,14 @@ class GpuPrefillManager:
         else:
             self._group_size = GROUP_SIZE
         logger.info("GPU prefill group_size=%d", self._group_size)
+
+        # Padded hidden size for Marlin w2 kernel compatibility (e.g., 2880→2944)
+        if krasis_engine is not None:
+            self._w2_padded_n = krasis_engine.marlin_w2_padded_n()
+        else:
+            self._w2_padded_n = hidden_size
+        if self._w2_padded_n != hidden_size:
+            logger.info("Marlin w2 padded N: %d → %d (kernel compat)", hidden_size, self._w2_padded_n)
 
         # Persistent/layer-grouped expert buffers
         self._prefill_mode = "chunked"  # "persistent", "layer_grouped", "active_only", or "chunked"
@@ -206,6 +415,7 @@ class GpuPrefillManager:
         self._hcs_sort_idx: dict[int, torch.Tensor] = {}  # layer → [n_hot, 0] kernel helper
         self._hcs_gating_1: dict[int, torch.Tensor] = {}  # layer → [1, n_hot] for M=1
         self._hcs_initialized: bool = False
+        self._hcs_biases: dict[int, dict[str, torch.Tensor]] = {}  # layer → remapped biases for hot experts
         # CUDA graph state (optional acceleration for hot_cached_static)
         self._hcs_cuda_graphs: dict[int, object] = {}  # layer → CUDAGraph
         self._hcs_graph_io: dict[int, dict[str, torch.Tensor]] = {}  # layer → fixed I/O tensors
@@ -262,14 +472,107 @@ class GpuPrefillManager:
             self._allocate_ao_buffer()  # Staging buffer
             self._allocate_lru_buffer()  # LRU cache buffer
 
+    def _call_fused_moe(
+        self,
+        moe_layer_idx: int,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        w1_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        gating_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        global_num_experts: int = -1,
+        expert_map=None,
+        g_idx1=None,
+        g_idx2=None,
+        sort_indices1=None,
+        sort_indices2=None,
+        workspace=None,
+        num_bits=None,
+        is_k_full=True,
+        inplace=False,
+        routed_scaling_factor=None,
+        bias_gate_up: Optional[torch.Tensor] = None,
+        bias_down: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Dispatch to standard or GPT OSS fused_marlin_moe based on swiglu_limit.
+
+        For GPT OSS models (swiglu_limit > 0), uses custom activation + biases.
+        bias_gate_up/bias_down override auto-lookup (needed for HCS with remapped slots).
+        """
+        if num_bits is None:
+            num_bits = self.num_bits
+
+        if self.swiglu_limit > 0:
+            # Use explicit biases if provided, else look up from layer index
+            if bias_gate_up is None or bias_down is None:
+                biases = self._expert_biases.get(moe_layer_idx, {})
+                if bias_gate_up is None:
+                    bias_gate_up = biases.get("gate_up_bias")
+                if bias_down is None:
+                    bias_down = biases.get("down_bias")
+            return _fused_marlin_moe_gpt_oss(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                gating_output=gating_output,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                gate_up_bias=bias_gate_up,
+                down_bias=bias_down,
+                swiglu_limit=self.swiglu_limit,
+                activation_alpha=self.activation_alpha,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                g_idx1=g_idx1,
+                g_idx2=g_idx2,
+                sort_indices1=sort_indices1,
+                sort_indices2=sort_indices2,
+                workspace=workspace,
+                num_bits=num_bits,
+                is_k_full=is_k_full,
+                inplace=inplace,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+        else:
+            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+                fused_marlin_moe,
+            )
+            return fused_marlin_moe(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                gating_output=gating_output,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                g_idx1=g_idx1,
+                g_idx2=g_idx2,
+                sort_indices1=sort_indices1,
+                sort_indices2=sort_indices2,
+                workspace=workspace,
+                num_bits=num_bits,
+                is_k_full=is_k_full,
+                inplace=inplace,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+
     def _per_expert_vram_bytes(self) -> int:
         """Calculate per-expert VRAM usage in bytes for Marlin format."""
         K = self.hidden_size
+        K_w2 = self._w2_padded_n  # may be > K if padded for Marlin compat
         N = self.intermediate_size
         gs = self._group_size
         nb2 = self.num_bits // 2  # 2 for INT4, 4 for INT8
         w13_bytes = (K // 16) * (2 * N * nb2) * 4 + (K // gs) * (2 * N) * 2
-        w2_bytes = (N // 16) * (K * nb2) * 4 + (N // gs) * K * 2
+        w2_bytes = (N // 16) * (K_w2 * nb2) * 4 + (N // gs) * K_w2 * 2
         return w13_bytes + w2_bytes
 
     def _select_prefill_mode(self):
@@ -370,6 +673,94 @@ class GpuPrefillManager:
             # Fallback: 32 experts per chunk
             return min(32, self.num_experts)
 
+    def _load_expert_biases(self):
+        """Load GPT OSS expert biases from safetensors as GPU tensors.
+
+        Only called when swiglu_limit > 0. Biases are small (~7.5 MB per layer
+        for GPT OSS 120B) so we load them all at startup.
+
+        Stores per layer: gate_up_bias [E, 2N] and down_bias [E, K] on GPU.
+        Gate and up biases are de-interleaved from the original format and
+        concatenated as [gate | up] to match the Marlin w1 output layout.
+        """
+        if self.swiglu_limit <= 0:
+            return
+
+        import safetensors.torch
+        index_path = Path(self.model_path) / "model.safetensors.index.json"
+        if not index_path.exists():
+            logger.warning("No safetensors index for bias loading")
+            return
+
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+
+        # Auto-detect prefix
+        prefix = None
+        for key in weight_map:
+            if "mlp.experts" in key and "bias" in key:
+                # e.g. "model.layers.0.mlp.experts.gate_up_proj_bias"
+                idx = key.find(".layers.")
+                if idx >= 0:
+                    prefix = key[:idx]
+                    break
+        if prefix is None:
+            logger.warning("Could not detect prefix for expert biases")
+            return
+
+        # Use safe_open to selectively load only bias tensors (avoids loading
+        # entire 4 GB shards — biases spread across all 15 shards)
+        from safetensors import safe_open
+        shard_handles = {}  # shard_name -> safe_open handle
+
+        loaded = 0
+        for moe_idx in range(self._num_moe_layers):
+            layer_idx = moe_idx + self.first_k_dense
+            gu_name = f"{prefix}.layers.{layer_idx}.mlp.experts.gate_up_proj_bias"
+            dn_name = f"{prefix}.layers.{layer_idx}.mlp.experts.down_proj_bias"
+
+            gu_shard = weight_map.get(gu_name)
+            dn_shard = weight_map.get(dn_name)
+            if not gu_shard or not dn_shard:
+                continue
+
+            # Open shard handles lazily
+            for sn in (gu_shard, dn_shard):
+                if sn not in shard_handles:
+                    shard_path = Path(self.model_path) / sn
+                    if shard_path.exists():
+                        shard_handles[sn] = safe_open(str(shard_path), framework="pt")
+            if gu_shard not in shard_handles or dn_shard not in shard_handles:
+                continue
+
+            # gate_up_proj_bias: [n_experts, 2*intermediate] interleaved
+            gu_bias_raw = shard_handles[gu_shard].get_tensor(gu_name).float()  # [E, 2N]
+            # De-interleave: even columns = gate, odd columns = up
+            gate_bias = gu_bias_raw[:, ::2]   # [E, N]
+            up_bias = gu_bias_raw[:, 1::2]    # [E, N]
+            # Concatenate as [gate | up] to match Marlin w1 layout
+            gate_up_bias = torch.cat([gate_bias, up_bias], dim=1)  # [E, 2N]
+
+            # down_proj_bias: [n_experts, hidden]
+            down_bias = shard_handles[dn_shard].get_tensor(dn_name).float()  # [E, K]
+
+            self._expert_biases[moe_idx] = {
+                "gate_up_bias": gate_up_bias.to(self.params_dtype).to(self.device),
+                "down_bias": down_bias.to(self.params_dtype).to(self.device),
+            }
+            loaded += 1
+
+        # Close handles
+        shard_handles.clear()
+
+        if loaded > 0:
+            size_mb = sum(
+                b["gate_up_bias"].nbytes + b["down_bias"].nbytes
+                for b in self._expert_biases.values()
+            ) / 1e6
+            logger.info("Loaded expert biases: %d layers, %.1f MB on %s", loaded, size_mb, self.device)
+
     def prepare_all_layers(self):
         """Pre-prepare all MoE layers at startup.
 
@@ -377,6 +768,9 @@ class GpuPrefillManager:
         Selective/Chunked engine: no-op (weights read from engine on demand).
         Legacy mode: loads from disk cache.
         """
+        # Load GPT OSS expert biases if needed
+        self._load_expert_biases()
+
         if self._engine is not None:
             if self._prefill_mode == "persistent":
                 self._preload_persistent()
@@ -712,6 +1106,7 @@ class GpuPrefillManager:
 
         E = self.num_experts
         K = self.hidden_size
+        K_w2 = self._w2_padded_n  # may be > K if padded for Marlin compat
         N = self.intermediate_size
         gs = self._group_size
         nb2 = self.num_bits // 2
@@ -719,8 +1114,8 @@ class GpuPrefillManager:
         # Compute sizes in bytes (matching tensor shapes in preload_layer_group)
         w13p_size = E * (K // 16) * (2 * N * nb2) * 4  # int32
         w13s_size = E * (K // gs) * (2 * N) * 2  # bf16
-        w2p_size = E * (N // 16) * (K * nb2) * 4  # int32
-        w2s_size = E * (N // gs) * K * 2  # bf16
+        w2p_size = E * (N // 16) * (K_w2 * nb2) * 4  # int32 (uses padded K)
+        w2s_size = E * (N // gs) * K_w2 * 2  # bf16 (uses padded K)
 
         total = w13p_size + w13s_size + w2p_size + w2s_size
         logger.info(
@@ -785,6 +1180,7 @@ class GpuPrefillManager:
 
         torch.cuda.set_device(self.device)
         K = self.hidden_size
+        K_w2 = self._w2_padded_n  # may be > K if padded for Marlin compat
         N = self.intermediate_size
         gs = self._group_size
         nb2 = self.num_bits // 2
@@ -830,9 +1226,9 @@ class GpuPrefillManager:
             w13_scale = torch.frombuffer(self._dma_buf_w13s, dtype=torch.bfloat16
                 ).reshape(E, K // gs, 2 * N)
             w2_packed = torch.frombuffer(self._dma_buf_w2p, dtype=torch.int32
-                ).reshape(E, N // 16, K * nb2)
+                ).reshape(E, N // 16, K_w2 * nb2)
             w2_scale = torch.frombuffer(self._dma_buf_w2s, dtype=torch.bfloat16
-                ).reshape(E, N // gs, K)
+                ).reshape(E, N // gs, K_w2)
 
             if detailed:
                 t2 = time.perf_counter()
@@ -1220,7 +1616,8 @@ class GpuPrefillManager:
         if M > 1:
             self._workspace.zero_()
 
-        output = fused_marlin_moe(
+        output = self._call_fused_moe(
+            moe_layer_idx=moe_layer_idx,
             hidden_states=x,
             w1=self._ao_gpu_w13,
             w2=self._ao_gpu_w2,
@@ -1230,14 +1627,11 @@ class GpuPrefillManager:
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             global_num_experts=E,
-            expert_map=None,
             g_idx1=self._gpu_g_idx,
             g_idx2=self._gpu_g_idx,
             sort_indices1=self._gpu_sort_idx,
             sort_indices2=self._gpu_sort_idx,
             workspace=self._workspace,
-            num_bits=self.num_bits,
-            is_k_full=True,
         ).to(x.dtype)
 
         return output
@@ -1365,7 +1759,8 @@ class GpuPrefillManager:
         if M > 1:
             self._workspace.zero_()
 
-        output = fused_marlin_moe(
+        output = self._call_fused_moe(
+            moe_layer_idx=moe_layer_idx,
             hidden_states=x,
             w1=self._ao_gpu_w13,
             w2=self._ao_gpu_w2,
@@ -1375,14 +1770,11 @@ class GpuPrefillManager:
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             global_num_experts=E,
-            expert_map=None,
             g_idx1=self._gpu_g_idx,
             g_idx2=self._gpu_g_idx,
             sort_indices1=self._gpu_sort_idx,
             sort_indices2=self._gpu_sort_idx,
             workspace=self._workspace,
-            num_bits=self.num_bits,
-            is_k_full=True,
         ).to(x.dtype)
 
         return output
@@ -1655,7 +2047,20 @@ class GpuPrefillManager:
         )
 
         # Run fused_marlin_moe with compact buffer
-        output = fused_marlin_moe(
+        # For GPT OSS compact: build remapped biases from emap
+        compact_gu_bias = None
+        compact_dn_bias = None
+        if self.swiglu_limit > 0 and moe_layer_idx in self._expert_biases:
+            full_b = self._expert_biases[moe_layer_idx]
+            # Remap: for each local slot, get the global expert's bias
+            reverse = self._compact_reverse[moe_layer_idx]  # local_slot → global_eid
+            slot_eids = [reverse.get(s, 0) for s in range(slots)]
+            idx = torch.tensor(slot_eids, dtype=torch.long)
+            compact_gu_bias = full_b["gate_up_bias"][idx]
+            compact_dn_bias = full_b["down_bias"][idx]
+
+        output = self._call_fused_moe(
+            moe_layer_idx=moe_layer_idx,
             hidden_states=x,
             w1=buf["w13"],
             w2=buf["w2"],
@@ -1665,14 +2070,13 @@ class GpuPrefillManager:
             topk_weights=topk_weights,
             topk_ids=local_ids,
             global_num_experts=slots,
-            expert_map=None,
             g_idx1=self._compact_g_idx,
             g_idx2=self._compact_g_idx,
             sort_indices1=self._compact_sort_idx,
             sort_indices2=self._compact_sort_idx,
             workspace=self._workspace,
-            num_bits=self.num_bits,
-            is_k_full=True,
+            bias_gate_up=compact_gu_bias,
+            bias_down=compact_dn_bias,
         ).to(x.dtype)
 
         return output
@@ -2118,6 +2522,17 @@ class GpuPrefillManager:
                 1, n, device=self.device,
             )
 
+            # Remap expert biases for hot experts (GPT OSS)
+            if self.swiglu_limit > 0 and layer_idx in self._expert_biases:
+                full_biases = self._expert_biases[layer_idx]
+                gu_full = full_biases["gate_up_bias"]  # [E, 2N]
+                dn_full = full_biases["down_bias"]     # [E, K]
+                eids_tensor = torch.tensor(eids, dtype=torch.long)
+                self._hcs_biases[layer_idx] = {
+                    "gate_up_bias": gu_full[eids_tensor],  # [n_hot, 2N]
+                    "down_bias": dn_full[eids_tensor],     # [n_hot, K]
+                }
+
             layer_mb = (w13.nbytes + w13s.nbytes + w2.nbytes + w2s.nbytes) / 1e6
             total_mb += layer_mb
 
@@ -2171,9 +2586,6 @@ class GpuPrefillManager:
 
         For M=1 decode: CPU finishes within GPU's ~1.5ms Marlin kernel window.
         """
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
 
         M = x.shape[0]
         timing = TIMING.decode and M == 1
@@ -2273,7 +2685,10 @@ class GpuPrefillManager:
             if M > 1:
                 self._workspace.zero_()
 
-            gpu_output = fused_marlin_moe(
+            # Get remapped biases for hot experts (GPT OSS)
+            hcs_bias = self._hcs_biases.get(moe_layer_idx, {})
+            gpu_output = self._call_fused_moe(
+                moe_layer_idx=moe_layer_idx,
                 hidden_states=x,
                 w1=bufs["w13"],
                 w2=bufs["w2"],
@@ -2283,14 +2698,13 @@ class GpuPrefillManager:
                 topk_weights=gpu_topk_weights,
                 topk_ids=local_ids,
                 global_num_experts=n_hot,
-                expert_map=None,
                 g_idx1=g_idx,
                 g_idx2=g_idx,
                 sort_indices1=sort_idx,
                 sort_indices2=sort_idx,
                 workspace=self._workspace,
-                num_bits=self.num_bits,
-                is_k_full=True,
+                bias_gate_up=hcs_bias.get("gate_up_bias"),
+                bias_down=hcs_bias.get("down_bias"),
             ).to(x.dtype)
 
         if timing:
@@ -2478,17 +2892,14 @@ class GpuPrefillManager:
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Forward using pre-loaded persistent expert buffers. Zero DMA."""
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
-
         M = x.shape[0]
         buffers = self._persistent[moe_layer_idx]
         gating_output = torch.empty(M, self.num_experts, device=self.device)
 
         self._workspace.zero_()
 
-        output = fused_marlin_moe(
+        output = self._call_fused_moe(
+            moe_layer_idx=moe_layer_idx,
             hidden_states=x,
             w1=buffers["w13_packed"],
             w2=buffers["w2_packed"],
@@ -2498,14 +2909,11 @@ class GpuPrefillManager:
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             global_num_experts=self.num_experts,
-            expert_map=None,
             g_idx1=self._gpu_g_idx,
             g_idx2=self._gpu_g_idx,
             sort_indices1=self._gpu_sort_idx,
             sort_indices2=self._gpu_sort_idx,
             workspace=self._workspace,
-            num_bits=self.num_bits,
-            is_k_full=True,
         ).to(x.dtype)
 
         return output
