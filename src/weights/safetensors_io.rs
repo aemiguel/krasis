@@ -196,6 +196,11 @@ impl MmapSafetensors {
             let _ = self.mmap.advise_range(memmap2::Advice::WillNeed, start, len);
         }
     }
+
+    /// Evict all pages from page cache. Call after all data has been copied out.
+    pub fn evict_page_cache(&self) {
+        let _ = unsafe { self.mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+    }
 }
 
 #[cfg(test)]

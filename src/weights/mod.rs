@@ -1515,12 +1515,18 @@ impl WeightStore {
             }
         }
 
+        // Evict page cache — data is now copied into heap Vecs
+        let cache_bytes = mmap.len();
+        let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        drop(mmap);
+        drop(file);
+
         let elapsed = load_start.elapsed();
         log::info!(
             "Cache loaded: {:.1} GB in {:.1}s ({:.1} GB/s)",
-            mmap.len() as f64 / 1e9,
+            cache_bytes as f64 / 1e9,
             elapsed.as_secs_f64(),
-            mmap.len() as f64 / 1e9 / elapsed.as_secs_f64(),
+            cache_bytes as f64 / 1e9 / elapsed.as_secs_f64(),
         );
 
         Ok(WeightStore {
@@ -1886,7 +1892,10 @@ impl WeightStore {
         std::fs::rename(&tmp_path, cache_path)
             .map_err(|e| format!("Failed to rename cache file: {e}"))?;
 
-        // Free all safetensors mmaps and reclaim RAM
+        // Evict safetensors page cache, then free mmaps and reclaim RAM
+        for shard in shards.values() {
+            shard.evict_page_cache();
+        }
         drop(shards);
         #[cfg(target_os = "linux")]
         unsafe { libc::malloc_trim(0); }
@@ -2145,6 +2154,11 @@ impl WeightStore {
             log::info!("  Loaded {} shared experts (Marlin)", num_layers_to_load);
         }
 
+        // Evict page cache — data is now copied into heap Vecs
+        let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        drop(mmap);
+        drop(file);
+
         let elapsed = load_start.elapsed();
         log::info!(
             "MARLIN cache loaded in {:.1}s: {} layers × {} experts (+ {} shared), {:.1} GB",
@@ -2371,7 +2385,10 @@ impl WeightStore {
         std::fs::rename(&tmp_path, cache_path)
             .map_err(|e| format!("Failed to rename CPU cache file: {e}"))?;
 
-        // Free safetensors mmaps and reclaim RAM
+        // Evict safetensors page cache, then free mmaps and reclaim RAM
+        for shard in shards.values() {
+            shard.evict_page_cache();
+        }
         drop(shards);
         #[cfg(target_os = "linux")]
         unsafe { libc::malloc_trim(0); }
@@ -2552,6 +2569,11 @@ impl WeightStore {
             }
             log::info!("  Loaded {} shared experts (CPU INT{})", num_layers_to_load, expected_bits);
         }
+
+        // Evict page cache — data is now copied into heap Vecs
+        let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        drop(mmap);
+        drop(file);
 
         let elapsed = load_start.elapsed();
         log::info!(
@@ -3391,7 +3413,8 @@ impl WeightStore {
         std::fs::rename(&tmp_path, cache_path)
             .map_err(|e| format!("Failed to rename GGUF CPU cache file: {e}"))?;
 
-        // Free GGUF mmap and reclaim RAM
+        // Evict GGUF page cache, then free mmap and reclaim RAM
+        gguf_file.evict_page_cache();
         drop(gguf_file);
         #[cfg(target_os = "linux")]
         unsafe { libc::malloc_trim(0); }
@@ -3543,6 +3566,11 @@ impl WeightStore {
             }
             log::info!("  Loaded {} shared experts (GGUF→AVX2)", num_layers_to_load);
         }
+
+        // Evict page cache — data is now copied into heap Vecs
+        let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        drop(mmap);
+        drop(file);
 
         let elapsed = load_start.elapsed();
         log::info!(

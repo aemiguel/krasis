@@ -524,6 +524,11 @@ impl GgufFile {
         }
         None
     }
+
+    /// Evict all pages from page cache. Call after all data has been copied out.
+    pub fn evict_page_cache(&self) {
+        let _ = unsafe { self.mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+    }
 }
 
 // ── FP16/BF16/F32 dequantization ──────────────────────────────────────
