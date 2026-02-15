@@ -11,6 +11,9 @@ Contact: see the Google Forms link on my GitHub profile
 ### Option A: pip install (recommended)
 
 ```bash
+# Ensure pip is available
+sudo apt install python3-pip   # Ubuntu/Debian
+
 pip install krasis
 
 # PyTorch with CUDA must be installed separately
