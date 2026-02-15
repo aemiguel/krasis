@@ -1,0 +1,233 @@
+{
+  "model": "Qwen3-235B-A22B",
+  "pp_partition": [
+    47,
+    47
+  ],
+  "hardware_fingerprint": "b17e33b935f6bc95",
+  "model_fingerprint": "322e7c1079a54aea",
+  "prefill_prompt_tokens": 10000,
+  "decode_prompt_tokens": 16,
+  "decode_gen_tokens": 64,
+  "n_runs": 3,
+  "prefill": {
+    "persistent": {
+      "error": "CUDA OOM",
+      "divisor": 1
+    },
+    "hcs_prefill": {
+      "avg_ttft": 47.448,
+      "avg_tok_s": 210.8,
+      "vram_mb": {
+        "0": 12790.0,
+        "1": 12800.0
+      },
+      "runs": [
+        {
+          "ttft": 48.177,
+          "tok_s": 207.6
+        },
+        {
+          "ttft": 47.092,
+          "tok_s": 212.4
+        },
+        {
+          "ttft": 47.076,
+          "tok_s": 212.4
+        }
+      ],
+      "switch_time": 1.1,
+      "divisor": -3
+    },
+    "layer_grouped_2": {
+      "error": "CUDA OOM",
+      "divisor": 2
+    },
+    "layer_grouped_4": {
+      "error": "CUDA OOM",
+      "divisor": 4
+    },
+    "active_only": {
+      "avg_ttft": 211.804,
+      "avg_tok_s": 47.3,
+      "vram_mb": {
+        "0": 13325.0,
+        "1": 13014.0
+      },
+      "runs": [
+        {
+          "ttft": 223.054,
+          "tok_s": 44.8
+        },
+        {
+          "ttft": 205.864,
+          "tok_s": 48.6
+        },
+        {
+          "ttft": 206.495,
+          "tok_s": 48.4
+        }
+      ],
+      "switch_time": 0.4,
+      "divisor": -1
+    },
+    "chunked": {
+      "avg_ttft": 178.867,
+      "avg_tok_s": 55.9,
+      "vram_mb": {
+        "0": 13325.0,
+        "1": 13014.0
+      },
+      "runs": [
+        {
+          "ttft": 178.698,
+          "tok_s": 56.0
+        },
+        {
+          "ttft": 178.654,
+          "tok_s": 56.0
+        },
+        {
+          "ttft": 179.249,
+          "tok_s": 55.8
+        }
+      ],
+      "switch_time": 0.4,
+      "divisor": 0
+    }
+  },
+  "decode": {
+    "hcs_hybrid": {
+      "avg_tok_s": 1.77,
+      "vram_mb": {
+        "0": 12780.0,
+        "1": 12800.0
+      },
+      "runs": [
+        {
+          "decode_tok_s": 1.89,
+          "n_gen": 64,
+          "total_s": 37.46,
+          "ttft": 3.649,
+          "decode_s": 33.81
+        },
+        {
+          "decode_tok_s": 1.71,
+          "n_gen": 64,
+          "total_s": 41.02,
+          "ttft": 3.679,
+          "decode_s": 37.34
+        },
+        {
+          "decode_tok_s": 1.72,
+          "n_gen": 64,
+          "total_s": 40.88,
+          "ttft": 3.746,
+          "decode_s": 37.13
+        }
+      ],
+      "switch_time": 1.0,
+      "divisor": -3
+    },
+    "compact": {
+      "avg_tok_s": 0.23,
+      "vram_mb": {
+        "0": 13325.0,
+        "1": 13014.0
+      },
+      "runs": [
+        {
+          "decode_tok_s": 0.23,
+          "n_gen": 64,
+          "total_s": 282.26,
+          "ttft": 3.682,
+          "decode_s": 278.58
+        },
+        {
+          "decode_tok_s": 0.23,
+          "n_gen": 64,
+          "total_s": 280.7,
+          "ttft": 3.579,
+          "decode_s": 277.12
+        },
+        {
+          "decode_tok_s": 0.23,
+          "n_gen": 64,
+          "total_s": 280.78,
+          "ttft": 3.678,
+          "decode_s": 277.1
+        }
+      ],
+      "switch_time": 0.3,
+      "divisor": -1
+    },
+    "lru": {
+      "avg_tok_s": 0.23,
+      "vram_mb": {
+        "0": 16030.0,
+        "1": 14427.0
+      },
+      "runs": [
+        {
+          "decode_tok_s": 0.23,
+          "n_gen": 64,
+          "total_s": 284.12,
+          "ttft": 3.736,
+          "decode_s": 280.38
+        },
+        {
+          "decode_tok_s": 0.23,
+          "n_gen": 64,
+          "total_s": 283.15,
+          "ttft": 3.673,
+          "decode_s": 279.48
+        },
+        {
+          "decode_tok_s": 0.23,
+          "n_gen": 64,
+          "total_s": 283.81,
+          "ttft": 3.705,
+          "decode_s": 280.11
+        }
+      ],
+      "switch_time": 0.3,
+      "divisor": -2
+    },
+    "pure_cpu": {
+      "avg_tok_s": 1.81,
+      "vram_mb": {
+        "0": 12079.0,
+        "1": 11768.0
+      },
+      "runs": [
+        {
+          "decode_tok_s": 1.77,
+          "n_gen": 64,
+          "total_s": 39.81,
+          "ttft": 3.645,
+          "decode_s": 36.17
+        },
+        {
+          "decode_tok_s": 1.75,
+          "n_gen": 64,
+          "total_s": 40.18,
+          "ttft": 3.669,
+          "decode_s": 36.51
+        },
+        {
+          "decode_tok_s": 1.92,
+          "n_gen": 64,
+          "total_s": 36.96,
+          "ttft": 3.579,
+          "decode_s": 33.38
+        }
+      ],
+      "switch_time": 0.3,
+      "divisor": null
+    }
+  },
+  "best_prefill": "hcs_prefill",
+  "best_decode": "pure_cpu",
+  "best_prefill_divisor": -3,
+  "best_decode_divisor": null
+}
