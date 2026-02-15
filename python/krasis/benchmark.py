@@ -422,6 +422,38 @@ class KrasisBenchmark:
         return "\n".join(lines)
 
     # ──────────────────────────────────────────────────────────
+    # Benchmark archive
+    # ──────────────────────────────────────────────────────────
+
+    def _archive_benchmark(self, model_info: Dict, report: str):
+        """Write benchmark report to benchmarks/<name>.log for archival."""
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)
+        )))
+        benchmarks_dir = os.path.join(repo_root, "benchmarks")
+
+        # Build filename: <model>_<source>_<Ngpu>_<gpu_quant>_<cpu_quant>.log
+        model_name = model_info["model_name"]
+        gguf_path = getattr(self.model, "gguf_path", None)
+        if gguf_path:
+            source = os.path.splitext(os.path.basename(gguf_path))[0]
+        else:
+            source = "native"
+        num_gpus = len(model_info["pp_partition"])
+        gpu_quant = f"int{model_info['gpu_expert_bits']}gpu"
+        cpu_quant = f"int{model_info['cpu_expert_bits']}cpu"
+        filename = f"{model_name}_{source}_{num_gpus}gpu_{gpu_quant}_{cpu_quant}.log"
+
+        try:
+            os.makedirs(benchmarks_dir, exist_ok=True)
+            archive_path = os.path.join(benchmarks_dir, filename)
+            with open(archive_path, "w") as f:
+                f.write(report + "\n")
+            print(f"Benchmark archived to benchmarks/{filename}")
+        except OSError as e:
+            print(f"Warning: could not archive benchmark: {e}")
+
+    # ──────────────────────────────────────────────────────────
     # Main entry point
     # ──────────────────────────────────────────────────────────
 
@@ -486,7 +518,10 @@ class KrasisBenchmark:
         except OSError as e:
             print(f"\nWarning: could not write to {self.log_path}: {e}")
 
-        # 9. Return structured results
+        # 9. Archive to benchmarks/ directory
+        self._archive_benchmark(model_info, report)
+
+        # 10. Return structured results
         return {
             "system": sys_info,
             "model": model_info,

@@ -1,5 +1,18 @@
 # Krasis Changelog
 
+## Feature: Benchmark Archive + BENCHMARKS.md Summary — 2026-02-15
+
+### Changes
+- Benchmark runs now auto-archive to `benchmarks/<model>_<source>_<gpu>_<cpu>.log`
+  - Filename built from model name, GGUF source (or "native"), GPU/CPU quant bits
+  - Each config combo gets one canonical file (overwritten on re-run)
+  - `benchmark_results.log` append behavior unchanged
+- Rewrote `BENCHMARKS.md` as concise summary table with links to `benchmarks/` log files
+  - Moved detailed auto-optimiser strategy analysis to "Historical Strategy Analysis" section
+  - Added methodology, filename convention, and tool configuration sections
+
+---
+
 ## Feature: Benchmark and Launch — 2026-02-15
 
 ### New Feature
