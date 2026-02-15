@@ -13,6 +13,7 @@ import argparse
 import http.client
 import json
 import os
+import select
 import signal
 import sys
 import time
@@ -53,6 +54,106 @@ KEY_DOWN = "DOWN"
 KEY_ENTER = "ENTER"
 KEY_ESCAPE = "ESC"
 KEY_QUIT = "q"
+
+# Bracketed paste escape sequences
+_PASTE_START = "\x1b[200~"
+_PASTE_END = "\x1b[201~"
+
+
+def _read_input_with_paste() -> str:
+    """Read user input supporting multi-line paste via bracketed paste mode.
+
+    - Enter submits (when not in a paste)
+    - Pasted text with newlines is captured as-is (terminal sends paste brackets)
+    - Ctrl-C raises KeyboardInterrupt, Ctrl-D raises EOFError
+    - Basic line editing: backspace works, but no readline features (arrow keys, etc.)
+    """
+    if not _HAS_TERMIOS:
+        return input()
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    buf = []
+    in_paste = False
+    esc_buf = ""  # buffer for escape sequence detection
+
+    # Enable bracketed paste mode
+    sys.stdout.write("\x1b[?2004h")
+    sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)  # cbreak: chars available immediately, Ctrl-C still works
+
+        while True:
+            ch = sys.stdin.read(1)
+            if not ch:
+                raise EOFError
+
+            # ── Escape sequence detection ──
+            if esc_buf or ch == "\x1b":
+                esc_buf += ch
+                # Check if we have a complete paste bracket
+                if esc_buf == _PASTE_START:
+                    in_paste = True
+                    esc_buf = ""
+                    continue
+                if esc_buf == _PASTE_END:
+                    in_paste = False
+                    esc_buf = ""
+                    continue
+                # Still building — check if it could still become a paste bracket
+                if _PASTE_START.startswith(esc_buf) or _PASTE_END.startswith(esc_buf):
+                    continue
+                # Not a paste bracket — flush esc_buf as literal chars
+                # (skip escape sequences we don't handle, like arrow keys)
+                esc_buf = ""
+                continue
+
+            # ── Ctrl-C ──
+            if ch == "\x03":
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+
+            # ── Ctrl-D (EOF) ──
+            if ch == "\x04":
+                if not buf:
+                    raise EOFError
+                continue  # ignore if buffer non-empty
+
+            # ── Backspace ──
+            if ch in ("\x7f", "\x08"):
+                if buf:
+                    buf.pop()
+                    # Erase character on screen
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+
+            # ── Enter / newline ──
+            if ch in ("\r", "\n"):
+                if in_paste:
+                    # Inside a paste: keep the newline
+                    buf.append("\n")
+                    sys.stdout.write("\n       ")  # visual continuation indent
+                    sys.stdout.flush()
+                    continue
+                else:
+                    # Normal Enter: submit
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return "".join(buf)
+
+            # ── Normal character ──
+            buf.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+
+    finally:
+        # Disable bracketed paste mode and restore terminal
+        sys.stdout.write("\x1b[?2004l")
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def _clear_screen():
@@ -329,7 +430,7 @@ def chat_loop(
         try:
             sys.stdout.write(f"  {GREEN}{BOLD}You:{NC} ")
             sys.stdout.flush()
-            user_input = input()
+            user_input = _read_input_with_paste()
 
             if not user_input.strip():
                 continue
