@@ -5,7 +5,38 @@ build-backend = "maturin"
 [project]
 name = "krasis"
 version = "0.1.0"
+description = "Hybrid LLM runtime — minimal VRAM, always-on GPU prefill, optimised CPU inference"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
+readme = "README.md"
+keywords = ["llm", "inference", "moe", "gpu", "cpu"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "uvicorn>=0.20",
+    "fastapi>=0.100",
+    "safetensors>=0.4",
+    "numpy>=1.24",
+    "transformers>=4.40",
+]
+
+[project.optional-dependencies]
+gpu = ["flashinfer>=0.1"]
+
+[project.urls]
+Homepage = "https://github.com/brontoguana/krasis"
+Repository = "https://github.com/brontoguana/krasis"
+
+[project.scripts]
+krasis = "krasis.launcher:main"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

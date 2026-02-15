@@ -116,8 +116,14 @@ phase_setup() {
     if ! python3 -c "from krasis import KrasisEngine" 2>/dev/null; then
         warn "Krasis not installed — building from source..."
 
+        # Try sourcing cargo env in case Rust was just installed
+        if ! command -v cargo &>/dev/null && [[ -f "$HOME/.cargo/env" ]]; then
+            source "$HOME/.cargo/env"
+        fi
         if ! command -v cargo &>/dev/null; then
-            err "cargo not found. Install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+            err "cargo not found. Install Rust, then restart your shell:"
+            echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+            echo "  source ~/.cargo/env"
             exit 1
         fi
         info "cargo found: $(cargo --version)"
