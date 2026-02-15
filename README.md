@@ -11,8 +11,9 @@ Contact: see the Google Forms link on my GitHub profile
 ### Option A: pip install (recommended)
 
 ```bash
-# Ensure pip is available
-sudo apt install python3-pip   # Ubuntu/Debian
+# Create a virtual environment (avoids PEP 668 "externally-managed" errors)
+python3 -m venv ~/.krasis-env
+source ~/.krasis-env/bin/activate
 
 pip install krasis
 
@@ -26,6 +27,8 @@ huggingface-cli download Qwen/Qwen3-Coder-Next \
 # Launch
 krasis
 ```
+
+> **Note:** On Ubuntu 23.04+ / Debian 12+, bare `pip install` is blocked by PEP 668. The venv approach above avoids this. Alternatively: `pipx install krasis` or `pip install --break-system-packages krasis`.
 
 ### Option B: from source
 
