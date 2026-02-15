@@ -8,6 +8,24 @@ Contact: see the Google Forms link on my GitHub profile
 
 ## Quick Start
 
+### Option A: pip install (recommended)
+
+```bash
+pip install krasis
+
+# PyTorch with CUDA must be installed separately
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+
+# Download a model into ~/.krasis/models/
+huggingface-cli download Qwen/Qwen3-Coder-Next \
+    --local-dir ~/.krasis/models/Qwen3-Coder-Next
+
+# Launch
+krasis
+```
+
+### Option B: from source
+
 ```bash
 # Prerequisites (Ubuntu/Debian)
 sudo apt update && sudo apt install python3.12-venv
@@ -15,34 +33,46 @@ sudo apt update && sudo apt install python3.12-venv
 # Clone and run — everything else is automatic
 git clone https://github.com/brontoguana/krasis.git
 cd krasis
-
-# Download a model into models/ (any HuggingFace MoE model with safetensors)
-# e.g. huggingface-cli download Qwen/Qwen3-Coder-Next --local-dir models/Qwen3-Coder-Next
-
-# Launch (interactive TUI — handles venv, build, dependencies, optimization)
 ./krasis
 ```
 
-On first run, the `./krasis` script:
-1. Creates a Python virtual environment (`.venv/`)
-2. Installs Rust dependencies and builds the Krasis native library
-3. Installs Python dependencies (PyTorch must be pre-installed)
-4. Checks system configuration (CPU governor, hugepages, SIMD)
-5. Opens an interactive TUI for model selection and configuration
-6. Builds optimized weight caches on disk (GPU Marlin + CPU AVX2)
-7. Auto-discovers the best prefill/decode strategy for your hardware
+### Where things go
+
+Krasis stores everything under `~/.krasis/` (override with `KRASIS_HOME`):
+
+```
+~/.krasis/
+├── config          # saved launch configuration
+└── models/         # put your HuggingFace models here
+    └── Qwen3-Coder-Next/
+        ├── *.safetensors   # model weights (BF16)
+        ├── config.json
+        └── .krasis_cache/  # auto-generated, can grow large
+            ├── experts_marlin_g128.bin   # GPU cache (INT4/INT8)
+            ├── experts_cpu_4_g128.bin    # CPU cache (INT4/INT8)
+            └── auto_optimise.json        # cached strategy
+```
+
+**Note:** The `.krasis_cache/` folder inside each model directory can be very large (100-300 GB for 350B+ models). It contains pre-computed quantized weights and is rebuilt automatically if deleted.
+
+On first run, Krasis:
+1. Creates `~/.krasis/` and `~/.krasis/models/`
+2. Checks system configuration (CPU governor, hugepages, SIMD)
+3. Opens an interactive TUI for model selection and configuration
+4. Builds optimized weight caches on disk (GPU Marlin + CPU AVX2)
+5. Auto-discovers the best prefill/decode strategy for your hardware
 
 Subsequent runs skip all setup and load cached weights + strategy in seconds.
 
 ```bash
 # Non-interactive (use saved config from last launch)
-./krasis --non-interactive
+krasis --non-interactive
 
 # Override specific settings
-./krasis --model-path /path/to/model --num-gpus 2
+krasis --model-path /path/to/model --num-gpus 2
 
 # Chat with a running server
-./krasis-chat
+krasis-chat
 ```
 
 The server exposes an OpenAI-compatible API at `http://localhost:8080/v1/chat/completions` with SSE streaming support, compatible with tools like Cursor, OpenCode, and any OpenAI SDK client.
@@ -176,12 +206,13 @@ Speed depends on model size and VRAM capacity. Smaller models (V2-Lite) can fit 
 - **GPU**: NVIDIA compute 8.0+ (Ampere/Ada). 16GB+ VRAM per GPU. AMD GPUs are not supported (Marlin kernels and FlashInfer are CUDA-only).
 - **RAM**: ~500-600 GB for 350B+ models (expert weights in system RAM).
 
-## Building
+## Building from Source
 
-The `./krasis` launcher handles building automatically on first run. If you prefer manual setup:
+The `./krasis` launcher handles building automatically on first run. For manual/development setup:
 
 ```bash
-# Create venv and install
+git clone https://github.com/brontoguana/krasis.git
+cd krasis
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 
@@ -194,26 +225,27 @@ pip install torch --index-url https://download.pytorch.org/whl/cu126
 ### Interactive Launcher (recommended)
 
 ```bash
-./krasis
+krasis        # pip install
+./krasis      # from source
 ```
 
 The launcher provides a TUI with:
-- Model selection (scans `models/` directory)
+- Model selection (scans `~/.krasis/models/` directory)
 - GPU selection and pipeline parallelism configuration
 - Per-component quantization with live VRAM/RAM budget display
 - CPU expert source selection (build INT4/INT8 from native, or use GGUF)
 - Auto-optimisation (discovers best prefill/decode strategy on first run)
 
-Configuration is saved to `.krasis_config` and reloaded on subsequent launches.
+Configuration is saved to `~/.krasis/config` and reloaded on subsequent launches.
 
 ### Non-Interactive Launch
 
 ```bash
 # Use saved config
-./krasis --non-interactive
+krasis --non-interactive
 
 # Override specific settings
-./krasis --non-interactive --model-path /path/to/model --num-gpus 2
+krasis --non-interactive --model-path /path/to/model --num-gpus 2
 ```
 
 ### Direct Server (advanced)
