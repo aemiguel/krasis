@@ -1448,8 +1448,12 @@ def main():
 
     launcher = Launcher(args)
 
-    # Load saved config
+    # Load saved config (check new location, fall back to legacy repo-root location)
     saved = _load_config(launcher.config_file)
+    if not saved:
+        legacy_config = os.path.join(launcher.script_dir, ".krasis_config")
+        if os.path.exists(legacy_config):
+            saved = _load_config(legacy_config)
     if saved:
         launcher.cfg.apply_saved(saved)
 
@@ -1469,6 +1473,8 @@ def main():
                 launcher.cfg.model_path = models[0]["path"]
             else:
                 print(f"Error: no --model-path given and no models in {launcher.models_dir}",
+                      file=sys.stderr)
+                print(f"Download a model with: huggingface-cli download <model> --local-dir {launcher.models_dir}/<name>",
                       file=sys.stderr)
                 sys.exit(1)
 
