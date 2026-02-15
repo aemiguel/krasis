@@ -309,7 +309,7 @@ def discover_servers(
 ) -> List[Dict[str, Any]]:
     """Scan ports for running Krasis servers."""
     if ports is None:
-        ports = range(8080, 8091)
+        ports = range(8000, 8091)
 
     servers = []
     for port in ports:
@@ -666,8 +666,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--system", default="",
                         help="Initial system prompt")
-    parser.add_argument("--scan-start", type=int, default=8080,
-                        help="Port scan range start (default: 8080)")
+    parser.add_argument("--scan-start", type=int, default=8000,
+                        help="Port scan range start (default: 8000)")
     parser.add_argument("--scan-end", type=int, default=8090,
                         help="Port scan range end (default: 8090)")
     args = parser.parse_args()
