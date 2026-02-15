@@ -347,7 +347,7 @@ class LauncherConfig:
         self.model_path: str = ""
         self.selected_gpu_indices: List[int] = []  # empty = all GPUs
         self.pp_partition: str = ""
-        self.expert_divisor: int = 1
+        self.expert_divisor = "auto"  # str "auto" or int
         self.kv_dtype: str = "fp8_e4m3"
         self.gpu_expert_bits: int = 4
         self.cpu_expert_bits: int = 4
@@ -377,10 +377,14 @@ class LauncherConfig:
         if "CFG_PP_PARTITION" in saved:
             self.pp_partition = saved["CFG_PP_PARTITION"]
         if "CFG_EXPERT_DIVISOR" in saved:
-            try:
-                self.expert_divisor = int(saved["CFG_EXPERT_DIVISOR"])
-            except ValueError:
-                pass
+            val = saved["CFG_EXPERT_DIVISOR"]
+            if val == "auto":
+                self.expert_divisor = "auto"
+            else:
+                try:
+                    self.expert_divisor = int(val)
+                except ValueError:
+                    pass
         if "CFG_KV_DTYPE" in saved:
             self.kv_dtype = saved["CFG_KV_DTYPE"]
         if "CFG_GPU_EXPERT_BITS" in saved:
@@ -478,7 +482,7 @@ class ConfigOption:
 OPTIONS = [
     ConfigOption("PP partition", "pp_partition", opt_type="text", affects_budget=True),
     ConfigOption("Expert divisor", "expert_divisor",
-                 choices=[1, 2, 3, 4, 8, 16, 32, 0], affects_budget=True,
+                 choices=["auto", 1, 2, 3, 4, 8, 16, 32, 0], affects_budget=True,
                  suffix=" ({desc})"),
     ConfigOption("KV dtype", "kv_dtype",
                  choices=["fp8_e4m3", "bf16"], affects_budget=True),
@@ -503,6 +507,7 @@ OPTIONS = [
 ]
 
 DIVISOR_DESCRIPTIONS = {
+    "auto": "auto-optimise",
     0: "chunked",
     1: "persistent",
     2: "grouped(2)",
@@ -894,10 +899,12 @@ class Launcher:
             if self.selected_gpus:
                 gpu_vram = min(g["vram_mb"] for g in self.selected_gpus)
             from krasis.vram_budget import compute_launcher_budget
+            # For "auto", use chunked (0) for budget estimate
+            divisor = self.cfg.expert_divisor if isinstance(self.cfg.expert_divisor, int) else 0
             return compute_launcher_budget(
                 model_path=self.cfg.model_path,
                 pp_partition=pp,
-                expert_divisor=self.cfg.expert_divisor,
+                expert_divisor=divisor,
                 kv_dtype=self.cfg.kv_dtype,
                 gpu_expert_bits=self.cfg.gpu_expert_bits,
                 cpu_expert_bits=self.cfg.cpu_expert_bits,
@@ -1233,12 +1240,13 @@ class Launcher:
         """Build args and exec the Krasis server."""
         num_gpus = len(self.selected_gpus) if self.selected_gpus else self.hw["gpu_count"]
 
+        is_auto = self.cfg.expert_divisor == "auto"
+
         cmd_args = [
             sys.executable, "-m", "krasis.server",
             "--model-path", self.cfg.model_path,
             "--pp-partition", self.cfg.pp_partition,
             "--num-gpus", str(num_gpus),
-            "--expert-divisor", str(self.cfg.expert_divisor),
             "--kv-dtype", self.cfg.kv_dtype,
             "--gpu-expert-bits", str(self.cfg.gpu_expert_bits),
             "--cpu-expert-bits", str(self.cfg.cpu_expert_bits),
@@ -1251,6 +1259,11 @@ class Launcher:
             "--port", str(self.cfg.port),
             "--gpu-prefill-threshold", str(self.cfg.gpu_prefill_threshold),
         ]
+
+        if is_auto:
+            cmd_args.extend(["--strategy", "auto"])
+        else:
+            cmd_args.extend(["--expert-divisor", str(self.cfg.expert_divisor)])
 
         if self.cfg.gguf_path:
             cmd_args.extend(["--gguf-path", self.cfg.gguf_path])
@@ -1287,8 +1300,8 @@ def parse_args() -> argparse.Namespace:
                         help="Number of GPUs to use")
     parser.add_argument("--selected-gpus", default=None,
                         help="Comma-separated GPU indices to use (e.g. '0,2')")
-    parser.add_argument("--expert-divisor", type=int, default=None,
-                        help="Expert loading: 0=chunked, 1=persistent, >=2=layer-grouped")
+    parser.add_argument("--expert-divisor", default=None,
+                        help="Expert loading: auto, 0=chunked, 1=persistent, >=2=layer-grouped")
     parser.add_argument("--kv-dtype", default=None,
                         help="KV cache dtype: fp8_e4m3 or bf16")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
@@ -1336,7 +1349,13 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
     if args.pp_partition is not None:
         cfg.pp_partition = args.pp_partition
     if args.expert_divisor is not None:
-        cfg.expert_divisor = args.expert_divisor
+        if args.expert_divisor == "auto":
+            cfg.expert_divisor = "auto"
+        else:
+            try:
+                cfg.expert_divisor = int(args.expert_divisor)
+            except ValueError:
+                pass
     if args.kv_dtype is not None:
         cfg.kv_dtype = args.kv_dtype
     if args.gpu_expert_bits is not None:
