@@ -974,7 +974,7 @@ class KrasisModel:
         4. If minimum chunk still OOMs, raise the error
         """
         max_chunk_override = None
-        max_retries = 3
+        max_retries = 0 if not getattr(self, '_oom_retry_enabled', True) else 3
         freed_graphs = False
 
         for attempt in range(max_retries + 1):
@@ -1104,14 +1104,11 @@ class KrasisModel:
             first_manager = self.gpu_prefill_managers.get(first_dev_str)
             if first_manager and intermediate_per_token > 0:
                 per_expert = first_manager._per_expert_vram_bytes()
-                # HCS: experts pre-loaded on GPU(s), no DMA buffer needed
-                if getattr(first_manager, '_hcs_initialized', False):
-                    expert_group_bytes = 0
-                else:
-                    # 1-layer expert group VRAM (including shared experts)
-                    expert_group_bytes = self.cfg.n_routed_experts * per_expert
-                    if self.cfg.n_shared_experts > 0:
-                        expert_group_bytes += per_expert  # ~1 shared expert worth
+                # 1-layer expert group VRAM for DMA during prefill
+                # (HCS uses layer-grouped DMA for M>1 prefill, HCS hot/cold for M=1 decode)
+                expert_group_bytes = self.cfg.n_routed_experts * per_expert
+                if first_manager.n_shared_experts > 0:
+                    expert_group_bytes += per_expert  # ~1 shared expert worth
                 # Safety margin: kernel workspace, PyTorch allocator fragmentation,
                 # attention intermediates, hidden states between chunks.
                 # Use 2x safety factor on the per-token estimate to account for
@@ -1224,6 +1221,10 @@ class KrasisModel:
                 # Reset seq_state for this group (each group's layers start with 0 KV)
                 seq_state.seq_len = 0
 
+                # Reset prefill stats for this group
+                if TIMING.prefill and manager:
+                    manager.reset_prefill_stats()
+
                 # Process all chunks through this group
                 for c in range(num_chunks):
                     h = _to_device(chunk_hidden[c], dev)
@@ -1267,6 +1268,9 @@ class KrasisModel:
                     torch.cuda.synchronize(dev)
                     compute_elapsed = time.perf_counter() - t_compute_start
                     rank_compute_time += compute_elapsed
+                    # Print HCS summary for this group
+                    if manager:
+                        manager.log_prefill_summary(group_idx)
 
                 # Free experts for this group (skip for active_only)
                 if manager and group_moe_indices and not is_active_only:

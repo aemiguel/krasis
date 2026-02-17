@@ -42,6 +42,27 @@ async def health():
     return {"status": "ok"}
 
 
+@app.post("/v1/timing")
+async def toggle_timing(request: Request):
+    """Toggle timing flags at runtime. POST with {"prefill": true/false, "decode": true/false}."""
+    from krasis.timing import TIMING
+    body = await request.json()
+    result = {}
+    if "prefill" in body:
+        TIMING.prefill = bool(body["prefill"])
+        result["prefill"] = TIMING.prefill
+    if "decode" in body:
+        TIMING.decode = bool(body["decode"])
+        result["decode"] = TIMING.decode
+    if "diag" in body:
+        TIMING.diag = bool(body["diag"])
+        result["diag"] = TIMING.diag
+    if not result:
+        result = {"prefill": TIMING.prefill, "decode": TIMING.decode, "diag": TIMING.diag}
+    logger.info("Timing flags: prefill=%s decode=%s diag=%s", TIMING.prefill, TIMING.decode, TIMING.diag)
+    return result
+
+
 @app.get("/v1/models")
 async def list_models():
     return {
@@ -382,43 +403,97 @@ def main():
     else:
         logger.info("Using cached heatmap: %s", heatmap_path)
 
-    # CUDA warmup before expert allocation
+    # CUDA runtime warmup — triggers cuBLAS + Triton kernel compilation
+    # before the allocation loop so VRAM measurements are accurate.
+    # Full model warmup happens inside the allocation loop's first inference.
     _model.warmup_cuda_runtime()
 
-    # ── HCS allocation loop: load experts, validate, increase headroom on fail ──
+    # ── HCS allocation loop: start small, step up until close to max VRAM ──
     import torch as _torch
+
+    # Build 10K test prompt once — need enough text to exceed 10K tokens after tokenization
+    _test_content = (
+        "Explain distributed consensus algorithms including Paxos, Raft, and PBFT. "
+        "Describe database transaction isolation levels and their trade-offs. "
+        "Discuss compiler optimization passes such as dead code elimination. "
+    ) * 300
+    _test_tokens = _model.tokenizer.apply_chat_template(
+        [{"role": "user", "content": _test_content}]
+    )[:10000]
+    logger.info("Test prompt: %d tokens", len(_test_tokens))
+
     for dev_str, manager in _model.gpu_prefill_managers.items():
-        free_mb = int(_torch.cuda.mem_get_info(manager.device)[0] / (1024 * 1024))
-        headroom_mb = 1000  # start: reserve 1000 MB for activations
+        total_vram = _torch.cuda.get_device_properties(manager.device).total_memory
+        initial_budget_mb = max(500, int(total_vram / (1024 * 1024) / 3))
 
-        while headroom_mb < free_mb:
-            logger.info("HCS allocation attempt: headroom=%d MB on %s", headroom_mb, dev_str)
-            manager.clear_hcs()
-            manager._init_hot_cached_static(
-                heatmap_path=heatmap_path, headroom_mb=headroom_mb,
-            )
+        # Step 1: Load a conservative budget and run 10K inference to measure cost
+        manager.clear_hcs()
+        manager._init_hot_cached_static(
+            heatmap_path=heatmap_path, expert_budget_mb=initial_budget_mb,
+        )
+        n_experts = sum(manager._hcs_num_pinned.values())
+        free_after_load = _torch.cuda.mem_get_info(manager.device)[0]
+        logger.info(
+            "HCS calibration: budget=%d MB, %d experts, %d MB free after load on %s",
+            initial_budget_mb, n_experts, free_after_load // (1024*1024), dev_str,
+        )
 
-            ok, info = manager.validate_gpu_allocation(_model)
-            if ok:
-                logger.info("HCS allocation PASSED on %s: %s", dev_str, info)
-                break
-
-            logger.warning(
-                "HCS allocation FAILED on %s (headroom=%d MB): %s — retrying with more headroom",
-                dev_str, headroom_mb, info["reasons"],
-            )
-            headroom_mb += 500
-
-        if headroom_mb >= free_mb:
+        ok, info = manager.validate_gpu_allocation(_model, _test_tokens)
+        if not ok:
             logger.error(
-                "FATAL: HCS allocation failed on %s — not enough VRAM to run inference "
-                "even with zero experts. Free VRAM: %d MB. The model's non-expert layers "
-                "(attention, KV cache, embeddings) leave insufficient room for activation "
-                "intermediates. Try: fewer GPUs sharing layers, smaller --kv-cache-mb, "
-                "or a smaller model.",
-                dev_str, free_mb,
+                "FATAL: HCS allocation failed on %s — even %d MB of experts OOMs. "
+                "Not enough VRAM for inference. Try: smaller --kv-cache-mb or a smaller model.",
+                dev_str, initial_budget_mb,
             )
             sys.exit(1)
+
+        inference_cost_bytes = info["inference_cost_bytes"]
+        logger.info("Measured inference cost: %d MB", inference_cost_bytes // (1024*1024))
+
+        # Step 2: Calculate max expert budget from measured cost
+        # free_after_load = free VRAM with initial_budget of experts loaded
+        # Adding more experts reduces free VRAM 1:1
+        # We need inference_cost * 1.2 headroom for safe operation
+        headroom_needed = int(inference_cost_bytes * 1.2)
+        extra_available = free_after_load - headroom_needed
+        if extra_available > 0:
+            max_budget_mb = initial_budget_mb + extra_available // (1024 * 1024)
+        else:
+            max_budget_mb = initial_budget_mb
+        logger.info(
+            "HCS calculated max budget: %d MB (%d MB initial + %d MB extra headroom)",
+            max_budget_mb, initial_budget_mb, extra_available // (1024*1024),
+        )
+
+        # Step 3: Reload at max budget and verify with one final inference
+        manager.clear_hcs()
+        manager._init_hot_cached_static(
+            heatmap_path=heatmap_path, expert_budget_mb=max_budget_mb,
+        )
+        n_experts = sum(manager._hcs_num_pinned.values())
+        free_after_load = _torch.cuda.mem_get_info(manager.device)[0]
+        logger.info(
+            "HCS final load: budget=%d MB, %d experts, %d MB free on %s",
+            max_budget_mb, n_experts, free_after_load // (1024*1024), dev_str,
+        )
+
+        ok, info = manager.validate_gpu_allocation(_model, _test_tokens)
+        if not ok:
+            # Final load OOM'd — fall back to calibration budget
+            logger.warning(
+                "Final load OOM at %d MB — falling back to calibration budget %d MB",
+                max_budget_mb, initial_budget_mb,
+            )
+            manager.clear_hcs()
+            manager._init_hot_cached_static(
+                heatmap_path=heatmap_path, expert_budget_mb=initial_budget_mb,
+            )
+            n_experts = sum(manager._hcs_num_pinned.values())
+
+        logger.info(
+            "HCS allocation complete on %s: %d experts cached",
+            dev_str, n_experts,
+        )
 
     logger.info("HCS ready")
 
@@ -427,9 +502,6 @@ def main():
         from krasis.benchmark import KrasisBenchmark
         bench = KrasisBenchmark(_model)
         bench.run()
-
-    # ── Warmup: run a short generation so first real request is fast ──
-    _warmup_model(_model)
 
     logger.info("Model loaded, starting server on %s:%d", args.host, args.port)
 

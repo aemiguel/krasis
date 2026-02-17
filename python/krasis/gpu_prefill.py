@@ -422,6 +422,19 @@ class GpuPrefillManager:
         self._hcs_graph_io: dict[int, dict[str, torch.Tensor]] = {}  # layer → fixed I/O tensors
         self._hcs_cuda_graphs_enabled: bool = False
 
+        # Prefill timing accumulators (reset per request via reset_prefill_stats)
+        self._pf_cpu_submit_ms: float = 0.0
+        self._pf_gpu_ms: float = 0.0
+        self._pf_cpu_sync_ms: float = 0.0
+        self._pf_cpu_to_gpu_ms: float = 0.0
+        self._pf_combine_ms: float = 0.0
+        self._pf_cpu_only_ms: float = 0.0
+        self._pf_layers_total: int = 0
+        self._pf_layers_cold: int = 0
+        self._pf_layers_all_cold: int = 0
+        self._pf_cold_experts: int = 0
+        self._pf_total_experts: int = 0
+
         # Chunk size: how many experts fit in one GPU buffer load
         if chunk_size is None:
             chunk_size = self._auto_chunk_size()
@@ -1172,11 +1185,10 @@ class GpuPrefillManager:
         (pages already mapped), then torch.frombuffer creates a zero-copy view,
         then .to(device) does PCIe DMA. No intermediate allocations.
         """
-        # HCS: hot experts already pre-loaded on GPU(s), cold handled by CPU.
-        # No DMA needed — skip entirely to avoid populating self._persistent
-        # which would hijack dispatch to _forward_persistent().
-        if self._prefill_mode == "hot_cached_static" and self._hcs_initialized:
-            return
+        # HCS M>1 prefill: use layer-grouped DMA to GPU instead of CPU cold path.
+        # CPU AVX2 engine takes 5-8s/layer for M=10K vs 40ms GPU kernel.
+        # DMA one layer's experts (~830 MB) into free VRAM, compute on GPU, free.
+        # (preload_layer_group is only called during M>1 prefill, not M=1 decode)
 
         assert self._engine is not None, "Layer-grouped mode requires Krasis engine"
         detailed = TIMING.prefill
@@ -2420,12 +2432,15 @@ class GpuPrefillManager:
 
         self._hcs_initialized = False
 
+        # Full CUDA reset — synchronize to clear any pending errors,
+        # then free all cached memory
+        torch.cuda.synchronize(self.device)
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("HCS state cleared on %s", self.device)
 
     def _init_hot_cached_static(self, heatmap_path: Optional[str] = None,
-                                headroom_mb: int = 1000):
+                                expert_budget_mb: Optional[int] = None):
         """Initialize hot_cached_static strategy.
 
         Loads expert heatmap, selects hot experts that fit in VRAM budget,
@@ -2435,8 +2450,8 @@ class GpuPrefillManager:
         Args:
             heatmap_path: Path to expert_heatmap.json. If None, uses
                           accumulated warmup heatmap from self._heatmap.
-            headroom_mb: VRAM headroom in MB to reserve for activations,
-                        CUDA graphs, Marlin workspace, etc.
+            expert_budget_mb: Max MB to spend on expert weights. If None,
+                             uses free VRAM minus 1 GB headroom.
         """
         assert self._engine is not None, "hot_cached_static requires Krasis engine"
 
@@ -2462,16 +2477,20 @@ class GpuPrefillManager:
         # Sort by activation count descending
         sorted_experts = sorted(heatmap.items(), key=lambda x: x[1], reverse=True)
 
-        # Compute VRAM budget — reserve headroom for activations + CUDA graphs.
-        headroom = headroom_mb * 1024 * 1024
+        # Compute VRAM budget for expert loading.
         per_expert = self._per_expert_vram_bytes()
         try:
             free_vram = torch.cuda.mem_get_info(self.device)[0]
-            usable = max(0, free_vram - headroom)
+            if expert_budget_mb is not None:
+                usable = min(free_vram, expert_budget_mb * 1024 * 1024)
+            else:
+                usable = max(0, free_vram - 1000 * 1024 * 1024)  # fallback: 1 GB headroom
             max_experts = max(0, usable // per_expert)
             logger.info(
-                "HCS VRAM budget: %.1f MB free, %d MB headroom, %d max experts (%.1f MB/expert)",
-                free_vram / 1e6, headroom_mb, max_experts, per_expert / 1e6,
+                "HCS VRAM budget: %.1f MB free, %s MB for experts, %d max experts (%.1f MB/expert)",
+                free_vram / 1e6,
+                expert_budget_mb if expert_budget_mb is not None else f"{usable // (1024*1024)} (auto)",
+                max_experts, per_expert / 1e6,
             )
         except Exception:
             max_experts = 1000
@@ -2610,96 +2629,86 @@ class GpuPrefillManager:
 
         self._hcs_initialized = True
 
-    def validate_gpu_allocation(self, model) -> tuple:
-        """Validate that current GPU allocation can run inference efficiently.
+    def validate_gpu_allocation(self, model, test_tokens) -> tuple:
+        """Run 10K-token inference to validate GPU allocation.
 
-        Runs a few CUDA forward passes to flush out any lazy allocations,
-        then measures true free VRAM and checks chunk size headroom.
-        Returns (ok: bool, info: dict) where ok=False means the
-        allocation needs adjustment.
+        Returns (ok, info) with inference_cost_bytes measured on success.
         """
-        info = {}
-        ok = True
-        reasons = []
-
-        # 1. Run test inference a few times to trigger all lazy CUDA allocations
-        #    (Triton compilation, cuBLAS workspace, PyTorch caching allocator)
-        test_tokens = model.tokenizer.apply_chat_template(
-            [{"role": "user", "content": "Explain the theory of " * 60}]
-        )[:500]
-        test_passed = True
-        for run in range(3):
-            try:
-                with torch.inference_mode():
-                    model.generate(test_tokens, max_new_tokens=1, temperature=0.6)
-            except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, RuntimeError) as e:
-                err_str = str(e).lower()
-                if ("out of memory" in err_str
-                        or isinstance(e, (torch.cuda.OutOfMemoryError,
-                                          torch.OutOfMemoryError))):
-                    test_passed = False
-                    ok = False
-                    reasons.append(f"test inference OOM on run {run + 1}: {e}")
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    break
-                else:
-                    raise
-        info["test_passed"] = test_passed
-
-        # 2. Measure free VRAM after lazy allocations are settled
-        gc.collect()
-        torch.cuda.empty_cache()
-        cuda_free = torch.cuda.mem_get_info(self.device)[0]
-        pytorch_pool = (torch.cuda.memory_reserved(self.device)
-                        - torch.cuda.memory_allocated(self.device))
-        available = cuda_free + max(0, pytorch_pool)
-        info["free_vram_mb"] = round(available / 1e6)
-
-        # 3. Calculate chunk size for 10K prefill (mirrors model.py chunk calc)
-        cfg = model.cfg
-        topk = cfg.num_experts_per_tok
-        N = cfg.moe_intermediate_size
-        K = cfg.hidden_size
-        intermediate_per_token = topk * (N + max(2 * N, K)) * 2  # BF16
-        hidden_per_token = K * 2 * 2  # hidden + residual
-        total_per_token = (intermediate_per_token + hidden_per_token) * 2.0  # 2x safety
-
-        if total_per_token > 0 and available > 0:
-            max_chunk = int(available / total_per_token)
-        else:
-            max_chunk = 0
-        chunk_size = max(256, min(10000, max_chunk))
-        info["chunk_size"] = chunk_size
-        info["max_chunk"] = max_chunk
-
-        MIN_GOOD_CHUNK = 5000
-        if max_chunk < MIN_GOOD_CHUNK:
-            ok = False
-            reasons.append(
-                f"chunk_size={chunk_size} (max={max_chunk}, need >={MIN_GOOD_CHUNK})"
-            )
-
-        # 4. Expert count
         n_experts = sum(self._hcs_num_pinned.values()) if self._hcs_num_pinned else 0
-        info["n_experts"] = n_experts
+        free_after_load = torch.cuda.mem_get_info(self.device)[0]
 
-        # 5. CUDA graphs
-        n_graphs = len(self._hcs_cuda_graphs)
-        info["n_cuda_graphs"] = n_graphs
+        model._oom_retry_enabled = False
+        try:
+            torch.cuda.reset_peak_memory_stats(self.device)
+            with torch.inference_mode():
+                model.generate(test_tokens, max_new_tokens=1, temperature=0.6)
 
-        info["ok"] = ok
-        info["reasons"] = reasons
+            peak = torch.cuda.max_memory_allocated(self.device)
+            baseline = torch.cuda.memory_allocated(self.device)
+            inference_cost = peak - baseline
 
+            logger.info(
+                "GPU validation PASS: %d experts, %d MB free after load, "
+                "inference cost %d MB (peak %d MB, baseline %d MB)",
+                n_experts, free_after_load // (1024*1024),
+                inference_cost // (1024*1024), peak // (1024*1024),
+                baseline // (1024*1024),
+            )
+            return True, {
+                "n_experts": n_experts,
+                "free_after_load_mb": free_after_load // (1024*1024),
+                "inference_cost_bytes": inference_cost,
+            }
+        except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, RuntimeError) as e:
+            err_str = str(e).lower()
+            if ("out of memory" in err_str
+                    or isinstance(e, (torch.cuda.OutOfMemoryError,
+                                      torch.OutOfMemoryError))):
+                logger.warning(
+                    "GPU validation FAIL: %d experts, %d MB free after load — OOM",
+                    n_experts, free_after_load // (1024*1024),
+                )
+                gc.collect()
+                torch.cuda.empty_cache()
+                return False, {"n_experts": n_experts}
+            raise
+        finally:
+            model._oom_retry_enabled = True
+
+    def reset_prefill_stats(self):
+        """Reset prefill timing accumulators (call before each prefill request)."""
+        self._pf_cpu_submit_ms = 0.0
+        self._pf_gpu_ms = 0.0
+        self._pf_cpu_sync_ms = 0.0
+        self._pf_cpu_to_gpu_ms = 0.0
+        self._pf_combine_ms = 0.0
+        self._pf_cpu_only_ms = 0.0
+        self._pf_layers_total = 0
+        self._pf_layers_cold = 0
+        self._pf_layers_all_cold = 0
+        self._pf_cold_experts = 0
+        self._pf_total_experts = 0
+
+    def log_prefill_summary(self, chunk_idx: int = -1):
+        """Log accumulated prefill timing summary."""
+        total = (self._pf_cpu_submit_ms + self._pf_gpu_ms + self._pf_cpu_sync_ms
+                 + self._pf_cpu_to_gpu_ms + self._pf_combine_ms + self._pf_cpu_only_ms)
+        if self._pf_layers_total == 0:
+            return
+        cold_pct = (100.0 * self._pf_cold_experts / max(self._pf_total_experts, 1))
+        label = f"chunk={chunk_idx}" if chunk_idx >= 0 else "total"
         logger.info(
-            "GPU validation %s: %d experts, %d MB free, chunk=%d (max=%d), "
-            "graphs=%d, test=%s%s",
-            "PASS" if ok else "FAIL", n_experts, info["free_vram_mb"],
-            chunk_size, max_chunk, n_graphs, test_passed,
-            f" — {'; '.join(reasons)}" if reasons else "",
+            "HCS-PREFILL-SUMMARY %s: %d layers (%d cold, %d all-cold) | "
+            "cpu_submit=%.0fms gpu=%.0fms cpu_sync=%.0fms cpu_to_gpu=%.0fms "
+            "combine=%.0fms cpu_only=%.0fms | total=%.0fms | "
+            "cold=%d/%d(%.0f%%)",
+            label, self._pf_layers_total, self._pf_layers_cold,
+            self._pf_layers_all_cold,
+            self._pf_cpu_submit_ms, self._pf_gpu_ms,
+            self._pf_cpu_sync_ms, self._pf_cpu_to_gpu_ms,
+            self._pf_combine_ms, self._pf_cpu_only_ms,
+            total, self._pf_cold_experts, self._pf_total_experts, cold_pct,
         )
-
-        return ok, info
 
     def _forward_hot_cached_static(
         self,
@@ -2722,7 +2731,7 @@ class GpuPrefillManager:
         """
 
         M = x.shape[0]
-        timing = TIMING.decode and M == 1
+        timing = (TIMING.decode and M == 1) or (TIMING.prefill and M > 1)
 
         if timing:
             t_start = time.perf_counter()
@@ -2752,6 +2761,9 @@ class GpuPrefillManager:
 
         # ── Step 1: Submit cold experts to CPU engine (async) ──
         if has_cold:
+            if timing:
+                t_serialize_start = time.perf_counter()
+
             if M == 1:
                 cpu_ids_list = [
                     eid if local_slots[j] < 0 else -1
@@ -2764,18 +2776,38 @@ class GpuPrefillManager:
                 cpu_ids[hot_mask] = -1
                 cpu_ids = cpu_ids.to(torch.int32)
 
+            if timing:
+                t_ids_ready = time.perf_counter()
+
             act_cpu = x.detach().cpu().contiguous()
             ids_cpu = cpu_ids.cpu().contiguous()
             wts_cpu = topk_weights.detach().cpu().contiguous()
+
+            if timing:
+                t_cpu_copy = time.perf_counter()
 
             act_bytes = act_cpu.view(torch.uint16).numpy().view(np.uint8).tobytes()
             ids_bytes = ids_cpu.numpy().view(np.uint8).tobytes()
             wts_bytes = wts_cpu.numpy().view(np.uint8).tobytes()
 
+            if timing:
+                t_tobytes = time.perf_counter()
+
             self._engine.submit_forward(moe_layer_idx, act_bytes, ids_bytes, wts_bytes, M)
 
         if timing:
             t_cpu_submitted = time.perf_counter()
+            if has_cold and M > 1:
+                logger.info(
+                    "HCS-PREFILL-SUBMIT L%d M=%d: ids_prep=%.1fms gpu_to_cpu=%.1fms "
+                    "tobytes=%.1fms submit=%.1fms total=%.1fms",
+                    moe_layer_idx, M,
+                    (t_ids_ready - t_serialize_start) * 1000,
+                    (t_cpu_copy - t_ids_ready) * 1000,
+                    (t_tobytes - t_cpu_copy) * 1000,
+                    (t_cpu_submitted - t_tobytes) * 1000,
+                    (t_cpu_submitted - t_serialize_start) * 1000,
+                )
 
         # ── Step 2: GPU hot expert computation ──
         if M == 1:
@@ -2847,10 +2879,16 @@ class GpuPrefillManager:
 
         # ── Step 3: Sync CPU result and combine ──
         if has_cold:
+            if timing:
+                t_cpu_sync_start = time.perf_counter()
             cpu_output_bytes = self._engine.sync_forward()
+            if timing:
+                t_cpu_sync_done = time.perf_counter()
             cpu_raw = torch.frombuffer(
                 bytearray(cpu_output_bytes), dtype=torch.bfloat16
             ).reshape(M, self.hidden_size).to(self.device)
+            if timing:
+                t_cpu_to_gpu = time.perf_counter()
 
             # CPU engine applies routed_scaling_factor — divide it out
             # so forward() can apply it uniformly to the combined output
@@ -2862,15 +2900,44 @@ class GpuPrefillManager:
         if timing:
             t_end = time.perf_counter()
             gpu_ms = (t_gpu_done - (t_cpu_submitted if has_cold else t_start)) * 1000
-            logger.info(
-                "HCS-TIMING L%d: cpu_submit=%.1fms gpu=%.1fms cpu_sync=%.1fms total=%.1fms cold=%s",
-                moe_layer_idx,
-                (t_cpu_submitted - t_start) * 1000 if has_cold else 0,
-                gpu_ms,
-                (t_end - t_gpu_done) * 1000 if has_cold else 0,
-                (t_end - t_start) * 1000,
-                has_cold,
-            )
+            # Count cold vs hot experts for this layer
+            if M == 1:
+                n_cold = sum(1 for s in local_slots if s < 0)
+                n_total = len(local_slots)
+            else:
+                n_cold = int((lookup_result < 0).sum().item())
+                n_total = lookup_result.numel()
+            prefix = "HCS-PREFILL" if M > 1 else "HCS-TIMING"
+            submit_ms = (t_cpu_submitted - t_start) * 1000 if has_cold else 0
+            sync_ms = (t_cpu_sync_done - t_cpu_sync_start) * 1000 if has_cold else 0
+            togpu_ms = (t_cpu_to_gpu - t_cpu_sync_done) * 1000 if has_cold else 0
+            combine_ms = (t_end - t_cpu_to_gpu) * 1000 if has_cold else 0
+            if has_cold:
+                logger.info(
+                    "%s L%d M=%d: cpu_submit=%.1fms gpu=%.1fms cpu_sync=%.1fms cpu_to_gpu=%.1fms "
+                    "combine=%.1fms total=%.1fms cold=%d/%d(%.0f%%)",
+                    prefix, moe_layer_idx, M,
+                    submit_ms, gpu_ms, sync_ms, togpu_ms, combine_ms,
+                    (t_end - t_start) * 1000,
+                    n_cold, n_total, 100.0 * n_cold / max(n_total, 1),
+                )
+            else:
+                logger.info(
+                    "%s L%d M=%d: gpu_only=%.1fms total=%.1fms cold=0/%d",
+                    prefix, moe_layer_idx, M,
+                    gpu_ms, (t_end - t_start) * 1000, n_total,
+                )
+            # Accumulate for summary
+            self._pf_cpu_submit_ms += submit_ms
+            self._pf_gpu_ms += gpu_ms
+            self._pf_cpu_sync_ms += sync_ms
+            self._pf_cpu_to_gpu_ms += togpu_ms
+            self._pf_combine_ms += combine_ms
+            self._pf_layers_total += 1
+            if has_cold:
+                self._pf_layers_cold += 1
+            self._pf_cold_experts += n_cold
+            self._pf_total_experts += n_total
 
         # Update heatmap for potential re-pinning
         if self._heatmap is not None:
@@ -2897,6 +2964,11 @@ class GpuPrefillManager:
         All experts are dispatched to the Rust AVX2 engine.
         """
         M = x.shape[0]
+        timing = (TIMING.decode and M == 1) or (TIMING.prefill and M > 1)
+
+        if timing:
+            t_start = time.perf_counter()
+
         act_cpu = x.detach().cpu().contiguous()
         ids_cpu = topk_ids.detach().cpu().to(torch.int32).contiguous()
         wts_cpu = topk_weights.detach().cpu().contiguous()
@@ -2905,8 +2977,14 @@ class GpuPrefillManager:
         ids_bytes = ids_cpu.numpy().view(np.uint8).tobytes()
         wts_bytes = wts_cpu.numpy().view(np.uint8).tobytes()
 
+        if timing:
+            t_serialized = time.perf_counter()
+
         self._engine.submit_forward(moe_layer_idx, act_bytes, ids_bytes, wts_bytes, M)
         output_bytes = self._engine.sync_forward()
+
+        if timing:
+            t_cpu_done = time.perf_counter()
 
         output = torch.frombuffer(
             bytearray(output_bytes), dtype=torch.bfloat16
@@ -2915,6 +2993,27 @@ class GpuPrefillManager:
         # CPU engine applies routed_scaling_factor — divide it out
         if self.routed_scaling_factor != 1.0:
             output = output / self.routed_scaling_factor
+
+        if timing:
+            t_end = time.perf_counter()
+            cpu_only_ms = (t_end - t_start) * 1000
+            prefix = "HCS-PREFILL-CPU" if M > 1 else "HCS-CPU"
+            logger.info(
+                "%s L%d M=%d: serialize=%.1fms cpu_compute=%.1fms to_gpu=%.1fms total=%.1fms",
+                prefix, moe_layer_idx, M,
+                (t_serialized - t_start) * 1000,
+                (t_cpu_done - t_serialized) * 1000,
+                (t_end - t_cpu_done) * 1000,
+                cpu_only_ms,
+            )
+            # Accumulate for summary
+            self._pf_cpu_only_ms += cpu_only_ms
+            self._pf_layers_total += 1
+            self._pf_layers_all_cold += 1
+            # All experts cold in this path
+            n_total = topk_ids.numel()
+            self._pf_cold_experts += n_total
+            self._pf_total_experts += n_total
 
         return output
 
@@ -3289,7 +3388,10 @@ class GpuPrefillManager:
         if debug_sync:
             torch.cuda.synchronize(self.device)
 
-        if self._prefill_mode == "hot_cached_static" and self._hcs_initialized:
+        # Layer-grouped DMA data takes priority (M>1 prefill uses GPU for all experts)
+        if self._persistent and moe_layer_idx in self._persistent:
+            output = self._forward_persistent(moe_layer_idx, x, topk_ids, topk_weights)
+        elif self._prefill_mode == "hot_cached_static" and self._hcs_initialized:
             output = self._forward_hot_cached_static(moe_layer_idx, x, topk_ids, topk_weights)
         elif self._prefill_mode in ("active_only", "lru") and self._engine is not None:
             if M == 1:
@@ -3303,9 +3405,6 @@ class GpuPrefillManager:
                 # Invalidate compact state (AO buffer will be used for prefill)
                 self._invalidate_compact()
                 output = self._forward_active_only(moe_layer_idx, x, topk_ids, topk_weights)
-        elif self._prefill_mode in ("persistent", "layer_grouped") and \
-                self._persistent and moe_layer_idx in self._persistent:
-            output = self._forward_persistent(moe_layer_idx, x, topk_ids, topk_weights)
         elif self._engine is not None:
             self._allocate_gpu_buffer()
             output = self._forward_engine(moe_layer_idx, x, topk_ids, topk_weights, debug_sync)
