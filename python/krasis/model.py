@@ -1140,6 +1140,14 @@ class KrasisModel:
             chunk_size = 2048
             logger.warning("Chunk calc exception: %s, defaulting to %d", e, chunk_size)
 
+        # Default chunk size cap — avoids OOM on first attempt for typical VRAM sizes.
+        # The auto-calculated chunk_size can exceed what actually fits because the
+        # VRAM budget estimate doesn't account for all transient allocations.
+        max_default_chunk = 5000
+        if chunk_size > max_default_chunk:
+            logger.info("Chunk size capped by default limit: %d → %d", chunk_size, max_default_chunk)
+            chunk_size = max_default_chunk
+
         # Apply OOM retry override (from _forward_prefill_with_oom_retry)
         if max_chunk_override is not None and max_chunk_override < chunk_size:
             logger.info("Chunk size capped by OOM retry: %d → %d", chunk_size, max_chunk_override)

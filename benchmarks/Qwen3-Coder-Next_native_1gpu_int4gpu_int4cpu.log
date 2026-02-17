@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-16 17:52:12
+Krasis Benchmark — 2026-02-17 12:15:26
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,10 +7,10 @@ PP Partition:     [48] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            995 GB total, 76.7 GB used by process
-  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 12272 MB allocated
-  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 14817 MB allocated
-  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 14634 MB allocated
+  RAM:            995 GB total, 77.8 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 11211 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
 
 Quantization:
   GPU experts:    INT4 (Marlin)
@@ -27,29 +27,28 @@ Strategy:
   Mode:           gpu_decode (hot_cached_static)
 
 Prefill (10000 tokens, 3 runs):
-  Run 1:  534.1 tok/s, TTFT=18.72s
-  Run 2:  282.3 tok/s, TTFT=35.42s
-  Run 3:  527.3 tok/s, TTFT=18.96s
-  Average: 447.9 tok/s, TTFT=24.37s
+  Run 1:  516.2 tok/s, TTFT=19.37s
+  Run 2:  527.7 tok/s, TTFT=18.95s
+  Run 3:  527.1 tok/s, TTFT=18.97s
+  Average: 523.7 tok/s, TTFT=19.10s
 
 Decode (64 tokens, 3 runs):
-  Run 1:  9.02 tok/s (110.8ms/tok)
-  Run 2:  9.03 tok/s (110.7ms/tok)
-  Run 3:  9.01 tok/s (111.0ms/tok)
-  Average: 9.02 tok/s (110.8ms/tok)
+  Run 1:  7.71 tok/s (129.6ms/tok)
+  Run 2:  7.75 tok/s (129.1ms/tok)
+  Run 3:  7.66 tok/s (130.6ms/tok)
+  Average: 7.71 tok/s (129.8ms/tok)
 
 Verification:
   Prefill prompt: user
 Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Describe database transaction isolation levels and their trade-offs. Discuss compiler optimization passes such as dead co... [63136 chars total]
   Decode prompt:  Write a poem about recursion in programming.
   Generated output (64 tokens):
-    **The Ladder of Self-Call**  
+    **The Recursive Ladder**  
     
-    A function stands, both small and keen,  
-    With purpose clear, and task unseen.  
-    It checks a base, a solid ground—  
-    A final stop, where paths are found:  
+    A function calls itself—soft and low,  
+    A whisper in the code’s deep flow.  
+    It checks the base: *“Am I done?  
+    If not, I’ll call again, until the run is won.”*  
     
-    > *“If n is zero, rest is done;  
-    > Return
+    A stack of frames, like books upright,
 ================================================================
