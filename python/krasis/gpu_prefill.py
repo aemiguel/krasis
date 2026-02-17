@@ -2400,7 +2400,32 @@ class GpuPrefillManager:
             json.dump(data, f, indent=2)
         logger.info("Heatmap saved: %d entries to %s", len(data), path)
 
-    def _init_hot_cached_static(self, heatmap_path: Optional[str] = None):
+    def clear_hcs(self):
+        """Tear down all HCS state so the manager can be re-initialized."""
+        # Release CUDA graphs
+        self._hcs_cuda_graphs.clear()
+        self._hcs_graph_io.clear()
+        self._hcs_cuda_graphs_enabled = False
+
+        # Release GPU buffers
+        self._hcs_buffers.clear()
+        self._hcs_lookup.clear()
+        self._hcs_num_pinned.clear()
+        self._hcs_g_idx.clear()
+        self._hcs_sort_idx.clear()
+        self._hcs_gating_1.clear()
+        self._hcs_biases.clear()
+        self._pinned.clear()
+        self._workspace = None
+
+        self._hcs_initialized = False
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("HCS state cleared on %s", self.device)
+
+    def _init_hot_cached_static(self, heatmap_path: Optional[str] = None,
+                                headroom_mb: int = 1000):
         """Initialize hot_cached_static strategy.
 
         Loads expert heatmap, selects hot experts that fit in VRAM budget,
@@ -2410,6 +2435,8 @@ class GpuPrefillManager:
         Args:
             heatmap_path: Path to expert_heatmap.json. If None, uses
                           accumulated warmup heatmap from self._heatmap.
+            headroom_mb: VRAM headroom in MB to reserve for activations,
+                        CUDA graphs, Marlin workspace, etc.
         """
         assert self._engine is not None, "hot_cached_static requires Krasis engine"
 
@@ -2435,16 +2462,16 @@ class GpuPrefillManager:
         # Sort by activation count descending
         sorted_experts = sorted(heatmap.items(), key=lambda x: x[1], reverse=True)
 
-        # Compute VRAM budget — reserve headroom for CUDA graphs + Marlin workspace.
-        HEADROOM = 1000 * 1024 * 1024  # 1000 MB (graphs + workspace only)
+        # Compute VRAM budget — reserve headroom for activations + CUDA graphs.
+        headroom = headroom_mb * 1024 * 1024
         per_expert = self._per_expert_vram_bytes()
         try:
             free_vram = torch.cuda.mem_get_info(self.device)[0]
-            usable = max(0, free_vram - HEADROOM)
+            usable = max(0, free_vram - headroom)
             max_experts = max(0, usable // per_expert)
             logger.info(
-                "HCS VRAM budget: %.1f MB free, %.0f MB headroom, %d max experts (%.1f MB/expert)",
-                free_vram / 1e6, HEADROOM / 1e6, max_experts, per_expert / 1e6,
+                "HCS VRAM budget: %.1f MB free, %d MB headroom, %d max experts (%.1f MB/expert)",
+                free_vram / 1e6, headroom_mb, max_experts, per_expert / 1e6,
             )
         except Exception:
             max_experts = 1000
@@ -2586,25 +2613,50 @@ class GpuPrefillManager:
     def validate_gpu_allocation(self, model) -> tuple:
         """Validate that current GPU allocation can run inference efficiently.
 
-        Checks free VRAM, predicted chunk size, CUDA graphs, and runs a test
-        inference. Returns (ok: bool, info: dict) where ok=False means the
+        Runs a few CUDA forward passes to flush out any lazy allocations,
+        then measures true free VRAM and checks chunk size headroom.
+        Returns (ok: bool, info: dict) where ok=False means the
         allocation needs adjustment.
         """
-        gc.collect()
-        torch.cuda.empty_cache()
-
         info = {}
         ok = True
         reasons = []
 
-        # 1. Measure free VRAM
+        # 1. Run test inference a few times to trigger all lazy CUDA allocations
+        #    (Triton compilation, cuBLAS workspace, PyTorch caching allocator)
+        test_tokens = model.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Explain the theory of " * 60}]
+        )[:500]
+        test_passed = True
+        for run in range(3):
+            try:
+                with torch.inference_mode():
+                    model.generate(test_tokens, max_new_tokens=1, temperature=0.6)
+            except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, RuntimeError) as e:
+                err_str = str(e).lower()
+                if ("out of memory" in err_str
+                        or isinstance(e, (torch.cuda.OutOfMemoryError,
+                                          torch.OutOfMemoryError))):
+                    test_passed = False
+                    ok = False
+                    reasons.append(f"test inference OOM on run {run + 1}: {e}")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    break
+                else:
+                    raise
+        info["test_passed"] = test_passed
+
+        # 2. Measure free VRAM after lazy allocations are settled
+        gc.collect()
+        torch.cuda.empty_cache()
         cuda_free = torch.cuda.mem_get_info(self.device)[0]
         pytorch_pool = (torch.cuda.memory_reserved(self.device)
                         - torch.cuda.memory_allocated(self.device))
         available = cuda_free + max(0, pytorch_pool)
         info["free_vram_mb"] = round(available / 1e6)
 
-        # 2. Calculate chunk size for 10K prefill (mirrors model.py chunk calc)
+        # 3. Calculate chunk size for 10K prefill (mirrors model.py chunk calc)
         cfg = model.cfg
         topk = cfg.num_experts_per_tok
         N = cfg.moe_intermediate_size
@@ -2628,33 +2680,13 @@ class GpuPrefillManager:
                 f"chunk_size={chunk_size} (max={max_chunk}, need >={MIN_GOOD_CHUNK})"
             )
 
-        # 3. Expert count
+        # 4. Expert count
         n_experts = sum(self._hcs_num_pinned.values()) if self._hcs_num_pinned else 0
         info["n_experts"] = n_experts
 
-        # 4. CUDA graphs
+        # 5. CUDA graphs
         n_graphs = len(self._hcs_cuda_graphs)
         info["n_cuda_graphs"] = n_graphs
-
-        # 5. Test inference
-        try:
-            test_tokens = model.tokenizer.apply_chat_template(
-                [{"role": "user", "content": "Explain the theory of " * 60}]
-            )[:500]
-            with torch.inference_mode():
-                model.generate(test_tokens, max_new_tokens=1, temperature=0.6)
-            info["test_passed"] = True
-        except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, RuntimeError) as e:
-            err_str = str(e).lower()
-            if ("out of memory" in err_str
-                    or isinstance(e, (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError))):
-                info["test_passed"] = False
-                ok = False
-                reasons.append(f"test inference OOM: {e}")
-                gc.collect()
-                torch.cuda.empty_cache()
-            else:
-                raise
 
         info["ok"] = ok
         info["reasons"] = reasons
@@ -2663,8 +2695,7 @@ class GpuPrefillManager:
             "GPU validation %s: %d experts, %d MB free, chunk=%d (max=%d), "
             "graphs=%d, test=%s%s",
             "PASS" if ok else "FAIL", n_experts, info["free_vram_mb"],
-            chunk_size, max_chunk, n_graphs,
-            info.get("test_passed", "skipped"),
+            chunk_size, max_chunk, n_graphs, test_passed,
             f" — {'; '.join(reasons)}" if reasons else "",
         )
 

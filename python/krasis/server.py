@@ -385,9 +385,40 @@ def main():
     # CUDA warmup before expert allocation
     _model.warmup_cuda_runtime()
 
-    # Initialize HCS on all managers
+    # ── HCS allocation loop: load experts, validate, increase headroom on fail ──
+    import torch as _torch
     for dev_str, manager in _model.gpu_prefill_managers.items():
-        manager._init_hot_cached_static(heatmap_path=heatmap_path)
+        free_mb = int(_torch.cuda.mem_get_info(manager.device)[0] / (1024 * 1024))
+        headroom_mb = 1000  # start: reserve 1000 MB for activations
+
+        while headroom_mb < free_mb:
+            logger.info("HCS allocation attempt: headroom=%d MB on %s", headroom_mb, dev_str)
+            manager.clear_hcs()
+            manager._init_hot_cached_static(
+                heatmap_path=heatmap_path, headroom_mb=headroom_mb,
+            )
+
+            ok, info = manager.validate_gpu_allocation(_model)
+            if ok:
+                logger.info("HCS allocation PASSED on %s: %s", dev_str, info)
+                break
+
+            logger.warning(
+                "HCS allocation FAILED on %s (headroom=%d MB): %s — retrying with more headroom",
+                dev_str, headroom_mb, info["reasons"],
+            )
+            headroom_mb += 500
+
+        if headroom_mb >= free_mb:
+            logger.error(
+                "FATAL: HCS allocation failed on %s — not enough VRAM to run inference "
+                "even with zero experts. Free VRAM: %d MB. The model's non-expert layers "
+                "(attention, KV cache, embeddings) leave insufficient room for activation "
+                "intermediates. Try: fewer GPUs sharing layers, smaller --kv-cache-mb, "
+                "or a smaller model.",
+                dev_str, free_mb,
+            )
+            sys.exit(1)
 
     logger.info("HCS ready")
 
