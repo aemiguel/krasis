@@ -207,7 +207,7 @@ class KrasisBenchmark:
         }
 
     # ──────────────────────────────────────────────────────────
-    # Prompt building (reused from auto_optimise.py)
+    # Prompt building
     # ──────────────────────────────────────────────────────────
 
     def _make_prompt(self, target_tokens: int) -> List[int]:

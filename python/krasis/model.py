@@ -280,11 +280,12 @@ def _compute_layer_groups(
 
 
 def _hcs_prefill_divisor(manager, rank, cfg) -> int:
-    """Auto-compute layer group divisor for HCS prefill based on VRAM budget.
+    """Auto-compute layer group divisor for HCS prefill.
 
-    HCS stores hot experts statically for decode, but prefill needs ALL experts
-    loaded per-group via preload_layer_group(). This computes how many groups
-    are needed so each group fits in available VRAM.
+    HCS stores hot experts statically on GPU(s) — prefill runs hot experts on
+    GPU in parallel with cold experts on CPU, zero DMA. The divisor controls
+    how layers are grouped for the forward loop (preload_layer_group() is a
+    no-op under HCS since experts are already loaded).
     """
     first_k = cfg.first_k_dense_replace
     moe_layers = [l for l in range(rank.layer_start, rank.layer_end) if l >= first_k]
@@ -323,6 +324,7 @@ class KrasisModel:
         expert_divisor: int = 1,
         gguf_path: Optional[str] = None,
         gguf_native: bool = False,
+        kv_cache_mb: int = 2000,
     ):
         self.cfg = ModelConfig.from_model_path(model_path)
         self.quant_cfg = quant_cfg or QuantConfig()
@@ -338,6 +340,7 @@ class KrasisModel:
         self.pp_partition = pp_partition
         self.ranks = build_pp_ranks(self.cfg, pp_partition, devices)
         self.kv_dtype = kv_dtype
+        self.kv_cache_mb = kv_cache_mb
         self.krasis_threads = krasis_threads
         self.gpu_prefill_enabled = gpu_prefill
         self.gpu_prefill_threshold = gpu_prefill_threshold
@@ -442,6 +445,119 @@ class KrasisModel:
         self._loaded = True
         total = time.perf_counter() - start
         logger.info("Model fully loaded in %.1fs", total)
+
+    def warmup_cuda_runtime(self):
+        """Trigger ALL lazy CUDA runtime allocations before HCS expert loading.
+
+        Runs representative kernels at multiple M sizes (including large prefill)
+        to trigger cuBLAS workspace, Triton compilation cache, and any other
+        lazy CUDA allocations.  This ensures _init_hot_cached_static() sees
+        the true available VRAM instead of an inflated number.
+
+        Must be called after model.load() and before HCS expert allocation.
+        """
+        import gc
+
+        device = torch.device(self.ranks[0].device)
+        free_before = torch.cuda.mem_get_info(device)[0]
+
+        # ── 1. cuBLAS workspace: int8 matmuls at representative sizes ──
+        try:
+            max_k, max_n = 0, 0
+            for layer in self.layers:
+                for key in ("gate_up_proj", "down_proj"):
+                    w = layer.shared_expert.get(key) if layer.shared_expert else None
+                    if w is not None:
+                        wt = w[0] if isinstance(w, (tuple, list)) else w
+                        k, n = wt.shape
+                        if k * n > max_k * max_n:
+                            max_k, max_n = k, n
+                if hasattr(layer, 'attention'):
+                    for key in ("q_proj", "o_proj"):
+                        w = getattr(layer.attention, key, None)
+                        if w is not None:
+                            wt = w[0] if isinstance(w, (tuple, list)) else w
+                            k, n = wt.shape
+                            if k * n > max_k * max_n:
+                                max_k, max_n = k, n
+
+            if max_k > 0 and max_n > 0:
+                # Cover M=1 (decode), M=16/32 (small batch), M=512 (prefill chunk)
+                for m in (1, 16, 32, 128, 512):
+                    try:
+                        x = torch.randint(-127, 127, (max(m, 16), max_k),
+                                          dtype=torch.int8, device=device)
+                        w = torch.randint(-127, 127, (max_n, max_k),
+                                          dtype=torch.int8, device=device)
+                        _ = torch._int_mm(x, w.t())
+                        del x, w, _
+                    except Exception:
+                        pass
+                torch.cuda.synchronize(device)
+        except Exception as e:
+            logger.warning("CUDA warmup (cuBLAS): %s", e)
+
+        # ── 2. Triton/Marlin: fused_marlin_moe at M=1 and M=128 ──
+        try:
+            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+                fused_marlin_moe,
+            )
+            from sglang.srt.layers.quantization.marlin_utils import (
+                marlin_make_workspace,
+            )
+
+            K = self.cfg.hidden_size
+            N = self.cfg.moe_intermediate_size
+            engine = getattr(self, 'krasis_engine', None)
+            gs = engine.group_size() if engine else 128
+            bits = getattr(self.quant_cfg, 'gpu_expert_bits', 4)
+            nb2 = bits // 2
+            n_dummy = 2  # minimal expert count
+
+            ws = marlin_make_workspace(device, max_blocks_per_sm=4)
+            w13 = torch.zeros(n_dummy, K // 16, 2 * N * nb2,
+                              dtype=torch.int32, device=device)
+            w13s = torch.zeros(n_dummy, K // gs, 2 * N,
+                               dtype=torch.bfloat16, device=device)
+            w2 = torch.zeros(n_dummy, N // 16, K * nb2,
+                             dtype=torch.int32, device=device)
+            w2s = torch.zeros(n_dummy, N // gs, K,
+                              dtype=torch.bfloat16, device=device)
+            gi = torch.empty(n_dummy, 0, dtype=torch.int32, device=device)
+            si = torch.empty(n_dummy, 0, dtype=torch.int32, device=device)
+
+            for m in (1, 128):
+                x = torch.zeros(m, K, dtype=torch.bfloat16, device=device)
+                g = torch.empty(m, n_dummy, device=device)
+                tw = torch.zeros(m, 1, dtype=torch.float32, device=device)
+                ti = torch.zeros(m, 1, dtype=torch.int32, device=device)
+                for _ in range(3):  # Triton compiles on first call
+                    _ = fused_marlin_moe(
+                        hidden_states=x, w1=w13, w2=w2,
+                        w1_scale=w13s, w2_scale=w2s,
+                        gating_output=g,
+                        topk_weights=tw, topk_ids=ti,
+                        global_num_experts=n_dummy, expert_map=None,
+                        g_idx1=gi, g_idx2=gi,
+                        sort_indices1=si, sort_indices2=si,
+                        workspace=ws, num_bits=bits, is_k_full=True,
+                    )
+                del x, g, tw, ti
+            torch.cuda.synchronize(device)
+            del w13, w13s, w2, w2s, gi, si, ws
+        except Exception as e:
+            logger.warning("CUDA warmup (Marlin): %s", e)
+
+        # ── Clean up and measure ──
+        gc.collect()
+        torch.cuda.empty_cache()
+        free_after = torch.cuda.mem_get_info(device)[0]
+        consumed = free_before - free_after
+        logger.info(
+            "CUDA runtime warmup complete: %.0f MB consumed "
+            "(%.0f MB free before → %.0f MB free after)",
+            consumed / 1e6, free_before / 1e6, free_after / 1e6,
+        )
 
     def _load_gpu_weights(self, loader: WeightLoader):
         """Stream-load all GPU weights layer by layer."""
@@ -556,6 +672,7 @@ class KrasisModel:
                 # the ~438 GB Python Marlin RAM cache)
                 engine_ref = getattr(self, 'krasis_engine', None)
                 num_moe_layers = self.cfg.num_hidden_layers - self.cfg.first_k_dense_replace
+
                 manager = GpuPrefillManager(
                     model_path=self.cfg.model_path,
                     device=dev,
@@ -637,28 +754,6 @@ class KrasisModel:
         self._kv_layer_offsets = {}
         use_combined = (self.attention_backend == "trtllm")
 
-        # Compute VRAM reservation for layer-grouped expert buffers
-        # so the KV cache auto-sizer doesn't over-allocate.
-        # Use per-rank MoE layer count (not total) since each GPU only loads its rank's layers.
-        vram_reserve = 0
-        if self.expert_divisor >= 2 and self.gpu_prefill_enabled and self.cfg.n_routed_experts > 0:
-            # Find max per-rank MoE layer count
-            max_rank_moe = max(
-                sum(1 for li in rank.layer_range if self.cfg.is_moe_layer(li))
-                for rank in self.ranks
-            )
-            for dev_str, manager in self.gpu_prefill_managers.items():
-                per_expert = manager._per_expert_vram_bytes()
-                moe_per_group = ceil(max_rank_moe / self.expert_divisor)
-                vram_reserve = per_expert * self.cfg.n_routed_experts * moe_per_group
-                logger.info(
-                    "VRAM reservation for layer-grouped prefill: %.1f MB "
-                    "(moe_per_group=%d, %d experts, %.1f MB/expert)",
-                    vram_reserve / 1e6, moe_per_group,
-                    self.cfg.n_routed_experts, per_expert / 1e6,
-                )
-                break  # same reservation per GPU
-
         for rank in self.ranks:
             dev = torch.device(rank.device)
 
@@ -680,7 +775,7 @@ class KrasisModel:
                     device=dev,
                     kv_dtype=self.kv_dtype,
                     combined=use_combined,
-                    vram_reserve_bytes=vram_reserve,
+                    max_mb=self.kv_cache_mb,
                 )
             else:
                 cache = None
@@ -1009,10 +1104,14 @@ class KrasisModel:
             first_manager = self.gpu_prefill_managers.get(first_dev_str)
             if first_manager and intermediate_per_token > 0:
                 per_expert = first_manager._per_expert_vram_bytes()
-                # 1-layer expert group VRAM (including shared experts)
-                expert_group_bytes = self.cfg.n_routed_experts * per_expert
-                if self.cfg.n_shared_experts > 0:
-                    expert_group_bytes += per_expert  # ~1 shared expert worth
+                # HCS: experts pre-loaded on GPU(s), no DMA buffer needed
+                if getattr(first_manager, '_hcs_initialized', False):
+                    expert_group_bytes = 0
+                else:
+                    # 1-layer expert group VRAM (including shared experts)
+                    expert_group_bytes = self.cfg.n_routed_experts * per_expert
+                    if self.cfg.n_shared_experts > 0:
+                        expert_group_bytes += per_expert  # ~1 shared expert worth
                 # Safety margin: kernel workspace, PyTorch allocator fragmentation,
                 # attention intermediates, hidden states between chunks.
                 # Use 2x safety factor on the per-token estimate to account for

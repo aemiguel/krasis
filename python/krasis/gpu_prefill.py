@@ -14,6 +14,7 @@ Usage:
     output = manager.forward(moe_layer_idx, hidden_states, topk_ids, topk_weights)
 """
 
+import gc
 import json
 import logging
 import os
@@ -1079,7 +1080,7 @@ class GpuPrefillManager:
             self._gpu_w2_scale = None
             torch.cuda.empty_cache()
 
-        except torch.cuda.OutOfMemoryError:
+        except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):
             logger.warning(
                 "OOM during persistent preload at layer %d — "
                 "falling back to layer_grouped (divisor=2)",
@@ -1171,6 +1172,12 @@ class GpuPrefillManager:
         (pages already mapped), then torch.frombuffer creates a zero-copy view,
         then .to(device) does PCIe DMA. No intermediate allocations.
         """
+        # HCS: hot experts already pre-loaded on GPU(s), cold handled by CPU.
+        # No DMA needed — skip entirely to avoid populating self._persistent
+        # which would hijack dispatch to _forward_persistent().
+        if self._prefill_mode == "hot_cached_static" and self._hcs_initialized:
+            return
+
         assert self._engine is not None, "Layer-grouped mode requires Krasis engine"
         detailed = TIMING.prefill
 
@@ -2221,7 +2228,7 @@ class GpuPrefillManager:
                 }
                 pinned += 1
                 total_mb += self._per_expert_vram_bytes() / 1e6
-            except torch.cuda.OutOfMemoryError:
+            except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):
                 logger.warning("OOM during pinning at slot %d — stopping", pinned)
                 torch.cuda.empty_cache()
                 break
@@ -2348,7 +2355,7 @@ class GpuPrefillManager:
                     }
                     pinned += 1
                     total_mb += self._per_expert_vram_bytes() / 1e6
-                except torch.cuda.OutOfMemoryError:
+                except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):
                     logger.warning("OOM during weighted pinning at slot %d — stopping", pinned)
                     torch.cuda.empty_cache()
                     break
@@ -2428,17 +2435,16 @@ class GpuPrefillManager:
         # Sort by activation count descending
         sorted_experts = sorted(heatmap.items(), key=lambda x: x[1], reverse=True)
 
-        # Compute VRAM budget
+        # Compute VRAM budget — reserve headroom for CUDA graphs + Marlin workspace.
+        HEADROOM = 1000 * 1024 * 1024  # 1000 MB (graphs + workspace only)
         per_expert = self._per_expert_vram_bytes()
         try:
             free_vram = torch.cuda.mem_get_info(self.device)[0]
-            # Reserve 3.5 GB for KV cache, attention intermediates, kernel workspace
-            headroom = int(3.5 * 1024 * 1024 * 1024)
-            budget = free_vram - headroom
-            max_experts = max(0, budget // per_expert)
+            usable = max(0, free_vram - HEADROOM)
+            max_experts = max(0, usable // per_expert)
             logger.info(
-                "HCS VRAM budget: %.1f MB free, %.1f MB headroom, %d max experts (%.1f MB/expert)",
-                free_vram / 1e6, headroom / 1e6, max_experts, per_expert / 1e6,
+                "HCS VRAM budget: %.1f MB free, %.0f MB headroom, %d max experts (%.1f MB/expert)",
+                free_vram / 1e6, HEADROOM / 1e6, max_experts, per_expert / 1e6,
             )
         except Exception:
             max_experts = 1000
@@ -2496,6 +2502,7 @@ class GpuPrefillManager:
             w13s = w13s_cpu.to(self.device, non_blocking=True)
             w2 = w2_cpu.to(self.device, non_blocking=True)
             w2s = w2s_cpu.to(self.device, non_blocking=True)
+            torch.cuda.synchronize(self.device)
 
             self._hcs_buffers[layer_idx] = {
                 "w13": w13, "w13_scale": w13s,
@@ -2536,9 +2543,10 @@ class GpuPrefillManager:
             layer_mb = (w13.nbytes + w13s.nbytes + w2.nbytes + w2s.nbytes) / 1e6
             total_mb += layer_mb
 
-        # Ensure workspace is allocated
-        if self._workspace is None:
-            self._workspace = marlin_make_workspace(self.device, max_blocks_per_sm=4)
+        if not hot_experts:
+            logger.info("hot_cached_static: no experts loaded (all CPU)")
+            self._hcs_initialized = True
+            return
 
         # Populate self._pinned so active_only prefill path skips DMA for hot experts.
         # Uses views into HCS buffers — zero extra VRAM.
@@ -2564,6 +2572,14 @@ class GpuPrefillManager:
             self.device, len(hot_experts), len(layer_experts), total_mb, elapsed,
             min(layers_with_pins.values()), max(layers_with_pins.values()),
         )
+
+        # Allocate Marlin workspace + capture CUDA graphs
+        from sglang.srt.layers.quantization.marlin_utils import (
+            marlin_make_workspace,
+        )
+        if self._workspace is None:
+            self._workspace = marlin_make_workspace(self.device, max_blocks_per_sm=4)
+        self._init_cuda_graphs()
 
         self._hcs_initialized = True
 
@@ -2881,7 +2897,7 @@ class GpuPrefillManager:
         # Replay captured kernel
         graph.replay()
 
-        # Return clone (graph tensor is reused next call)
+        # Return clone (graph tensor is in CUDA graph private pool)
         return io["output"].clone()
 
     def _forward_persistent(
@@ -3156,16 +3172,7 @@ class GpuPrefillManager:
             torch.cuda.synchronize(self.device)
 
         if self._prefill_mode == "hot_cached_static" and self._hcs_initialized:
-            if M == 1:
-                # M=1 decode: hot experts on GPU static buffers, cold on CPU (zero DMA)
-                output = self._forward_hot_cached_static(moe_layer_idx, x, topk_ids, topk_weights)
-            elif self._persistent and moe_layer_idx in self._persistent:
-                # M>1 prefill: use layer_grouped preloaded experts (all experts in VRAM)
-                output = self._forward_persistent(moe_layer_idx, x, topk_ids, topk_weights)
-            else:
-                # M>1 prefill fallback: DMA-based active_only
-                self._invalidate_compact()
-                output = self._forward_active_only(moe_layer_idx, x, topk_ids, topk_weights)
+            output = self._forward_hot_cached_static(moe_layer_idx, x, topk_ids, topk_weights)
         elif self._prefill_mode in ("active_only", "lru") and self._engine is not None:
             if M == 1:
                 # Compact per-layer buffers for decode (cross-token expert caching)

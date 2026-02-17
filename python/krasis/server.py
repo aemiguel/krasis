@@ -155,6 +155,74 @@ async def _blocking_response(request: GenerationRequest):
     }
 
 
+def _build_heatmap(model: KrasisModel, save_path: str) -> str:
+    """Build expert activation heatmap by running active_only inference.
+
+    Switches to active_only mode, runs a large prompt to gather activation
+    counts, saves the heatmap, then switches back.  Returns path to saved file.
+    """
+    import gc, os, torch
+
+    # Build a ~10K token prompt
+    sections = [
+        "Explain distributed consensus algorithms including Paxos, Raft, and PBFT. ",
+        "Describe database transaction isolation levels and their trade-offs. ",
+        "Discuss compiler optimization passes such as dead code elimination and loop unrolling. ",
+        "Explain the CAP theorem and its practical implications for system design. ",
+        "Describe memory management strategies in operating systems including paging and segmentation. ",
+        "Discuss the principles of functional programming and category theory. ",
+        "Explain how neural network backpropagation works with gradient descent. ",
+        "Describe the architecture of modern CPUs including pipelining and branch prediction. ",
+        "Discuss cryptographic primitives including AES, RSA, and elliptic curve cryptography. ",
+        "Explain container orchestration with Kubernetes including pods, services, and deployments. ",
+    ]
+    content = ""
+    while True:
+        for section in sections:
+            content += section
+        tokens = model.tokenizer.apply_chat_template([{"role": "user", "content": content}])
+        if len(tokens) >= 10000:
+            tokens = tokens[:10000]
+            break
+
+    # Switch to active_only mode (tracks activations, cheapest GPU mode)
+    for layer in model.layers:
+        if hasattr(layer, 'gpu_prefill_manager'):
+            layer.gpu_prefill_manager = None
+    model.gpu_prefill_managers.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    model.gpu_prefill_enabled = True
+    model.expert_divisor = -1  # active_only
+    model._init_gpu_prefill()
+
+    # Run inference to gather heatmap
+    logger.info("Building heatmap with %d tokens...", len(tokens))
+    with torch.inference_mode():
+        model.generate(tokens, max_new_tokens=128, temperature=0.6)
+
+    # Save heatmap
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    for manager in model.gpu_prefill_managers.values():
+        manager.save_heatmap(save_path)
+        break
+    logger.info("Heatmap saved to %s", save_path)
+
+    # Switch back to HCS mode
+    for layer in model.layers:
+        if hasattr(layer, 'gpu_prefill_manager'):
+            layer.gpu_prefill_manager = None
+    model.gpu_prefill_managers.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    model.expert_divisor = -3  # hot_cached_static
+    model._init_gpu_prefill()
+
+    return save_path
+
+
 def _warmup_model(model: KrasisModel):
     """Run a short generation to warm up GPU kernels, expert DMA, and CUDA caches.
 
@@ -220,8 +288,6 @@ def _remove_registry() -> None:
 def main():
     parser = argparse.ArgumentParser(description="Krasis standalone LLM server")
     parser.add_argument("--model-path", required=True, help="Path to HF model")
-    parser.add_argument("--pp-partition", default=None,
-                        help="Comma-separated layer counts per GPU (e.g. 31,30)")
     parser.add_argument("--num-gpus", type=int, default=None,
                         help="Number of GPUs (auto-detected if omitted)")
     parser.add_argument("--host", default="0.0.0.0")
@@ -230,15 +296,10 @@ def main():
                         help="CPU threads for expert computation")
     parser.add_argument("--kv-dtype", default="fp8_e4m3",
                         choices=["fp8_e4m3", "bf16"])
-    parser.add_argument("--expert-divisor", type=int, default=1,
-                        help="Expert loading: -3=hot_cached_static, -2=lru, -1=active-only, 0=chunked, 1=persistent, >=2=layer-grouped")
-    parser.add_argument("--cache-strategy", default=None,
-                        choices=["none", "active_only", "static_pin", "weighted_pin", "lru", "hybrid", "hot_cached_static"],
-                        help="Expert caching strategy (overrides expert-divisor for cache modes)")
+    parser.add_argument("--kv-cache-mb", type=int, default=2000,
+                        help="KV cache size in MB (default: 2000)")
     parser.add_argument("--heatmap-path", default=None,
-                        help="Path to expert_heatmap.json for hot_cached_static init")
-    parser.add_argument("--cuda-graphs", action="store_true", default=False,
-                        help="Enable CUDA graph capture for M=1 decode (hot_cached_static only)")
+                        help="Path to expert_heatmap.json for HCS init")
     parser.add_argument("--gpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Marlin quantization bits for GPU prefill experts")
     parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
@@ -251,21 +312,10 @@ def main():
                         help="Quantization for dense MLP weights")
     parser.add_argument("--lm-head-quant", default="int8", choices=["bf16", "int8"],
                         help="Quantization for lm_head weights")
-    parser.add_argument("--gpu-prefill-threshold", type=int, default=300,
-                        help="Min tokens to trigger GPU prefill (default: 300)")
-    parser.add_argument("--gpu-decode", action="store_true", default=None,
-                        help="Route M=1 decode through GPU (default: True for active_only/static_pin)")
-    parser.add_argument("--no-gpu-decode", dest="gpu_decode", action="store_false",
-                        help="Disable GPU decode (use CPU for M=1)")
     parser.add_argument("--gguf-path", default=None,
                         help="Path to GGUF file for CPU experts")
     parser.add_argument("--force-load", action="store_true",
                         help="Force reload of cached weights")
-    parser.add_argument("--strategy", default="manual",
-                        choices=["auto", "manual"],
-                        help="auto: auto-discover best strategy on first run; manual: use explicit flags")
-    parser.add_argument("--force-optimize", action="store_true",
-                        help="Force re-run auto-optimiser even if cached results exist (--strategy auto only)")
     parser.add_argument("--benchmark", action="store_true",
                         help="Run standardized benchmark before starting server")
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -278,10 +328,6 @@ def main():
 
     global _model, _scheduler, _model_name
     import torch
-
-    pp_partition = None
-    if args.pp_partition:
-        pp_partition = [int(x.strip()) for x in args.pp_partition.split(",")]
 
     kv_dtype = torch.float8_e4m3fn if args.kv_dtype == "fp8_e4m3" else torch.bfloat16
 
@@ -296,92 +342,54 @@ def main():
 
     _model_name = args.model_path.rstrip("/").split("/")[-1]
 
-    if args.strategy == "auto":
-        # ── Auto strategy: neutral init → auto-optimise or load cached ──
-        logger.info("Strategy: auto (expert_divisor=0 for neutral init)")
-        _model = KrasisModel(
-            model_path=args.model_path,
-            pp_partition=pp_partition,
-            num_gpus=args.num_gpus,
-            kv_dtype=kv_dtype,
-            krasis_threads=args.krasis_threads,
-            quant_cfg=quant_cfg,
-            expert_divisor=0,  # neutral chunked — cheapest init
-            gguf_path=args.gguf_path,
-            force_load=args.force_load,
-            gpu_prefill_threshold=300,
-        )
+    # ── Load model with HCS strategy ──
+    import os, json
+    from krasis.config import ModelConfig
 
-        logger.info("Loading model...")
-        _model.load()
+    cfg = ModelConfig.from_model_path(args.model_path)
+    num_layers = cfg.num_hidden_layers
+    num_gpus_available = args.num_gpus or torch.cuda.device_count()
 
-        from krasis.auto_optimise import auto_optimise_or_load
-        # --benchmark always forces fresh auto-optimise (never use cache)
-        force = args.force_optimize or args.benchmark
-        auto_optimise_or_load(_model, force=force)
+    pp_partition = [num_layers]  # PP=1: all layers on primary GPU
+    logger.info("HCS strategy: PP=1, %d GPUs available", num_gpus_available)
 
+    _model = KrasisModel(
+        model_path=args.model_path,
+        pp_partition=pp_partition,
+        num_gpus=num_gpus_available,
+        kv_dtype=kv_dtype,
+        krasis_threads=args.krasis_threads,
+        quant_cfg=quant_cfg,
+        expert_divisor=-3,  # hot_cached_static
+        gguf_path=args.gguf_path,
+        force_load=args.force_load,
+        gpu_prefill_threshold=1,  # GPU decode always on for HCS
+        kv_cache_mb=args.kv_cache_mb,
+    )
+
+    logger.info("Loading model...")
+    _model.load()
+
+    # Resolve heatmap: cached > build
+    cache_dir = os.path.join(args.model_path, ".krasis_cache")
+    heatmap_path = args.heatmap_path
+    if not heatmap_path:
+        heatmap_path = os.path.join(cache_dir, "auto_heatmap.json")
+
+    if not os.path.exists(heatmap_path):
+        logger.info("No heatmap found — building via calibration...")
+        heatmap_path = _build_heatmap(_model, heatmap_path)
     else:
-        # ── Manual strategy: existing behavior ──
-        # Map cache-strategy to expert_divisor
-        expert_divisor = args.expert_divisor
-        if args.cache_strategy:
-            strategy_map = {
-                "active_only": -1,
-                "static_pin": -1,  # active_only + static pinning
-                "weighted_pin": -1,  # active_only + weighted pinning
-                "lru": -2,  # LRU cross-layer caching
-                "hybrid": -2,  # LRU + static pinning
-                "hot_cached_static": -3,  # hot on GPU (static), cold on CPU (parallel)
-                "none": expert_divisor,  # Keep existing divisor
-            }
-            expert_divisor = strategy_map.get(args.cache_strategy, expert_divisor)
-            logger.info("Cache strategy '%s' → expert_divisor=%d", args.cache_strategy, expert_divisor)
+        logger.info("Using cached heatmap: %s", heatmap_path)
 
-        # GPU decode: auto-enable for active_only/static_pin, or respect explicit flag
-        gpu_decode = args.gpu_decode
-        if gpu_decode is None:
-            # Auto-enable for cache strategies that use active-only mode
-            gpu_decode = args.cache_strategy in ("active_only", "static_pin", "weighted_pin", "lru", "hybrid", "hot_cached_static")
+    # CUDA warmup before expert allocation
+    _model.warmup_cuda_runtime()
 
-        gpu_prefill_threshold = args.gpu_prefill_threshold
-        if gpu_decode:
-            gpu_prefill_threshold = 1
-            logger.info("GPU decode enabled: gpu_prefill_threshold=1 (M=1 decode routes through GPU)")
+    # Initialize HCS on all managers
+    for dev_str, manager in _model.gpu_prefill_managers.items():
+        manager._init_hot_cached_static(heatmap_path=heatmap_path)
 
-        _model = KrasisModel(
-            model_path=args.model_path,
-            pp_partition=pp_partition,
-            num_gpus=args.num_gpus,
-            kv_dtype=kv_dtype,
-            krasis_threads=args.krasis_threads,
-            quant_cfg=quant_cfg,
-            expert_divisor=expert_divisor,
-            gguf_path=args.gguf_path,
-            force_load=args.force_load,
-            gpu_prefill_threshold=gpu_prefill_threshold,
-        )
-
-        logger.info("Loading model...")
-        _model.load()
-
-        # Configure expert pinning for static/weighted/hybrid strategies
-        if args.cache_strategy in ("static_pin", "weighted_pin", "hybrid"):
-            strategy = "weighted" if args.cache_strategy == "weighted_pin" else "uniform"
-            for dev_str, manager in _model.gpu_prefill_managers.items():
-                manager.configure_pinning(
-                    budget_mb=0,  # auto-detect from free VRAM
-                    warmup_requests=1,  # Pin after first request
-                    strategy=strategy,
-                )
-            logger.info("Expert pinning configured: strategy=%s", strategy)
-
-        # Initialize hot_cached_static strategy
-        if args.cache_strategy == "hot_cached_static":
-            for dev_str, manager in _model.gpu_prefill_managers.items():
-                manager._init_hot_cached_static(heatmap_path=args.heatmap_path)
-                if args.cuda_graphs:
-                    manager._init_cuda_graphs()
-            logger.info("hot_cached_static initialized (cuda_graphs=%s)", args.cuda_graphs)
+    logger.info("HCS ready")
 
     # Run benchmark if requested (after model load + strategy, before serving)
     if args.benchmark:
