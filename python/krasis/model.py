@@ -628,6 +628,20 @@ class KrasisModel:
             
             torch.cuda.synchronize(device)
 
+        # ── 3. Linear attention torch.compile warmup ──
+        if self.cfg.linear_num_value_heads > 0:
+            try:
+                from krasis.linear_attention import warmup_compiled_chunk_step
+                primary = devices[0]
+                warmup_compiled_chunk_step(
+                    primary,
+                    nv=self.cfg.linear_num_value_heads,
+                    dk=self.cfg.linear_key_head_dim,
+                    dv=self.cfg.linear_value_head_dim,
+                )
+            except Exception as e:
+                logger.warning("Linear attention torch.compile warmup failed: %s", e)
+
         # ── Clean up and measure ──
         gc.collect()
         torch.cuda.empty_cache()
@@ -2024,15 +2038,15 @@ class KrasisModel:
                 "attention_linear": 0.0,
                 "routing": 0.0,
                 "shared_expert": 0.0,
-                "gpu0_forward": 0.0,
-                "gpu1_input_copy": 0.0,
-                "gpu1_forward": 0.0,
-                "gpu1_wait": 0.0,
                 "output_transfer": 0.0,
-                "output_sum": 0.0,
                 "free": 0.0,
                 "layer_total": 0.0,
             }
+            # Per-GPU timing entries
+            for _gi, _mgr in enumerate(all_managers):
+                _ep_times[f"gpu{_gi}_forward"] = 0.0
+                if ep_streams.get(_mgr.device) is not None:
+                    _ep_times[f"gpu{_gi}_input_copy"] = 0.0
             _ep_layer_count = 0
             _ep_dense_count = 0
             _ep_dense_time = 0.0
@@ -2140,10 +2154,10 @@ class KrasisModel:
                     # ── Multi-GPU EP path for MoE layers ──
                     # Split-attention: both GPUs run half-head attention in parallel,
                     # then both GPUs run their expert slices in parallel.
-                    use_split_attn = getattr(self, '_split_attention_active', False)
-                    gpu1_dev = self.all_devices[1]
-                    gpu1_layer = self._device_state[str(gpu1_dev)]["layers"][abs_layer_idx]
-                    attn_stream = ep_streams.get(gpu1_dev)
+                    use_split_attn = getattr(self, '_split_attention_active', False) and len(self.all_devices) >= 2
+                    gpu1_dev = self.all_devices[1] if len(self.all_devices) >= 2 else None
+                    gpu1_layer = self._device_state[str(gpu1_dev)]["layers"][abs_layer_idx] if gpu1_dev is not None else None
+                    attn_stream = ep_streams.get(gpu1_dev) if gpu1_dev is not None else None
 
                     if ep_timing:
                         torch.cuda.synchronize(dev)
@@ -2281,20 +2295,19 @@ class KrasisModel:
 
                     # (d) Routed experts — SERIAL for timing, parallel otherwise
                     if ep_timing:
-                        # GPU 0 forward (serial)
-                        gpu0_out = None
-                        gpu1_out = None
-                        for mgr in all_managers:
+                        # Serial per-GPU forward for accurate timing
+                        partial_outputs = []
+                        for _gi, mgr in enumerate(all_managers):
                             stream = ep_streams.get(mgr.device)
                             if stream is None:
                                 # Primary GPU forward
                                 torch.cuda.synchronize(dev)
-                                _t_g0_0 = time.perf_counter()
-                                gpu0_out = mgr.forward(moe_layer_idx, h, topk_ids, topk_weights,
-                                                       routed_only=True)
+                                _t_fwd0 = time.perf_counter()
+                                out = mgr.forward(moe_layer_idx, h, topk_ids, topk_weights,
+                                                  routed_only=True)
                                 torch.cuda.synchronize(dev)
-                                _t_g0_1 = time.perf_counter()
-                                _ep_times["gpu0_forward"] += _t_g0_1 - _t_g0_0
+                                _ep_times[f"gpu{_gi}_forward"] += time.perf_counter() - _t_fwd0
+                                partial_outputs.append((mgr.device, out))
                             else:
                                 # Secondary GPU: measure input copy separately
                                 _t_copy0 = time.perf_counter()
@@ -2302,34 +2315,31 @@ class KrasisModel:
                                 ids_dev = _to_device(topk_ids, mgr.device)
                                 wts_dev = _to_device(topk_weights, mgr.device)
                                 torch.cuda.synchronize(mgr.device)
-                                _t_copy1 = time.perf_counter()
-                                _ep_times["gpu1_input_copy"] += _t_copy1 - _t_copy0
+                                _ep_times[f"gpu{_gi}_input_copy"] += time.perf_counter() - _t_copy0
 
                                 # Secondary GPU forward
-                                _t_g1_0 = time.perf_counter()
-                                gpu1_out = mgr.forward(moe_layer_idx, h_dev, ids_dev, wts_dev,
-                                                       routed_only=True)
+                                _t_fwd0 = time.perf_counter()
+                                out = mgr.forward(moe_layer_idx, h_dev, ids_dev, wts_dev,
+                                                  routed_only=True)
                                 torch.cuda.synchronize(mgr.device)
-                                _t_g1_1 = time.perf_counter()
-                                _ep_times["gpu1_forward"] += _t_g1_1 - _t_g1_0
+                                _ep_times[f"gpu{_gi}_forward"] += time.perf_counter() - _t_fwd0
+                                partial_outputs.append((mgr.device, out))
 
-                        # Output transfer
+                        # Output transfer + summation
                         torch.cuda.synchronize(dev)
                         _t_xfer0 = time.perf_counter()
-                        if gpu1_out is not None:
-                            gpu1_on_primary = _to_device(gpu1_out, dev)
+                        routed_output = None
+                        for po_device, po_out in partial_outputs:
+                            if po_device == dev:
+                                routed_output = po_out
+                            else:
+                                out_on_primary = _to_device(po_out, dev)
+                                if routed_output is None:
+                                    routed_output = out_on_primary
+                                else:
+                                    routed_output = routed_output + out_on_primary
                         torch.cuda.synchronize(dev)
-                        _t_xfer1 = time.perf_counter()
-                        _ep_times["output_transfer"] += _t_xfer1 - _t_xfer0
-
-                        # Summation
-                        _t_sum0 = time.perf_counter()
-                        routed_output = gpu0_out
-                        if gpu1_out is not None:
-                            routed_output = routed_output + gpu1_on_primary
-                        torch.cuda.synchronize(dev)
-                        _t_sum1 = time.perf_counter()
-                        _ep_times["output_sum"] += _t_sum1 - _t_sum0
+                        _ep_times["output_transfer"] += time.perf_counter() - _t_xfer0
 
                     else:
                         # Normal parallel path (no timing)

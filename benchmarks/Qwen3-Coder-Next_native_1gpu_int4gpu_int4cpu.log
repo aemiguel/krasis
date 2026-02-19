@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-19 09:52:00
+Krasis Benchmark — 2026-02-19 11:28:39
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,10 +7,10 @@ PP Partition:     [48] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            995 GB total, 78.3 GB used by process
-  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 8940 MB allocated
+  RAM:            995 GB total, 79.1 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 9553 MB allocated
   GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3022 MB allocated
-  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3022 MB allocated
 
 Quantization:
   GPU experts:    INT4 (Marlin)
@@ -27,28 +27,28 @@ Strategy:
   Mode:           gpu_decode (hot_cached_static)
 
 Prefill (10000 tokens, 3 runs):
-  Run 1:  811.1 tok/s, TTFT=12.33s
-  Run 2:  812.6 tok/s, TTFT=12.31s
-  Run 3:  812.7 tok/s, TTFT=12.30s
-  Average: 812.1 tok/s, TTFT=12.31s
+  Run 1:  855.0 tok/s, TTFT=11.70s
+  Run 2:  856.3 tok/s, TTFT=11.68s
+  Run 3:  857.0 tok/s, TTFT=11.67s
+  Average: 856.1 tok/s, TTFT=11.68s
 
 Decode (64 tokens, 3 runs):
-  Run 1:  7.81 tok/s (128.0ms/tok)
-  Run 2:  7.81 tok/s (128.0ms/tok)
-  Run 3:  7.84 tok/s (127.5ms/tok)
-  Average: 7.82 tok/s (127.8ms/tok)
+  Run 1:  7.96 tok/s (125.7ms/tok)
+  Run 2:  7.95 tok/s (125.7ms/tok)
+  Run 3:  7.93 tok/s (126.0ms/tok)
+  Average: 7.95 tok/s (125.8ms/tok)
 
 Verification:
   Prefill prompt: user
 Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Describe database transaction isolation levels and their trade-offs. Discuss compiler optimization passes such as dead co... [63136 chars total]
   Decode prompt:  Write a poem about recursion in programming.
   Generated output (64 tokens):
-    **The Recursive Ladder**
+    **The Ladder of Self-Call**  
     
-    A function calls itself—no error, no fall—  
-    A mirror held up to the mind’s own design.  
-    It winds through the logic, a spiral, a call:  
-    *"If base is not met, then recurse—line by line."*  
+    A function stands, both humble, tall,  
+    Within the code, it answers call—  
+    But not to *other* functions, no—  
+    It calls *itself*—and watch it grow.  
     
-    It peels like an
+    > *"Base case first,"* it softly cries,
 ================================================================

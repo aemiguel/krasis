@@ -19,6 +19,7 @@ Ported from HF transformers Qwen3NextGatedDeltaNet — fixes:
 
 import logging
 import math
+import os
 import time
 from typing import Optional, Tuple
 
@@ -30,6 +31,73 @@ from krasis.timing import TIMING
 from krasis.weight_loader import int8_linear
 
 logger = logging.getLogger(__name__)
+
+# Fused linear attention: solve_triangular + torch.compile
+# Disable with KRASIS_FUSED_LINEAR_ATTN=0 to fall back to original Python loops
+_FUSED_LINEAR_ATTN = os.environ.get("KRASIS_FUSED_LINEAR_ATTN", "1") != "0"
+
+# Compiled chunk step (lazily created on first use)
+_compiled_chunk_step = None
+
+
+def _chunk_step(q_i, k_i, v_i, g_i, k_cumd_i, decay_mask_i,
+                mask_strict_upper, state):
+    """Single recurrent chunk step: intra-chunk attention + cross-chunk state update."""
+    attn_intra = (q_i @ k_i.transpose(-1, -2)) * decay_mask_i
+    attn_intra = attn_intra.masked_fill(mask_strict_upper, 0)
+
+    v_prime = k_cumd_i @ state
+    v_new = v_i - v_prime
+
+    attn_inter = (q_i * g_i.unsqueeze(-1).exp()) @ state
+    output = attn_inter + attn_intra @ v_new
+
+    g_last = g_i[:, :, -1]
+    g_last_exp = g_last.unsqueeze(-1).unsqueeze(-1).exp()
+    k_decay = (g_last.unsqueeze(-1) - g_i).exp().unsqueeze(-1)
+    new_state = state * g_last_exp + (k_i * k_decay).transpose(-1, -2) @ v_new
+
+    return output, new_state
+
+
+def _get_chunk_step():
+    """Get the chunk step function (compiled if enabled, eager otherwise)."""
+    global _compiled_chunk_step
+    if not _FUSED_LINEAR_ATTN:
+        return _chunk_step
+    if _compiled_chunk_step is not None:
+        return _compiled_chunk_step
+    try:
+        _compiled_chunk_step = torch.compile(
+            _chunk_step, mode="default", dynamic=False)
+        logger.info("Compiled linear attention chunk step (default/Inductor mode)")
+    except Exception as e:
+        logger.warning("torch.compile failed for chunk step, using eager: %s", e)
+        _compiled_chunk_step = _chunk_step
+    return _compiled_chunk_step
+
+
+def warmup_compiled_chunk_step(device, nv, dk, dv, chunk_size=64):
+    """Warm up torch.compile for the linear attention chunk step function."""
+    if not _FUSED_LINEAR_ATTN:
+        return
+    step_fn = _get_chunk_step()
+    if step_fn is _chunk_step:
+        return  # compilation failed, using eager — no warmup needed
+    try:
+        s = torch.zeros(1, nv, dk, dv, dtype=torch.float32, device=device)
+        q = torch.zeros(1, nv, chunk_size, dk, dtype=torch.float32, device=device)
+        k = torch.zeros(1, nv, chunk_size, dk, dtype=torch.float32, device=device)
+        v = torch.zeros(1, nv, chunk_size, dv, dtype=torch.float32, device=device)
+        g = torch.zeros(1, nv, chunk_size, dtype=torch.float32, device=device)
+        dm = torch.zeros(1, nv, chunk_size, chunk_size, dtype=torch.float32, device=device)
+        m = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=device), diagonal=1)
+        for _ in range(3):
+            step_fn(q, k, v, g, k, dm, m, s)
+        torch.cuda.synchronize(device)
+        logger.info("Linear attention torch.compile warmup complete on %s", device)
+    except Exception as e:
+        logger.warning("Linear attention torch.compile warmup on %s failed: %s", device, e)
 
 
 def _linear(x: torch.Tensor, weight_data) -> torch.Tensor:
@@ -505,6 +573,85 @@ class GatedDeltaNetAttention:
 
         return result
 
+    def _chunked_inner(
+        self,
+        recurrent_state: torch.Tensor,
+        q_c: torch.Tensor,
+        k_c: torch.Tensor,
+        v_beta_c: torch.Tensor,
+        k_beta_c: torch.Tensor,
+        g_c: torch.Tensor,
+        chunk_size: int,
+        num_chunks: int,
+    ) -> tuple:
+        """Nilpotent correction + recurrent chunk loop (shared by all chunked paths).
+
+        Replaces ~600 kernel launches (63-iter nilpotent loop + 16-chunk recurrent loop)
+        with ~18 (2 triangular solves + 16 compiled chunk steps) when fused mode is on.
+
+        Args:
+            recurrent_state: [1, nv, dk, dv] current recurrent state
+            q_c: [1, nv, num_chunks, chunk_size, dk]
+            k_c: [1, nv, num_chunks, chunk_size, dk]
+            v_beta_c: [1, nv, num_chunks, chunk_size, dv] beta-scaled values
+            k_beta_c: [1, nv, num_chunks, chunk_size, dk] beta-scaled keys
+            g_c: [1, nv, num_chunks, chunk_size] gating values
+            chunk_size: size of each chunk (64)
+            num_chunks: number of chunks
+
+        Returns:
+            (core_attn_out, updated_recurrent_state)
+        """
+        device = q_c.device
+
+        mask_upper = torch.triu(
+            torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=device), diagonal=0)
+        mask_strict_upper = torch.triu(
+            torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=device), diagonal=1)
+
+        # Cumulative g for decay within chunks
+        g_cum = g_c.cumsum(dim=-1)
+
+        # Intra-chunk decay matrix
+        decay_mask = (g_cum.unsqueeze(-1) - g_cum.unsqueeze(-2)).tril().exp().tril()
+
+        # Intra-chunk attention matrix (strictly lower triangular, nilpotent)
+        attn = -(k_beta_c @ k_c.transpose(-1, -2)) * decay_mask
+        attn = attn.masked_fill(mask_upper, 0)
+
+        if _FUSED_LINEAR_ATTN:
+            # Solve (I - A) @ x = b via triangular solve (2 cuBLAS calls vs 63-iter loop).
+            # A = attn (strictly lower triangular). (I - A) is unitriangular lower.
+            # Pass -attn with unitriangular=True: diagonal treated as 1, giving I - A.
+            neg_attn = -attn
+            value_corrected = torch.linalg.solve_triangular(
+                neg_attn, v_beta_c, upper=False, unitriangular=True)
+            k_cumdecay = torch.linalg.solve_triangular(
+                neg_attn, k_beta_c * g_cum.exp().unsqueeze(-1),
+                upper=False, unitriangular=True)
+        else:
+            # Original nilpotent correction (resolvent series, 63 iterations)
+            for i in range(1, chunk_size):
+                row = attn[..., i, :i].clone()
+                sub = attn[..., :i, :i].clone()
+                attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+            attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=device)
+            value_corrected = attn @ v_beta_c
+            k_cumdecay = attn @ (k_beta_c * g_cum.exp().unsqueeze(-1))
+
+        # Recurrent chunk loop
+        core_attn_out = torch.zeros_like(value_corrected)
+        step_fn = _get_chunk_step()
+
+        for i in range(num_chunks):
+            output, recurrent_state = step_fn(
+                q_c[:, :, i], k_c[:, :, i], value_corrected[:, :, i],
+                g_cum[:, :, i], k_cumdecay[:, :, i], decay_mask[:, :, i],
+                mask_strict_upper, recurrent_state)
+            core_attn_out[:, :, i] = output
+
+        return core_attn_out, recurrent_state
+
     def _forward_chunked(self, hidden: torch.Tensor) -> torch.Tensor:
         """Chunked prefill: matches HF torch_chunk_gated_delta_rule.
 
@@ -607,61 +754,10 @@ class GatedDeltaNetAttention:
         v_beta_c = v_beta.reshape(1, self.num_v_heads, num_chunks, chunk_size, self.v_head_dim)
         g_c = g_3d.reshape(1, self.num_v_heads, num_chunks, chunk_size)
 
-        # Masks
-        mask_upper = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=self.device), diagonal=0)
-        mask_strict_upper = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=self.device), diagonal=1)
-
-        # Cumulative g for decay within chunks
-        g_cum = g_c.cumsum(dim=-1)  # [1, nv, num_chunks, chunk_size]
-
-        # Intra-chunk decay matrix
-        decay_mask = (g_cum.unsqueeze(-1) - g_cum.unsqueeze(-2)).tril().exp().tril()
-        # [1, nv, num_chunks, chunk_size, chunk_size]
-
-        # Intra-chunk attention matrix (lower triangular)
-        # attn[i,j] = -(k_beta[j] @ k[j]^T) * decay[i,j]
-        attn = -(k_beta_c @ k_c.transpose(-1, -2)) * decay_mask
-        attn = attn.masked_fill(mask_upper, 0)
-
-        # Nilpotent correction (resolvent series)
-        for i in range(1, chunk_size):
-            row = attn[..., i, :i].clone()
-            sub = attn[..., :i, :i].clone()
-            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-
-        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=self.device)
-
-        # Corrected values and keys
-        value_corrected = attn @ v_beta_c
-        k_cumdecay = attn @ (k_beta_c * g_cum.exp().unsqueeze(-1))
-
-        # Initialize output
-        core_attn_out = torch.zeros_like(value_corrected)
-
-        # Process chunks with recurrent state
-        for i in range(num_chunks):
-            q_i = q_c[:, :, i]      # [1, nv, chunk_size, dk]
-            k_i = k_c[:, :, i]      # [1, nv, chunk_size, dk]
-            v_i = value_corrected[:, :, i]  # [1, nv, chunk_size, dv]
-            g_i = g_cum[:, :, i]     # [1, nv, chunk_size]
-
-            # Intra-chunk attention
-            attn_intra = (q_i @ k_i.transpose(-1, -2)) * decay_mask[:, :, i]
-            attn_intra = attn_intra.masked_fill_(mask_strict_upper, 0)
-
-            # Cross-chunk contribution from recurrent state
-            v_prime = k_cumdecay[:, :, i] @ self._recurrent_state  # [1, nv, chunk_size, dv]
-            v_new = v_i - v_prime
-
-            attn_inter = (q_i * g_i.unsqueeze(-1).exp()) @ self._recurrent_state  # [1, nv, chunk_size, dv]
-            core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
-
-            # Update recurrent state
-            g_last = g_i[:, :, -1]  # [1, nv] — cumulative g at end of chunk
-            self._recurrent_state = (
-                self._recurrent_state * g_last.unsqueeze(-1).unsqueeze(-1).exp()
-                + (k_i * (g_last.unsqueeze(-1) - g_i).exp().unsqueeze(-1)).transpose(-1, -2) @ v_new
-            )
+        # Nilpotent correction + recurrent chunk loop (shared implementation)
+        core_attn_out, self._recurrent_state = self._chunked_inner(
+            self._recurrent_state, q_c, k_c, v_beta_c, k_beta_c, g_c,
+            chunk_size, num_chunks)
 
         # Reshape output: [1, nv, num_chunks, chunk_size, dv] → [1, nv, total_len, dv]
         core_attn_out = core_attn_out.reshape(1, self.num_v_heads, -1, self.v_head_dim)
@@ -865,47 +961,9 @@ class GatedDeltaNetAttention:
         v_beta_c = v_beta.reshape(1, nv, num_chunks, chunk_size, self.v_head_dim)
         g_c = g_3d.reshape(1, nv, num_chunks, chunk_size)
 
-        mask_upper = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=self.device), diagonal=0)
-        mask_strict_upper = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=self.device), diagonal=1)
-
-        g_cum = g_c.cumsum(dim=-1)
-        decay_mask = (g_cum.unsqueeze(-1) - g_cum.unsqueeze(-2)).tril().exp().tril()
-
-        attn = -(k_beta_c @ k_c.transpose(-1, -2)) * decay_mask
-        attn = attn.masked_fill(mask_upper, 0)
-
-        for i in range(1, chunk_size):
-            row = attn[..., i, :i].clone()
-            sub = attn[..., :i, :i].clone()
-            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-
-        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=self.device)
-
-        value_corrected = attn @ v_beta_c
-        k_cumdecay = attn @ (k_beta_c * g_cum.exp().unsqueeze(-1))
-
-        core_attn_out = torch.zeros_like(value_corrected)
-
-        for i in range(num_chunks):
-            q_i = q_c[:, :, i]
-            k_i = k_c[:, :, i]
-            v_i = value_corrected[:, :, i]
-            g_i = g_cum[:, :, i]
-
-            attn_intra = (q_i @ k_i.transpose(-1, -2)) * decay_mask[:, :, i]
-            attn_intra = attn_intra.masked_fill_(mask_strict_upper, 0)
-
-            v_prime = k_cumdecay[:, :, i] @ self._prefill_recurrent_state
-            v_new = v_i - v_prime
-
-            attn_inter = (q_i * g_i.unsqueeze(-1).exp()) @ self._prefill_recurrent_state
-            core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
-
-            g_last = g_i[:, :, -1]
-            self._prefill_recurrent_state = (
-                self._prefill_recurrent_state * g_last.unsqueeze(-1).unsqueeze(-1).exp()
-                + (k_i * (g_last.unsqueeze(-1) - g_i).exp().unsqueeze(-1)).transpose(-1, -2) @ v_new
-            )
+        core_attn_out, self._prefill_recurrent_state = self._chunked_inner(
+            self._prefill_recurrent_state, q_c, k_c, v_beta_c, k_beta_c, g_c,
+            chunk_size, num_chunks)
 
         core_attn_out = core_attn_out.reshape(1, nv, -1, self.v_head_dim)
         core_attn_out = core_attn_out[:, :, :M, :]
@@ -1044,47 +1102,9 @@ class GatedDeltaNetAttention:
         v_beta_c = v_beta.reshape(1, self.num_v_heads, num_chunks, chunk_size, self.v_head_dim)
         g_c = g_3d.reshape(1, self.num_v_heads, num_chunks, chunk_size)
 
-        mask_upper = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=self.device), diagonal=0)
-        mask_strict_upper = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=self.device), diagonal=1)
-
-        g_cum = g_c.cumsum(dim=-1)
-        decay_mask = (g_cum.unsqueeze(-1) - g_cum.unsqueeze(-2)).tril().exp().tril()
-
-        attn = -(k_beta_c @ k_c.transpose(-1, -2)) * decay_mask
-        attn = attn.masked_fill(mask_upper, 0)
-
-        for i in range(1, chunk_size):
-            row = attn[..., i, :i].clone()
-            sub = attn[..., :i, :i].clone()
-            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-
-        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=self.device)
-
-        value_corrected = attn @ v_beta_c
-        k_cumdecay = attn @ (k_beta_c * g_cum.exp().unsqueeze(-1))
-
-        core_attn_out = torch.zeros_like(value_corrected)
-
-        for i in range(num_chunks):
-            q_i = q_c[:, :, i]
-            k_i = k_c[:, :, i]
-            v_i = value_corrected[:, :, i]
-            g_i = g_cum[:, :, i]
-
-            attn_intra = (q_i @ k_i.transpose(-1, -2)) * decay_mask[:, :, i]
-            attn_intra = attn_intra.masked_fill_(mask_strict_upper, 0)
-
-            v_prime = k_cumdecay[:, :, i] @ self._recurrent_state
-            v_new = v_i - v_prime
-
-            attn_inter = (q_i * g_i.unsqueeze(-1).exp()) @ self._recurrent_state
-            core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
-
-            g_last = g_i[:, :, -1]
-            self._recurrent_state = (
-                self._recurrent_state * g_last.unsqueeze(-1).unsqueeze(-1).exp()
-                + (k_i * (g_last.unsqueeze(-1) - g_i).exp().unsqueeze(-1)).transpose(-1, -2) @ v_new
-            )
+        core_attn_out, self._recurrent_state = self._chunked_inner(
+            self._recurrent_state, q_c, k_c, v_beta_c, k_beta_c, g_c,
+            chunk_size, num_chunks)
 
         core_attn_out = core_attn_out.reshape(1, self.num_v_heads, -1, self.v_head_dim)
         core_attn_out = core_attn_out[:, :, :M, :]
@@ -1232,47 +1252,9 @@ class GatedDeltaNetAttention:
         v_beta_c = v_beta.reshape(1, self.num_v_heads, num_chunks, chunk_size, self.v_head_dim)
         g_c = g_3d.reshape(1, self.num_v_heads, num_chunks, chunk_size)
 
-        mask_upper = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=self.device), diagonal=0)
-        mask_strict_upper = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=self.device), diagonal=1)
-
-        g_cum = g_c.cumsum(dim=-1)
-        decay_mask = (g_cum.unsqueeze(-1) - g_cum.unsqueeze(-2)).tril().exp().tril()
-
-        attn = -(k_beta_c @ k_c.transpose(-1, -2)) * decay_mask
-        attn = attn.masked_fill(mask_upper, 0)
-
-        for i in range(1, chunk_size):
-            row = attn[..., i, :i].clone()
-            sub = attn[..., :i, :i].clone()
-            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-
-        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=self.device)
-
-        value_corrected = attn @ v_beta_c
-        k_cumdecay = attn @ (k_beta_c * g_cum.exp().unsqueeze(-1))
-
-        core_attn_out = torch.zeros_like(value_corrected)
-
-        for i in range(num_chunks):
-            q_i = q_c[:, :, i]
-            k_i = k_c[:, :, i]
-            v_i = value_corrected[:, :, i]
-            g_i = g_cum[:, :, i]
-
-            attn_intra = (q_i @ k_i.transpose(-1, -2)) * decay_mask[:, :, i]
-            attn_intra = attn_intra.masked_fill_(mask_strict_upper, 0)
-
-            v_prime = k_cumdecay[:, :, i] @ self._recurrent_state
-            v_new = v_i - v_prime
-
-            attn_inter = (q_i * g_i.unsqueeze(-1).exp()) @ self._recurrent_state
-            core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
-
-            g_last = g_i[:, :, -1]
-            self._recurrent_state = (
-                self._recurrent_state * g_last.unsqueeze(-1).unsqueeze(-1).exp()
-                + (k_i * (g_last.unsqueeze(-1) - g_i).exp().unsqueeze(-1)).transpose(-1, -2) @ v_new
-            )
+        core_attn_out, self._recurrent_state = self._chunked_inner(
+            self._recurrent_state, q_c, k_c, v_beta_c, k_beta_c, g_c,
+            chunk_size, num_chunks)
 
         core_attn_out = core_attn_out.reshape(1, self.num_v_heads, -1, self.v_head_dim)
         core_attn_out = core_attn_out[:, :, :M, :]
