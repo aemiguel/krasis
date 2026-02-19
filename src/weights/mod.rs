@@ -260,7 +260,8 @@ impl GgufExpertWeights {
 ///   INT8: [K, N] as i8 packed into u32 — K outer, N contiguous → SIMD across N
 ///
 /// **GPU Marlin format** (`from_expert_weights_marlin`):
-///   INT4: Marlin tile-permuted [K/8, N] → optimized for fused_marlin_moe CUDA kernel
+///   INT4: Marlin tile-permuted [K/16, 2*N] → optimized for fused_marlin_moe CUDA kernel
+///   INT8: Marlin tile-permuted [K/16, 4*N] → optimized for fused_marlin_moe CUDA kernel
 pub struct UnifiedExpertWeights {
     /// w13 (gate+up concatenated): packed data as u32.
     /// CPU INT4: [K/8, 2*N] transposed packed. CPU INT8: [K, 2*N] i8 in u32.
@@ -466,8 +467,16 @@ impl UnifiedExpertWeights {
     /// Convert from separate gate/up/down ExpertWeights to GPU-native Marlin format.
     ///
     /// Combines gate+up into w13 [2*N, K], then Marlin-repacks both w13 and w2.
-    /// Result is GPU-native Marlin INT4: same bytes on disk, in RAM, on GPU.
-    pub fn from_expert_weights_marlin(ew: &ExpertWeights) -> Self {
+    /// Supports both INT4 (gpu_bits=4) and INT8 (gpu_bits=8) Marlin format.
+    pub fn from_expert_weights_marlin(ew: &ExpertWeights, gpu_bits: u8) -> Self {
+        if gpu_bits == 4 {
+            Self::from_expert_weights_marlin_int4(ew)
+        } else {
+            Self::from_expert_weights_marlin_int8(ew)
+        }
+    }
+
+    fn from_expert_weights_marlin_int4(ew: &ExpertWeights) -> Self {
         use crate::weights::marlin::marlin_repack;
 
         let gate = ew.gate.as_int4();
@@ -500,7 +509,6 @@ impl UnifiedExpertWeights {
         // Pad down_proj output dimension if needed for Marlin kernel compatibility
         let padded_hidden = marlin_w2_padded_n(hidden, intermediate);
         let w2 = if padded_hidden != hidden {
-            // Pad down's rows (output dim) from hidden to padded_hidden
             let pad_rows = padded_hidden - hidden;
             let cols_per_row_packed = down.cols / 8;
             let scales_per_row = down.cols / down.group_size;
@@ -530,6 +538,73 @@ impl UnifiedExpertWeights {
             group_size,
             num_bits: 4,
             w2_bits: 4,
+            gate_bias: None,
+            up_bias: None,
+            down_bias: None,
+        }
+    }
+
+    fn from_expert_weights_marlin_int8(ew: &ExpertWeights) -> Self {
+        use crate::weights::marlin::marlin_repack_int8;
+
+        let gate = match &ew.gate { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 gate for Marlin INT8") };
+        let up = match &ew.up { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 up for Marlin INT8") };
+        let down = match &ew.down { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 down for Marlin INT8") };
+
+        let hidden = gate.cols;
+        let intermediate = gate.rows;
+        let group_size = gate.group_size;
+
+        // Combine gate+up into single QuantizedInt8 [2*N, K]
+        let mut combined_data = Vec::with_capacity(gate.data.len() + up.data.len());
+        combined_data.extend_from_slice(&gate.data);
+        combined_data.extend_from_slice(&up.data);
+
+        let mut combined_scales = Vec::with_capacity(gate.scales.len() + up.scales.len());
+        combined_scales.extend_from_slice(&gate.scales);
+        combined_scales.extend_from_slice(&up.scales);
+
+        let combined = QuantizedInt8 {
+            data: combined_data,
+            scales: combined_scales,
+            rows: 2 * intermediate,
+            cols: hidden,
+            group_size,
+        };
+
+        let w13 = marlin_repack_int8(&combined);
+
+        // Pad down_proj output dimension if needed
+        let padded_hidden = marlin_w2_padded_n(hidden, intermediate);
+        let w2 = if padded_hidden != hidden {
+            let pad_rows = padded_hidden - hidden;
+            let scales_per_row = down.cols / down.group_size;
+            let mut padded_data = down.data.clone();
+            padded_data.extend(std::iter::repeat(0i8).take(pad_rows * down.cols));
+            let mut padded_scales = down.scales.clone();
+            padded_scales.extend(std::iter::repeat(0u16).take(pad_rows * scales_per_row));
+            let padded_down = QuantizedInt8 {
+                data: padded_data,
+                scales: padded_scales,
+                rows: padded_hidden,
+                cols: down.cols,
+                group_size: down.group_size,
+            };
+            marlin_repack_int8(&padded_down)
+        } else {
+            marlin_repack_int8(down)
+        };
+
+        UnifiedExpertWeights {
+            w13_packed: w13.packed,
+            w13_scales: w13.scales,
+            w2_packed: w2.packed,
+            w2_scales: w2.scales,
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            group_size,
+            num_bits: 8,
+            w2_bits: 8,
             gate_bias: None,
             up_bias: None,
             down_bias: None,
@@ -796,10 +871,17 @@ fn cache_path(model_dir: &Path, num_bits: u8, group_size: usize) -> PathBuf {
 }
 
 /// Cache file path for v3 Marlin format (GPU-native Marlin INT4).
-fn cache_path_marlin(model_dir: &Path, group_size: usize) -> PathBuf {
-    model_dir
-        .join(".krasis_cache")
-        .join(format!("experts_marlin_g{group_size}.bin"))
+fn cache_path_marlin(model_dir: &Path, group_size: usize, gpu_bits: u8) -> PathBuf {
+    if gpu_bits == 4 {
+        // Backward compatible with existing INT4 caches
+        model_dir
+            .join(".krasis_cache")
+            .join(format!("experts_marlin_g{group_size}.bin"))
+    } else {
+        model_dir
+            .join(".krasis_cache")
+            .join(format!("experts_marlin_{gpu_bits}b_g{group_size}.bin"))
+    }
 }
 
 /// Cache file path for CPU-optimized transposed format (INT4 or INT8).
@@ -832,17 +914,19 @@ pub fn marlin_w2_padded_n(hidden: usize, intermediate: usize) -> usize {
     }
 }
 
-/// Compute per-expert byte sizes for unified format.
+/// Compute per-expert byte sizes for Marlin GPU format.
+/// For INT4: pack_factor=8, packed shape [K/16, 2*N] per tile.
+/// For INT8: pack_factor=4, packed shape [K/16, 4*N] per tile (2x INT4).
 /// Returns (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes).
-fn unified_expert_byte_sizes(config: &ModelConfig, group_size: usize) -> (usize, usize, usize, usize) {
+fn marlin_expert_byte_sizes(config: &ModelConfig, group_size: usize, gpu_bits: u8) -> (usize, usize, usize, usize) {
     let h = config.hidden_size;
     let m = config.moe_intermediate_size;
     let h_w2 = marlin_w2_padded_n(h, m);
-    // w13 (gate+up concat, transposed): [K/8, 2*N] as u32
-    let w13_packed_bytes = (h / 8) * (2 * m) * 4;
+    // Pack divisor: INT4 packs 8 values/u32 (h/8), INT8 packs 4 values/u32 (h/4)
+    let div = if gpu_bits == 4 { 8 } else { 4 };
+    let w13_packed_bytes = (h / div) * (2 * m) * 4;
     let w13_scales_bytes = (h / group_size) * (2 * m) * 2;
-    // w2 (down, transposed): [K_down/8, N_down] as u32 (N may be padded)
-    let w2_packed_bytes = (m / 8) * h_w2 * 4;
+    let w2_packed_bytes = (m / div) * h_w2 * 4;
     let w2_scales_bytes = (m / group_size) * h_w2 * 2;
     (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes)
 }
@@ -960,12 +1044,12 @@ fn expected_cpu_cache_size(
     CACHE_HEADER_SIZE + routed_total + shared_total
 }
 
-/// Expected total v2 unified cache file size.
-fn expected_unified_cache_size(
+/// Expected total Marlin cache file size.
+fn expected_marlin_cache_size(
     config: &ModelConfig, group_size: usize, num_moe_layers: usize,
-    n_shared_experts: usize, shared_intermediate: usize,
+    n_shared_experts: usize, shared_intermediate: usize, gpu_bits: u8,
 ) -> usize {
-    let (w13pb, w13sb, w2pb, w2sb) = unified_expert_byte_sizes(config, group_size);
+    let (w13pb, w13sb, w2pb, w2sb) = marlin_expert_byte_sizes(config, group_size, gpu_bits);
     let per_routed_expert = w13pb + w13sb + w2pb + w2sb;
     let routed_total = num_moe_layers * config.n_routed_experts * per_routed_expert;
 
@@ -973,9 +1057,10 @@ fn expected_unified_cache_size(
     let shared_total = if n_shared_experts > 0 {
         let shared_m = shared_intermediate;
         let h = config.hidden_size;
-        let s_w13p = (h / 8) * (2 * shared_m) * 4;
+        let div = if gpu_bits == 4 { 8 } else { 4 };
+        let s_w13p = (h / div) * (2 * shared_m) * 4;
         let s_w13s = (h / group_size) * (2 * shared_m) * 2;
-        let s_w2p = (shared_m / 8) * h * 4;
+        let s_w2p = (shared_m / div) * h * 4;
         let s_w2s = (shared_m / group_size) * h * 2;
         num_moe_layers * (s_w13p + s_w13s + s_w2p + s_w2s)
     } else {
@@ -1119,16 +1204,16 @@ impl WeightStore {
         let mut gpu_loaded = false;
         for try_gs in &[cache_gs, group_size, 32, 64, 128] {
             if gpu_loaded { break; }
-            let try_path = cache_path_marlin(model_dir, *try_gs);
+            let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits);
             if try_path.exists() {
                 match Self::load_marlin_cache(
                     &try_path, &config, *try_gs, total_moe_layers, config_hash,
-                    moe_start, num_moe_layers,
+                    moe_start, num_moe_layers, gpu_num_bits,
                 ) {
                     Ok(store) => {
                         log::info!(
-                            "Loaded GPU Marlin cache in {:.1}s (gs={}): {} layers, {} experts (+ {} shared)",
-                            start.elapsed().as_secs_f64(), try_gs,
+                            "Loaded GPU Marlin INT{} cache in {:.1}s (gs={}): {} layers, {} experts (+ {} shared)",
+                            gpu_num_bits, start.elapsed().as_secs_f64(), try_gs,
                             num_moe_layers, config.n_routed_experts, store.shared_experts_gpu.len(),
                         );
                         experts_gpu = store.experts_gpu;
@@ -1147,21 +1232,21 @@ impl WeightStore {
 
         // Build Marlin cache if not found
         if !gpu_loaded {
-            let mpath = cache_path_marlin(model_dir, cache_gs);
-            log::info!("No v3 Marlin cache found, building from safetensors...");
+            let mpath = cache_path_marlin(model_dir, cache_gs, gpu_num_bits);
+            log::info!("No Marlin INT{} cache found, building from safetensors...", gpu_num_bits);
             let built_gs = Self::build_marlin_cache_locked(
-                model_dir, &config, group_size, total_moe_layers, &mpath, config_hash,
+                model_dir, &config, group_size, total_moe_layers, &mpath, config_hash, gpu_num_bits,
             )?;
             effective_gs = built_gs;
 
             // Load the just-built cache
             for try_gs in &[built_gs, cache_gs, group_size, 32, 64, 128] {
                 if gpu_loaded { break; }
-                let try_path = cache_path_marlin(model_dir, *try_gs);
+                let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits);
                 if try_path.exists() {
                     match Self::load_marlin_cache(
                         &try_path, &config, *try_gs, total_moe_layers, config_hash,
-                        moe_start, num_moe_layers,
+                        moe_start, num_moe_layers, gpu_num_bits,
                     ) {
                         Ok(store) => {
                             log::info!(
@@ -1753,10 +1838,11 @@ impl WeightStore {
         start_moe_layer: usize,
         cache_path: &Path,
         config_hash: u64,
+        gpu_bits: u8,
     ) -> Result<usize, String> {
         log::info!(
-            "Streaming build MARLIN cache: {} MoE layers from safetensors → {}",
-            num_moe_layers, cache_path.display(),
+            "Streaming build MARLIN cache (INT{}): {} MoE layers from safetensors → {}",
+            gpu_bits, num_moe_layers, cache_path.display(),
         );
         crate::syscheck::log_memory_usage("before streaming_build_marlin_cache");
 
@@ -1831,7 +1917,7 @@ impl WeightStore {
         };
 
         if mxfp4 {
-            log::info!("Detected MXFP4 pre-quantized experts — will dequant to BF16 then quantize to INT4");
+            log::info!("Detected MXFP4 pre-quantized experts — will dequant to BF16 then quantize to INT{gpu_bits}");
         }
 
         // Create cache directory + temp file
@@ -1906,26 +1992,34 @@ impl WeightStore {
             let expert_data: Vec<ExpertWeights> = if mxfp4 {
                 load_mxfp4_layer_experts(
                     layer_idx, &layers_prefix, &index.weight_map, &shards,
-                    config, effective_group_size, 4,
+                    config, effective_group_size, gpu_bits,
                 )?
             } else {
                 let mut data = Vec::with_capacity(config.n_routed_experts);
                 for eidx in 0..config.n_routed_experts {
                     let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
                     let (gate, up, down) = if prequantized {
-                        let g = QuantWeight::Int4(load_prequantized_weight(
-                            &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
-                        )?);
-                        let u = QuantWeight::Int4(load_prequantized_weight(
-                            &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
-                        )?);
-                        let d = QuantWeight::Int4(load_prequantized_weight(
-                            &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
-                        )?);
-                        (g, u, d)
+                        if gpu_bits == 8 {
+                            // Pre-quantized INT4 → need to dequant and re-quantize as INT8
+                            // For now, load BF16 and quantize fresh (fall through to non-prequant path)
+                            load_and_quantize_expert(
+                                &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                            )?
+                        } else {
+                            let g = QuantWeight::Int4(load_prequantized_weight(
+                                &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
+                            )?);
+                            let u = QuantWeight::Int4(load_prequantized_weight(
+                                &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                            )?);
+                            let d = QuantWeight::Int4(load_prequantized_weight(
+                                &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                            )?);
+                            (g, u, d)
+                        }
                     } else {
                         load_and_quantize_expert(
-                            &prefix, &index.weight_map, &shards, effective_group_size, 4,
+                            &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
                         )?
                     };
                     data.push(ExpertWeights { gate, up, down });
@@ -1977,7 +2071,7 @@ impl WeightStore {
             let repack_start = std::time::Instant::now();
             let expert_results: Vec<UnifiedExpertWeights> = expert_data
                 .into_par_iter()
-                .map(|ew| UnifiedExpertWeights::from_expert_weights_marlin(&ew))
+                .map(|ew| UnifiedExpertWeights::from_expert_weights_marlin(&ew, gpu_bits))
                 .collect();
             let repack_elapsed = repack_start.elapsed();
 
@@ -2017,10 +2111,10 @@ impl WeightStore {
                 let layer_idx = moe_idx + config.first_k_dense_replace;
                 let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.shared_experts");
                 let (gate, up, down) = load_and_quantize_expert(
-                    &prefix, &index.weight_map, &shards, effective_group_size, 4,
+                    &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
                 )?;
                 let ew = ExpertWeights { gate, up, down };
-                let marlin = UnifiedExpertWeights::from_expert_weights_marlin(&ew);
+                let marlin = UnifiedExpertWeights::from_expert_weights_marlin(&ew, gpu_bits);
 
                 write_vec_u32(&mut w, &marlin.w13_packed)?;
                 write_vec_u16(&mut w, &marlin.w13_scales)?;
@@ -2064,6 +2158,7 @@ impl WeightStore {
         total_moe_layers: usize,
         cache_path: &Path,
         config_hash: u64,
+        gpu_bits: u8,
     ) -> Result<usize, String> {
         use std::fs::OpenOptions;
 
@@ -2095,14 +2190,14 @@ impl WeightStore {
 
                 let result = Self::streaming_build_marlin_cache(
                     model_dir, config, group_size, total_moe_layers,
-                    0, cache_path, config_hash,
+                    0, cache_path, config_hash, gpu_bits,
                 );
 
                 let _ = std::fs::remove_file(&lock_path);
 
                 match result {
                     Ok(effective_gs) => {
-                        let expected_path = cache_path_marlin(model_dir, effective_gs);
+                        let expected_path = cache_path_marlin(model_dir, effective_gs, gpu_bits);
                         if expected_path != *cache_path {
                             std::fs::rename(cache_path, &expected_path)
                                 .map_err(|e| format!("Failed to rename cache: {e}"))?;
@@ -2123,7 +2218,7 @@ impl WeightStore {
                     std::thread::sleep(std::time::Duration::from_secs(5));
 
                     for try_gs in &[group_size, 32, 64, 128] {
-                        let try_path = cache_path_marlin(model_dir, *try_gs);
+                        let try_path = cache_path_marlin(model_dir, *try_gs, gpu_bits);
                         if try_path.exists() {
                             let waited = wait_start.elapsed();
                             log::info!(
@@ -2165,6 +2260,7 @@ impl WeightStore {
         config_hash: u64,
         start_moe_layer: usize,
         num_layers_to_load: usize,
+        gpu_bits: u8,
     ) -> Result<Self, String> {
         let file = std::fs::File::open(path)
             .map_err(|e| format!("Failed to open Marlin cache: {e}"))?;
@@ -2221,10 +2317,10 @@ impl WeightStore {
             ));
         }
 
-        // Validate file size (byte counts identical to v2 unified)
+        // Validate file size
         let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
-        let expected = expected_unified_cache_size(
-            config, group_size, total_moe_layers, config.n_shared_experts, shared_intermediate,
+        let expected = expected_marlin_cache_size(
+            config, group_size, total_moe_layers, config.n_shared_experts, shared_intermediate, gpu_bits,
         );
         if mmap.len() != expected {
             return Err(format!(
@@ -2248,8 +2344,8 @@ impl WeightStore {
         let h = config.hidden_size;
         let m = config.moe_intermediate_size;
 
-        // Per-expert byte sizes (identical to v2 unified)
-        let (w13pb, w13sb, w2pb, w2sb) = unified_expert_byte_sizes(config, group_size);
+        // Per-expert byte sizes
+        let (w13pb, w13sb, w2pb, w2sb) = marlin_expert_byte_sizes(config, group_size, gpu_bits);
         let per_routed_expert = w13pb + w13sb + w2pb + w2sb;
         let per_routed_layer = config.n_routed_experts * per_routed_expert;
 
@@ -2260,7 +2356,7 @@ impl WeightStore {
         for layer_idx in 0..num_layers_to_load {
             let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
             for _eidx in 0..config.n_routed_experts {
-                layer_experts.push(read_unified_expert(&mmap, &mut offset, h, m, group_size));
+                layer_experts.push(read_marlin_expert(&mmap, &mut offset, h, m, group_size, gpu_bits));
             }
             experts_gpu.push(layer_experts);
 
@@ -2278,10 +2374,11 @@ impl WeightStore {
         if config.n_shared_experts > 0 {
             let routed_total = total_moe_layers * per_routed_layer;
             let shared_m = config.n_shared_experts * config.moe_intermediate_size;
+            let div = if gpu_bits == 4 { 8 } else { 4 };
             let (s_w13pb, s_w13sb, s_w2pb, s_w2sb) = (
-                (h / 8) * (2 * shared_m) * 4,
+                (h / div) * (2 * shared_m) * 4,
                 (h / group_size) * (2 * shared_m) * 2,
-                (shared_m / 8) * h * 4,
+                (shared_m / div) * h * 4,
                 (shared_m / group_size) * h * 2,
             );
             let per_shared = s_w13pb + s_w13sb + s_w2pb + s_w2sb;
@@ -2291,7 +2388,7 @@ impl WeightStore {
 
             for _i in 0..num_layers_to_load {
                 shared_experts_gpu.push(
-                    read_unified_expert(&mmap, &mut offset, h, shared_m, group_size),
+                    read_marlin_expert(&mmap, &mut offset, h, shared_m, group_size, gpu_bits),
                 );
             }
             log::info!("  Loaded {} shared experts (Marlin)", num_layers_to_load);
@@ -2322,8 +2419,8 @@ impl WeightStore {
             shared_experts_gguf: Vec::new(),
             config: config.clone(),
             group_size,
-            cpu_num_bits: 4,
-            gpu_num_bits: 4,
+            cpu_num_bits: gpu_bits, // Will be overridden by caller
+            gpu_num_bits: gpu_bits,
         })
     }
 
@@ -3087,16 +3184,16 @@ impl WeightStore {
         // Try loading existing Marlin cache
         for try_gs in &[cache_gs, group_size, 32, 64, 128] {
             if gpu_loaded { break; }
-            let try_path = cache_path_marlin(model_dir, *try_gs);
+            let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits);
             if try_path.exists() {
                 match Self::load_marlin_cache(
                     &try_path, &config, *try_gs, total_moe_layers, config_hash,
-                    moe_start, num_moe_layers,
+                    moe_start, num_moe_layers, gpu_num_bits,
                 ) {
                     Ok(store) => {
                         log::info!(
-                            "Loaded GPU Marlin cache in {:.1}s (gs={})",
-                            start.elapsed().as_secs_f64(), try_gs,
+                            "Loaded GPU Marlin INT{} cache in {:.1}s (gs={})",
+                            gpu_num_bits, start.elapsed().as_secs_f64(), try_gs,
                         );
                         experts_gpu = store.experts_gpu;
                         shared_experts_gpu = store.shared_experts_gpu;
@@ -3114,20 +3211,20 @@ impl WeightStore {
 
         // Build Marlin cache if not found
         if !gpu_loaded {
-            let mpath = cache_path_marlin(model_dir, cache_gs);
-            log::info!("No Marlin cache found, building from safetensors...");
+            let mpath = cache_path_marlin(model_dir, cache_gs, gpu_num_bits);
+            log::info!("No Marlin INT{} cache found, building from safetensors...", gpu_num_bits);
             let built_gs = Self::build_marlin_cache_locked(
-                model_dir, &config, group_size, total_moe_layers, &mpath, config_hash,
+                model_dir, &config, group_size, total_moe_layers, &mpath, config_hash, gpu_num_bits,
             )?;
             effective_gs = built_gs;
 
             for try_gs in &[built_gs, cache_gs, group_size, 32, 64, 128] {
                 if gpu_loaded { break; }
-                let try_path = cache_path_marlin(model_dir, *try_gs);
+                let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits);
                 if try_path.exists() {
                     if let Ok(store) = Self::load_marlin_cache(
                         &try_path, &config, *try_gs, total_moe_layers, config_hash,
-                        moe_start, num_moe_layers,
+                        moe_start, num_moe_layers, gpu_num_bits,
                     ) {
                         experts_gpu = store.experts_gpu;
                         shared_experts_gpu = store.shared_experts_gpu;
@@ -4006,21 +4103,24 @@ fn write_vec_u16<W: Write>(w: &mut W, data: &[u16]) -> Result<(), String> {
     w.write_all(bytes).map_err(|e| format!("Write u16 error: {e}"))
 }
 
-/// Read a UnifiedExpertWeights from mmap'd cache data at the given offset.
-fn read_unified_expert(
+/// Read a UnifiedExpertWeights from mmap'd Marlin cache data at the given offset.
+/// `gpu_bits` determines pack factor: INT4=8 values/u32, INT8=4 values/u32.
+fn read_marlin_expert(
     data: &[u8],
     offset: &mut usize,
     hidden_size: usize,
     intermediate_size: usize,
     group_size: usize,
+    gpu_bits: u8,
 ) -> UnifiedExpertWeights {
     let h = hidden_size;
     let m = intermediate_size;
-    let packed_k = h / 8;
+    let div = if gpu_bits == 4 { 8 } else { 4 }; // pack divisor
+    let packed_k = h / div;
     let num_groups = h / group_size;
     let two_n = 2 * m;
 
-    // w13_packed: [K/8, 2*N] as u32
+    // w13_packed: [K/div, 2*N] as u32
     let w13_packed_count = packed_k * two_n;
     let mut w13_packed = vec![0u32; w13_packed_count];
     unsafe {
@@ -4044,9 +4144,9 @@ fn read_unified_expert(
     }
     *offset += w13_scales_count * 2;
 
-    // w2_packed: [K_down/8, N_down] as u32 — N_down may be padded for Marlin kernel compat
+    // w2_packed: [K_down/div, N_down] as u32 — N_down may be padded for Marlin kernel compat
     let h_w2 = marlin_w2_padded_n(h, m);
-    let down_packed_k = m / 8;
+    let down_packed_k = m / div;
     let w2_packed_count = down_packed_k * h_w2;
     let mut w2_packed = vec![0u32; w2_packed_count];
     unsafe {
@@ -4079,8 +4179,8 @@ fn read_unified_expert(
         hidden_size,
         intermediate_size,
         group_size,
-        num_bits: 4, // Marlin cache is always INT4
-        w2_bits: 4,
+        num_bits: gpu_bits,
+        w2_bits: gpu_bits,
         gate_bias: None,
         up_bias: None,
         down_bias: None,
@@ -4928,14 +5028,14 @@ mod tests {
             .expect("Failed to load V2-Lite");
 
         // Verify Marlin cache file exists (v3 format)
-        let mpath = cache_path_marlin(model_dir, store.group_size);
+        let mpath = cache_path_marlin(model_dir, store.group_size, 4);
         assert!(mpath.exists(), "Marlin cache file should exist after load");
 
         let size = std::fs::metadata(&mpath).unwrap().len();
         let shared_intermediate = store.config.n_shared_experts * store.config.moe_intermediate_size;
-        let expected = expected_unified_cache_size(
+        let expected = expected_marlin_cache_size(
             &store.config, store.group_size, store.num_moe_layers(),
-            store.config.n_shared_experts, shared_intermediate,
+            store.config.n_shared_experts, shared_intermediate, 4,
         );
         assert_eq!(size as usize, expected, "Marlin cache file size mismatch");
 

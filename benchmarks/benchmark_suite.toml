@@ -52,14 +52,14 @@ gguf_name = "DeepSeek-V2-Lite-GGUF"
 name = "Qwen3-Coder-Next"
 
 [[model]]
-name = "Qwen3-235B-A22B"
-gguf_name = "Qwen3-235B-A22B-GGUF"
-
-[[model]]
 name = "gpt-oss-120b"
 
 [[model]]
 name = "GLM-4.7"
+
+[[model]]
+name = "Qwen3-235B-A22B"
+gguf_name = "Qwen3-235B-A22B-GGUF"
 
 # Native model with GGUF for CPU experts (searches ~/.krasis/models/ subdirs):
 # [[model]]

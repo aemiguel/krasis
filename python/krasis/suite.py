@@ -79,18 +79,25 @@ class SuiteRunner:
 
     def __init__(self, config_path: str, output_dir: str = ""):
         self.config_path = config_path
+        self.repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)
+        )))
         if not output_dir:
-            # Default: benchmarks/suite_logs/ relative to repo root
-            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__)
-            )))
-            output_dir = os.path.join(repo_root, "benchmarks", "suite_logs")
+            output_dir = os.path.join(self.repo_root, "benchmarks", "suite_logs")
         self.output_dir = output_dir
         self.krasis_home = os.environ.get(
             "KRASIS_HOME",
             os.path.join(os.path.expanduser("~"), ".krasis"),
         )
         self.models_dir = os.path.join(self.krasis_home, "models")
+        self.python = self._find_python()
+
+    def _find_python(self) -> str:
+        """Find the correct python binary — prefer the repo venv."""
+        venv_python = os.path.join(self.repo_root, ".venv", "bin", "python3")
+        if os.path.isfile(venv_python):
+            return venv_python
+        return sys.executable
 
     def _find_gguf(self, name: str) -> str:
         """Find a GGUF by name under ~/.krasis/models/.
@@ -179,7 +186,7 @@ class SuiteRunner:
     def _build_cmd(self, combo: SuiteCombo) -> List[str]:
         """Build the subprocess command for one combo."""
         cmd = [
-            sys.executable, "-m", "krasis.server",
+            self.python, "-m", "krasis.server",
             "--model-path", combo.model_path,
             "--num-gpus", str(combo.num_gpus),
             "--benchmark",
@@ -300,12 +307,35 @@ class SuiteRunner:
 
         return result
 
+    def _clean_old_logs(self) -> int:
+        """Delete old log and summary files from the output directory.
+
+        Returns the number of files deleted.
+        """
+        if not os.path.isdir(self.output_dir):
+            return 0
+        count = 0
+        for f in os.listdir(self.output_dir):
+            if f.endswith(".log") or f.startswith("suite_summary_"):
+                path = os.path.join(self.output_dir, f)
+                try:
+                    os.remove(path)
+                    count += 1
+                except OSError:
+                    pass
+        return count
+
     def run_all(self) -> List[SuiteResult]:
         """Run all combos sequentially, skipping on failure."""
         combos = self.load_config()
         if not combos:
             print(f"{RED}No valid model × config combinations found.{NC}")
             return []
+
+        # Clean old logs before starting
+        cleaned = self._clean_old_logs()
+        if cleaned:
+            print(f"{DIM}Cleaned {cleaned} old log/summary files from {self.output_dir}{NC}")
 
         total = len(combos)
         print(f"\n{BOLD}Krasis Benchmark Suite{NC}")

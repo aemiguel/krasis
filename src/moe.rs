@@ -1097,7 +1097,7 @@ impl KrasisEngine {
     /// Runs startup system checks (CPU governor, hugepages, memory budget).
     ///
     /// `cpu_num_bits`: 4 or 8, quantization for CPU decode experts. Default: 4.
-    /// `gpu_num_bits`: 4 (Marlin INT4 for GPU prefill). Default: 4.
+    /// `gpu_num_bits`: 4 or 8 (Marlin INT4/INT8 for GPU prefill). Default: 4.
     /// `num_bits`: Legacy param — sets cpu_num_bits (backward compat).
     /// `gguf_path`: If set, load CPU expert weights from this GGUF file instead of
     ///              building from safetensors. GPU Marlin cache still from safetensors.
@@ -1112,9 +1112,9 @@ impl KrasisEngine {
                 format!("cpu_num_bits must be 4 or 8, got {cpu_bits}")
             ));
         }
-        if gpu_bits != 4 {
+        if gpu_bits != 4 && gpu_bits != 8 {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("gpu_num_bits must be 4 (Marlin), got {gpu_bits}")
+                format!("gpu_num_bits must be 4 or 8 (Marlin), got {gpu_bits}")
             ));
         }
         let bits = cpu_bits; // For backward-compat logging and memory estimation
@@ -2978,7 +2978,7 @@ mod tests {
             down: QuantWeight::Int4(quantize_int4(&down_bf16, hidden, intermediate, group_size)),
         };
 
-        let marlin = UnifiedExpertWeights::from_expert_weights_marlin(&expert);
+        let marlin = UnifiedExpertWeights::from_expert_weights_marlin(&expert, 4);
 
         // Synthetic activation
         let mut activation = vec![0u16; hidden];

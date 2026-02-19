@@ -1,11 +1,11 @@
-//! Marlin INT4 format conversion and handling.
+//! Marlin INT4/INT8 format conversion and handling.
 //!
-//! Converts HF model weights (BF16) to INT4 packed format.
+//! Converts HF model weights (BF16) to INT4/INT8 packed Marlin format.
 //! Two stages:
-//!   1. quantize_int4() — symmetric INT4 quantization + packing (CPU-friendly layout)
-//!   2. marlin_repack() — permute for GPU warp coalescing (added later)
+//!   1. quantize_int4()/quantize_int8() — symmetric quantization + packing (CPU-friendly layout)
+//!   2. marlin_repack()/marlin_repack_int8() — permute for GPU warp coalescing
 //!
-//! The CPU reads the packed INT4 + BF16 scales directly.
+//! The CPU reads the packed INT4/INT8 + BF16 scales directly.
 //! The GPU applies marlin_repack on-the-fly per layer during prefill.
 
 /// Default quantization group size.
@@ -576,6 +576,271 @@ pub fn dequantize_marlin(m: &MarlinRepacked) -> Vec<f32> {
     output
 }
 
+/// Number of INT8 values packed per u32 for Marlin INT8 format.
+const PACK_FACTOR_INT8: usize = 4;
+
+/// Generate the Marlin weight permutation table for INT8.
+///
+/// Returns a 1024-element array mapping destination → source index within a
+/// 16×64 tile. Matches vLLM's `get_weight_perm(num_bits=8)`.
+/// Same base permutation as INT4, but with INT8 interleave pattern [0, 2, 1, 3].
+pub fn generate_weight_perm_int8() -> [usize; 1024] {
+    let mut perm = [0usize; 1024];
+    let mut idx = 0;
+
+    for i in 0..32 {
+        let col = i / 4;
+        let mut perm1 = [0usize; 8];
+        let mut p1_idx = 0;
+
+        for block in 0..2 {
+            for &row in &[
+                2 * (i % 4),
+                2 * (i % 4) + 1,
+                2 * (i % 4 + 4),
+                2 * (i % 4 + 4) + 1,
+            ] {
+                perm1[p1_idx] = 16 * row + col + 8 * block;
+                p1_idx += 1;
+            }
+        }
+
+        for j in 0..4 {
+            for &p in &perm1 {
+                perm[idx] = p + 256 * j;
+                idx += 1;
+            }
+        }
+    }
+
+    // Apply INT8 interleaving: [0, 2, 1, 3] (groups of 4, not 8)
+    let interleave = [0, 2, 1, 3];
+    let mut result = [0usize; 1024];
+    for group in 0..(1024 / 4) {
+        for (dest, &src) in interleave.iter().enumerate() {
+            result[group * 4 + dest] = perm[group * 4 + src];
+        }
+    }
+
+    result
+}
+
+/// Repack a QuantizedInt8 into Marlin GPU INT8 format.
+///
+/// Follows the same structure as INT4 marlin_repack but with:
+/// - 4 values packed per u32 (not 8)
+/// - INT8 weight permutation (interleave [0,2,1,3])
+/// - Unsigned offset: q + 128 (not q + 8)
+///
+/// Our format: data `[N, K]` as i8, scales `[N, K/group_size]` as BF16
+/// Marlin format: packed `[K/16, 4*N]` as u32, scales `[K/group_size, N]` as BF16
+///
+/// N = rows (output dim), K = cols (input dim) of the original weight matrix.
+pub fn marlin_repack_int8(q: &QuantizedInt8) -> MarlinRepacked {
+    let n = q.rows;
+    let k = q.cols;
+    let group_size = q.group_size;
+    let t0 = std::time::Instant::now();
+
+    assert!(k % MARLIN_TILE == 0, "K ({k}) must be divisible by {MARLIN_TILE}");
+    assert!(n % 64 == 0, "N ({n}) must be divisible by 64 (Marlin tile constraint)");
+
+    // Step 1: Convert signed i8 → unsigned u8 [N, K] (q + 128)
+    let mut unsigned = vec![0u8; n * k];
+    for i in 0..q.data.len() {
+        unsigned[i] = (q.data[i] as i16 + 128) as u8;
+    }
+
+    let t1 = t0.elapsed();
+
+    // Step 2+3 fused: tile permute reading from [N, K] with transposed indexing
+    let k_tiles = k / MARLIN_TILE;
+    let n_tiles = n / MARLIN_TILE;
+    let row_len = n * MARLIN_TILE;
+
+    let mut permuted = vec![0u8; k_tiles * row_len];
+
+    for kt in 0..k_tiles {
+        for nt in 0..n_tiles {
+            for tk in 0..MARLIN_TILE {
+                for tn in 0..MARLIN_TILE {
+                    let src_k = kt * MARLIN_TILE + tk;
+                    let src_n = nt * MARLIN_TILE + tn;
+                    let dst_col = nt * MARLIN_TILE * MARLIN_TILE + tk * MARLIN_TILE + tn;
+                    permuted[kt * row_len + dst_col] = unsigned[src_n * k + src_k];
+                }
+            }
+        }
+    }
+
+    // Apply INT8 weight permutation to chunks of 1024
+    let perm = generate_weight_perm_int8();
+    let num_chunks = row_len / 1024;
+    let mut perm_applied = vec![0u8; k_tiles * row_len];
+
+    for kt in 0..k_tiles {
+        for chunk in 0..num_chunks {
+            let base = kt * row_len + chunk * 1024;
+            for i in 0..1024 {
+                perm_applied[base + i] = permuted[base + perm[i]];
+            }
+        }
+    }
+
+    let t3 = t0.elapsed();
+
+    // Step 4: Pack 4 unsigned bytes per u32
+    let out_cols = row_len / PACK_FACTOR_INT8; // = 4*N
+    let mut out_packed = vec![0u32; k_tiles * out_cols];
+
+    for row in 0..k_tiles {
+        for col in 0..out_cols {
+            let mut word: u32 = 0;
+            for i in 0..PACK_FACTOR_INT8 {
+                let src_col = col * PACK_FACTOR_INT8 + i;
+                let val = perm_applied[row * row_len + src_col] as u32;
+                word |= val << (i as u32 * 8);
+            }
+            out_packed[row * out_cols + col] = word;
+        }
+    }
+
+    let t4 = t0.elapsed();
+
+    // Step 5: Transpose scales [N, K/gs] → [K/gs, N]
+    let num_groups_k = k / group_size;
+    let mut scales_transposed = vec![0u16; num_groups_k * n];
+    for row in 0..n {
+        for g in 0..num_groups_k {
+            scales_transposed[g * n + row] = q.scales[row * num_groups_k + g];
+        }
+    }
+
+    // Step 6: Apply scale permutation (same as INT4)
+    let (scale_perm, scale_perm_single) = generate_scale_perms();
+    let is_grouped = group_size < k;
+    let sperm: &[usize] = if is_grouped { &scale_perm } else { &scale_perm_single };
+    let perm_len = sperm.len();
+    let total_scale_vals = num_groups_k * n;
+    let num_scale_chunks = total_scale_vals / perm_len;
+
+    let mut scales_permuted = vec![0u16; total_scale_vals];
+    for chunk in 0..num_scale_chunks {
+        let base = chunk * perm_len;
+        for i in 0..perm_len {
+            scales_permuted[base + i] = scales_transposed[base + sperm[i]];
+        }
+    }
+
+    let t6 = t0.elapsed();
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static REPACK_INT8_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let count = REPACK_INT8_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 5 || count % 384 == 0 {
+        log::info!(
+            "marlin_repack_int8 [{n}×{k}] total={:.1}ms: convert={:.1} tile+perm={:.1} pack={:.1} scales={:.1}ms",
+            t6.as_secs_f64() * 1000.0,
+            t1.as_secs_f64() * 1000.0,
+            (t3 - t1).as_secs_f64() * 1000.0,
+            (t4 - t3).as_secs_f64() * 1000.0,
+            (t6 - t4).as_secs_f64() * 1000.0,
+        );
+    }
+
+    MarlinRepacked {
+        packed: out_packed,
+        scales: scales_permuted,
+        k,
+        n,
+        group_size,
+    }
+}
+
+/// Dequantize Marlin-repacked INT8 weights back to f32 for verification.
+///
+/// Reverses the INT8 permutation and packing to recover the original [N, K] f32 values.
+pub fn dequantize_marlin_int8(m: &MarlinRepacked) -> Vec<f32> {
+    let k = m.k;
+    let n = m.n;
+    let group_size = m.group_size;
+    let k_tiles = k / MARLIN_TILE;
+    let row_len = n * MARLIN_TILE;
+    let out_cols = row_len / PACK_FACTOR_INT8;
+    let num_groups_k = k / group_size;
+
+    // Step 1: Unpack [K/16, 4*N] → [K/16, N*16] unsigned values
+    let mut perm_applied = vec![0u8; k_tiles * row_len];
+    for row in 0..k_tiles {
+        for col in 0..out_cols {
+            let word = m.packed[row * out_cols + col];
+            for i in 0..PACK_FACTOR_INT8 {
+                perm_applied[row * row_len + col * PACK_FACTOR_INT8 + i] =
+                    ((word >> (i as u32 * 8)) & 0xFF) as u8;
+            }
+        }
+    }
+
+    // Step 2: Invert weight permutation
+    let perm = generate_weight_perm_int8();
+    let num_chunks = row_len / 1024;
+    let mut permuted = vec![0u8; k_tiles * row_len];
+    for kt in 0..k_tiles {
+        for chunk in 0..num_chunks {
+            let base = kt * row_len + chunk * 1024;
+            for i in 0..1024 {
+                permuted[base + perm[i]] = perm_applied[base + i];
+            }
+        }
+    }
+
+    // Step 3: Invert tile transpose → [K, N] values
+    let n_tiles = n / MARLIN_TILE;
+    let mut transposed = vec![0u8; k * n];
+    for kt in 0..k_tiles {
+        for nt in 0..n_tiles {
+            for tk in 0..MARLIN_TILE {
+                for tn in 0..MARLIN_TILE {
+                    let src_k = kt * MARLIN_TILE + tk;
+                    let src_n = nt * MARLIN_TILE + tn;
+                    let permuted_col = nt * MARLIN_TILE * MARLIN_TILE + tk * MARLIN_TILE + tn;
+                    transposed[src_k * n + src_n] = permuted[kt * row_len + permuted_col];
+                }
+            }
+        }
+    }
+
+    // Step 4: Invert scale permutation
+    let (scale_perm, scale_perm_single) = generate_scale_perms();
+    let is_grouped = group_size < k;
+    let sperm: &[usize] = if is_grouped { &scale_perm } else { &scale_perm_single };
+    let perm_len = sperm.len();
+    let total_scale_vals = num_groups_k * n;
+    let num_scale_chunks = total_scale_vals / perm_len;
+
+    let mut scales_transposed = vec![0u16; total_scale_vals];
+    for chunk in 0..num_scale_chunks {
+        let base = chunk * perm_len;
+        for i in 0..perm_len {
+            scales_transposed[base + sperm[i]] = m.scales[base + i];
+        }
+    }
+
+    // Step 5: Transpose [K, N] → [N, K] and dequantize
+    let mut output = vec![0.0f32; n * k];
+    for ki in 0..k {
+        for ni in 0..n {
+            let u8_val = transposed[ki * n + ni];
+            let q_val = (u8_val as i16) - 128; // back to signed [-128, 127]
+            let group_idx = ki / group_size;
+            let scale = bf16_to_f32(scales_transposed[group_idx * n + ni]);
+            output[ni * k + ki] = q_val as f32 * scale;
+        }
+    }
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,6 +1051,109 @@ mod tests {
         assert!(
             max_diff == 0.0,
             "Marlin repack changed values! max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_weight_perm_int8_properties() {
+        let perm = generate_weight_perm_int8();
+
+        // Must be a valid permutation of 0..1024
+        let mut sorted = perm.to_vec();
+        sorted.sort();
+        for (i, &v) in sorted.iter().enumerate() {
+            assert_eq!(v, i, "INT8 perm: not a valid permutation, missing index {i}");
+        }
+        eprintln!("INT8 weight perm: valid permutation of 0..1024 ✓");
+    }
+
+    #[test]
+    fn test_marlin_repack_int8_roundtrip_synthetic() {
+        // 64 rows (N), 128 cols (K) — Marlin requires N % 64 == 0
+        let n = 64;
+        let k = 128;
+        let group_size = 128;
+
+        let mut weight_bf16 = vec![0u16; n * k];
+        for i in 0..weight_bf16.len() {
+            let val = ((i as f32 / weight_bf16.len() as f32) - 0.5) * 0.2;
+            weight_bf16[i] = f32_to_bf16(val);
+        }
+
+        // Quantize to INT8
+        let q = quantize_int8(&weight_bf16, n, k, group_size);
+
+        // Dequantize via our format (baseline)
+        let deq_ours = dequantize_int8(&q);
+
+        // Repack to Marlin INT8, then dequantize
+        let m = marlin_repack_int8(&q);
+
+        // INT8 output shape: [K/16, 4*N]
+        assert_eq!(m.packed.len(), (k / 16) * (4 * n));
+        assert_eq!(m.scales.len(), (k / group_size) * n);
+
+        let deq_marlin = dequantize_marlin_int8(&m);
+
+        // Both dequantizations should produce identical results
+        let mut max_diff: f32 = 0.0;
+        for i in 0..(n * k) {
+            let diff = (deq_ours[i] - deq_marlin[i]).abs();
+            max_diff = max_diff.max(diff);
+        }
+
+        eprintln!(
+            "Marlin INT8 repack roundtrip {n}×{k}: max_diff={max_diff:.8} (should be 0.0)"
+        );
+        assert!(
+            max_diff == 0.0,
+            "Marlin INT8 repack changed values! max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_marlin_repack_int8_v2_lite() {
+        let path = Path::new("/home/main/Documents/Claude/hf-models/DeepSeek-V2-Lite/model-00001-of-000004.safetensors");
+        if !path.exists() {
+            eprintln!("Skipping — V2-Lite not downloaded");
+            return;
+        }
+
+        let st = MmapSafetensors::open(path).expect("Failed to open");
+        let gate_name = "model.layers.1.mlp.experts.0.gate_proj.weight";
+        let info = st.tensor_info(gate_name).expect("Not found");
+        let bf16_data: &[u16] = st.tensor_as_slice(gate_name).expect("Failed to read");
+
+        let n = info.shape[0]; // 1408
+        let k = info.shape[1]; // 2048
+
+        let q = quantize_int8(bf16_data, n, k, DEFAULT_GROUP_SIZE);
+        let deq_ours = dequantize_int8(&q);
+
+        let m = marlin_repack_int8(&q);
+
+        eprintln!(
+            "V2-Lite gate_proj Marlin INT8 repack: packed [{}, {}] ({} KB), scales [{}, {}] ({} KB)",
+            k / 16,
+            4 * n,
+            m.packed.len() * 4 / 1024,
+            k / DEFAULT_GROUP_SIZE,
+            n,
+            m.scales.len() * 2 / 1024,
+        );
+
+        let deq_marlin = dequantize_marlin_int8(&m);
+
+        let mut max_diff: f32 = 0.0;
+        for i in 0..(n * k) {
+            let diff = (deq_ours[i] - deq_marlin[i]).abs();
+            max_diff = max_diff.max(diff);
+        }
+
+        eprintln!("  INT8 round-trip max_diff: {max_diff:.8}");
+        assert!(
+            max_diff == 0.0,
+            "Marlin INT8 repack changed values! max_diff={max_diff}"
         );
     }
 }
