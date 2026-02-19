@@ -37,7 +37,6 @@ class KrasisBenchmark:
             log_path = os.path.join(repo_root, "benchmark_results.log")
         self.log_path = log_path
 
-        self.prefill_tokens = 10000
         self.decode_tokens = 64
         self.n_runs = 3
 
@@ -210,32 +209,25 @@ class KrasisBenchmark:
     # Prompt building
     # ──────────────────────────────────────────────────────────
 
-    def _make_prompt(self, target_tokens: int) -> List[int]:
-        """Generate a chat prompt of approximately target_tokens length."""
-        sections = [
-            "Explain distributed consensus algorithms including Paxos, Raft, and PBFT. ",
-            "Describe database transaction isolation levels and their trade-offs. ",
-            "Discuss compiler optimization passes such as dead code elimination and loop unrolling. ",
-            "Explain the CAP theorem and its practical implications for system design. ",
-            "Describe memory management strategies in operating systems including paging and segmentation. ",
-            "Discuss the principles of functional programming and category theory. ",
-            "Explain how neural network backpropagation works with gradient descent. ",
-            "Describe the architecture of modern CPUs including pipelining and branch prediction. ",
-            "Discuss cryptographic primitives including AES, RSA, and elliptic curve cryptography. ",
-            "Explain container orchestration with Kubernetes including pods, services, and deployments. ",
-        ]
-        content = ""
-        while True:
-            for section in sections:
-                content += section
-            messages = [{"role": "user", "content": content}]
-            tokens = self.model.tokenizer.apply_chat_template(messages)
-            if len(tokens) >= target_tokens:
-                return tokens[:target_tokens]
+    def _load_prompt_file(self, filename: str) -> str:
+        """Load a prompt from benchmarks/<filename>."""
+        benchmarks_dir = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)
+        )))
+        prompt_path = os.path.join(benchmarks_dir, "benchmarks", filename)
+        with open(prompt_path) as f:
+            return f.read().strip()
+
+    def _make_prompt(self) -> List[int]:
+        """Load prefill prompt from file and tokenize."""
+        content = self._load_prompt_file("prefill_prompt_20k")
+        messages = [{"role": "user", "content": content}]
+        return self.model.tokenizer.apply_chat_template(messages)
 
     def _make_short_prompt(self) -> List[int]:
-        """Generate a short chat prompt for decode testing."""
-        messages = [{"role": "user", "content": "Write a poem about recursion in programming."}]
+        """Load decode prompt from file and tokenize."""
+        content = self._load_prompt_file("decode_prompt")
+        messages = [{"role": "user", "content": content}]
         return self.model.tokenizer.apply_chat_template(messages)
 
     # ──────────────────────────────────────────────────────────
@@ -432,17 +424,17 @@ class KrasisBenchmark:
         )))
         benchmarks_dir = os.path.join(repo_root, "benchmarks")
 
-        # Build filename: <model>_<source>_<Ngpu>_<gpu_quant>_<cpu_quant>.log
+        # Build filename: <model>_<gguf>_<N>gpu_int<X>gpu_int<Y>cpu.log
         model_name = model_info["model_name"]
         gguf_path = getattr(self.model, "gguf_path", None)
         if gguf_path:
-            source = os.path.splitext(os.path.basename(gguf_path))[0]
+            gguf_name = os.path.splitext(os.path.basename(gguf_path))[0]
         else:
-            source = "native"
+            gguf_name = "native"
         num_gpus = len(model_info["pp_partition"])
         gpu_quant = f"int{model_info['gpu_expert_bits']}gpu"
         cpu_quant = f"int{model_info['cpu_expert_bits']}cpu"
-        filename = f"{model_name}_{source}_{num_gpus}gpu_{gpu_quant}_{cpu_quant}.log"
+        filename = f"{model_name}_{gguf_name}_{num_gpus}gpu_{gpu_quant}_{cpu_quant}.log"
 
         try:
             os.makedirs(benchmarks_dir, exist_ok=True)
@@ -475,7 +467,7 @@ class KrasisBenchmark:
 
         # 2. Build prompts
         print("\nBuilding test prompts...")
-        large_tokens = self._make_prompt(self.prefill_tokens)
+        large_tokens = self._make_prompt()
         short_tokens = self._make_short_prompt()
         print(f"  Prefill prompt: {len(large_tokens)} tokens")
         print(f"  Decode prompt: {len(short_tokens)} tokens")
