@@ -3,7 +3,7 @@ name = "krasis"
 version = "0.1.7"
 edition = "2021"
 description = "Hybrid LLM runtime — minimal VRAM, always-on GPU prefill, optimised CPU inference"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 
 [lib]
 name = "krasis"
