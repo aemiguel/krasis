@@ -68,6 +68,10 @@ def _get_chunk_step():
     if _compiled_chunk_step is not None:
         return _compiled_chunk_step
     try:
+        # Disable Inductor CUDA graphs: the recurrent loop feeds output→input
+        # (state from iteration N → input to iteration N+1), which CUDA graphs
+        # can't handle (buffer overwrite error). Inductor JIT fusion still works.
+        torch._inductor.config.triton.cudagraphs = False
         _compiled_chunk_step = torch.compile(
             _chunk_step, mode="default", dynamic=False)
         logger.info("Compiled linear attention chunk step (default/Inductor mode)")

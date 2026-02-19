@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-19 11:28:39
+Krasis Benchmark — 2026-02-19 12:37:49
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -27,28 +27,28 @@ Strategy:
   Mode:           gpu_decode (hot_cached_static)
 
 Prefill (10000 tokens, 3 runs):
-  Run 1:  855.0 tok/s, TTFT=11.70s
-  Run 2:  856.3 tok/s, TTFT=11.68s
+  Run 1:  857.2 tok/s, TTFT=11.67s
+  Run 2:  856.2 tok/s, TTFT=11.68s
   Run 3:  857.0 tok/s, TTFT=11.67s
-  Average: 856.1 tok/s, TTFT=11.68s
+  Average: 856.8 tok/s, TTFT=11.67s
 
 Decode (64 tokens, 3 runs):
-  Run 1:  7.96 tok/s (125.7ms/tok)
-  Run 2:  7.95 tok/s (125.7ms/tok)
-  Run 3:  7.93 tok/s (126.0ms/tok)
-  Average: 7.95 tok/s (125.8ms/tok)
+  Run 1:  7.81 tok/s (128.1ms/tok)
+  Run 2:  7.89 tok/s (126.7ms/tok)
+  Run 3:  7.94 tok/s (125.9ms/tok)
+  Average: 7.88 tok/s (126.9ms/tok)
 
 Verification:
   Prefill prompt: user
 Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Describe database transaction isolation levels and their trade-offs. Discuss compiler optimization passes such as dead co... [63136 chars total]
   Decode prompt:  Write a poem about recursion in programming.
   Generated output (64 tokens):
-    **The Ladder of Self-Call**  
+    **The Labyrinth of Self-Reference**  
     
-    A function stands, both humble, tall,  
-    Within the code, it answers call—  
-    But not to *other* functions, no—  
-    It calls *itself*—and watch it grow.  
+    A function stands, both bold and small,  
+    It calls itself—yet answers all.  
+    No loop of `for`, no `while` to spin—  
+    Just *itself*, again, again within.  
     
-    > *"Base case first,"* it softly cries,
+    *"Base case,"* whispers the first decree:
 ================================================================

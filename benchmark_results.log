@@ -2861,3 +2861,225 @@ Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Descri
     > *"Base case first,"* it softly cries,
 ================================================================
 
+================================================================
+Krasis Benchmark — 2026-02-19 11:38:23
+================================================================
+Model:            Qwen3-Coder-Next
+Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
+PP Partition:     [48] (1 GPUs)
+
+Hardware:
+  CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
+  RAM:            995 GB total, 78.9 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 11353 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3022 MB allocated
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3022 MB allocated
+
+Quantization:
+  GPU experts:    INT4 (Marlin)
+  CPU experts:    INT4
+  Attention:      INT8
+  Shared expert:  INT8
+  Dense MLP:      INT8
+  LM head:        INT8
+  KV cache:       FP8 E4M3
+
+Strategy:
+  Expert divisor: -3 (hot_cached_static)
+  Prefill threshold: 1
+  Mode:           gpu_decode (hot_cached_static)
+
+Prefill (10000 tokens, 3 runs):
+  Run 1:  841.6 tok/s, TTFT=11.88s
+  Run 2:  842.6 tok/s, TTFT=11.87s
+  Run 3:  841.9 tok/s, TTFT=11.88s
+  Average: 842.0 tok/s, TTFT=11.88s
+
+Decode (64 tokens, 3 runs):
+  Run 1:  8.00 tok/s (125.0ms/tok)
+  Run 2:  7.87 tok/s (127.0ms/tok)
+  Run 3:  7.90 tok/s (126.6ms/tok)
+  Average: 7.92 tok/s (126.2ms/tok)
+
+Verification:
+  Prefill prompt: user
+Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Describe database transaction isolation levels and their trade-offs. Discuss compiler optimization passes such as dead co... [63136 chars total]
+  Decode prompt:  Write a poem about recursion in programming.
+  Generated output (64 tokens):
+    **The Recursive Ladder**  
+    
+    A function stands, both small and wise,  
+    It looks within its own eyes—  
+    Not lost, but *looking back*, you see,  
+    A mirror held to what it be.  
+    
+    *“Call me,”* it whispers, soft and clear,  
+    *“But first
+================================================================
+
+================================================================
+Krasis Benchmark — 2026-02-19 11:52:29
+================================================================
+Model:            Qwen3-Coder-Next
+Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
+PP Partition:     [48] (1 GPUs)
+
+Hardware:
+  CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
+  RAM:            995 GB total, 79.0 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 9553 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3022 MB allocated
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3022 MB allocated
+
+Quantization:
+  GPU experts:    INT4 (Marlin)
+  CPU experts:    INT4
+  Attention:      INT8
+  Shared expert:  INT8
+  Dense MLP:      INT8
+  LM head:        INT8
+  KV cache:       FP8 E4M3
+
+Strategy:
+  Expert divisor: -3 (hot_cached_static)
+  Prefill threshold: 1
+  Mode:           gpu_decode (hot_cached_static)
+
+Prefill (10000 tokens, 3 runs):
+  Run 1:  856.5 tok/s, TTFT=11.68s
+  Run 2:  857.6 tok/s, TTFT=11.66s
+  Run 3:  859.9 tok/s, TTFT=11.63s
+  Average: 858.0 tok/s, TTFT=11.66s
+
+Decode (64 tokens, 3 runs):
+  Run 1:  7.94 tok/s (125.9ms/tok)
+  Run 2:  7.88 tok/s (127.0ms/tok)
+  Run 3:  7.89 tok/s (126.8ms/tok)
+  Average: 7.90 tok/s (126.6ms/tok)
+
+Verification:
+  Prefill prompt: user
+Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Describe database transaction isolation levels and their trade-offs. Discuss compiler optimization passes such as dead co... [63136 chars total]
+  Decode prompt:  Write a poem about recursion in programming.
+  Generated output (64 tokens):
+    **The Recursive Ladder**  
+    
+    A function calls itself—soft and low—  
+    A whispered echo, row on row.  
+    It climbs a ladder, step by step,  
+    A spiral where the roots run deep.  
+    
+    *“If base is met,”* it softly says,  
+    *“I’ll pause,
+================================================================
+
+================================================================
+Krasis Benchmark — 2026-02-19 12:29:38
+================================================================
+Model:            Qwen3-Coder-Next
+Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
+PP Partition:     [48] (1 GPUs)
+
+Hardware:
+  CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
+  RAM:            995 GB total, 80.2 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 9242 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3022 MB allocated
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3022 MB allocated
+
+Quantization:
+  GPU experts:    INT4 (Marlin)
+  CPU experts:    INT4
+  Attention:      INT8
+  Shared expert:  INT8
+  Dense MLP:      INT8
+  LM head:        INT8
+  KV cache:       FP8 E4M3
+
+Strategy:
+  Expert divisor: -3 (hot_cached_static)
+  Prefill threshold: 1
+  Mode:           gpu_decode (hot_cached_static)
+
+Prefill (10000 tokens, 3 runs):
+  Run 1:  448.6 tok/s, TTFT=22.29s
+  Run 2:  449.4 tok/s, TTFT=22.25s
+  Run 3:  449.3 tok/s, TTFT=22.26s
+  Average: 449.1 tok/s, TTFT=22.27s
+
+Decode (64 tokens, 3 runs):
+  Run 1:  7.84 tok/s (127.5ms/tok)
+  Run 2:  7.81 tok/s (128.1ms/tok)
+  Run 3:  7.89 tok/s (126.8ms/tok)
+  Average: 7.85 tok/s (127.5ms/tok)
+
+Verification:
+  Prefill prompt: user
+Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Describe database transaction isolation levels and their trade-offs. Discuss compiler optimization passes such as dead co... [63136 chars total]
+  Decode prompt:  Write a poem about recursion in programming.
+  Generated output (64 tokens):
+    **The Recursive Ladder**  
+    
+    A function calls itself—no error, no fear—  
+    A mirror held up to the code, year on year.  
+    It dips its own tail in the inkwell it’s drawn,  
+    A spiral of logic, both deep and drawn.  
+    
+    *“Base case first!”*
+================================================================
+
+================================================================
+Krasis Benchmark — 2026-02-19 12:37:49
+================================================================
+Model:            Qwen3-Coder-Next
+Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
+PP Partition:     [48] (1 GPUs)
+
+Hardware:
+  CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
+  RAM:            995 GB total, 79.1 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 9553 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3022 MB allocated
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3022 MB allocated
+
+Quantization:
+  GPU experts:    INT4 (Marlin)
+  CPU experts:    INT4
+  Attention:      INT8
+  Shared expert:  INT8
+  Dense MLP:      INT8
+  LM head:        INT8
+  KV cache:       FP8 E4M3
+
+Strategy:
+  Expert divisor: -3 (hot_cached_static)
+  Prefill threshold: 1
+  Mode:           gpu_decode (hot_cached_static)
+
+Prefill (10000 tokens, 3 runs):
+  Run 1:  857.2 tok/s, TTFT=11.67s
+  Run 2:  856.2 tok/s, TTFT=11.68s
+  Run 3:  857.0 tok/s, TTFT=11.67s
+  Average: 856.8 tok/s, TTFT=11.67s
+
+Decode (64 tokens, 3 runs):
+  Run 1:  7.81 tok/s (128.1ms/tok)
+  Run 2:  7.89 tok/s (126.7ms/tok)
+  Run 3:  7.94 tok/s (125.9ms/tok)
+  Average: 7.88 tok/s (126.9ms/tok)
+
+Verification:
+  Prefill prompt: user
+Explain distributed consensus algorithms including Paxos, Raft, and PBFT. Describe database transaction isolation levels and their trade-offs. Discuss compiler optimization passes such as dead co... [63136 chars total]
+  Decode prompt:  Write a poem about recursion in programming.
+  Generated output (64 tokens):
+    **The Labyrinth of Self-Reference**  
+    
+    A function stands, both bold and small,  
+    It calls itself—yet answers all.  
+    No loop of `for`, no `while` to spin—  
+    Just *itself*, again, again within.  
+    
+    *"Base case,"* whispers the first decree:
+================================================================
+
