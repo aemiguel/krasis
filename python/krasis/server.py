@@ -29,6 +29,19 @@ from krasis.scheduler import GenerationRequest, Scheduler
 
 logger = logging.getLogger("krasis.server")
 
+# ANSI formatting for status output
+_BOLD = "\033[1m"
+_CYAN = "\033[36m"
+_GREEN = "\033[32m"
+_DIM = "\033[2m"
+_NC = "\033[0m"
+
+
+def _status(label: str) -> None:
+    """Print a highlighted status section header (also logged)."""
+    print(f"\n{_BOLD}{_CYAN}▸ {label}{_NC}", flush=True)
+    logger.info("── %s ──", label)
+
 app = FastAPI(title="Krasis", version="0.1.0")
 _scheduler: Optional[Scheduler] = None
 _model: Optional[KrasisModel] = None
@@ -392,10 +405,24 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.6)
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
+    log_format = "%(asctime)s %(name)s %(levelname)s %(message)s"
+    logging.basicConfig(level=logging.INFO, format=log_format)
+
+    # Also log to krasis.log file (captures all logger output + uncaught exceptions)
+    _log_file = os.path.join(os.getcwd(), "krasis.log")
+    _file_handler = logging.FileHandler(_log_file, mode="a")
+    _file_handler.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(logging.Formatter(log_format))
+    logging.getLogger().addHandler(_file_handler)
+
+    # Capture uncaught exceptions to the log file
+    _original_excepthook = sys.excepthook
+    def _log_excepthook(exc_type, exc_value, exc_tb):
+        logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+        _original_excepthook(exc_type, exc_value, exc_tb)
+    sys.excepthook = _log_excepthook
+
+    logger.info("Logging to %s", _log_file)
 
     global _model, _scheduler, _model_name
     import torch
@@ -438,7 +465,7 @@ def main():
         kv_cache_mb=args.kv_cache_mb,
     )
 
-    logger.info("Loading model...")
+    _status("Loading model weights")
     _model.load()
 
     # Resolve heatmap: cached > build
@@ -448,18 +475,21 @@ def main():
         heatmap_path = os.path.join(cache_dir, "auto_heatmap.json")
 
     if not os.path.exists(heatmap_path):
-        logger.info("No heatmap found — building via calibration...")
+        _status("Building expert heatmap (calibration)")
         heatmap_path = _build_heatmap(_model, heatmap_path)
     else:
+        _status("Loading cached heatmap")
         logger.info("Using cached heatmap: %s", heatmap_path)
 
     # CUDA runtime warmup — triggers cuBLAS + Triton kernel compilation
     # before the allocation loop so VRAM measurements are accurate.
     num_gpus_available = args.num_gpus or torch.cuda.device_count()
     devices = [torch.device(f"cuda:{i}") for i in range(num_gpus_available)]
+    _status("Warming up CUDA runtime")
     _model.warmup_cuda_runtime(devices)
 
     # ── Unified HCS allocation loop ──
+    _status("Allocating HCS expert cache")
     logger.info("Unified HCS: initializing with devices: %s", [str(d) for d in devices])
 
     # Build 10K test prompt for validation — need enough text to exceed 10K tokens
@@ -584,7 +614,9 @@ def main():
         from krasis.benchmark import KrasisBenchmark
         bench = KrasisBenchmark(_model)
         bench.run()
+        sys.exit(0)
 
+    _status(f"Server ready on {args.host}:{args.port}")
     logger.info("Model loaded, starting server on %s:%d", args.host, args.port)
 
     _scheduler = Scheduler(_model)

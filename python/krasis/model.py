@@ -509,6 +509,7 @@ class KrasisModel:
         self._start_ram_watchdog()
 
         # Phase 1: GPU weights
+        print(f"\n\033[1m\033[36m▸ Loading GPU weights\033[0m", flush=True)
         logger.info("Phase 1: Loading GPU weights (streaming INT8)...")
         loader = WeightLoader(self.cfg, self.quant_cfg)
         self._load_gpu_weights(loader)
@@ -523,6 +524,7 @@ class KrasisModel:
 
         # Phase 2: CPU expert weights
         cpu_start = time.perf_counter()
+        print(f"\n\033[1m\033[36m▸ Loading CPU expert weights\033[0m", flush=True)
         logger.info("Phase 2: Loading CPU expert weights (Krasis INT4)...")
         self._load_cpu_experts()
         cpu_elapsed = time.perf_counter() - cpu_start
@@ -534,6 +536,7 @@ class KrasisModel:
 
         # Phase 3: GPU prefill managers (one per device)
         if self.gpu_prefill_enabled and self.cfg.n_routed_experts > 0:
+            print(f"\n\033[1m\033[36m▸ Initializing GPU prefill managers\033[0m", flush=True)
             self._init_gpu_prefill()
 
         # Allocate KV caches
@@ -584,7 +587,7 @@ class KrasisModel:
                             if k * n > max_k * max_n: max_k, max_n = k, n
 
                 if max_k > 0:
-                    for m_size in (1, 16, 512):
+                    for m_size in (32, 512):
                         x = torch.randint(-127, 127, (m_size, max_k), dtype=torch.int8, device=device)
                         w = torch.randint(-127, 127, (max_n, max_k), dtype=torch.int8, device=device)
                         _ = torch._int_mm(x, w.t())
@@ -601,18 +604,29 @@ class KrasisModel:
                     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
                     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
                     ws = marlin_make_workspace(device, max_blocks_per_sm=4)
-                    w13 = torch.zeros(n_dummy, K // 16, 2 * N * nb2, dtype=torch.int32, device=device)
-                    w13s = torch.zeros(n_dummy, K // gs, 2 * N, dtype=torch.bfloat16, device=device)
+                    # w1 (gate+up): [E, K//16, 2*N*nb2], scale: [E, K//gs, 2*N]
+                    w1 = torch.zeros(n_dummy, K // 16, 2 * N * nb2, dtype=torch.int32, device=device)
+                    w1s = torch.zeros(n_dummy, K // gs, 2 * N, dtype=torch.bfloat16, device=device)
+                    # w2 (down): [E, N//16, K*nb2], scale: [E, N//gs, K]
+                    w2 = torch.zeros(n_dummy, N // 16, K * nb2, dtype=torch.int32, device=device)
+                    w2s = torch.zeros(n_dummy, N // gs, K, dtype=torch.bfloat16, device=device)
                     x = torch.zeros(1, K, dtype=torch.bfloat16, device=device)
                     g = torch.empty(1, n_dummy, device=device)
                     tw = torch.zeros(1, 1, dtype=torch.float32, device=device)
                     ti = torch.zeros(1, 1, dtype=torch.int32, device=device)
-                    fused_marlin_moe(x, w13, w13, w13s, w13s, g, tw, ti, n_dummy, None,
-                                     torch.empty(n_dummy,0,dtype=torch.int32,device=device),
-                                     torch.empty(n_dummy,0,dtype=torch.int32,device=device),
-                                     torch.empty(n_dummy,0,dtype=torch.int32,device=device),
-                                     torch.empty(n_dummy,0,dtype=torch.int32,device=device),
-                                     ws, bits, True)
+                    fused_marlin_moe(
+                        hidden_states=x, w1=w1, w2=w2,
+                        w1_scale=w1s, w2_scale=w2s,
+                        gating_output=g, topk_weights=tw, topk_ids=ti,
+                        global_num_experts=n_dummy, expert_map=None,
+                        g_idx1=torch.empty(n_dummy, 0, dtype=torch.int32, device=device),
+                        g_idx2=torch.empty(n_dummy, 0, dtype=torch.int32, device=device),
+                        sort_indices1=torch.empty(n_dummy, 0, dtype=torch.int32, device=device),
+                        sort_indices2=torch.empty(n_dummy, 0, dtype=torch.int32, device=device),
+                        w1_zeros=None, w2_zeros=None,
+                        workspace=ws, num_bits=bits, is_k_full=True,
+                    )
+                    torch.cuda.synchronize(device)
                 else:
                     # Warm up the Triton kernel with dummy standard-GPTQ data
                     w13_marlin = torch.zeros(n_dummy, K // 16, 2 * N * nb2, dtype=torch.int32)
@@ -2052,8 +2066,10 @@ class KrasisModel:
             _ep_dense_time = 0.0
 
         # ── DMA pipelining: overlap next group's DMA with current compute ──
-        # Disabled during ep_timing (detailed sync-heavy timing) and active_only mode.
-        _pipeline_enabled = bool(_dma_managers) and not is_active_only and not ep_timing
+        # Disabled during ep_timing (detailed sync-heavy timing), active_only mode,
+        # and validation sync (synchronous operation for precise error catching).
+        _validation = getattr(self, '_validation_sync', False)
+        _pipeline_enabled = bool(_dma_managers) and not is_active_only and not ep_timing and not _validation
         _has_prefetch = False
         _prefetch_futures = []
         if _pipeline_enabled:
@@ -2149,6 +2165,16 @@ class KrasisModel:
                             torch.cuda.synchronize(dev)
                             _ep_dense_time += time.perf_counter() - _t_dense0
                             _ep_dense_count += 1
+                        # Per-layer sync for validation: catch CUDA errors precisely
+                        if getattr(self, '_validation_sync', False):
+                            try:
+                                torch.cuda.synchronize(dev)
+                            except Exception as e:
+                                logger.error(
+                                    "CUDA error at layer %d (moe_idx=%s, chunk=%d/%d, M=%d): %s",
+                                    abs_layer_idx, moe_layer_idx, c+1, num_chunks, chunk_M, e,
+                                )
+                                raise
                         continue
 
                     # ── Multi-GPU EP path for MoE layers ──

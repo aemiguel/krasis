@@ -408,6 +408,7 @@ def compute_launcher_budget(
         mn = n_layers - dn
         
         shared_bytes = _component_weight_bytes(shared_params_per_moe, shared_expert_quant) * mn if shared_params_per_moe else 0
+        dense_mlp_bytes = _component_weight_bytes(dense_mlp_params_per_layer, dense_mlp_quant) * dn
         gate_bytes = hidden * n_experts * 2 * mn  # always BF16 (routing weights)
 
         # Expert buffers (GPU side) - these fit into the remaining space
@@ -430,7 +431,7 @@ def compute_launcher_budget(
             emode = "n/a"
 
         total_bytes = (
-            base_model_footprint + shared_bytes +
+            base_model_footprint + shared_bytes + dense_mlp_bytes +
             gate_bytes +
             ebuf_bytes + cuda_overhead * 1024 * 1024
         )
@@ -448,8 +449,10 @@ def compute_launcher_budget(
             "rank": rank_idx,
             "n_layers": n_layers, # this rank is still 'responsible' for this many layers in HCS/EP
             "moe_layers": mn,
+            "dense_layers": dn,
             "attention_mb": base_attn_bytes / MB,
             "shared_expert_mb": shared_bytes / MB,
+            "dense_mlp_mb": dense_mlp_bytes / MB,
             "expert_buffer_mb": ebuf_bytes / MB,
             "expert_mode": emode,
             "embed_lmhead_mb": (base_embed_bytes + base_lmhead_bytes) / MB,

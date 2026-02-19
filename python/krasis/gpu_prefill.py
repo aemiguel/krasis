@@ -2989,6 +2989,7 @@ class GpuPrefillManager:
         free_after_load = torch.cuda.mem_get_info(self.device)[0]
 
         model._oom_retry_enabled = False
+        model._validation_sync = True  # Per-layer CUDA sync to pinpoint errors
         try:
             torch.cuda.reset_peak_memory_stats(self.device)
             with torch.inference_mode():
@@ -3010,7 +3011,7 @@ class GpuPrefillManager:
                 "free_after_load_mb": free_after_load // (1024*1024),
                 "inference_cost_bytes": inference_cost,
             }
-        except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, RuntimeError) as e:
+        except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, RuntimeError, torch.AcceleratorError) as e:
             err_str = str(e).lower()
             if ("out of memory" in err_str
                     or isinstance(e, (torch.cuda.OutOfMemoryError,
@@ -3022,9 +3023,17 @@ class GpuPrefillManager:
                 gc.collect()
                 torch.cuda.empty_cache()
                 return False, {"n_experts": n_experts}
+            if "illegal memory access" in err_str or "cuda error" in err_str:
+                logger.error(
+                    "GPU validation FAIL: CUDA error during inference. "
+                    "Run with CUDA_LAUNCH_BLOCKING=1 and KRASIS_DEBUG_SYNC=1 "
+                    "for detailed error location. Error: %s", e,
+                )
+                raise
             raise
         finally:
             model._oom_retry_enabled = True
+            model._validation_sync = False
 
     def reset_prefill_stats(self):
         """Reset prefill timing accumulators (call before each prefill request)."""
