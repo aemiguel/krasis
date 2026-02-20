@@ -613,9 +613,15 @@ class GatedDeltaNetAttention:
         # Intra-chunk decay matrix
         decay_mask = (g_cum.unsqueeze(-1) - g_cum.unsqueeze(-2)).tril().exp().tril()
 
+        _timing = TIMING.prefill
+
         # Intra-chunk attention matrix (strictly lower triangular, nilpotent)
         attn = -(k_beta_c @ k_c.transpose(-1, -2)) * decay_mask
         attn = attn.masked_fill(mask_upper, 0)
+
+        if _timing:
+            torch.cuda.synchronize(device)
+            _ci_t0 = time.perf_counter()
 
         if _FUSED_LINEAR_ATTN:
             # Solve (I - A) @ x = b via triangular solve (2 cuBLAS calls vs 63-iter loop).
@@ -637,6 +643,10 @@ class GatedDeltaNetAttention:
             value_corrected = attn @ v_beta_c
             k_cumdecay = attn @ (k_beta_c * g_cum.exp().unsqueeze(-1))
 
+        if _timing:
+            torch.cuda.synchronize(device)
+            _ci_t1 = time.perf_counter()
+
         # Recurrent chunk loop
         core_attn_out = torch.zeros_like(value_corrected)
         step_fn = _get_chunk_step()
@@ -648,6 +658,14 @@ class GatedDeltaNetAttention:
                 mask_strict_upper, recurrent_state)
             core_attn_out[:, :, i] = output
 
+        if _timing:
+            torch.cuda.synchronize(device)
+            _ci_t2 = time.perf_counter()
+            logger.info(
+                "  LA-INNER chunks=%d: nilpotent=%.1fms loop=%.1fms (%.2fms/chunk)",
+                num_chunks, (_ci_t1 - _ci_t0) * 1000, (_ci_t2 - _ci_t1) * 1000,
+                (_ci_t2 - _ci_t1) * 1000 / max(num_chunks, 1))
+
         return core_attn_out, recurrent_state
 
     def _forward_chunked(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -655,8 +673,13 @@ class GatedDeltaNetAttention:
 
         Uses the parallel-within-chunk, recurrent-across-chunks formulation.
         """
+        _timing = TIMING.prefill
         M = hidden.shape[0]
         chunk_size = 64
+
+        if _timing:
+            torch.cuda.synchronize(hidden.device)
+            _t0 = time.perf_counter()
 
         # Project all tokens at once
         qkvz = _linear(hidden, self.in_proj_qkvz)  # [M, q+k+v+z]
@@ -693,6 +716,10 @@ class GatedDeltaNetAttention:
         conv_out = F.silu(conv_out[:, :, -M:])
         conv_out = conv_out.to(hidden.dtype)
         conv_out = conv_out.transpose(1, 2).squeeze(0)  # [M, conv_dim]
+
+        if _timing:
+            torch.cuda.synchronize(hidden.device)
+            _t1 = time.perf_counter()
 
         # Split to q, k, v and reshape to heads
         q_all = conv_out[:, :self.key_dim].reshape(M, self.num_k_heads, self.k_head_dim)
@@ -743,6 +770,10 @@ class GatedDeltaNetAttention:
         v_beta = v_4d * beta_3d.unsqueeze(-1)          # [1, nv, total_len, dv]
         k_beta = k_4d * beta_3d.unsqueeze(-1)          # [1, nv, total_len, dk]
 
+        if _timing:
+            torch.cuda.synchronize(hidden.device)
+            _t2 = time.perf_counter()
+
         # Reshape to chunks: [1, nv, num_chunks, chunk_size, dim]
         num_chunks = total_len // chunk_size
         q_c = q_4d.reshape(1, self.num_v_heads, num_chunks, chunk_size, self.k_head_dim)
@@ -757,6 +788,10 @@ class GatedDeltaNetAttention:
             self._recurrent_state, q_c, k_c, v_beta_c, k_beta_c, g_c,
             chunk_size, num_chunks)
 
+        if _timing:
+            torch.cuda.synchronize(hidden.device)
+            _t3 = time.perf_counter()
+
         # Reshape output: [1, nv, num_chunks, chunk_size, dv] → [1, nv, total_len, dv]
         core_attn_out = core_attn_out.reshape(1, self.num_v_heads, -1, self.v_head_dim)
         # Trim padding and transpose back
@@ -769,7 +804,20 @@ class GatedDeltaNetAttention:
 
         # Flatten and project (cast back to BF16 for out_proj)
         attn_flat = attn_out.reshape(M, self.num_v_heads * self.v_head_dim).to(torch.bfloat16)
-        return _linear(attn_flat, self.out_proj)  # [M, hidden]
+        result = _linear(attn_flat, self.out_proj)  # [M, hidden]
+
+        if _timing:
+            torch.cuda.synchronize(hidden.device)
+            _t4 = time.perf_counter()
+            logger.info(
+                "LA-PREFILL L%s(%s) M=%d chunks=%d: proj+conv=%.1fms prep=%.1fms "
+                "inner(nilpotent+loop)=%.1fms norm+outproj=%.1fms total=%.1fms",
+                self.layer_idx, hidden.device, M, num_chunks,
+                (_t1 - _t0) * 1000, (_t2 - _t1) * 1000,
+                (_t3 - _t2) * 1000, (_t4 - _t3) * 1000,
+                (_t4 - _t0) * 1000)
+
+        return result
 
     def _forward_recurrent_no_outproj(self, hidden: torch.Tensor) -> torch.Tensor:
         """Full recurrent forward without out_proj. Returns flat [M, nv*dv]."""

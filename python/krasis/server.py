@@ -527,8 +527,8 @@ def main():
     logger.info("Test prompt: %d tokens", len(_test_tokens))
 
     # ── Find the richest GPU for HCS ──
-    # With split-attention, GPU0 has embedding+lm_head overhead, GPU1+ have more
-    # free VRAM. HCS experts go on the GPU with the most free VRAM.
+    # Streaming attention: all attention on GPU0 (embedding+lm_head+all layers),
+    # GPU1+ have near-zero allocation. HCS experts go on richest GPU (GPU1+).
     primary_dev = devices[0]
     if len(devices) > 1:
         hcs_dev = max(devices, key=lambda d: torch.cuda.mem_get_info(d)[0])

@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-20 21:02:17
+Krasis Benchmark — 2026-02-20 22:55:54
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,10 +7,10 @@ PP Partition:     [48] (2 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            995 GB total, 78.2 GB used by process
-  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 4244 MB allocated
-  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 10838 MB allocated
-  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
+  RAM:            995 GB total, 78.1 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 5363 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 12015 MB allocated
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
 
 Quantization:
   GPU experts:    INT4 (Marlin)
@@ -27,21 +27,28 @@ Strategy:
   Mode:           gpu_decode (hot_cached_static)
 
 Prefill (10000 tokens, 3 runs):
-  Run 1:  884.1 tok/s, TTFT=11.31s
-  Run 2:  876.5 tok/s, TTFT=11.41s
-  Run 3:  880.1 tok/s, TTFT=11.36s
-  Average: 880.2 tok/s, TTFT=11.36s
+  Run 1:  853.2 tok/s, TTFT=11.72s
+  Run 2:  853.3 tok/s, TTFT=11.72s
+  Run 3:  852.7 tok/s, TTFT=11.73s
+  Average: 853.1 tok/s, TTFT=11.72s
 
 Decode (64 tokens, 3 runs):
-  Run 1:  8.10 tok/s (123.5ms/tok)
-  Run 2:  8.14 tok/s (122.9ms/tok)
-  Run 3:  8.20 tok/s (122.0ms/tok)
-  Average: 8.15 tok/s (122.8ms/tok)
+  Run 1:  8.68 tok/s (115.2ms/tok)
+  Run 2:  8.71 tok/s (114.8ms/tok)
+  Run 3:  8.73 tok/s (114.5ms/tok)
+  Average: 8.71 tok/s (114.8ms/tok)
 
 Verification:
   Prefill prompt: user
 Distributed consensus algorithms form the backbone of modern fault-tolerant systems. The Paxos algorithm, proposed by Leslie Lamport, achieves consensus among a group of processes even when some ... [52428 chars total]
   Decode prompt:  Write a poem about recursion in programming at least 100 words long.
   Generated output (64 tokens):
-     matter matter matter lig/orword.wordasp.org 用户pix ​​的独特(unique uniq的独特 �译译ˈ谓臣大臣大臣.rtゥgif GIFIDIDutch语言/languagew.schema.schemaitectureitecture shared\u的独特视角 perspectives独独在它们echsimSimits.sim似amo样的 FileMode layers layersughiculty level levelˌ etc
+    **The Recursive Ladder**
+    
+    A function calls itself—soft, precise, and slow,  
+    A mirror held to light, where logic starts to grow.  
+    No loop of steel, no counted, clanking chain,  
+    But gentle steps up logic’s winding lane.  
+    
+    *“Base case first,”* it whispers
 ================================================================

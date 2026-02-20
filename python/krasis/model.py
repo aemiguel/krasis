@@ -1,11 +1,12 @@
 """Full model: embedding → N transformer layers → LM head.
 
-Single process, N GPUs (PP=N). Each GPU owns a slice of layers
-plus its local KV cache. Hidden states transfer at PP boundaries.
+Streaming attention architecture: ALL attention on GPU0, experts
+split across all GPUs via EP. GPU1+ reserved for EP prefill and
+HCS decode experts (zero attention allocation).
 
 Loading sequence:
   Phase 0: System RAM budget check (refuse to run if insufficient)
-  Phase 1: GPU weights (streaming BF16→INT8, one tensor at a time)
+  Phase 1: GPU weights — all on GPU0 (streaming BF16→INT8, one tensor at a time)
   Phase 2: CPU expert weights (Krasis Rust engine, INT4)
 """
 
@@ -394,7 +395,7 @@ class CPUHubManager:
 
 
 class KrasisModel:
-    """Full model with pipeline-parallel GPU inference + CPU MoE experts."""
+    """Full model with streaming attention (GPU0) + EP MoE (all GPUs) + CPU experts."""
 
     def __init__(
         self,
@@ -460,16 +461,13 @@ class KrasisModel:
         self.tokenizer: Optional[Tokenizer] = None
         self._loaded = False
 
-        # Per-device state for split-attention multi-GPU.
-        # Keys are device strings ("cuda:0", "cuda:1", ...).
-        # Values: {"layers": [layers on this device], "embedding": T, "final_norm": T,
-        #          "lm_head_data": T}  (embedding/norm/lm_head only on GPU0)
+        # Per-device state (streaming attention: GPU0 only).
         self._device_state: dict = {}
         self._active_device: Optional[str] = None  # current device for use_device()
 
-        # Split-attention: layers distributed across GPUs for VRAM distribution.
-        # _layer_split[gpu_idx] = (start, end) — absolute layer index range per GPU.
-        # _get_gpu_for_layer(i) returns the GPU index owning layer i.
+        # Streaming attention: all layers on GPU0.
+        # _layer_split = [(0, L)] — single entry covering all layers.
+        # _get_gpu_for_layer(i) always returns 0.
         self._layer_split: List[Tuple[int, int]] = []
 
         # HCS device: GPU where ALL MoE decode happens (most free VRAM, typically GPU1).
@@ -793,32 +791,29 @@ class KrasisModel:
         return result
 
     def _load_gpu_weights(self, loader: WeightLoader):
-        """Stream-load GPU weights with split-attention: L/N layers per GPU.
+        """Stream-load GPU weights: all attention on GPU0.
 
-        Single GPU: all layers on GPU0 (same as before).
-        Multi-GPU: layers split evenly across GPUs for VRAM distribution.
-        Embedding + final_norm + lm_head always on GPU0.
+        Streaming attention architecture: ALL attention weights, norms, gate
+        weights, shared expert weights, embedding, final_norm, and lm_head
+        live on GPU0. GPU1+ are reserved entirely for EP expert parallelism
+        during prefill and HCS expert cache during decode.
+
+        This eliminates cross-GPU hidden state transfers during attention
+        (which can't be parallelized due to layer data dependencies) and
+        frees GPU1+ VRAM entirely for HCS decode experts.
         """
         self.layers = []
         primary_dev = self.all_devices[0]
         torch.cuda.set_device(primary_dev)
-        N = len(self.all_devices)
         L = self.cfg.num_hidden_layers
 
-        # ── Compute balanced split ──
-        base = L // N
-        remainder = L % N
-        split_sizes = [base + (1 if i < remainder else 0) for i in range(N)]
-        offset = 0
-        self._layer_split = []
-        for size in split_sizes:
-            self._layer_split.append((offset, offset + size))
-            offset += size
-        logger.info("Layer split across %d GPUs: %s", N,
-                     [f"GPU{i}=[{s},{e})" for i, (s, e) in enumerate(self._layer_split)])
+        # All attention on GPU0 — single split covering all layers
+        self._layer_split = [(0, L)]
+        logger.info("Streaming attention: all %d layers on GPU0, %d GPUs for EP",
+                     L, len(self.all_devices))
 
-        # ── Load ALL layers to primary device first (streaming from safetensors) ──
-        logger.info("Loading full base model to primary device %s...", primary_dev)
+        # ── Load ALL layers to primary device ──
+        logger.info("Loading full base model to %s...", primary_dev)
         self.embedding = loader.load_embedding(primary_dev)
 
         for layer_idx in range(L):
@@ -835,7 +830,7 @@ class KrasisModel:
         self.final_norm = loader.load_final_norm(primary_dev)
         self.lm_head_data = loader.load_lm_head(primary_dev)
 
-        # ── VRAM checkpoint: before layer move ──
+        # ── VRAM checkpoint ──
         def _vram_snap(label):
             for di, d in enumerate(self.all_devices):
                 free, total = torch.cuda.mem_get_info(d)
@@ -849,48 +844,238 @@ class KrasisModel:
                 )
         _vram_snap("after-all-layers-loaded")
 
-        # ── Move split layers to their target GPUs ──
-        for gpu_idx in range(1, N):
-            start, end = self._layer_split[gpu_idx]
-            target_dev = self.all_devices[gpu_idx]
-            t0 = time.perf_counter()
-            logger.info("Moving layers [%d, %d) to %s...", start, end, target_dev)
-
-            for i in range(start, end):
-                old_layer = self.layers[i]
-                w = self._extract_layer_weights(old_layer, primary_dev)
-                w_copy = self._copy_weights_dict(w, target_dev)
-                new_layer = TransformerLayer(
-                    self.cfg, i, w_copy, target_dev,
-                    krasis_engine=None,
-                    gpu_prefill_manager=None,
-                    gpu_prefill_threshold=self.gpu_prefill_threshold,
-                    attention_backend=self.attention_backend,
-                )
-                self.layers[i] = new_layer
-                del old_layer
-
-            torch.cuda.empty_cache()
-            alloc_mb = torch.cuda.memory_allocated(target_dev) / (1024**2)
-            elapsed = time.perf_counter() - t0
-            logger.info(
-                "Moved %d layers to %s in %.1fs (%.0f MB allocated)",
-                end - start, target_dev, elapsed, alloc_mb,
-            )
-
-        _vram_snap("after-layer-move+empty_cache")
-
-        # ── Build per-device state ──
+        # ── Build per-device state (GPU0 only) ──
         self._active_device = str(primary_dev)
-        for gpu_idx, dev in enumerate(self.all_devices):
-            dev_str = str(dev)
-            start, end = self._layer_split[gpu_idx]
-            state = {"layers": self.layers[start:end]}
-            if gpu_idx == 0:
-                state["embedding"] = self.embedding
-                state["final_norm"] = self.final_norm
-                state["lm_head_data"] = self.lm_head_data
-            self._device_state[dev_str] = state
+        dev_str = str(primary_dev)
+        self._device_state[dev_str] = {
+            "layers": self.layers,
+            "embedding": self.embedding,
+            "final_norm": self.final_norm,
+            "lm_head_data": self.lm_head_data,
+        }
+
+    # ── Attention streaming: offload/reload for large models ──
+
+    def _estimate_attention_vram(self) -> int:
+        """Estimate total GPU VRAM used by attention weights across all layers.
+
+        Returns bytes consumed by all attention-related parameters:
+        norms, attention projections, gate weights, shared experts.
+        Does NOT include KV cache, embedding, or lm_head.
+        """
+        total = 0
+        for layer in self.layers:
+            # Norms
+            total += layer.input_norm_weight.nelement() * layer.input_norm_weight.element_size()
+            total += layer.post_attn_norm_weight.nelement() * layer.post_attn_norm_weight.element_size()
+
+            # Attention weights
+            attn = layer.attention
+            for attr_name in dir(attn):
+                val = getattr(attn, attr_name, None)
+                if isinstance(val, torch.Tensor) and val.device.type == 'cuda':
+                    total += val.nelement() * val.element_size()
+                elif isinstance(val, tuple) and len(val) == 2:
+                    # INT8 (weight, scale) tuple
+                    for t in val:
+                        if isinstance(t, torch.Tensor) and t.device.type == 'cuda':
+                            total += t.nelement() * t.element_size()
+
+            # Gate weights + shared expert (MoE layers)
+            if layer.is_moe:
+                if layer.gate_weight is not None:
+                    total += layer.gate_weight.nelement() * layer.gate_weight.element_size()
+                if layer.gate_bias is not None:
+                    total += layer.gate_bias.nelement() * layer.gate_bias.element_size()
+                if layer.e_score_correction_bias is not None:
+                    total += layer.e_score_correction_bias.nelement() * layer.e_score_correction_bias.element_size()
+                if layer.shared_expert is not None:
+                    for v in layer.shared_expert.values():
+                        if isinstance(v, torch.Tensor):
+                            total += v.nelement() * v.element_size()
+                        elif isinstance(v, tuple):
+                            for t in v:
+                                if isinstance(t, torch.Tensor):
+                                    total += t.nelement() * t.element_size()
+                if layer.shared_expert_gate is not None:
+                    total += layer.shared_expert_gate.nelement() * layer.shared_expert_gate.element_size()
+
+            # Dense MLP (non-MoE layers)
+            if not layer.is_moe and hasattr(layer, 'mlp') and layer.mlp is not None:
+                for v in layer.mlp.values():
+                    if isinstance(v, torch.Tensor):
+                        total += v.nelement() * v.element_size()
+                    elif isinstance(v, tuple):
+                        for t in v:
+                            if isinstance(t, torch.Tensor):
+                                total += t.nelement() * t.element_size()
+
+        return total
+
+    def _should_stream_attention(self, headroom_mb: int = 2000) -> bool:
+        """Check if attention weights should be streamed (offloaded) during prefill.
+
+        Returns True if total attention VRAM exceeds what GPU0 can hold after
+        accounting for headroom needed for KV cache, activations, and DMA buffers.
+        """
+        if not self._loaded or not self.layers:
+            return False
+        dev = self.all_devices[0]
+        free, total = torch.cuda.mem_get_info(dev)
+        attn_vram = self._estimate_attention_vram()
+        # Headroom for KV cache, activations, DMA buffers, CUDA overhead
+        available = free + attn_vram  # If we offloaded, we'd reclaim attn_vram
+        needed = attn_vram + headroom_mb * 1024 * 1024
+        should_stream = needed > total
+        if should_stream:
+            logger.info(
+                "Attention streaming ENABLED: %d MB attention, %d MB total VRAM, "
+                "%d MB needed (with %d MB headroom)",
+                attn_vram >> 20, total >> 20, needed >> 20, headroom_mb,
+            )
+        return should_stream
+
+    def _offload_attention_to_ram(self):
+        """Move all attention weights from GPU0 to pinned CPU RAM for streaming.
+
+        After this, layers still exist as TransformerLayer objects but their
+        attention weights are on CPU. Gate/shared expert weights also offloaded.
+        """
+        self._attn_offloaded = True
+        self._attn_cpu_weights = {}  # layer_idx -> {attr: cpu_tensor}
+        t0 = time.perf_counter()
+        total_bytes = 0
+
+        for layer_idx, layer in enumerate(self.layers):
+            w = self._extract_layer_weights(layer, layer.device)
+            cpu_w = self._copy_weights_dict(w, 'cpu')
+            self._attn_cpu_weights[layer_idx] = cpu_w
+            total_bytes += sum(
+                t.nelement() * t.element_size()
+                for t in self._flatten_weights(cpu_w)
+            )
+            # Null GPU refs to free VRAM (keep layer object for structure)
+            self._null_layer_gpu_weights(layer)
+
+        torch.cuda.empty_cache()
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "Attention offloaded: %d layers, %d MB to CPU RAM in %.1fs",
+            len(self.layers), total_bytes >> 20, elapsed,
+        )
+
+    def _load_attention_group(self, layer_indices: List[int]):
+        """Load attention weights for a group of layers from CPU RAM to GPU0.
+
+        Call before processing a layer group during prefill when streaming.
+        """
+        if not getattr(self, '_attn_offloaded', False):
+            return
+        dev = self.all_devices[0]
+        for layer_idx in layer_indices:
+            cpu_w = self._attn_cpu_weights.get(layer_idx)
+            if cpu_w is None:
+                continue
+            gpu_w = self._copy_weights_dict(cpu_w, dev)
+            old_layer = self.layers[layer_idx]
+            new_layer = TransformerLayer(
+                self.cfg, layer_idx, gpu_w, dev,
+                krasis_engine=old_layer.krasis_engine,
+                gpu_prefill_manager=old_layer.gpu_prefill_manager,
+                gpu_prefill_threshold=self.gpu_prefill_threshold,
+                attention_backend=self.attention_backend,
+            )
+            # Preserve CPU decode buffers
+            for buf_name in ('_cpu_act_buf', '_cpu_ids_buf', '_cpu_wts_buf',
+                             '_cpu_out_buf', '_gpu_out_buf'):
+                buf = getattr(old_layer, buf_name, None)
+                if buf is not None:
+                    setattr(new_layer, buf_name, buf)
+            self.layers[layer_idx] = new_layer
+
+    def _free_attention_group(self, layer_indices: List[int]):
+        """Free GPU attention weights for a group of layers after processing.
+
+        Nulls GPU refs so VRAM can be reclaimed for the next group's DMA.
+        """
+        if not getattr(self, '_attn_offloaded', False):
+            return
+        for layer_idx in layer_indices:
+            layer = self.layers[layer_idx]
+            self._null_layer_gpu_weights(layer)
+        torch.cuda.empty_cache()
+
+    def _reload_all_attention(self):
+        """Reload all attention weights to GPU0 permanently (for decode after prefill).
+
+        After prefill with streaming, decode needs all attention weights resident
+        on GPU0 for the full layer loop.
+        """
+        if not getattr(self, '_attn_offloaded', False):
+            return
+        dev = self.all_devices[0]
+        t0 = time.perf_counter()
+        for layer_idx in range(len(self.layers)):
+            cpu_w = self._attn_cpu_weights.get(layer_idx)
+            if cpu_w is None:
+                continue
+            gpu_w = self._copy_weights_dict(cpu_w, dev)
+            old_layer = self.layers[layer_idx]
+            new_layer = TransformerLayer(
+                self.cfg, layer_idx, gpu_w, dev,
+                krasis_engine=old_layer.krasis_engine,
+                gpu_prefill_manager=old_layer.gpu_prefill_manager,
+                gpu_prefill_threshold=self.gpu_prefill_threshold,
+                attention_backend=self.attention_backend,
+            )
+            for buf_name in ('_cpu_act_buf', '_cpu_ids_buf', '_cpu_wts_buf',
+                             '_cpu_out_buf', '_gpu_out_buf'):
+                buf = getattr(old_layer, buf_name, None)
+                if buf is not None:
+                    setattr(new_layer, buf_name, buf)
+            self.layers[layer_idx] = new_layer
+        self._attn_offloaded = False
+        elapsed = time.perf_counter() - t0
+        logger.info("Attention reloaded to GPU0: %d layers in %.1fs", len(self.layers), elapsed)
+
+    @staticmethod
+    def _flatten_weights(w_dict: dict) -> List[torch.Tensor]:
+        """Flatten a nested weight dict into a list of tensors."""
+        tensors = []
+        for v in w_dict.values():
+            if isinstance(v, dict):
+                tensors.extend(KrasisModel._flatten_weights(v))
+            elif isinstance(v, torch.Tensor):
+                tensors.append(v)
+            elif isinstance(v, tuple):
+                for t in v:
+                    if isinstance(t, torch.Tensor):
+                        tensors.append(t)
+        return tensors
+
+    @staticmethod
+    def _null_layer_gpu_weights(layer):
+        """Null out GPU weight references on a layer to free VRAM."""
+        layer.input_norm_weight = None
+        layer.post_attn_norm_weight = None
+
+        # Attention
+        attn = layer.attention
+        for attr_name in list(vars(attn).keys()):
+            val = getattr(attn, attr_name, None)
+            if isinstance(val, torch.Tensor) and val.device.type == 'cuda':
+                setattr(attn, attr_name, None)
+            elif isinstance(val, tuple) and len(val) == 2:
+                if all(isinstance(t, torch.Tensor) for t in val):
+                    setattr(attn, attr_name, None)
+
+        # Gate + shared expert
+        if layer.is_moe:
+            layer.gate_weight = None
+            layer.gate_bias = None
+            layer.e_score_correction_bias = None
+            layer.shared_expert = None
+            layer.shared_expert_gate = None
 
     def _load_cpu_experts(self):
         """Load expert weights into Krasis Rust engine."""
@@ -1410,9 +1595,8 @@ class KrasisModel:
     def _init_kv_caches(self):
         """Allocate paged KV caches per GPU split group.
 
-        For split-attention: one KV cache per GPU, covering that GPU's
-        full attention layers. For hybrid models, linear attention layers
-        get -1 in _kv_layer_offsets.
+        Streaming attention: all attention on GPU0, so single KV cache on GPU0.
+        For hybrid models, linear attention layers get -1 in _kv_layer_offsets.
 
         self.kv_caches[gpu_idx] = KV cache for the gpu_idx'th split group.
         """
@@ -1465,7 +1649,7 @@ class KrasisModel:
         raise ValueError(f"Layer {global_layer_idx} out of range")
 
     def _get_gpu_for_layer(self, layer_idx: int) -> int:
-        """Get GPU index owning a given layer (split-attention)."""
+        """Get GPU index owning a given layer (streaming attention: always 0)."""
         for gpu_idx, (start, end) in enumerate(self._layer_split):
             if start <= layer_idx < end:
                 return gpu_idx
@@ -1493,9 +1677,18 @@ class KrasisModel:
         """
         layer_dev = layer.device
         hcs_dev = self._hcs_device
+        timing = TIMING.decode
+
+        if timing:
+            torch.cuda.synchronize(layer_dev)
+            t0 = time.perf_counter()
 
         # 1. Routing on layer_dev (tiny gate matmul)
         topk_ids, topk_weights = layer.compute_routing(hidden_on_layer_dev)
+
+        if timing:
+            torch.cuda.synchronize(layer_dev)
+            t_routing = time.perf_counter()
 
         # 2. Shared expert on layer_dev (CUDA graph or direct)
         shared_output = None
@@ -1514,10 +1707,18 @@ class KrasisModel:
         elif layer.shared_expert_gate is not None and layer.shared_expert is not None:
             shared_output = layer._shared_expert_forward(hidden_on_layer_dev)
 
+        if timing:
+            # Don't sync shared stream yet — it should overlap with routed experts
+            t_shared_launched = time.perf_counter()
+
         # 3. Transfer to HCS device
         hidden_hcs = _to_device(hidden_on_layer_dev, hcs_dev)
         topk_ids_hcs = _to_device(topk_ids, hcs_dev)
         topk_weights_hcs = _to_device(topk_weights, hcs_dev)
+
+        if timing:
+            torch.cuda.synchronize(hcs_dev)
+            t_xfer_to_hcs = time.perf_counter()
 
         # 4. Routed experts on HCS device via its manager
         hcs_mgr = self.gpu_prefill_managers.get(str(hcs_dev))
@@ -1543,8 +1744,16 @@ class KrasisModel:
                 routed_output = routed_output + shared_output
             return routed_output
 
+        if timing:
+            torch.cuda.synchronize(hcs_dev)
+            t_hcs_done = time.perf_counter()
+
         # 5. Transfer routed output back to layer_dev
         routed_on_layer = _to_device(routed_output, layer_dev)
+
+        if timing:
+            torch.cuda.synchronize(layer_dev)
+            t_xfer_back = time.perf_counter()
 
         # 6. Apply scaling + combine with shared expert
         rsf = self.cfg.routed_scaling_factor
@@ -1558,6 +1767,21 @@ class KrasisModel:
         elif shared_output is not None:
             routed_on_layer = routed_on_layer + shared_output
 
+        if timing:
+            torch.cuda.synchronize(layer_dev)
+            t_combine = time.perf_counter()
+            logger.info(
+                "XDEV-MOE L%d: route=%.2f shared_launch=%.2f xfer_to=%.2f hcs_fwd=%.2f xfer_back=%.2f combine=%.2f total=%.2fms",
+                moe_layer_idx,
+                (t_routing - t0) * 1000,
+                (t_shared_launched - t_routing) * 1000,
+                (t_xfer_to_hcs - t_shared_launched) * 1000,
+                (t_hcs_done - t_xfer_to_hcs) * 1000,
+                (t_xfer_back - t_hcs_done) * 1000,
+                (t_combine - t_xfer_back) * 1000,
+                (t_combine - t0) * 1000,
+            )
+
         return routed_on_layer
 
     def forward(
@@ -1566,12 +1790,12 @@ class KrasisModel:
         positions: torch.Tensor,
         seq_states: List[SequenceKVState],
     ) -> torch.Tensor:
-        """Full forward pass with split-attention multi-GPU support.
+        """Full forward pass with streaming attention architecture.
 
-        Layers are distributed across GPUs (split-attention). During decode (M=1):
-        - Attention runs on each layer's owning GPU
-        - MoE runs on HCS device (GPU with most free VRAM, all experts there)
-        - Hidden bounces between GPUs as needed (8 KB per transfer, negligible)
+        ALL attention runs on GPU0. During decode (M=1):
+        - Attention runs on GPU0 (where all weights live)
+        - MoE runs on HCS device via _cross_device_moe (8 KB hidden transfer)
+        - No cross-GPU hidden state bouncing for attention
 
         Args:
             token_ids: [M] int64 token IDs
@@ -1629,6 +1853,16 @@ class KrasisModel:
         positions_cache = {}  # device -> positions tensor (avoid repeated transfers)
         positions_cache[str(first_dev)] = positions.to(first_dev) if positions.device != first_dev else positions
 
+        # Per-layer timing accumulators (only when timing enabled)
+        if timing:
+            _t_attn_total = 0.0  # total attention time (all layer types)
+            _t_moe_total = 0.0   # total MoE time (cross-device or unified)
+            _t_xfer_total = 0.0  # total cross-device hidden transfers
+            _t_lin_attn_layers = 0  # count of linear attention layers
+            _t_gqa_layers = 0      # count of GQA attention layers
+            _t_moe_layers = 0      # count of MoE layers
+            _t_unified_layers = 0  # count of unified (same-device) layers
+
         for abs_layer_idx in range(self.cfg.num_hidden_layers):
             layer = self.layers[abs_layer_idx]
             layer_dev = torch.device(layer.device)
@@ -1642,10 +1876,16 @@ class KrasisModel:
 
             # Transfer hidden to layer device if needed
             if prev_layer_dev != layer_dev:
+                if timing:
+                    torch.cuda.synchronize(prev_layer_dev)
+                    _t_xfer0 = time.perf_counter()
                 hidden = _to_device(hidden, layer_dev)
                 if residual is not None:
                     residual = _to_device(residual, layer_dev)
                 prev_layer_dev = layer_dev
+                if timing:
+                    torch.cuda.synchronize(layer_dev)
+                    _t_xfer_total += time.perf_counter() - _t_xfer0
 
             # Cache positions per device
             dev_str = str(layer_dev)
@@ -1662,6 +1902,10 @@ class KrasisModel:
             )
 
             if use_cross_device_moe:
+                if timing:
+                    torch.cuda.synchronize(layer_dev)
+                    _t_la = time.perf_counter()
+
                 # Split path: attention on layer_dev, MoE on HCS device
                 if kv_layer_offset < 0:
                     hidden, residual = layer.forward_attn(
@@ -1673,9 +1917,29 @@ class KrasisModel:
                         hidden, residual, layer_positions,
                         kv_cache, seq_state, kv_layer_offset, num_new_tokens=M,
                     )
+
+                if timing:
+                    torch.cuda.synchronize(layer_dev)
+                    _t_la_done = time.perf_counter()
+                    _t_attn_total += _t_la_done - _t_la
+                    if layer.layer_type == "linear_attention":
+                        _t_lin_attn_layers += 1
+                    else:
+                        _t_gqa_layers += 1
+
                 # MoE on HCS device, result back on layer_dev
                 hidden = self._cross_device_moe(layer, hidden, moe_layer_idx)
+
+                if timing:
+                    # _cross_device_moe already syncs internally when timing
+                    _t_moe_done = time.perf_counter()
+                    _t_moe_total += _t_moe_done - _t_la_done
+                    _t_moe_layers += 1
             else:
+                if timing:
+                    torch.cuda.synchronize(layer_dev)
+                    _t_uni0 = time.perf_counter()
+
                 # Unified path: everything on layer_dev
                 if kv_layer_offset < 0:
                     hidden, residual = layer.forward(
@@ -1689,6 +1953,18 @@ class KrasisModel:
                         kv_cache, seq_state, kv_layer_offset,
                         moe_layer_idx, num_new_tokens=M,
                     )
+
+                if timing:
+                    torch.cuda.synchronize(layer_dev)
+                    _t_uni1 = time.perf_counter()
+                    _t_unified_layers += 1
+                    # Unified layers include both attn + MoE in one call
+                    # Attribute to MoE if it's a MoE layer, else attn
+                    if layer.is_moe:
+                        _t_moe_total += _t_uni1 - _t_uni0
+                        _t_moe_layers += 1
+                    else:
+                        _t_attn_total += _t_uni1 - _t_uni0
 
             if TIMING.diag and diag and abs_layer_idx in (0, 1, self.cfg.num_hidden_layers // 2, self.cfg.num_hidden_layers - 1):
                 h = hidden[-1] if hidden.shape[0] > 1 else hidden[0]
@@ -1737,13 +2013,30 @@ class KrasisModel:
         if timing:
             torch.cuda.synchronize()
             t_fwd_end = time.perf_counter()
+            total_ms = (t_fwd_end - t_fwd_start) * 1000
+            layers_ms = (t_after_layers - t_fwd_start) * 1000
+            post_ms = (t_fwd_end - t_after_layers) * 1000
+            attn_ms = _t_attn_total * 1000
+            moe_ms = _t_moe_total * 1000
+            xfer_ms = _t_xfer_total * 1000
             logger.info(
-                "DECODE-TOKEN: total=%.1fms (layers=%.1fms post=%.1fms, %d layers)",
-                (t_fwd_end - t_fwd_start) * 1000,
-                (t_after_layers - t_fwd_start) * 1000,
-                (t_fwd_end - t_after_layers) * 1000,
-                self.cfg.num_hidden_layers,
+                "DECODE-TOKEN: total=%.1fms (layers=%.1fms post=%.1fms)",
+                total_ms, layers_ms, post_ms,
             )
+            logger.info(
+                "  BREAKDOWN: attn=%.1fms (%d lin + %d gqa) moe=%.1fms (%d layers) xfer=%.1fms unified=%d",
+                attn_ms, _t_lin_attn_layers, _t_gqa_layers,
+                moe_ms, _t_moe_layers, xfer_ms, _t_unified_layers,
+            )
+            if layers_ms > 0:
+                logger.info(
+                    "  PERCENT: attn=%.0f%% moe=%.0f%% xfer=%.0f%% post=%.0f%% unaccounted=%.0f%%",
+                    attn_ms / total_ms * 100,
+                    moe_ms / total_ms * 100,
+                    xfer_ms / total_ms * 100,
+                    post_ms / total_ms * 100,
+                    (total_ms - attn_ms - moe_ms - xfer_ms - post_ms) / total_ms * 100,
+                )
 
         return logits
 
@@ -1846,9 +2139,9 @@ class KrasisModel:
         Loop structure (group-outer, chunk-inner):
             for each group → DMA experts once → for each chunk → for each layer → compute
 
-        For multi-GPU (num_gpus > 1), uses Expert Parallelism: each GPU runs
-        its local expert slice on dedicated CUDA streams, GPU-direct summation.
-        For single GPU, uses standard layer.forward() path.
+        Streaming attention: ALL attention runs on GPU0. Expert Parallelism
+        splits MoE experts across all GPUs for parallel compute. No cross-GPU
+        hidden state transfers during attention (only for EP MoE dispatch).
         """
         assert self._loaded, "Model not loaded. Call load() first."
         M = token_ids.shape[0]
@@ -1888,8 +2181,7 @@ class KrasisModel:
             effective_divisor = max(1, self.expert_divisor)
 
         # Use rank 0 as the reference for groups (PP=1: all layers in one rank).
-        # Layers may physically be on different GPUs (split-attention), but the
-        # group computation just needs the full layer range.
+        # Streaming attention: all layers on GPU0, groups for expert DMA chunking.
         rank = self.ranks[0]
         dev = torch.device(rank.device)  # initial device (GPU0)
 
@@ -1921,15 +2213,12 @@ class KrasisModel:
         dma_pool = ThreadPoolExecutor(max_workers=max(len(_dma_managers), 1)) if _dma_managers else None
 
         # Per-GPU CUDA streams for EP compute.
-        # With split attention, any GPU can be the "current" device for a layer,
-        # so we need streams for ALL managers (not just non-primary ones).
+        # GPU0 runs attention on default stream, EP streams handle MoE dispatch.
         ep_streams = {}
         if use_ep:
             for mgr in all_managers:
                 ep_streams[mgr.device] = torch.cuda.Stream(device=mgr.device)
 
-        # ── Lightweight split-attention timing ──
-        # KRASIS_SPLIT_TIMING=1: total-only (preserves parallelism)
         # ── Lightweight per-group timing (DMA vs compute breakdown) ──
         _layer_timing = use_ep and os.environ.get("KRASIS_LAYER_TIMING") == "1"
         if _layer_timing:
@@ -1962,18 +2251,24 @@ class KrasisModel:
             _ep_dense_time = 0.0
 
         # ── DMA pipelining: overlap next group's DMA with current compute ──
-        # Disabled during ep_timing (detailed sync-heavy timing), active_only mode,
-        # and validation sync (synchronous operation for precise error catching).
+        # Disabled during active_only mode and validation sync.
+        # EP timing now uses CUDA events (no sync overhead), so pipelining stays enabled.
         _validation = getattr(self, '_validation_sync', False)
-        _pipeline_enabled = bool(_dma_managers) and not is_active_only and not ep_timing and not _validation
+        _pipeline_enabled = bool(_dma_managers) and not is_active_only and not _validation
         _has_prefetch = False
         _prefetch_futures = []
         if _pipeline_enabled:
             logger.info("DMA pipelining ENABLED (%d managers, %d groups)",
                         len(_dma_managers), len(groups))
 
+        _attn_streaming = getattr(self, '_attn_offloaded', False)
+
         for group_idx, (group_layers, group_moe_indices) in enumerate(groups):
             need_load = group_moe_indices and not is_active_only
+
+            # 0. Load attention weights for this group (streaming mode)
+            if _attn_streaming:
+                self._load_attention_group(group_layers)
 
             # 1. Ensure current group's experts are loaded
             if need_load:
@@ -2017,10 +2312,9 @@ class KrasisModel:
                                          for mgr in _dma_managers]
                     _has_prefetch = True
 
-            # Reset seq_state for this group (all GPU split groups)
-            for ss in seq_states:
-                if ss is not None:
-                    ss.seq_len = 0
+            # Reset seq_state for this group (all attention on GPU0)
+            if seq_states[0] is not None:
+                seq_states[0].seq_len = 0
             if _layer_timing and need_load:
                 _lt_compute0 = time.perf_counter()
 
@@ -2038,22 +2332,12 @@ class KrasisModel:
 
                 for abs_layer_idx in group_layers:
                     layer = self.layers[abs_layer_idx]
-                    layer_dev = torch.device(layer.device)
                     moe_layer_idx = abs_layer_idx - first_k if abs_layer_idx >= first_k else None
                     kv_layer_offset = self._kv_layer_offsets.get(abs_layer_idx, 0)
 
-                    # Transfer to layer's device if needed (split-attention GPU boundary)
-                    if h.device != layer_dev:
-                        h = _to_device(h, layer_dev)
-                        if r is not None:
-                            r = _to_device(r, layer_dev)
-                        pos = _to_device(pos, layer_dev)
-                        dev = layer_dev  # update current device
-
-                    # Get the KV cache for this layer's GPU
-                    gpu_idx = self._get_gpu_for_layer(abs_layer_idx)
-                    kv_cache = self.kv_caches[gpu_idx]
-                    seq_state = seq_states[gpu_idx]
+                    # Streaming attention: all layers on GPU0, no cross-GPU transfers
+                    kv_cache = self.kv_caches[0]
+                    seq_state = seq_states[0]
 
                     # Dense or linear attention layers, or single-GPU: use standard path
                     if not use_ep or moe_layer_idx is None:
@@ -2089,8 +2373,6 @@ class KrasisModel:
                         continue
 
                     # ── Multi-GPU EP path for MoE layers ──
-                    gpu1_dev = self.all_devices[1] if len(self.all_devices) >= 2 else None
-
                     if ep_timing:
                         torch.cuda.synchronize(dev)
                         _t_layer0 = time.perf_counter()
@@ -2112,6 +2394,12 @@ class KrasisModel:
                         _t_attn = time.perf_counter()
                         _attn_dt = _t_attn - _t_layer0
                         _ep_times["attention"] += _attn_dt
+                        dev_key = f"attn_{dev}"
+                        if dev_key not in _ep_times:
+                            _ep_times[dev_key] = 0.0
+                            _ep_times[f"attn_{dev}_count"] = 0
+                        _ep_times[dev_key] += _attn_dt
+                        _ep_times[f"attn_{dev}_count"] += 1
                         if layer.layer_type == "linear_attention":
                             _ep_times["attention_linear"] += _attn_dt
                         else:
@@ -2125,109 +2413,95 @@ class KrasisModel:
                         _t_route = time.perf_counter()
                         _ep_times["routing"] += _t_route - _t_attn
 
-                    # (c) Shared expert on GPU 0 — run SERIALLY for timing
+                    # (c) Shared expert on layer_dev (async overlap with routed experts)
                     shared_output = None
-                    if ep_timing:
-                        # Force serial shared expert for accurate measurement
-                        if layer.shared_expert is not None:
+                    has_shared_overlap = (layer._shared_stream is not None
+                                          and layer.shared_expert is not None)
+                    if has_shared_overlap:
+                        layer._shared_stream.wait_stream(torch.cuda.current_stream(dev))
+                        with torch.cuda.stream(layer._shared_stream):
                             shared_output = layer._shared_expert_forward(h)
-                        torch.cuda.synchronize(dev)
-                        _t_shared = time.perf_counter()
-                        _ep_times["shared_expert"] += _t_shared - _t_route
-                    else:
-                        has_shared_overlap = (layer._shared_stream is not None
-                                              and layer.shared_expert is not None)
-                        if has_shared_overlap:
-                            layer._shared_stream.wait_stream(torch.cuda.current_stream(dev))
-                            with torch.cuda.stream(layer._shared_stream):
-                                shared_output = layer._shared_expert_forward(h)
-                        elif layer.shared_expert is not None:
-                            shared_output = layer._shared_expert_forward(h)
+                    elif layer.shared_expert is not None:
+                        shared_output = layer._shared_expert_forward(h)
 
-                    # (d) Routed experts — SERIAL for timing, parallel otherwise
                     if ep_timing:
-                        # Serial per-GPU forward for accurate timing
-                        partial_outputs = []
-                        for _gi, mgr in enumerate(all_managers):
-                            if mgr.device == dev:
-                                # Same device as layer — run directly
-                                torch.cuda.synchronize(dev)
-                                _t_fwd0 = time.perf_counter()
-                                out = mgr.forward(moe_layer_idx, h, topk_ids, topk_weights,
-                                                  routed_only=True)
-                                torch.cuda.synchronize(dev)
-                                _ep_times[f"gpu{_gi}_forward"] += time.perf_counter() - _t_fwd0
-                                partial_outputs.append((mgr.device, out))
-                            else:
-                                # Different device: measure input copy separately
-                                _t_copy0 = time.perf_counter()
+                        _t_shared = time.perf_counter()
+
+                    # (d) Routed experts — ALWAYS parallel, with CUDA event timing
+                    h_ready = torch.cuda.current_stream(dev).record_event()
+
+                    # CUDA events for per-GPU kernel timing (no sync required)
+                    if ep_timing:
+                        _gpu_events = {}  # gpu_idx -> (start_event, end_event, device)
+
+                    partial_outputs = []
+                    for _gi, mgr in enumerate(all_managers):
+                        if mgr.device == dev:
+                            if ep_timing:
+                                _ev_start = torch.cuda.Event(enable_timing=True)
+                                _ev_end = torch.cuda.Event(enable_timing=True)
+                                _ev_start.record()
+                            out = mgr.forward(moe_layer_idx, h, topk_ids, topk_weights,
+                                              routed_only=True)
+                            if ep_timing:
+                                _ev_end.record()
+                                _gpu_events[_gi] = (_ev_start, _ev_end, dev)
+                            partial_outputs.append((mgr.device, out))
+                        else:
+                            stream = ep_streams[mgr.device]
+                            stream.wait_event(h_ready)
+                            with torch.cuda.stream(stream):
+                                if ep_timing:
+                                    _ev_start = torch.cuda.Event(enable_timing=True)
+                                    _ev_end = torch.cuda.Event(enable_timing=True)
+                                    _ev_start.record(stream)
                                 h_dev = _to_device(h, mgr.device)
                                 ids_dev = _to_device(topk_ids, mgr.device)
                                 wts_dev = _to_device(topk_weights, mgr.device)
-                                torch.cuda.synchronize(mgr.device)
-                                _ep_times[f"gpu{_gi}_input_copy"] += time.perf_counter() - _t_copy0
-
-                                # Different device forward
-                                _t_fwd0 = time.perf_counter()
                                 out = mgr.forward(moe_layer_idx, h_dev, ids_dev, wts_dev,
                                                   routed_only=True)
-                                torch.cuda.synchronize(mgr.device)
-                                _ep_times[f"gpu{_gi}_forward"] += time.perf_counter() - _t_fwd0
+                                if ep_timing:
+                                    _ev_end.record(stream)
+                                    _gpu_events[_gi] = (_ev_start, _ev_end, mgr.device)
                                 partial_outputs.append((mgr.device, out))
 
-                        # Output transfer + summation
-                        torch.cuda.synchronize(dev)
-                        _t_xfer0 = time.perf_counter()
-                        routed_output = None
-                        for po_device, po_out in partial_outputs:
-                            if po_device == dev:
-                                routed_output = po_out
+                    if ep_timing:
+                        _t_dispatch_done = time.perf_counter()
+
+                    if has_shared_overlap:
+                        torch.cuda.current_stream(dev).wait_stream(layer._shared_stream)
+
+                    routed_output = None
+                    for po_device, po_out in partial_outputs:
+                        if po_device == dev:
+                            routed_output = po_out
+                        else:
+                            ep_streams[po_device].synchronize()
+                            out_on_primary = _to_device(po_out, dev)
+                            if routed_output is None:
+                                routed_output = out_on_primary
                             else:
-                                out_on_primary = _to_device(po_out, dev)
-                                if routed_output is None:
-                                    routed_output = out_on_primary
-                                else:
-                                    routed_output = routed_output + out_on_primary
-                        torch.cuda.synchronize(dev)
-                        _ep_times["output_transfer"] += time.perf_counter() - _t_xfer0
+                                routed_output = routed_output + out_on_primary
 
-                    else:
-                        # Normal parallel path (no timing)
-                        h_ready = torch.cuda.current_stream(dev).record_event()
-
-                        partial_outputs = []
-                        for mgr in all_managers:
-                            if mgr.device == dev:
-                                # Same device as layer — run on default stream
-                                out = mgr.forward(moe_layer_idx, h, topk_ids, topk_weights,
-                                                  routed_only=True)
-                                partial_outputs.append((mgr.device, out))
-                            else:
-                                # Different device — use EP stream
-                                stream = ep_streams[mgr.device]
-                                stream.wait_event(h_ready)
-                                with torch.cuda.stream(stream):
-                                    h_dev = _to_device(h, mgr.device)
-                                    ids_dev = _to_device(topk_ids, mgr.device)
-                                    wts_dev = _to_device(topk_weights, mgr.device)
-                                    out = mgr.forward(moe_layer_idx, h_dev, ids_dev, wts_dev,
-                                                      routed_only=True)
-                                    partial_outputs.append((mgr.device, out))
-
-                        if has_shared_overlap:
-                            torch.cuda.current_stream(dev).wait_stream(layer._shared_stream)
-
-                        routed_output = None
-                        for po_device, po_out in partial_outputs:
-                            if po_device == dev:
-                                routed_output = po_out
-                            else:
-                                ep_streams[po_device].synchronize()
-                                out_on_primary = _to_device(po_out, dev)
-                                if routed_output is None:
-                                    routed_output = out_on_primary
-                                else:
-                                    routed_output = routed_output + out_on_primary
+                    if ep_timing:
+                        # Sync all devices to ensure kernels have completed
+                        for _sync_dev in self.all_devices:
+                            try:
+                                torch.cuda.synchronize(_sync_dev)
+                            except Exception as _sync_err:
+                                logger.warning("EP timing: sync %s failed: %s", _sync_dev, _sync_err)
+                        _t_sync_done = time.perf_counter()
+                        # Collect CUDA event timings (GPU kernel times)
+                        for _gi, (_ev_s, _ev_e, _ev_dev) in _gpu_events.items():
+                            try:
+                                _ev_e.synchronize()
+                                _gpu_ms = _ev_s.elapsed_time(_ev_e)
+                                _ep_times[f"gpu{_gi}_forward"] += _gpu_ms / 1000.0
+                            except Exception as _ev_err:
+                                logger.warning("EP timing: gpu%d event error: %s", _gi, _ev_err)
+                        _ep_times["shared_expert"] += (_t_shared - _t_route) if has_shared_overlap else 0
+                        _ep_times["output_transfer"] += _t_sync_done - _t_dispatch_done
+                        _ep_layer_count += 1
 
                     # (f) Apply routed_scaling_factor + shared expert on GPU 0
                     rsf = self.cfg.routed_scaling_factor
@@ -2239,18 +2513,20 @@ class KrasisModel:
                         h = routed_output
 
                     if ep_timing:
-                        torch.cuda.synchronize(dev)
+                        try:
+                            for _sync_dev in self.all_devices:
+                                torch.cuda.synchronize(_sync_dev)
+                        except Exception:
+                            pass
                         _ep_times["layer_total"] += time.perf_counter() - _t_layer0
-                        _ep_layer_count += 1
 
                 # Save for next group
                 chunk_hidden[c] = h
                 chunk_residual[c] = r
 
-                # Advance ALL seq_states for this chunk (layers span multiple GPUs)
-                for ss in seq_states:
-                    if ss is not None:
-                        ss.advance(chunk_M)
+                # Advance KV seq_state (all attention on GPU0 → single cache)
+                if seq_states[0] is not None:
+                    seq_states[0].advance(chunk_M)
             # 4. Free experts for this group
             if _layer_timing and need_load:
                 torch.cuda.synchronize(dev)
@@ -2280,6 +2556,14 @@ class KrasisModel:
                 _lt_free_total += time.perf_counter() - _lt_free0
                 _lt_count += 1
 
+            # 5. Free attention weights for this group (streaming mode)
+            if _attn_streaming:
+                self._free_attention_group(group_layers)
+
+        # Reload all attention weights for decode (streaming mode)
+        if _attn_streaming:
+            self._reload_all_attention()
+
         # Restore EP slicing state (single-GPU only)
         if _saved_ep is not None:
             manager.expert_start, manager.expert_end, manager.num_local_experts = _saved_ep
@@ -2296,23 +2580,36 @@ class KrasisModel:
             logger.info("EP TIMING BREAKDOWN (%d MoE layers, %d dense layers, %d chunks)",
                         _ep_layer_count, _ep_dense_count, num_chunks)
             logger.info("-" * 70)
+            _skip_phases = {"layer_total", "attention_gqa", "attention_linear"}
+            # Also skip per-device attn_* keys (shown separately below)
+            _skip_phases.update(k for k in _ep_times if k.startswith("attn_"))
             for phase, t in _ep_times.items():
-                if phase == "layer_total":
+                if phase in _skip_phases:
                     continue
                 per_layer = (t / _ep_layer_count * 1000) if _ep_layer_count > 0 else 0
                 pct = (t / _ep_times["layer_total"] * 100) if _ep_times["layer_total"] > 0 else 0
                 logger.info("  %-20s %8.1f ms total  %6.2f ms/layer  %5.1f%%",
                             phase, t * 1000, per_layer, pct)
             logger.info("-" * 70)
-            # Per-layer-type attention averages
-            num_gqa = self.cfg.num_full_attention_layers if self.cfg.is_hybrid else _ep_layer_count
-            num_linear = _ep_layer_count - num_gqa
-            if num_gqa > 0:
-                logger.info("  %-20s %6.2f ms/layer  (%d layers)",
-                            "  avg GQA attn", _ep_times["attention_gqa"] / num_gqa * 1000, num_gqa)
-            if num_linear > 0:
-                logger.info("  %-20s %6.2f ms/layer  (%d layers)",
-                            "  avg linear attn", _ep_times["attention_linear"] / num_linear * 1000, num_linear)
+            # Per-layer-type attention averages (multiply by num_chunks for layer-chunks)
+            num_gqa_chunks = (self.cfg.num_full_attention_layers if self.cfg.is_hybrid else _ep_layer_count) * num_chunks
+            num_linear_chunks = _ep_layer_count - num_gqa_chunks
+            if num_gqa_chunks > 0:
+                logger.info("  %-20s %6.2f ms/chunk  (%d layer-chunks)",
+                            "  avg GQA attn", _ep_times["attention_gqa"] / num_gqa_chunks * 1000, num_gqa_chunks)
+            if num_linear_chunks > 0:
+                logger.info("  %-20s %6.2f ms/chunk  (%d layer-chunks)",
+                            "  avg linear attn", _ep_times["attention_linear"] / num_linear_chunks * 1000, num_linear_chunks)
+            # Per-device attention averages
+            for d in self.all_devices:
+                dk = f"attn_{d}"
+                ck = f"attn_{d}_count"
+                if dk in _ep_times and _ep_times[ck] > 0:
+                    logger.info("  %-20s %6.2f ms/chunk  (%d chunks, %.0f ms total)",
+                                f"  attn on {d}",
+                                _ep_times[dk] / _ep_times[ck] * 1000,
+                                int(_ep_times[ck]),
+                                _ep_times[dk] * 1000)
             logger.info("-" * 70)
             logger.info("  %-20s %8.1f ms total  %6.2f ms/layer",
                         "LAYER TOTAL", _ep_times["layer_total"] * 1000,

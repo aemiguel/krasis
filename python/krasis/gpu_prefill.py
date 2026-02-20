@@ -3563,6 +3563,9 @@ class GpuPrefillManager:
         dev_indices = [int(device_lookup[eid]) for eid in topk_list]
         has_cold = any(d < 0 for d in dev_indices)
 
+        if timing:
+            t_classify = time.perf_counter()
+
         # ── Step 1: Submit cold experts to CPU engine (async) ──
         if has_cold:
             cpu_ids = topk_ids.clone()
@@ -3583,9 +3586,16 @@ class GpuPrefillManager:
         # ── Step 2: Replay per-device CUDA graphs ──
         gpu_output = torch.zeros(1, K, dtype=self.params_dtype, device=primary_device)
 
+        if timing:
+            # Per-device timing: wall-clock start/end for parallelism verification
+            _dev_timings = []  # (device_str, n_experts, setup_ms, replay_wall_start, replay_wall_end, accum_ms)
+
         for hcs_dev in self._hcs_devices:
             if moe_layer_idx not in hcs_dev.cuda_graphs:
                 continue
+
+            if timing:
+                _t_dev_start = time.perf_counter()
 
             io = hcs_dev.graph_io[moe_layer_idx]
             graph = hcs_dev.cuda_graphs[moe_layer_idx]
@@ -3599,6 +3609,7 @@ class GpuPrefillManager:
             # Remap global expert IDs → local slot IDs for this device
             lookup_result = lookup[topk_ids.long()]  # [1, top_k] — on primary device
             on_this_dev = lookup_result >= 0
+            n_on_dev = on_this_dev.sum().item()
 
             # Build local_ids and weights for this device
             local_ids = lookup_result.clone().to(topk_ids.dtype)
@@ -3611,8 +3622,14 @@ class GpuPrefillManager:
             io["local_ids"].copy_(local_ids if hcs_dev.is_primary else local_ids.to(hcs_dev.device))
             io["weights"].copy_(dev_weights if hcs_dev.is_primary else dev_weights.to(hcs_dev.device))
 
+            if timing:
+                _t_setup_done = time.perf_counter()
+
             # Replay CUDA graph
             graph.replay()
+
+            if timing:
+                _t_replay_done = time.perf_counter()
 
             # Accumulate output on primary device
             if hcs_dev.is_primary:
@@ -3620,7 +3637,18 @@ class GpuPrefillManager:
             else:
                 gpu_output += io["output"].to(primary_device)
 
+            if timing:
+                _t_accum_done = time.perf_counter()
+                _dev_timings.append((
+                    str(hcs_dev.device), n_on_dev,
+                    (_t_setup_done - _t_dev_start) * 1000,  # setup_ms
+                    _t_setup_done,  # replay wall start (absolute)
+                    _t_replay_done,  # replay wall end (absolute)
+                    (_t_accum_done - _t_replay_done) * 1000,  # accum_ms
+                ))
+
         if timing:
+            # Sync all devices to measure true GPU completion
             torch.cuda.synchronize(primary_device)
             for hcs_dev in self._hcs_devices:
                 if not hcs_dev.is_primary:
@@ -3642,11 +3670,43 @@ class GpuPrefillManager:
             t_end = time.perf_counter()
             n_cold = sum(1 for d in dev_indices if d < 0)
             n_total = len(topk_list)
-            gpu_ms = (t_gpu_done - (t_cpu_submitted if has_cold else t_start)) * 1000
+            classify_ms = (t_classify - t_start) * 1000
+            cpu_submit_ms = (t_cpu_submitted - t_classify) * 1000
+            gpu_ms = (t_gpu_done - t_cpu_submitted) * 1000
             total_ms = (t_end - t_start) * 1000
+
+            # Per-device details
+            dev_details = []
+            for dev_str, n_exp, setup_ms, ws, we, accum_ms in _dev_timings:
+                replay_wall_ms = (we - ws) * 1000
+                dev_details.append(f"{dev_str}({n_exp}exp setup={setup_ms:.2f} replay={replay_wall_ms:.2f} accum={accum_ms:.2f})")
+
+            # Parallelism check: did GPU replays overlap?
+            parallel_note = ""
+            if len(_dev_timings) >= 2:
+                # Check if second device's replay started before first device's replay ended
+                _, _, _, ws0, we0, _ = _dev_timings[0]
+                _, _, _, ws1, we1, _ = _dev_timings[1]
+                overlap_start = max(ws0, ws1)
+                overlap_end = min(we0, we1)
+                if overlap_end > overlap_start:
+                    overlap_ms = (overlap_end - overlap_start) * 1000
+                    parallel_note = f" PARALLEL overlap={overlap_ms:.2f}ms"
+                else:
+                    gap_ms = (max(ws0, ws1) - min(we0, we1)) * 1000
+                    parallel_note = f" SEQUENTIAL gap={gap_ms:.2f}ms"
+
+            cold_detail = ""
+            if has_cold:
+                cpu_wait_ms = (t_cpu_sync_done - t_cpu_sync_start) * 1000
+                cpu_xfer_ms = (t_cpu_to_gpu - t_cpu_sync_done) * 1000
+                cold_detail = f" cpu_wait={cpu_wait_ms:.2f} cpu_xfer={cpu_xfer_ms:.2f}"
+
             logger.info(
-                "HCS-MGPU-GRAPHED L%d: gpu=%.1fms total=%.1fms cold=%d/%d devs=%d",
-                moe_layer_idx, gpu_ms, total_ms, n_cold, n_total, len(self._hcs_devices),
+                "HCS-MGPU L%d: classify=%.2f cpu_sub=%.2f gpu=%.2f%s total=%.2fms cold=%d/%d%s | %s",
+                moe_layer_idx, classify_ms, cpu_submit_ms, gpu_ms,
+                cold_detail, total_ms, n_cold, n_total,
+                parallel_note, " | ".join(dev_details),
             )
 
         if self._heatmap is not None:

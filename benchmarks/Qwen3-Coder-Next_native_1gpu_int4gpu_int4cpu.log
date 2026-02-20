@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-20 20:58:05
+Krasis Benchmark — 2026-02-20 21:37:24
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -27,15 +27,15 @@ Strategy:
   Mode:           gpu_decode (hot_cached_static)
 
 Prefill (10000 tokens, 3 runs):
-  Run 1:  979.4 tok/s, TTFT=10.21s
-  Run 2:  956.4 tok/s, TTFT=10.46s
-  Run 3:  1003.1 tok/s, TTFT=9.97s
-  Average: 979.6 tok/s, TTFT=10.21s
+  Run 1:  977.8 tok/s, TTFT=10.23s
+  Run 2:  955.9 tok/s, TTFT=10.46s
+  Run 3:  1003.2 tok/s, TTFT=9.97s
+  Average: 979.0 tok/s, TTFT=10.22s
 
 Decode (64 tokens, 3 runs):
-  Run 1:  7.89 tok/s (126.8ms/tok)
-  Run 2:  7.94 tok/s (126.0ms/tok)
-  Run 3:  7.84 tok/s (127.5ms/tok)
+  Run 1:  7.90 tok/s (126.6ms/tok)
+  Run 2:  7.90 tok/s (126.6ms/tok)
+  Run 3:  7.86 tok/s (127.2ms/tok)
   Average: 7.89 tok/s (126.8ms/tok)
 
 Verification:
@@ -43,12 +43,13 @@ Verification:
 Distributed consensus algorithms form the backbone of modern fault-tolerant systems. The Paxos algorithm, proposed by Leslie Lamport, achieves consensus among a group of processes even when some ... [52428 chars total]
   Decode prompt:  Write a poem about recursion in programming at least 100 words long.
   Generated output (64 tokens):
-    **The Recursive Ladder**
+    **The Ladder of Self-Call**  
     
-    A function calls itself—soft, precise, and deep—  
-    A mirror held to light, where meaning starts to creep.  
-    Like Russian dolls that nest within one another’s frame,  
-    It peels back layers, whispering the same name.  
+    A function stands, alone and tall,  
+    Its purpose clear, its task to call—  
+    But not with tools of loop or scan,  
+    It turns, instead, to *call itself again*.  
     
-    *"Base case first,"* the
+    “Base case!” cries the guard at dawn,  
+    A simple
 ================================================================
