@@ -132,22 +132,9 @@ def trace_prefill(model, prompt_text, label=""):
                     first_nan_layer = abs_layer_idx
                 break
 
-            # MoE / Dense MLP
+            # MoE / Dense MLP — use CPU path to isolate attention as NaN source
             if moe_layer_idx is not None:
-                if mgr is not None:
-                    mgr.preload_layer_group([moe_layer_idx])
-                    topk_ids, topk_weights = layer.compute_routing(hidden)
-                    mlp_out = mgr.forward(moe_layer_idx, hidden, topk_ids, topk_weights)
-                    # Also do shared expert
-                    if layer.shared_expert_gate is not None or layer.has_shared_expert:
-                        se_out = mgr._shared_expert_forward(moe_layer_idx, hidden)
-                        if layer.shared_expert_gate is not None:
-                            gate = torch.sigmoid(layer.shared_expert_gate(hidden.float())).to(hidden.dtype)
-                            se_out = se_out * gate
-                        mlp_out = mlp_out + se_out
-                    mgr.free_layer_group()
-                else:
-                    mlp_out = layer._moe_forward(hidden, moe_layer_idx)
+                mlp_out = layer._moe_forward(hidden, moe_layer_idx)
             else:
                 mlp_out = layer._dense_mlp_forward(hidden)
 
