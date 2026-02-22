@@ -1462,8 +1462,104 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         cfg.multi_gpu_hcs = True
 
 
+def _ensure_gpu_deps():
+    """Check for CUDA torch + GPU packages, install if missing.
+
+    Runs on first launch (or whenever torch lacks CUDA support on a
+    CUDA-capable machine).  Installs into the current Python environment
+    so subsequent launches are instant.
+    """
+    import shutil
+
+    # Step 1: Is this a CUDA-capable machine?
+    if not shutil.which("nvidia-smi"):
+        return  # no NVIDIA GPU — nothing to do
+
+    # Step 2: Is torch already CUDA-enabled?
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # CUDA torch is fine — check optional GPU packages
+            _ensure_gpu_packages()
+            return
+    except ImportError:
+        pass  # torch not installed at all
+
+    # Step 3: Detect CUDA version from nvidia-smi
+    cuda_ver = None
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=driver_version",
+             "--format=csv,noheader,nounits"],
+            text=True, timeout=10,
+        ).strip().split("\n")[0]
+        # Map driver version to CUDA toolkit version for index URL
+        # Driver 535+ → CUDA 12.1, 545+ → 12.4, 560+ → 12.6
+        major = int(out.split(".")[0])
+        if major >= 560:
+            cuda_ver = "cu126"
+        elif major >= 545:
+            cuda_ver = "cu124"
+        elif major >= 535:
+            cuda_ver = "cu121"
+        elif major >= 525:
+            cuda_ver = "cu118"
+    except Exception:
+        cuda_ver = "cu126"  # default to latest
+
+    if cuda_ver is None:
+        print(f"{YELLOW}Warning: Could not detect CUDA version, skipping auto-setup{NC}")
+        return
+
+    index_url = f"https://download.pytorch.org/whl/{cuda_ver}"
+
+    print(f"{BOLD}GPU detected but torch lacks CUDA support.{NC}")
+    print(f"Installing CUDA-enabled PyTorch ({cuda_ver})...\n")
+
+    # Install CUDA torch
+    cmd = [
+        sys.executable, "-m", "pip", "install",
+        "torch", "--index-url", index_url,
+        "--quiet", "--no-warn-conflicts",
+    ]
+    ret = subprocess.call(cmd)
+    if ret != 0:
+        print(f"{RED}Failed to install CUDA torch. You can install manually:{NC}")
+        print(f"  pip install torch --index-url {index_url}")
+        return
+
+    print(f"{GREEN}CUDA torch installed successfully.{NC}\n")
+    _ensure_gpu_packages()
+
+
+def _ensure_gpu_packages():
+    """Install flashinfer and sgl-kernel if missing."""
+    missing = []
+    for pkg, import_name in [("flashinfer-python", "flashinfer"),
+                              ("sgl-kernel", "sgl_kernel")]:
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pkg)
+
+    if not missing:
+        return
+
+    print(f"Installing GPU packages: {', '.join(missing)}...")
+    cmd = [sys.executable, "-m", "pip", "install"] + missing + ["--quiet"]
+    ret = subprocess.call(cmd)
+    if ret != 0:
+        print(f"{YELLOW}Warning: Failed to install {', '.join(missing)}.{NC}")
+        print(f"  Install manually: pip install {' '.join(missing)}")
+    else:
+        print(f"{GREEN}GPU packages installed.{NC}\n")
+
+
 def main():
     args = parse_args()
+
+    # Auto-setup GPU dependencies on first run
+    _ensure_gpu_deps()
 
     # Handle --benchmark-suite early (no hardware detection or config needed)
     if args.benchmark_suite is not None:
