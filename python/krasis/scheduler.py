@@ -105,6 +105,14 @@ class Scheduler:
         generated_count = 0
 
         try:
+            # Reset linear attention recurrent state between requests.
+            # Without this, conv_state and recurrent_state persist from the
+            # previous request, corrupting output (repetition / garbage).
+            if cfg.is_hybrid:
+                for layer in model.layers:
+                    if layer.layer_type == "linear_attention":
+                        layer.attention.reset_state()
+
             with torch.inference_mode():
                 # ── Prefill ──
                 prompt_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device)

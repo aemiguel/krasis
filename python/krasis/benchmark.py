@@ -219,23 +219,31 @@ class KrasisBenchmark:
     # ──────────────────────────────────────────────────────────
 
     def _load_prompt_file(self, filename: str) -> str:
-        """Load a prompt from benchmarks/<filename>."""
-        benchmarks_dir = os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)
-        )))
-        prompt_path = os.path.join(benchmarks_dir, "benchmarks", filename)
-        with open(prompt_path) as f:
-            return f.read().strip()
+        """Load a prompt from benchmark_data/<filename> inside the package."""
+        pkg_dir = os.path.dirname(os.path.abspath(__file__))
+        prompt_path = os.path.join(pkg_dir, "benchmark_data", filename)
+        if os.path.isfile(prompt_path):
+            with open(prompt_path) as f:
+                return f.read().strip()
+        # Fallback: repo layout (benchmarks/ at repo root)
+        repo_dir = os.path.dirname(os.path.dirname(pkg_dir))
+        prompt_path = os.path.join(repo_dir, "benchmarks", filename)
+        if os.path.isfile(prompt_path):
+            with open(prompt_path) as f:
+                return f.read().strip()
+        raise FileNotFoundError(
+            f"Benchmark prompt file '{filename}' not found in package or repo"
+        )
 
     def _make_prompt(self) -> List[int]:
-        """Load prefill prompt from file and tokenize to ~10K tokens."""
+        """Build prefill prompt (~10K tokens) from file."""
         content = self._load_prompt_file("prefill_prompt_20k")
         messages = [{"role": "user", "content": content}]
         tokens = self.model.tokenizer.apply_chat_template(messages)
         return tokens[:10000]
 
     def _make_short_prompt(self) -> List[int]:
-        """Load decode prompt from file and tokenize."""
+        """Build decode prompt from file."""
         content = self._load_prompt_file("decode_prompt")
         messages = [{"role": "user", "content": content}]
         return self.model.tokenizer.apply_chat_template(messages)
