@@ -112,52 +112,31 @@ def _install_cuda_toolkit():
         return True
 
     print(f"  {YELLOW}nvcc not found — needed for FlashInfer JIT compilation.{NC}")
-
-    # Check if we have sudo
-    is_root = os.geteuid() == 0
-    if not is_root:
-        print(f"\n  {RED}CUDA toolkit installation requires sudo.{NC}")
-        print(f"  Run: {BOLD}sudo krasis-setup{NC}")
-        print(f"  Or install manually:")
-        distro = _detect_distro()
-        if distro == "debian":
-            print(f"    sudo apt install nvidia-cuda-toolkit")
-        elif distro == "rhel":
-            print(f"    sudo dnf install cuda-toolkit")
-        else:
-            print(f"    Install the CUDA toolkit for your distro")
-        return False
+    print(f"  Installing CUDA toolkit (will ask for your password)...\n")
 
     distro = _detect_distro()
-    is_wsl = _is_wsl()
+    # Use sudo in the commands — it will prompt for password if needed
+    sudo = [] if os.geteuid() == 0 else ["sudo"]
 
     if distro == "debian":
-        if is_wsl:
-            print(f"  Installing CUDA toolkit for WSL (Ubuntu)...")
-            # WSL uses the wsl-ubuntu repo
-            cmds = [
-                ["apt-get", "update", "-qq"],
-                ["apt-get", "install", "-y", "-qq", "nvidia-cuda-toolkit"],
-            ]
-        else:
-            print(f"  Installing CUDA toolkit (Ubuntu/Debian)...")
-            cmds = [
-                ["apt-get", "update", "-qq"],
-                ["apt-get", "install", "-y", "-qq", "nvidia-cuda-toolkit"],
-            ]
+        cmds = [
+            sudo + ["apt-get", "update", "-qq"],
+            sudo + ["apt-get", "install", "-y", "nvidia-cuda-toolkit"],
+        ]
         for cmd in cmds:
             ret = _run(cmd, check=False)
             if ret.returncode != 0:
                 print(f"  {RED}Failed. Try manually: sudo apt install nvidia-cuda-toolkit{NC}")
                 return False
     elif distro == "rhel":
-        print(f"  Installing CUDA toolkit (RHEL/Fedora)...")
-        ret = _run(["dnf", "install", "-y", "cuda-toolkit"], check=False)
+        ret = _run(sudo + ["dnf", "install", "-y", "cuda-toolkit"], check=False)
         if ret.returncode != 0:
             print(f"  {RED}Failed. Try manually: sudo dnf install cuda-toolkit{NC}")
             return False
     else:
-        print(f"  {RED}Unknown distro. Install CUDA toolkit manually.{NC}")
+        print(f"  {RED}Unknown distro. Install CUDA toolkit manually:{NC}")
+        print(f"    sudo apt install nvidia-cuda-toolkit  (Debian/Ubuntu)")
+        print(f"    sudo dnf install cuda-toolkit          (Fedora/RHEL)")
         return False
 
     if _has_nvcc():
@@ -258,18 +237,11 @@ def main():
     # Step 1: CUDA toolkit
     results["nvcc"] = _install_cuda_toolkit()
 
-    # Step 2: CUDA torch (runs as current user, not root)
-    # If running as root, skip pip installs (don't install into root's Python)
-    is_root = os.geteuid() == 0
-    if is_root and "SUDO_USER" in os.environ:
-        print(f"\n{BOLD}Step 2-3: Python packages{NC}")
-        print(f"  {DIM}Skipping pip installs under sudo (would install to root).{NC}")
-        print(f"  Run {BOLD}krasis-setup{NC} again as your normal user for Python packages.")
-        results["torch"] = None
-        results["packages"] = None
-    else:
-        results["torch"] = _install_cuda_torch()
-        results["packages"] = _install_gpu_packages()
+    # Step 2: CUDA torch
+    results["torch"] = _install_cuda_torch()
+
+    # Step 3: GPU packages
+    results["packages"] = _install_gpu_packages()
 
     # Summary
     print(f"\n{DIM}{'─' * 50}{NC}")
@@ -282,13 +254,10 @@ def main():
         else:
             print(f"  {DIM}–{NC} {name} (skipped)")
 
-    if all(v is True for v in results.values() if v is not None):
+    if all(v is True for v in results.values()):
         print(f"\n{GREEN}{BOLD}Setup complete! Run 'krasis' to start.{NC}\n")
-    elif results.get("nvcc") is False:
-        print(f"\n{YELLOW}Run {BOLD}sudo krasis-setup{NC}{YELLOW} to install CUDA toolkit,")
-        print(f"then run {BOLD}krasis-setup{NC}{YELLOW} again for Python packages.{NC}\n")
     else:
-        print(f"\n{YELLOW}Some steps failed. See above for manual install commands.{NC}\n")
+        print(f"\n{YELLOW}Some steps failed. See above for details.{NC}\n")
 
 
 if __name__ == "__main__":
