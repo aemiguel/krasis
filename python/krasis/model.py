@@ -3293,7 +3293,11 @@ class KrasisModel:
         # Guard: ensure prompt_tokens is a list of ints
         if isinstance(prompt_tokens, str):
             prompt_tokens = self.tokenizer.encode(prompt_tokens)
-        if prompt_tokens and not isinstance(prompt_tokens[0], int):
+        elif isinstance(prompt_tokens, dict):
+            prompt_tokens = prompt_tokens["input_ids"]
+        elif hasattr(prompt_tokens, "input_ids"):
+            prompt_tokens = prompt_tokens.input_ids
+        if isinstance(prompt_tokens, list) and prompt_tokens and not isinstance(prompt_tokens[0], int):
             prompt_tokens = [int(t) for t in prompt_tokens]
 
         # Create per-GPU-split sequence states (one per KV cache / GPU)

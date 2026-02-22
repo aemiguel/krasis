@@ -47,9 +47,14 @@ class Tokenizer:
         """Force result to List[int] regardless of what transformers returned."""
         if isinstance(result, str):
             return self.tokenizer.encode(result, add_special_tokens=False)
+        # transformers v5: apply_chat_template returns BatchEncoding dict
+        if isinstance(result, dict):
+            result = result["input_ids"]
+        # BatchEncoding may also behave like a dict but have .input_ids
+        if hasattr(result, "input_ids"):
+            result = result.input_ids
         if isinstance(result, list):
             if result and isinstance(result[0], str):
-                # Tokenizer returned list of string tokens — re-encode
                 return self.tokenizer.encode(
                     "".join(result), add_special_tokens=False
                 )
