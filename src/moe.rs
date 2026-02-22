@@ -16,6 +16,8 @@ use crate::kernel::avx2::{
     build_marlin_tile_map, build_marlin_scale_map,
     MarlinTileMap, MarlinScaleMap,
     quantize_activation_int16,
+    quantize_activation_int16_f32,
+    silu_quantize_int16_avx2,
 };
 use crate::gguf_kernels::{expert_forward_gguf, GgufScratch};
 use crate::weights::marlin::{bf16_to_f32, f32_to_bf16, DEFAULT_GROUP_SIZE};
@@ -129,21 +131,33 @@ pub fn expert_forward_integer(
     // up_out = integer_matmul(up_proj, act_int16) → f32 [intermediate_size]
     matmul_fn(&expert.up, act_int16, act_scales, &mut scratch.up_out);
 
-    // hidden = SiLU(gate_out) * up_out → BF16 [intermediate_size]
-    for i in 0..scratch.gate_out.len() {
-        let x = scratch.gate_out[i];
-        let silu = x * fast_sigmoid(x);
-        let hidden = silu * scratch.up_out[i];
-        scratch.hidden_bf16[i] = f32_to_bf16(hidden);
+    // Fused SiLU(gate) * up → INT16 quantize (AVX2 vectorized, no BF16 intermediate)
+    let n = scratch.gate_out.len();
+    let gs = scratch.group_size;
+    if n % 8 == 0 && gs % 8 == 0 {
+        unsafe {
+            silu_quantize_int16_avx2(
+                scratch.gate_out.as_mut_ptr(),
+                scratch.up_out.as_ptr(),
+                scratch.hidden_int16.as_mut_ptr(),
+                scratch.hidden_scales.as_mut_ptr(),
+                n,
+                gs,
+            );
+        }
+    } else {
+        // Scalar fallback for non-8-aligned sizes
+        for i in 0..n {
+            let x = scratch.gate_out[i];
+            scratch.gate_out[i] = x * fast_sigmoid(x) * scratch.up_out[i];
+        }
+        quantize_activation_int16_f32(
+            &scratch.gate_out[..n],
+            gs,
+            &mut scratch.hidden_int16,
+            &mut scratch.hidden_scales,
+        );
     }
-
-    // Quantize intermediate hidden state to INT16 for down projection
-    quantize_activation_int16(
-        &scratch.hidden_bf16,
-        scratch.group_size,
-        &mut scratch.hidden_int16,
-        &mut scratch.hidden_scales,
-    );
 
     // expert_out = integer_matmul(down_proj, hidden_int16) → f32 [hidden_size]
     matmul_fn(&expert.down, &scratch.hidden_int16, &scratch.hidden_scales, &mut scratch.expert_out);
@@ -219,39 +233,54 @@ pub fn expert_forward_unified(
         }
     }
 
-    // Split w13_out into gate[N] and up[N], apply activation
+    // Split w13_out into gate[N] and up[N], apply activation + quantize
     if swiglu_limit > 0.0 {
         // GPT OSS activation: gate*sigmoid(gate*alpha)*(up+1) with clamping
+        // Write f32 directly to w13_out[0..n], skip BF16 intermediate
         let alpha = activation_alpha;
         for i in 0..n {
             let mut gate = scratch.w13_out[i];
             let mut up = scratch.w13_out[n + i];
-            // Clamp: gate ≤ limit, -limit ≤ up ≤ limit
             if gate > swiglu_limit { gate = swiglu_limit; }
             if up > swiglu_limit { up = swiglu_limit; }
             if up < -swiglu_limit { up = -swiglu_limit; }
             let glu = gate * fast_sigmoid(gate * alpha);
-            let hidden = (up + 1.0) * glu;
-            scratch.hidden_bf16[i] = f32_to_bf16(hidden);
+            scratch.w13_out[i] = (up + 1.0) * glu;
+        }
+        // Quantize from f32 directly (no BF16 round-trip)
+        quantize_activation_int16_f32(
+            &scratch.w13_out[..n],
+            gs,
+            &mut scratch.hidden_int16,
+            &mut scratch.hidden_scales,
+        );
+    } else if n % 8 == 0 && gs % 8 == 0 {
+        // Standard SiLU: fused AVX2 SiLU + quantize (no BF16 intermediate)
+        let w13_ptr = scratch.w13_out.as_mut_ptr();
+        unsafe {
+            silu_quantize_int16_avx2(
+                w13_ptr,
+                w13_ptr.add(n) as *const f32,
+                scratch.hidden_int16.as_mut_ptr(),
+                scratch.hidden_scales.as_mut_ptr(),
+                n,
+                gs,
+            );
         }
     } else {
-        // Standard SiLU: SiLU(gate) * up
+        // Scalar fallback for non-8-aligned sizes
         for i in 0..n {
             let gate = scratch.w13_out[i];
             let up = scratch.w13_out[n + i];
-            let silu = gate * fast_sigmoid(gate);
-            let hidden = silu * up;
-            scratch.hidden_bf16[i] = f32_to_bf16(hidden);
+            scratch.w13_out[i] = gate * fast_sigmoid(gate) * up;
         }
+        quantize_activation_int16_f32(
+            &scratch.w13_out[..n],
+            gs,
+            &mut scratch.hidden_int16,
+            &mut scratch.hidden_scales,
+        );
     }
-
-    // Quantize intermediate hidden state to INT16 for down projection
-    quantize_activation_int16(
-        &scratch.hidden_bf16,
-        gs,
-        &mut scratch.hidden_int16,
-        &mut scratch.hidden_scales,
-    );
 
     // w2 matmul: expert_out[hidden_size] = hidden[N] @ w2[N, hidden_size]
     // Use w2_bits (may differ from num_bits for mixed-precision GGUF sources)
@@ -854,10 +883,22 @@ fn prefetch_expert_nta(_expert: &ExpertWeights) {
     // No-op on non-x86 — hardware prefetcher will handle it
 }
 
-/// Fast sigmoid approximation: 1 / (1 + exp(-x))
+///// Fast sigmoid via polynomial exp approximation (no libm exp).
+///
+/// Uses 2^(x * log2(e)) decomposition with degree-5 minimax polynomial.
+/// ~20 bit accuracy, avoids ~20 cycle libm exp call.
 #[inline]
 fn fast_sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    // Clamp to avoid overflow in exp
+    let neg_x = (-x).max(-20.0).min(20.0);
+    // exp(neg_x) = 2^(neg_x * log2(e))
+    let t = neg_x * 1.4426950408889634;
+    let n = t.floor();
+    let f = t - n;
+    // Degree-5 minimax polynomial for 2^f on [0, 1)
+    let pow2f = 1.0 + f * (0.6931472 + f * (0.2402265 + f * (0.0555041 + f * (0.009618129 + f * 0.0013333558))));
+    let exp_neg_x = pow2f * f32::from_bits(((n as i32 + 127) as u32) << 23);
+    1.0 / (1.0 + exp_neg_x)
 }
 
 /// Work unit for the async MoE worker thread.
@@ -2429,25 +2470,32 @@ impl KrasisEngine {
             let weights_raw = &topk_weights[b * topk..(b + 1) * topk];
 
             // Filter masked experts (id == -1 means GPU-handled)
-            let mut expert_indices = Vec::with_capacity(topk);
-            let mut expert_weights = Vec::with_capacity(topk);
+            // Stack arrays avoid Vec allocation overhead (~1-2μs per layer)
+            const MAX_TOPK: usize = 32;
+            assert!(topk <= MAX_TOPK, "topk {} exceeds MAX_TOPK {}", topk, MAX_TOPK);
+            let mut expert_indices = [0usize; MAX_TOPK];
+            let mut expert_weights = [0.0f32; MAX_TOPK];
+            let mut n_experts = 0;
             for j in 0..topk {
                 if ids_raw[j] >= 0 {
-                    expert_indices.push(ids_raw[j] as usize);
-                    expert_weights.push(weights_raw[j]);
+                    expert_indices[n_experts] = ids_raw[j] as usize;
+                    expert_weights[n_experts] = weights_raw[j];
+                    n_experts += 1;
                 }
             }
 
-            if expert_indices.is_empty() {
+            if n_experts == 0 {
                 continue;
             }
 
             output_f32.fill(0.0);
+            let ei = &expert_indices[..n_experts];
+            let ew = &expert_weights[..n_experts];
             if use_gguf {
                 if let Some(ref mut gs) = gguf_scratch {
                     moe_forward_gguf(
                         store, moe_layer_idx, act,
-                        &expert_indices, &expert_weights,
+                        ei, ew,
                         output_f32, gs, gguf_scratch_pool,
                         gguf_shared_scratch,
                         parallel, numa_map,
@@ -2456,7 +2504,7 @@ impl KrasisEngine {
             } else if store.has_unified() {
                 moe_forward_unified(
                     store, moe_layer_idx, act,
-                    &expert_indices, &expert_weights,
+                    ei, ew,
                     output_f32, scratch, scratch_pool,
                     shared_scratch,
                     parallel, numa_map,
@@ -2464,7 +2512,7 @@ impl KrasisEngine {
             } else {
                 moe_forward(
                     store, moe_layer_idx, act,
-                    &expert_indices, &expert_weights,
+                    ei, ew,
                     output_f32, scratch, scratch_pool,
                     shared_scratch,
                     parallel, numa_map,

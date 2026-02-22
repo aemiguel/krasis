@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-22 01:28:17
+Krasis Benchmark — 2026-02-22 07:04:39
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -27,16 +27,16 @@ Strategy:
   Mode:           pure_cpu decode, layer_grouped(2) prefill
 
 Prefill (10000 tokens, 3 runs):
-  Run 1:  962.6 tok/s, TTFT=10.39s
-  Run 2:  1047.3 tok/s, TTFT=9.55s
-  Run 3:  1045.8 tok/s, TTFT=9.56s
-  Average: 1018.6 tok/s, TTFT=9.83s
+  Run 1:  963.2 tok/s, TTFT=10.38s
+  Run 2:  1046.3 tok/s, TTFT=9.56s
+  Run 3:  1044.8 tok/s, TTFT=9.57s
+  Average: 1018.1 tok/s, TTFT=9.84s
 
 Decode (64 tokens, 3 runs):
-  Run 1:  10.46 tok/s (95.6ms/tok)
-  Run 2:  10.38 tok/s (96.3ms/tok)
-  Run 3:  10.11 tok/s (99.0ms/tok)
-  Average: 10.32 tok/s (97.0ms/tok)
+  Run 1:  10.60 tok/s (94.4ms/tok)
+  Run 2:  10.55 tok/s (94.8ms/tok)
+  Run 3:  10.54 tok/s (94.8ms/tok)
+  Average: 10.56 tok/s (94.7ms/tok)
 
 Verification:
   Prefill prompt: user
@@ -45,11 +45,9 @@ Distributed consensus algorithms form the backbone of modern fault-tolerant syst
   Generated output (64 tokens):
     **The Recursive Ladder**
     
-    A function calls itself—no mistake, no flaw—  
-    A mirror held to logic’s shifting law.  
-    It peels the problem layer by layer deep,  
-    Like nested dreams where shadows start to creep.  
-    
-    “*Base case first!*” the wise coder cries,  
-    A harbor
+    A function calls itself—soft, precise, and deep—  
+    A mirror held to functions, while the logic sleeps.  
+    It descends, a spiral, stair by stair,  
+    Each call a step into the unknown air.  
+    *"Base case first!"* it whispers in the glo
 ================================================================

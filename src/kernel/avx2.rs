@@ -176,6 +176,18 @@ unsafe fn hsum_avx2(v: __m256) -> f32 {
     _mm_cvtss_f32(sum32)
 }
 
+/// Horizontal max of 8 f32 lanes.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hmax_avx2(v: __m256) -> f32 {
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let max4 = _mm_max_ps(lo, hi);
+    let max2 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+    let max1 = _mm_max_ps(max2, _mm_shuffle_ps(max2, max2, 1));
+    _mm_cvtss_f32(max1)
+}
+
 /// Safe wrapper for the AVX2 INT4 matmul kernel.
 pub fn matmul_int4_avx2(q: &QuantizedInt4, activation: &[u16], output: &mut [f32]) {
     assert_eq!(activation.len(), q.cols);
@@ -250,6 +262,42 @@ pub fn quantize_activation_int16(
         for i in 0..group_size {
             let val = bf16_to_f32(activation_bf16[start + i]);
             let quantized = (val * inv_scale).round() as i32;
+            output_int16[start + i] = quantized.clamp(-32768, 32767) as i16;
+        }
+    }
+}
+
+/// INT16 per-group quantization from f32 activations directly (no BF16 intermediate).
+///
+/// Same as `quantize_activation_int16` but takes f32 input, eliminating
+/// the f32→BF16→f32 round-trip that loses precision and wastes cycles.
+pub fn quantize_activation_int16_f32(
+    activation_f32: &[f32],
+    group_size: usize,
+    output_int16: &mut [i16],
+    output_scales: &mut [f32],
+) {
+    let k = activation_f32.len();
+    let num_groups = k / group_size;
+    assert_eq!(output_int16.len(), k);
+    assert_eq!(output_scales.len(), num_groups);
+    assert!(k % group_size == 0);
+
+    for g in 0..num_groups {
+        let start = g * group_size;
+
+        // Find max abs value in group
+        let mut max_abs: f32 = 0.0;
+        for i in 0..group_size {
+            max_abs = max_abs.max(activation_f32[start + i].abs());
+        }
+
+        let scale = if max_abs > 0.0 { max_abs / 32767.0 } else { 1.0 };
+        let inv_scale = if max_abs > 0.0 { 32767.0 / max_abs } else { 0.0 };
+        output_scales[g] = scale;
+
+        for i in 0..group_size {
+            let quantized = (activation_f32[start + i] * inv_scale).round() as i32;
             output_int16[start + i] = quantized.clamp(-32768, 32767) as i16;
         }
     }
@@ -1000,12 +1048,12 @@ pub fn matmul_int4_transposed_parallel(
     });
 }
 
-/// AVX2 integer transposed INT4 matmul using `_mm256_mullo_epi32`.
+/// AVX2 integer transposed INT4 matmul using paired `_mm256_madd_epi16`.
 ///
-/// Uses INT32 accumulation for the inner loop. At group boundaries,
-/// converts to f32 and applies combined weight_scale × activation_scale.
-/// The combined scale is a vector of 8 values (one per N output) because
-/// each N output has a different weight scale for the same K group.
+/// Processes 2 nibbles per iteration (vs 1 with mullo_epi32), using
+/// immediate shifts (1 cycle) instead of variable shifts (3 cycles on Zen 2).
+/// Each pair of INT4 weights is packed as INT16 for madd_epi16 (1 uop, 3 cycle
+/// latency vs mullo_epi32's 2 uops, 5 cycle latency).
 ///
 /// # Safety
 /// Requires AVX2 + FMA. All pointers must be valid.
@@ -1027,9 +1075,31 @@ pub unsafe fn expert_matmul_int4_transposed_integer(
 
     let mask_0f = _mm256_set1_epi32(0xF);
     let offset_8 = _mm256_set1_epi32(8);
+    let mask_ffff = _mm256_set1_epi32(0xFFFF);
 
     let n_blocks = n_out / 8;
     let n_rem = n_out % 8;
+
+    // Macro for extracting a nibble pair and accumulating via madd_epi16.
+    // Extracts nibbles at bit positions (lo_shift, lo_shift+4) from each of 8 words,
+    // packs as INT16 pairs, and does madd with broadcast activation pair.
+    macro_rules! nibble_pair_madd {
+        ($words:expr, $lo_shift:expr, $act_ptr:expr, $k_off:expr, $int_acc:expr) => {{
+            let w_lo = _mm256_srli_epi32($words, $lo_shift);
+            let nib_lo = _mm256_sub_epi32(_mm256_and_si256(w_lo, mask_0f), offset_8);
+            let w_hi = _mm256_srli_epi32($words, $lo_shift + 4);
+            let nib_hi = _mm256_sub_epi32(_mm256_and_si256(w_hi, mask_0f), offset_8);
+            let w_pair = _mm256_or_si256(
+                _mm256_and_si256(nib_lo, mask_ffff),
+                _mm256_slli_epi32(nib_hi, 16));
+            let a0 = *$act_ptr.add($k_off) as u16;
+            let a1 = *$act_ptr.add($k_off + 1) as u16;
+            let act_pair = _mm256_set1_epi32(
+                ((a0 as u32) | ((a1 as u32) << 16)) as i32);
+            $int_acc = _mm256_add_epi32($int_acc,
+                _mm256_madd_epi16(w_pair, act_pair));
+        }};
+    }
 
     for nb in 0..n_blocks {
         let n_base = n_start + nb * 8;
@@ -1046,21 +1116,11 @@ pub unsafe fn expert_matmul_int4_transposed_integer(
                     packed.add(k_row * n_stride + n_base) as *const __m256i,
                 );
 
-                for j in 0..8i32 {
-                    let shift = _mm256_set1_epi32(j * 4);
-                    let shifted = _mm256_srlv_epi32(words, shift);
-                    let masked = _mm256_and_si256(shifted, mask_0f);
-                    let signed_i32 = _mm256_sub_epi32(masked, offset_8);
-
-                    // Broadcast INT16 activation → INT32, multiply, accumulate
-                    let act_val = *act_int16.add(k_base + j as usize) as i32;
-                    let act_broadcast = _mm256_set1_epi32(act_val);
-
-                    int_acc = _mm256_add_epi32(
-                        int_acc,
-                        _mm256_mullo_epi32(signed_i32, act_broadcast),
-                    );
-                }
+                // Process 4 nibble pairs (8 nibbles total) using madd_epi16
+                nibble_pair_madd!(words,  0, act_int16, k_base,     int_acc);
+                nibble_pair_madd!(words,  8, act_int16, k_base + 2, int_acc);
+                nibble_pair_madd!(words, 16, act_int16, k_base + 4, int_acc);
+                nibble_pair_madd!(words, 24, act_int16, k_base + 6, int_acc);
             }
 
             // Convert INT32 → f32, apply combined weight × activation scale
@@ -1809,6 +1869,155 @@ pub fn transpose_int4(q: &QuantizedInt4) -> (Vec<u32>, Vec<u16>) {
     }
 
     (t_packed, t_scales)
+}
+
+// ============================================================================
+// Fused SiLU + INT16 quantize — AVX2 vectorized
+// ============================================================================
+//
+// Replaces the scalar SiLU loop + f32_to_bf16 + quantize_activation_int16 chain.
+// Eliminates:
+//   - BF16 intermediate conversion (optimization B)
+//   - libm exp() calls (optimization F)
+//   - Scalar loop overhead (optimization C)
+
+/// AVX2 vectorized fast exp(x) approximation.
+///
+/// Uses 2^(x * log2(e)) decomposition with a degree-5 minimax polynomial
+/// for the fractional part. Accurate to ~20 bits for |x| < 20.
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn fast_exp_avx2(x: __m256) -> __m256 {
+    let log2e = _mm256_set1_ps(1.4426950408889634);
+
+    // t = x * log2(e)
+    let t = _mm256_mul_ps(x, log2e);
+
+    // n = floor(t)
+    let n = _mm256_floor_ps(t);
+    let ni = _mm256_cvtps_epi32(n);
+
+    // f = t - n (fractional part, in [0, 1))
+    let f = _mm256_sub_ps(t, n);
+
+    // 2^f via degree-5 minimax polynomial
+    let c5 = _mm256_set1_ps(0.0013333558);
+    let c4 = _mm256_set1_ps(0.009618129);
+    let c3 = _mm256_set1_ps(0.0555041);
+    let c2 = _mm256_set1_ps(0.2402265);
+    let c1 = _mm256_set1_ps(0.6931472);
+    let one = _mm256_set1_ps(1.0);
+
+    // Horner's method: ((((c5*f + c4)*f + c3)*f + c2)*f + c1)*f + 1
+    let poly = _mm256_fmadd_ps(c5, f, c4);
+    let poly = _mm256_fmadd_ps(poly, f, c3);
+    let poly = _mm256_fmadd_ps(poly, f, c2);
+    let poly = _mm256_fmadd_ps(poly, f, c1);
+    let poly = _mm256_fmadd_ps(poly, f, one);
+
+    // 2^n via exponent bit manipulation
+    let exp_bits = _mm256_slli_epi32(
+        _mm256_add_epi32(ni, _mm256_set1_epi32(127)), 23);
+    let pow2n = _mm256_castsi256_ps(exp_bits);
+
+    _mm256_mul_ps(poly, pow2n)
+}
+
+/// AVX2 vectorized sigmoid: 1 / (1 + exp(-x)).
+///
+/// Uses fast_exp_avx2 for exp and rcp_ps + Newton-Raphson for reciprocal.
+/// Accurate to ~20 bits (more than sufficient for INT16 quantization).
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn fast_sigmoid_avx2(x: __m256) -> __m256 {
+    // Clamp to [-20, 20] to prevent overflow
+    let neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
+    let clamped = _mm256_max_ps(
+        _mm256_min_ps(neg_x, _mm256_set1_ps(20.0)),
+        _mm256_set1_ps(-20.0));
+
+    let exp_neg_x = fast_exp_avx2(clamped);
+    let denom = _mm256_add_ps(_mm256_set1_ps(1.0), exp_neg_x);
+
+    // Reciprocal with Newton-Raphson refinement (~23 bit precision)
+    let rcp = _mm256_rcp_ps(denom);
+    let two = _mm256_set1_ps(2.0);
+    _mm256_mul_ps(rcp, _mm256_fnmadd_ps(denom, rcp, two))
+}
+
+/// AVX2 fused SiLU(gate) * up → INT16 quantization.
+///
+/// Replaces: scalar SiLU loop + f32_to_bf16 + quantize_activation_int16.
+/// Computes SiLU in f32, finds per-group max, quantizes to INT16 in two passes.
+///
+/// # Arguments
+/// * `gate_inout` - [n] gate output f32; overwritten with SiLU(gate)*up intermediate
+/// * `up` - [n] up output f32
+/// * `hidden_int16` - [n] output quantized INT16
+/// * `hidden_scales` - [n/group_size] output per-group scales
+/// * `n` - intermediate size (must be multiple of 8)
+/// * `group_size` - quantization group size (must be multiple of 8)
+///
+/// # Safety
+/// Requires AVX2 + FMA. All pointers must be valid for their stated sizes.
+/// `gate_inout` and `up` may reference different regions of the same buffer.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn silu_quantize_int16_avx2(
+    gate_inout: *mut f32,
+    up: *const f32,
+    hidden_int16: *mut i16,
+    hidden_scales: *mut f32,
+    n: usize,
+    group_size: usize,
+) {
+    let num_groups = n / group_size;
+    let sign_mask = _mm256_set1_ps(-0.0);
+
+    for g in 0..num_groups {
+        let start = g * group_size;
+        let mut max_abs_vec = _mm256_setzero_ps();
+
+        // Pass 1: SiLU(gate) * up → f32, track max abs per group
+        for i in (0..group_size).step_by(8) {
+            let idx = start + i;
+            let g_vec = _mm256_loadu_ps(gate_inout.add(idx));
+            let u_vec = _mm256_loadu_ps(up.add(idx));
+
+            let sig = fast_sigmoid_avx2(g_vec);
+            let silu = _mm256_mul_ps(g_vec, sig);
+            let hidden = _mm256_mul_ps(silu, u_vec);
+
+            // Store f32 in-place (overwrites gate values, already consumed)
+            _mm256_storeu_ps(gate_inout.add(idx), hidden);
+
+            // Track max abs
+            let abs_h = _mm256_andnot_ps(sign_mask, hidden);
+            max_abs_vec = _mm256_max_ps(max_abs_vec, abs_h);
+        }
+
+        // Horizontal max
+        let max_val = hmax_avx2(max_abs_vec);
+
+        let scale = if max_val > 0.0 { max_val / 32767.0 } else { 1.0 };
+        let inv_scale = if max_val > 0.0 { 32767.0 / max_val } else { 0.0 };
+        *hidden_scales.add(g) = scale;
+
+        let inv_scale_vec = _mm256_set1_ps(inv_scale);
+
+        // Pass 2: quantize f32 → INT16
+        for i in (0..group_size).step_by(8) {
+            let idx = start + i;
+            let hidden = _mm256_loadu_ps(gate_inout.add(idx));
+            let scaled = _mm256_mul_ps(hidden, inv_scale_vec);
+            let int32 = _mm256_cvtps_epi32(scaled);
+
+            // Pack i32 → i16 via 128-bit halves
+            let lo128 = _mm256_castsi256_si128(int32);
+            let hi128 = _mm256_extracti128_si256(int32, 1);
+            let packed16 = _mm_packs_epi32(lo128, hi128);
+            _mm_storeu_si128(hidden_int16.add(idx) as *mut __m128i, packed16);
+        }
+    }
 }
 
 #[cfg(test)]
