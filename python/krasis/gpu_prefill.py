@@ -1609,9 +1609,32 @@ class GpuPrefillManager:
 
         Synchronizes the prefetch stream, then swaps _prefetch_persistent into
         _persistent so that forward() can use the prefetched expert weights.
+
+        Critical: tensors were allocated on the prefetch stream but will be
+        consumed on the default stream. We must:
+        1. Make the default stream wait for the prefetch stream (GPU-side ordering)
+        2. Call record_stream() so the allocator won't recycle the memory until
+           the default stream finishes using it
         """
         if self._prefetch_stream is not None:
-            self._prefetch_stream.synchronize()
+            # GPU-side ordering: default stream waits for prefetch DMA to complete.
+            # stream.synchronize() is host-side only — it doesn't establish
+            # GPU-side ordering between the prefetch and default streams.
+            event = self._prefetch_stream.record_event()
+            torch.cuda.current_stream(self.device).wait_event(event)
+
+        # Mark all prefetched tensors as used by the default (current) stream.
+        # Without this, PyTorch's allocator may recycle the memory after
+        # free_layer_group() drops references, even if the default stream
+        # is still reading these tensors for compute.
+        cur_stream = torch.cuda.current_stream(self.device)
+        for buffers in self._prefetch_persistent.values():
+            for t in buffers.values():
+                t.record_stream(cur_stream)
+        for buffers in self._prefetch_persistent_shared.values():
+            for t in buffers.values():
+                t.record_stream(cur_stream)
+
         self._persistent = self._prefetch_persistent
         self._persistent_shared = self._prefetch_persistent_shared
         self._prefetch_persistent = {}
