@@ -444,6 +444,8 @@ def main():
                         help="Run standardized benchmark before starting server")
     parser.add_argument("--benchmark-only", action="store_true",
                         help="Run benchmark and exit (don't start server)")
+    parser.add_argument("--stress-test", action="store_true",
+                        help="Run stress test (diverse prompts) and exit")
     parser.add_argument("--hcs", action="store_true",
                         help="Enable HCS expert cache — pin hot experts on GPU for decode")
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -775,6 +777,14 @@ def main():
         bench.run()
         if args.benchmark_only:
             sys.exit(0)
+
+    # Run stress test if requested
+    if args.stress_test:
+        from krasis.stress_test import StressTest
+        st = StressTest(_model)
+        results = st.run()
+        failed = sum(1 for r in results if r["status"].startswith("FAIL"))
+        sys.exit(1 if failed > 0 else 0)
 
     _status(f"Server ready on {args.host}:{args.port}")
     logger.info("Model loaded, starting server on %s:%d", args.host, args.port)

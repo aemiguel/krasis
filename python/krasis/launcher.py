@@ -758,6 +758,7 @@ def _launch_mode_screen() -> Optional[str]:
         ("Launch", "Start the server immediately", "launch"),
         ("Benchmark and Launch", "Run prefill + decode benchmark, then start server", "benchmark"),
         ("Benchmark Only", "Run benchmark and exit", "benchmark_only"),
+        ("Stress Test", "Run diverse prompts to catch edge cases", "stress_test"),
         ("Benchmark Suite", "Run all model \u00d7 config combos from suite config", "suite"),
     ]
     cursor = 0
@@ -1311,7 +1312,8 @@ class Launcher:
             print(f"  CPU experts: {budget['cpu_expert_gb']:.1f} GB / {budget['total_ram_gb']} GB")
         print()
 
-    def launch_server(self, benchmark: bool = False, benchmark_only: bool = False) -> None:
+    def launch_server(self, benchmark: bool = False, benchmark_only: bool = False,
+                      stress_test: bool = False) -> None:
         """Build args and exec the Krasis server."""
         num_gpus = len(self.selected_gpus) if self.selected_gpus else self.hw["gpu_count"]
 
@@ -1344,6 +1346,8 @@ class Launcher:
             cmd_args.append("--benchmark")
         if benchmark_only:
             cmd_args.append("--benchmark-only")
+        if stress_test:
+            cmd_args.append("--stress-test")
 
         # Set CUDA_VISIBLE_DEVICES to selected GPUs
         if self.selected_gpus:
@@ -1678,6 +1682,7 @@ def main():
             launcher.launch_server(
                 benchmark=(launch_mode in ("benchmark", "benchmark_only")),
                 benchmark_only=(launch_mode == "benchmark_only"),
+                stress_test=(launch_mode == "stress_test"),
             )
         else:
             print("Aborted.")
