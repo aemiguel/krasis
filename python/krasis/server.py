@@ -293,6 +293,10 @@ def _build_heatmap(model: KrasisModel, save_path: str) -> str:
     model.layer_group_size = 1
     model._init_gpu_prefill()
 
+    # Enable heatmap collection on all managers
+    for manager in model.gpu_prefill_managers.values():
+        manager.enable_heatmap()
+
     # Run inference to gather heatmap
     logger.info("Building heatmap with %d tokens...", len(tokens))
     with torch.inference_mode():
@@ -771,7 +775,7 @@ def main():
         )
 
     # Run benchmark if requested (after model load + strategy, before serving)
-    if args.benchmark:
+    if args.benchmark or args.benchmark_only:
         from krasis.benchmark import KrasisBenchmark
         bench = KrasisBenchmark(_model)
         bench.run()

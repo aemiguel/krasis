@@ -416,8 +416,9 @@ class GpuPrefillManager:
         self._ao_cache_hits: int = 0
         self._ao_cache_misses: int = 0
 
-        # Expert activation heatmap: {(layer, expert): count} — built during warmup
-        self._heatmap: dict[tuple[int, int], int] = {}
+        # Expert activation heatmap: {(layer, expert): count} — built only when needed
+        # None = disabled (no overhead), {} = actively collecting
+        self._heatmap: dict[tuple[int, int], int] | None = None
         self._heatmap_requests: int = 0
 
         # Static pin state: pinned (layer, expert) → {w13, w13_scale, w2, w2_scale} on GPU
@@ -2317,6 +2318,16 @@ class GpuPrefillManager:
             "pinned_experts": len(self._pinned),
         }
 
+    def enable_heatmap(self):
+        """Enable expert activation heatmap collection.
+
+        Must be called before inference if you want to accumulate heatmap data
+        (e.g. for heatmap building or warmup-based pinning). Disabled by default
+        to avoid overhead during normal inference.
+        """
+        if self._heatmap is None:
+            self._heatmap = {}
+
     def configure_pinning(self, budget_mb: float = 0, warmup_requests: int = 1,
                           strategy: str = "uniform"):
         """Configure static expert pinning.
@@ -2335,6 +2346,7 @@ class GpuPrefillManager:
         self._pin_budget_mb = budget_mb
         self._warmup_requests = warmup_requests
         self._pin_strategy = strategy
+        self.enable_heatmap()  # Need heatmap data for warmup-based pinning
         per_expert_mb = self._per_expert_vram_bytes() / 1e6
         max_slots = int(budget_mb / per_expert_mb)
         logger.info(

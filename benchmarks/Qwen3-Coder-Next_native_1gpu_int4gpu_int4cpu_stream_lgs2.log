@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-22 12:30:03
+Krasis Benchmark — 2026-02-22 16:10:03
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -27,28 +27,30 @@ Strategy:
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
 Prefill (10000 tokens, 3 runs):
-  Run 1:  973.5 tok/s, TTFT=10.27s
-  Run 2:  1047.1 tok/s, TTFT=9.55s
-  Run 3:  1045.5 tok/s, TTFT=9.57s
-  Average: 1022.0 tok/s, TTFT=9.80s
+  Run 1:  971.3 tok/s, TTFT=10.30s
+  Run 2:  1051.6 tok/s, TTFT=9.51s
+  Run 3:  1050.4 tok/s, TTFT=9.52s
+  Average: 1024.4 tok/s, TTFT=9.78s
 
 Decode (64 tokens, 3 runs):
-  Run 1:  7.38 tok/s (135.6ms/tok)
-  Run 2:  7.35 tok/s (136.1ms/tok)
-  Run 3:  7.40 tok/s (135.2ms/tok)
-  Average: 7.38 tok/s (135.6ms/tok)
+  Run 1:  7.84 tok/s (127.6ms/tok)
+  Run 2:  7.80 tok/s (128.3ms/tok)
+  Run 3:  7.83 tok/s (127.7ms/tok)
+  Average: 7.82 tok/s (127.9ms/tok)
 
 Verification:
   Prefill prompt: user
 Distributed consensus algorithms form the backbone of modern fault-tolerant systems. The Paxos algorithm, proposed by Leslie Lamport, achieves consensus among a group of processes even when some ... [52428 chars total]
   Decode prompt:  Write a poem about recursion in programming at least 100 words long.
   Generated output (64 tokens):
-    **The Recursive Ladder**  
+    **The Recursive Ladder**
     
-    A function calls itself—soft, precise, and deep—  
-    A mirror held to light within the code’s own keep.  
-    No loop of *for* or *while*, no tangled spin,  
-    Just *self-invocation*, where the logic’s win.  
+    A function calls itself—a whispered trace,  
+    A mirror held to time and space.  
+    Not error, but a spiral’s grace,  
+    A tower built in nested space.  
     
-    It starts with
+    It starts with base: a quiet door,  
+    A floor where recursion stops—  
+    No more calls, no
 ================================================================

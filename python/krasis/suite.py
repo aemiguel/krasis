@@ -206,7 +206,7 @@ class SuiteRunner:
             self.python, "-m", "krasis.server",
             "--model-path", combo.model_path,
             "--num-gpus", str(combo.num_gpus),
-            "--benchmark",
+            "--benchmark-only",
             "--layer-group-size", str(combo.layer_group_size),
             "--kv-dtype", combo.kv_dtype,
             "--gpu-expert-bits", str(combo.gpu_expert_bits),

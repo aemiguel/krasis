@@ -1,0 +1,171 @@
+
+[1m[36m▸ Loading model weights[0m
+
+[1m[36m▸ Loading GPU weights[0m
+
+[1m[36m▸ Offloading attention for streaming decode[0m
+
+[1m[36m▸ Loading CPU expert weights[0m
+
+[1m[36m▸ Initializing GPU prefill managers[0m
+
+[1m[36m▸ Warming up CUDA runtime[0m
+
+[1m[36m▸ Pure CPU MoE decode (use --hcs to enable expert caching)[0m
+
+[1m════════════════════════════════════════════════
+  KRASIS BENCHMARK
+════════════════════════════════════════════════[0m
+
+[1m[36m▸ Collecting system info[0m
+  Model:    [1mQwen3-Coder-Next[0m
+  GPUs:     3x NVIDIA RTX 2000 Ada Generation
+  Strategy: pure_cpu decode, layer_grouped(2) + stream_attn prefill
+
+[1m[36m▸ Loading benchmark prompts[0m
+  Prefill: 10,000 tokens
+  Decode:  24 tokens
+
+[1m[36m▸ Warmup (2 short generations)[0m
+  Warmup: 2 short generations...
+  Warmup complete.
+
+[1m[36m▸ Running prefill benchmark (10,000 tokens, 3 runs)[0m
+  Run 1: 971.3 tok/s, TTFT=10.30s
+  Run 2: 1051.6 tok/s, TTFT=9.51s
+  Run 3: 1050.4 tok/s, TTFT=9.52s
+  [1mAverage: 1024.4 tok/s, TTFT=9.78s[0m
+
+[1m[36m▸ Running decode benchmark (64 tokens, 3 runs)[0m
+  Run 1: 7.84 tok/s (127.6ms/tok)
+  Run 2: 7.80 tok/s (128.3ms/tok)
+  Run 3: 7.83 tok/s (127.7ms/tok)
+  [1mAverage: 7.82 tok/s (127.9ms/tok)[0m
+
+[1m[36m▸ Writing results[0m
+
+[1m────────────────────────────────────────────────
+  BENCHMARK COMPLETE
+────────────────────────────────────────────────[0m
+  Prefill: [32m[1m1024.4 tok/s[0m  TTFT=9.78s
+  Decode:  [32m[1m7.82 tok/s[0m  (127.9ms/tok)
+  Log:     [2mbenchmarks/Qwen3-Coder-Next_native_1gpu_int4gpu_int4cpu_stream_lgs2.log[0m
+
+
+
+--- STDERR ---
+2026-02-22 16:07:52,950 krasis.server INFO Logging to /home/main/Documents/Claude/krasis/krasis.log
+2026-02-22 16:07:52,951 krasis.server INFO HCS strategy: PP=1, 1 GPUs available
+2026-02-22 16:07:52,951 krasis.model INFO KrasisModel: 48 layers, PP=[48], 1 GPUs, attn=flashinfer, hybrid=12 full + 36 linear
+2026-02-22 16:07:52,996 krasis.server INFO ── Loading model weights ──
+2026-02-22 16:07:52,996 krasis.model INFO RAM budget: experts=39.9 GB, overhead=20.0 GB, total=59.9 GB needed | system: 995.5 GB total, 952.8 GB available
+2026-02-22 16:07:52,996 krasis.model INFO RAM budget OK: 59.9 GB needed, 935.6 GB headroom
+2026-02-22 16:07:52,997 krasis.model INFO RAM watchdog started: will exit if < 5.0% free
+2026-02-22 16:07:52,997 krasis.model INFO Phase 1: Loading GPU weights (streaming INT8)...
+2026-02-22 16:07:53,156 krasis.model INFO Streaming attention: all 48 layers on GPU0, 1 GPUs for EP
+2026-02-22 16:07:53,156 krasis.model INFO Loading full base model to cuda:0...
+2026-02-22 16:07:53,156 krasis.weight_loader INFO Loading embedding: model.embed_tokens.weight
+2026-02-22 16:07:53,411 krasis.weight_loader INFO Layer 0 loaded in 0.2s (GPU alloc: 631 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:53,581 krasis.weight_loader INFO Layer 1 loaded in 0.2s (GPU alloc: 672 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:53,737 krasis.weight_loader INFO Layer 2 loaded in 0.2s (GPU alloc: 714 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:53,864 krasis.weight_loader INFO Layer 3 loaded in 0.1s (GPU alloc: 749 MB, moe=True, type=full_attention)
+2026-02-22 16:07:53,865 krasis.attention INFO Layer 3: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:54,031 krasis.weight_loader INFO Layer 4 loaded in 0.2s (GPU alloc: 926 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:54,181 krasis.weight_loader INFO Layer 5 loaded in 0.1s (GPU alloc: 967 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:54,332 krasis.weight_loader INFO Layer 6 loaded in 0.2s (GPU alloc: 1009 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:54,449 krasis.weight_loader INFO Layer 7 loaded in 0.1s (GPU alloc: 1044 MB, moe=True, type=full_attention)
+2026-02-22 16:07:54,449 krasis.attention INFO Layer 7: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:54,610 krasis.weight_loader INFO Layer 8 loaded in 0.2s (GPU alloc: 1093 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:54,762 krasis.weight_loader INFO Layer 9 loaded in 0.2s (GPU alloc: 1134 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:54,915 krasis.weight_loader INFO Layer 10 loaded in 0.2s (GPU alloc: 1175 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:55,036 krasis.weight_loader INFO Layer 11 loaded in 0.1s (GPU alloc: 1210 MB, moe=True, type=full_attention)
+2026-02-22 16:07:55,036 krasis.attention INFO Layer 11: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:55,199 krasis.weight_loader INFO Layer 12 loaded in 0.2s (GPU alloc: 1260 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:55,351 krasis.weight_loader INFO Layer 13 loaded in 0.2s (GPU alloc: 1301 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:55,505 krasis.weight_loader INFO Layer 14 loaded in 0.2s (GPU alloc: 1342 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:55,625 krasis.weight_loader INFO Layer 15 loaded in 0.1s (GPU alloc: 1377 MB, moe=True, type=full_attention)
+2026-02-22 16:07:55,626 krasis.attention INFO Layer 15: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:55,788 krasis.weight_loader INFO Layer 16 loaded in 0.2s (GPU alloc: 1427 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:55,943 krasis.weight_loader INFO Layer 17 loaded in 0.2s (GPU alloc: 1468 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:56,094 krasis.weight_loader INFO Layer 18 loaded in 0.2s (GPU alloc: 1509 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:56,215 krasis.weight_loader INFO Layer 19 loaded in 0.1s (GPU alloc: 1544 MB, moe=True, type=full_attention)
+2026-02-22 16:07:56,215 krasis.attention INFO Layer 19: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:56,378 krasis.weight_loader INFO Layer 20 loaded in 0.2s (GPU alloc: 1594 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:56,533 krasis.weight_loader INFO Layer 21 loaded in 0.2s (GPU alloc: 1635 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:56,688 krasis.weight_loader INFO Layer 22 loaded in 0.2s (GPU alloc: 1676 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:56,809 krasis.weight_loader INFO Layer 23 loaded in 0.1s (GPU alloc: 1711 MB, moe=True, type=full_attention)
+2026-02-22 16:07:56,809 krasis.attention INFO Layer 23: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:56,969 krasis.weight_loader INFO Layer 24 loaded in 0.2s (GPU alloc: 1760 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:57,122 krasis.weight_loader INFO Layer 25 loaded in 0.2s (GPU alloc: 1802 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:57,277 krasis.weight_loader INFO Layer 26 loaded in 0.2s (GPU alloc: 1843 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:57,398 krasis.weight_loader INFO Layer 27 loaded in 0.1s (GPU alloc: 1878 MB, moe=True, type=full_attention)
+2026-02-22 16:07:57,399 krasis.attention INFO Layer 27: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:57,561 krasis.weight_loader INFO Layer 28 loaded in 0.2s (GPU alloc: 1927 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:57,716 krasis.weight_loader INFO Layer 29 loaded in 0.2s (GPU alloc: 1969 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:57,867 krasis.weight_loader INFO Layer 30 loaded in 0.2s (GPU alloc: 2010 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:57,989 krasis.weight_loader INFO Layer 31 loaded in 0.1s (GPU alloc: 2045 MB, moe=True, type=full_attention)
+2026-02-22 16:07:57,989 krasis.attention INFO Layer 31: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:58,153 krasis.weight_loader INFO Layer 32 loaded in 0.2s (GPU alloc: 2094 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:58,309 krasis.weight_loader INFO Layer 33 loaded in 0.2s (GPU alloc: 2135 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:58,464 krasis.weight_loader INFO Layer 34 loaded in 0.2s (GPU alloc: 2177 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:58,583 krasis.weight_loader INFO Layer 35 loaded in 0.1s (GPU alloc: 2212 MB, moe=True, type=full_attention)
+2026-02-22 16:07:58,583 krasis.attention INFO Layer 35: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:58,747 krasis.weight_loader INFO Layer 36 loaded in 0.2s (GPU alloc: 2261 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:58,901 krasis.weight_loader INFO Layer 37 loaded in 0.2s (GPU alloc: 2302 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:59,055 krasis.weight_loader INFO Layer 38 loaded in 0.2s (GPU alloc: 2344 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:59,176 krasis.weight_loader INFO Layer 39 loaded in 0.1s (GPU alloc: 2379 MB, moe=True, type=full_attention)
+2026-02-22 16:07:59,176 krasis.attention INFO Layer 39: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:59,337 krasis.weight_loader INFO Layer 40 loaded in 0.2s (GPU alloc: 2428 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:59,490 krasis.weight_loader INFO Layer 41 loaded in 0.2s (GPU alloc: 2469 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:59,645 krasis.weight_loader INFO Layer 42 loaded in 0.2s (GPU alloc: 2510 MB, moe=True, type=linear_attention)
+2026-02-22 16:07:59,764 krasis.weight_loader INFO Layer 43 loaded in 0.1s (GPU alloc: 2545 MB, moe=True, type=full_attention)
+2026-02-22 16:07:59,764 krasis.attention INFO Layer 43: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:07:59,925 krasis.weight_loader INFO Layer 44 loaded in 0.2s (GPU alloc: 2595 MB, moe=True, type=linear_attention)
+2026-02-22 16:08:00,088 krasis.weight_loader INFO Layer 45 loaded in 0.2s (GPU alloc: 2636 MB, moe=True, type=linear_attention)
+2026-02-22 16:08:00,240 krasis.weight_loader INFO Layer 46 loaded in 0.2s (GPU alloc: 2677 MB, moe=True, type=linear_attention)
+2026-02-22 16:08:00,359 krasis.weight_loader INFO Layer 47 loaded in 0.1s (GPU alloc: 2712 MB, moe=True, type=full_attention)
+2026-02-22 16:08:00,359 krasis.attention INFO Layer 47: gated attention detected (q_proj dim=8192, expected=4096)
+2026-02-22 16:08:00,367 krasis.weight_loader INFO Loading final norm: model.norm.weight
+2026-02-22 16:08:00,369 krasis.weight_loader INFO Loading LM head: lm_head.weight (precision=int8)
+2026-02-22 16:08:01,538 krasis.model INFO VRAM[after-all-layers-loaded] GPU0: free=12783 MB, alloc=3021 MB, reserved=3042 MB, non-pytorch=132 MB
+2026-02-22 16:08:01,775 krasis.model INFO GPU0: 3021 MB allocated
+2026-02-22 16:08:01,775 krasis.model INFO GPU weights loaded in 8.8s
+2026-02-22 16:08:02,959 krasis.model INFO Attention offloaded: 48 layers, 1712 MB to CPU RAM in 1.2s
+2026-02-22 16:08:04,630 krasis.model INFO Streaming attention: 2 buffer set(s) for 2 layer type(s) (double-buffered)
+2026-02-22 16:08:04,639 krasis.model INFO Streaming attention decode: 48 layers, 1472 MB pinned, 116 MB GPU buffers (2 type(s), 2x ping-pong), GPU free: 14089 MB, 2.9s
+2026-02-22 16:08:04,639 krasis.model INFO Phase 2: Loading CPU expert weights (Krasis INT4)...
+2026-02-22 16:08:04,639 krasis.model INFO shared_expert_gate detected — Rust engine will skip shared experts (handled on GPU)
+2026-02-22 16:08:57,073 krasis.model INFO Krasis engine: 48 MoE layers, 512 experts, hidden=2048
+2026-02-22 16:08:57,160 krasis.model INFO Routing weights sent to Rust engine (48 MoE layers)
+2026-02-22 16:08:57,160 krasis.model INFO CPU experts loaded in 52.5s
+2026-02-22 16:08:57,160 krasis.model WARNING RAM estimate deviation: estimated 39.9 GB, actual VmRSS 79.4 GB (99% off) — estimates may need recalibration
+2026-02-22 16:08:57,160 krasis.gpu_prefill INFO GpuPrefillManager(rank 0/1): expert_slice=[0, 512), local_count=512
+2026-02-22 16:08:57,160 krasis.gpu_prefill INFO GPU prefill group_size=128
+2026-02-22 16:08:57,161 krasis.gpu_prefill INFO Auto chunk_size: 512 experts (1.6 MB each, 5804.5 MB budget of 14773.4 MB free)
+2026-02-22 16:08:57,161 krasis.gpu_prefill INFO Layer-grouped mode: 2 layers/group, 24 groups, ~1660.9 MB per group, 48 total MoE layers
+2026-02-22 16:08:57,161 krasis.gpu_prefill INFO GpuPrefillManager(engine): experts=512, hidden=2048, intermediate=512, chunk_size=512, num_chunks=1, shared=1, scale=1.000, num_bits=4, prefill_mode=layer_grouped, layer_group_size=2
+2026-02-22 16:08:57,161 krasis.model INFO GPU prefill manager created for cuda:0 (rank 0/1)
+2026-02-22 16:08:57,161 krasis.gpu_prefill INFO Engine path: Marlin-native DMA copy (zero conversion, zero RAM cache)
+2026-02-22 16:08:57,161 krasis.model INFO GPU prefill: 1 managers, threshold=300 tokens
+2026-02-22 16:08:57,161 krasis.kv_cache INFO KV cache: 2000 MB → 10666 pages (170.7K tokens)
+2026-02-22 16:08:57,164 krasis.kv_cache INFO KV cache allocated: 12 layers × 10666 pages × 16 tokens = 2000 MB (gqa, gqa-split)
+2026-02-22 16:08:57,165 krasis.model INFO Hybrid model: 12 full attention layers (KV cache), 36 linear attention layers
+2026-02-22 16:08:57,448 krasis.tokenizer INFO Tokenizer loaded: vocab=151643, eos=151645, bos=-1
+2026-02-22 16:08:57,448 krasis.model INFO Model fully loaded in 64.5s
+2026-02-22 16:08:57,451 krasis.server INFO ── Warming up CUDA runtime ──
+2026-02-22 16:08:57,452 krasis.model INFO Warming up CUDA runtime on all devices: ['cuda:0']
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+2026-02-22 16:09:01,234 krasis.linear_attention INFO Compiled linear attention chunk step (default/Inductor mode)
+2026-02-22 16:09:01,877 krasis.linear_attention INFO Linear attention torch.compile warmup complete on cuda:0
+2026-02-22 16:09:02,169 krasis.model INFO CUDA runtime warmup on cuda:0 complete: 13 MB consumed (12676 MB free before → 12664 MB free after)
+2026-02-22 16:09:02,169 krasis.server INFO ── Pure CPU MoE decode (use --hcs to enable expert caching) ──
+2026-02-22 16:09:02,169 krasis.server INFO CPU decode: M=1 via Rust engine (pass --hcs to enable HCS expert cache)
+2026-02-22 16:09:07,503 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-02-22 16:09:07,504 krasis.gpu_prefill INFO Pre-allocating pinned DMA buffers: 830.5 MB (w13p=536.9, w13s=16.8, w2p=268.4, w2s=8.4)
+2026-02-22 16:09:08,133 krasis.gpu_prefill INFO Pinned DMA buffers allocated: 830.5 MB in 0.6s (one-time cost)
+2026-02-22 16:09:08,371 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.24s (GPU total: 5828.8 MB)
+2026-02-22 16:09:17,788 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-02-22 16:09:18,029 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.24s (GPU total: 5844.1 MB)
+2026-02-22 16:09:27,299 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-02-22 16:09:27,539 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.24s (GPU total: 5844.1 MB)

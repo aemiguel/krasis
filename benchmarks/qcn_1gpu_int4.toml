@@ -1,0 +1,7 @@
+[[config]]
+num_gpus = 1
+gpu_expert_bits = 4
+cpu_expert_bits = 4
+
+[[model]]
+name = "Qwen3-Coder-Next"
