@@ -72,16 +72,18 @@ def int8_linear(
     x_scale = x_amax / 127.0
     x_int8 = (x_float / x_scale).round().clamp(-128, 127).to(torch.int8)
 
-    # _int_mm requires M > 16; pad if needed
-    if M <= 16:
-        pad = 17 - M
+    # _int_mm requires M >= 17 and M to be a multiple of 8 on SM89
+    padded_M = max(M, 17)
+    padded_M = (padded_M + 7) & ~7  # round up to multiple of 8
+    if padded_M != M:
+        pad = padded_M - M
         x_int8 = torch.nn.functional.pad(x_int8, (0, 0, 0, pad))
         x_scale = torch.nn.functional.pad(x_scale, (0, 0, 0, pad))
 
     # INT8 matmul: [M, K] @ [K, N] -> [M, N] INT32
     out_int32 = torch._int_mm(x_int8, weight_int8.t())
 
-    if M <= 16:
+    if padded_M != M:
         out_int32 = out_int32[:M]
         x_scale = x_scale[:M]
 

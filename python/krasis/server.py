@@ -803,6 +803,8 @@ def main():
         logger.info("Shutting down (press Ctrl-C again to force)...")
 
     server.handle_exit = _handle_exit
+    signal.signal(signal.SIGINT, _handle_exit)
+    signal.signal(signal.SIGTERM, _handle_exit)
     server.run()
 
 
