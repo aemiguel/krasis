@@ -238,9 +238,18 @@ class GatedDeltaNetAttention:
 
         # Capture the graph on the same stream
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=stream):
-            out = self._forward_recurrent_inplace(self._la_input)
-            self._la_output.copy_(out)
+        try:
+            with torch.cuda.graph(g, stream=stream):
+                out = self._forward_recurrent_inplace(self._la_input)
+                self._la_output.copy_(out)
+        except Exception:
+            # Failed capture can leave streams in capture mode.
+            # Synchronize to clear CUDA error state before re-raising.
+            try:
+                torch.cuda.synchronize(self.device)
+            except Exception:
+                pass
+            raise
 
         # Restore state after capture
         self._conv_state.copy_(conv_saved)
@@ -425,7 +434,17 @@ class GatedDeltaNetAttention:
                     return self._la_output.clone()
                 except Exception as e:
                     logger.warning("CUDA graph capture failed for LA layer %d: %s", self.layer_idx, e)
+                    # Critical: reset CUDA state after failed capture.
+                    # Graph capture can propagate to the default stream; if capture
+                    # fails, the default stream may be left in capture mode, which
+                    # makes ALL subsequent CUDA ops fail ("stream is capturing").
+                    try:
+                        torch.cuda.synchronize(self.device)
+                    except Exception:
+                        pass  # GPU may be in error state, just clear it
+                    self._la_graph = None
                     self._la_input = None  # disable graph attempts
+                    self._la_output = None
                     return self._forward_recurrent(hidden)
             else:
                 return self._forward_recurrent(hidden)

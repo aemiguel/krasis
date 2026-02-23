@@ -325,7 +325,6 @@ CONFIG_KEYS = [
     "CFG_ATTENTION_QUANT", "CFG_SHARED_EXPERT_QUANT", "CFG_DENSE_MLP_QUANT",
     "CFG_LM_HEAD_QUANT", "CFG_KRASIS_THREADS", "CFG_HOST", "CFG_PORT",
     "CFG_GPU_PREFILL_THRESHOLD", "CFG_GGUF_PATH", "CFG_FORCE_LOAD",
-    "CFG_HCS", "CFG_MULTI_GPU_HCS",
 ]
 
 
@@ -386,8 +385,6 @@ class LauncherConfig:
         self.gpu_prefill_threshold: int = 300
         self.gguf_path: str = ""
         self.force_load: bool = False
-        self.hcs: bool = False  # HCS expert caching on GPU (off = pure CPU decode)
-        self.multi_gpu_hcs: bool = False  # pin HCS experts on all GPUs
 
     def apply_saved(self, saved: Dict[str, str]) -> None:
         """Apply loaded config values."""
@@ -465,10 +462,6 @@ class LauncherConfig:
             self.gguf_path = saved["CFG_GGUF_PATH"]
         if "CFG_FORCE_LOAD" in saved and saved["CFG_FORCE_LOAD"]:
             self.force_load = saved["CFG_FORCE_LOAD"] == "1"
-        if "CFG_HCS" in saved and saved["CFG_HCS"]:
-            self.hcs = saved["CFG_HCS"] == "1"
-        if "CFG_MULTI_GPU_HCS" in saved and saved["CFG_MULTI_GPU_HCS"]:
-            self.multi_gpu_hcs = saved["CFG_MULTI_GPU_HCS"] == "1"
 
     def to_save_dict(self) -> Dict[str, Any]:
         """Convert to dict for saving."""
@@ -490,8 +483,6 @@ class LauncherConfig:
             "CFG_GPU_PREFILL_THRESHOLD": str(self.gpu_prefill_threshold),
             "CFG_GGUF_PATH": self.gguf_path,
             "CFG_FORCE_LOAD": "1" if self.force_load else "",
-            "CFG_HCS": "1" if self.hcs else "",
-            "CFG_MULTI_GPU_HCS": "1" if self.multi_gpu_hcs else "",
         }
 
 
@@ -528,10 +519,6 @@ OPTIONS = [
     ConfigOption("PP partition", "pp_partition", opt_type="text", affects_budget=True),
     ConfigOption("Layer group size", "layer_group_size",
                  choices=[2, 4, 6, 8, 10, 12], affects_budget=True),
-    ConfigOption("HCS expert cache", "hcs",
-                 choices=[False, True]),
-    ConfigOption("Multi-GPU HCS", "multi_gpu_hcs",
-                 choices=[False, True]),
     ConfigOption("KV dtype", "kv_dtype",
                  choices=["fp8_e4m3", "bf16"], affects_budget=True),
     ConfigOption("GPU expert bits", "gpu_expert_bits",
@@ -566,10 +553,6 @@ def _is_option_visible(opt: ConfigOption, model_info: Optional[Dict], cfg: Optio
     if opt.key == "dense_mlp_quant":
         # Only show if model has dense (non-MoE) layers
         if model_info and model_info.get("dense_layers", 0) == 0:
-            return False
-    if opt.key == "multi_gpu_hcs":
-        # Only show when HCS is enabled
-        if cfg and not cfg.hcs:
             return False
     return True
 
@@ -1103,9 +1086,80 @@ class Launcher:
             lines.append(f"  {DIM}(budget unavailable){NC}")
 
         lines.append("")
-        lines.append(f"  {DIM}[\u2191\u2193] Navigate  [\u2190\u2192] Change  [Enter] Launch  [q] Quit{NC}")
+        lines.append(f"  {DIM}[\u2191\u2193] Navigate  [\u2190\u2192] Change  [Enter] Launch{NC}")
+        lines.append(f"  {DIM}[L] Load config  [S] Save config  [q] Quit{NC}")
 
         return "\n".join(lines)
+
+    def _load_config_screen(self) -> bool:
+        """Show a scrolling list of .conf files in CWD. Returns True if a config was loaded."""
+        cwd = os.getcwd()
+        conf_files = sorted(
+            f for f in os.listdir(cwd)
+            if f.endswith(".conf") and os.path.isfile(os.path.join(cwd, f))
+        )
+        if not conf_files:
+            # Show brief message then return
+            _clear_screen()
+            sys.stdout.write(f"\n  No .conf files found in {cwd}\n\n  {DIM}[Any key] Back{NC}\n")
+            sys.stdout.flush()
+            _read_key()
+            return False
+
+        cursor = 0
+        while True:
+            _clear_screen()
+            lines = [f"  {BOLD}Load config from {cwd}:{NC}\n"]
+            for i, name in enumerate(conf_files):
+                prefix = f"  {CYAN}\u25b8{NC} " if i == cursor else "    "
+                hl = BOLD if i == cursor else ""
+                lines.append(f"{prefix}{hl}{name}{NC}")
+            lines.append(f"\n  {DIM}[\u2191\u2193] Select  [Enter] Load  [Esc] Cancel{NC}")
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+
+            key = _read_key()
+            if key == KEY_UP:
+                cursor = (cursor - 1) % len(conf_files)
+            elif key == KEY_DOWN:
+                cursor = (cursor + 1) % len(conf_files)
+            elif key == KEY_ENTER:
+                path = os.path.join(cwd, conf_files[cursor])
+                saved = _load_config(path)
+                if saved:
+                    self.cfg.apply_saved(saved)
+                    # Re-resolve GPUs and PP after loading
+                    self._resolve_selected_gpus()
+                    if self.model_info:
+                        ngpus = len(self.selected_gpus) if self.selected_gpus else 1
+                        pp_parts = [x.strip() for x in self.cfg.pp_partition.split(",") if x.strip()] if self.cfg.pp_partition else []
+                        needs_recompute = not pp_parts or len(pp_parts) != ngpus
+                        if needs_recompute:
+                            self.cfg.pp_partition = self._compute_default_pp(self.model_info["layers"])
+                    # Reload model info if model path changed
+                    if self.cfg.model_path:
+                        self._read_model_info()
+                    self.budget = self._compute_budget()
+                return True
+            elif key == KEY_ESCAPE or key == KEY_QUIT:
+                return False
+
+    def _save_config_screen(self) -> None:
+        """Prompt for filename and save current config to CWD."""
+        _show_cursor()
+        name = _edit_value("Config filename", "my-config.conf")
+        _hide_cursor()
+        if not name:
+            return
+        if "." not in os.path.basename(name):
+            name += ".conf"
+        save_path = os.path.join(os.getcwd(), name)
+        _save_config(save_path, self.cfg.to_save_dict())
+        # Show confirmation briefly
+        _clear_screen()
+        sys.stdout.write(f"\n  {GREEN}Saved: {save_path}{NC}\n\n  {DIM}[Any key] Back{NC}\n")
+        sys.stdout.flush()
+        _read_key()
 
     def _cycle_value(self, opt: ConfigOption, direction: int) -> None:
         """Cycle a config value left/right."""
@@ -1250,6 +1304,10 @@ class Launcher:
                         setattr(self.cfg, opt.key, new_val)
                     if opt.affects_budget:
                         self.budget = self._compute_budget()
+                elif key in ("l", "L"):
+                    self._load_config_screen()
+                elif key in ("s", "S"):
+                    self._save_config_screen()
                 elif key == KEY_ENTER:
                     return True
                 elif key == KEY_QUIT or key == KEY_ESCAPE:
@@ -1302,10 +1360,6 @@ class Launcher:
             print(f"  CPU experts:     Build INT{self.cfg.cpu_expert_bits} from native")
         print(f"  PP partition:    {self.cfg.pp_partition}")
         print(f"  Layer group:     {self.cfg.layer_group_size} layers (double-buffered)")
-        hcs_str = "ON" if self.cfg.hcs else "OFF (pure CPU decode)"
-        if self.cfg.hcs and self.cfg.multi_gpu_hcs:
-            hcs_str += " (multi-GPU)"
-        print(f"  HCS:             {hcs_str}")
         print(f"  KV dtype:        {self.cfg.kv_dtype}")
         print(f"  GPU expert bits: {self.cfg.gpu_expert_bits}")
         print(f"  CPU expert bits: {self.cfg.cpu_expert_bits}")
@@ -1359,10 +1413,6 @@ class Launcher:
             "--port", str(self.cfg.port),
         ]
 
-        if self.cfg.hcs:
-            cmd_args.append("--hcs")
-        if self.cfg.multi_gpu_hcs:
-            cmd_args.append("--multi-gpu-hcs")
         if self.cfg.gguf_path:
             cmd_args.extend(["--gguf-path", self.cfg.gguf_path])
         if self.cfg.force_load:
@@ -1394,6 +1444,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Krasis — Interactive MoE inference server launcher",
     )
+    parser.add_argument("--config", default=None,
+                        help="Path to config file (CFG_KEY=\"value\" format). "
+                             "Implies --non-interactive.")
     parser.add_argument("--non-interactive", action="store_true",
                         help="Use saved/default config without prompts")
     parser.add_argument("--model-path", default=None,
@@ -1426,10 +1479,6 @@ def parse_args() -> argparse.Namespace:
                         help="Server bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=None,
                         help="Server port (default: 8012)")
-    parser.add_argument("--hcs", action="store_true", default=None,
-                        help="Enable HCS expert caching on GPU for decode")
-    parser.add_argument("--multi-gpu-hcs", action="store_true", default=None,
-                        help="Pin HCS experts on ALL GPUs")
     parser.add_argument("--gguf-path", default=None,
                         help="Path to GGUF file for CPU experts")
     parser.add_argument("--gpu-prefill-threshold", type=int, default=None,
@@ -1492,10 +1541,6 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         cfg.gguf_path = args.gguf_path
     if args.force_load:
         cfg.force_load = True
-    if args.hcs is not None and args.hcs:
-        cfg.hcs = True
-    if args.multi_gpu_hcs is not None and args.multi_gpu_hcs:
-        cfg.multi_gpu_hcs = True
 
 
 def _check_gpu_deps():
@@ -1616,14 +1661,18 @@ def main():
 
     launcher = Launcher(args)
 
-    # Load saved config (check new location, fall back to legacy repo-root location)
-    saved = _load_config(launcher.config_file)
-    if not saved:
-        legacy_config = os.path.join(launcher.script_dir, ".krasis_config")
-        if os.path.exists(legacy_config):
-            saved = _load_config(legacy_config)
-    if saved:
-        launcher.cfg.apply_saved(saved)
+    # Load config from --config file (non-interactive only)
+    if args.config:
+        config_path = os.path.expanduser(args.config)
+        if not os.path.isfile(config_path):
+            print(f"Error: config file not found: {config_path}", file=sys.stderr)
+            sys.exit(1)
+        saved = _load_config(config_path)
+        if saved:
+            launcher.cfg.apply_saved(saved)
+        args.non_interactive = True  # --config implies non-interactive
+    # (No auto-load from ~/.krasis/config — TUI always starts with hardcoded defaults.
+    #  Use --config or the in-TUI "Load Config" option to load a config file.)
 
     # Force BF16 KV if GPU doesn't support FP8
     if not launcher.hw["has_fp8"] and launcher.cfg.kv_dtype == "fp8_e4m3":
@@ -1670,13 +1719,10 @@ def main():
             )
 
         launcher.print_summary()
-        _save_config(launcher.config_file, launcher.cfg.to_save_dict())
         launcher.launch_server(benchmark=args.benchmark)
     else:
         # Interactive TUI
         if launcher.run_interactive():
-            _save_config(launcher.config_file, launcher.cfg.to_save_dict())
-
             # Launch mode selection (skip if --benchmark on CLI)
             if args.benchmark:
                 launch_mode = "benchmark"

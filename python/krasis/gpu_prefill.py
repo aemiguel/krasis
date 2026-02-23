@@ -1511,6 +1511,12 @@ class GpuPrefillManager:
             w2_packed = self._dma_buf_w2p.view(torch.int32).reshape(self._dma_shape_w2p)
             w2_scale = self._dma_buf_w2s.view(torch.bfloat16).reshape(self._dma_shape_w2s)
 
+            # Make the prefetch stream wait for the default stream before
+            # allocating. The caching allocator can give the prefetch stream
+            # blocks that are still in use by pending default-stream kernels.
+            # wait_stream creates a GPU-side dependency without blocking CPU.
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+
             # GPU: Queue PCIe DMA
             # (pinned memory → no blocking CPU-side staging copy)
             with torch.cuda.stream(stream):

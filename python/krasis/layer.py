@@ -268,7 +268,6 @@ class TransformerLayer:
         """
         M = hidden.shape[0]
         layer_timing = (TIMING.decode and M == 1) or (TIMING.prefill and M > 1)
-
         if layer_timing:
             torch.cuda.synchronize()
             t_layer_start = time.perf_counter()
@@ -665,11 +664,8 @@ class TransformerLayer:
             with torch.cuda.stream(self._shared_stream):
                 shared_future = self._shared_expert_forward(hidden)
 
-        # ── Dispatch: GPU path (prefill or decode) vs CPU decode ──
-        # GPU path for: (1) prefill above threshold, or (2) M=1 decode (gpu_decode)
-        if self.gpu_prefill_manager is not None and (
-            M >= self.gpu_prefill_threshold or M == 1
-        ):
+        # ── Dispatch: GPU path (prefill) vs CPU decode ──
+        if self.gpu_prefill_manager is not None and M >= self.gpu_prefill_threshold:
             # GPU path: INT4 Marlin kernel handles routing + expert computation
             output = self._gpu_prefill_forward(hidden, topk_ids, topk_weights, moe_layer_idx)
         else:

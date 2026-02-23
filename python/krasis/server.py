@@ -13,8 +13,10 @@ import gc
 import json
 import logging
 import os
+import select
 import signal
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -407,8 +409,94 @@ def main():
         _cleanup_cuda()
         os._exit(1)
     signal.signal(signal.SIGTERM, _force_exit_handler)
-    parser = argparse.ArgumentParser(description="Krasis standalone LLM server")
-    parser.add_argument("--model-path", required=True, help="Path to HF model")
+    # ── Pre-parse --config to load defaults from file ──
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None,
+                     help="Path to config file (KEY=VALUE format). "
+                          "CLI args override config file values.")
+    pre_args, remaining_argv = pre.parse_known_args()
+
+    config_defaults = {}
+    if pre_args.config:
+        config_path = pre_args.config
+        if not os.path.isfile(config_path):
+            print(f"Error: config file not found: {config_path}", file=sys.stderr)
+            sys.exit(1)
+        # Mapping from CFG_* keys (used in ~/.krasis/config) to argparse dests
+        _CFG_KEY_MAP = {
+            "MODEL_PATH": "model_path",
+            "CFG_SELECTED_GPUS": "_selected_gpus",  # special: comma list → num_gpus
+            "CFG_PP_PARTITION": None,  # not used by server
+            "CFG_LAYER_GROUP_SIZE": "layer_group_size",
+            "CFG_KV_DTYPE": "kv_dtype",
+            "CFG_GPU_EXPERT_BITS": "gpu_expert_bits",
+            "CFG_CPU_EXPERT_BITS": "cpu_expert_bits",
+            "CFG_ATTENTION_QUANT": "attention_quant",
+            "CFG_SHARED_EXPERT_QUANT": "shared_expert_quant",
+            "CFG_DENSE_MLP_QUANT": "dense_mlp_quant",
+            "CFG_LM_HEAD_QUANT": "lm_head_quant",
+            "CFG_KRASIS_THREADS": "krasis_threads",
+            "CFG_HOST": "host",
+            "CFG_PORT": "port",
+            "CFG_GPU_PREFILL_THRESHOLD": "gpu_prefill_threshold",
+            "CFG_GGUF_PATH": "gguf_path",
+            "CFG_FORCE_LOAD": "force_load",
+            "CFG_HCS": None,           # HCS disabled — ignore from config files
+            "CFG_MULTI_GPU_HCS": None,  # HCS disabled — ignore from config files
+            "CFG_KV_CACHE_MB": "kv_cache_mb",
+        }
+        with open(config_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                # Determine argparse dest: check CFG_ map first, then fall back
+                if key in _CFG_KEY_MAP:
+                    dest = _CFG_KEY_MAP[key]
+                    if dest is None:
+                        continue  # skip keys not used by server
+                    # Handle special cases for CFG_ format
+                    if key == "CFG_SELECTED_GPUS":
+                        # Convert comma-separated GPU indices to num_gpus count
+                        gpu_list = [x.strip() for x in val.split(",") if x.strip()]
+                        if gpu_list:
+                            config_defaults["num_gpus"] = len(gpu_list)
+                        continue
+                    if key in ("CFG_FORCE_LOAD",):
+                        # CFG_ format uses "1"/"" for booleans
+                        config_defaults[dest] = val == "1"
+                        continue
+                else:
+                    # Plain key format (key-name or key_name)
+                    dest = key.replace("-", "_").lower()
+                # Convert "true"/"false" strings for store_true args
+                if isinstance(val, str) and val.lower() == "true":
+                    config_defaults[dest] = True
+                elif isinstance(val, str) and val.lower() == "false":
+                    config_defaults[dest] = False
+                else:
+                    # Try int, then float, then string
+                    try:
+                        config_defaults[dest] = int(val)
+                    except ValueError:
+                        try:
+                            config_defaults[dest] = float(val)
+                        except ValueError:
+                            config_defaults[dest] = val
+        # Expand ~ in model_path
+        if "model_path" in config_defaults and isinstance(config_defaults["model_path"], str):
+            config_defaults["model_path"] = os.path.expanduser(config_defaults["model_path"])
+        print(f"Loaded config from {config_path}: {config_defaults}")
+
+    parser = argparse.ArgumentParser(description="Krasis standalone LLM server",
+                                     parents=[pre])
+    parser.add_argument("--model-path", required="model_path" not in config_defaults,
+                        help="Path to HF model")
     parser.add_argument("--num-gpus", type=int, default=None,
                         help="Number of GPUs (auto-detected if omitted)")
     parser.add_argument("--host", default="0.0.0.0")
@@ -437,8 +525,6 @@ def main():
                         help="Path to GGUF file for CPU experts")
     parser.add_argument("--force-load", action="store_true",
                         help="Force reload of cached weights")
-    parser.add_argument("--multi-gpu-hcs", action="store_true",
-                        help="Pin HCS experts on ALL GPUs (slower on no-P2P systems)")
     parser.add_argument("--no-stream-attention", action="store_true",
                         help="Disable streaming attention (load all layers persistently on GPU). "
                              "Only use if all layers fit in VRAM.")
@@ -452,10 +538,16 @@ def main():
                         help="Run stress test (diverse prompts) and exit")
     parser.add_argument("--perplexity", action="store_true",
                         help="Run perplexity evaluation and exit")
-    parser.add_argument("--hcs", action="store_true",
-                        help="Enable HCS expert cache — pin hot experts on GPU for decode")
     parser.add_argument("--temperature", type=float, default=0.6)
-    args = parser.parse_args()
+
+    # Apply config file defaults, then parse CLI (CLI wins over config file)
+    if config_defaults:
+        parser.set_defaults(**config_defaults)
+    args = parser.parse_args(remaining_argv)
+
+    # HCS is disabled — force off regardless of config file contents
+    args.hcs = False
+    args.multi_gpu_hcs = False
 
     log_format = "%(asctime)s %(name)s %(levelname)s %(message)s"
     logging.basicConfig(level=logging.INFO, format=log_format)
@@ -490,6 +582,13 @@ def main():
         cpu_expert_bits=args.cpu_expert_bits,
     )
 
+    # Expand ~ in paths (config files use ~/.krasis/...)
+    args.model_path = os.path.expanduser(args.model_path)
+    if args.heatmap_path:
+        args.heatmap_path = os.path.expanduser(args.heatmap_path)
+    if args.gguf_path:
+        args.gguf_path = os.path.expanduser(args.gguf_path)
+
     _model_name = args.model_path.rstrip("/").split("/")[-1]
 
     # ── Load model with HCS strategy ──
@@ -513,7 +612,7 @@ def main():
         layer_group_size=args.layer_group_size,
         gguf_path=args.gguf_path,
         force_load=args.force_load,
-        gpu_prefill_threshold=1 if args.hcs else 500,  # GPU decode with HCS, CPU decode default
+        gpu_prefill_threshold=1 if args.hcs else int(os.environ.get("KRASIS_PREFILL_THRESHOLD", "500")),
         kv_cache_mb=args.kv_cache_mb,
         stream_attention=not args.no_stream_attention,
     )
@@ -544,8 +643,8 @@ def main():
 
     # ── Unified HCS allocation loop ──
     if not args.hcs:
-        _status("Pure CPU MoE decode (use --hcs to enable expert caching)")
-        logger.info("CPU decode: M=1 via Rust engine (pass --hcs to enable HCS expert cache)")
+        _status("Pure CPU MoE decode")
+        logger.info("CPU decode: M=1 via Rust engine")
         _model._hcs_device = None
         _model._multi_gpu_hcs = False
     else:
@@ -857,6 +956,7 @@ def main():
         sys.exit(0)
 
     _status(f"Server ready on {args.host}:{args.port}")
+    print(f"  {_DIM}Press Q to quit, Ctrl-C to force exit{_NC}", flush=True)
     logger.info("Model loaded, starting server on %s:%d", args.host, args.port)
 
     _scheduler = Scheduler(_model)
@@ -885,6 +985,25 @@ def main():
     server.handle_exit = _handle_exit
     signal.signal(signal.SIGINT, _handle_exit)
     signal.signal(signal.SIGTERM, _handle_exit)
+
+    # Background thread: press Q to quit
+    def _stdin_listener():
+        try:
+            while not server.should_exit:
+                # Use select to avoid blocking forever (check every 0.5s)
+                if select.select([sys.stdin], [], [], 0.5)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch in ("q", "Q"):
+                        logger.info("'Q' pressed — shutting down...")
+                        server.should_exit = True
+                        server.force_exit = True
+                        break
+        except (OSError, ValueError):
+            pass  # stdin closed or not a tty
+    if sys.stdin.isatty():
+        t = threading.Thread(target=_stdin_listener, daemon=True)
+        t.start()
+
     server.run()
 
 

@@ -1269,6 +1269,11 @@ class KrasisModel:
         dma_stream = self._stream_attn_dma_stream
         cpu_tensors = self._stream_attn_cpu[layer_idx]
         gpu_bufs = self._get_stream_bufs(layer_idx, buf_idx)
+        # The DMA stream must wait for the default stream before overwriting
+        # a ping-pong buffer. The buffer we're writing to was read 2 layers
+        # ago on the default stream — without this wait, the DMA copy can
+        # race with those still-executing kernels.
+        dma_stream.wait_stream(torch.cuda.current_stream(self.all_devices[0]))
         with torch.cuda.stream(dma_stream):
             for dict_key, gpu_buf in gpu_bufs.items():
                 src = cpu_tensors.get(dict_key)
@@ -2879,23 +2884,28 @@ class KrasisModel:
                             elif self._stream_attn_loaded.get(buf_idx) != abs_layer_idx:
                                 self._stream_attn_load(abs_layer_idx, buf_idx)
 
-                            # Start prefetch for next layer into opposite buffer
+                            # Prefetch next layer within group (safe: uses opposite buffer)
                             next_li = li + 1
                             if next_li < len(group_layers):
                                 next_layer = group_layers[next_li]
-                            else:
-                                # Cross-group: prefetch first layer of next group
-                                next_group_idx = group_idx + 1
-                                if next_group_idx < len(groups):
-                                    next_layer = groups[next_group_idx][0][0]
-                                else:
-                                    next_layer = None
-                            if next_layer is not None:
                                 next_buf = next_layer % 2
                                 self._stream_attn_prefetch(next_layer, next_buf)
                                 self._prefill_prefetch_started = True
                                 self._prefill_prefetch_buf = next_buf
-                        # Subsequent chunks: weights already on GPU from chunk 0
+
+                        # Cross-group prefetch: only on the LAST chunk.
+                        # Earlier chunks still need the current group's buffers,
+                        # and the cross-group prefetch would overwrite them.
+                        is_last_layer_in_group = (li == len(group_layers) - 1)
+                        is_last_chunk = (c == num_chunks - 1)
+                        if is_last_layer_in_group and is_last_chunk:
+                            next_group_idx = group_idx + 1
+                            if next_group_idx < len(groups):
+                                next_layer = groups[next_group_idx][0][0]
+                                next_buf = next_layer % 2
+                                self._stream_attn_prefetch(next_layer, next_buf)
+                                self._prefill_prefetch_started = True
+                                self._prefill_prefetch_buf = next_buf
 
                     # Streaming attention: all layers on GPU0, no cross-GPU transfers
                     kv_cache = self.kv_caches[0]
@@ -3171,9 +3181,9 @@ class KrasisModel:
             if need_load:
                 _clear_cache = True
 
-                # Sync default stream before freeing when pipelining enabled.
-                if _pipeline_enabled:
-                    torch.cuda.synchronize(dev)
+                # Sync default stream before freeing: empty_cache() can return
+                # blocks to CUDA that pending kernels still reference.
+                torch.cuda.synchronize(dev)
 
                 if ep_timing:
                     for d in self.all_devices:
