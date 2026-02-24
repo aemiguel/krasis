@@ -10,7 +10,7 @@ name = "krasis"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.23", features = ["extension-module", "multiple-pymethods"] }
 memmap2 = "0.9"
 safetensors = "0.4"
 rayon = "1.10"

@@ -1095,6 +1095,18 @@ impl Drop for KrasisEngine {
     }
 }
 
+impl KrasisEngine {
+    /// Get shared reference to the weight store (for CpuDecodeStore integration).
+    pub(crate) fn get_weight_store(&self) -> Option<std::sync::Arc<crate::weights::WeightStore>> {
+        self.store.clone()
+    }
+
+    /// Whether parallel expert processing is enabled (internal use).
+    pub(crate) fn get_parallel(&self) -> bool {
+        self.parallel
+    }
+}
+
 #[pymethods]
 impl KrasisEngine {
     #[new]

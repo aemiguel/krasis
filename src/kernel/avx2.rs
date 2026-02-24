@@ -1050,13 +1050,18 @@ pub fn matmul_int4_transposed_parallel(
 
 /// AVX2 integer transposed INT4 matmul using paired `_mm256_madd_epi16`.
 ///
-/// Processes 2 nibbles per iteration (vs 1 with mullo_epi32), using
-/// immediate shifts (1 cycle) instead of variable shifts (3 cycles on Zen 2).
-/// Each pair of INT4 weights is packed as INT16 for madd_epi16 (1 uop, 3 cycle
-/// latency vs mullo_epi32's 2 uops, 5 cycle latency).
+/// K-outer, N-inner loop order for cache-friendly sequential weight access.
+/// For each K-group, scans all N-blocks sequentially (stride-1 within rows),
+/// instead of iterating all K-rows per N-block (stride-N between rows).
+/// This transforms random 48KB-stride accesses into sequential scans,
+/// reducing L2 cache misses ~32x for large N.
+///
+/// Activation pairs are pre-computed once per K-pack and broadcast to all N-blocks.
+/// INT32 partial sums are accumulated in a scratch buffer (max 1KB for 256 N-columns),
+/// converted to f32 at group boundaries.
 ///
 /// # Safety
-/// Requires AVX2 + FMA. All pointers must be valid.
+/// Requires AVX2 + FMA. All pointers must be valid. n_out must be <= 256.
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn expert_matmul_int4_transposed_integer(
     packed: *const u32,        // [K/8, n_stride]
@@ -1080,11 +1085,22 @@ pub unsafe fn expert_matmul_int4_transposed_integer(
     let n_blocks = n_out / 8;
     let n_rem = n_out % 8;
 
-    // Macro for extracting a nibble pair and accumulating via madd_epi16.
-    // Extracts nibbles at bit positions (lo_shift, lo_shift+4) from each of 8 words,
-    // packs as INT16 pairs, and does madd with broadcast activation pair.
-    macro_rules! nibble_pair_madd {
-        ($words:expr, $lo_shift:expr, $act_ptr:expr, $k_off:expr, $int_acc:expr) => {{
+    // Zero output
+    let zero_ps = _mm256_setzero_ps();
+    for nb in 0..n_blocks {
+        _mm256_storeu_ps(output.add(nb * 8), zero_ps);
+    }
+    for r in 0..n_rem {
+        *output.add(n_blocks * 8 + r) = 0.0;
+    }
+
+    // INT32 scratch accumulators per N-block (max 32 blocks for n_out<=256)
+    let zero_si = _mm256_setzero_si256();
+    let mut int_scratch = [zero_si; 32];
+
+    // Macro for extracting nibble pair from pre-loaded words and accumulating
+    macro_rules! nibble_pair_acc {
+        ($words:expr, $lo_shift:expr, $act_pair:expr, $acc:expr) => {{
             let w_lo = _mm256_srli_epi32($words, $lo_shift);
             let nib_lo = _mm256_sub_epi32(_mm256_and_si256(w_lo, mask_0f), offset_8);
             let w_hi = _mm256_srli_epi32($words, $lo_shift + 4);
@@ -1092,54 +1108,75 @@ pub unsafe fn expert_matmul_int4_transposed_integer(
             let w_pair = _mm256_or_si256(
                 _mm256_and_si256(nib_lo, mask_ffff),
                 _mm256_slli_epi32(nib_hi, 16));
-            let a0 = *$act_ptr.add($k_off) as u16;
-            let a1 = *$act_ptr.add($k_off + 1) as u16;
-            let act_pair = _mm256_set1_epi32(
-                ((a0 as u32) | ((a1 as u32) << 16)) as i32);
-            $int_acc = _mm256_add_epi32($int_acc,
-                _mm256_madd_epi16(w_pair, act_pair));
+            $acc = _mm256_add_epi32($acc, _mm256_madd_epi16(w_pair, $act_pair));
         }};
     }
 
-    for nb in 0..n_blocks {
-        let n_base = n_start + nb * 8;
-        let mut float_acc = _mm256_setzero_ps();
-
-        for g in 0..num_groups {
-            let mut int_acc = _mm256_setzero_si256();
-
-            for pack in 0..packs_per_group {
-                let k_row = g * packs_per_group + pack;
-                let k_base = k_row * 8;
-
-                let words = _mm256_loadu_si256(
-                    packed.add(k_row * n_stride + n_base) as *const __m256i,
-                );
-
-                // Process 4 nibble pairs (8 nibbles total) using madd_epi16
-                nibble_pair_madd!(words,  0, act_int16, k_base,     int_acc);
-                nibble_pair_madd!(words,  8, act_int16, k_base + 2, int_acc);
-                nibble_pair_madd!(words, 16, act_int16, k_base + 4, int_acc);
-                nibble_pair_madd!(words, 24, act_int16, k_base + 6, int_acc);
-            }
-
-            // Convert INT32 → f32, apply combined weight × activation scale
-            let group_f32 = _mm256_cvtepi32_ps(int_acc);
-            let w_scales_bf16 = _mm_loadu_si128(
-                weight_scales.add(g * n_stride + n_base) as *const __m128i,
-            );
-            let w_scales_u32 = _mm256_cvtepu16_epi32(w_scales_bf16);
-            let w_scale_vec = _mm256_castsi256_ps(_mm256_slli_epi32(w_scales_u32, 16));
-            let a_scale = _mm256_set1_ps(*act_scales.add(g));
-            let combined = _mm256_mul_ps(w_scale_vec, a_scale);
-
-            float_acc = _mm256_fmadd_ps(group_f32, combined, float_acc);
+    // K-groups outer, N-blocks inner (cache-friendly weight access)
+    for g in 0..num_groups {
+        // Zero scratch for this group
+        for nb in 0..n_blocks {
+            int_scratch[nb] = zero_si;
         }
 
-        _mm256_storeu_ps(output.add(nb * 8), float_acc);
+        let a_scale_f32 = *act_scales.add(g);
+
+        for pack in 0..packs_per_group {
+            let k_row = g * packs_per_group + pack;
+            let k_base = k_row * 8;
+
+            // Pre-compute 4 activation pair broadcasts (same for all N-blocks)
+            let a01 = ((*act_int16.add(k_base) as u16 as u32)
+                | ((*act_int16.add(k_base + 1) as u16 as u32) << 16)) as i32;
+            let ap0 = _mm256_set1_epi32(a01);
+
+            let a23 = ((*act_int16.add(k_base + 2) as u16 as u32)
+                | ((*act_int16.add(k_base + 3) as u16 as u32) << 16)) as i32;
+            let ap1 = _mm256_set1_epi32(a23);
+
+            let a45 = ((*act_int16.add(k_base + 4) as u16 as u32)
+                | ((*act_int16.add(k_base + 5) as u16 as u32) << 16)) as i32;
+            let ap2 = _mm256_set1_epi32(a45);
+
+            let a67 = ((*act_int16.add(k_base + 6) as u16 as u32)
+                | ((*act_int16.add(k_base + 7) as u16 as u32) << 16)) as i32;
+            let ap3 = _mm256_set1_epi32(a67);
+
+            let row_off = k_row * n_stride + n_start;
+
+            // Sequential scan across all N-blocks for this K-row
+            for nb in 0..n_blocks {
+                let words = _mm256_loadu_si256(
+                    packed.add(row_off + nb * 8) as *const __m256i);
+                let mut acc = int_scratch[nb];
+
+                nibble_pair_acc!(words,  0, ap0, acc);
+                nibble_pair_acc!(words,  8, ap1, acc);
+                nibble_pair_acc!(words, 16, ap2, acc);
+                nibble_pair_acc!(words, 24, ap3, acc);
+
+                int_scratch[nb] = acc;
+            }
+        }
+
+        // Group boundary: convert INT32 → f32, apply scale, accumulate to output
+        let a_scale_vec = _mm256_set1_ps(a_scale_f32);
+        for nb in 0..n_blocks {
+            let n_base = n_start + nb * 8;
+            let group_f32 = _mm256_cvtepi32_ps(int_scratch[nb]);
+            let w_scales_bf16 = _mm_loadu_si128(
+                weight_scales.add(g * n_stride + n_base) as *const __m128i);
+            let w_scales_u32 = _mm256_cvtepu16_epi32(w_scales_bf16);
+            let w_scale_vec = _mm256_castsi256_ps(_mm256_slli_epi32(w_scales_u32, 16));
+            let combined = _mm256_mul_ps(w_scale_vec, a_scale_vec);
+
+            let cur = _mm256_loadu_ps(output.add(nb * 8));
+            _mm256_storeu_ps(output.add(nb * 8),
+                _mm256_fmadd_ps(group_f32, combined, cur));
+        }
     }
 
-    // Handle remainder N positions with scalar code
+    // Handle remainder N positions with scalar code (at most 7 elements)
     if n_rem > 0 {
         let rem_start = n_blocks * 8;
         for r in 0..n_rem {
@@ -1169,6 +1206,8 @@ pub unsafe fn expert_matmul_int4_transposed_integer(
 }
 
 /// Safe wrapper for AVX2 integer transposed INT4 matmul.
+///
+/// For large N, tiles the N dimension to keep scratch buffer in L1 cache.
 pub fn matmul_int4_transposed_integer(
     packed: &[u32],
     scales: &[u16],
@@ -1191,12 +1230,19 @@ pub fn matmul_int4_transposed_integer(
         panic!("AVX2 + FMA required");
     }
 
-    unsafe {
-        expert_matmul_int4_transposed_integer(
-            packed.as_ptr(), scales.as_ptr(), act_int16.as_ptr(),
-            act_scales.as_ptr(), output.as_mut_ptr(),
-            k, n, 0, n, group_size,
-        );
+    // Tile N to keep scratch buffer small (max 32 blocks = 1KB per tile)
+    const TILE_N: usize = 256;
+    let mut n_done = 0;
+    while n_done < n {
+        let tile_n = (n - n_done).min(TILE_N);
+        unsafe {
+            expert_matmul_int4_transposed_integer(
+                packed.as_ptr(), scales.as_ptr(), act_int16.as_ptr(),
+                act_scales.as_ptr(), output.as_mut_ptr().add(n_done),
+                k, n, n_done, tile_n, group_size,
+            );
+        }
+        n_done += tile_n;
     }
 }
 
@@ -1268,11 +1314,12 @@ pub fn matmul_int4_transposed_integer_parallel(
 
 /// AVX2 integer transposed INT8 matmul using `_mm256_madd_epi16`.
 ///
-/// Weight layout: data[K, N] as i8, scales[K/group_size, N] as BF16.
-/// Processes 8 N-outputs at a time, 2 K positions per iteration.
+/// K-outer, N-inner loop order for cache-friendly sequential weight access.
+/// Same strategy as INT4 transposed: scans N-blocks sequentially within each
+/// K-row pair, reducing cache misses from stride-N to stride-1.
 ///
 /// # Safety
-/// Requires AVX2 + FMA. All pointers must be valid.
+/// Requires AVX2 + FMA. All pointers must be valid. n_out must be <= 256.
 /// `group_size` must be even and divisible by 2.
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn expert_matmul_int8_transposed_integer(
@@ -1293,56 +1340,68 @@ pub unsafe fn expert_matmul_int8_transposed_integer(
     let n_blocks = n_out / 8;
     let n_rem = n_out % 8;
 
+    // Zero output
+    let zero_ps = _mm256_setzero_ps();
     for nb in 0..n_blocks {
-        let n_base = n_start + nb * 8;
-        let mut float_acc = _mm256_setzero_ps();
+        _mm256_storeu_ps(output.add(nb * 8), zero_ps);
+    }
+    for r in 0..n_rem {
+        *output.add(n_blocks * 8 + r) = 0.0;
+    }
 
-        for g in 0..num_groups {
-            let mut int_acc = _mm256_setzero_si256();
+    // INT32 scratch accumulators per N-block
+    let zero_si = _mm256_setzero_si256();
+    let mut int_scratch = [zero_si; 32];
 
-            for p in 0..pairs_per_group {
-                let k0 = g * group_size + p * 2;
-                let k1 = k0 + 1;
-
-                // Load 8 i8 values from each K row (64 bits each)
-                let row0 = _mm_loadl_epi64(
-                    data.add(k0 * n_stride + n_base) as *const __m128i,
-                );
-                let row1 = _mm_loadl_epi64(
-                    data.add(k1 * n_stride + n_base) as *const __m128i,
-                );
-
-                // Interleave bytes: [w[k0,0], w[k1,0], w[k0,1], w[k1,1], ...]
-                let interleaved = _mm_unpacklo_epi8(row0, row1);
-
-                // Sign-extend to INT16: 16 values in 256-bit register
-                let w16 = _mm256_cvtepi8_epi16(interleaved);
-
-                // Activation pair broadcast: [act[k0], act[k1]] repeated 8 times
-                let a0 = *act_int16.add(k0) as u16;
-                let a1 = *act_int16.add(k1) as u16;
-                let combined = (a0 as u32) | ((a1 as u32) << 16);
-                let act_pair = _mm256_set1_epi32(combined as i32);
-
-                // madd_epi16: 16 (INT16 × INT16) → 8 INT32 partial sums
-                let dot = _mm256_madd_epi16(w16, act_pair);
-                int_acc = _mm256_add_epi32(int_acc, dot);
-            }
-
-            // Convert INT32 → f32, apply combined weight × activation scale
-            let group_f32 = _mm256_cvtepi32_ps(int_acc);
-            let w_scales_bf16 = _mm_loadu_si128(
-                weight_scales.add(g * n_stride + n_base) as *const __m128i,
-            );
-            let w_scales_u32 = _mm256_cvtepu16_epi32(w_scales_bf16);
-            let w_scale_vec = _mm256_castsi256_ps(_mm256_slli_epi32(w_scales_u32, 16));
-            let a_scale = _mm256_set1_ps(*act_scales.add(g));
-            let combined = _mm256_mul_ps(w_scale_vec, a_scale);
-
-            float_acc = _mm256_fmadd_ps(group_f32, combined, float_acc);
+    // K-groups outer, N-blocks inner
+    for g in 0..num_groups {
+        for nb in 0..n_blocks {
+            int_scratch[nb] = zero_si;
         }
 
-        _mm256_storeu_ps(output.add(nb * 8), float_acc);
+        let a_scale_f32 = *act_scales.add(g);
+
+        for p in 0..pairs_per_group {
+            let k0 = g * group_size + p * 2;
+            let k1 = k0 + 1;
+
+            // Pre-compute activation pair broadcast (same for all N-blocks)
+            let a0 = *act_int16.add(k0) as u16;
+            let a1 = *act_int16.add(k1) as u16;
+            let act_pair = _mm256_set1_epi32(
+                ((a0 as u32) | ((a1 as u32) << 16)) as i32);
+
+            let row0_off = k0 * n_stride + n_start;
+            let row1_off = k1 * n_stride + n_start;
+
+            // Sequential scan across all N-blocks for this K-pair
+            for nb in 0..n_blocks {
+                let row0 = _mm_loadl_epi64(
+                    data.add(row0_off + nb * 8) as *const __m128i);
+                let row1 = _mm_loadl_epi64(
+                    data.add(row1_off + nb * 8) as *const __m128i);
+                let interleaved = _mm_unpacklo_epi8(row0, row1);
+                let w16 = _mm256_cvtepi8_epi16(interleaved);
+                let dot = _mm256_madd_epi16(w16, act_pair);
+                int_scratch[nb] = _mm256_add_epi32(int_scratch[nb], dot);
+            }
+        }
+
+        // Group boundary: convert INT32 → f32, apply scale, accumulate to output
+        let a_scale_vec = _mm256_set1_ps(a_scale_f32);
+        for nb in 0..n_blocks {
+            let n_base = n_start + nb * 8;
+            let group_f32 = _mm256_cvtepi32_ps(int_scratch[nb]);
+            let w_scales_bf16 = _mm_loadu_si128(
+                weight_scales.add(g * n_stride + n_base) as *const __m128i);
+            let w_scales_u32 = _mm256_cvtepu16_epi32(w_scales_bf16);
+            let w_scale_vec = _mm256_castsi256_ps(_mm256_slli_epi32(w_scales_u32, 16));
+            let combined = _mm256_mul_ps(w_scale_vec, a_scale_vec);
+
+            let cur = _mm256_loadu_ps(output.add(nb * 8));
+            _mm256_storeu_ps(output.add(nb * 8),
+                _mm256_fmadd_ps(group_f32, combined, cur));
+        }
     }
 
     // Handle remainder N positions with scalar code
@@ -1373,6 +1432,7 @@ pub unsafe fn expert_matmul_int8_transposed_integer(
 ///
 /// Weight layout: data as i8 packed into u32 in [K, N] layout, scales [K/gs, N] as BF16.
 /// The u32 vec is just a byte container — actual data is i8.
+/// For large N, tiles the N dimension to keep scratch buffer in L1.
 pub fn matmul_int8_transposed_integer(
     data_u32: &[u32],     // [K, N] as i8 packed into u32 (byte container)
     scales: &[u16],        // [K/group_size, N] BF16
@@ -1396,13 +1456,19 @@ pub fn matmul_int8_transposed_integer(
         panic!("AVX2 + FMA required");
     }
 
-    unsafe {
-        expert_matmul_int8_transposed_integer(
-            data_u32.as_ptr() as *const i8,
-            scales.as_ptr(), act_int16.as_ptr(),
-            act_scales.as_ptr(), output.as_mut_ptr(),
-            k, n, 0, n, group_size,
-        );
+    const TILE_N: usize = 256;
+    let mut n_done = 0;
+    while n_done < n {
+        let tile_n = (n - n_done).min(TILE_N);
+        unsafe {
+            expert_matmul_int8_transposed_integer(
+                data_u32.as_ptr() as *const i8,
+                scales.as_ptr(), act_int16.as_ptr(),
+                act_scales.as_ptr(), output.as_mut_ptr().add(n_done),
+                k, n, n_done, tile_n, group_size,
+            );
+        }
+        n_done += tile_n;
     }
 }
 

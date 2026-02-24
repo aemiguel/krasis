@@ -29,6 +29,7 @@ _CPU_DECODE_TIMING = os.environ.get("KRASIS_CPU_DECODE_TIMING", "0") == "1"
 _TIMING_REPORT_INTERVAL = int(os.environ.get("KRASIS_TIMING_INTERVAL", "20"))
 _NO_QUANT = os.environ.get("KRASIS_NO_QUANT", "0") == "1"
 _PYTHON_NORMS = os.environ.get("KRASIS_PYTHON_NORMS", "0") == "1"
+_PYTHON_DECODE = os.environ.get("KRASIS_PYTHON_DECODE", "0") == "1"
 
 
 def sample_cpu(logits: torch.Tensor, temperature: float = 0.6,
@@ -136,6 +137,8 @@ class CpuDecoder:
         self._max_seq = 0
         self._prepared = False
         self._step_count = 0
+        self._use_rust_decode = False
+        self._decode_graph_tensors = []  # prevent GC of tensors passed to Rust
 
         # Timing instrumentation (enabled via KRASIS_CPU_DECODE_TIMING=1)
         self._timing = _CPU_DECODE_TIMING
@@ -238,6 +241,15 @@ class CpuDecoder:
         else:
             self._quantize_all_weights()
 
+        # ── Store norm weights in Rust for zero-overhead access ──
+        store = self._store
+        self._final_norm_id = store.store_norm_weight(
+            self._final_norm.data_ptr(), self._final_norm.numel())
+        for ld in self._layers:
+            for nk in ('input_norm', 'post_attn_norm'):
+                nw = ld[nk]
+                ld[f'{nk}_id'] = store.store_norm_weight(nw.data_ptr(), nw.numel())
+
         # ── Pre-compute RoPE tables (max 128K positions) ──
         self._max_rope_seq = 131072
         self._init_rope()
@@ -246,6 +258,9 @@ class CpuDecoder:
         # Use 32K as default max decode context; actual prompts up to this length
         # are supported without reallocation. Larger prompts trigger reallocation.
         self._preallocate_buffers(max_seq=32768)
+
+        # ── Configure Rust decode graph (single-call decode_step) ──
+        self._configure_decode_graph()
 
         self._weights_initialized = True
         elapsed = time.perf_counter() - t0
@@ -316,6 +331,10 @@ class CpuDecoder:
 
         # ── Copy linear attention state from GPU (not zero!) ──
         self._copy_recurrent_state_from_gpu()
+
+        # ── Update Rust decode state pointers ──
+        if self._use_rust_decode:
+            self._set_decode_state()
 
         # Reset step counter and timing
         self._step_count = 0
@@ -443,13 +462,15 @@ class CpuDecoder:
     def _init_linear_attention(self, layer_idx, layer, ld):
         """Copy linear attention weights to CPU (immutable). State templates stored for reset."""
         attn = layer.attention
+        # conv1d_weight: squeeze [conv_dim, 1, kernel_dim] -> [conv_dim, kernel_dim] for Rust
+        conv_w = attn.conv1d_weight.float().cpu().squeeze(1).contiguous()
         ld['attn'] = {
             'in_proj_qkvz': self._to_cpu_f32(attn.in_proj_qkvz),
             'in_proj_ba': self._to_cpu_f32(attn.in_proj_ba),
-            'conv1d_weight': attn.conv1d_weight.float().cpu(),  # [conv_dim, 1, kernel_dim]
+            'conv1d_weight': conv_w,
             'out_proj': self._to_cpu_f32(attn.out_proj),
-            'A_log': attn.A_log.float().cpu(),
-            'dt_bias': attn.dt_bias.float().cpu(),
+            'A_log': attn.A_log.float().cpu().contiguous(),
+            'dt_bias': attn.dt_bias.float().cpu().contiguous(),
             'norm_weight': attn.norm_weight.float().cpu().reshape(-1).contiguous(),
             'num_k_heads': attn.num_k_heads,
             'num_v_heads': attn.num_v_heads,
@@ -553,13 +574,17 @@ class CpuDecoder:
 
         if layer_type == "linear_attention":
             attn_d = cpu_w.get("linear_attention", {})
+            conv_w = attn_d['conv1d_weight'].float().cpu()
+            if conv_w.dim() == 3:
+                conv_w = conv_w.squeeze(1)
+            conv_w = conv_w.contiguous()
             ld['attn'] = {
                 'in_proj_qkvz': self._to_cpu_f32(attn_d['in_proj_qkvz']),
                 'in_proj_ba': self._to_cpu_f32(attn_d['in_proj_ba']),
-                'conv1d_weight': attn_d['conv1d_weight'].float().cpu(),
+                'conv1d_weight': conv_w,
                 'out_proj': self._to_cpu_f32(attn_d['out_proj']),
-                'A_log': attn_d['A_log'].float().cpu(),
-                'dt_bias': attn_d['dt_bias'].float().cpu(),
+                'A_log': attn_d['A_log'].float().cpu().contiguous(),
+                'dt_bias': attn_d['dt_bias'].float().cpu().contiguous(),
                 'norm_weight': attn_d['norm_weight'].float().cpu().reshape(-1).contiguous(),
                 'num_k_heads': layer.attention.num_k_heads,
                 'num_v_heads': layer.attention.num_v_heads,
@@ -694,6 +719,12 @@ class CpuDecoder:
                 se = ld['shared_expert']
                 self._qw(se, 'gate_up_proj', bits, gs)
                 self._qw(se, 'down_proj', bits, gs)
+                # Quantize shared_expert_gate if present (ensure 2D)
+                if 'gate' in se and isinstance(se['gate'], torch.Tensor):
+                    g = se['gate']
+                    if g.dim() == 1:
+                        se['gate'] = g.unsqueeze(0)
+                    self._qw(se, 'gate', bits, gs)
 
             if 'dense_mlp' in ld:
                 d = ld['dense_mlp']
@@ -701,8 +732,38 @@ class CpuDecoder:
                 self._qw(d, 'up_proj', bits, gs)
                 self._qw(d, 'down_proj', bits, gs)
 
-        logger.info("Quantized %d weights into Rust store (%d KB INT%d)",
-                     self._store.num_weights(), self._store.total_bytes() // 1024, bits)
+            # Store MoE routing weights as float32 in Rust
+            if 'gate_weight' in ld:
+                gw = ld['gate_weight'].contiguous()
+                ne, hd = gw.shape
+                bias_ptr = None
+                bias_len = 0
+                esc_ptr = None
+                esc_len = 0
+                if 'gate_bias' in ld:
+                    gb = ld['gate_bias'].contiguous()
+                    bias_ptr = gb.data_ptr()
+                    bias_len = gb.numel()
+                    ld['_gate_bias_tensor'] = gb  # prevent GC
+                if 'e_score_corr' in ld:
+                    ec = ld['e_score_corr'].contiguous()
+                    esc_ptr = ec.data_ptr()
+                    esc_len = ec.numel()
+                    ld['_e_score_corr_tensor'] = ec  # prevent GC
+                rid = self._store.store_route_weight(
+                    gw.data_ptr(), ne, hd,
+                    bias_ptr, bias_len, esc_ptr, esc_len)
+                ld['_route_id'] = rid
+                # Free Python copies (data now lives in Rust)
+                ld.pop('gate_weight', None)
+                ld.pop('gate_bias', None)
+                ld.pop('e_score_corr', None)
+                ld.pop('_gate_bias_tensor', None)
+                ld.pop('_e_score_corr_tensor', None)
+
+        logger.info("Quantized %d weights + %d route weights into Rust store (%d KB INT%d)",
+                     self._store.num_weights(), self._store.num_route_weights(),
+                     self._store.total_bytes() // 1024, bits)
 
     def _qw(self, d, key, bits, gs):
         """Quantize one weight matrix: d[key] → d[key+'_wid'] + d[key+'_buf']."""
@@ -984,6 +1045,193 @@ class CpuDecoder:
                      state_bytes / 1e6, len(self._la_recur_state))
 
     # ──────────────────────────────────────────────────────
+    # Rust decode graph configuration
+    # ──────────────────────────────────────────────────────
+
+    def _configure_decode_graph(self):
+        """Configure the Rust decode graph for single-call decode_step.
+
+        Only supported for models with linear_attention or GQA (not MLA).
+        Falls back to Python path for unsupported models or when disabled.
+        """
+        cfg = self.cfg
+
+        if _PYTHON_DECODE:
+            logger.info("KRASIS_PYTHON_DECODE=1: using Python decode path")
+            self._use_rust_decode = False
+            return
+
+        if cfg.is_mla or _NO_QUANT or self._lm_head_wid is None:
+            self._use_rust_decode = False
+            return
+
+        store = self._store
+
+        # scoring_func: 0=sigmoid, 1=softmax, 2=swiglu
+        topk = cfg.num_experts_per_tok if cfg.num_experts_per_tok > 0 else 0
+        if topk > 0:
+            if hasattr(cfg, 'swiglu_limit') and cfg.swiglu_limit > 0:
+                sf = 2
+            elif cfg.scoring_func == "sigmoid":
+                sf = 0
+            else:
+                sf = 1
+        else:
+            sf = 0
+        rsf = getattr(cfg, 'routed_scaling_factor', 1.0)
+        ntp = getattr(cfg, 'norm_topk_prob', False)
+
+        store.configure_decode(
+            cfg.hidden_size, cfg.num_hidden_layers,
+            cfg.rms_norm_eps, self._final_norm_id, self._lm_head_wid,
+            cfg.vocab_size, topk, sf, ntp, rsf,
+            self._embedding.data_ptr())
+
+        first_k = cfg.first_k_dense_replace
+
+        for layer_idx, ld in enumerate(self._layers):
+            a = ld.get('attn', {})
+
+            if ld['type'] == 'linear_attention':
+                # Expand norm_weight [dv] → [nv*dv] if needed
+                nw = a['norm_weight']
+                nv = a['num_v_heads']
+                dv = a['v_head_dim']
+                if nw.numel() == dv:
+                    nw_expanded = nw.repeat(nv).contiguous()
+                else:
+                    nw_expanded = nw.contiguous()
+                self._decode_graph_tensors.append(nw_expanded)
+
+                store.add_decode_la_layer(
+                    ld['input_norm_id'], ld['post_attn_norm_id'],
+                    a['in_proj_qkvz_wid'], a['in_proj_ba_wid'], a['out_proj_wid'],
+                    a['conv1d_weight'].data_ptr(),
+                    a['A_log'].data_ptr(), a['dt_bias'].data_ptr(),
+                    nw_expanded.data_ptr(),
+                    a['num_k_heads'], a['num_v_heads'],
+                    a['k_head_dim'], a['v_head_dim'],
+                    a['head_ratio'], a['kernel_dim'], a['scale'])
+
+            elif cfg.is_gqa:
+                q_norm = a.get('q_norm')
+                k_norm = a.get('k_norm')
+                q_norm_ptr = q_norm.data_ptr() if q_norm is not None else 0
+                q_norm_len = q_norm.numel() if q_norm is not None else 0
+                k_norm_ptr = k_norm.data_ptr() if k_norm is not None else 0
+                k_norm_len = k_norm.numel() if k_norm is not None else 0
+                if q_norm is not None:
+                    self._decode_graph_tensors.append(q_norm.contiguous())
+                if k_norm is not None:
+                    self._decode_graph_tensors.append(k_norm.contiguous())
+
+                store.add_decode_gqa_layer(
+                    ld['input_norm_id'], ld['post_attn_norm_id'],
+                    a['q_proj_wid'], a['k_proj_wid'],
+                    a['v_proj_wid'], a['o_proj_wid'],
+                    q_norm_ptr, q_norm_len, k_norm_ptr, k_norm_len,
+                    a['gated'], a['num_heads'], a['num_kv_heads'],
+                    a['head_dim'], a['sm_scale'])
+            else:
+                logger.warning("Unsupported attention type for decode graph at layer %d", layer_idx)
+                self._use_rust_decode = False
+                return
+
+            # MLP config
+            moe_layer_idx = layer_idx - first_k if layer_idx >= first_k else None
+
+            if ld['is_moe'] and '_route_id' in ld:
+                se = ld.get('shared_expert', {})
+                sgu_wid = se.get('gate_up_proj_wid')
+                sd_wid = se.get('down_proj_wid')
+                sg_wid = se.get('gate_wid')
+                store.set_decode_layer_moe(
+                    layer_idx, ld['_route_id'],
+                    moe_layer_idx if moe_layer_idx is not None else 0,
+                    sgu_wid, sd_wid, sg_wid)
+            elif 'dense_mlp' in ld:
+                d = ld['dense_mlp']
+                store.set_decode_layer_dense(
+                    layer_idx,
+                    d['gate_proj_wid'], d['up_proj_wid'], d['down_proj_wid'])
+
+        # RoPE (for GQA layers)
+        if self._rope_cos is not None:
+            store.set_decode_rope(
+                self._rope_cos.data_ptr(), self._rope_sin.data_ptr(),
+                self._rope_cos.shape[-1], self._rope_cos.shape[0])
+
+        # MoE store
+        if topk > 0 and self.engine is not None:
+            store.set_moe_store(self.engine)
+
+        store.finalize_decode()
+        self._use_rust_decode = True
+        logger.info("Rust decode graph configured: %d layers, topk=%d",
+                     cfg.num_hidden_layers, topk)
+
+    def _set_decode_state(self):
+        """Update Rust decode state pointers after prepare()."""
+        cfg = self.cfg
+        num_layers = cfg.num_hidden_layers
+        kv_k_ptrs = []
+        kv_v_ptrs = []
+        conv_state_ptrs = []
+        recur_state_ptrs = []
+
+        for layer_idx in range(num_layers):
+            if layer_idx in self._kv_k:
+                kv_k_ptrs.append(self._kv_k[layer_idx].data_ptr())
+                kv_v_ptrs.append(self._kv_v[layer_idx].data_ptr())
+            else:
+                kv_k_ptrs.append(0)
+                kv_v_ptrs.append(0)
+
+            if layer_idx in self._la_conv_state:
+                cs = self._la_conv_state[layer_idx]
+                if cs.dim() == 3:
+                    cs = cs.squeeze(0)
+                conv_state_ptrs.append(cs.data_ptr())
+            else:
+                conv_state_ptrs.append(0)
+
+            if layer_idx in self._la_recur_state:
+                rs = self._la_recur_state[layer_idx]
+                if rs.dim() == 4:
+                    rs = rs.squeeze(0)
+                recur_state_ptrs.append(rs.data_ptr())
+            else:
+                recur_state_ptrs.append(0)
+
+        self._store.set_decode_state(
+            self._seq_len, self._max_kv_seq,
+            kv_k_ptrs, kv_v_ptrs,
+            conv_state_ptrs, recur_state_ptrs)
+
+    def _step_rust(self, token_id: int, position: int) -> torch.Tensor:
+        """Rust single-call decode step."""
+        _t = self._timing
+        if _t:
+            _t0 = time.perf_counter()
+
+        self._store.decode_step(token_id, position, self._lm_head_buf.data_ptr())
+        logits = self._lm_head_buf.unsqueeze(0)
+
+        self._step_count += 1
+
+        if _t:
+            total_step = time.perf_counter() - _t0
+            self._timings['total'] += total_step
+            self._timing_counts['steps'] += 1
+            if self._timing_counts['steps'] % _TIMING_REPORT_INTERVAL == 0:
+                n = self._timing_counts['steps']
+                avg = self._timings['total'] / n * 1000
+                logger.info("=== CPU DECODE (Rust, %d steps, avg %.1f ms/tok, %.2f tok/s) ===",
+                            n, avg, 1000.0 / avg if avg > 0 else 0)
+
+        return logits
+
+    # ──────────────────────────────────────────────────────
     # Core decode step
     # ──────────────────────────────────────────────────────
 
@@ -998,6 +1246,12 @@ class CpuDecoder:
             logits: [1, vocab_size] float32 CPU tensor
         """
         assert self._prepared, "Call prepare() first"
+
+        # ── Rust single-call decode path ──
+        if self._use_rust_decode:
+            return self._step_rust(token_id, position)
+
+        # ── Python fallback path ──
         cfg = self.cfg
         _t = self._timing
 
@@ -1036,9 +1290,9 @@ class CpuDecoder:
             if _t:
                 _t0 = time.perf_counter()
             if use_rust_norms:
-                store.fused_add_rmsnorm(
+                store.fused_add_rmsnorm_id(
                     hidden.data_ptr(), residual.data_ptr(),
-                    ld['input_norm'].data_ptr(), eps, h_size, first_residual)
+                    ld['input_norm_id'], eps, h_size, first_residual)
             else:
                 if first_residual:
                     residual.copy_(hidden)
@@ -1085,9 +1339,9 @@ class CpuDecoder:
                 attn_out = attn_out.squeeze(0)
             hidden = attn_out.contiguous()
             if use_rust_norms:
-                store.fused_add_rmsnorm(
+                store.fused_add_rmsnorm_id(
                     hidden.data_ptr(), residual.data_ptr(),
-                    ld['post_attn_norm'].data_ptr(), eps, h_size, False)
+                    ld['post_attn_norm_id'], eps, h_size, False)
             else:
                 residual.add_(hidden)
                 variance = residual.pow(2).mean() + eps
@@ -1123,9 +1377,9 @@ class CpuDecoder:
         if _t:
             _t0 = time.perf_counter()
         if use_rust_norms:
-            store.fused_add_rmsnorm(
+            store.fused_add_rmsnorm_id(
                 hidden.data_ptr(), residual.data_ptr(),
-                self._final_norm.data_ptr(), eps, h_size, False)
+                self._final_norm_id, eps, h_size, False)
         else:
             residual.add_(hidden)
             variance = residual.pow(2).mean() + eps
@@ -1404,6 +1658,18 @@ class CpuDecoder:
     # Linear Attention (Gated DeltaNet, Qwen3-Next)
     # ──────────────────────────────────────────────────────
 
+    def _init_la_conv_buffers(self, a):
+        """Pre-allocate reusable buffers for linear attention conv (once per model)."""
+        nv = a['num_v_heads']
+        dk = a['k_head_dim']
+        dv = a['v_head_dim']
+        a['_q_buf'] = torch.empty(nv * dk, dtype=torch.float32)
+        a['_k_buf'] = torch.empty(nv * dk, dtype=torch.float32)
+        a['_v_buf'] = torch.empty(nv * dv, dtype=torch.float32)
+        a['_z_buf'] = torch.empty(nv * dv, dtype=torch.float32)
+        a['_g_buf'] = torch.empty(nv, dtype=torch.float32)
+        a['_beta_buf'] = torch.empty(nv, dtype=torch.float32)
+
     def _linear_attention_step(self, layer_idx, ld, hidden):
         """Gated DeltaNet recurrent decode step (M=1)."""
         a = ld['attn']
@@ -1412,7 +1678,6 @@ class CpuDecoder:
         dk = a['k_head_dim']
         dv = a['v_head_dim']
         hr = a['head_ratio']
-        conv_dim = a['conv_dim']
         kernel_dim = a['kernel_dim']
         _t = self._timing
         store = self._store
@@ -1425,57 +1690,43 @@ class CpuDecoder:
         if _t:
             self._timings['la_proj'] += time.perf_counter() - _t0
 
-        # ── Un-interleave + Conv + Gate params ──
+        # ── Un-interleave + Conv + Gate params (Rust) ──
         if _t:
             _t0 = time.perf_counter()
-        group_dim = 2 * dk + 2 * dv * hr
-        qkvz_grouped = qkvz.view(1, nk, group_dim)
-        split_sizes = [dk, dk, hr * dv, hr * dv]
-        q, k, v, z = torch.split(qkvz_grouped, split_sizes, dim=2)
-        v = v.reshape(1, nv, dv)
-        z = z.reshape(1, nv, dv)
 
-        ba_grouped = ba.view(1, nk, 2 * hr)
-        b, a_param = torch.split(ba_grouped, [hr, hr], dim=2)
-        b = b.reshape(1, nv)
-        a_param = a_param.reshape(1, nv)
+        # Lazily allocate conv buffers
+        if '_q_buf' not in a:
+            self._init_la_conv_buffers(a)
 
-        # Conv1d state update
-        q_flat = q.reshape(1, nk * dk)
-        k_flat = k.reshape(1, nk * dk)
-        v_flat = v.reshape(1, nv * dv)
+        q_buf = a['_q_buf']
+        k_buf = a['_k_buf']
+        v_buf = a['_v_buf']
+        z_buf = a['_z_buf']
+        g_buf = a['_g_buf']
+        beta_buf = a['_beta_buf']
 
-        mixed_qkv = torch.cat([q_flat, k_flat, v_flat], dim=-1)  # [1, conv_dim]
-        mixed_qkv = mixed_qkv.unsqueeze(0).transpose(1, 2)  # [1, conv_dim, 1]
-
+        # conv_state is [1, conv_dim, kernel_dim] — squeeze to [conv_dim, kernel_dim] for Rust
         conv_state = self._la_conv_state[layer_idx]
-        conv_input = torch.cat([conv_state, mixed_qkv], dim=-1)  # [1, conv_dim, kernel_dim+1]
-        self._la_conv_state[layer_idx] = conv_input[:, :, -kernel_dim:].clone()
+        if conv_state.dim() == 3:
+            conv_state = conv_state.squeeze(0)
+        conv_state = conv_state.contiguous()
 
-        # Depthwise conv1d for M=1: dot product per channel
-        conv_weight = a['conv1d_weight'].squeeze(1)  # [conv_dim, kernel_dim]
-        conv_out = (conv_input[:, :, -kernel_dim:] * conv_weight.unsqueeze(0)).sum(dim=-1)
-        conv_out = F.silu(conv_out).unsqueeze(0)  # [1, 1, conv_dim]
-        conv_out = conv_out.squeeze(0)  # [1, conv_dim]
+        qkvz_flat = qkvz.squeeze(0).contiguous() if qkvz.dim() == 2 else qkvz.contiguous()
+        ba_flat = ba.squeeze(0).contiguous() if ba.dim() == 2 else ba.contiguous()
 
-        # Split back to heads
-        key_dim = nk * dk
-        q_out = conv_out[:, :key_dim].reshape(1, nk, dk)
-        k_out = conv_out[:, key_dim:key_dim * 2].reshape(1, nk, dk)
-        v_out = conv_out[:, key_dim * 2:].reshape(1, nv, dv)
+        store.linear_attention_conv(
+            qkvz_flat.data_ptr(), ba_flat.data_ptr(),
+            conv_state.data_ptr(), a['conv1d_weight'].data_ptr(),
+            a['A_log'].data_ptr(), a['dt_bias'].data_ptr(),
+            a['scale'],
+            q_buf.data_ptr(), k_buf.data_ptr(),
+            v_buf.data_ptr(), z_buf.data_ptr(),
+            g_buf.data_ptr(), beta_buf.data_ptr(),
+            nk, nv, dk, dv, hr, kernel_dim)
 
-        # Gate parameters
-        beta = torch.sigmoid(b)  # [1, nv]
-        g = -a['A_log'].exp() * F.softplus(a_param + a['dt_bias'])  # [1, nv]
+        # Update conv state (modified in-place by Rust)
+        self._la_conv_state[layer_idx] = conv_state.unsqueeze(0)
 
-        # Expand key heads
-        if hr > 1:
-            q_out = q_out.repeat_interleave(hr, dim=1)  # [1, nv, dk]
-            k_out = k_out.repeat_interleave(hr, dim=1)
-
-        # L2 normalize
-        q_out = F.normalize(q_out, p=2, dim=-1) * a['scale']
-        k_out = F.normalize(k_out, p=2, dim=-1)
         if _t:
             self._timings['la_conv'] += time.perf_counter() - _t0
 
@@ -1483,12 +1734,6 @@ class CpuDecoder:
         if _t:
             _t0 = time.perf_counter()
         state = self._la_recur_state[layer_idx]  # [1, nv, dk, dv]
-
-        q_t = q_out[0].contiguous()    # [nv, dk]
-        k_t = k_out[0].contiguous()    # [nv, dk]
-        v_t = v_out[0].contiguous()    # [nv, dv]
-        g_vals = g[0].contiguous()     # [nv] (raw, not exp'd — Rust will exp)
-        beta_t = beta[0].contiguous()  # [nv]
 
         # State is [1, nv, dk, dv] — squeeze to [nv, dk, dv] for Rust
         state_3d = state.squeeze(0).contiguous()
@@ -1499,8 +1744,8 @@ class CpuDecoder:
         recur_out = self._la_recur_out
 
         store.linear_attention_recurrent(
-            state_3d.data_ptr(), q_t.data_ptr(), k_t.data_ptr(),
-            v_t.data_ptr(), g_vals.data_ptr(), beta_t.data_ptr(),
+            state_3d.data_ptr(), q_buf.data_ptr(), k_buf.data_ptr(),
+            v_buf.data_ptr(), g_buf.data_ptr(), beta_buf.data_ptr(),
             recur_out.data_ptr(), nv, dk, dv)
 
         self._la_recur_state[layer_idx] = state_3d.unsqueeze(0)
@@ -1510,7 +1755,6 @@ class CpuDecoder:
         # ── Gated RMSNorm + SiLU (Rust) ──
         if _t:
             _t0 = time.perf_counter()
-        z_flat = z.reshape(nv * dv).contiguous()
 
         if not hasattr(self, '_la_gated_out') or self._la_gated_out is None:
             self._la_gated_out = torch.empty(nv * dv, dtype=torch.float32)
@@ -1525,7 +1769,7 @@ class CpuDecoder:
             else:
                 a[nw_key] = nw.contiguous()
         store.gated_rmsnorm_silu(
-            recur_out.data_ptr(), z_flat.data_ptr(),
+            recur_out.data_ptr(), z_buf.data_ptr(),
             a[nw_key].data_ptr(),
             gated_out.data_ptr(), self.cfg.rms_norm_eps, nv, dv)
 
@@ -1534,7 +1778,7 @@ class CpuDecoder:
                         self._step_count, layer_idx,
                         recur_out.norm().item(), recur_out.abs().max().item(),
                         gated_out.norm().item(), gated_out.abs().max().item(),
-                        z_flat.norm().item(), z_flat.abs().max().item(),
+                        z_buf.norm().item(), z_buf.abs().max().item(),
                         a['norm_weight'].norm().item(), state_3d.norm().item())
 
         if _t:
@@ -1653,42 +1897,70 @@ class CpuDecoder:
     # ──────────────────────────────────────────────────────
 
     def _moe_forward(self, ld, hidden, moe_layer_idx):
-        """MoE: CPU routing + Rust engine experts + CPU shared expert."""
+        """MoE: Rust routing + Rust engine experts + Rust shared expert."""
         cfg = self.cfg
         topk = cfg.num_experts_per_tok
         _t = self._timing
 
-        # ── Routing (CPU) ──
+        # ── Routing (Rust) ──
         if _t:
             _t0 = time.perf_counter()
+        h_flat = hidden if hidden.dim() == 1 else hidden.squeeze(0)
         h_2d = hidden.unsqueeze(0) if hidden.dim() == 1 else hidden
-        router_logits = torch.matmul(h_2d, ld['gate_weight'].t())
-        if 'gate_bias' in ld:
-            router_logits = router_logits + ld['gate_bias']
 
-        if cfg.swiglu_limit > 0:
-            topk_weights, topk_ids = torch.topk(router_logits, topk, dim=-1)
-            topk_weights = F.softmax(topk_weights, dim=-1)
-        elif cfg.scoring_func == "sigmoid":
-            scores = torch.sigmoid(router_logits)
-            if 'e_score_corr' in ld:
-                topk_weights, topk_ids = torch.topk(
-                    scores + ld['e_score_corr'], topk, dim=-1)
-                topk_weights = scores.gather(1, topk_ids)
+        route_id = ld.get('_route_id')
+        if route_id is not None:
+            # Rust routing path
+            # Pre-allocate routing output buffers (reuse across layers)
+            if not hasattr(self, '_route_ids_buf') or self._route_ids_buf is None:
+                self._route_ids_buf = torch.empty(topk, dtype=torch.int32)
+                self._route_wts_buf = torch.empty(topk, dtype=torch.float32)
+
+            # scoring_func: 0=sigmoid, 1=softmax, 2=swiglu
+            if cfg.swiglu_limit > 0:
+                sf = 2
+            elif cfg.scoring_func == "sigmoid":
+                sf = 0
             else:
-                topk_weights, topk_ids = torch.topk(scores, topk, dim=-1)
-            if cfg.norm_topk_prob:
-                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+                sf = 1
+
+            self._store.moe_route(
+                route_id, h_flat.data_ptr(),
+                self._route_ids_buf.data_ptr(),
+                self._route_wts_buf.data_ptr(),
+                topk, sf, cfg.norm_topk_prob)
+
+            topk_ids = self._route_ids_buf.unsqueeze(0)    # [1, topk]
+            topk_weights = self._route_wts_buf.unsqueeze(0)  # [1, topk]
         else:
-            scores = F.softmax(router_logits, dim=-1)
-            if 'e_score_corr' in ld:
-                topk_weights, topk_ids = torch.topk(
-                    scores + ld['e_score_corr'], topk, dim=-1)
-                topk_weights = scores.gather(1, topk_ids)
+            # Python fallback (only if store_route_weight wasn't called)
+            router_logits = torch.matmul(h_2d, ld['gate_weight'].t())
+            if 'gate_bias' in ld:
+                router_logits = router_logits + ld['gate_bias']
+
+            if cfg.swiglu_limit > 0:
+                topk_weights, topk_ids = torch.topk(router_logits, topk, dim=-1)
+                topk_weights = F.softmax(topk_weights, dim=-1)
+            elif cfg.scoring_func == "sigmoid":
+                scores = torch.sigmoid(router_logits)
+                if 'e_score_corr' in ld:
+                    topk_weights, topk_ids = torch.topk(
+                        scores + ld['e_score_corr'], topk, dim=-1)
+                    topk_weights = scores.gather(1, topk_ids)
+                else:
+                    topk_weights, topk_ids = torch.topk(scores, topk, dim=-1)
+                if cfg.norm_topk_prob:
+                    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
             else:
-                topk_weights, topk_ids = torch.topk(scores, topk, dim=-1)
-            if cfg.norm_topk_prob:
-                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+                scores = F.softmax(router_logits, dim=-1)
+                if 'e_score_corr' in ld:
+                    topk_weights, topk_ids = torch.topk(
+                        scores + ld['e_score_corr'], topk, dim=-1)
+                    topk_weights = scores.gather(1, topk_ids)
+                else:
+                    topk_weights, topk_ids = torch.topk(scores, topk, dim=-1)
+                if cfg.norm_topk_prob:
+                    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         if _t:
             self._timings['moe_routing'] += time.perf_counter() - _t0
 
