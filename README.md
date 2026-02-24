@@ -60,10 +60,10 @@ Speeds reported in the following models are benchmarked on the following hardwar
 
 Measured with INT4 GPU + INT4 CPU experts, BF16 attention, INT8 shared/MLP/lm_head, FP8 KV cache. Sliding window (2048 tokens, stride 1024), GPU Marlin prefill.
 
-| Model | Dataset | Tokens | PPL | BPC | Throughput |
-|-------|---------|:------:|:---:|:---:|:----------:|
-| **Qwen3-Coder-Next** | WikiText-2 | 299K | 10.64 | 3.41 | 121 tok/s |
-| **Qwen3-Coder-Next** | C4 validation | 500K | 12.44 | 3.64 | 123 tok/s |
+| Model | Dataset | Tokens | PPL | BPC |
+|-------|---------|:------:|:---:|:---:|
+| **Qwen3-Coder-Next** | WikiText-2 | 299K | 10.64 | 3.41 |
+| **Qwen3-Coder-Next** | C4 validation | 500K | 12.44 | 3.64 |
 
 ## Quick Start
 
