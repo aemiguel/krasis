@@ -8,7 +8,7 @@ Config: 10K–50K token prompts, FP8 KV cache, BF16 attention, INT8 shared_exper
 
 | Model | GPUs | GPU/CPU bits | Prefill (tok/s) | TTFT @ 20K | Decode (tok/s) | ms/tok | Log |
 |-------|-----:|-------------:|----------------:|:----------:|:--------------:|:------:|-----|
-| Qwen3-Coder-Next | 1 | INT4/INT4 | 1,060.6 | 18.9s | 14.84 | 67.6 | [log](Qwen3-Coder-Next_native_1gpu_int4gpu_int4cpu_stream_lgs2.log) |
+| Qwen3-Coder-Next | 1 | INT4/INT4 | 1,056.6 | 18.9s | 15.81 | 63.6 | [log](Qwen3-Coder-Next_native_1gpu_int4gpu_int4cpu_stream_lgs2.log) |
 | Qwen3-Coder-Next | 1 | INT8/INT8 | 873.2 | 40.1s | 12.41 | 80.6 | [log](Qwen3-Coder-Next_native_1gpu_int8gpu_int8cpu_stream_lgs2.log) |
 | DeepSeek-V2-Lite | 1 | INT4/INT4 | 1,476.5 | 13.6s | 20.18 | 49.7 | [log](DeepSeek-V2-Lite_native_1gpu_int4gpu_int4cpu_stream_lgs2.log) |
 | DeepSeek-V2-Lite | 1 | INT8/INT8 | 1,316.9 | 15.2s | 17.84 | 56.2 | [log](DeepSeek-V2-Lite_native_1gpu_int8gpu_int8cpu_stream_lgs2.log) |
@@ -18,7 +18,7 @@ Config: 10K–50K token prompts, FP8 KV cache, BF16 attention, INT8 shared_exper
 - **NUMA-aware thread pinning**: rayon threads pinned round-robin across 4 NUMA nodes via sched_setaffinity. Eliminates cross-node memory traffic.
 - **MPOL_INTERLEAVE**: Weight mmap pages spread across all memory controllers. 4x aggregate DRAM bandwidth.
 - **MLA AVX2 kernels**: w_kc/w_vc absorption and attention vectorized with parallel head dispatch.
-- **Combined effect**: QCN decode 7.89 → 14.84 tok/s (+88%), V2-Lite decode 6.22 → 20.18 tok/s (+224%).
+- **Combined effect**: QCN decode 7.89 → 15.81 tok/s (+100%), V2-Lite decode 6.22 → 20.18 tok/s (+224%).
 
 ---
 

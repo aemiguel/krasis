@@ -603,14 +603,15 @@ class CpuDecoder:
 
     def _zero_kv_cache(self):
         """Zero pre-allocated KV cache buffers for new request."""
-        for t in self._kv_k.values():
-            t.zero_()
-        for t in self._kv_v.values():
-            t.zero_()
-        for t in self._mla_ckv.values():
-            t.zero_()
-        for t in self._mla_kpe.values():
-            t.zero_()
+        with torch.inference_mode():
+            for t in self._kv_k.values():
+                t.zero_()
+            for t in self._kv_v.values():
+                t.zero_()
+            for t in self._mla_ckv.values():
+                t.zero_()
+            for t in self._mla_kpe.values():
+                t.zero_()
 
     def _copy_recurrent_state_from_gpu(self):
         """Copy linear attention recurrent + conv state from GPU after prefill.

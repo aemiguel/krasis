@@ -428,6 +428,18 @@ def run_large_prompt_tests(base_url: str) -> List[TestResult]:
     results.append(r)
     print(f"  {_pass(r.detail) if r.passed else _fail(r.detail)} [{r.name}]")
 
+    # Test 5d: ~100K tokens
+    print(f"  Building ~100K token prompt...", end="", flush=True)
+    text_100k = _build_large_text(100000)
+    prompt_100k = f"{text_100k}\n\nWhat was the main theme of Section 100? Answer briefly."
+    print(f" done ({len(prompt_100k)} chars)")
+
+    r = test_coherent_response(base_url, "large_100k", [
+        {"role": "user", "content": prompt_100k},
+    ], max_tokens=128, timeout=1200, stream=True, min_words=3)
+    results.append(r)
+    print(f"  {_pass(r.detail) if r.passed else _fail(r.detail)} [{r.name}]")
+
     return results
 
 
@@ -520,6 +532,9 @@ def main():
     warmup_ok = status == 200
     warmup_elapsed = time.time() - t_w
     print(f" {'done' if warmup_ok else 'FAILED'} ({warmup_elapsed:.1f}s)")
+    if warmup_ok:
+        warmup_text, _ = parse_sse_content(body)
+        print(f"  {DIM}>>> {warmup_text[:200]}{NC}")
     if not warmup_ok:
         print(f"  Warmup failed: status={status}, body={body}")
         print("  Server may be stuck. Aborting tests.")
@@ -543,14 +558,23 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"{BOLD}SUMMARY{NC}: {passed}/{total} passed, {failed} failed, {total_time:.1f}s total")
 
+    # Show ALL response texts for manual review
+    print(f"\n{BOLD}Response texts (review for coherence):{NC}")
+    for r in all_results:
+        status = f"{GREEN}PASS{NC}" if r.passed else f"{RED}FAIL{NC}"
+        print(f"\n  [{status}] {r.name}: {r.detail}")
+        if r.response_text:
+            # Show full text (truncated at 500 chars for readability)
+            preview = r.response_text[:500].replace("\n", "\\n")
+            print(f"  {DIM}>>> {preview}{NC}")
+        else:
+            print(f"  {DIM}>>> (no response text captured){NC}")
+
     if failed > 0:
         print(f"\n{RED}Failed tests:{NC}")
         for r in all_results:
             if not r.passed:
                 print(f"  {r.name}: {r.detail}")
-                if r.response_text:
-                    preview = r.response_text[:200].replace("\n", "\\n")
-                    print(f"    Response: {preview!r}")
 
     print()
     if failed == 0:

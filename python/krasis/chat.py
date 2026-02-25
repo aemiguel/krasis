@@ -560,6 +560,44 @@ def stream_chat(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Server info queries
+# ═══════════════════════════════════════════════════════════════════════
+
+def _query_max_context(url: str) -> int:
+    """Query the server's max context token capacity. Returns 0 if unknown."""
+    try:
+        req = urllib.request.Request(f"{url}/health")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+            return data.get("max_context_tokens", 0)
+    except Exception:
+        return 0
+
+
+def _format_token_count(n: int) -> str:
+    """Format token count: 175000 -> '175K', 1200000 -> '1.2M'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return str(n)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token for English text."""
+    return max(1, len(text) // 4)
+
+
+def _estimate_message_tokens(messages: List[Dict[str, str]]) -> int:
+    """Rough token estimate for a full message list."""
+    total = 0
+    for msg in messages:
+        # ~4 tokens per message for role/formatting overhead
+        total += 4 + _estimate_tokens(msg.get("content", ""))
+    return total
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Chat loop
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -573,6 +611,7 @@ def chat_loop(
     url = server["url"]
     model = server["model"]
     messages: List[Dict[str, str]] = []
+    max_context = _query_max_context(url)
 
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -585,6 +624,8 @@ def chat_loop(
     print(f"  {BOLD}\u2551  {CYAN}Krasis Chat{NC}{BOLD} \u2014 {model_display:<37s}\u2551{NC}")
     print(f"  {BOLD}\u255a{'═' * 50}\u255d{NC}")
     print(f"  {DIM}Server: {server['host']}:{server['port']}{NC}")
+    if max_context > 0:
+        print(f"  {DIM}Max context: {_format_token_count(max_context)} tokens{NC}")
     print(f"  {DIM}Commands: /new (clear history)  /system <msg>  /exit{NC}")
     print()
 
@@ -620,6 +661,64 @@ def chat_loop(
                 print(f"  {DIM}System prompt set.{NC}\n")
                 continue
 
+            # ── Check prompt length before sending ──
+            pending_messages = messages + [{"role": "user", "content": user_input}]
+            est_tokens = _estimate_message_tokens(pending_messages)
+
+            if max_context > 0 and est_tokens > int(max_context * 0.9):
+                # Prompt is near or over the KV cache limit
+                if est_tokens >= max_context:
+                    print(
+                        f"\n  {RED}Prompt too long: ~{_format_token_count(est_tokens)} tokens "
+                        f"exceeds KV cache capacity of {_format_token_count(max_context)}.{NC}"
+                    )
+                else:
+                    print(
+                        f"\n  {YELLOW}Warning: ~{_format_token_count(est_tokens)} tokens "
+                        f"leaves little room for response "
+                        f"(max {_format_token_count(max_context)}).{NC}"
+                    )
+
+                # Offer options
+                # How many tokens to keep: 80% of max context
+                safe_tokens = int(max_context * 0.8)
+                # Rough char count for truncation
+                safe_chars = safe_tokens * 4
+
+                print(f"  {DIM}[C] Cancel  [T] Truncate to ~{_format_token_count(safe_tokens)} tokens  [S] Send anyway{NC}")
+                sys.stdout.write(f"  Choice: ")
+                sys.stdout.flush()
+
+                choice = ""
+                if _HAS_TERMIOS:
+                    fd = sys.stdin.fileno()
+                    old = termios.tcgetattr(fd)
+                    try:
+                        tty.setcbreak(fd)
+                        ch = sys.stdin.read(1).lower()
+                        choice = ch
+                        sys.stdout.write(ch + "\n")
+                        sys.stdout.flush()
+                    finally:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                else:
+                    choice = input().strip().lower()
+
+                if choice == "c" or choice == "":
+                    print(f"  {DIM}Cancelled.{NC}\n")
+                    continue
+                elif choice == "t":
+                    # Truncate: keep the start of the user message
+                    if len(user_input) > safe_chars:
+                        user_input = user_input[:safe_chars]
+                        new_est = _estimate_message_tokens(
+                            messages + [{"role": "user", "content": user_input}]
+                        )
+                        print(
+                            f"  {DIM}Truncated to ~{_format_token_count(new_est)} tokens.{NC}\n"
+                        )
+                # choice == "s": send anyway
+
             # ── Send message ──
             messages.append({"role": "user", "content": user_input})
 
@@ -652,7 +751,12 @@ def chat_loop(
                 print(f"  {DIM}Server may have shut down.{NC}\n")
                 messages.pop()  # remove failed user message
             except RuntimeError as e:
-                print(f"\n\n  {RED}Error: {e}{NC}\n")
+                error_str = str(e)
+                # Check if server returned context_length_exceeded
+                if "context_length_exceeded" in error_str or "Prompt too long" in error_str:
+                    print(f"\n\n  {RED}Server rejected: prompt exceeds KV cache capacity.{NC}\n")
+                else:
+                    print(f"\n\n  {RED}Error: {e}{NC}\n")
                 messages.pop()
             except Exception as e:
                 print(f"\n\n  {RED}{type(e).__name__}: {e}{NC}\n")

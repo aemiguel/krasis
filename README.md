@@ -11,9 +11,9 @@ Krasis can run MoE language models that are much too large to fit in a consumer 
 
 **Crucially, it runs these models at a speed that is usable.**
 
-## Qwen3-Coder-Next / 1,060 tok/s prefill / 14.8 tok/s decode
+## Qwen3-Coder-Next / 1,060 tok/s prefill / 15.8 tok/s decode
 
-For example, running Qwen3-Coder-Next (80B params, 148 GB BF16) on a single-socket EPYC 7742 with 1x RTX 2000 Ada 16 GB, Krasis achieves **1,060 tokens/sec prefill** and **14.8 tokens/sec decode**.
+For example, running Qwen3-Coder-Next (80B params, 148 GB BF16) on a single-socket EPYC 7742 with 1x RTX 2000 Ada 16 GB, Krasis achieves **1,060 tokens/sec prefill** and **15.8 tokens/sec decode**.
 
 ## How LLMs work
 
@@ -59,7 +59,7 @@ Benchmark uses 10K–50K token prompts (prefill) and 64-token generation runs (d
 
 | Model | Expert Quant | Prefill (tok/s) | TTFT @ 20K | Decode (tok/s) | ms/tok |
 |-------|:------------:|:---------------:|:----------:|:--------------:|:------:|
-| **Qwen3-Coder-Next** | INT4 GPU + INT4 CPU | 1,060 | 18.9s | 14.84 | 67.6 |
+| **Qwen3-Coder-Next** | INT4 GPU + INT4 CPU | 1,060 | 18.9s | 15.81 | 63.6 |
 | **Qwen3-Coder-Next** | INT8 GPU + INT8 CPU | 873 | 40.1s | 12.41 | 80.6 |
 | **DeepSeek V2-Lite** | INT4 GPU + INT4 CPU | 1,477 | 13.6s | 20.18 | 49.7 |
 | **DeepSeek V2-Lite** | INT8 GPU + INT8 CPU | 1,317 | 15.2s | 17.84 | 56.2 |
@@ -72,7 +72,7 @@ Measured with INT4 GPU + INT4 CPU experts, BF16 attention, INT8 shared/MLP/lm_he
 
 | Model | Dataset | Tokens | PPL | BPC | Throughput |
 |-------|---------|:------:|:---:|:---:|:----------:|
-| **Qwen3-Coder-Next** | WikiText-2 | 299K | 10.64 | 3.41 | 121 tok/s |
+| **Qwen3-Coder-Next** | WikiText-2 | 299K | 7.23 | 2.85 | 128 tok/s |
 | **Qwen3-Coder-Next** | C4 validation | 500K | 12.44 | 3.64 | 123 tok/s |
 | **DeepSeek V2-Lite** | WikiText-2 | 307K | 6.03 | 2.59 | 593 tok/s |
 | **DeepSeek V2-Lite** | C4 validation | 500K | 9.22 | 3.20 | 573 tok/s |

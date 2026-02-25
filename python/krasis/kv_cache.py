@@ -139,6 +139,11 @@ class PagedKVCache:
         return self.page_size * self.kv_cache_dim * elem_size * self.num_layers
 
     @property
+    def max_context_tokens(self) -> int:
+        """Maximum number of tokens this cache can hold."""
+        return self.max_pages * self.page_size
+
+    @property
     def free_page_count(self) -> int:
         return len(self._free_pages)
 

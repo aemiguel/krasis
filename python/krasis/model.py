@@ -398,7 +398,7 @@ class KrasisModel:
         layer_group_size: int = 1,
         gguf_path: Optional[str] = None,
         gguf_native: bool = False,
-        kv_cache_mb: int = 2000,
+        kv_cache_mb: int = 0,  # 0 = auto-size to available VRAM
         stream_attention: bool = True,
     ):
         self.cfg = ModelConfig.from_model_path(model_path)
@@ -1871,10 +1871,30 @@ class KrasisModel:
         For hybrid models, linear attention layers get -1 in _kv_layer_offsets.
 
         self.kv_caches[gpu_idx] = KV cache for the gpu_idx'th split group.
+
+        If kv_cache_mb == 0 (auto), computes the maximum KV cache that fits in
+        free VRAM minus headroom for HCS, CUDA workspace, and temporaries.
         """
         self.kv_caches = []
         self._kv_layer_offsets = {}
         use_combined = (self.attention_backend == "trtllm")
+
+        # Auto-size KV cache: measure free VRAM and use it
+        kv_mb = self.kv_cache_mb
+        if kv_mb == 0:
+            # Auto: use free VRAM minus headroom
+            # KV cache goes on GPU0 (streaming attention), measure its free VRAM
+            dev = self.all_devices[0]
+            free_bytes, _ = torch.cuda.mem_get_info(dev)
+            # Reserve headroom: 1.5 GB for HCS expert buffers, CUDA graphs,
+            # workspace, and inference transients
+            headroom_mb = 1500
+            auto_mb = max(256, int(free_bytes / (1024 * 1024)) - headroom_mb)
+            logger.info(
+                "KV cache auto-size: %d MB free on %s, headroom=%d MB → %d MB for KV",
+                free_bytes // (1024 * 1024), dev, headroom_mb, auto_mb,
+            )
+            kv_mb = auto_mb
 
         for gpu_idx, (start, end) in enumerate(self._layer_split):
             dev = self.all_devices[gpu_idx]
@@ -1897,7 +1917,7 @@ class KrasisModel:
                     device=dev,
                     kv_dtype=self.kv_dtype,
                     combined=use_combined,
-                    max_mb=self.kv_cache_mb,
+                    max_mb=kv_mb,
                 )
             else:
                 cache = None
@@ -1910,6 +1930,15 @@ class KrasisModel:
                 "Hybrid model: %d full attention layers (KV cache), %d linear attention layers",
                 total_kv, total_linear,
             )
+
+    def get_max_context_tokens(self) -> int:
+        """Maximum prompt + generation tokens supported by the KV cache."""
+        if not self.kv_caches:
+            return 0
+        # Bottleneck is the smallest KV cache across GPU splits
+        return min(
+            c.max_context_tokens for c in self.kv_caches if c is not None
+        )
 
     def _get_rank_for_layer(self, global_layer_idx: int) -> int:
         """Get the PP rank index that owns a given layer."""

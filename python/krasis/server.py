@@ -55,7 +55,8 @@ _model_name: str = "unknown"
 async def health():
     if _model is None or not _model._loaded:
         return JSONResponse({"status": "loading"}, status_code=503)
-    return {"status": "ok"}
+    max_ctx = _model.get_max_context_tokens() if _model else 0
+    return {"status": "ok", "max_context_tokens": max_ctx}
 
 
 @app.post("/v1/timing")
@@ -166,6 +167,21 @@ async def chat_completions(request: Request):
     # Tokenize
     prompt_tokens = _model.tokenizer.apply_chat_template(messages)
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+    # Check prompt fits in KV cache (with room for at least some generation)
+    max_ctx = _model.get_max_context_tokens()
+    if len(prompt_tokens) >= max_ctx:
+        return JSONResponse({
+            "error": {
+                "message": f"Prompt too long: {len(prompt_tokens):,} tokens exceeds "
+                           f"KV cache capacity of {max_ctx:,} tokens.",
+                "type": "invalid_request_error",
+                "param": "messages",
+                "code": "context_length_exceeded",
+                "prompt_tokens": len(prompt_tokens),
+                "max_context_tokens": max_ctx,
+            }
+        }, status_code=413)
 
     stop_ids = [_model.cfg.eos_token_id]
     # Handle custom stop tokens
@@ -505,8 +521,8 @@ def main():
                         help="CPU threads for expert computation")
     parser.add_argument("--kv-dtype", default="fp8_e4m3",
                         choices=["fp8_e4m3", "bf16"])
-    parser.add_argument("--kv-cache-mb", type=int, default=2000,
-                        help="KV cache size in MB (default: 2000)")
+    parser.add_argument("--kv-cache-mb", type=int, default=0,
+                        help="KV cache size in MB (0 = auto-size to available VRAM)")
     parser.add_argument("--heatmap-path", default=None,
                         help="Path to expert_heatmap.json for HCS init")
     parser.add_argument("--gpu-expert-bits", type=int, default=4, choices=[4, 8],
@@ -955,9 +971,15 @@ def main():
 
         sys.exit(0)
 
+    max_ctx = _model.get_max_context_tokens()
+    kv_label = "auto" if args.kv_cache_mb == 0 else f"{args.kv_cache_mb} MB"
     _status(f"Server ready on {args.host}:{args.port}")
+    print(f"  {_DIM}KV cache: {kv_label} → {max_ctx:,} max context tokens{_NC}", flush=True)
     print(f"  {_DIM}Press Q to quit, Ctrl-C to force exit{_NC}", flush=True)
-    logger.info("Model loaded, starting server on %s:%d", args.host, args.port)
+    logger.info(
+        "Model loaded, starting server on %s:%d (max context: %d tokens)",
+        args.host, args.port, max_ctx,
+    )
 
     _scheduler = Scheduler(_model)
 

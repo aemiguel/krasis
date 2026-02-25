@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-25 15:58:06
+Krasis Benchmark — 2026-02-25 22:10:56
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -25,16 +25,16 @@ Strategy:
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
 Prefill (3 runs at different lengths):
-  Run 1:  1060.6 tok/s, TTFT=18.86s (20,000 tokens)
-  Run 2:  929.2 tok/s, TTFT=37.67s (35,000 tokens)
-  Run 3:  822.0 tok/s, TTFT=60.82s (50,000 tokens)
-  Best:    1060.6 tok/s, TTFT=18.86s (20,000 tokens)
+  Run 1:  1056.6 tok/s, TTFT=18.93s (20,000 tokens)
+  Run 2:  934.6 tok/s, TTFT=37.45s (35,000 tokens)
+  Run 3:  820.8 tok/s, TTFT=60.92s (50,000 tokens)
+  Best:    1056.6 tok/s, TTFT=18.93s (20,000 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  14.66 tok/s (68.2ms/tok)
-  Run 2:  16.04 tok/s (62.4ms/tok)
-  Run 3:  13.83 tok/s (72.3ms/tok)
-  Average: 14.84 tok/s (67.6ms/tok)
+  Run 1:  14.38 tok/s (69.6ms/tok)
+  Run 2:  16.93 tok/s (59.1ms/tok)
+  Run 3:  16.13 tok/s (62.0ms/tok)
+  Average: 15.81 tok/s (63.6ms/tok)
 
 Verification:
   Prefill prompt: user
@@ -57,5 +57,5 @@ Explain how public key cryptography works, including the RSA algorithm and why i
 assistant
 
   Generated output (64 tokens):
-    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys: a **public key** (shared openly) and a **private key** (kept secret). Unlike symmetric-key cryptography (where the same key encrypts and decrypts), here, what one
+    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys—**a public key** and a **private key**—to enable secure communication, authentication, and digital signatures. Unlike symmetric-key cryptography (where the same key is used for encryption and decryption
 ================================================================
