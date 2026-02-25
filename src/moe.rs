@@ -28,6 +28,8 @@ use pyo3::types::{PyByteArray, PyBytes};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
+#[cfg(target_os = "linux")]
+use libc;
 
 /// Lazily-initialized Marlin tile map (kept for GPU prefill path and debugging).
 #[allow(dead_code)]
@@ -1330,6 +1332,18 @@ impl KrasisEngine {
     #[new]
     #[pyo3(signature = (parallel=true, num_threads=None, skip_shared_experts=false))]
     pub fn new(parallel: bool, num_threads: Option<usize>, skip_shared_experts: bool) -> Self {
+        // Enable transparent huge pages for this process.
+        // Some environments (tmux, systemd) inherit PR_SET_THP_DISABLE=1
+        // which silently prevents all THP allocation despite madvise succeeding.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let was_disabled = libc::prctl(42, 0, 0, 0, 0); // PR_GET_THP_DISABLE
+            if was_disabled == 1 {
+                libc::prctl(41, 0, 0, 0, 0); // PR_SET_THP_DISABLE = 0
+                log::info!("THP was process-disabled, re-enabled via prctl");
+            }
+        }
+
         // Configure rayon thread pool (once, globally)
         if let Some(n) = num_threads {
             let _ = rayon::ThreadPoolBuilder::new()

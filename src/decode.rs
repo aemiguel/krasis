@@ -3193,7 +3193,21 @@ pub fn bench_decode_synthetic(
     use std::time::Instant;
     use crate::weights::{ModelConfig, UnifiedExpertWeights};
 
+    // Enable transparent huge pages for this process.
+    // Some environments (tmux, systemd) inherit PR_SET_THP_DISABLE=1
+    // which silently prevents all THP allocation despite madvise succeeding.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if libc::prctl(42, 0, 0, 0, 0) == 1 { // PR_GET_THP_DISABLE
+            libc::prctl(41, 0, 0, 0, 0); // PR_SET_THP_DISABLE = 0
+            eprintln!("THP re-enabled (was inherited disabled)");
+        }
+    }
+
     // Configure rayon thread pool (must match real model's thread count)
+    // NOTE: Both sequential pinning (cores 0-19) and CCD-spread pinning tested.
+    // Both HURT performance. Sequential concentrates on 2-3 MCs. Spread causes
+    // cross-fabric latency. Linux scheduler's natural balancing is best.
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build_global();
@@ -3318,10 +3332,13 @@ pub fn bench_decode_synthetic(
     eprintln!("Allocating contiguous mmap: {:.1} GB packed + {:.1} MB scales",
         packed_mmap_bytes as f64 / 1e9, scales_mmap_bytes as f64 / 1e6);
 
+    // NOTE: Do NOT use MAP_POPULATE here — it pre-faults all pages as 4K before
+    // madvise can request huge pages. Instead: mmap lazy, madvise HUGEPAGE, then
+    // the random data fill below faults pages in as 2MB transparent huge pages.
     let packed_base = unsafe {
         libc::mmap(std::ptr::null_mut(), packed_mmap_bytes,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1, 0)
     };
     if packed_base == libc::MAP_FAILED {
@@ -3330,7 +3347,7 @@ pub fn bench_decode_synthetic(
     let scales_base = unsafe {
         libc::mmap(std::ptr::null_mut(), scales_mmap_bytes,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1, 0)
     };
     if scales_base == libc::MAP_FAILED {
