@@ -294,6 +294,9 @@ pub struct UnifiedExpertWeights {
     pub up_bias: Option<Vec<f32>>,
     /// down_bias: [hidden_size] f32 — added to down output after w2 matmul
     pub down_bias: Option<Vec<f32>>,
+
+    /// Whether data is in tiled layout (TILE_N=256 wide tiles).
+    pub tiled: bool,
 }
 
 impl UnifiedExpertWeights {
@@ -367,6 +370,7 @@ impl UnifiedExpertWeights {
             gate_bias: None,
             up_bias: None,
             down_bias: None,
+            tiled: false,
         }
     }
 
@@ -461,6 +465,7 @@ impl UnifiedExpertWeights {
             gate_bias: None,
             up_bias: None,
             down_bias: None,
+            tiled: false,
         }
     }
 
@@ -541,6 +546,7 @@ impl UnifiedExpertWeights {
             gate_bias: None,
             up_bias: None,
             down_bias: None,
+            tiled: false,
         }
     }
 
@@ -608,6 +614,7 @@ impl UnifiedExpertWeights {
             gate_bias: None,
             up_bias: None,
             down_bias: None,
+            tiled: false,
         }
     }
 
@@ -658,6 +665,7 @@ impl UnifiedExpertWeights {
                 gate_bias: None,
                 up_bias: None,
                 down_bias: None,
+                tiled: false,
             }
         } else {
             // INT8 gate/up
@@ -710,6 +718,7 @@ impl UnifiedExpertWeights {
                 gate_bias: None,
                 up_bias: None,
                 down_bias: None,
+                tiled: false,
             }
         };
 
@@ -4237,6 +4246,7 @@ fn read_marlin_expert(
         gate_bias: None,
         up_bias: None,
         down_bias: None,
+        tiled: false,
     }
 }
 
@@ -4323,6 +4333,7 @@ fn read_unified_expert_cpu(
         gate_bias: None,
         up_bias: None,
         down_bias: None,
+        tiled: false,
     }
 }
 
@@ -4412,6 +4423,7 @@ fn read_unified_expert_cpu_mixed(
         gate_bias: None,
         up_bias: None,
         down_bias: None,
+        tiled: false,
     }
 }
 

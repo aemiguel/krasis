@@ -1303,6 +1303,158 @@ pub fn matmul_int4_transposed_integer_parallel(
     });
 }
 
+// ── Tiled transposed INT4 layout ────────────────────────────────────────
+//
+// Repack from [K/8, N] to [N/TILE, K/8, TILE] so each 256-wide N-tile is
+// physically contiguous in memory. Each thread reads a sequential 256 KB
+// stream instead of a strided pattern with 48 KB gaps between K-rows.
+// Reuses the same kernel — only pointer arithmetic changes.
+
+/// Tile width for tiled layout. Must match chunk_n in parallel dispatch (256).
+pub const TILE_N: usize = 256;
+
+/// Repack INT4 packed weights from [K/8, N] to [N/TILE, K/8, TILE].
+/// Last tile is zero-padded if N is not a multiple of TILE_N.
+pub fn repack_tiled_int4_packed(packed: &[u32], k: usize, n: usize) -> Vec<u32> {
+    let k_rows = k / 8;
+    let num_tiles = (n + TILE_N - 1) / TILE_N;
+    let total = num_tiles * k_rows * TILE_N;
+    let mut tiled = vec![0u32; total];
+
+    for tile in 0..num_tiles {
+        let n_start = tile * TILE_N;
+        let n_end = (n_start + TILE_N).min(n);
+        let tile_base = tile * k_rows * TILE_N;
+
+        for k_row in 0..k_rows {
+            let src_off = k_row * n + n_start;
+            let dst_off = tile_base + k_row * TILE_N;
+            let width = n_end - n_start;
+            tiled[dst_off..dst_off + width].copy_from_slice(&packed[src_off..src_off + width]);
+        }
+    }
+    tiled
+}
+
+/// Repack INT4/INT8 scales from [K/gs, N] to [N/TILE, K/gs, TILE].
+pub fn repack_tiled_scales(scales: &[u16], num_groups: usize, n: usize) -> Vec<u16> {
+    let num_tiles = (n + TILE_N - 1) / TILE_N;
+    let total = num_tiles * num_groups * TILE_N;
+    let mut tiled = vec![0u16; total];
+
+    for tile in 0..num_tiles {
+        let n_start = tile * TILE_N;
+        let n_end = (n_start + TILE_N).min(n);
+        let tile_base = tile * num_groups * TILE_N;
+
+        for g in 0..num_groups {
+            let src_off = g * n + n_start;
+            let dst_off = tile_base + g * TILE_N;
+            let width = n_end - n_start;
+            tiled[dst_off..dst_off + width].copy_from_slice(&scales[src_off..src_off + width]);
+        }
+    }
+    tiled
+}
+
+/// Single-threaded tiled INT4 matmul. Data in [N/TILE, K/8, TILE] layout.
+pub fn matmul_int4_transposed_integer_tiled(
+    packed: &[u32],
+    scales: &[u16],
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+    k: usize,
+    n: usize,
+    group_size: usize,
+) {
+    assert_eq!(act_int16.len(), k);
+    assert_eq!(act_scales.len(), k / group_size);
+    assert_eq!(output.len(), n);
+    assert!(k % group_size == 0);
+    assert!(group_size % 8 == 0);
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    let k_rows = k / 8;
+    let num_groups = k / group_size;
+    let packed_tile_size = k_rows * TILE_N;
+    let scales_tile_size = num_groups * TILE_N;
+
+    let mut n_done = 0usize;
+    let mut tile_idx = 0usize;
+    while n_done < n {
+        let tile_n = (n - n_done).min(TILE_N);
+        unsafe {
+            expert_matmul_int4_transposed_integer(
+                packed.as_ptr().add(tile_idx * packed_tile_size),
+                scales.as_ptr().add(tile_idx * scales_tile_size),
+                act_int16.as_ptr(),
+                act_scales.as_ptr(),
+                output.as_mut_ptr().add(n_done),
+                k, TILE_N, 0, tile_n, group_size,
+            );
+        }
+        n_done += tile_n;
+        tile_idx += 1;
+    }
+}
+
+/// Parallel tiled INT4 matmul. Data in [N/TILE, K/8, TILE] layout.
+pub fn matmul_int4_transposed_integer_parallel_tiled(
+    packed: &[u32],
+    scales: &[u16],
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+    k: usize,
+    n: usize,
+    group_size: usize,
+) {
+    use rayon::prelude::*;
+
+    assert_eq!(act_int16.len(), k);
+    assert_eq!(act_scales.len(), k / group_size);
+    assert_eq!(output.len(), n);
+    assert!(k % group_size == 0);
+    assert!(group_size % 8 == 0);
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    if n <= 64 {
+        matmul_int4_transposed_integer_tiled(packed, scales, act_int16, act_scales, output, k, n, group_size);
+        return;
+    }
+
+    let k_rows = k / 8;
+    let num_groups = k / group_size;
+    let packed_tile_size = k_rows * TILE_N;
+    let scales_tile_size = num_groups * TILE_N;
+    let packed_addr = packed.as_ptr() as usize;
+    let scales_addr = scales.as_ptr() as usize;
+    let act_addr = act_int16.as_ptr() as usize;
+    let act_scales_addr = act_scales.as_ptr() as usize;
+
+    output.par_chunks_mut(TILE_N).enumerate().for_each(|(tile_idx, chunk)| {
+        let n_count = chunk.len();
+
+        unsafe {
+            expert_matmul_int4_transposed_integer(
+                (packed_addr as *const u32).add(tile_idx * packed_tile_size),
+                (scales_addr as *const u16).add(tile_idx * scales_tile_size),
+                act_addr as *const i16,
+                act_scales_addr as *const f32,
+                chunk.as_mut_ptr(),
+                k, TILE_N, 0, n_count, group_size,
+            );
+        }
+    });
+}
+
 // ── Transposed layout INT8 kernels (for CPU-optimized weight format) ────
 //
 // Weight layout: [K, N] — K is reduction dimension (outer), N is output
@@ -1527,6 +1679,133 @@ pub fn matmul_int8_transposed_integer_parallel(
                 act_scales_addr as *const f32,
                 chunk.as_mut_ptr(),
                 k, n, n_start, n_count, group_size,
+            );
+        }
+    });
+}
+
+// ── Tiled transposed INT8 layout ────────────────────────────────────────
+
+/// Repack INT8 data from [K, N] (i8 in u32 container) to [N/TILE, K, TILE] tiled.
+pub fn repack_tiled_int8_packed(data_u32: &[u32], k: usize, n: usize) -> Vec<u32> {
+    let num_tiles = (n + TILE_N - 1) / TILE_N;
+    let total_bytes = num_tiles * k * TILE_N;
+    let total_u32 = (total_bytes + 3) / 4;
+    let mut tiled = vec![0u32; total_u32];
+
+    let src = data_u32.as_ptr() as *const u8;
+    let dst = tiled.as_mut_ptr() as *mut u8;
+
+    for tile in 0..num_tiles {
+        let n_start = tile * TILE_N;
+        let n_end = (n_start + TILE_N).min(n);
+        let tile_base = tile * k * TILE_N;
+        let width = n_end - n_start;
+
+        for k_pos in 0..k {
+            let src_off = k_pos * n + n_start;
+            let dst_off = tile_base + k_pos * TILE_N;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(src_off), dst.add(dst_off), width);
+            }
+        }
+    }
+    tiled
+}
+
+/// Single-threaded tiled INT8 matmul. Data in [N/TILE, K, TILE] layout.
+pub fn matmul_int8_transposed_integer_tiled(
+    data_u32: &[u32],
+    scales: &[u16],
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+    k: usize,
+    n: usize,
+    group_size: usize,
+) {
+    assert_eq!(act_int16.len(), k);
+    assert_eq!(act_scales.len(), k / group_size);
+    assert_eq!(output.len(), n);
+    assert!(k % group_size == 0);
+    assert!(group_size % 2 == 0);
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    let num_groups = k / group_size;
+    let data_tile_size_bytes = k * TILE_N;
+    let data_tile_size_u32 = (data_tile_size_bytes + 3) / 4;
+    let scales_tile_size = num_groups * TILE_N;
+
+    let mut n_done = 0usize;
+    let mut tile_idx = 0usize;
+    while n_done < n {
+        let tile_n = (n - n_done).min(TILE_N);
+        unsafe {
+            expert_matmul_int8_transposed_integer(
+                (data_u32.as_ptr().add(tile_idx * data_tile_size_u32)) as *const i8,
+                scales.as_ptr().add(tile_idx * scales_tile_size),
+                act_int16.as_ptr(),
+                act_scales.as_ptr(),
+                output.as_mut_ptr().add(n_done),
+                k, TILE_N, 0, tile_n, group_size,
+            );
+        }
+        n_done += tile_n;
+        tile_idx += 1;
+    }
+}
+
+/// Parallel tiled INT8 matmul. Data in [N/TILE, K, TILE] layout.
+pub fn matmul_int8_transposed_integer_parallel_tiled(
+    data_u32: &[u32],
+    scales: &[u16],
+    act_int16: &[i16],
+    act_scales: &[f32],
+    output: &mut [f32],
+    k: usize,
+    n: usize,
+    group_size: usize,
+) {
+    use rayon::prelude::*;
+
+    assert_eq!(act_int16.len(), k);
+    assert_eq!(act_scales.len(), k / group_size);
+    assert_eq!(output.len(), n);
+    assert!(k % group_size == 0);
+    assert!(group_size % 2 == 0);
+
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        panic!("AVX2 + FMA required");
+    }
+
+    if n <= 64 {
+        matmul_int8_transposed_integer_tiled(data_u32, scales, act_int16, act_scales, output, k, n, group_size);
+        return;
+    }
+
+    let num_groups = k / group_size;
+    let data_tile_size_bytes = k * TILE_N;
+    let data_tile_size_u32 = (data_tile_size_bytes + 3) / 4;
+    let scales_tile_size = num_groups * TILE_N;
+    let data_addr = data_u32.as_ptr() as usize;
+    let scales_addr = scales.as_ptr() as usize;
+    let act_addr = act_int16.as_ptr() as usize;
+    let act_scales_addr = act_scales.as_ptr() as usize;
+
+    output.par_chunks_mut(TILE_N).enumerate().for_each(|(tile_idx, chunk)| {
+        let n_count = chunk.len();
+
+        unsafe {
+            expert_matmul_int8_transposed_integer(
+                (data_addr + tile_idx * data_tile_size_u32 * 4) as *const i8,
+                (scales_addr + tile_idx * scales_tile_size * 2) as *const u16,
+                act_addr as *const i16,
+                act_scales_addr as *const f32,
+                chunk.as_mut_ptr(),
+                k, TILE_N, 0, n_count, group_size,
             );
         }
     });

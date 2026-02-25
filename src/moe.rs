@@ -12,7 +12,9 @@ use crate::kernel::avx2::{
     matmul_int8_integer, matmul_int8_integer_parallel,
     matmul_int4_marlin, matmul_int4_marlin_parallel,
     matmul_int4_transposed_integer, matmul_int4_transposed_integer_parallel,
+    matmul_int4_transposed_integer_tiled, matmul_int4_transposed_integer_parallel_tiled,
     matmul_int8_transposed_integer, matmul_int8_transposed_integer_parallel,
+    matmul_int8_transposed_integer_tiled, matmul_int8_transposed_integer_parallel_tiled,
     expert_matmul_int4_transposed_integer, expert_matmul_int8_transposed_integer,
     build_marlin_tile_map, build_marlin_scale_map,
     MarlinTileMap, MarlinScaleMap,
@@ -193,9 +195,22 @@ pub fn expert_forward_unified(
     let two_n = 2 * n;
     let gs = expert.group_size;
 
-    // Dispatch based on weight precision
-    match expert.num_bits {
-        4 => {
+    // Dispatch based on weight precision and tiling
+    match (expert.num_bits, expert.tiled) {
+        (4, true) => {
+            let matmul_fn = if parallel {
+                matmul_int4_transposed_integer_parallel_tiled
+            } else {
+                matmul_int4_transposed_integer_tiled
+            };
+            matmul_fn(
+                &expert.w13_packed, &expert.w13_scales,
+                act_int16, act_scales,
+                &mut scratch.w13_out,
+                k, two_n, gs,
+            );
+        }
+        (4, false) => {
             let matmul_fn = if parallel {
                 matmul_int4_transposed_integer_parallel
             } else {
@@ -208,7 +223,20 @@ pub fn expert_forward_unified(
                 k, two_n, gs,
             );
         }
-        8 => {
+        (8, true) => {
+            let matmul_fn = if parallel {
+                matmul_int8_transposed_integer_parallel_tiled
+            } else {
+                matmul_int8_transposed_integer_tiled
+            };
+            matmul_fn(
+                &expert.w13_packed, &expert.w13_scales,
+                act_int16, act_scales,
+                &mut scratch.w13_out,
+                k, two_n, gs,
+            );
+        }
+        (8, false) => {
             let matmul_fn = if parallel {
                 matmul_int8_transposed_integer_parallel
             } else {
@@ -287,8 +315,21 @@ pub fn expert_forward_unified(
 
     // w2 matmul: expert_out[hidden_size] = hidden[N] @ w2[N, hidden_size]
     // Use w2_bits (may differ from num_bits for mixed-precision GGUF sources)
-    match expert.w2_bits {
-        4 => {
+    match (expert.w2_bits, expert.tiled) {
+        (4, true) => {
+            let matmul_fn = if parallel {
+                matmul_int4_transposed_integer_parallel_tiled
+            } else {
+                matmul_int4_transposed_integer_tiled
+            };
+            matmul_fn(
+                &expert.w2_packed, &expert.w2_scales,
+                &scratch.hidden_int16, &scratch.hidden_scales,
+                &mut scratch.expert_out,
+                n, k, gs,
+            );
+        }
+        (4, false) => {
             let matmul_fn = if parallel {
                 matmul_int4_transposed_integer_parallel
             } else {
@@ -301,7 +342,20 @@ pub fn expert_forward_unified(
                 n, k, gs,
             );
         }
-        8 => {
+        (8, true) => {
+            let matmul_fn = if parallel {
+                matmul_int8_transposed_integer_parallel_tiled
+            } else {
+                matmul_int8_transposed_integer_tiled
+            };
+            matmul_fn(
+                &expert.w2_packed, &expert.w2_scales,
+                &scratch.hidden_int16, &scratch.hidden_scales,
+                &mut scratch.expert_out,
+                n, k, gs,
+            );
+        }
+        (8, false) => {
             let matmul_fn = if parallel {
                 matmul_int8_transposed_integer_parallel
             } else {
@@ -1329,6 +1383,50 @@ impl KrasisEngine {
 
 #[pymethods]
 impl KrasisEngine {
+    /// Repack all expert weights to tiled layout for better memory bandwidth.
+    /// Must be called before the weight store is shared with CpuDecodeStore.
+    pub fn repack_experts_to_tiled(&mut self) -> pyo3::PyResult<()> {
+        use crate::kernel::avx2::{repack_tiled_int4_packed, repack_tiled_int8_packed, repack_tiled_scales};
+        let t0 = std::time::Instant::now();
+
+        let arc = self.store.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("No weight store loaded"))?;
+        let ws = std::sync::Arc::get_mut(arc)
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Cannot repack: weight store has multiple owners (call before set_moe_store)"))?;
+
+        let mut n_experts = 0usize;
+        for layer in ws.experts_cpu.iter_mut() {
+            for expert in layer.iter_mut() {
+                if expert.tiled { continue; }
+                let h = expert.hidden_size;
+                let m = expert.intermediate_size;
+                let gs = expert.group_size;
+                let two_m = 2 * m;
+
+                expert.w13_packed = if expert.num_bits == 4 {
+                    repack_tiled_int4_packed(&expert.w13_packed, h, two_m)
+                } else {
+                    repack_tiled_int8_packed(&expert.w13_packed, h, two_m)
+                };
+                expert.w13_scales = repack_tiled_scales(&expert.w13_scales, h / gs, two_m);
+
+                expert.w2_packed = if expert.w2_bits == 4 {
+                    repack_tiled_int4_packed(&expert.w2_packed, m, h)
+                } else {
+                    repack_tiled_int8_packed(&expert.w2_packed, m, h)
+                };
+                expert.w2_scales = repack_tiled_scales(&expert.w2_scales, m / gs, h);
+
+                expert.tiled = true;
+                n_experts += 1;
+            }
+        }
+
+        log::info!("Repacked {} experts to tiled layout in {:.1}s", n_experts, t0.elapsed().as_secs_f64());
+        Ok(())
+    }
+
     #[new]
     #[pyo3(signature = (parallel=true, num_threads=None, skip_shared_experts=false))]
     pub fn new(parallel: bool, num_threads: Option<usize>, skip_shared_experts: bool) -> Self {
@@ -1536,6 +1634,40 @@ impl KrasisEngine {
 
         // Attach expert biases for GPT OSS models (gate_up + down biases per expert)
         store.attach_expert_biases(Path::new(path));
+
+        // Repack expert weights to tiled layout (256-wide tiles for sequential memory access)
+        {
+            use crate::kernel::avx2::{repack_tiled_int4_packed, repack_tiled_int8_packed, repack_tiled_scales};
+            let t0 = std::time::Instant::now();
+            let mut n_experts = 0usize;
+            for layer in store.experts_cpu.iter_mut() {
+                for expert in layer.iter_mut() {
+                    if expert.tiled { continue; }
+                    let h = expert.hidden_size;
+                    let m = expert.intermediate_size;
+                    let gs = expert.group_size;
+                    let two_m = 2 * m;
+
+                    expert.w13_packed = if expert.num_bits == 4 {
+                        repack_tiled_int4_packed(&expert.w13_packed, h, two_m)
+                    } else {
+                        repack_tiled_int8_packed(&expert.w13_packed, h, two_m)
+                    };
+                    expert.w13_scales = repack_tiled_scales(&expert.w13_scales, h / gs, two_m);
+
+                    expert.w2_packed = if expert.w2_bits == 4 {
+                        repack_tiled_int4_packed(&expert.w2_packed, m, h)
+                    } else {
+                        repack_tiled_int8_packed(&expert.w2_packed, m, h)
+                    };
+                    expert.w2_scales = repack_tiled_scales(&expert.w2_scales, m / gs, h);
+
+                    expert.tiled = true;
+                    n_experts += 1;
+                }
+            }
+            log::info!("Repacked {} experts to tiled layout in {:.1}s", n_experts, t0.elapsed().as_secs_f64());
+        }
 
         // Wrap store in Arc for sharing with worker thread
         let store = Arc::new(store);

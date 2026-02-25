@@ -6,7 +6,10 @@
 
 use crate::kernel::avx2::{
     matmul_int4_transposed_integer, matmul_int4_transposed_integer_parallel,
+    matmul_int4_transposed_integer_tiled, matmul_int4_transposed_integer_parallel_tiled,
     matmul_int8_transposed_integer, matmul_int8_transposed_integer_parallel,
+    matmul_int8_transposed_integer_tiled, matmul_int8_transposed_integer_parallel_tiled,
+    repack_tiled_int4_packed, repack_tiled_int8_packed, repack_tiled_scales,
     quantize_activation_int16_f32,
 };
 use crate::moe::{ExpertScratch, moe_forward_unified};
@@ -20,8 +23,10 @@ struct TransposedWeight {
     /// Packed weight data (transposed).
     /// INT4: [K/8, N] as u32 (8 nibbles per u32)
     /// INT8: [K, N] as i8 packed into u32 container
+    /// When tiled: [N/TILE, K/8, TILE] (INT4) or [N/TILE, K, TILE] (INT8)
     packed: Vec<u32>,
     /// Per-group scales in BF16 (transposed). [K/group_size, N]
+    /// When tiled: [N/TILE, K/group_size, TILE]
     scales: Vec<u16>,
     /// Output dimension (N = rows of original weight).
     rows: usize,
@@ -29,6 +34,8 @@ struct TransposedWeight {
     cols: usize,
     group_size: usize,
     num_bits: u8,
+    /// Whether data is in tiled layout (TILE_N=256 wide tiles).
+    tiled: bool,
 }
 
 /// Quantize f32 weight matrix [N, K] to transposed INT4 format.
@@ -97,7 +104,7 @@ fn quantize_f32_to_transposed_int4(
         }
     }
 
-    TransposedWeight { packed, scales, rows, cols, group_size, num_bits: 4 }
+    TransposedWeight { packed, scales, rows, cols, group_size, num_bits: 4, tiled: false }
 }
 
 /// Quantize f32 weight matrix [N, K] to transposed INT8 format.
@@ -166,7 +173,7 @@ fn quantize_f32_to_transposed_int8(
         }
     }
 
-    TransposedWeight { packed, scales, rows, cols, group_size, num_bits: 8 }
+    TransposedWeight { packed, scales, rows, cols, group_size, num_bits: 8, tiled: false }
 }
 
 /// A single MoE routing weight stored as float32 (small, accuracy-critical).
@@ -1088,8 +1095,17 @@ impl CpuDecodeStore {
         let n = w.rows;
         let gs = w.group_size;
 
-        match w.num_bits {
-            4 => {
+        match (w.num_bits, w.tiled) {
+            (4, true) => {
+                if self.parallel && n > 64 {
+                    matmul_int4_transposed_integer_parallel_tiled(
+                        &w.packed, &w.scales, act_int16, act_scales, output, k, n, gs);
+                } else {
+                    matmul_int4_transposed_integer_tiled(
+                        &w.packed, &w.scales, act_int16, act_scales, output, k, n, gs);
+                }
+            }
+            (4, false) => {
                 if self.parallel && n > 64 {
                     matmul_int4_transposed_integer_parallel(
                         &w.packed, &w.scales, act_int16, act_scales, output, k, n, gs);
@@ -1098,7 +1114,16 @@ impl CpuDecodeStore {
                         &w.packed, &w.scales, act_int16, act_scales, output, k, n, gs);
                 }
             }
-            8 => {
+            (8, true) => {
+                if self.parallel && n > 64 {
+                    matmul_int8_transposed_integer_parallel_tiled(
+                        &w.packed, &w.scales, act_int16, act_scales, output, k, n, gs);
+                } else {
+                    matmul_int8_transposed_integer_tiled(
+                        &w.packed, &w.scales, act_int16, act_scales, output, k, n, gs);
+                }
+            }
+            (8, false) => {
                 if self.parallel && n > 64 {
                     matmul_int8_transposed_integer_parallel(
                         &w.packed, &w.scales, act_int16, act_scales, output, k, n, gs);
@@ -1409,8 +1434,19 @@ fn dispatch_matmul_free(
     output: &mut [f32],
     parallel: bool,
 ) {
-    match w.num_bits {
-        4 => {
+    match (w.num_bits, w.tiled) {
+        (4, true) => {
+            if parallel && w.rows > 64 {
+                matmul_int4_transposed_integer_parallel_tiled(
+                    &w.packed, &w.scales, act_int16, act_scales, output,
+                    w.cols, w.rows, w.group_size);
+            } else {
+                matmul_int4_transposed_integer_tiled(
+                    &w.packed, &w.scales, act_int16, act_scales, output,
+                    w.cols, w.rows, w.group_size);
+            }
+        }
+        (4, false) => {
             if parallel && w.rows > 64 {
                 matmul_int4_transposed_integer_parallel(
                     &w.packed, &w.scales, act_int16, act_scales, output,
@@ -1421,7 +1457,18 @@ fn dispatch_matmul_free(
                     w.cols, w.rows, w.group_size);
             }
         }
-        8 => {
+        (8, true) => {
+            if parallel && w.rows > 64 {
+                matmul_int8_transposed_integer_parallel_tiled(
+                    &w.packed, &w.scales, act_int16, act_scales, output,
+                    w.cols, w.rows, w.group_size);
+            } else {
+                matmul_int8_transposed_integer_tiled(
+                    &w.packed, &w.scales, act_int16, act_scales, output,
+                    w.cols, w.rows, w.group_size);
+            }
+        }
+        (8, false) => {
             if parallel && w.rows > 64 {
                 matmul_int8_transposed_integer_parallel(
                     &w.packed, &w.scales, act_int16, act_scales, output,
@@ -1981,6 +2028,73 @@ impl CpuDecodeStore {
         g.moe_scratch_pool = (0..topk).map(|_| ExpertScratch::new(hidden, intermediate, gs)).collect();
         g.moe_store = Some(store);
         log::info!("DecodeGraph MoE store set: hidden={}, intermediate={}, topk={}", hidden, intermediate, topk);
+        Ok(())
+    }
+
+    /// Repack all weights (non-expert + expert) to tiled layout for better memory access.
+    /// Call after all weights are loaded but before running decode.
+    pub fn repack_to_tiled(&mut self) -> PyResult<()> {
+        use crate::kernel::avx2::{repack_tiled_int4_packed, repack_tiled_int8_packed, repack_tiled_scales};
+        let t0 = std::time::Instant::now();
+
+        // Repack non-expert TransposedWeights
+        let mut n_weights = 0usize;
+        for w in self.weights.iter_mut() {
+            if w.tiled { continue; }
+            let num_groups = w.cols / w.group_size;
+            let new_packed = if w.num_bits == 4 {
+                repack_tiled_int4_packed(&w.packed, w.cols, w.rows)
+            } else {
+                repack_tiled_int8_packed(&w.packed, w.cols, w.rows)
+            };
+            let new_scales = repack_tiled_scales(&w.scales, num_groups, w.rows);
+            w.packed = new_packed;
+            w.scales = new_scales;
+            w.tiled = true;
+            n_weights += 1;
+        }
+
+        // Repack expert weights if moe_store is available
+        let mut n_experts = 0usize;
+        if let Some(ref mut g) = self.decode_graph {
+            if let Some(ref mut arc) = g.moe_store {
+                if let Some(ws) = Arc::get_mut(arc) {
+                    for layer in ws.experts_cpu.iter_mut() {
+                        for expert in layer.iter_mut() {
+                            if expert.tiled { continue; }
+                            let h = expert.hidden_size;
+                            let m = expert.intermediate_size;
+                            let gs = expert.group_size;
+                            let two_m = 2 * m;
+
+                            // w13: K=hidden_size, N=2*intermediate_size
+                            expert.w13_packed = if expert.num_bits == 4 {
+                                repack_tiled_int4_packed(&expert.w13_packed, h, two_m)
+                            } else {
+                                repack_tiled_int8_packed(&expert.w13_packed, h, two_m)
+                            };
+                            expert.w13_scales = repack_tiled_scales(&expert.w13_scales, h / gs, two_m);
+
+                            // w2: K=intermediate_size, N=hidden_size
+                            expert.w2_packed = if expert.w2_bits == 4 {
+                                repack_tiled_int4_packed(&expert.w2_packed, m, h)
+                            } else {
+                                repack_tiled_int8_packed(&expert.w2_packed, m, h)
+                            };
+                            expert.w2_scales = repack_tiled_scales(&expert.w2_scales, m / gs, h);
+
+                            expert.tiled = true;
+                            n_experts += 1;
+                        }
+                    }
+                } else {
+                    log::warn!("Cannot repack experts: Arc has multiple owners");
+                }
+            }
+        }
+
+        log::info!("Repacked to tiled layout: {} weights + {} experts in {:.1}s",
+            n_weights, n_experts, t0.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -3408,7 +3522,7 @@ fn fake_transposed_weight(rows: usize, cols: usize, group_size: usize, num_bits:
     let num_groups = cols / group_size;
     let mut scales = vec![0u16; num_groups * rows];
     fill_random_scales_u16(&mut scales, rng);
-    TransposedWeight { packed, scales, rows, cols, group_size, num_bits }
+    TransposedWeight { packed, scales, rows, cols, group_size, num_bits, tiled: false }
 }
 
 /// Synthetic decode benchmark — measures decode_step speed without loading a real model.
@@ -3424,7 +3538,7 @@ fn fake_transposed_weight(rows: usize, cols: usize, group_size: usize, num_bits:
 ///   timing: Enable per-component timing (KRASIS_CPU_DECODE_TIMING)
 ///   num_bits: Weight quantization (4 or 8)
 #[pyfunction]
-#[pyo3(signature = (config_path, num_steps=100, warmup=5, timing=false, num_bits=4, max_experts=0, num_threads=20))]
+#[pyo3(signature = (config_path, num_steps=100, warmup=5, timing=false, num_bits=4, max_experts=0, num_threads=20, tiled=false))]
 pub fn bench_decode_synthetic(
     config_path: &str,
     num_steps: usize,
@@ -3433,6 +3547,7 @@ pub fn bench_decode_synthetic(
     num_bits: u8,
     max_experts: usize,
     num_threads: usize,
+    tiled: bool,
 ) -> PyResult<()> {
     use std::time::Instant;
     use crate::weights::{ModelConfig, UnifiedExpertWeights};
@@ -3628,7 +3743,7 @@ pub fn bench_decode_synthetic(
         let scales = unsafe { Vec::from_raw_parts((scales_base as *mut u16).add(s_off), sc, sc) };
         s_off += sc;
         let id = store.weights.len();
-        store.weights.push(TransposedWeight { packed, scales, rows, cols, group_size, num_bits });
+        store.weights.push(TransposedWeight { packed, scales, rows, cols, group_size, num_bits, tiled: false });
         id
     };
 
@@ -3883,6 +3998,7 @@ pub fn bench_decode_synthetic(
                 gate_bias: None,
                 up_bias: None,
                 down_bias: None,
+                tiled: false,
             });
         }
         moe_store.experts_cpu.push(layer_experts);
@@ -3896,6 +4012,69 @@ pub fn bench_decode_synthetic(
         .sum();
     eprintln!("Expert weights allocated: {:.1} GB in {:.1}s",
         expert_bytes as f64 / 1e9, alloc_start.elapsed().as_secs_f64());
+
+    // ── 5b. Repack to tiled layout if requested ──
+    if tiled {
+        let tile_start = Instant::now();
+        eprintln!("Repacking to tiled layout (TILE_N=256)...");
+
+        // Repack non-expert TransposedWeights
+        for w in store.weights.iter_mut() {
+            let num_groups = w.cols / w.group_size;
+            let new_packed = if w.num_bits == 4 {
+                repack_tiled_int4_packed(&w.packed, w.cols, w.rows)
+            } else {
+                repack_tiled_int8_packed(&w.packed, w.cols, w.rows)
+            };
+            let new_scales = repack_tiled_scales(&w.scales, num_groups, w.rows);
+            // Defuse old mmap-backed vecs before replacing
+            std::mem::forget(std::mem::take(&mut w.packed));
+            std::mem::forget(std::mem::take(&mut w.scales));
+            w.packed = new_packed;
+            w.scales = new_scales;
+            w.tiled = true;
+        }
+
+        // Repack expert weights
+        for layer in moe_store.experts_cpu.iter_mut() {
+            for expert in layer.iter_mut() {
+                let h = expert.hidden_size;
+                let m = expert.intermediate_size;
+                let gs = expert.group_size;
+                let two_m = 2 * m;
+
+                // w13: K=hidden_size, N=2*intermediate_size
+                let new_w13_packed = if expert.num_bits == 4 {
+                    repack_tiled_int4_packed(&expert.w13_packed, h, two_m)
+                } else {
+                    repack_tiled_int8_packed(&expert.w13_packed, h, two_m)
+                };
+                let w13_groups = h / gs;
+                let new_w13_scales = repack_tiled_scales(&expert.w13_scales, w13_groups, two_m);
+                std::mem::forget(std::mem::take(&mut expert.w13_packed));
+                std::mem::forget(std::mem::take(&mut expert.w13_scales));
+                expert.w13_packed = new_w13_packed;
+                expert.w13_scales = new_w13_scales;
+
+                // w2: K=intermediate_size, N=hidden_size
+                let new_w2_packed = if expert.w2_bits == 4 {
+                    repack_tiled_int4_packed(&expert.w2_packed, m, h)
+                } else {
+                    repack_tiled_int8_packed(&expert.w2_packed, m, h)
+                };
+                let w2_groups = m / gs;
+                let new_w2_scales = repack_tiled_scales(&expert.w2_scales, w2_groups, h);
+                std::mem::forget(std::mem::take(&mut expert.w2_packed));
+                std::mem::forget(std::mem::take(&mut expert.w2_scales));
+                expert.w2_packed = new_w2_packed;
+                expert.w2_scales = new_w2_scales;
+
+                expert.tiled = true;
+            }
+        }
+
+        eprintln!("Tiled repack done in {:.1}s", tile_start.elapsed().as_secs_f64());
+    }
 
     // Set MoE store on graph directly (bypass PyO3 interface)
     {
@@ -4078,10 +4257,12 @@ pub fn bench_decode_synthetic(
     // All TransposedWeight and UnifiedExpertWeights Vecs point into the mmap regions.
     // We must prevent their Drop from calling dealloc on mmap'd memory.
 
-    // Defuse non-expert weight Vecs
+    // Defuse non-expert weight Vecs (skip tiled — they're heap-backed, normal drop is fine)
     for w in store.weights.iter_mut() {
-        std::mem::forget(std::mem::take(&mut w.packed));
-        std::mem::forget(std::mem::take(&mut w.scales));
+        if !w.tiled {
+            std::mem::forget(std::mem::take(&mut w.packed));
+            std::mem::forget(std::mem::take(&mut w.scales));
+        }
     }
 
     // Defuse expert weight Vecs (inside Arc<WeightStore>)
@@ -4091,10 +4272,12 @@ pub fn bench_decode_synthetic(
                 Ok(mut ws) => {
                     for layer in ws.experts_cpu.iter_mut() {
                         for expert in layer.iter_mut() {
-                            std::mem::forget(std::mem::take(&mut expert.w13_packed));
-                            std::mem::forget(std::mem::take(&mut expert.w13_scales));
-                            std::mem::forget(std::mem::take(&mut expert.w2_packed));
-                            std::mem::forget(std::mem::take(&mut expert.w2_scales));
+                            if !expert.tiled {
+                                std::mem::forget(std::mem::take(&mut expert.w13_packed));
+                                std::mem::forget(std::mem::take(&mut expert.w13_scales));
+                                std::mem::forget(std::mem::take(&mut expert.w2_packed));
+                                std::mem::forget(std::mem::take(&mut expert.w2_scales));
+                            }
                         }
                     }
                 }
