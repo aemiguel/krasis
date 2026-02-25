@@ -222,23 +222,15 @@ class KrasisBenchmark:
     # ──────────────────────────────────────────────────────────
 
     def _load_prompt_file(self, filename: str) -> str:
-        """Load a prompt from benchmarks/<filename> in the repo."""
-        pkg_dir = os.path.dirname(os.path.abspath(__file__))
-        repo_dir = os.path.dirname(os.path.dirname(pkg_dir))
-        prompt_path = os.path.join(repo_dir, "benchmarks", filename)
+        """Load a prompt file bundled with the package."""
+        prompts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
+        prompt_path = os.path.join(prompts_dir, filename)
         if os.path.isfile(prompt_path):
             with open(prompt_path) as f:
                 return f.read().strip()
         raise FileNotFoundError(
             f"Benchmark prompt file '{filename}' not found at {prompt_path}"
         )
-
-    def _make_prompt(self) -> List[int]:
-        """Build prefill prompt (~10K tokens) from file."""
-        content = self._load_prompt_file("prefill_prompt_20k")
-        messages = [{"role": "user", "content": content}]
-        tokens = self.model.tokenizer.apply_chat_template(messages)
-        return tokens[:10000]
 
     def _make_short_prompt(self) -> List[int]:
         """Build decode prompt from file."""
@@ -254,12 +246,12 @@ class KrasisBenchmark:
         return 100000  # fallback
 
     def _discover_prefill_files(self) -> List[str]:
-        """Discover available prefill_prompt_10k_N files."""
+        """Discover available prefill_prompt_N files."""
         files = []
         for i in range(1, 100):
             try:
-                self._load_prompt_file(f"prefill_prompt_10k_{i}")
-                files.append(f"prefill_prompt_10k_{i}")
+                self._load_prompt_file(f"prefill_prompt_{i}")
+                files.append(f"prefill_prompt_{i}")
             except FileNotFoundError:
                 break
         return files
@@ -267,7 +259,7 @@ class KrasisBenchmark:
     def _make_prefill_prompts(self, n: int, max_tokens_override: int = 0) -> List[List[int]]:
         """Build n different prefill prompts from separate numbered files.
 
-        Loads prefill_prompt_10k_1 through prefill_prompt_10k_N — each file
+        Loads prefill_prompt_1 through prefill_prompt_N — each file
         covers a completely different domain to ensure different expert
         activation patterns across runs.  Truncates to KV cache capacity
         (with margin for decode tokens).
@@ -283,12 +275,9 @@ class KrasisBenchmark:
         files = self._discover_prefill_files()
 
         if not files:
-            # Fall back to legacy single file
-            content = self._load_prompt_file("prefill_prompt_20k")
-            tokens = self.model.tokenizer.apply_chat_template(
-                [{"role": "user", "content": content}]
+            raise FileNotFoundError(
+                "No prefill prompt files found. Expected prefill_prompt_1, prefill_prompt_2, etc."
             )
-            return [tokens[:min(cap, len(tokens))]] * n
 
         prompts = []
         for i in range(n):
@@ -314,11 +303,9 @@ class KrasisBenchmark:
         files = self._discover_prefill_files()
 
         if not files:
-            content = self._load_prompt_file("prefill_prompt_20k")
-            tokens = self.model.tokenizer.apply_chat_template(
-                [{"role": "user", "content": content}]
+            raise FileNotFoundError(
+                "No prefill prompt files found. Expected prefill_prompt_1, prefill_prompt_2, etc."
             )
-            return [tokens[:min(length, kv_limit, len(tokens))] for length in lengths]
 
         prompts = []
         for i, target in enumerate(lengths):

@@ -205,6 +205,9 @@ if [[ "$NEED_VENV" == true ]]; then
     "$VENV_DIR/bin/pip" install --upgrade pip -q 2>&1 | tail -1
 fi
 
+# ── Create models directory ──────────────────────────────────────────
+mkdir -p "$HOME/.krasis/models"
+
 # ── Download and install ─────────────────────────────────────────────
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT

@@ -191,7 +191,7 @@ python tests/test_network.py --port 8012 --quick    # known-answer only
 - `*.log` -- Full benchmark output logs
 - `suite_logs/` -- Benchmark suite output
 - `*.toml` -- Suite config files
-- Prompt files: `prefill_prompt_10k_{1-6}`, `decode_prompt_{1-6}`
+- Prompt files bundled in package (`python/krasis/prompts/`): `prefill_prompt_{1-6}`, `decode_prompt_{1-6}`
   - Files 1-3 used for warmup, files 4-6 used for timed runs
 
 ## Utility Shell Scripts
