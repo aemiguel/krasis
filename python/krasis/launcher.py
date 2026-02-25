@@ -1441,9 +1441,11 @@ class Launcher:
 # ═══════════════════════════════════════════════════════════════════════
 
 def parse_args() -> argparse.Namespace:
+    from krasis import __version__
     parser = argparse.ArgumentParser(
         description="Krasis — Interactive MoE inference server launcher",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", default=None,
                         help="Path to config file (CFG_KEY=\"value\" format). "
                              "Implies --non-interactive.")

@@ -34,7 +34,7 @@ Krasis employs a different approach that utilises the GPU and system RAM more he
 In order to achieve these speeds, Krasis has a few requirements.
 
 - **Krasis uses more system RAM than other runtimes**, you may need 2x the model weights worth of system ram (so to run a 100GB model you may need 200GB of system ram), but this is almost always **far more achievable than the equivalent VRAM**.
-- Krasis must be given the *BF16 safetensors model** downloaded from (HuggingFace)[https://huggingface.co/]
+- Krasis must be given the **BF16 safetensors model** downloaded from [HuggingFace](https://huggingface.co/)
 - Krasis can build everything it needs from this model or if you prefer you can give it a second GGUF model (in addition to the BF16 safetensors model) which takes advantage of more advanced quantisation (e.g. unsloth Q4_K models)
 - Krasis currently only works with **NVidia GPUs**
 - Krasis **may take some time on the first run** as it is doing a lot of pre-run work to optimise everything, major parts of this are cached for later runs though so they are generally much shorter startup times.
@@ -79,45 +79,70 @@ Measured with INT4 GPU + INT4 CPU experts, BF16 attention, INT8 shared/MLP/lm_he
 
 ## Quick Start
 
-### Install
+### Requirements
+
+- **Linux** (Ubuntu 22.04+, or WSL2 on Windows)
+- **Python 3.10+**
+- **NVIDIA GPU** with CUDA drivers installed
+- **System RAM**: roughly 2x the BF16 model size (e.g. 160 GB RAM for an 80 GB model)
+- **Disk space**: roughly 3x the BF16 model size (original + cached formats)
+
+### 1. Install Krasis
 
 ```bash
-# Update APT
-sudo apt update   # Ubuntu/Debian
+curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash
+```
 
-# Install pipx if you don't have it
-sudo apt install pipx   # Ubuntu/Debian
-# or: pip install --user pipx
+This creates a Python environment at `~/.krasis/venv`, installs Krasis, symlinks the commands into `~/.local/bin`, and adds that directory to your PATH. No sudo required. Works immediately in the current terminal session.
 
-# Install Krasis
-pipx install krasis
-pipx ensurepath        # adds ~/.local/bin to PATH (restart terminal or source ~/.bashrc)
+### 2. Install CUDA dependencies
 
-# Run setup — installs CUDA toolkit, PyTorch, FlashInfer, ninja
-# (will prompt for your password when installing system packages)
+```bash
 krasis-setup
 ```
 
-### Download a model
+This installs the CUDA toolkit (if needed), PyTorch, and FlashInfer. May need sudo for the CUDA toolkit. Only required once.
+
+### 3. Download a model
 
 ```bash
-# Install huggingface-cli if you don't have it
-pip install huggingface-hub
+pip install huggingface-hub   # if you don't have it
 
-# Download a model into ~/.krasis/models/
-huggingface-cli download Qwen/Qwen3-Coder-Next \
-    --local-dir ~/.krasis/models/Qwen3-Coder-Next
+huggingface-cli download deepseek-ai/DeepSeek-V2-Lite \
+    --local-dir ~/.krasis/models/DeepSeek-V2-Lite
 ```
 
-### Run
+Krasis needs the BF16 safetensors model from HuggingFace. Put it under `~/.krasis/models/`. Some other models you can download:
+
+```bash
+# Qwen3-Coder-Next (80B params, 148 GB, fastest on consumer hardware)
+huggingface-cli download Qwen/Qwen3-Coder-Next \
+    --local-dir ~/.krasis/models/Qwen3-Coder-Next
+
+# Qwen3-235B (235B params, 438 GB, needs ~500 GB RAM)
+huggingface-cli download Qwen/Qwen3-235B-A22B \
+    --local-dir ~/.krasis/models/Qwen3-235B-A22B
+```
+
+### 4. Run
 
 ```bash
 krasis
 ```
 
-That's it. The launcher walks you through model selection and configuration. First run takes longer as Krasis builds optimised weight caches.
+The launcher walks you through model selection and configuration via a TUI. First run takes longer as Krasis builds optimised weight caches (these are saved to disk for subsequent runs).
 
-### WSL (Windows Subsystem for Linux)
+### Upgrade / Uninstall
+
+```bash
+# Upgrade
+curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash
+
+# Uninstall (keeps model files)
+curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash -s -- --uninstall
+```
+
+### WSL2 (Windows)
 
 Krasis works on WSL2. By default WSL only uses 50% of your system RAM, which is usually not enough for large models. Create or edit `C:\Users\<YourUsername>\.wslconfig`:
 
@@ -126,23 +151,11 @@ Krasis works on WSL2. By default WSL only uses 50% of your system RAM, which is 
 memory=120GB
 ```
 
-Adjust the value to leave ~8 GB for Windows. Then restart WSL from PowerShell:
+Adjust the value to leave ~8 GB for Windows. Restart WSL from PowerShell with `wsl --shutdown`, then follow the install steps above inside WSL.
 
-```powershell
-wsl --shutdown
-```
+### Install from source
 
-Then follow the install steps above inside WSL.
-
-### Alternative: pip in a venv
-
-```bash
-python3 -m venv ~/.krasis-env && source ~/.krasis-env/bin/activate
-pip install krasis
-krasis-setup
-```
-
-### Alternative: from source
+Requires a Rust toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`):
 
 ```bash
 git clone https://github.com/brontoguana/krasis.git
@@ -150,7 +163,7 @@ cd krasis
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 krasis-setup
-./krasis
+krasis
 ```
 
 ## Usage

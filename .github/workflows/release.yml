@@ -1,19 +1,16 @@
-name: Publish to PyPI
+name: Build Release
 
 on:
   release:
     types: [published]
-  workflow_dispatch:  # Allow manual trigger for testing
+  workflow_dispatch:  # Manual trigger for testing builds
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build-linux:
+  build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [x86_64]
     steps:
       - uses: actions/checkout@v4
 
@@ -21,28 +18,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libnuma-dev
-
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
+          target: x86_64
           args: --release --out dist -i python3.10 python3.11 python3.12 python3.13
           manylinux: auto
           before-script-linux: |
             yum install -y numactl-devel 2>/dev/null || dnf install -y numactl-devel 2>/dev/null || apt-get install -y libnuma-dev 2>/dev/null || true
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-linux-${{ matrix.target }}
-          path: dist
-
-  build-sdist:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -50,29 +33,15 @@ jobs:
           command: sdist
           args: --out dist
 
-      - name: Upload sdist
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+
+      - name: Upload artifacts (CI debugging)
+        if: github.event_name != 'release'
         uses: actions/upload-artifact@v4
         with:
-          name: sdist
+          name: dist
           path: dist
-
-  publish:
-    needs: [build-linux, build-sdist]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'release'
-    environment:
-      name: pypi
-      url: https://pypi.org/p/krasis
-    permissions:
-      id-token: write  # trusted publishing
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}

@@ -1,5 +1,11 @@
 """Krasis — hybrid LLM MoE runtime."""
 
+from importlib.metadata import version as _pkg_version, PackageNotFoundError
+try:
+    __version__ = _pkg_version("krasis")
+except PackageNotFoundError:
+    __version__ = "dev"
+
 try:
     from krasis.krasis import KrasisEngine, WeightStore, CpuDecodeStore, system_check, bench_decode_synthetic
 except ImportError:
