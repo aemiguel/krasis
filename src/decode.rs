@@ -12,7 +12,7 @@ use crate::kernel::avx2::{
     repack_tiled_int4_packed, repack_tiled_int8_packed, repack_tiled_scales,
     quantize_activation_int16_f32,
 };
-use crate::moe::{ExpertScratch, moe_forward_unified};
+use crate::moe::{ExpertScratch, moe_forward_unified, moe_forward_flattened};
 use crate::weights::marlin::f32_to_bf16;
 use crate::weights::WeightStore;
 use pyo3::prelude::*;
@@ -955,8 +955,8 @@ impl CpuDecodeStore {
         let logits = &mut self.route_logits[..ne];
         let scores = &mut self.route_scores[..ne];
 
-        // Step 1: AVX2 matmul — logits[e] = gate_weight[e, :] @ hidden
-        unsafe { moe_route_matmul_avx2(&rw.data, hidden, logits, ne, hd) };
+        // Step 1: AVX2 matmul — logits[e] = gate_weight[e, :] @ hidden (parallel)
+        unsafe { moe_route_matmul_avx2_parallel(&rw.data, hidden, logits, ne, hd) };
 
         // Add bias if present
         if let Some(ref bias) = rw.bias {
@@ -1399,6 +1399,68 @@ unsafe fn moe_route_matmul_avx2(
     }
 }
 
+/// Parallel AVX2-optimized matmul for MoE routing.
+///
+/// Splits ne experts across rayon threads. Each thread computes a chunk of
+/// dot products independently. For 512 experts @ hd=2048, this is 4MB of
+/// gate data that benefits from parallel DRAM channel access.
+unsafe fn moe_route_matmul_avx2_parallel(
+    gate: &[f32],
+    hidden: &[f32],
+    logits: &mut [f32],
+    ne: usize,
+    hd: usize,
+) {
+    use rayon::prelude::*;
+    // SAFETY: Each rayon thread writes to a disjoint slice of logits[].
+    // gate[] and hidden[] are read-only.
+    let gate_addr = gate.as_ptr() as usize;
+    let hidden_addr = hidden.as_ptr() as usize;
+    let logits_addr = logits.as_mut_ptr() as usize;
+
+    (0..ne).into_par_iter().for_each(|e| {
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn dot_avx2(gate_row: *const f32, hidden_ptr: *const f32, hd: usize) -> f32 {
+            use std::arch::x86_64::*;
+            let chunks = hd / 8;
+            let chunks2 = chunks / 2;
+            let mut acc0 = _mm256_setzero_ps();
+            let mut acc1 = _mm256_setzero_ps();
+            let mut i = 0usize;
+            for _ in 0..chunks2 {
+                let h0 = _mm256_loadu_ps(hidden_ptr.add(i));
+                let g0 = _mm256_loadu_ps(gate_row.add(i));
+                acc0 = _mm256_fmadd_ps(g0, h0, acc0);
+                let h1 = _mm256_loadu_ps(hidden_ptr.add(i + 8));
+                let g1 = _mm256_loadu_ps(gate_row.add(i + 8));
+                acc1 = _mm256_fmadd_ps(g1, h1, acc1);
+                i += 16;
+            }
+            if chunks % 2 != 0 {
+                let h0 = _mm256_loadu_ps(hidden_ptr.add(i));
+                let g0 = _mm256_loadu_ps(gate_row.add(i));
+                acc0 = _mm256_fmadd_ps(g0, h0, acc0);
+            }
+            let sum8 = _mm256_add_ps(acc0, acc1);
+            let hi128 = _mm256_extractf128_ps(sum8, 1);
+            let lo128 = _mm256_castps256_ps128(sum8);
+            let sum4 = _mm_add_ps(lo128, hi128);
+            let shuf = _mm_movehdup_ps(sum4);
+            let sum2 = _mm_add_ps(sum4, shuf);
+            let shuf2 = _mm_movehl_ps(sum2, sum2);
+            let sum1 = _mm_add_ss(sum2, shuf2);
+            _mm_cvtss_f32(sum1)
+        }
+        unsafe {
+            let gate_ptr = gate_addr as *const f32;
+            let hidden_ptr = hidden_addr as *const f32;
+            let logits_ptr = logits_addr as *mut f32;
+            let row = gate_ptr.add(e * hd);
+            *logits_ptr.add(e) = dot_avx2(row, hidden_ptr, hd);
+        }
+    });
+}
+
 /// Find indices of top-k largest values via partial selection sort.
 /// For small k (e.g., 10) and moderate n (e.g., 512), this is faster than full sort.
 fn topk_indices(values: &[f32], k: usize, out: &mut [i32]) {
@@ -1677,6 +1739,33 @@ enum DecodeAttnConfig {
         sm_scale: f32,
         fused_qkv_wid: Option<usize>,  // fused Q+K+V weight for single dispatch
     },
+    /// Multi-head Latent Attention (DeepSeek V2/V3, Kimi K2.5).
+    /// KV is compressed into a low-rank latent vector + rope embedding.
+    MLA {
+        // Quantized projection weights (stored as TransposedWeight IDs)
+        kv_a_proj_wid: usize,  // [kv_lora_rank + rope_dim, hidden_size]
+        o_proj_wid: usize,     // [hidden_size, num_heads * v_head_dim]
+        // Q path: either direct or LoRA
+        q_proj_wid: Option<usize>,      // [num_heads * head_dim, hidden_size]
+        q_a_proj_wid: Option<usize>,    // [q_lora_rank, hidden_size]
+        q_b_proj_wid: Option<usize>,    // [num_heads * head_dim, q_lora_rank]
+        // BF16 per-head projection matrices (stored as f32 for compute)
+        w_kc: Vec<f32>,         // [num_heads, qk_nope_dim, kv_lora_rank]
+        w_vc: Vec<f32>,         // [num_heads, v_head_dim, kv_lora_rank]
+        // Norm weights
+        kv_a_norm: Vec<f32>,    // [kv_lora_rank]
+        q_a_norm: Option<Vec<f32>>,  // [q_lora_rank] (only if LoRA)
+        // MLA-specific RoPE (YaRN) — separate from GQA rope
+        rope_cos: Vec<f32>,     // [max_seq, rope_dim/2]
+        rope_sin: Vec<f32>,     // [max_seq, rope_dim/2]
+        // Dimensions
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        sm_scale: f32,
+    },
 }
 
 /// Per-layer MLP configuration.
@@ -1764,6 +1853,19 @@ struct DecodeGraph {
     gqa_scores: Vec<f32>,
     gqa_attn_out: Vec<f32>,
 
+    // MLA scratch
+    mla_kv_out: Vec<f32>,           // kv_a_proj output [kv_lora_rank + rope_dim]
+    mla_kv_compressed: Vec<f32>,    // normed [kv_lora_rank]
+    mla_q_full: Vec<f32>,           // [num_heads * head_dim]
+    mla_q_compressed: Vec<f32>,     // q_a_proj output [q_lora_rank] (LoRA path)
+    mla_q_absorbed: Vec<f32>,       // [num_heads * kv_lora_rank] after w_kc absorption
+    mla_attn_scores: Vec<f32>,      // [num_heads * kv_max_seq]
+    mla_attn_out: Vec<f32>,         // [num_heads * kv_lora_rank]
+    mla_v_projected: Vec<f32>,      // [num_heads * v_head_dim]
+    // MLA KV cache: per-layer pointers to flat [max_seq, dim] f32 arrays
+    mla_ckv_ptrs: Vec<usize>,       // compressed KV [max_seq * kv_lora_rank] per layer
+    mla_kpe_ptrs: Vec<usize>,       // rope K position [max_seq * rope_dim] per layer
+
     // MLP scratch
     mlp_gate_up: Vec<f32>,
     mlp_hidden_buf: Vec<f32>,
@@ -1803,6 +1905,10 @@ struct DecodeGraph {
     t_gqa_rope: f64,
     t_gqa_attn: f64,
     t_gqa_o_proj: f64,
+    t_mla_proj: f64,
+    t_mla_rope: f64,
+    t_mla_attn: f64,
+    t_mla_o_proj: f64,
     t_moe_route: f64,
     t_moe_experts: f64,
     t_moe_shared: f64,
@@ -1864,6 +1970,11 @@ impl CpuDecodeStore {
             gqa_q_buf: Vec::new(), gqa_k_buf: Vec::new(), gqa_v_buf: Vec::new(),
             gqa_qkv_buf: Vec::new(),
             gqa_scores: Vec::new(), gqa_attn_out: Vec::new(),
+            mla_kv_out: Vec::new(), mla_kv_compressed: Vec::new(),
+            mla_q_full: Vec::new(), mla_q_compressed: Vec::new(),
+            mla_q_absorbed: Vec::new(), mla_attn_scores: Vec::new(),
+            mla_attn_out: Vec::new(), mla_v_projected: Vec::new(),
+            mla_ckv_ptrs: vec![0; num_layers], mla_kpe_ptrs: vec![0; num_layers],
             mlp_gate_up: Vec::new(), mlp_hidden_buf: Vec::new(),
             moe_store: None, moe_scratch: None, moe_scratch_pool: Vec::new(),
             moe_output: vec![0.0; hidden_size],
@@ -1882,6 +1993,7 @@ impl CpuDecodeStore {
             t_norm: 0.0, t_la_proj: 0.0, t_la_conv: 0.0, t_la_recur: 0.0,
             t_la_gate_norm: 0.0, t_la_out_proj: 0.0,
             t_gqa_proj: 0.0, t_gqa_rope: 0.0, t_gqa_attn: 0.0, t_gqa_o_proj: 0.0,
+            t_mla_proj: 0.0, t_mla_rope: 0.0, t_mla_attn: 0.0, t_mla_o_proj: 0.0,
             t_moe_route: 0.0, t_moe_experts: 0.0, t_moe_shared: 0.0,
             t_dense_mlp: 0.0, t_lm_head: 0.0, t_total: 0.0,
         }));
@@ -1972,6 +2084,78 @@ impl CpuDecodeStore {
                 q_proj_wid, k_proj_wid, v_proj_wid, o_proj_wid,
                 q_norm, k_norm, gated, num_heads, num_kv_heads, head_dim, sm_scale,
                 fused_qkv_wid: None,
+            },
+            mlp: DecodeMlpConfig::None,
+        });
+        Ok(())
+    }
+
+    /// Add an MLA (Multi-head Latent Attention) layer to the decode graph.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (input_norm_id, post_attn_norm_id, kv_a_proj_wid, o_proj_wid,
+        q_proj_wid, q_a_proj_wid, q_b_proj_wid,
+        w_kc_ptr, w_kc_len, w_vc_ptr, w_vc_len,
+        kv_a_norm_ptr, kv_a_norm_len,
+        q_a_norm_ptr, q_a_norm_len,
+        rope_cos_ptr, rope_sin_ptr, rope_len, rope_max_seq,
+        num_heads, kv_lora_rank, qk_nope_dim, qk_rope_dim, v_head_dim, sm_scale))]
+    pub fn add_decode_mla_layer(
+        &mut self,
+        input_norm_id: usize,
+        post_attn_norm_id: usize,
+        kv_a_proj_wid: usize,
+        o_proj_wid: usize,
+        q_proj_wid: Option<usize>,
+        q_a_proj_wid: Option<usize>,
+        q_b_proj_wid: Option<usize>,
+        w_kc_ptr: usize, w_kc_len: usize,
+        w_vc_ptr: usize, w_vc_len: usize,
+        kv_a_norm_ptr: usize, kv_a_norm_len: usize,
+        q_a_norm_ptr: usize, q_a_norm_len: usize,
+        rope_cos_ptr: usize, rope_sin_ptr: usize,
+        rope_len: usize, rope_max_seq: usize,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        sm_scale: f32,
+    ) -> PyResult<()> {
+        let g = self.decode_graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure_decode first"))?;
+
+        // Copy BF16 w_kc/w_vc to f32
+        let w_kc_bf16 = unsafe { std::slice::from_raw_parts(w_kc_ptr as *const u16, w_kc_len) };
+        let w_kc: Vec<f32> = w_kc_bf16.iter().map(|&b| crate::weights::marlin::bf16_to_f32(b)).collect();
+        let w_vc_bf16 = unsafe { std::slice::from_raw_parts(w_vc_ptr as *const u16, w_vc_len) };
+        let w_vc: Vec<f32> = w_vc_bf16.iter().map(|&b| crate::weights::marlin::bf16_to_f32(b)).collect();
+
+        // Copy norm weights
+        let kv_a_norm = unsafe {
+            std::slice::from_raw_parts(kv_a_norm_ptr as *const f32, kv_a_norm_len).to_vec()
+        };
+        let q_a_norm = if q_a_norm_len > 0 {
+            Some(unsafe { std::slice::from_raw_parts(q_a_norm_ptr as *const f32, q_a_norm_len).to_vec() })
+        } else { None };
+
+        // Copy RoPE tables (already f32 from Python)
+        let rope_half = qk_rope_dim / 2;
+        let rope_cos = unsafe {
+            std::slice::from_raw_parts(rope_cos_ptr as *const f32, rope_max_seq * rope_half).to_vec()
+        };
+        let rope_sin = unsafe {
+            std::slice::from_raw_parts(rope_sin_ptr as *const f32, rope_max_seq * rope_half).to_vec()
+        };
+
+        g.layers.push(DecodeLayer {
+            input_norm_id,
+            post_attn_norm_id,
+            attn: DecodeAttnConfig::MLA {
+                kv_a_proj_wid, o_proj_wid,
+                q_proj_wid, q_a_proj_wid, q_b_proj_wid,
+                w_kc, w_vc, kv_a_norm, q_a_norm,
+                rope_cos, rope_sin,
+                num_heads, kv_lora_rank, qk_nope_dim, qk_rope_dim, v_head_dim, sm_scale,
             },
             mlp: DecodeMlpConfig::None,
         });
@@ -2288,6 +2472,23 @@ impl CpuDecodeStore {
                     }
                     max_k = max_k.max(self.weights[*o_proj_wid].cols);
                 }
+                DecodeAttnConfig::MLA { kv_a_proj_wid, o_proj_wid,
+                    q_proj_wid, q_a_proj_wid, q_b_proj_wid,
+                    num_heads, kv_lora_rank, qk_nope_dim, qk_rope_dim, v_head_dim, .. } => {
+                    max_heads = max_heads.max(*num_heads);
+                    max_heads_hd = max_heads_hd.max(num_heads * v_head_dim);
+                    max_k = max_k.max(self.weights[*kv_a_proj_wid].cols);
+                    max_k = max_k.max(self.weights[*o_proj_wid].cols);
+                    if let Some(wid) = q_proj_wid {
+                        max_k = max_k.max(self.weights[*wid].cols);
+                    }
+                    if let Some(wid) = q_a_proj_wid {
+                        max_k = max_k.max(self.weights[*wid].cols);
+                    }
+                    if let Some(wid) = q_b_proj_wid {
+                        max_k = max_k.max(self.weights[*wid].cols);
+                    }
+                }
             }
             match &layer.mlp {
                 DecodeMlpConfig::MoE { shared_gate_up_wid, shared_down_wid, .. } => {
@@ -2301,6 +2502,8 @@ impl CpuDecodeStore {
                 }
                 DecodeMlpConfig::Dense { gate_proj_wid, up_proj_wid, down_proj_wid } => {
                     max_intermediate = max_intermediate.max(self.weights[*gate_proj_wid].rows);
+                    // down_proj.cols may be padded larger than gate_proj.rows
+                    max_intermediate = max_intermediate.max(self.weights[*down_proj_wid].cols);
                     max_k = max_k.max(self.weights[*gate_proj_wid].cols);
                     max_k = max_k.max(self.weights[*up_proj_wid].cols);
                     max_k = max_k.max(self.weights[*down_proj_wid].cols);
@@ -2331,6 +2534,42 @@ impl CpuDecodeStore {
         // scores buffer sized for max_heads * max_kv_seq — will be set after set_decode_state
         g.gqa_scores = Vec::new(); // deferred
         g.gqa_attn_out = vec![0.0; max_heads_hd.max(1)];
+
+        // MLA scratch — sized by scanning MLA layers
+        {
+            let mut max_kv_out = 0usize;
+            let mut max_kv_lora = 0usize;
+            let mut max_q_full = 0usize;
+            let mut max_q_compressed = 0usize;
+            let mut max_q_absorbed = 0usize;
+            let mut max_v_projected = 0usize;
+            for layer in &g.layers {
+                if let DecodeAttnConfig::MLA { num_heads, kv_lora_rank, qk_nope_dim, qk_rope_dim,
+                    v_head_dim, q_a_proj_wid, .. } = &layer.attn {
+                    let head_dim = qk_nope_dim + qk_rope_dim;
+                    max_kv_out = max_kv_out.max(kv_lora_rank + qk_rope_dim);
+                    max_kv_lora = max_kv_lora.max(*kv_lora_rank);
+                    max_q_full = max_q_full.max(num_heads * head_dim);
+                    max_q_absorbed = max_q_absorbed.max(num_heads * kv_lora_rank);
+                    max_v_projected = max_v_projected.max(num_heads * v_head_dim);
+                    if let Some(wid) = q_a_proj_wid {
+                        max_q_compressed = max_q_compressed.max(self.weights[*wid].rows);
+                    }
+                }
+            }
+            if max_kv_out > 0 {
+                g.mla_kv_out = vec![0.0; max_kv_out];
+                g.mla_kv_compressed = vec![0.0; max_kv_lora];
+                g.mla_q_full = vec![0.0; max_q_full];
+                g.mla_q_compressed = vec![0.0; max_q_compressed.max(1)];
+                g.mla_q_absorbed = vec![0.0; max_q_absorbed];
+                // mla_attn_scores deferred until set_decode_state (needs kv_max_seq)
+                g.mla_attn_scores = Vec::new();
+                g.mla_attn_out = vec![0.0; max_q_absorbed];
+                g.mla_v_projected = vec![0.0; max_v_projected];
+            }
+        }
+
         g.mlp_gate_up = vec![0.0; (max_intermediate * 2).max(1)];
         g.mlp_hidden_buf = vec![0.0; max_intermediate.max(1)];
         g.act_int16 = vec![0i16; max_k];
@@ -2352,7 +2591,7 @@ impl CpuDecodeStore {
     }
 
     /// Update per-request state pointers (call after prepare).
-    #[pyo3(signature = (seq_len, kv_max_seq, kv_k_ptrs, kv_v_ptrs, conv_state_ptrs, recur_state_ptrs))]
+    #[pyo3(signature = (seq_len, kv_max_seq, kv_k_ptrs, kv_v_ptrs, conv_state_ptrs, recur_state_ptrs, mla_ckv_ptrs=None, mla_kpe_ptrs=None))]
     pub fn set_decode_state(
         &mut self,
         seq_len: usize,
@@ -2361,6 +2600,8 @@ impl CpuDecodeStore {
         kv_v_ptrs: Vec<usize>,
         conv_state_ptrs: Vec<usize>,
         recur_state_ptrs: Vec<usize>,
+        mla_ckv_ptrs: Option<Vec<usize>>,
+        mla_kpe_ptrs: Option<Vec<usize>>,
     ) -> PyResult<()> {
         let g = self.decode_graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure_decode first"))?;
@@ -2370,16 +2611,28 @@ impl CpuDecodeStore {
         g.kv_v_ptrs = kv_v_ptrs;
         g.conv_state_ptrs = conv_state_ptrs;
         g.recur_state_ptrs = recur_state_ptrs;
+        if let Some(ptrs) = mla_ckv_ptrs { g.mla_ckv_ptrs = ptrs; }
+        if let Some(ptrs) = mla_kpe_ptrs { g.mla_kpe_ptrs = ptrs; }
         // Allocate/resize GQA scores buffer for current max_seq
         let mut max_heads = 0;
         for layer in &g.layers {
-            if let DecodeAttnConfig::GQA { num_heads, .. } = &layer.attn {
-                max_heads = max_heads.max(*num_heads);
+            match &layer.attn {
+                DecodeAttnConfig::GQA { num_heads, .. } => {
+                    max_heads = max_heads.max(*num_heads);
+                }
+                DecodeAttnConfig::MLA { num_heads, .. } => {
+                    max_heads = max_heads.max(*num_heads);
+                }
+                _ => {}
             }
         }
         let needed = max_heads * kv_max_seq;
         if g.gqa_scores.len() < needed {
             g.gqa_scores.resize(needed, 0.0);
+        }
+        // Also resize MLA attention scores buffer
+        if g.mla_attn_scores.len() < needed {
+            g.mla_attn_scores.resize(needed, 0.0);
         }
         Ok(())
     }
@@ -2686,6 +2939,277 @@ impl CpuDecodeStore {
                         parallel);
                     if timing { graph.t_gqa_o_proj += t0.elapsed().as_secs_f64(); }
                 }
+
+                DecodeAttnConfig::MLA {
+                    kv_a_proj_wid, o_proj_wid,
+                    q_proj_wid, q_a_proj_wid, q_b_proj_wid,
+                    w_kc, w_vc, kv_a_norm, q_a_norm,
+                    rope_cos, rope_sin,
+                    num_heads, kv_lora_rank, qk_nope_dim, qk_rope_dim, v_head_dim, sm_scale,
+                } => {
+                    let nh = *num_heads;
+                    let klr = *kv_lora_rank;
+                    let qk_nd = *qk_nope_dim;
+                    let qk_rd = *qk_rope_dim;
+                    let vhd = *v_head_dim;
+                    let head_dim = qk_nd + qk_rd;
+                    let rope_half = qk_rd / 2;
+
+                    // ── Step 1: KV compressed projection ──
+                    // hidden → kv_out[kv_lora_rank + qk_rope_dim]
+                    let t0 = if timing { Instant::now() } else { t_step_start };
+                    let k_in = weights[*kv_a_proj_wid].cols;
+                    quantize_activation_int16_f32(
+                        &graph.hidden[..k_in], graph.group_size,
+                        &mut graph.act_int16[..k_in],
+                        &mut graph.act_scales[..k_in / graph.group_size]);
+                    dispatch_matmul_free(
+                        &weights[*kv_a_proj_wid],
+                        &graph.act_int16[..k_in],
+                        &graph.act_scales[..k_in / graph.group_size],
+                        &mut graph.mla_kv_out[..klr + qk_rd],
+                        parallel);
+
+                    // Split: kv_compressed = kv_out[..klr], k_pe = kv_out[klr..]
+                    // RMSNorm on kv_compressed
+                    graph.mla_kv_compressed[..klr].copy_from_slice(&graph.mla_kv_out[..klr]);
+                    {
+                        let mut sum_sq = 0.0f32;
+                        for i in 0..klr {
+                            sum_sq += graph.mla_kv_compressed[i] * graph.mla_kv_compressed[i];
+                        }
+                        let rms = (sum_sq / klr as f32 + eps).sqrt().recip();
+                        for i in 0..klr {
+                            graph.mla_kv_compressed[i] *= rms * kv_a_norm[i];
+                        }
+                    }
+
+                    // ── Step 2: Query projection ──
+                    if let Some(qa_wid) = q_a_proj_wid {
+                        // LoRA path: q_a_proj → RMSNorm → q_b_proj
+                        let qa_rows = weights[*qa_wid].rows;
+                        let qa_k = weights[*qa_wid].cols;
+                        quantize_activation_int16_f32(
+                            &graph.hidden[..qa_k], graph.group_size,
+                            &mut graph.act_int16[..qa_k],
+                            &mut graph.act_scales[..qa_k / graph.group_size]);
+                        dispatch_matmul_free(
+                            &weights[*qa_wid],
+                            &graph.act_int16[..qa_k],
+                            &graph.act_scales[..qa_k / graph.group_size],
+                            &mut graph.mla_q_compressed[..qa_rows],
+                            parallel);
+                        // RMSNorm on q_compressed
+                        if let Some(qa_norm) = q_a_norm {
+                            let mut sum_sq = 0.0f32;
+                            for i in 0..qa_rows {
+                                sum_sq += graph.mla_q_compressed[i] * graph.mla_q_compressed[i];
+                            }
+                            let rms = (sum_sq / qa_rows as f32 + eps).sqrt().recip();
+                            for i in 0..qa_rows {
+                                graph.mla_q_compressed[i] *= rms * qa_norm[i];
+                            }
+                        }
+                        // q_b_proj: q_compressed → q_full
+                        let qb_wid = q_b_proj_wid.unwrap();
+                        let qb_k = weights[qb_wid].cols;
+                        quantize_activation_int16_f32(
+                            &graph.mla_q_compressed[..qb_k], graph.group_size,
+                            &mut graph.act_int16[..qb_k],
+                            &mut graph.act_scales[..qb_k / graph.group_size]);
+                        dispatch_matmul_free(
+                            &weights[qb_wid],
+                            &graph.act_int16[..qb_k],
+                            &graph.act_scales[..qb_k / graph.group_size],
+                            &mut graph.mla_q_full[..nh * head_dim],
+                            parallel);
+                    } else {
+                        // Direct path: q_proj
+                        let qw = q_proj_wid.as_ref().unwrap();
+                        let q_k = weights[*qw].cols;
+                        quantize_activation_int16_f32(
+                            &graph.hidden[..q_k], graph.group_size,
+                            &mut graph.act_int16[..q_k],
+                            &mut graph.act_scales[..q_k / graph.group_size]);
+                        dispatch_matmul_free(
+                            &weights[*qw],
+                            &graph.act_int16[..q_k],
+                            &graph.act_scales[..q_k / graph.group_size],
+                            &mut graph.mla_q_full[..nh * head_dim],
+                            parallel);
+                    }
+                    if timing { graph.t_mla_proj += t0.elapsed().as_secs_f64(); }
+
+                    // ── Step 3: De-interleave + RoPE ──
+                    let t0 = if timing { Instant::now() } else { t_step_start };
+
+                    // De-interleave k_pe in-place: [re0,im0,re1,im1,...] → [re0,re1,...,im0,im1,...]
+                    // Work on mla_kv_out[klr..klr+qk_rd]
+                    {
+                        // Use temporary storage (stack for small dims)
+                        let mut tmp = [0.0f32; 256]; // qk_rope_dim is typically 64
+                        let src = &graph.mla_kv_out[klr..klr + qk_rd];
+                        for i in 0..rope_half {
+                            tmp[i] = src[i * 2];               // real parts
+                            tmp[rope_half + i] = src[i * 2 + 1]; // imag parts
+                        }
+                        graph.mla_kv_out[klr..klr + qk_rd].copy_from_slice(&tmp[..qk_rd]);
+                    }
+
+                    // De-interleave q_pe per head and apply RoPE
+                    let cos = &rope_cos[position * rope_half..(position + 1) * rope_half];
+                    let sin = &rope_sin[position * rope_half..(position + 1) * rope_half];
+
+                    for h in 0..nh {
+                        let base = h * head_dim + qk_nd; // start of q_pe for this head
+                        // De-interleave q_pe for this head
+                        let mut tmp = [0.0f32; 256];
+                        for i in 0..rope_half {
+                            tmp[i] = graph.mla_q_full[base + i * 2];
+                            tmp[rope_half + i] = graph.mla_q_full[base + i * 2 + 1];
+                        }
+                        // Apply RoPE to q_pe
+                        for i in 0..rope_half {
+                            let x1 = tmp[i];
+                            let x2 = tmp[rope_half + i];
+                            graph.mla_q_full[base + i] = x1 * cos[i] - x2 * sin[i];
+                            graph.mla_q_full[base + rope_half + i] = x2 * cos[i] + x1 * sin[i];
+                        }
+                    }
+
+                    // Apply RoPE to k_pe (single, shared across heads)
+                    {
+                        let kpe = &mut graph.mla_kv_out[klr..klr + qk_rd];
+                        for i in 0..rope_half {
+                            let x1 = kpe[i];
+                            let x2 = kpe[rope_half + i];
+                            kpe[i] = x1 * cos[i] - x2 * sin[i];
+                            kpe[rope_half + i] = x2 * cos[i] + x1 * sin[i];
+                        }
+                    }
+
+                    // ── Step 4: Absorb w_kc into query ──
+                    // For each head: q_absorbed[h, :klr] = q_nope[h, :qk_nd] @ w_kc[h, :qk_nd, :klr]
+                    // w_kc layout: [num_heads, qk_nope_dim, kv_lora_rank]
+                    for h in 0..nh {
+                        let q_base = h * head_dim; // q_nope starts here
+                        let wkc_base = h * qk_nd * klr;
+                        let out_base = h * klr;
+                        for j in 0..klr {
+                            let mut acc = 0.0f32;
+                            for i in 0..qk_nd {
+                                acc += graph.mla_q_full[q_base + i] * w_kc[wkc_base + i * klr + j];
+                            }
+                            graph.mla_q_absorbed[out_base + j] = acc;
+                        }
+                    }
+                    if timing { graph.t_mla_rope += t0.elapsed().as_secs_f64(); }
+
+                    // ── Step 5: KV cache write + Attention ──
+                    let t0 = if timing { Instant::now() } else { t_step_start };
+
+                    // Write compressed KV to cache
+                    let ckv_cache: &mut [f32] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            graph.mla_ckv_ptrs[layer_idx] as *mut f32,
+                            graph.kv_max_seq * klr)
+                    };
+                    let kpe_cache: &mut [f32] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            graph.mla_kpe_ptrs[layer_idx] as *mut f32,
+                            graph.kv_max_seq * qk_rd)
+                    };
+                    let ckv_offset = position * klr;
+                    ckv_cache[ckv_offset..ckv_offset + klr]
+                        .copy_from_slice(&graph.mla_kv_compressed[..klr]);
+                    let kpe_offset = position * qk_rd;
+                    kpe_cache[kpe_offset..kpe_offset + qk_rd]
+                        .copy_from_slice(&graph.mla_kv_out[klr..klr + qk_rd]);
+
+                    // Attention: per head
+                    // score[h,t] = dot(q_absorbed[h], ckv[t]) + dot(q_pe[h], kpe[t])
+                    let seq_len = position + 1;
+                    for h in 0..nh {
+                        let qa_base = h * klr;
+                        let qpe_base = h * head_dim + qk_nd; // q_pe in mla_q_full after RoPE
+                        let score_base = h * seq_len;
+                        let mut max_score = f32::NEG_INFINITY;
+
+                        for t in 0..seq_len {
+                            let mut s = 0.0f32;
+                            // dot(q_absorbed, ckv)
+                            let ckv_t = t * klr;
+                            for i in 0..klr {
+                                s += graph.mla_q_absorbed[qa_base + i] * ckv_cache[ckv_t + i];
+                            }
+                            // dot(q_pe, kpe)
+                            let kpe_t = t * qk_rd;
+                            for i in 0..qk_rd {
+                                s += graph.mla_q_full[qpe_base + i] * kpe_cache[kpe_t + i];
+                            }
+                            s *= sm_scale;
+                            graph.mla_attn_scores[score_base + t] = s;
+                            if s > max_score { max_score = s; }
+                        }
+
+                        // Softmax
+                        let mut sum_exp = 0.0f32;
+                        for t in 0..seq_len {
+                            let e = (graph.mla_attn_scores[score_base + t] - max_score).exp();
+                            graph.mla_attn_scores[score_base + t] = e;
+                            sum_exp += e;
+                        }
+                        let inv_sum = 1.0 / sum_exp;
+                        for t in 0..seq_len {
+                            graph.mla_attn_scores[score_base + t] *= inv_sum;
+                        }
+
+                        // Weighted sum: attn_out[h] = sum_t(weight[t] * ckv[t])
+                        let out_base = h * klr;
+                        for j in 0..klr {
+                            let mut acc = 0.0f32;
+                            for t in 0..seq_len {
+                                acc += graph.mla_attn_scores[score_base + t]
+                                    * ckv_cache[t * klr + j];
+                            }
+                            graph.mla_attn_out[out_base + j] = acc;
+                        }
+                    }
+                    if timing { graph.t_mla_attn += t0.elapsed().as_secs_f64(); }
+
+                    // ── Step 6: w_vc projection + o_proj ──
+                    let t0 = if timing { Instant::now() } else { t_step_start };
+
+                    // For each head: v_projected[h] = w_vc[h] @ attn_out[h]
+                    // w_vc: [num_heads, v_head_dim, kv_lora_rank]
+                    for h in 0..nh {
+                        let wvc_base = h * vhd * klr;
+                        let ao_base = h * klr;
+                        let vp_base = h * vhd;
+                        for o in 0..vhd {
+                            let mut acc = 0.0f32;
+                            for d in 0..klr {
+                                acc += w_vc[wvc_base + o * klr + d]
+                                    * graph.mla_attn_out[ao_base + d];
+                            }
+                            graph.mla_v_projected[vp_base + o] = acc;
+                        }
+                    }
+
+                    // o_proj: [num_heads * v_head_dim] → [hidden_size]
+                    let o_k = weights[*o_proj_wid].cols;
+                    quantize_activation_int16_f32(
+                        &graph.mla_v_projected[..o_k], graph.group_size,
+                        &mut graph.act_int16[..o_k],
+                        &mut graph.act_scales[..o_k / graph.group_size]);
+                    dispatch_matmul_free(
+                        &weights[*o_proj_wid],
+                        &graph.act_int16[..o_k],
+                        &graph.act_scales[..o_k / graph.group_size],
+                        &mut graph.hidden[..hs],
+                        parallel);
+                    if timing { graph.t_mla_o_proj += t0.elapsed().as_secs_f64(); }
+                }
             }
 
             // Post-attention norm
@@ -2722,7 +3246,7 @@ impl CpuDecodeStore {
                     let logits_buf = &mut graph.route_logits[..ne];
                     let scores_buf = &mut graph.route_scores[..ne];
                     let corrected_buf = &mut graph.route_corrected[..ne];
-                    unsafe { moe_route_matmul_avx2(&rw.data, &graph.hidden[..hd], logits_buf, ne, hd) };
+                    unsafe { moe_route_matmul_avx2_parallel(&rw.data, &graph.hidden[..hd], logits_buf, ne, hd) };
                     if let Some(ref bias) = rw.bias {
                         for e in 0..ne { logits_buf[e] += bias[e]; }
                     }
@@ -2928,6 +3452,12 @@ impl CpuDecodeStore {
                 log::info!("  gqa_rope:     {:6.1} ms ({:4.1}%)", graph.t_gqa_rope / nf * 1000.0, graph.t_gqa_rope / graph.t_total * 100.0);
                 log::info!("  gqa_attn:     {:6.1} ms ({:4.1}%)", graph.t_gqa_attn / nf * 1000.0, graph.t_gqa_attn / graph.t_total * 100.0);
                 log::info!("  gqa_o_proj:   {:6.1} ms ({:4.1}%)", graph.t_gqa_o_proj / nf * 1000.0, graph.t_gqa_o_proj / graph.t_total * 100.0);
+                if graph.t_mla_proj > 0.0 {
+                    log::info!("  mla_proj:     {:6.1} ms ({:4.1}%)", graph.t_mla_proj / nf * 1000.0, graph.t_mla_proj / graph.t_total * 100.0);
+                    log::info!("  mla_rope:     {:6.1} ms ({:4.1}%)", graph.t_mla_rope / nf * 1000.0, graph.t_mla_rope / graph.t_total * 100.0);
+                    log::info!("  mla_attn:     {:6.1} ms ({:4.1}%)", graph.t_mla_attn / nf * 1000.0, graph.t_mla_attn / graph.t_total * 100.0);
+                    log::info!("  mla_o_proj:   {:6.1} ms ({:4.1}%)", graph.t_mla_o_proj / nf * 1000.0, graph.t_mla_o_proj / graph.t_total * 100.0);
+                }
                 log::info!("  moe_route:    {:6.1} ms ({:4.1}%)", graph.t_moe_route / nf * 1000.0, graph.t_moe_route / graph.t_total * 100.0);
                 log::info!("  moe_experts:  {:6.1} ms ({:4.1}%)", graph.t_moe_experts / nf * 1000.0, graph.t_moe_experts / graph.t_total * 100.0);
                 log::info!("  moe_shared:   {:6.1} ms ({:4.1}%)", graph.t_moe_shared / nf * 1000.0, graph.t_moe_shared / graph.t_total * 100.0);
@@ -2935,7 +3465,9 @@ impl CpuDecodeStore {
                 log::info!("  lm_head:      {:6.1} ms ({:4.1}%)", graph.t_lm_head / nf * 1000.0, graph.t_lm_head / graph.t_total * 100.0);
                 let accounted = graph.t_norm + graph.t_la_proj + graph.t_la_conv + graph.t_la_recur
                     + graph.t_la_gate_norm + graph.t_la_out_proj + graph.t_gqa_proj + graph.t_gqa_rope
-                    + graph.t_gqa_attn + graph.t_gqa_o_proj + graph.t_moe_route + graph.t_moe_experts
+                    + graph.t_gqa_attn + graph.t_gqa_o_proj
+                    + graph.t_mla_proj + graph.t_mla_rope + graph.t_mla_attn + graph.t_mla_o_proj
+                    + graph.t_moe_route + graph.t_moe_experts
                     + graph.t_moe_shared + graph.t_dense_mlp + graph.t_lm_head;
                 let overhead = graph.t_total - accounted;
                 log::info!("  overhead:     {:6.1} ms ({:4.1}%)", overhead / nf * 1000.0, overhead / graph.t_total * 100.0);
@@ -4021,6 +4553,11 @@ pub fn bench_decode_synthetic(
         gqa_qkv_buf: Vec::new(),
         gqa_scores: Vec::new(),
         gqa_attn_out: Vec::new(),
+        mla_kv_out: Vec::new(), mla_kv_compressed: Vec::new(),
+        mla_q_full: Vec::new(), mla_q_compressed: Vec::new(),
+        mla_q_absorbed: Vec::new(), mla_attn_scores: Vec::new(),
+        mla_attn_out: Vec::new(), mla_v_projected: Vec::new(),
+        mla_ckv_ptrs: vec![0; num_layers], mla_kpe_ptrs: vec![0; num_layers],
         mlp_gate_up: Vec::new(),
         mlp_hidden_buf: Vec::new(),
         moe_store: None,
@@ -4044,6 +4581,7 @@ pub fn bench_decode_synthetic(
         t_norm: 0.0, t_la_proj: 0.0, t_la_conv: 0.0, t_la_recur: 0.0,
         t_la_gate_norm: 0.0, t_la_out_proj: 0.0,
         t_gqa_proj: 0.0, t_gqa_rope: 0.0, t_gqa_attn: 0.0, t_gqa_o_proj: 0.0,
+        t_mla_proj: 0.0, t_mla_rope: 0.0, t_mla_attn: 0.0, t_mla_o_proj: 0.0,
         t_moe_route: 0.0, t_moe_experts: 0.0, t_moe_shared: 0.0,
         t_dense_mlp: 0.0, t_lm_head: 0.0, t_total: 0.0,
     }));
@@ -4411,6 +4949,7 @@ pub fn bench_decode_synthetic(
         g.t_norm = 0.0; g.t_la_proj = 0.0; g.t_la_conv = 0.0; g.t_la_recur = 0.0;
         g.t_la_gate_norm = 0.0; g.t_la_out_proj = 0.0;
         g.t_gqa_proj = 0.0; g.t_gqa_rope = 0.0; g.t_gqa_attn = 0.0; g.t_gqa_o_proj = 0.0;
+        g.t_mla_proj = 0.0; g.t_mla_rope = 0.0; g.t_mla_attn = 0.0; g.t_mla_o_proj = 0.0;
         g.t_moe_route = 0.0; g.t_moe_experts = 0.0; g.t_moe_shared = 0.0;
         g.t_dense_mlp = 0.0; g.t_lm_head = 0.0; g.t_total = 0.0;
     }
@@ -4448,6 +4987,12 @@ pub fn bench_decode_synthetic(
             eprintln!("  gqa_rope:     {:6.1}", g.t_gqa_rope / n * 1000.0);
             eprintln!("  gqa_attn:     {:6.1}", g.t_gqa_attn / n * 1000.0);
             eprintln!("  gqa_o_proj:   {:6.1}", g.t_gqa_o_proj / n * 1000.0);
+            if g.t_mla_proj > 0.0 {
+                eprintln!("  mla_proj:     {:6.1}", g.t_mla_proj / n * 1000.0);
+                eprintln!("  mla_rope:     {:6.1}", g.t_mla_rope / n * 1000.0);
+                eprintln!("  mla_attn:     {:6.1}", g.t_mla_attn / n * 1000.0);
+                eprintln!("  mla_o_proj:   {:6.1}", g.t_mla_o_proj / n * 1000.0);
+            }
             eprintln!("  moe_route:    {:6.1}", g.t_moe_route / n * 1000.0);
             eprintln!("  moe_experts:  {:6.1}", g.t_moe_experts / n * 1000.0);
             eprintln!("  moe_shared:   {:6.1}", g.t_moe_shared / n * 1000.0);
@@ -4455,7 +5000,9 @@ pub fn bench_decode_synthetic(
             eprintln!("  lm_head:      {:6.1}", g.t_lm_head / n * 1000.0);
             let accounted = g.t_norm + g.t_la_proj + g.t_la_conv + g.t_la_recur
                 + g.t_la_gate_norm + g.t_la_out_proj + g.t_gqa_proj + g.t_gqa_rope
-                + g.t_gqa_attn + g.t_gqa_o_proj + g.t_moe_route + g.t_moe_experts
+                + g.t_gqa_attn + g.t_gqa_o_proj
+                + g.t_mla_proj + g.t_mla_rope + g.t_mla_attn + g.t_mla_o_proj
+                + g.t_moe_route + g.t_moe_experts
                 + g.t_moe_shared + g.t_dense_mlp + g.t_lm_head;
             let overhead = g.t_total - accounted;
             eprintln!("  overhead:     {:6.1}", overhead / n * 1000.0);

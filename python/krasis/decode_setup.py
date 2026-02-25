@@ -94,6 +94,10 @@ class CpuDecoder:
         self._kv_k = {}  # layer_idx -> [max_kv_seq, kv_heads, head_dim] float32
         self._kv_v = {}  # layer_idx -> [max_kv_seq, kv_heads, head_dim] float32
 
+        # MLA KV cache (CPU, flat layout) — compressed KV + rope position embeddings
+        self._mla_ckv = {}  # layer_idx -> [max_kv_seq, kv_lora_rank] float32
+        self._mla_kpe = {}  # layer_idx -> [max_kv_seq, qk_rope_dim] float32
+
         # Linear attention state (per-layer, CPU float32) — pre-allocated, zeroed per request
         self._la_conv_state = {}    # layer_idx -> [1, conv_dim, kernel_dim]
         self._la_recur_state = {}   # layer_idx -> [1, nv, dk, dv]
@@ -107,6 +111,8 @@ class CpuDecoder:
         # RoPE tables (CPU float32) — set by init_weights
         self._rope_cos = None
         self._rope_sin = None
+        self._mla_rope_cos = None
+        self._mla_rope_sin = None
 
         # Pre-allocated pinned MoE buffers for Rust engine interface
         hidden = self.cfg.hidden_size
@@ -194,6 +200,8 @@ class CpuDecoder:
                 self._init_attention_from_cpu_store(layer_idx, layer, ld, cpu_w)
             elif layer.layer_type == "linear_attention":
                 self._init_linear_attention(layer_idx, layer, ld)
+            elif cfg.is_mla:
+                self._init_mla(layer_idx, layer, ld)
             elif cfg.is_gqa:
                 self._init_gqa(layer_idx, layer, ld)
 
@@ -365,6 +373,30 @@ class CpuDecoder:
             'o_proj_bias': attn.o_proj_bias.float().cpu() if attn.o_proj_bias is not None else None,
         }
 
+    def _init_mla(self, layer_idx, layer, ld):
+        """Copy MLA attention weights to CPU (immutable). KV cache allocated per request."""
+        attn = layer.attention
+        a = {
+            'kv_a_proj': self._to_cpu_f32(attn.kv_a_proj),
+            'o_proj': self._to_cpu_f32(attn.o_proj),
+            'kv_a_norm': attn.kv_a_norm_weight.float().cpu().contiguous(),
+            'w_kc': attn.w_kc.to(torch.bfloat16).cpu().contiguous(),
+            'w_vc': attn.w_vc.to(torch.bfloat16).cpu().contiguous(),
+            'num_heads': attn.num_heads,
+            'kv_lora_rank': attn.kv_lora_rank,
+            'qk_nope_dim': attn.qk_nope_dim,
+            'qk_rope_dim': attn.qk_rope_dim,
+            'v_head_dim': attn.v_head_dim,
+            'sm_scale': attn.sm_scale,
+        }
+        if attn.has_q_lora:
+            a['q_a_proj'] = self._to_cpu_f32(attn.q_a_proj)
+            a['q_b_proj'] = self._to_cpu_f32(attn.q_b_proj)
+            a['q_a_norm'] = attn.q_a_norm_weight.float().cpu().contiguous()
+        else:
+            a['q_proj'] = self._to_cpu_f32(attn.q_proj)
+        ld['attn'] = a
+
     def _prepare_moe(self, layer, ld):
         """Copy MoE routing and shared expert weights."""
         ld['gate_weight'] = layer._gate_weight_f32.cpu()
@@ -429,6 +461,30 @@ class CpuDecoder:
             attn._init_state()
             self._la_conv_state_templates[layer_idx] = attn._conv_state.shape
             self._la_recur_state_templates[layer_idx] = attn._recurrent_state.shape
+
+        elif self.cfg.is_mla:
+            attn_d = cpu_w.get("attention", {})
+            attn = layer.attention
+            a = {
+                'kv_a_proj': self._to_cpu_f32(attn_d['kv_a_proj_with_mqa']),
+                'o_proj': self._to_cpu_f32(attn_d['o_proj']),
+                'kv_a_norm': attn_d['kv_a_layernorm'].float().cpu().contiguous(),
+                'w_kc': attn_d['w_kc'].to(torch.bfloat16).cpu().contiguous(),
+                'w_vc': attn_d['w_vc'].to(torch.bfloat16).cpu().contiguous(),
+                'num_heads': attn.num_heads,
+                'kv_lora_rank': attn.kv_lora_rank,
+                'qk_nope_dim': attn.qk_nope_dim,
+                'qk_rope_dim': attn.qk_rope_dim,
+                'v_head_dim': attn.v_head_dim,
+                'sm_scale': attn.sm_scale,
+            }
+            if attn.has_q_lora:
+                a['q_a_proj'] = self._to_cpu_f32(attn_d['q_a_proj'])
+                a['q_b_proj'] = self._to_cpu_f32(attn_d['q_b_proj'])
+                a['q_a_norm'] = attn_d['q_a_layernorm'].float().cpu().contiguous()
+            else:
+                a['q_proj'] = self._to_cpu_f32(attn_d['q_proj'])
+            ld['attn'] = a
 
         elif self.cfg.is_gqa:
             attn_d = cpu_w.get("attention", {})
@@ -506,6 +562,14 @@ class CpuDecoder:
                 self._qw(a, 'in_proj_qkvz', bits, gs)
                 self._qw(a, 'in_proj_ba', bits, gs)
                 self._qw(a, 'out_proj', bits, gs)
+            elif self.cfg.is_mla:
+                self._qw(a, 'kv_a_proj', bits, gs)
+                self._qw(a, 'o_proj', bits, gs)
+                if 'q_a_proj' in a:
+                    self._qw(a, 'q_a_proj', bits, gs)
+                    self._qw(a, 'q_b_proj', bits, gs)
+                else:
+                    self._qw(a, 'q_proj', bits, gs)
             elif self.cfg.is_gqa:
                 for key in ('q_proj', 'k_proj', 'v_proj', 'o_proj'):
                     self._qw(a, key, bits, gs)
@@ -567,12 +631,15 @@ class CpuDecoder:
             return
         w = w.contiguous()
         rows, cols = w.shape
-        if cols % gs != 0:
-            logger.debug("Skipping %s: cols %d not divisible by %d", key, cols, gs)
-            return
-        if bits == 4 and cols % 8 != 0:
-            logger.debug("Skipping %s: cols %d not divisible by 8", key, cols)
-            return
+        # Pad cols to be divisible by group_size (and by 8 for INT4)
+        align = gs if bits != 4 else max(gs, 8)
+        if cols % align != 0:
+            new_cols = ((cols + align - 1) // align) * align
+            logger.debug("Padding %s cols %d -> %d for alignment", key, cols, new_cols)
+            padded = torch.zeros(rows, new_cols, dtype=w.dtype)
+            padded[:, :cols] = w
+            w = padded.contiguous()
+            cols = new_cols
         wid = self._store.store_weight_f32(w.data_ptr(), rows, cols, bits)
         buf = torch.empty(rows, dtype=torch.float32)
         d[f'{key}_wid'] = wid
@@ -588,6 +655,10 @@ class CpuDecoder:
         for t in self._kv_k.values():
             t.zero_()
         for t in self._kv_v.values():
+            t.zero_()
+        for t in self._mla_ckv.values():
+            t.zero_()
+        for t in self._mla_kpe.values():
             t.zero_()
 
     def _copy_recurrent_state_from_gpu(self):
@@ -642,7 +713,22 @@ class CpuDecoder:
                 if kv_offset < 0:
                     continue
 
-                if self.cfg.is_gqa and abs_layer in self._kv_k:
+                if self.cfg.is_mla and abs_layer in self._mla_ckv:
+                    # MLA: compressed KV + rope position embeddings
+                    ckv_layer, kpe_layer = kv_cache.get_layer_caches(kv_offset)
+
+                    token_idx = 0
+                    for page_idx in page_indices:
+                        tokens_in_page = min(page_size, seq_len - token_idx)
+                        if tokens_in_page <= 0:
+                            break
+                        self._mla_ckv[abs_layer][token_idx:token_idx + tokens_in_page] = \
+                            ckv_layer[page_idx, :tokens_in_page].float().cpu()
+                        self._mla_kpe[abs_layer][token_idx:token_idx + tokens_in_page] = \
+                            kpe_layer[page_idx, :tokens_in_page].float().cpu()
+                        token_idx += tokens_in_page
+
+                elif self.cfg.is_gqa and abs_layer in self._kv_k:
                     # GQA: separate K, V caches
                     k_layer = kv_cache.k_cache[kv_offset]
                     v_layer = kv_cache.v_cache[kv_offset]
@@ -666,8 +752,38 @@ class CpuDecoder:
 
     def _init_rope(self):
         """Pre-compute RoPE cos/sin tables for CPU decode."""
+        import math
         cfg = self.cfg
         max_pos = self._max_rope_seq
+
+        if cfg.is_mla:
+            # MLA YaRN RoPE — same logic as attention.py MLAAttention._get_rope_cos_sin
+            dim = cfg.qk_rope_head_dim
+            freqs = 1.0 / (cfg.rope_theta ** (torch.arange(0, dim, 2).float() / dim))
+
+            rope_cfg = cfg.rope_scaling
+            if rope_cfg:
+                factor = rope_cfg.get("factor", 1.0)
+                if factor > 1.0:
+                    original_max = rope_cfg.get("original_max_position_embeddings", 4096)
+                    beta_fast = rope_cfg.get("beta_fast", 32.0)
+                    beta_slow = rope_cfg.get("beta_slow", 1.0)
+
+                    low = max(0, math.floor(dim * math.log(original_max / (beta_fast * 2 * math.pi))
+                                            / (2 * math.log(cfg.rope_theta))))
+                    high = min(dim // 2 - 1, math.ceil(dim * math.log(original_max / (beta_slow * 2 * math.pi))
+                                                        / (2 * math.log(cfg.rope_theta))))
+                    freq_extra = freqs.clone()
+                    freq_inter = freqs / factor
+                    ramp = torch.clamp(
+                        (torch.arange(dim // 2).float() - low) / max(high - low, 0.001), 0, 1)
+                    inv_freq_mask = 1.0 - ramp
+                    freqs = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+
+            t = torch.arange(max_pos, dtype=torch.float32)
+            freqs = torch.outer(t, freqs)
+            self._mla_rope_cos = freqs.cos().contiguous()
+            self._mla_rope_sin = freqs.sin().contiguous()
 
         if cfg.is_gqa:
             dim = cfg.rotary_dim
@@ -712,6 +828,16 @@ class CpuDecoder:
                         max_seq, num_kv_heads, head_dim, dtype=torch.float32)
                     kv_bytes += 2 * max_seq * num_kv_heads * head_dim * 4
 
+            # MLA layers: compressed KV + rope position embeddings
+            if 'kv_lora_rank' in a:
+                klr = a['kv_lora_rank']
+                qk_rd = a['qk_rope_dim']
+                self._mla_ckv[layer_idx] = torch.zeros(
+                    max_seq, klr, dtype=torch.float32)
+                self._mla_kpe[layer_idx] = torch.zeros(
+                    max_seq, qk_rd, dtype=torch.float32)
+                kv_bytes += max_seq * (klr + qk_rd) * 4
+
         # ── Recurrent + conv state for linear attention layers ──
         state_bytes = 0
         for layer_idx, shape in self._la_conv_state_templates.items():
@@ -722,9 +848,10 @@ class CpuDecoder:
             self._la_recur_state[layer_idx] = torch.zeros(shape, dtype=torch.float32)
             state_bytes += torch.zeros(shape).nelement() * 4
 
-        logger.info("Pre-allocated buffers: KV cache %.1f MB (%d layers, max_seq=%d), "
+        total_kv_layers = len(self._kv_k) + len(self._mla_ckv)
+        logger.info("Pre-allocated buffers: KV cache %.1f MB (%d GQA + %d MLA layers, max_seq=%d), "
                      "recurrent state %.1f MB (%d layers)",
-                     kv_bytes / 1e6, len(self._kv_k), max_seq,
+                     kv_bytes / 1e6, len(self._kv_k), len(self._mla_ckv), max_seq,
                      state_bytes / 1e6, len(self._la_recur_state))
 
     # ──────────────────────────────────────────────────────
@@ -781,6 +908,37 @@ class CpuDecoder:
                     a['num_k_heads'], a['num_v_heads'],
                     a['k_head_dim'], a['v_head_dim'],
                     a['head_ratio'], a['kernel_dim'], a['scale'])
+
+            elif cfg.is_mla:
+                # Keep tensors alive for Rust to read via pointers
+                w_kc = a['w_kc']
+                w_vc = a['w_vc']
+                kv_a_norm = a['kv_a_norm']
+                self._decode_graph_tensors.extend([w_kc, w_vc, kv_a_norm])
+
+                q_a_norm = a.get('q_a_norm')
+                q_a_norm_ptr = q_a_norm.data_ptr() if q_a_norm is not None else 0
+                q_a_norm_len = q_a_norm.numel() if q_a_norm is not None else 0
+                if q_a_norm is not None:
+                    self._decode_graph_tensors.append(q_a_norm)
+
+                # RoPE tables (computed in _init_rope)
+                self._decode_graph_tensors.extend([self._mla_rope_cos, self._mla_rope_sin])
+
+                store.add_decode_mla_layer(
+                    ld['input_norm_id'], ld['post_attn_norm_id'],
+                    a['kv_a_proj_wid'], a['o_proj_wid'],
+                    a.get('q_proj_wid'), a.get('q_a_proj_wid'), a.get('q_b_proj_wid'),
+                    w_kc.data_ptr(), w_kc.numel(),
+                    w_vc.data_ptr(), w_vc.numel(),
+                    kv_a_norm.data_ptr(), kv_a_norm.numel(),
+                    q_a_norm_ptr, q_a_norm_len,
+                    self._mla_rope_cos.data_ptr(), self._mla_rope_sin.data_ptr(),
+                    self._mla_rope_cos.numel(), self._max_rope_seq,
+                    a['num_heads'], a['kv_lora_rank'],
+                    a['qk_nope_dim'], a['qk_rope_dim'],
+                    a['v_head_dim'], a['sm_scale'],
+                )
 
             elif cfg.is_gqa:
                 q_norm = a.get('q_norm')
@@ -875,10 +1033,25 @@ class CpuDecoder:
             else:
                 recur_state_ptrs.append(0)
 
+        # MLA cache pointers
+        mla_ckv_ptrs = None
+        mla_kpe_ptrs = None
+        if self._mla_ckv:
+            mla_ckv_ptrs = []
+            mla_kpe_ptrs = []
+            for layer_idx in range(num_layers):
+                if layer_idx in self._mla_ckv:
+                    mla_ckv_ptrs.append(self._mla_ckv[layer_idx].data_ptr())
+                    mla_kpe_ptrs.append(self._mla_kpe[layer_idx].data_ptr())
+                else:
+                    mla_ckv_ptrs.append(0)
+                    mla_kpe_ptrs.append(0)
+
         self._store.set_decode_state(
             self._seq_len, self._max_kv_seq,
             kv_k_ptrs, kv_v_ptrs,
-            conv_state_ptrs, recur_state_ptrs)
+            conv_state_ptrs, recur_state_ptrs,
+            mla_ckv_ptrs, mla_kpe_ptrs)
 
     def _step_rust(self, token_id: int, position: int) -> torch.Tensor:
         """Rust single-call decode step."""

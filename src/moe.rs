@@ -801,6 +801,8 @@ pub fn moe_forward_flattened(
     // ── Phase 1: All w13 matmul chunks in one flat parallel dispatch ──
     let w13_chunks_per = (two_n + chunk_n - 1) / chunk_n;
     let total_w13 = n_exp * w13_chunks_per;
+    let tiled = experts[0].tiled;
+    let num_groups_w13 = hidden / gs;
 
     (0..total_w13).into_par_iter().for_each(|item| {
         let ei = item / w13_chunks_per;
@@ -811,18 +813,43 @@ pub fn moe_forward_flattened(
 
         unsafe {
             let out = (w13_addrs[ei] as *mut f32).add(n_start);
-            match expert.num_bits {
-                4 => expert_matmul_int4_transposed_integer(
-                    expert.w13_packed.as_ptr(),
-                    expert.w13_scales.as_ptr(),
-                    act_addr as *const i16, act_sc_addr as *const f32,
-                    out, hidden, two_n, n_start, n_count, gs),
-                8 => expert_matmul_int8_transposed_integer(
-                    expert.w13_packed.as_ptr() as *const i8,
-                    expert.w13_scales.as_ptr(),
-                    act_addr as *const i16, act_sc_addr as *const f32,
-                    out, hidden, two_n, n_start, n_count, gs),
-                _ => {}
+            if tiled {
+                // Tiled layout: each tile's data is contiguous at tile_idx offset.
+                // n_stride=TILE_N, n_start=0 within the tile.
+                let scales_tile_size = num_groups_w13 * chunk_n;
+                match expert.num_bits {
+                    4 => {
+                        let packed_tile_size = (hidden / 8) * chunk_n; // u32 elements per tile
+                        expert_matmul_int4_transposed_integer(
+                            expert.w13_packed.as_ptr().add(ci * packed_tile_size),
+                            expert.w13_scales.as_ptr().add(ci * scales_tile_size),
+                            act_addr as *const i16, act_sc_addr as *const f32,
+                            out, hidden, chunk_n, 0, n_count, gs);
+                    }
+                    8 => {
+                        let packed_tile_bytes = hidden * chunk_n; // bytes per tile
+                        expert_matmul_int8_transposed_integer(
+                            (expert.w13_packed.as_ptr() as *const i8).add(ci * packed_tile_bytes),
+                            expert.w13_scales.as_ptr().add(ci * scales_tile_size),
+                            act_addr as *const i16, act_sc_addr as *const f32,
+                            out, hidden, chunk_n, 0, n_count, gs);
+                    }
+                    _ => {}
+                }
+            } else {
+                match expert.num_bits {
+                    4 => expert_matmul_int4_transposed_integer(
+                        expert.w13_packed.as_ptr(),
+                        expert.w13_scales.as_ptr(),
+                        act_addr as *const i16, act_sc_addr as *const f32,
+                        out, hidden, two_n, n_start, n_count, gs),
+                    8 => expert_matmul_int8_transposed_integer(
+                        expert.w13_packed.as_ptr() as *const i8,
+                        expert.w13_scales.as_ptr(),
+                        act_addr as *const i16, act_sc_addr as *const f32,
+                        out, hidden, two_n, n_start, n_count, gs),
+                    _ => {}
+                }
             }
         }
     });
@@ -883,6 +910,7 @@ pub fn moe_forward_flattened(
     let w2_n = hidden;
     let w2_chunks_per = (w2_n + chunk_n - 1) / chunk_n;
     let total_w2 = n_exp * w2_chunks_per;
+    let num_groups_w2 = k_down / gs;
 
     (0..total_w2).into_par_iter().for_each(|item| {
         let ei = item / w2_chunks_per;
@@ -896,18 +924,41 @@ pub fn moe_forward_flattened(
             let hsc = h_scales_addrs[ei] as *const f32;
             let out = (expert_out_addrs[ei] as *mut f32).add(n_start);
 
-            match expert.w2_bits {
-                4 => expert_matmul_int4_transposed_integer(
-                    expert.w2_packed.as_ptr(),
-                    expert.w2_scales.as_ptr(),
-                    h16, hsc, out,
-                    k_down, w2_n, n_start, n_count, gs),
-                8 => expert_matmul_int8_transposed_integer(
-                    expert.w2_packed.as_ptr() as *const i8,
-                    expert.w2_scales.as_ptr(),
-                    h16, hsc, out,
-                    k_down, w2_n, n_start, n_count, gs),
-                _ => {}
+            if tiled {
+                let scales_tile_size_w2 = num_groups_w2 * chunk_n;
+                match expert.w2_bits {
+                    4 => {
+                        let packed_tile_size_w2 = (k_down / 8) * chunk_n;
+                        expert_matmul_int4_transposed_integer(
+                            expert.w2_packed.as_ptr().add(ci * packed_tile_size_w2),
+                            expert.w2_scales.as_ptr().add(ci * scales_tile_size_w2),
+                            h16, hsc, out,
+                            k_down, chunk_n, 0, n_count, gs);
+                    }
+                    8 => {
+                        let packed_tile_bytes_w2 = k_down * chunk_n;
+                        expert_matmul_int8_transposed_integer(
+                            (expert.w2_packed.as_ptr() as *const i8).add(ci * packed_tile_bytes_w2),
+                            expert.w2_scales.as_ptr().add(ci * scales_tile_size_w2),
+                            h16, hsc, out,
+                            k_down, chunk_n, 0, n_count, gs);
+                    }
+                    _ => {}
+                }
+            } else {
+                match expert.w2_bits {
+                    4 => expert_matmul_int4_transposed_integer(
+                        expert.w2_packed.as_ptr(),
+                        expert.w2_scales.as_ptr(),
+                        h16, hsc, out,
+                        k_down, w2_n, n_start, n_count, gs),
+                    8 => expert_matmul_int8_transposed_integer(
+                        expert.w2_packed.as_ptr() as *const i8,
+                        expert.w2_scales.as_ptr(),
+                        h16, hsc, out,
+                        k_down, w2_n, n_start, n_count, gs),
+                    _ => {}
+                }
             }
         }
     });

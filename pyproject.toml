@@ -6,13 +6,13 @@ build-backend = "maturin"
 name = "krasis"
 version = "0.1.44"
 description = "Hybrid LLM runtime — minimal VRAM, always-on GPU prefill, optimised CPU inference"
-license = {text = "AGPL-3.0-only"}
+license = {text = "SSPL-1.0"}
 requires-python = ">=3.10"
 readme = "README.md"
 keywords = ["llm", "inference", "moe", "gpu", "cpu"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "License :: Other/Proprietary License",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
