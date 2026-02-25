@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "krasis"
-version = "0.1.49"
+version = "0.1.50"
 dependencies = [
  "cc",
  "env_logger",

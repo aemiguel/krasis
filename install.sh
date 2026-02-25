@@ -174,9 +174,27 @@ esac
 
 info "Using $PYTHON (Python $PY_VER_DOT)"
 
-# ── Check venv module ────────────────────────────────────────────────
-"$PYTHON" -c "import venv" &>/dev/null \
-    || err "Python venv module not found.\n  sudo apt install python3-venv   # or: python${PY_VER_DOT}-venv"
+# ── Ensure venv module ───────────────────────────────────────────────
+if ! "$PYTHON" -c "import venv" &>/dev/null; then
+    warn "Python venv module not found. Installing python${PY_VER_DOT}-venv..."
+    if command -v apt-get &>/dev/null; then
+        SUDO=()
+        [[ "$(id -u)" -ne 0 ]] && SUDO=(sudo)
+        "${SUDO[@]}" apt-get update -qq 2>/dev/null
+        "${SUDO[@]}" apt-get install -y "python${PY_VER_DOT}-venv" \
+            || err "Failed to install python${PY_VER_DOT}-venv.\n  Try manually: sudo apt install python${PY_VER_DOT}-venv"
+    elif command -v dnf &>/dev/null; then
+        SUDO=()
+        [[ "$(id -u)" -ne 0 ]] && SUDO=(sudo)
+        "${SUDO[@]}" dnf install -y "python3-libs" 2>/dev/null \
+            || err "Failed to install python venv. Try: sudo dnf install python3-libs"
+    else
+        err "Python venv module not found.\n  Install it for your distro (e.g. sudo apt install python${PY_VER_DOT}-venv)"
+    fi
+    # Verify it worked
+    "$PYTHON" -c "import venv" &>/dev/null \
+        || err "Python venv module still not available after install attempt."
+fi
 
 # ── Setup venv ───────────────────────────────────────────────────────
 # If the venv exists, check it's healthy and uses the right Python.
