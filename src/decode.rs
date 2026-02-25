@@ -212,6 +212,10 @@ pub struct CpuDecodeStore {
     route_corrected: Vec<f32>,
     /// Full decode graph for single-call decode_step (optional, built by configure_decode).
     decode_graph: Option<Box<DecodeGraph>>,
+    /// Contiguous mmap regions backing TransposedWeight data (for THP).
+    /// Each entry is (base_ptr as usize, byte_len) for munmap on drop.
+    /// Stored as usize instead of *mut u8 to satisfy Send/Sync requirements.
+    mmap_regions: Vec<(usize, usize)>,
 }
 
 #[pymethods]
@@ -233,6 +237,7 @@ impl CpuDecodeStore {
             route_scores: Vec::new(),
             route_corrected: Vec::new(),
             decode_graph: None,
+            mmap_regions: Vec::new(),
         }
     }
 
@@ -1078,6 +1083,22 @@ impl CpuDecodeStore {
     /// Number of stored route weights.
     pub fn num_route_weights(&self) -> usize {
         self.route_weights.len()
+    }
+}
+
+impl Drop for CpuDecodeStore {
+    fn drop(&mut self) {
+        if !self.mmap_regions.is_empty() {
+            // Defuse mmap-backed weight Vecs to prevent dealloc on mmap'd memory
+            for w in self.weights.iter_mut() {
+                std::mem::forget(std::mem::take(&mut w.packed));
+                std::mem::forget(std::mem::take(&mut w.scales));
+            }
+            // Unmap the contiguous regions
+            for &(base_usize, len) in &self.mmap_regions {
+                unsafe { libc::munmap(base_usize as *mut libc::c_void, len); }
+            }
+        }
     }
 }
 
@@ -2098,6 +2119,124 @@ impl CpuDecodeStore {
         Ok(())
     }
 
+    /// Consolidate all TransposedWeight data into contiguous mmap regions with MADV_HUGEPAGE.
+    ///
+    /// After tiling, each weight's packed/scales data lives in separate heap Vecs.
+    /// This method allocates two large contiguous mmap regions (one for packed, one for scales),
+    /// copies all weight data into them, and replaces the heap Vecs with mmap-backed slices.
+    /// The contiguous layout enables transparent huge pages (2MB), dramatically reducing TLB misses.
+    pub fn consolidate_weights_mmap(&mut self) -> PyResult<()> {
+        if self.weights.is_empty() {
+            return Ok(());
+        }
+        if !self.mmap_regions.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Weights already consolidated into mmap"));
+        }
+
+        let t0 = std::time::Instant::now();
+
+        // Calculate total bytes needed
+        let total_packed_bytes: usize = self.weights.iter().map(|w| w.packed.len() * 4).sum();
+        let total_scales_bytes: usize = self.weights.iter().map(|w| w.scales.len() * 2).sum();
+
+        if total_packed_bytes == 0 {
+            return Ok(());
+        }
+
+        log::info!("Consolidating {} weights into contiguous mmap: {:.1} MB packed + {:.1} MB scales",
+            self.weights.len(), total_packed_bytes as f64 / 1e6, total_scales_bytes as f64 / 1e6);
+
+        // Allocate contiguous mmap regions
+        let packed_base = unsafe {
+            libc::mmap(std::ptr::null_mut(), total_packed_bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1, 0)
+        };
+        if packed_base == libc::MAP_FAILED {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "mmap failed for packed weight consolidation"));
+        }
+
+        let scales_base = unsafe {
+            libc::mmap(std::ptr::null_mut(), total_scales_bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1, 0)
+        };
+        if scales_base == libc::MAP_FAILED {
+            unsafe { libc::munmap(packed_base, total_packed_bytes); }
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "mmap failed for scales consolidation"));
+        }
+
+        // Request huge pages
+        unsafe {
+            libc::madvise(packed_base, total_packed_bytes, libc::MADV_HUGEPAGE);
+            libc::madvise(scales_base, total_scales_bytes, libc::MADV_HUGEPAGE);
+        }
+
+        // Copy data from heap Vecs into mmap, replace Vecs with mmap-backed ones
+        let mut p_off: usize = 0; // byte offset into packed mmap
+        let mut s_off: usize = 0; // byte offset into scales mmap
+
+        for w in self.weights.iter_mut() {
+            let pk_bytes = w.packed.len() * 4;
+            let sc_bytes = w.scales.len() * 2;
+            let pk_len = w.packed.len();
+            let sc_len = w.scales.len();
+
+            // Copy packed data into mmap
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    w.packed.as_ptr() as *const u8,
+                    (packed_base as *mut u8).add(p_off),
+                    pk_bytes,
+                );
+            }
+            // Drop old heap Vec, replace with mmap-backed Vec
+            let old_packed = std::mem::take(&mut w.packed);
+            drop(old_packed);
+            w.packed = unsafe {
+                Vec::from_raw_parts(
+                    (packed_base as *mut u32).add(p_off / 4),
+                    pk_len, pk_len,
+                )
+            };
+            p_off += pk_bytes;
+
+            // Copy scales data into mmap
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    w.scales.as_ptr() as *const u8,
+                    (scales_base as *mut u8).add(s_off),
+                    sc_bytes,
+                );
+            }
+            let old_scales = std::mem::take(&mut w.scales);
+            drop(old_scales);
+            w.scales = unsafe {
+                Vec::from_raw_parts(
+                    (scales_base as *mut u16).add(s_off / 2),
+                    sc_len, sc_len,
+                )
+            };
+            s_off += sc_bytes;
+        }
+
+        assert_eq!(p_off, total_packed_bytes);
+        assert_eq!(s_off, total_scales_bytes);
+
+        // Track mmap regions for cleanup (stored as usize for Send/Sync)
+        self.mmap_regions.push((packed_base as usize, total_packed_bytes));
+        self.mmap_regions.push((scales_base as usize, total_scales_bytes));
+
+        log::info!("Consolidated weights into mmap with MADV_HUGEPAGE in {:.1}ms",
+            t0.elapsed().as_secs_f64() * 1000.0);
+        Ok(())
+    }
+
     /// Finalize decode graph — allocate scratch buffers based on layer configs.
     pub fn finalize_decode(&mut self) -> PyResult<()> {
         let g = self.decode_graph.as_mut()
@@ -2915,6 +3054,73 @@ impl CpuDecodeStore {
 
         Ok(generated)
     }
+
+    /// Generate tokens in a tight Rust loop, returning all token IDs.
+    /// No callback, no tokenizer — pure compute. Zero Python involvement per token.
+    #[pyo3(signature = (first_token, start_position, max_tokens, temperature, top_k, top_p, stop_ids))]
+    pub fn generate_batch(
+        &mut self,
+        first_token: usize,
+        start_position: usize,
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        stop_ids: Vec<usize>,
+    ) -> PyResult<Vec<usize>> {
+        use std::time::Instant;
+
+        let graph = self.decode_graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure_decode first"))?;
+        let vocab_size = graph.vocab_size;
+
+        // Pre-allocate logits buffer
+        let mut logits = vec![0.0f32; vocab_size];
+        let output_ptr = logits.as_mut_ptr() as usize;
+
+        // Build stop set for O(1) lookup
+        let stop_set: std::collections::HashSet<usize> = stop_ids.into_iter().collect();
+
+        // RNG for sampling (xorshift64)
+        let mut rng_state: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        if rng_state == 0 { rng_state = 0xDEADBEEF; }
+        let mut rng_next = move || -> u64 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+
+        let decode_start = Instant::now();
+        let mut next_token = first_token;
+        let mut result = Vec::with_capacity(max_tokens);
+
+        for step in 0..max_tokens {
+            let pos = start_position + step;
+
+            self.decode_step(next_token, pos, output_ptr)?;
+
+            next_token = sample_from_logits(
+                &mut logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+            result.push(next_token);
+
+            if stop_set.contains(&next_token) {
+                break;
+            }
+        }
+
+        let elapsed = decode_start.elapsed().as_secs_f64();
+        if !result.is_empty() {
+            let tps = result.len() as f64 / elapsed;
+            log::info!("generate_batch: {} tokens in {:.2}s ({:.1} tok/s)",
+                result.len(), elapsed, tps);
+        }
+
+        Ok(result)
+    }
 }
 
 // ── Sampling (pure Rust, no PyTorch) ──
@@ -3538,7 +3744,7 @@ fn fake_transposed_weight(rows: usize, cols: usize, group_size: usize, num_bits:
 ///   timing: Enable per-component timing (KRASIS_CPU_DECODE_TIMING)
 ///   num_bits: Weight quantization (4 or 8)
 #[pyfunction]
-#[pyo3(signature = (config_path, num_steps=100, warmup=5, timing=false, num_bits=4, max_experts=0, num_threads=20, tiled=false))]
+#[pyo3(signature = (config_path, num_steps=100, warmup=5, timing=false, num_bits=4, max_experts=0, num_threads=20, tiled=true))]
 pub fn bench_decode_synthetic(
     config_path: &str,
     num_steps: usize,
@@ -4074,6 +4280,10 @@ pub fn bench_decode_synthetic(
         }
 
         eprintln!("Tiled repack done in {:.1}s", tile_start.elapsed().as_secs_f64());
+
+        // NOTE: consolidate_weights_mmap() was tested here but caused a 15% regression.
+        // Non-expert weights (1.1 GB) are too small relative to expert data (40 GB)
+        // for mmap+MADV_HUGEPAGE to help. Tiled layout alone provides good locality.
     }
 
     // Set MoE store on graph directly (bypass PyO3 interface)

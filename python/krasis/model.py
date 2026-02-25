@@ -595,7 +595,7 @@ class KrasisModel:
 
         # Phase 5: Initialize CPU decode weights (one-time, immutable)
         print(f"\n\033[1m\033[36m▸ Initializing CPU decode weights\033[0m", flush=True)
-        from krasis.cpu_decode import CpuDecoder
+        from krasis.decode_setup import CpuDecoder
         cpu_decoder = CpuDecoder(self)
         cpu_decoder.init_weights()
         self._cpu_decoder = cpu_decoder
@@ -3394,45 +3394,22 @@ class KrasisModel:
             if next_token in stop_token_ids:
                 return generated
 
-            # ── Decode (CPU) — weights already initialized at load time ──
-            from krasis.cpu_decode import sample_cpu
-
+            # ── Decode (CPU) — entire loop in Rust, zero Python per token ──
             cpu_decoder = self._cpu_decoder
             cpu_decoder.prepare(seq_states_per_rank, max_new_tokens)
 
             _t_decode_start = time.perf_counter()
 
-            for step in range(max_new_tokens - 1):
-                if _DEBUG_DECODE:
-                    import sys
-                    print(f"[DBG] decode step={step} token={next_token}", file=sys.stderr, flush=True)
-
-                if TIMING.decode:
-                    _t_step_start = time.perf_counter()
-
-                pos = len(prompt_tokens) + step
-
-                logits = cpu_decoder.step(next_token, pos)
-
-                if TIMING.decode:
-                    _t_forward = time.perf_counter()
-
-                next_token = sample_cpu(logits, temperature, top_k, top_p)
-
-                if TIMING.decode:
-                    _t_sample = time.perf_counter()
-                    logger.info(
-                        "CPU-DECODE-STEP %d: forward=%.1fms sample=%.1fms total=%.1fms",
-                        step,
-                        (_t_forward - _t_step_start) * 1000,
-                        (_t_sample - _t_forward) * 1000,
-                        (_t_sample - _t_step_start) * 1000,
-                    )
-
-                generated.append(next_token)
-
-                if next_token in stop_token_ids:
-                    break
+            decode_tokens = cpu_decoder._store.generate_batch(
+                first_token=next_token,
+                start_position=len(prompt_tokens),
+                max_tokens=max_new_tokens - 1,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                stop_ids=list(stop_token_ids),
+            )
+            generated.extend(decode_tokens)
 
         finally:
             torch.cuda.synchronize()

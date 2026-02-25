@@ -11,7 +11,7 @@ Default: pure CPU MoE decode (no HCS), streamed attention with double buffering.
 | DeepSeek-V2-Lite | 2 | INT4/INT4 | 2 | ON | 1623.1 | 6.16 | 6.22 | 160.9 | PASS | [log](suite_logs/) |
 | Qwen3-Coder-Next | 1 | INT8/INT8 | 2 | ON | 696.4 | 14.36 | 5.93 | 168.6 | PASS | [log](suite_logs/) |
 | Qwen3-Coder-Next | 1 | INT4/INT4 | 2 | ON | 979.6 | 10.21 | 7.89 | 126.8 | PASS | [log](Qwen3-Coder-Next_native_1gpu_int4gpu_int4cpu.log) |
-| Qwen3-Coder-Next | 1 | INT4/INT4 | 2 | OFF | 1024.4 | 9.78 | 7.82 | 127.9 | PASS | [log](Qwen3-Coder-Next_native_1gpu_int4gpu_int4cpu_stream_lgs2.log) |
+| Qwen3-Coder-Next | 1 | INT4/INT4 | 2 | OFF | 1097.4 | 18.23 | 8.12 | 123.4 | PASS | [log](Qwen3-Coder-Next_native_1gpu_int4gpu_int4cpu_stream_lgs2.log) |
 | Qwen3-Coder-Next | 2 | INT4/INT4 | 2 | ON | 880.2 | 11.36 | 8.15 | 122.8 | FAIL* | [log](Qwen3-Coder-Next_native_2gpu_int4gpu_int4cpu.log) |
 | Qwen3-Coder-Next | 2 | INT4/INT4 | 2 | multi | 806.8 | 12.39 | 9.14 | 109.4 | PASS | [log](Qwen3-Coder-Next_native_2gpu_int4gpu_int4cpu_multigpu_hcs.log) |
 | Qwen3-Coder-Next | 2 | INT4/INT4 | 2 | ON | 859.6 | 11.63 | 7.21 | 138.8 | PASS | [log](Qwen3-Coder-Next_native_2gpu_int4gpu_int4cpu_stream_lgs2.log) |

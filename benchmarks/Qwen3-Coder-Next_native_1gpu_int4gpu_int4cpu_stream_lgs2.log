@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-25 06:37:44
+Krasis Benchmark — 2026-02-25 09:20:26
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,7 +7,7 @@ PP Partition:     [48] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            995 GB total, 87.0 GB used by process
+  RAM:            995 GB total, 87.1 GB used by process
   GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3865 MB allocated
   GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
   GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
@@ -27,16 +27,16 @@ Strategy:
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
 Prefill (3 runs at different lengths):
-  Run 1:  1094.5 tok/s, TTFT=18.27s (20,000 tokens)
-  Run 2:  961.5 tok/s, TTFT=36.40s (35,000 tokens)
-  Run 3:  845.4 tok/s, TTFT=59.14s (50,000 tokens)
-  Best:    1094.5 tok/s, TTFT=18.27s (20,000 tokens)
+  Run 1:  1097.4 tok/s, TTFT=18.23s (20,000 tokens)
+  Run 2:  961.0 tok/s, TTFT=36.42s (35,000 tokens)
+  Run 3:  845.5 tok/s, TTFT=59.14s (50,000 tokens)
+  Best:    1097.4 tok/s, TTFT=18.23s (20,000 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  6.30 tok/s (158.8ms/tok)
-  Run 2:  6.40 tok/s (156.2ms/tok)
-  Run 3:  5.95 tok/s (167.9ms/tok)
-  Average: 6.22 tok/s (161.0ms/tok)
+  Run 1:  7.74 tok/s (129.2ms/tok)
+  Run 2:  8.10 tok/s (123.5ms/tok)
+  Run 3:  8.51 tok/s (117.4ms/tok)
+  Average: 8.12 tok/s (123.4ms/tok)
 
 Verification:
   Prefill prompt: user
@@ -62,5 +62,7 @@ Explain how public key cryptography works, including the RSA algorithm and why i
 assistant
 
   Generated output (64 tokens):
-    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys: a **public key** (shared openly) and a **private key** (kept secret). Unlike symmetric-key cryptography (where the same key encrypts and decrypts), here, encryption and
+    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically related keys—**a public key** and a **private key**—to enable secure communication without requiring a shared secret beforehand.
+    
+    Here’s a breakdown of how it works, with emphasis on the widely used
 ================================================================

@@ -51,18 +51,34 @@ fn check_hugepages() {
     match std::fs::read_to_string(thp_path) {
         Ok(content) => {
             // Format: "always [madvise] never" — bracketed is active
-            if content.contains("[always]") || content.contains("[madvise]") {
-                log::info!("Transparent hugepages: enabled ✓");
-            } else {
+            if content.contains("[never]") {
                 log::warn!(
-                    "Transparent hugepages are disabled — enable for better TLB performance: \
-                     echo madvise | sudo tee {}",
+                    "⚠ Transparent hugepages DISABLED system-wide — expect 15-20% slower decode! \
+                     Model weights span 20+ GB across millions of 4K pages, causing constant TLB misses. \
+                     Fix: echo madvise | sudo tee {}",
                     thp_path,
                 );
+            } else if content.contains("[always]") || content.contains("[madvise]") {
+                log::info!("Transparent hugepages: enabled ✓");
+            } else {
+                log::info!("Transparent hugepages: unknown state ({})", content.trim());
             }
         }
         Err(_) => {
             log::info!("Transparent hugepages: could not read");
+        }
+    }
+
+    // Check per-process THP disable flag (inherited from tmux/systemd)
+    #[cfg(target_os = "linux")]
+    {
+        let thp_disabled = unsafe { libc::prctl(42, 0, 0, 0, 0) }; // PR_GET_THP_DISABLE
+        if thp_disabled == 1 {
+            log::warn!(
+                "⚠ THP disabled for this process (PR_SET_THP_DISABLE=1, often inherited from tmux). \
+                 KrasisEngine::new() will re-enable it automatically, but if you see this warning \
+                 from a standalone script, call krasis.system_check() after creating the engine."
+            );
         }
     }
 
