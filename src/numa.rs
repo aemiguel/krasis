@@ -289,7 +289,7 @@ impl NumaExpertMap {
     }
 }
 
-// ── Page migration via mbind ────────────────────────────────────────
+// ── Memory policy via set_mempolicy / mbind ─────────────────────────
 
 extern "C" {
     fn mbind(
@@ -300,10 +300,49 @@ extern "C" {
         maxnode: libc::c_ulong,
         flags: libc::c_uint,
     ) -> libc::c_int;
+
+    fn set_mempolicy(
+        mode: libc::c_int,
+        nodemask: *const libc::c_ulong,
+        maxnode: libc::c_ulong,
+    ) -> libc::c_int;
 }
 
+const MPOL_DEFAULT: libc::c_int = 0;
 const MPOL_BIND: libc::c_int = 2;
+const MPOL_INTERLEAVE: libc::c_int = 3;
 const MPOL_MF_MOVE: libc::c_uint = 2;
+
+/// Set process memory policy to MPOL_INTERLEAVE across all NUMA nodes.
+/// New allocations (mmap, page faults) will spread pages round-robin.
+/// Returns true on success, false if NUMA unavailable or syscall fails.
+pub fn set_interleave_all(num_nodes: usize) -> bool {
+    if !numa_is_available() || num_nodes <= 1 {
+        return false;
+    }
+    // Build bitmask with bits 0..num_nodes set
+    let nodemask: u64 = (1u64 << num_nodes) - 1;
+    let ret = unsafe {
+        set_mempolicy(
+            MPOL_INTERLEAVE,
+            &nodemask as *const u64 as *const libc::c_ulong,
+            num_nodes as libc::c_ulong + 1,
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        log::warn!("set_mempolicy(INTERLEAVE) failed: {err}");
+        return false;
+    }
+    true
+}
+
+/// Reset process memory policy to MPOL_DEFAULT (local allocation).
+pub fn reset_mempolicy() {
+    unsafe {
+        set_mempolicy(MPOL_DEFAULT, std::ptr::null(), 0);
+    }
+}
 
 /// Move existing memory pages to a specific NUMA node via mbind().
 /// Works on any allocated memory — aligns to page boundaries automatically.
@@ -369,6 +408,66 @@ pub fn unpin_thread() -> bool {
     // node=-1 means "run on any node"
     let result = unsafe { numa_run_on_node(-1) };
     result == 0
+}
+
+/// Build a NUMA-aware rayon global thread pool.
+///
+/// Distributes `num_threads` round-robin across NUMA nodes.
+/// Each thread is pinned to its assigned node's CPUs via sched_setaffinity.
+/// If NUMA is not available or has only 1 node, builds a plain pool.
+///
+/// Returns the NumaTopology for use by callers (e.g. interleave policy).
+pub fn build_numa_thread_pool(num_threads: usize) -> NumaTopology {
+    let topo = NumaTopology::detect();
+
+    if !topo.is_numa() {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build_global();
+        log::info!("NUMA: single node, rayon pool: {} threads (no pinning)", num_threads);
+        return topo;
+    }
+
+    let num_nodes = topo.num_nodes;
+    let node_cpus = topo.node_cpus.clone();
+
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .start_handler(move |thread_idx| {
+            // Round-robin assignment: thread i → node (i % num_nodes)
+            let node = thread_idx % num_nodes;
+            let cpus = &node_cpus[node];
+            if cpus.is_empty() {
+                return;
+            }
+            // Pick a specific CPU within this node (spread across node's cores)
+            let cpu_idx = (thread_idx / num_nodes) % cpus.len();
+            let cpu = cpus[cpu_idx];
+
+            // Use sched_setaffinity to pin to specific CPU
+            unsafe {
+                let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_ZERO(&mut cpuset);
+                libc::CPU_SET(cpu, &mut cpuset);
+                libc::sched_setaffinity(
+                    0, // current thread
+                    std::mem::size_of::<libc::cpu_set_t>(),
+                    &cpuset,
+                );
+            }
+        })
+        .build_global();
+
+    log::info!(
+        "NUMA: {} nodes, rayon pool: {} threads (pinned round-robin)",
+        num_nodes, num_threads,
+    );
+    for (i, cpus) in topo.node_cpus.iter().enumerate() {
+        let thread_count = (0..num_threads).filter(|t| t % num_nodes == i).count();
+        log::info!("  Node {}: {} threads, {} CPUs available", i, thread_count, cpus.len());
+    }
+
+    topo
 }
 
 #[cfg(test)]

@@ -2331,6 +2331,15 @@ impl CpuDecodeStore {
         log::info!("Consolidating {} weights into contiguous mmap: {:.1} MB packed + {:.1} MB scales",
             self.weights.len(), total_packed_bytes as f64 / 1e6, total_scales_bytes as f64 / 1e6);
 
+        // On multi-NUMA systems, set interleave policy so pages spread across
+        // all memory controllers. Maximizes aggregate bandwidth for decode reads.
+        let topo = crate::numa::NumaTopology::detect();
+        let interleaved = if topo.is_numa() {
+            crate::numa::set_interleave_all(topo.num_nodes)
+        } else {
+            false
+        };
+
         // Allocate contiguous mmap regions
         let packed_base = unsafe {
             libc::mmap(std::ptr::null_mut(), total_packed_bytes,
@@ -2339,6 +2348,7 @@ impl CpuDecodeStore {
                 -1, 0)
         };
         if packed_base == libc::MAP_FAILED {
+            if interleaved { crate::numa::reset_mempolicy(); }
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "mmap failed for packed weight consolidation"));
         }
@@ -2351,6 +2361,7 @@ impl CpuDecodeStore {
         };
         if scales_base == libc::MAP_FAILED {
             unsafe { libc::munmap(packed_base, total_packed_bytes); }
+            if interleaved { crate::numa::reset_mempolicy(); }
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "mmap failed for scales consolidation"));
         }
@@ -2411,6 +2422,12 @@ impl CpuDecodeStore {
 
         assert_eq!(p_off, total_packed_bytes);
         assert_eq!(s_off, total_scales_bytes);
+
+        // Reset NUMA policy now that pages are placed
+        if interleaved {
+            crate::numa::reset_mempolicy();
+            log::info!("NUMA: interleaved weight consolidation across {} nodes", topo.num_nodes);
+        }
 
         // Track mmap regions for cleanup (stored as usize for Send/Sync)
         self.mmap_regions.push((packed_base as usize, total_packed_bytes));
@@ -4466,14 +4483,13 @@ pub fn bench_decode_synthetic(
         }
     }
 
-    // Configure rayon thread pool (must match real model's thread count)
-    // NOTE: Both sequential pinning (cores 0-19) and CCD-spread pinning tested.
-    // Both HURT performance. Sequential concentrates on 2-3 MCs. Spread causes
-    // cross-fabric latency. Linux scheduler's natural balancing is best.
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global();
-    eprintln!("=== Synthetic Decode Benchmark (rayon: {} threads) ===", num_threads);
+    // Configure NUMA-aware rayon thread pool.
+    // On multi-node systems: distributes threads round-robin across NUMA nodes,
+    // pins each thread to its assigned node's CPUs via sched_setaffinity.
+    // On single-node: plain rayon pool with no pinning.
+    let numa_topo = crate::numa::build_numa_thread_pool(num_threads);
+    eprintln!("=== Synthetic Decode Benchmark (rayon: {} threads, NUMA: {} nodes) ===",
+        num_threads, numa_topo.num_nodes);
 
     // ── 1. Parse config.json ──
     let config_str = std::fs::read_to_string(config_path)
@@ -4669,6 +4685,19 @@ pub fn bench_decode_synthetic(
     eprintln!("Allocating contiguous mmap: {:.1} GB packed + {:.1} MB scales",
         packed_mmap_bytes as f64 / 1e9, scales_mmap_bytes as f64 / 1e6);
 
+    // On multi-NUMA systems, set MPOL_INTERLEAVE before mmap+fault so pages
+    // spread round-robin across all memory controllers. This maximizes aggregate
+    // bandwidth when rayon threads on different nodes read weight data.
+    let numa_interleaved = if numa_topo.is_numa() {
+        let ok = crate::numa::set_interleave_all(numa_topo.num_nodes);
+        if ok {
+            eprintln!("NUMA: interleave policy set for {} nodes", numa_topo.num_nodes);
+        }
+        ok
+    } else {
+        false
+    };
+
     // NOTE: Do NOT use MAP_POPULATE here — it pre-faults all pages as 4K before
     // madvise can request huge pages. Instead: mmap lazy, madvise HUGEPAGE, then
     // the random data fill below faults pages in as 2MB transparent huge pages.
@@ -4679,6 +4708,7 @@ pub fn bench_decode_synthetic(
             -1, 0)
     };
     if packed_base == libc::MAP_FAILED {
+        if numa_interleaved { crate::numa::reset_mempolicy(); }
         return Err(pyo3::exceptions::PyRuntimeError::new_err("mmap failed for packed weights"));
     }
     let scales_base = unsafe {
@@ -4689,6 +4719,7 @@ pub fn bench_decode_synthetic(
     };
     if scales_base == libc::MAP_FAILED {
         unsafe { libc::munmap(packed_base, packed_mmap_bytes); }
+        if numa_interleaved { crate::numa::reset_mempolicy(); }
         return Err(pyo3::exceptions::PyRuntimeError::new_err("mmap failed for scales"));
     }
     unsafe {
@@ -4696,13 +4727,18 @@ pub fn bench_decode_synthetic(
         libc::madvise(scales_base, scales_mmap_bytes, libc::MADV_HUGEPAGE);
     }
 
-    // Fill entire mmap regions with random data before slicing
+    // Fill entire mmap regions with random data before slicing.
+    // Pages are faulted here — with MPOL_INTERLEAVE active, they spread across nodes.
     let mut rng = Xorshift64::new(0x12345678ABCDEF01);
     eprintln!("Pre-generating random weight data...");
     let packed_slice = unsafe { std::slice::from_raw_parts_mut(packed_base as *mut u32, total_packed_u32) };
     fill_random_u32(packed_slice, &mut rng);
     let scales_slice = unsafe { std::slice::from_raw_parts_mut(scales_base as *mut u16, total_scales_u16) };
     fill_random_scales_u16(scales_slice, &mut rng);
+
+    // NOTE: Do NOT reset interleave policy here — if tiled=true, the repack below
+    // allocates new heap Vecs that replace the mmap data. Those also need interleaving.
+    // Policy is reset after tiled repack (or immediately if tiled=false).
 
     // Offset trackers into the mmap regions
     let mut p_off = 0usize; // packed offset in u32 units
@@ -5138,6 +5174,12 @@ pub fn bench_decode_synthetic(
         // NOTE: consolidate_weights_mmap() was tested here but caused a 15% regression.
         // Non-expert weights (1.1 GB) are too small relative to expert data (40 GB)
         // for mmap+MADV_HUGEPAGE to help. Tiled layout alone provides good locality.
+    }
+
+    // Reset NUMA interleave policy now that all weight pages are placed
+    if numa_interleaved {
+        crate::numa::reset_mempolicy();
+        eprintln!("NUMA: interleave policy reset to default");
     }
 
     // Set MoE store on graph directly (bypass PyO3 interface)
