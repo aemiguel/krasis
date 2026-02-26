@@ -11,7 +11,7 @@ Krasis can run MoE language models that are much too large to fit in a consumer 
 
 **Most importantly, it runs these models at usable speeds.**
 
-## Qwen3-Coder-Next Results
+## Qwen3-Coder-Next Results (80B params, 3595 tok/sec prefill on 1x 5080 16GB)
 
 Qwen3-Coder-Next (80B params, 148 GB BF16) is a model which will clearly not fit inside a single consumer GPU unless very heavily quantised to Q2 or less.
 
