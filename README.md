@@ -107,7 +107,7 @@ Benchmark uses 10K–50K token prompts (prefill) and 64-token generation runs (d
 
 ### Requirements
 
-- **Linux** (Ubuntu 22.04+, or WSL2 on Windows)
+- **Linux** (Ubuntu 24.04+, or WSL2 on Windows)
 - **Python 3.10+**
 - **NVIDIA GPU** with CUDA drivers installed
 - **System RAM**: roughly 2x the quantised model size
