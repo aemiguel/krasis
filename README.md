@@ -115,8 +115,8 @@ Benchmark uses 10K–50K token prompts (prefill) and 64-token generation runs (d
 |-------|:------------:|:---------------:|:----------:|:--------------:|:------:|
 | **Qwen3-Coder-Next** | INT4 GPU + INT4 CPU | 1,060 | 18.9s | 15.81 | 63.6 |
 | **Qwen3-Coder-Next** | INT8 GPU + INT8 CPU | 873 | 40.1s | 12.41 | 80.6 |
-| **Qwen3.5-35B-A3B** | INT4 GPU + INT4 CPU | 1374.1 | 14.56s | 15.04 | 66.6 |
-| **Qwen3-235B-A22B** | INT4 GPU + INT4 CPU | 289.3 | 69.13s | 3.36 | 298.3 |
+| **Qwen3.5-35B-A3B** | INT4 GPU + INT4 CPU | 1374 | 14.56s | 15.04 | 66.6 |
+| **Qwen3-235B-A22B** | INT4 GPU + INT4 CPU | 289 | 69.13s | 3.36 | 298.3 |
 | **DeepSeek V2-Lite** | INT4 GPU + INT4 CPU | 1,477 | 13.6s | 20.18 | 49.7 |
 | **DeepSeek V2-Lite** | INT8 GPU + INT8 CPU | 1,317 | 15.2s | 17.84 | 56.2 |
 
