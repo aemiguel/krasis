@@ -9,13 +9,22 @@ You can [contact me here](https://forms.gle/ue4nvyvNNHtUZ7MQ7) but please don't 
 
 Krasis can run MoE language models that are much too large to fit in a consumer GPU (multi-hundred gigabyte modesl with 100 - 500+ billion parameters) on consumer or accessible server hardware you can actually buy without a second mortgage and your own personal power station. 
 
-**Crucially, it runs these models at a speed that is usable.**
+**Most importantly, it runs these models at speeds much closer to datacenter operations.**
 
-## Qwen3-Coder-Next / 1,060 tok/s prefill / 15.8 tok/s decode
+## Qwen3-Coder-Next Results
 
-For example, running Qwen3-Coder-Next (80B params, 148 GB BF16) on a single-socket EPYC 7742 with 1x RTX 2000 Ada 16 GB, Krasis achieves **1,060 tokens/sec prefill** and **15.8 tokens/sec decode**.
+Qwen3-Coder-Next (80B params, 148 GB BF16) is a model which will clearly not fit inside a single consumer GPU.
 
-## How LLMs work
+At Q4 Qwen3-Coder-Next is around 37GB, too much to fit on even the largest consumer GPUs. 
+
+Krasis is able to run Qwen3-Coder-Next (Q4 quantised) with **one 16GB GPU** at the following speeds:
+
+- 5900X, 3200 DDR4, 1x 5080 16GB (PCIE4.0x16) : **3589 tok/sec prefill, 14.5 tok/sec decode**
+- Epyc 7742, 2666 DDR4, 1x RTX Ada 2000 16GB (PCIE4.0x8) : **1060 tok/sec prefill, 18.9 tok/sec decode**
+
+Krasis can likely run QCN at speed with even more VRAM limited GPUs than these.
+
+## Why LLM's run slow, and how Krasis runs them fast
 
 LLM model operation consist of two key steps:
 
@@ -35,21 +44,37 @@ In order to achieve these speeds, Krasis has a few requirements.
 
 - **Krasis uses more system RAM than other runtimes**, you may need 2x the model weights worth of system ram (so to run a 100GB model you may need 200GB of system ram), but this is almost always **far more achievable than the equivalent VRAM**.
 - Krasis must be given the **BF16 safetensors model** downloaded from [HuggingFace](https://huggingface.co/)
-- Krasis can build everything it needs from this model or if you prefer you can give it a second GGUF model (in addition to the BF16 safetensors model) which takes advantage of more advanced quantisation (e.g. unsloth Q4_K models)
+- Krasis can build everything it needs from this model or if you prefer you can give it **both** the BF16 safetensors and a second GGUF model with an optimised quantisation you prefer (e.g. unsloth Q4_K models)
 - Krasis currently only works with **NVidia GPUs**
-- Krasis **may take some time on the first run** as it is doing a lot of pre-run work to optimise everything, major parts of this are cached for later runs though so they are generally much shorter startup times.
-- Krasis optimises models and caches them in .krasis, these can be large so you may need the original model **x3 space** or if you provide a GGUF in addition to the BF16 you may need **4x the space**.
+- Krasis **may take some time on the first run** as it is doing a lot of pre-run work to optimise everything for runtime, much of this is cached for later runs though so subsequent runs will be quicker.
+- Krasis optimises models and caches them in <home folder>/.krasis, these can be large so you may need disk space for the original model BF16 model plus **2x the quantized model** (for QCN at Q4 this would be 149GB + 38GB + 38GB = ~225GB).
 
 ## Supported Models
 
 | Model | Params | BF16 Size | Experts | Attention |
 |-------|:------:|:---------:|---------|-----------|
 | **Qwen3-Coder-Next** | 80B | 148 GB | 512 routed, top-10 | Hybrid (36 linear + 12 GQA) |
-| **Qwen3-235B-A22B** | 235B | 438 GB | 128 routed, top-8 | GQA |
 | **DeepSeek V2-Lite** | 16B | 29 GB | 64 + 2 shared, top-6 | MLA |
+
+## Models in progress
+
+| Model | Params | BF16 Size | Experts | Attention |
+|-------|:------:|:---------:|---------|-----------|
+| **Qwen3-235B-A22B** | 235B | 438 GB | 128 routed, top-8 | GQA |
 | **GLM-4.7** | 358B | 667 GB | 160 + 1 shared, top-8 | GQA (partial RoPE, bias) |
 
-## Benchmark: EPYC 7742 + 1x RTX 2000 Ada 16 GB
+## Perplexity (Quantization Quality)
+
+Measured with INT4 GPU + INT4 CPU experts, BF16 attention, INT8 shared/MLP/lm_head, FP8 KV cache. Sliding window (2048 tokens, stride 1024), GPU Marlin prefill.
+
+| Model | Dataset | Tokens | PPL | BPC | Throughput |
+|-------|---------|:------:|:---:|:---:|:----------:|
+| **Qwen3-Coder-Next** | WikiText-2 | 299K | 7.23 | 2.85 | 128 tok/s |
+| **Qwen3-Coder-Next** | C4 validation | 500K | 12.44 | 3.64 | 123 tok/s |
+| **DeepSeek V2-Lite** | WikiText-2 | 307K | 6.03 | 2.59 | 593 tok/s |
+| **DeepSeek V2-Lite** | C4 validation | 500K | 9.22 | 3.20 | 573 tok/s |
+
+## Benchmark: EPYC 7742, 2666 DDR4 + 1x RTX 2000 Ada 16 GB
 
 **Hardware:** AMD EPYC 7742 (64 cores, 4 NUMA nodes), DDR4-2666 8-channel, 1x NVIDIA RTX 2000 Ada 16 GB, PCIe 4.0 x8.
 
@@ -66,26 +91,18 @@ Benchmark uses 10K–50K token prompts (prefill) and 64-token generation runs (d
 
 INT4 experts give ~20% faster decode and ~20% faster prefill than INT8 due to halved memory bandwidth requirements. INT4 quantization quality is validated in the perplexity table below.
 
-## Perplexity (Quantization Quality)
-
-Measured with INT4 GPU + INT4 CPU experts, BF16 attention, INT8 shared/MLP/lm_head, FP8 KV cache. Sliding window (2048 tokens, stride 1024), GPU Marlin prefill.
-
-| Model | Dataset | Tokens | PPL | BPC | Throughput |
-|-------|---------|:------:|:---:|:---:|:----------:|
-| **Qwen3-Coder-Next** | WikiText-2 | 299K | 7.23 | 2.85 | 128 tok/s |
-| **Qwen3-Coder-Next** | C4 validation | 500K | 12.44 | 3.64 | 123 tok/s |
-| **DeepSeek V2-Lite** | WikiText-2 | 307K | 6.03 | 2.59 | 593 tok/s |
-| **DeepSeek V2-Lite** | C4 validation | 500K | 9.22 | 3.20 | 573 tok/s |
-
-## Quick Start
+## Running Krasis - Quick Start
 
 ### Requirements
 
 - **Linux** (Ubuntu 22.04+, or WSL2 on Windows)
 - **Python 3.10+**
 - **NVIDIA GPU** with CUDA drivers installed
-- **System RAM**: roughly 2x the BF16 model size (e.g. 160 GB RAM for an 80 GB model)
-- **Disk space**: roughly 3x the BF16 model size (original + cached formats)
+- **System RAM**: roughly 2x the quantised model size
+    - e.g. if BF16 is 100GB, Q8 is 50GB, Q4 is 25GB
+        - to run at Q8 required 2x50GB = 100GB system RAM
+        - to run at Q4 requires 2x25GB = 50GB system RAM
+- **Disk space**: roughly the BF16 model size plus 2x the quantised model size (see system ram)
 
 ### 1. Install Krasis
 
