@@ -35,6 +35,169 @@ def cache_dir_for_model(model_path: str) -> str:
     return new_dir
 
 
+def _parse_eos_token_id(raw: dict, cfg: dict) -> int:
+    """Parse eos_token_id which may be int or list of ints."""
+    eos = raw.get("eos_token_id", cfg.get("eos_token_id", 0))
+    if isinstance(eos, list):
+        return eos[0] if eos else 0
+    return eos
+
+
+def _parse_extra_stop_ids(raw: dict, cfg: dict) -> tuple:
+    """Parse additional stop token IDs from array eos_token_id."""
+    eos = raw.get("eos_token_id", cfg.get("eos_token_id", 0))
+    if isinstance(eos, list) and len(eos) > 1:
+        return tuple(eos[1:])
+    return ()
+
+
+def _infer_from_weights(model_path: str, cfg: dict) -> dict:
+    """Infer missing config fields from safetensors weight shapes.
+
+    Some VL models (DeepSeek-VL2) have incomplete language_config that's
+    missing num_hidden_layers, num_attention_heads, MLA dims, etc.
+    We infer these from the actual weight tensor shapes.
+    """
+    needed = {"num_hidden_layers", "num_attention_heads"}
+    # Also need MLA dims if model has kv_a_proj (MLA) but no kv_lora_rank in config
+    if all(k in cfg for k in needed) and "kv_lora_rank" in cfg:
+        return cfg  # nothing missing
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return cfg
+
+    with open(index_path) as f:
+        index = json.load(f)
+    wmap = index.get("weight_map", {})
+
+    # Detect prefix from weights — find the one with attention layers (not projector/vision)
+    prefix = None
+    for key in wmap:
+        pos = key.find(".layers.")
+        if pos > 0 and "self_attn" in key:
+            prefix = key[:pos]
+            break
+    if not prefix:
+        return cfg
+
+    # Infer num_hidden_layers by counting layer indices
+    if "num_hidden_layers" not in cfg:
+        layers = set()
+        for k in wmap:
+            if k.startswith(f"{prefix}.layers."):
+                rest = k[len(prefix) + 8:]  # skip ".layers."
+                try:
+                    layers.add(int(rest.split(".")[0]))
+                except ValueError:
+                    pass
+        if layers:
+            cfg = dict(cfg)
+            cfg["num_hidden_layers"] = max(layers) + 1
+
+    # Infer MLA dims from weight shapes if kv_a_proj_with_mqa exists
+    kv_a_key = f"{prefix}.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+    if kv_a_key in wmap and "kv_lora_rank" not in cfg:
+        import struct as _struct
+        # Read shapes from safetensors header
+        shapes = {}
+        _header_cache = {}
+        def _get_shape(tensor_name):
+            shard = wmap.get(tensor_name)
+            if not shard:
+                return None
+            if shard not in _header_cache:
+                fpath = os.path.join(model_path, shard)
+                with open(fpath, "rb") as f:
+                    hlen = _struct.unpack("<Q", f.read(8))[0]
+                    _header_cache[shard] = json.loads(f.read(hlen))
+            info = _header_cache[shard].get(tensor_name)
+            return info["shape"] if info else None
+
+        cfg = dict(cfg)
+
+        # kv_a_proj_with_mqa: [kv_lora_rank + qk_rope_head_dim, hidden_size]
+        # kv_a_layernorm: [kv_lora_rank]
+        # kv_b_proj: [n_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+        # o_proj: [hidden_size, n_heads * v_head_dim]
+        # q_proj: [n_heads * (qk_nope_head_dim + qk_rope_head_dim), hidden_size]
+        ln_shape = _get_shape(f"{prefix}.layers.0.self_attn.kv_a_layernorm.weight")
+        kv_a_shape = _get_shape(kv_a_key)
+        kv_b_shape = _get_shape(f"{prefix}.layers.0.self_attn.kv_b_proj.weight")
+        o_shape = _get_shape(f"{prefix}.layers.0.self_attn.o_proj.weight")
+        q_shape = _get_shape(f"{prefix}.layers.0.self_attn.q_proj.weight")
+
+        if ln_shape and kv_a_shape and kv_b_shape and o_shape and q_shape:
+            kv_lora_rank = ln_shape[0]
+            qk_rope_head_dim = kv_a_shape[0] - kv_lora_rank
+            hidden_size = cfg.get("hidden_size", o_shape[0])
+
+            # o_proj: [hidden, n_heads * v_head_dim]
+            total_v = o_shape[1]
+            # kv_b: [n_heads * (nope + v), kv_lora_rank]
+            total_kv_b = kv_b_shape[0]
+            # q_proj: [n_heads * (nope + rope), hidden]
+            total_q = q_shape[0]
+
+            # Solve: n_heads * v_head_dim = total_v
+            #        n_heads * (nope + v) = total_kv_b
+            #        n_heads * (nope + rope) = total_q
+            # From q: n_heads * nope = total_q - n_heads * rope
+            # From kv_b: n_heads * nope + total_v = total_kv_b
+            #   → total_q - n_heads * rope + total_v = total_kv_b
+            #   → n_heads = (total_q + total_v - total_kv_b) / rope  ... doesn't simplify easily
+            # Try common head dims: 128
+            for v_head in (128, 64, 96, 256):
+                if total_v % v_head == 0:
+                    n_heads = total_v // v_head
+                    nope_plus_v = total_kv_b // n_heads if total_kv_b % n_heads == 0 else 0
+                    nope = nope_plus_v - v_head
+                    if nope > 0 and total_q == n_heads * (nope + qk_rope_head_dim):
+                        cfg.setdefault("kv_lora_rank", kv_lora_rank)
+                        cfg.setdefault("qk_nope_head_dim", nope)
+                        cfg.setdefault("qk_rope_head_dim", qk_rope_head_dim)
+                        cfg.setdefault("v_head_dim", v_head)
+                        cfg.setdefault("num_attention_heads", n_heads)
+                        cfg.setdefault("num_key_value_heads", n_heads)
+                        break
+
+    return cfg
+
+
+def _detect_layers_prefix(model_path: str) -> str:
+    """Auto-detect the tensor prefix by scanning the safetensors index.
+
+    Looks for '.layers.' in weight names to determine the prefix:
+      - "model.layers.0..." → "model"
+      - "model.language_model.layers.0..." → "model.language_model"
+      - "language_model.model.layers.0..." → "language_model.model"
+      - "language.model.layers.0..." → "language.model"
+    Falls back to heuristic if no index file found.
+    """
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        # Prefer keys with self_attn to disambiguate from projector/vision layers
+        for key in index.get("weight_map", {}):
+            pos = key.find(".layers.")
+            if pos > 0 and "self_attn" in key:
+                return key[:pos]
+        # Fallback: any .layers. key
+        for key in index.get("weight_map", {}):
+            pos = key.find(".layers.")
+            if pos > 0:
+                return key[:pos]
+    # Fallback: check for text_config in config.json
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            raw = json.load(f)
+        if "text_config" in raw:
+            return "language_model.model"
+    return "model"
+
+
 @dataclass
 class QuantConfig:
     """Per-component quantization config for GPU weights.
@@ -119,6 +282,7 @@ class ModelConfig:
     tie_word_embeddings: bool = False
     bos_token_id: int = 0
     eos_token_id: int = 0
+    extra_stop_token_ids: tuple = ()  # additional stop tokens (e.g. from array eos_token_id)
 
     # Tensor prefix in safetensors (auto-detected)
     layers_prefix: str = "language_model.model"
@@ -129,12 +293,26 @@ class ModelConfig:
         with open(config_path) as f:
             raw = json.load(f)
 
-        # Kimi K2.5 nests under text_config; other models are flat
-        cfg = raw.get("text_config", raw)
+        # Some models nest config: Kimi K2.5 → text_config, DeepSeek-VL2 → language_config
+        cfg = raw.get("text_config", raw.get("language_config", raw))
 
-        # tie_word_embeddings may be at top level
+        # Infer missing fields from weight shapes (VL models with incomplete config)
+        cfg = _infer_from_weights(model_path, cfg)
+
+        # tie_word_embeddings may be at top level; infer from weight presence if not set
+        tie_default = True
+        if "tie_word_embeddings" not in cfg and "tie_word_embeddings" not in raw:
+            # Check if lm_head.weight exists in safetensors index — if so, not tied
+            index_path = os.path.join(model_path, "model.safetensors.index.json")
+            if os.path.exists(index_path):
+                with open(index_path) as f:
+                    idx_data = json.load(f)
+                for k in idx_data.get("weight_map", {}):
+                    if "lm_head.weight" in k:
+                        tie_default = False
+                        break
         tie = cfg.get("tie_word_embeddings",
-                       raw.get("tie_word_embeddings", True))
+                       raw.get("tie_word_embeddings", tie_default))
 
         # Detect attention type: MLA has kv_lora_rank, GQA does not
         is_mla = "kv_lora_rank" in cfg
@@ -167,7 +345,7 @@ class ModelConfig:
         # with weight initialized to zeros, while standard models use weight * x
         # with weight initialized to ones. We add 1.0 to stored weights at load time.
         arch = cfg.get("model_type", "")
-        norm_bias_one = arch in ("qwen3_next",)
+        norm_bias_one = arch in ("qwen3_next", "qwen3_5_moe_text")
 
         # Shared experts: n_shared_experts or infer from shared_expert_intermediate_size
         n_shared = cfg.get("n_shared_experts", 0)
@@ -195,6 +373,12 @@ class ModelConfig:
 
         # SwiGLU activation limit (GPT OSS clamps SwiGLU output)
         swiglu_limit = cfg.get("swiglu_limit", 0.0)
+
+        # RoPE: some models (Qwen3.5) nest rope_theta/partial_rotary_factor inside rope_parameters
+        rope_params = cfg.get("rope_parameters", {}) or {}
+        rope_theta = cfg.get("rope_theta", rope_params.get("rope_theta", 10000.0))
+        partial_rotary = cfg.get("partial_rotary_factor",
+                                 rope_params.get("partial_rotary_factor", 1.0))
 
         return cls(
             model_path=model_path,
@@ -230,13 +414,16 @@ class ModelConfig:
             routed_scaling_factor=cfg.get("routed_scaling_factor", 1.0),
             scoring_func=cfg.get("scoring_func", "softmax"),
             topk_method=cfg.get("topk_method", "greedy"),
-            norm_topk_prob=cfg.get("norm_topk_prob", False),
+            # Qwen3.5 MoE router always renormalizes top-k weights (hardcoded in HF),
+            # but the config.json doesn't include norm_topk_prob.  Default to True for
+            # qwen3_5_moe_text so softmax routing weights sum to 1.0 after top-k selection.
+            norm_topk_prob=cfg.get("norm_topk_prob", arch == "qwen3_5_moe_text"),
             rms_norm_eps=cfg.get("rms_norm_eps", 1e-6),
             hidden_act=cfg.get("hidden_act", "silu"),
-            rope_theta=cfg.get("rope_theta", 10000.0),
+            rope_theta=rope_theta,
             rope_scaling=cfg.get("rope_scaling") or {},
             max_position_embeddings=cfg.get("max_position_embeddings", 131072),
-            partial_rotary_factor=cfg.get("partial_rotary_factor", 1.0),
+            partial_rotary_factor=partial_rotary,
             attention_bias=cfg.get("attention_bias", False),
             sliding_window=sliding_window,
             expert_quant_method=expert_quant_method,
@@ -244,8 +431,9 @@ class ModelConfig:
             norm_bias_one=norm_bias_one,
             tie_word_embeddings=tie,
             bos_token_id=raw.get("bos_token_id", cfg.get("bos_token_id", 0)),
-            eos_token_id=raw.get("eos_token_id", cfg.get("eos_token_id", 0)),
-            layers_prefix="language_model.model" if "text_config" in raw else "model",
+            eos_token_id=_parse_eos_token_id(raw, cfg),
+            extra_stop_token_ids=_parse_extra_stop_ids(raw, cfg),
+            layers_prefix=_detect_layers_prefix(model_path),
         )
 
     @property

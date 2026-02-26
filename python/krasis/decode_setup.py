@@ -648,7 +648,7 @@ class CpuDecoder:
     # ──────────────────────────────────────────────────────
 
     def _copy_kv_cache(self, model, seq_states):
-        """Unpage GPU KV cache into flat CPU float32 arrays."""
+        """Unpage GPU KV cache into flat CPU FP8 arrays (zero-conversion copy)."""
         with torch.inference_mode():
             self._copy_kv_cache_inner(model, seq_states)
 
@@ -672,6 +672,7 @@ class CpuDecoder:
 
                 if self.cfg.is_mla and abs_layer in self._mla_ckv:
                     # MLA: compressed KV + rope position embeddings
+                    # GPU stores FP8 E4M3 -> copy as raw bytes (view as uint8)
                     ckv_layer, kpe_layer = kv_cache.get_layer_caches(kv_offset)
 
                     token_idx = 0
@@ -680,13 +681,14 @@ class CpuDecoder:
                         if tokens_in_page <= 0:
                             break
                         self._mla_ckv[abs_layer][token_idx:token_idx + tokens_in_page] = \
-                            ckv_layer[page_idx, :tokens_in_page].float().cpu()
+                            ckv_layer[page_idx, :tokens_in_page].view(torch.uint8).cpu()
                         self._mla_kpe[abs_layer][token_idx:token_idx + tokens_in_page] = \
-                            kpe_layer[page_idx, :tokens_in_page].float().cpu()
+                            kpe_layer[page_idx, :tokens_in_page].view(torch.uint8).cpu()
                         token_idx += tokens_in_page
 
                 elif self.cfg.is_gqa and abs_layer in self._kv_k:
                     # GQA: separate K, V caches
+                    # GPU stores FP8 E4M3 -> copy as raw bytes (view as uint8)
                     k_layer = kv_cache.k_cache[kv_offset]
                     v_layer = kv_cache.v_cache[kv_offset]
 
@@ -696,12 +698,12 @@ class CpuDecoder:
                         if tokens_in_page <= 0:
                             break
                         self._kv_k[abs_layer][token_idx:token_idx + tokens_in_page] = \
-                            k_layer[page_idx, :tokens_in_page].float().cpu()
+                            k_layer[page_idx, :tokens_in_page].view(torch.uint8).cpu()
                         self._kv_v[abs_layer][token_idx:token_idx + tokens_in_page] = \
-                            v_layer[page_idx, :tokens_in_page].float().cpu()
+                            v_layer[page_idx, :tokens_in_page].view(torch.uint8).cpu()
                         token_idx += tokens_in_page
 
-        logger.info("Copied KV cache to CPU: %d positions", self._seq_len)
+        logger.info("Copied KV cache to CPU (FP8): %d positions", self._seq_len)
 
     # ──────────────────────────────────────────────────────
     # RoPE initialization
@@ -779,21 +781,22 @@ class CpuDecoder:
                 num_kv_heads = a.get('num_kv_heads', 0)
                 head_dim = a.get('head_dim', 0)
                 if num_kv_heads > 0 and head_dim > 0:
+                    # FP8 E4M3: 1 byte per element, matching GPU KV cache dtype
                     self._kv_k[layer_idx] = torch.zeros(
-                        max_seq, num_kv_heads, head_dim, dtype=torch.float32)
+                        max_seq, num_kv_heads, head_dim, dtype=torch.uint8)
                     self._kv_v[layer_idx] = torch.zeros(
-                        max_seq, num_kv_heads, head_dim, dtype=torch.float32)
-                    kv_bytes += 2 * max_seq * num_kv_heads * head_dim * 4
+                        max_seq, num_kv_heads, head_dim, dtype=torch.uint8)
+                    kv_bytes += 2 * max_seq * num_kv_heads * head_dim  # 1 byte/elem
 
-            # MLA layers: compressed KV + rope position embeddings
+            # MLA layers: compressed KV + rope position embeddings (FP8)
             if 'kv_lora_rank' in a:
                 klr = a['kv_lora_rank']
                 qk_rd = a['qk_rope_dim']
                 self._mla_ckv[layer_idx] = torch.zeros(
-                    max_seq, klr, dtype=torch.float32)
+                    max_seq, klr, dtype=torch.uint8)
                 self._mla_kpe[layer_idx] = torch.zeros(
-                    max_seq, qk_rd, dtype=torch.float32)
-                kv_bytes += max_seq * (klr + qk_rd) * 4
+                    max_seq, qk_rd, dtype=torch.uint8)
+                kv_bytes += max_seq * (klr + qk_rd)  # 1 byte/elem
 
         # ── Recurrent + conv state for linear attention layers ──
         state_bytes = 0

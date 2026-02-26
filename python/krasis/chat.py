@@ -771,6 +771,107 @@ def chat_loop(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Sanity test
+# ═══════════════════════════════════════════════════════════════════════
+
+def _find_prompts_file() -> str:
+    """Locate sanity_test_prompts.txt relative to the krasis package."""
+    from pathlib import Path
+
+    # Try relative to this file: krasis/python/krasis/chat.py -> krasis/benchmarks/
+    pkg_dir = Path(__file__).resolve().parent  # krasis/python/krasis/
+    candidates = [
+        pkg_dir.parent.parent / "benchmarks" / "sanity_test_prompts.txt",
+        Path.cwd() / "benchmarks" / "sanity_test_prompts.txt",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return str(p)
+    raise FileNotFoundError(
+        "Cannot find benchmarks/sanity_test_prompts.txt. "
+        "Run from the krasis repo root or ensure the file exists."
+    )
+
+
+def run_sanity_test(
+    server: Dict[str, Any],
+    temperature: float = 0.6,
+    max_tokens: int = 4096,
+):
+    """Submit each prompt from sanity_test_prompts.txt, print and save results."""
+    from datetime import datetime
+    from pathlib import Path
+
+    url = server["url"]
+    model = server["model"]
+
+    prompts_path = _find_prompts_file()
+    with open(prompts_path, "r") as f:
+        all_lines = f.readlines()
+
+    # Filter to non-empty lines (skip blank separator lines)
+    prompts = [line.strip() for line in all_lines if line.strip()]
+
+    if not prompts:
+        print(f"  {RED}No prompts found in {prompts_path}{NC}")
+        return
+
+    # Build output filename: YYYYMMDD-HHMMSS-<model>-sanity.txt
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # Sanitize model name for filename
+    safe_model = model.replace("/", "-").replace(" ", "_")
+    out_name = f"{ts}-{safe_model}-sanity.txt"
+    out_dir = Path(prompts_path).parent
+    out_path = out_dir / out_name
+
+    results = []
+    header = f"Sanity Test: {model} @ {url}\nDate: {datetime.now().isoformat()}\n"
+    results.append(header)
+
+    print(f"\n  {BOLD}Sanity Test{NC} — {len(prompts)} prompts")
+    print(f"  {DIM}Server: {model} @ {url}{NC}")
+    print(f"  {DIM}Output: {out_path}{NC}\n")
+
+    for i, prompt in enumerate(prompts, 1):
+        print(f"  {BOLD}━━━ Prompt {i}/{len(prompts)} ━━━{NC}")
+        print(f"  {GREEN}Prompt:{NC} {prompt}")
+        sys.stdout.write(f"  {CYAN}Response:{NC} ")
+        sys.stdout.flush()
+
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            t0 = time.perf_counter()
+            display_text, raw_text = stream_chat(
+                url, messages, temperature, max_tokens,
+            )
+            elapsed = time.perf_counter() - t0
+            approx_tokens = max(1, len(display_text) // 4)
+            tps = approx_tokens / elapsed if elapsed > 0 else 0
+
+            print(f"\n  {DIM}({elapsed:.1f}s, ~{approx_tokens} tok, ~{tps:.1f} tok/s){NC}\n")
+
+            results.append(f"--- Prompt {i}/{len(prompts)} ---")
+            results.append(f"PROMPT: {prompt}")
+            results.append(f"RESPONSE: {display_text}")
+            results.append(f"TIME: {elapsed:.1f}s, ~{approx_tokens} tok, ~{tps:.1f} tok/s")
+            results.append("")
+
+        except Exception as e:
+            print(f"\n  {RED}ERROR: {e}{NC}\n")
+            results.append(f"--- Prompt {i}/{len(prompts)} ---")
+            results.append(f"PROMPT: {prompt}")
+            results.append(f"ERROR: {e}")
+            results.append("")
+
+    # Write results file
+    with open(out_path, "w") as f:
+        f.write("\n".join(results) + "\n")
+
+    print(f"  {BOLD}Results saved to:{NC} {out_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # CLI entry point
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -791,7 +892,16 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--system", default="",
                         help="Initial system prompt")
+    parser.add_argument("--sanitytest", action="store_true",
+                        help="Run sanity test: submit prompts from benchmarks/sanity_test_prompts.txt")
     args = parser.parse_args()
+
+    # Helper: run sanity test or chat loop based on args
+    def _run(server):
+        if args.sanitytest:
+            run_sanity_test(server, args.temperature, args.max_tokens)
+        else:
+            chat_loop(server, args.temperature, args.max_tokens, args.system)
 
     # ── Direct URL connection ──
     if args.url:
@@ -817,7 +927,7 @@ def main():
                 server["port"] = 80
         except Exception:
             pass
-        chat_loop(server, args.temperature, args.max_tokens, args.system)
+        _run(server)
         return
 
     # ── Server discovery ──
@@ -837,7 +947,7 @@ def main():
                     server["model"] = models_data[0].get("id", "unknown")
         except Exception:
             pass
-        chat_loop(server, args.temperature, args.max_tokens, args.system)
+        _run(server)
         return
 
     print(f"  {DIM}Discovering Krasis servers...{NC}")
@@ -872,7 +982,7 @@ def main():
             server = servers[0]
             print(f"  Using first: {server['model']} on :{server['port']}")
 
-    chat_loop(server, args.temperature, args.max_tokens, args.system)
+    _run(server)
 
 
 if __name__ == "__main__":

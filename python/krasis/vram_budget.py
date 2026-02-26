@@ -282,6 +282,7 @@ def compute_launcher_budget(
     lm_head_quant: str = "int8",
     gpu_vram_mb: int = 0,
     total_ram_gb: int = 0,
+    kv_cache_mb: int = 2000,
 ) -> Dict[str, Any]:
     """Compute VRAM + RAM budget for the launcher TUI.
 
@@ -374,95 +375,153 @@ def compute_launcher_budget(
     # Per-rank budget
     ranks = []
     total_model_layers = cfg["num_hidden_layers"]
-    
-    # Base model footprint: attention and norms for ALL layers, replicated on every GPU
-    if hybrid:
-        total_full_attn = sum(1 for i in range(total_model_layers) if (i + 1) % full_attn_interval == 0)
-        total_linear_attn = total_model_layers - total_full_attn
-    else:
-        total_full_attn = total_model_layers
-        total_linear_attn = 0
 
-    base_attn_bytes = _component_weight_bytes(attn_params_per_layer, attention_quant) * total_full_attn
-    base_attn_bytes += linear_attn_bpl * total_linear_attn
-    base_norm_bytes = 2 * hidden * 2 * total_model_layers  # always BF16
+    # Replicated on every GPU: embeddings and lm_head
     base_embed_bytes = cfg["vocab_size"] * hidden * 2      # always BF16
-    
-    # LM head footprint (only on last rank or replicated? Plan says "Base Model Footprint (N x weights)")
-    # We replicate everything to make every GPU a fully functional compute unit.
     base_lmhead_bytes = 0
     if not cfg.get("tie_word_embeddings", True):
         base_lmhead_bytes = _component_weight_bytes(cfg["vocab_size"] * hidden, lm_head_quant)
 
-    base_model_footprint = base_attn_bytes + base_norm_bytes + base_embed_bytes + base_lmhead_bytes
+    # Gate weights and norms are PERMANENT on GPU for ALL layers (not streamed).
+    # They're small enough to keep resident: ~1 MB/layer for gates, ~28 KB/layer for norms.
+    # Additionally, f32 copies of gate weights are kept for routing precision.
+    total_moe_layers_all = total_layers - first_k_dense
+    gate_bytes_all_layers = hidden * n_experts * 2 * total_moe_layers_all  # BF16
+    gate_f32_bytes_all_layers = hidden * n_experts * 4 * total_moe_layers_all  # F32 routing copy
+    norm_bytes_all_layers = 2 * hidden * 2 * total_layers  # BF16
+
+    # FlashInfer workspace (128 MB fixed allocation for attention)
+    flashinfer_workspace_bytes = 128 * 1024 * 1024
+
+    # Prefill workspace: intermediate tensors during MoE forward.
+    # fused_marlin_moe allocates intermediate_cache1/3 and intermediate_cache2.
+    # Size depends on prefill chunk size; estimate based on ~5000 tokens.
+    top_k = cfg.get("num_experts_per_tok", cfg.get("num_selected_experts", 8))
+    moe_inter = cfg.get("moe_intermediate_size", 0)
+    prefill_chunk = 5000  # typical chunk size
+    prefill_workspace_bytes = 0
+    if moe_inter > 0 and top_k > 0:
+        # intermediate_cache13: [M * topk, 2*N] bf16
+        # intermediate_cache2: [M * topk, hidden] bf16
+        prefill_workspace_bytes = (
+            prefill_chunk * top_k * 2 * moe_inter * 2 +  # cache13
+            prefill_chunk * top_k * hidden * 2             # cache2
+        )
 
     for rank_idx in range(num_ranks):
-        # PP partition still determines which expert slices this rank is RESPONSIBLE for in prefill
-        # or which it holds in its HCS cache.
         rank_start = sum(pp_partition[:rank_idx])
         rank_end = rank_start + pp_partition[rank_idx]
         n_layers = pp_partition[rank_idx]
 
-        # Expert related components (these are NOT replicated across all GPUs)
+        # Count full attention vs linear attention layers IN THIS RANK
+        if hybrid:
+            rank_full_attn = sum(1 for i in range(rank_start, rank_end) if (i + 1) % full_attn_interval == 0)
+            rank_linear_attn = n_layers - rank_full_attn
+        else:
+            rank_full_attn = n_layers
+            rank_linear_attn = 0
+
+        # Expert related components (per-rank)
         dn = max(0, min(rank_end, first_k_dense) - rank_start)
         mn = n_layers - dn
-        
-        shared_bytes = _component_weight_bytes(shared_params_per_moe, shared_expert_quant) * mn if shared_params_per_moe else 0
-        dense_mlp_bytes = _component_weight_bytes(dense_mlp_params_per_layer, dense_mlp_quant) * dn
-        gate_bytes = hidden * n_experts * 2 * mn  # always BF16 (routing weights)
 
-        # Expert buffers (GPU side) - these fit into the remaining space
-        # expert_divisor here is actually layer_group_size:
+        # With layer streaming (expert_divisor >= 1), ALL per-layer weights
+        # (attention, shared experts, expert buffers) are streamed through GPU
+        # in groups of layer_group_size. Only group_size layers are resident
+        # at any time (double-buffered DMA for attention).
+        # With persistent mode (expert_divisor == 0), all layers are on GPU.
+        if expert_divisor >= 1:
+            group_size = min(expert_divisor, max(mn, 1))
+            streaming = True
+        else:
+            group_size = 0  # not used
+            streaming = False
+
+        # Attention weights: capped by group_size when streaming
+        if streaming:
+            attn_layers = min(group_size, rank_full_attn)
+            linear_layers = min(group_size, rank_linear_attn)
+        else:
+            attn_layers = rank_full_attn
+            linear_layers = rank_linear_attn
+        rank_attn_bytes = _component_weight_bytes(attn_params_per_layer, attention_quant) * attn_layers
+        rank_attn_bytes += linear_attn_bpl * linear_layers
+
+        # Norms and gates are PERMANENT on GPU for ALL layers (not streamed)
+        rank_norm_bytes = norm_bytes_all_layers
+        gate_bytes = gate_bytes_all_layers + gate_f32_bytes_all_layers
+
+        # Shared experts: capped by group_size when streaming
+        if streaming:
+            shared_layers = min(group_size, mn)
+        else:
+            shared_layers = mn
+        shared_bytes = _component_weight_bytes(shared_params_per_moe, shared_expert_quant) * shared_layers if shared_params_per_moe else 0
+        dense_mlp_bytes = _component_weight_bytes(dense_mlp_params_per_layer, dense_mlp_quant) * dn
+
+        # Expert buffers (GPU side)
+        # expert_divisor is layer_group_size:
         #   0 = persistent (all layers), >=1 = N layers at a time
+        # When streaming with DMA pipelining, TWO groups are resident
+        # simultaneously: current group computing + next group prefetching.
         if mn > 0 and n_experts > 0:
             if expert_divisor == 0:
-                # Persistent: all experts for all MoE layers in rank
                 ebuf_bytes = expert_buf_bytes * n_experts * mn
                 emode = "persistent"
             elif expert_divisor >= 1:
-                # Layer-grouped: only one group at a time
-                group_size = min(expert_divisor, mn)
-                ebuf_bytes = expert_buf_bytes * n_experts * group_size
+                # Pipeline doubles the buffer: current + prefetched group
+                ebuf_bytes = expert_buf_bytes * n_experts * group_size * 2
                 emode = f"grouped({expert_divisor})"
             else:
-                # Fallback: one layer at a time
-                ebuf_bytes = expert_buf_bytes * n_experts
+                ebuf_bytes = expert_buf_bytes * n_experts * 2
                 emode = "grouped(1)"
         else:
             ebuf_bytes = 0
             emode = "n/a"
 
         total_bytes = (
-            base_model_footprint + shared_bytes + dense_mlp_bytes +
+            rank_attn_bytes + rank_norm_bytes +
+            base_embed_bytes + base_lmhead_bytes +
+            shared_bytes + dense_mlp_bytes +
             gate_bytes +
-            ebuf_bytes + cuda_overhead * 1024 * 1024
+            ebuf_bytes +
+            flashinfer_workspace_bytes +
+            prefill_workspace_bytes +
+            cuda_overhead * 1024 * 1024
         )
         free_bytes = gpu_vram_mb * 1024 * 1024 - total_bytes
-        # In EP/HCS mode, KV cache is only on GPU 0? No, plan doesn't specify.
-        # But if we want 10k token prefill, we probably need KV on all?
-        # Actually, attention runs on all GPUs for their subset of tokens.
-        # So every GPU needs KV cache for ITS tokens.
-        kv_layers_in_rank = total_full_attn  # All GPUs have all layers
-        kv_per_rank = kv_ptl * kv_layers_in_rank
+        # KV cache only for full attention layers in THIS rank's partition
+        kv_per_rank = kv_ptl * rank_full_attn
         kv_tokens = max(0, int(free_bytes // kv_per_rank)) if kv_per_rank > 0 and free_bytes > 0 else 0
+        # Tokens for the user-configured KV cache allocation
+        kv_alloc_bytes = kv_cache_mb * 1024 * 1024
+        kv_alloc_tokens = max(0, int(kv_alloc_bytes // kv_per_rank)) if kv_per_rank > 0 else 0
+        total_with_kv = total_bytes + min(kv_alloc_bytes, max(0, free_bytes))
+        free_after_kv = gpu_vram_mb * 1024 * 1024 - total_with_kv
 
         MB = 1024 * 1024
         ranks.append({
             "rank": rank_idx,
-            "n_layers": n_layers, # this rank is still 'responsible' for this many layers in HCS/EP
+            "n_layers": n_layers,
             "moe_layers": mn,
             "dense_layers": dn,
-            "attention_mb": base_attn_bytes / MB,
+            "attention_mb": rank_attn_bytes / MB,
             "shared_expert_mb": shared_bytes / MB,
             "dense_mlp_mb": dense_mlp_bytes / MB,
             "expert_buffer_mb": ebuf_bytes / MB,
             "expert_mode": emode,
-            "embed_lmhead_mb": (base_embed_bytes + base_lmhead_bytes) / MB,
-            "norms_gates_mb": (gate_bytes + base_norm_bytes) / MB,
+            "embedding_mb": base_embed_bytes / MB,
+            "lm_head_mb": base_lmhead_bytes / MB,
+            "norms_gates_mb": (gate_bytes + rank_norm_bytes) / MB,
             "cuda_overhead_mb": cuda_overhead,
+            "flashinfer_mb": flashinfer_workspace_bytes / MB,
+            "prefill_workspace_mb": prefill_workspace_bytes / MB,
             "total_mb": total_bytes / MB,
             "free_mb": free_bytes / MB,
             "kv_tokens": kv_tokens,
+            "kv_alloc_tokens": kv_alloc_tokens,
+            "total_with_kv_mb": total_with_kv / MB,
+            "free_after_kv_mb": free_after_kv / MB,
         })
 
     # Find worst-case rank
@@ -473,6 +532,79 @@ def compute_launcher_budget(
     cpu_expert_bytes_each = _cpu_expert_bytes_per_expert(cfg, cpu_expert_bits) if n_experts > 0 else 0
     total_moe_layers = total_layers - first_k_dense
     cpu_expert_gb = (cpu_expert_bytes_each * n_experts * total_moe_layers) / (1024 ** 3)
+
+    # RAM estimates (full model in system RAM for streaming to GPU)
+    # Count full/linear attention layers across entire model
+    if hybrid:
+        _total_full_attn = sum(1 for i in range(total_layers) if (i + 1) % full_attn_interval == 0)
+        _total_linear_attn = total_layers - _total_full_attn
+    else:
+        _total_full_attn = total_layers
+        _total_linear_attn = 0
+
+    MB = 1024 * 1024
+
+    # ── GPU-side weights held in system RAM (for streaming to GPU) ──
+    ram_attn_bytes = (
+        _component_weight_bytes(attn_params_per_layer, attention_quant) * _total_full_attn +
+        linear_attn_bpl * _total_linear_attn
+    )
+    ram_shared_bytes = (
+        _component_weight_bytes(shared_params_per_moe, shared_expert_quant) * total_moe_layers
+        if shared_params_per_moe else 0
+    )
+    ram_dense_bytes = _component_weight_bytes(dense_mlp_params_per_layer, dense_mlp_quant) * first_k_dense
+    ram_norms_gates_bytes = (
+        2 * hidden * 2 * total_layers +           # norms BF16
+        hidden * n_experts * 2 * total_moe_layers  # gates BF16
+    )
+    ram_embed_bytes = base_embed_bytes
+    ram_lmhead_bytes = base_lmhead_bytes
+    ram_gpu_experts_bytes = expert_buf_bytes * n_experts * total_moe_layers if n_experts > 0 else 0
+    ram_cpu_experts_bytes = cpu_expert_bytes_each * n_experts * total_moe_layers
+
+    # ── CpuDecodeStore: duplicate weights for CPU decode (re-quantized INT4) ──
+    # Attention is re-quantized from BF16 → INT4 for CPU decode matmuls.
+    # This is a SEPARATE copy from the GPU-side BF16 attention weights.
+    _decode_attn_params = attn_params_per_layer * _total_full_attn
+    ram_decode_attn_bytes = _decode_attn_params // 2 + (_decode_attn_params // 128) * 2  # INT4
+    # Embedding stored as F32 for CPU decode (separate from BF16 GPU copy)
+    ram_decode_embed_bytes = cfg["vocab_size"] * hidden * 4  # F32
+    # LM head re-quantized INT4
+    _lm_head_params = cfg["vocab_size"] * hidden
+    ram_decode_lmhead_bytes = _lm_head_params // 2 + (_lm_head_params // 128) * 2
+    # Norms as F32 (separate from BF16 copies)
+    ram_decode_norms_bytes = 2 * hidden * 4 * total_layers  # 2 norms × F32
+    # Gate routing weights as F32 (separate from BF16/F32 GPU copies)
+    ram_decode_routing_bytes = hidden * n_experts * 4 * total_moe_layers if n_experts > 0 else 0
+    # Shared expert re-quantized for decode
+    ram_decode_shared_bytes = 0
+    if shared_params_per_moe:
+        ram_decode_shared_bytes = shared_params_per_moe * total_moe_layers // 2  # INT4 approx
+
+    ram_decode_total_bytes = (ram_decode_attn_bytes + ram_decode_embed_bytes +
+                              ram_decode_lmhead_bytes + ram_decode_norms_bytes +
+                              ram_decode_routing_bytes + ram_decode_shared_bytes)
+
+    # ── CPU KV cache: preallocated for decode (FP8, default 32K tokens) ──
+    # CPU KV cache matches GPU FP8 E4M3 format — 1 byte per element, zero-conversion transfer
+    kv_preallocate_tokens = 32768
+    if is_mla:
+        cpu_kv_per_token = (cfg["kv_lora_rank"] + cfg["qk_rope_head_dim"]) * 1  # FP8
+    else:
+        n_kv_h = cfg.get("num_key_value_heads", cfg["num_attention_heads"])
+        h_dim = cfg.get("head_dim", cfg["hidden_size"] // cfg["num_attention_heads"])
+        cpu_kv_per_token = 2 * n_kv_h * h_dim * 1  # K+V, FP8
+    ram_cpu_kv_bytes = cpu_kv_per_token * kv_preallocate_tokens * _total_full_attn
+
+    ram_layer_weights_mb = (ram_attn_bytes + ram_shared_bytes + ram_dense_bytes +
+                            ram_norms_gates_bytes + ram_embed_bytes + ram_lmhead_bytes) / MB
+    ram_gpu_experts_mb = ram_gpu_experts_bytes / MB
+    ram_cpu_experts_mb = ram_cpu_experts_bytes / MB
+    ram_decode_mb = ram_decode_total_bytes / MB
+    ram_cpu_kv_mb = ram_cpu_kv_bytes / MB
+    ram_total_mb = (ram_layer_weights_mb + ram_gpu_experts_mb + ram_cpu_experts_mb +
+                    ram_decode_mb + ram_cpu_kv_mb)
 
     arch = "MLA" if is_mla else "GQA"
     if hybrid:
@@ -494,6 +626,18 @@ def compute_launcher_budget(
         "kv_dtype": kv_dtype,
         "hybrid": hybrid,
         "num_full_attention_layers": _num_full_attention_layers(cfg) if hybrid else total_layers,
+        "ram_attention_mb": ram_attn_bytes / MB,
+        "ram_shared_expert_mb": ram_shared_bytes / MB,
+        "ram_dense_mlp_mb": ram_dense_bytes / MB,
+        "ram_norms_gates_mb": ram_norms_gates_bytes / MB,
+        "ram_embedding_mb": ram_embed_bytes / MB,
+        "ram_lm_head_mb": ram_lmhead_bytes / MB,
+        "ram_gpu_experts_mb": ram_gpu_experts_mb,
+        "ram_cpu_experts_mb": ram_cpu_experts_mb,
+        "ram_decode_mb": ram_decode_mb,
+        "ram_cpu_kv_mb": ram_cpu_kv_mb,
+        "ram_layer_weights_mb": ram_layer_weights_mb,
+        "ram_total_mb": ram_total_mb,
     }
 
 
@@ -506,6 +650,7 @@ def compute_vram_budget(
     headroom_mb: int = 500,
     num_gpu_experts: int = 0,
     requested_context: int = 65536,
+    layer_group_size: int = 2,
 ) -> Dict[str, Any]:
     """Compute VRAM budget and recommended SGLang parameters.
 
@@ -522,6 +667,7 @@ def compute_vram_budget(
         headroom_mb: Reserved VRAM for GPU prefill workspace + temporaries.
         num_gpu_experts: Number of pinned experts on GPU (default 0).
         requested_context: Context length hint from user (tokens).
+        layer_group_size: Layer group size for streaming (0=persistent, >=1=streaming).
     """
     cfg = _read_model_config(model_path)
 
@@ -549,26 +695,17 @@ def compute_vram_budget(
     expert_bytes = _expert_bytes_per_expert(cfg) if num_gpu_experts > 0 else 0
     linear_attn_bpl = _linear_attention_bytes_per_layer(cfg, quantization) if hybrid else 0
 
-    # Base model footprint: attention and norms for ALL layers, replicated on every GPU
     total_model_layers = cfg["num_hidden_layers"]
     if is_mla:
         attn_per_layer = _mla_attention_bytes_per_layer(cfg, quantization)
     else:
         attn_per_layer = _gqa_attention_bytes_per_layer(cfg, quantization)
 
-    if hybrid:
-        total_full_attn = sum(1 for i in range(total_model_layers) if (i + 1) % full_attn_interval == 0)
-        total_linear_attn = total_model_layers - total_full_attn
-    else:
-        total_full_attn = total_model_layers
-        total_linear_attn = 0
+    norm_bytes_per_layer = _layernorm_bytes_per_layer(cfg)
 
-    base_attn_total = attn_per_layer * total_full_attn + linear_attn_bpl * total_linear_attn
-    base_norm_total = _layernorm_bytes_per_layer(cfg) * total_model_layers
+    # Replicated on every GPU: embeddings and lm_head
     base_embed_total = _embedding_bytes(cfg)
     base_lm_head_total = _lm_head_bytes(cfg)
-    
-    base_model_footprint = base_attn_total + base_norm_total + base_embed_total + base_lm_head_total
 
     ranks = []
     for rank_idx in range(num_ranks):
@@ -576,21 +713,52 @@ def compute_vram_budget(
         rank_end = rank_start + pp_partition[rank_idx]
         num_layers = pp_partition[rank_idx]
 
+        # Count full attention vs linear attention layers IN THIS RANK
+        if hybrid:
+            rank_full_attn = sum(1 for i in range(rank_start, rank_end) if (i + 1) % full_attn_interval == 0)
+            rank_linear_attn = num_layers - rank_full_attn
+        else:
+            rank_full_attn = num_layers
+            rank_linear_attn = 0
+
         dense_layers_in_rank = max(0, min(rank_end, first_k_dense) - rank_start)
         moe_layers_in_rank = num_layers - dense_layers_in_rank
 
-        dense_mlp_total = _dense_mlp_bytes_per_layer(cfg, quantization) * dense_layers_in_rank
-        shared_expert_total = _shared_expert_bytes_per_moe_layer(cfg, quantization) * moe_layers_in_rank
+        # With layer streaming (layer_group_size >= 1), attention and shared experts
+        # are streamed through GPU in groups. Norms and gates are PERMANENT (all layers).
+        streaming = layer_group_size >= 1
+        if streaming:
+            gs = min(layer_group_size, max(moe_layers_in_rank, 1))
+            attn_layers = min(gs, rank_full_attn)
+            linear_layers = min(gs, rank_linear_attn)
+            shared_layers = min(gs, moe_layers_in_rank)
+        else:
+            attn_layers = rank_full_attn
+            linear_layers = rank_linear_attn
+            shared_layers = moe_layers_in_rank
+
+        rank_attn_total = attn_per_layer * attn_layers + linear_attn_bpl * linear_layers
+        # Norms and gates are permanent for ALL layers (not streamed)
+        rank_norm_total = norm_bytes_per_layer * num_layers
+        hidden = cfg["hidden_size"]
+        n_experts_cli = cfg.get("n_routed_experts", cfg.get("num_experts", 0))
         gate_total = _gate_bytes_per_moe_layer(cfg) * moe_layers_in_rank
+        # F32 routing copies of gate weights
+        gate_f32_total = hidden * n_experts_cli * 4 * moe_layers_in_rank
+
+        dense_mlp_total = _dense_mlp_bytes_per_layer(cfg, quantization) * dense_layers_in_rank
+        shared_expert_total = _shared_expert_bytes_per_moe_layer(cfg, quantization) * shared_layers
         pinned_expert_total = expert_bytes * num_gpu_experts if num_gpu_experts > 0 else 0
 
         weight_total = (
-            base_model_footprint + dense_mlp_total + shared_expert_total +
-            gate_total + pinned_expert_total
+            rank_attn_total + rank_norm_total +
+            base_embed_total + base_lm_head_total +
+            dense_mlp_total + shared_expert_total +
+            gate_total + gate_f32_total + pinned_expert_total
         )
 
-        # Only full attention layers need KV cache
-        kv_per_token = _kv_bytes_per_token_per_layer(cfg, kv_cache_dtype) * total_full_attn
+        # KV cache only for full attention layers in THIS rank's partition
+        kv_per_token = _kv_bytes_per_token_per_layer(cfg, kv_cache_dtype) * rank_full_attn
 
         # Free VRAM = total - weights - SGLang overhead - headroom
         free_bytes = gpu_vram_bytes - weight_total - overhead_bytes - headroom_bytes
@@ -605,11 +773,11 @@ def compute_vram_budget(
             "num_layers": num_layers,
             "dense_layers": dense_layers_in_rank,
             "moe_layers": moe_layers_in_rank,
-            "attention_mb": base_attn_total / (1024**2),
+            "attention_mb": rank_attn_total / (1024**2),
             "dense_mlp_mb": dense_mlp_total / (1024**2),
             "shared_expert_mb": shared_expert_total / (1024**2),
             "gate_mb": gate_total / (1024**2),
-            "norm_mb": base_norm_total / (1024**2),
+            "norm_mb": rank_norm_total / (1024**2),
             "embedding_mb": base_embed_total / (1024**2),
             "lm_head_mb": base_lm_head_total / (1024**2),
             "pinned_experts_mb": pinned_expert_total / (1024**2),
@@ -757,6 +925,8 @@ def main():
                         help="Number of pinned experts on GPU")
     parser.add_argument("--context-length", type=int, default=65536,
                         help="Requested context length hint in tokens (default: 65536)")
+    parser.add_argument("--layer-group-size", type=int, default=2,
+                        help="Layer group size for streaming (0=persistent, default: 2)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress summary to stderr")
     args = parser.parse_args()
@@ -773,6 +943,7 @@ def main():
         headroom_mb=args.headroom_mb,
         num_gpu_experts=args.gpu_experts,
         requested_context=args.context_length,
+        layer_group_size=args.layer_group_size,
     )
 
     if not args.quiet:

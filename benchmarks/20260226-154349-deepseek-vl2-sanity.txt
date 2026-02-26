@@ -1,0 +1,39 @@
+Sanity Test: deepseek-vl2 @ http://localhost:8013
+Date: 2026-02-26T15:43:49.829414
+
+--- Prompt 1/7 ---
+PROMPT: Hi
+RESPONSE:  greetings welcome how i help you your email your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your your
+TIME: 22.2s, ~249 tok, ~11.2 tok/s
+
+--- Prompt 2/7 ---
+PROMPT: Who trained you?
+RESPONSE: 对自己��的���������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
+TIME: 19.5s, ~50 tok, ~2.6 tok/s
+
+--- Prompt 3/7 ---
+PROMPT: What is 2+2?
+RESPONSE: ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+TIME: 18.5s, ~99 tok, ~5.4 tok/s
+
+--- Prompt 4/7 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+TIME: 18.1s, ~99 tok, ~5.5 tok/s
+
+--- Prompt 5/7 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+TIME: 18.0s, ~99 tok, ~5.5 tok/s
+
+--- Prompt 6/7 ---
+PROMPT: Write me a poem
+RESPONSE:  –
+_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –_ –
+TIME: 17.8s, ~75 tok, ~4.2 tok/s
+
+--- Prompt 7/7 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: .sleep() sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep sleep
+TIME: 23.1s, ~297 tok, ~12.9 tok/s
+

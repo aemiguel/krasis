@@ -590,8 +590,14 @@ class KrasisModel:
         else:
             self.cpu_hub = None
 
-        # Load tokenizer
+        # Load tokenizer — override eos_token_id from tokenizer (authoritative)
+        # config.json may have wrong eos_token_id (e.g. Qwen3.5 has endoftext=248044
+        # in config but im_end=248046 is the real stop token from tokenizer_config.json)
         self.tokenizer = Tokenizer(self.cfg.model_path)
+        if self.tokenizer.eos_token_id and self.tokenizer.eos_token_id != self.cfg.eos_token_id:
+            logger.info("Overriding eos_token_id: config=%d -> tokenizer=%d",
+                        self.cfg.eos_token_id, self.tokenizer.eos_token_id)
+            self.cfg.eos_token_id = self.tokenizer.eos_token_id
 
         # Phase 5: Initialize CPU decode weights (one-time, immutable)
         print(f"\n\033[1m\033[36m▸ Initializing CPU decode weights\033[0m", flush=True)
@@ -836,9 +842,11 @@ class KrasisModel:
         live on GPU0. GPU1+ are reserved entirely for EP expert parallelism
         during prefill and HCS expert cache during decode.
 
-        This eliminates cross-GPU hidden state transfers during attention
-        (which can't be parallelized due to layer data dependencies) and
-        frees GPU1+ VRAM entirely for HCS decode experts.
+        When stream_attention is enabled, attention weights are loaded to GPU
+        one layer at a time, immediately offloaded to CPU, then freed from GPU
+        before loading the next layer. This bounds peak VRAM to ~1 layer of
+        attention + permanent weights (norms, gates, shared experts, embedding,
+        lm_head) instead of the full model.
         """
         self.layers = []
         primary_dev = self.all_devices[0]
@@ -850,20 +858,70 @@ class KrasisModel:
         logger.info("Streaming attention: all %d layers on GPU0, %d GPUs for EP",
                      L, len(self.all_devices))
 
-        # ── Load ALL layers to primary device ──
+        # ── Load layers ──
         logger.info("Loading full base model to %s...", primary_dev)
         self.embedding = loader.load_embedding(primary_dev)
 
-        for layer_idx in range(L):
-            weights = loader.load_layer(layer_idx, primary_dev)
-            layer = TransformerLayer(
-                self.cfg, layer_idx, weights, primary_dev,
-                krasis_engine=None,
-                gpu_prefill_manager=None,
-                gpu_prefill_threshold=self.gpu_prefill_threshold,
-                attention_backend=self.attention_backend,
-            )
-            self.layers.append(layer)
+        if self.stream_attention:
+            # Incremental load: load each layer to GPU, immediately offload
+            # attention to CPU to avoid accumulating all layers on GPU.
+            # Norms, gates, and shared experts stay on GPU (small, permanent).
+            self._attn_cpu_weights = {}
+            for layer_idx in range(L):
+                weights = loader.load_layer(layer_idx, primary_dev)
+                layer = TransformerLayer(
+                    self.cfg, layer_idx, weights, primary_dev,
+                    krasis_engine=None,
+                    gpu_prefill_manager=None,
+                    gpu_prefill_threshold=self.gpu_prefill_threshold,
+                    attention_backend=self.attention_backend,
+                )
+                # Extract attention weights to CPU, null GPU refs
+                w = self._extract_layer_weights(layer, layer.device)
+                attn_key = "linear_attention" if layer.layer_type == "linear_attention" else "attention"
+                attn_dict = w.get(attn_key, {})
+                cpu_attn = self._copy_weights_dict(attn_dict, 'cpu')
+                # Store for _init_stream_attention to pin later
+                self._attn_cpu_weights[layer_idx] = {
+                    "norms": w["norms"],
+                    attn_key: cpu_attn,
+                    "is_moe": w["is_moe"],
+                    "layer_type": w.get("layer_type", "full_attention"),
+                }
+                if "gate" in w:
+                    self._attn_cpu_weights[layer_idx]["gate"] = w["gate"]
+                if "shared_expert" in w:
+                    self._attn_cpu_weights[layer_idx]["shared_expert"] = w["shared_expert"]
+                if "dense_mlp" in w:
+                    self._attn_cpu_weights[layer_idx]["dense_mlp"] = w["dense_mlp"]
+                # Null attention on GPU (keep norms/gate/shared — already on GPU)
+                attn = layer.attention
+                for attr_name in list(vars(attn).keys()):
+                    val = getattr(attn, attr_name, None)
+                    if isinstance(val, torch.Tensor) and val.device.type == 'cuda':
+                        setattr(attn, attr_name, None)
+                    elif isinstance(val, tuple) and len(val) == 2:
+                        if all(isinstance(t, torch.Tensor) for t in val):
+                            setattr(attn, attr_name, None)
+                self.layers.append(layer)
+                if (layer_idx + 1) % 10 == 0 or layer_idx == L - 1:
+                    torch.cuda.empty_cache()
+                    alloc_mb = torch.cuda.memory_allocated(primary_dev) / (1024**2)
+                    logger.info("Layer %d/%d loaded+offloaded (GPU alloc: %.0f MB)",
+                                layer_idx + 1, L, alloc_mb)
+            self._attn_offloaded = True
+            logger.info("Incremental attention offload: %d layers, peak VRAM bounded to ~1 layer", L)
+        else:
+            for layer_idx in range(L):
+                weights = loader.load_layer(layer_idx, primary_dev)
+                layer = TransformerLayer(
+                    self.cfg, layer_idx, weights, primary_dev,
+                    krasis_engine=None,
+                    gpu_prefill_manager=None,
+                    gpu_prefill_threshold=self.gpu_prefill_threshold,
+                    attention_backend=self.attention_backend,
+                )
+                self.layers.append(layer)
 
         self.final_norm = loader.load_final_norm(primary_dev)
         self.lm_head_data = loader.load_lm_head(primary_dev)
@@ -880,7 +938,7 @@ class KrasisModel:
                     label, di, free >> 20, alloc >> 20, resv >> 20,
                     (total - free - resv) >> 20,
                 )
-        _vram_snap("after-all-layers-loaded")
+        _vram_snap("after-layers-loaded")
 
         # ── Build per-device state (GPU0 only) ──
         self._active_device = str(primary_dev)
@@ -1085,64 +1143,73 @@ class KrasisModel:
         then creates pinned CPU copies and pre-allocated GPU buffers for fast
         per-layer decode DMA.
 
+        When _load_gpu_weights already did incremental offloading (stream_attention
+        was True during load), _attn_cpu_weights is pre-populated and norms/gate/
+        shared are already on GPU. We skip Step 1 and Step 2.
+
         Prefill: uses _load_attention_group / _free_attention_group (existing)
         Decode: uses _stream_attn_load / _stream_attn_prefetch (new, fast)
         """
         dev = self.all_devices[0]
         t0 = time.perf_counter()
 
-        # Step 1: Use existing offload to move weights to CPU (populates _attn_cpu_weights)
-        self._offload_attention_to_ram()
+        already_offloaded = getattr(self, '_attn_offloaded', False)
 
-        # Step 2: Reload non-attention components to GPU permanently
-        # (norms, gate weights, shared expert, dense MLP — small, needed every decode)
-        for layer_idx in range(len(self.layers)):
-            cpu_w = self._attn_cpu_weights.get(layer_idx)
-            if cpu_w is None:
-                continue
-            layer = self.layers[layer_idx]
+        if not already_offloaded:
+            # Step 1: Use existing offload to move weights to CPU (populates _attn_cpu_weights)
+            self._offload_attention_to_ram()
 
-            # Norms (tiny, ~28 KB per layer)
-            norms = cpu_w.get("norms", {})
-            if "input_layernorm" in norms:
-                layer.input_norm_weight = norms["input_layernorm"].to(dev)
-            if "post_attention_layernorm" in norms:
-                layer.post_attn_norm_weight = norms["post_attention_layernorm"].to(dev)
+            # Step 2: Reload non-attention components to GPU permanently
+            # (norms, gate weights, shared expert, dense MLP — small, needed every decode)
+            for layer_idx in range(len(self.layers)):
+                cpu_w = self._attn_cpu_weights.get(layer_idx)
+                if cpu_w is None:
+                    continue
+                layer = self.layers[layer_idx]
 
-            # Gate weights (MoE routing, ~2 MB per layer)
-            if layer.is_moe and "gate" in cpu_w:
-                gate_d = cpu_w["gate"]
-                layer.gate_weight = gate_d["weight"].to(dev)
-                layer._gate_weight_f32 = layer.gate_weight.float()
-                if "bias" in gate_d:
-                    layer.gate_bias = gate_d["bias"].to(dev)
-                    layer._gate_bias_f32 = layer.gate_bias.float()
-                if "e_score_correction_bias" in gate_d:
-                    layer.e_score_correction_bias = gate_d["e_score_correction_bias"].to(dev)
-                    layer._e_score_correction_bias_f32 = layer.e_score_correction_bias.float()
+                # Norms (tiny, ~28 KB per layer)
+                norms = cpu_w.get("norms", {})
+                if "input_layernorm" in norms:
+                    layer.input_norm_weight = norms["input_layernorm"].to(dev)
+                if "post_attention_layernorm" in norms:
+                    layer.post_attn_norm_weight = norms["post_attention_layernorm"].to(dev)
 
-            # Shared expert (MoE, ~5-30 MB per layer)
-            if layer.is_moe and "shared_expert" in cpu_w:
-                se = self._copy_weights_dict(cpu_w["shared_expert"], dev)
-                layer.shared_expert = se
-                # Re-fuse gate+up proj
-                gp = se.get("gate_proj")
-                up = se.get("up_proj")
-                if gp is not None and up is not None:
-                    if isinstance(gp, tuple):
-                        se["gate_up_proj"] = (
-                            torch.cat([gp[0], up[0]], dim=0),
-                            torch.cat([gp[1], up[1]], dim=0),
-                        )
-                    else:
-                        se["gate_up_proj"] = torch.cat([gp, up], dim=0)
-                    del se["gate_proj"], se["up_proj"]
-                if "shared_expert_gate" in se:
-                    layer.shared_expert_gate = se["shared_expert_gate"]
+                # Gate weights (MoE routing, ~2 MB per layer)
+                if layer.is_moe and "gate" in cpu_w:
+                    gate_d = cpu_w["gate"]
+                    layer.gate_weight = gate_d["weight"].to(dev)
+                    layer._gate_weight_f32 = layer.gate_weight.float()
+                    if "bias" in gate_d:
+                        layer.gate_bias = gate_d["bias"].to(dev)
+                        layer._gate_bias_f32 = layer.gate_bias.float()
+                    if "e_score_correction_bias" in gate_d:
+                        layer.e_score_correction_bias = gate_d["e_score_correction_bias"].to(dev)
+                        layer._e_score_correction_bias_f32 = layer.e_score_correction_bias.float()
 
-            # Dense MLP (non-MoE layers)
-            if not layer.is_moe and "dense_mlp" in cpu_w:
-                layer.dense_mlp = self._copy_weights_dict(cpu_w["dense_mlp"], dev)
+                # Shared expert (MoE, ~5-30 MB per layer)
+                if layer.is_moe and "shared_expert" in cpu_w:
+                    se = self._copy_weights_dict(cpu_w["shared_expert"], dev)
+                    layer.shared_expert = se
+                    # Re-fuse gate+up proj
+                    gp = se.get("gate_proj")
+                    up = se.get("up_proj")
+                    if gp is not None and up is not None:
+                        if isinstance(gp, tuple):
+                            se["gate_up_proj"] = (
+                                torch.cat([gp[0], up[0]], dim=0),
+                                torch.cat([gp[1], up[1]], dim=0),
+                            )
+                        else:
+                            se["gate_up_proj"] = torch.cat([gp, up], dim=0)
+                        del se["gate_proj"], se["up_proj"]
+                    if "shared_expert_gate" in se:
+                        layer.shared_expert_gate = se["shared_expert_gate"]
+
+                # Dense MLP (non-MoE layers)
+                if not layer.is_moe and "dense_mlp" in cpu_w:
+                    layer.dense_mlp = self._copy_weights_dict(cpu_w["dense_mlp"], dev)
+        else:
+            logger.info("Attention already offloaded during load — skipping Steps 1-2")
 
         # Step 3: Create pinned CPU copies of ATTENTION-ONLY weights for fast DMA
         total_bytes = 0
@@ -3342,6 +3409,7 @@ class KrasisModel:
         top_k: int = 50,
         top_p: float = 0.95,
         stop_token_ids: Optional[List[int]] = None,
+        presence_penalty: float = 0.0,
     ) -> List[int]:
         """Generate tokens autoregressively.
 
@@ -3352,12 +3420,13 @@ class KrasisModel:
             top_k: Top-k filtering
             top_p: Top-p filtering
             stop_token_ids: Stop generation on these tokens
+            presence_penalty: Penalty for already-generated tokens (0 = disabled)
 
         Returns:
             List of generated token IDs (excluding prompt)
         """
         if stop_token_ids is None:
-            stop_token_ids = [self.cfg.eos_token_id]
+            stop_token_ids = [self.cfg.eos_token_id] + list(self.cfg.extra_stop_token_ids)
 
         # Guard: ensure prompt_tokens is a list of ints
         if isinstance(prompt_tokens, str):
@@ -3395,8 +3464,15 @@ class KrasisModel:
             # Take last token's logits
             next_logits = logits[-1:, :]
 
-            next_token = sample(next_logits, temperature, top_k, top_p).item()
+            # Track generated tokens for presence penalty
+            generated_set = set()
+            next_token = sample(
+                next_logits, temperature, top_k, top_p,
+                presence_penalty=presence_penalty,
+                generated_tokens=generated_set,
+            ).item()
             generated.append(next_token)
+            generated_set.add(next_token)
 
             torch.cuda.synchronize()
             self._last_ttft = time.perf_counter() - _t_gen_start
@@ -3418,6 +3494,7 @@ class KrasisModel:
                 top_k=top_k,
                 top_p=top_p,
                 stop_ids=list(stop_token_ids),
+                presence_penalty=presence_penalty,
             )
             generated.extend(decode_tokens)
 

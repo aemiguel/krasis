@@ -174,14 +174,12 @@ class WeightLoader:
 
         Returns (weight_int8, scale) if INT8, or plain BF16 tensor if BF16.
         """
-        # lm_head location depends on model:
-        #   Kimi K2.5: language_model.lm_head.weight
-        #   V2-Lite:   lm_head.weight
-        if self.cfg.layers_prefix == "model":
-            name = "lm_head.weight"
-        else:
-            prefix = self.cfg.layers_prefix.rsplit(".", 1)[0]  # "language_model"
-            name = f"{prefix}.lm_head.weight"
+        # lm_head location depends on model — try multiple naming conventions
+        name = "lm_head.weight"
+        if name not in self._weight_map:
+            if self.cfg.layers_prefix != "model":
+                prefix = self.cfg.layers_prefix.rsplit(".", 1)[0]
+                name = f"{prefix}.lm_head.weight"
         logger.info("Loading LM head: %s (precision=%s)", name, self.quant_cfg.lm_head)
         if self.quant_cfg.lm_head == "bf16":
             return self._load_bf16(name, device)
@@ -380,9 +378,43 @@ class WeightLoader:
         weights = {}
         load_proj = self._load_and_quantize if self.quant_cfg.attention == "int8" else self._load_bf16
 
-        # Quantizable projections
-        weights["in_proj_qkvz"] = load_proj(f"{prefix}.in_proj_qkvz.weight", device)
-        weights["in_proj_ba"] = load_proj(f"{prefix}.in_proj_ba.weight", device)
+        # Quantizable projections — handle fused (QCN) or separate (Qwen3.5) format
+        fused_qkvz = f"{prefix}.in_proj_qkvz.weight"
+        if fused_qkvz in self._weight_map:
+            # Fused format: in_proj_qkvz = [Q, K, V, Z], in_proj_ba = [B, A]
+            weights["in_proj_qkvz"] = load_proj(fused_qkvz, device)
+            weights["in_proj_ba"] = load_proj(f"{prefix}.in_proj_ba.weight", device)
+        else:
+            # Separate format (Qwen3.5): rearrange into fused interleaved format
+            # QKV is flat [Q_all, K_all, V_all], Z/B/A are flat per-head
+            # Must interleave per key-head group to match QCN's fused layout
+            qkv_raw = self._load_bf16(f"{prefix}.in_proj_qkv.weight", device)
+            z_raw = self._load_bf16(f"{prefix}.in_proj_z.weight", device)
+            b_raw = self._load_bf16(f"{prefix}.in_proj_b.weight", device)
+            a_raw = self._load_bf16(f"{prefix}.in_proj_a.weight", device)
+
+            nk = self.cfg.linear_num_key_heads    # 16
+            dk = self.cfg.linear_key_head_dim      # 128
+            hr = self.cfg.linear_num_value_heads // nk  # 2
+            dv = self.cfg.linear_value_head_dim    # 128
+            key_dim = nk * dk   # 2048
+            val_dim = self.cfg.linear_num_value_heads * dv  # 4096
+
+            # Interleave QKVZ per key-head group: [q_i, k_i, v_i, z_i] for each group i
+            qkvz_parts = []
+            for i in range(nk):
+                qkvz_parts.append(qkv_raw[i * dk : (i + 1) * dk])              # q group i
+                qkvz_parts.append(qkv_raw[key_dim + i * dk : key_dim + (i + 1) * dk])  # k group i
+                qkvz_parts.append(qkv_raw[key_dim * 2 + i * hr * dv : key_dim * 2 + (i + 1) * hr * dv])  # v group i
+                qkvz_parts.append(z_raw[i * hr * dv : (i + 1) * hr * dv])      # z group i
+            weights["in_proj_qkvz"] = torch.cat(qkvz_parts, dim=0)
+
+            # Interleave BA per key-head group: [b_i, a_i] for each group i
+            ba_parts = []
+            for i in range(nk):
+                ba_parts.append(b_raw[i * hr : (i + 1) * hr])
+                ba_parts.append(a_raw[i * hr : (i + 1) * hr])
+            weights["in_proj_ba"] = torch.cat(ba_parts, dim=0)
         weights["out_proj"] = load_proj(f"{prefix}.out_proj.weight", device)
 
         # Small/critical weights — always BF16

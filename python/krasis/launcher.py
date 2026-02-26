@@ -40,6 +40,14 @@ BLUE = "\033[0;34m"
 CYAN = "\033[0;36m"
 NC = "\033[0m"  # reset
 
+import re
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _visible_len(s: str) -> int:
+    """Length of string with ANSI escape codes stripped."""
+    return len(_ANSI_RE.sub("", s))
+
 
 def _clear_screen():
     sys.stdout.write("\033[2J\033[H")
@@ -224,7 +232,7 @@ def scan_models(search_dir: str, native_only: bool = False) -> List[Dict[str, An
     if not os.path.isdir(search_dir):
         return models
 
-    for name in sorted(os.listdir(search_dir)):
+    for name in sorted(os.listdir(search_dir), key=str.lower):
         model_dir = os.path.join(search_dir, name)
         config_path = os.path.join(model_dir, "config.json")
         if not os.path.isfile(config_path):
@@ -525,7 +533,6 @@ class ConfigOption:
 
 # Config options shown in TUI
 OPTIONS = [
-    ConfigOption("PP partition", "pp_partition", opt_type="text", affects_budget=True),
     ConfigOption("Layer group size", "layer_group_size",
                  choices=[2, 4, 6, 8, 10, 12], affects_budget=True),
     ConfigOption("KV cache (MB)", "kv_cache_mb",
@@ -1003,6 +1010,7 @@ class Launcher:
                 lm_head_quant=self.cfg.lm_head_quant,
                 gpu_vram_mb=gpu_vram,
                 total_ram_gb=self.hw["total_ram_gb"],
+                kv_cache_mb=self.cfg.kv_cache_mb,
             )
         except Exception:
             return None
@@ -1047,7 +1055,15 @@ class Launcher:
         # Config options (filter to visible ones for current model)
         native_dtype = (self.model_info or {}).get("native_dtype", "bfloat16")
         visible_options = [opt for opt in OPTIONS if _is_option_visible(opt, self.model_info, self.cfg)]
-        lines.append(f"  {DIM}\u2500\u2500\u2500 Configuration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
+
+        # Column positions for two-column size estimates (VRAM + RAM)
+        VRAM_COL = 58
+        COL_WIDTH = 10  # e.g. "XX,XXX MB" right-justified
+
+        sep_left = f"  {DIM}\u2500\u2500\u2500 Configuration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}"
+        hpad = max(1, VRAM_COL - _visible_len(sep_left))
+        lines.append(f"{sep_left}{' ' * hpad}{CYAN}{'VRAM':^{COL_WIDTH}}{NC}  {GREEN}{'RAM':^{COL_WIDTH}}{NC}")
+
         for i, opt in enumerate(visible_options):
             val = getattr(self.cfg, opt.key)
             display = _format_value(opt, val)
@@ -1063,21 +1079,67 @@ class Launcher:
             annotation = _quality_annotation(native_dtype, opt.key, val)
             suffix = f"  {annotation}" if annotation else ""
 
-            # KV cache: show max-context estimate
+            # KV cache: show shortened max-context estimate
             if opt.key == "kv_cache_mb" and self.model_info:
                 mi = self.model_info
                 kv_dim = mi.get("kv_dim", 0)
                 num_kv_layers = mi.get("num_kv_layers", 0)
                 max_ctx = mi.get("max_context", 0)
                 if kv_dim > 0 and num_kv_layers > 0:
-                    elem_size = 1 if self.cfg.kv_dtype == "fp8_e4m3" else 2
-                    bytes_per_token = kv_dim * elem_size * num_kv_layers
-                    max_ctx_mb = (max_ctx * bytes_per_token) / (1024 * 1024)
-                    suffix = f"  {DIM}(max context {max_ctx // 1000}K = {max_ctx_mb:,.0f} MB){NC}"
+                    suffix = f"  {DIM}(max {max_ctx // 1000}K){NC}"
 
-            # Right-align values
+            # Compute VRAM and RAM estimates from budget
+            vram_mb = 0
+            ram_mb = 0
+            if self.budget:
+                rank = self.budget["ranks"][self.budget["worst_rank"]]
+                b = self.budget
+                _vram_map = {
+                    "gpu_expert_bits": "expert_buffer_mb",
+                    "attention_quant": "attention_mb",
+                    "shared_expert_quant": "shared_expert_mb",
+                    "dense_mlp_quant": "dense_mlp_mb",
+                    "lm_head_quant": "lm_head_mb",
+                }
+                _ram_map = {
+                    "gpu_expert_bits": "ram_gpu_experts_mb",
+                    "cpu_expert_bits": "ram_cpu_experts_mb",
+                    "attention_quant": "ram_attention_mb",
+                    "shared_expert_quant": "ram_shared_expert_mb",
+                    "dense_mlp_quant": "ram_dense_mlp_mb",
+                    "lm_head_quant": "ram_lm_head_mb",
+                }
+                vkey = _vram_map.get(opt.key)
+                if vkey:
+                    vram_mb = rank.get(vkey, 0)
+                elif opt.key == "kv_cache_mb":
+                    vram_mb = self.cfg.kv_cache_mb
+                rkey = _ram_map.get(opt.key)
+                if rkey:
+                    ram_mb = b.get(rkey, 0)
+
+            # Build left part (prefix + label + value + annotation)
             label_part = f"{label_style}{opt.label:<20s}{NC}"
-            lines.append(f"{prefix}{label_part}{display}{suffix}")
+            left = f"{prefix}{label_part}{display}{suffix}"
+
+            # Build right columns: VRAM (cyan) + RAM (green)
+            has_estimates = vram_mb > 0 or ram_mb > 0
+            if has_estimates:
+                vis_len = _visible_len(left)
+                pad1 = max(1, VRAM_COL - vis_len)
+                if vram_mb >= 1:
+                    vram_str = f"{CYAN}{int(vram_mb):>{COL_WIDTH - 3},} MB{NC}"
+                elif vram_mb > 0:
+                    vram_str = f"{CYAN}{'<1 MB':>{COL_WIDTH}}{NC}"
+                else:
+                    vram_str = " " * COL_WIDTH
+                if ram_mb >= 1:
+                    ram_str = f"  {GREEN}{int(ram_mb):>{COL_WIDTH - 3},} MB{NC}"
+                else:
+                    ram_str = ""
+                lines.append(f"{left}{' ' * pad1}{vram_str}{ram_str}")
+            else:
+                lines.append(left)
 
         lines.append("")
 
@@ -1088,25 +1150,49 @@ class Launcher:
             rank = b["ranks"][wr]
             gpu_vram = b["gpu_vram_mb"]
 
-            lines.append(f"  {DIM}\u2500\u2500\u2500 VRAM Budget (worst: rank {wr}) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
-            lines.append(f"    Total:             {rank['total_mb']:>8,.0f} MB  / {gpu_vram:,} MB")
-            if rank["free_mb"] > 0:
-                kv_label = "fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16"
-                lines.append(
-                    f"    Free for KV:       {rank['free_mb']:>8,.0f} MB  "
-                    f"{GREEN}\u2192 ~{_format_tokens(rank['kv_tokens'])} tokens ({kv_label}){NC}"
-                )
+            lines.append(f"  {DIM}\u2500\u2500\u2500 VRAM (fixed costs) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
+            embed_mb = rank.get("embedding_mb", 0)
+            norms_gates_mb = rank.get("norms_gates_mb", 0)
+            cuda_mb = rank.get("cuda_overhead_mb", 0)
+            flashinfer_mb = rank.get("flashinfer_mb", 0)
+            prefill_ws_mb = rank.get("prefill_workspace_mb", 0)
+            lines.append(f"    Embedding:         {CYAN}{int(embed_mb):>8,} MB{NC}")
+            lines.append(f"    Norms + gates:     {CYAN}{int(norms_gates_mb):>8,} MB{NC}")
+            lines.append(f"    FlashInfer:        {CYAN}{int(flashinfer_mb):>8,} MB{NC}")
+            lines.append(f"    Prefill workspace: {CYAN}{int(prefill_ws_mb):>8,} MB{NC}")
+            lines.append(f"    CUDA overhead:     {CYAN}{int(cuda_mb):>8,} MB{NC}")
+            lines.append(f"    {DIM}\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
+            total_with_kv = int(rank.get("total_with_kv_mb", rank["total_mb"]))
+            free_after_kv = int(rank.get("free_after_kv_mb", rank["free_mb"]))
+            kv_alloc_tokens = rank.get("kv_alloc_tokens", rank["kv_tokens"])
+            kv_label = "fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16"
+            lines.append(
+                f"    Total:             {CYAN}{total_with_kv:>8,} MB{NC} / {int(gpu_vram):,} MB"
+                f"  {DIM}(~{_format_tokens(kv_alloc_tokens)} tokens {kv_label} KV){NC}"
+            )
+            if free_after_kv >= 0:
+                lines.append(f"    Free:              {CYAN}{free_after_kv:>8,} MB{NC}")
             else:
-                over = -rank["free_mb"]
-                lines.append(f"    {RED}\u26a0 OVER BUDGET by {over:,.0f} MB!{NC}")
+                over = -free_after_kv
+                lines.append(f"    {RED}\u26a0 OVER BUDGET by {int(over):,} MB!{NC}")
 
-            # RAM
+            # System RAM
             lines.append("")
             lines.append(f"  {DIM}\u2500\u2500\u2500 System RAM \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
-            lines.append(
-                f"    CPU experts (int{self.cfg.cpu_expert_bits}): "
-                f"{b['cpu_expert_gb']:>8.1f} GB  / {b['total_ram_gb']} GB available"
-            )
+            ram_lw = int(b.get('ram_layer_weights_mb', 0))
+            ram_ge = int(b.get('ram_gpu_experts_mb', 0))
+            ram_ce = int(b.get('ram_cpu_experts_mb', 0))
+            ram_dec = int(b.get('ram_decode_mb', 0))
+            ram_kv = int(b.get('ram_cpu_kv_mb', 0))
+            ram_tot = int(b.get('ram_total_mb', 0))
+            sys_ram_mb = int(b['total_ram_gb'] * 1024)
+            lines.append(f"    Layer weights:     {GREEN}{ram_lw:>8,} MB{NC}")
+            lines.append(f"    GPU experts:       {GREEN}{ram_ge:>8,} MB{NC}")
+            lines.append(f"    CPU experts:       {GREEN}{ram_ce:>8,} MB{NC}")
+            lines.append(f"    CPU decode store:  {GREEN}{ram_dec:>8,} MB{NC}")
+            lines.append(f"    CPU KV cache:      {GREEN}{ram_kv:>8,} MB{NC}")
+            lines.append(f"    {DIM}\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
+            lines.append(f"    Total:             {GREEN}{ram_tot:>8,} MB{NC} / {sys_ram_mb:,} MB")
         else:
             lines.append(f"  {DIM}(budget unavailable){NC}")
 

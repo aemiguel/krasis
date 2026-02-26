@@ -1,0 +1,76 @@
+Sanity Test: deepseek-vl2 @ http://localhost:8013
+Date: 2026-02-26T15:37:47.817524
+
+--- Prompt 1/7 ---
+PROMPT: Hi
+RESPONSE:  audience, I have a question about the use of "I" in English. I am a non-native speaker, and I am trying to write a letter to a native speaker. I would like to know if it is appropriate to use "I" in the beginning of a sentence, as in "I am writing to you" or "I am writing this letter to you." I am also curious about the use of "I" in the middle of a sentence, as in "I have been writing to you" or "I have been writing this letter to you." I would like to know if it is appropriate to use "I" in the middle of a sentence, as in "I have been writing to you" or "I have been writing this letter to you." Thank you for your help.
+
+The answer is: "I" is used to refer to the speaker, and it is appropriate to use "I" in the beginning of a sentence. However, it is not
+TIME: 18.4s, ~191 tok, ~10.4 tok/s
+
+--- Prompt 2/7 ---
+PROMPT: Who trained you?
+RESPONSE: ”？""
+"Who trained you?" is a question asking for the person who provided the training.
+TIME: 2.4s, ~21 tok, ~8.6 tok/s
+
+--- Prompt 3/7 ---
+PROMPT: What is 2+2?
+RESPONSE:  User, I am an AI language model, and I am here to assist you with your questions and provide information. In this case, I can help you with the calculation you have provided.
+
+The calculation is as follows:
+
+2 + 2 = 4
+
+Therefore, the answer to the question "What is 2 + 2?" is 4.
+TIME: 6.4s, ~70 tok, ~11.0 tok/s
+
+--- Prompt 4/7 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: )?
+TIME: 1.2s, ~1 tok, ~0.8 tok/s
+
+--- Prompt 5/7 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: )?"
+    }
+    return response
+}
+
+function getAnswer() {
+    const response = await fetch('https://api.quotable.io/v1/random')
+    const data = await response.json()
+    const quote = data.quote
+    const author = data.author
+    const response = document.querySelector('.response')
+    response.innerHTML = `<p>${quote}</p>`
+    response.classList.add('response')
+    response.classList.remove('response')
+    response.classList.add('response')
+    response.classList.remove('response')
+    response.classList.add('response')
+    response.classList.remove('response')
+    response.classList.add('response')
+    response.classList.remove('response')
+    response.classList.add('response')
+    response.classList.remove('response')
+    response.classList.add('response')
+    response.classList.remove('response')
+    response.classList.add('response')
+    response.classList.remove('response')
+    response.classList.add('response')
+    response.classList.remove('response')
+    response.classList.add('response')
+    response
+TIME: 19.9s, ~256 tok, ~12.9 tok/s
+
+--- Prompt 6/7 ---
+PROMPT: Write me a poem
+RESPONSE:  creative writing, poetry, and other forms of creative writing. I can assist you in generating original content for your writing projects. Please provide me with the genre, style, and any specific themes or ideas you have in mind, and I will do my best to help you create a unique and engaging piece of writing for you. If you have any questions or need further assistance, feel free to ask. Thank you for choosing me as your creative writing assistant. Enjoy your writing journey with me!
+TIME: 8.9s, ~122 tok, ~13.8 tok/s
+
+--- Prompt 7/7 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE:  until the 20th century, the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 4th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century. the 20th century was the 20th century.
+TIME: 23.2s, ~161 tok, ~6.9 tok/s
+

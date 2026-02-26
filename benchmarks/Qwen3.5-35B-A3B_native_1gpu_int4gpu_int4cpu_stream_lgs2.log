@@ -1,14 +1,14 @@
 ================================================================
-Krasis Benchmark — 2026-02-26 17:42:49
+Krasis Benchmark — 2026-02-26 15:54:58
 ================================================================
-Model:            Qwen3-235B-A22B
-Architecture:     qwen3_moe, 94 layers, 128 experts, top-8
-PP Partition:     [94] (1 GPUs)
+Model:            Qwen3.5-35B-A3B
+Architecture:     qwen3_5_moe_text, 40 layers, 256 experts, top-8, 10 GQA + 30 linear
+PP Partition:     [40] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            1007 GB total, 265.2 GB used by process
-  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 6738 MB allocated
+  RAM:            1007 GB total, 42.5 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 5209 MB allocated
 
 Quantization:
   GPU experts:    INT4 (Marlin)
@@ -25,16 +25,16 @@ Strategy:
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
 Prefill (3 runs at different lengths):
-  Run 1:  289.3 tok/s, TTFT=69.13s (20,000 tokens)
-  Run 2:  202.1 tok/s, TTFT=173.17s (35,000 tokens)
-  Run 3:  188.5 tok/s, TTFT=201.10s (37,912 tokens)
-  Best:    289.3 tok/s, TTFT=69.13s (20,000 tokens)
+  Run 1:  1374.1 tok/s, TTFT=14.56s (20,000 tokens)
+  Run 2:  1175.1 tok/s, TTFT=29.78s (35,000 tokens)
+  Run 3:  1033.3 tok/s, TTFT=48.39s (50,000 tokens)
+  Best:    1374.1 tok/s, TTFT=14.56s (20,000 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  3.32 tok/s (301.6ms/tok)
-  Run 2:  3.39 tok/s (295.3ms/tok)
-  Run 3:  3.36 tok/s (297.9ms/tok)
-  Average: 3.36 tok/s (298.3ms/tok)
+  Run 1:  14.61 tok/s (68.4ms/tok)
+  Run 2:  15.93 tok/s (62.8ms/tok)
+  Run 3:  14.59 tok/s (68.5ms/tok)
+  Average: 15.04 tok/s (66.6ms/tok)
 
 Verification:
   Prefill prompt: user
@@ -51,12 +51,17 @@ Contents
  VOLUME ONE
 Chapter 1. Marseilles—The Arrival
 Chapter 2. Father and Son
-Chapter 3. Th... [75616 chars total]
+Chapter 3. Th... [74063 chars total]
   Decode prompt:  user
 Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
 assistant
+<think>
 
   Generated output (64 tokens):
-    <think>
-    Okay, so I need to explain how public key cryptography works, including the RSA algorithm and why it's considered secure. Let me start by recalling what I know about cryptography. There are two main types: symmetric and asymmetric. Symmetric uses the same key for encryption and decryption, like AES. Asymmetric,
+    Here's a thinking process that leads to the suggested explanation of public key cryptography:
+    
+    1.  **Deconstruct the Request:**
+        *   **Topic:** Public Key Cryptography (Public Key Infrastructure - PKI).
+        *   **Specific Requirement:** Explain the RSA algorithm specifically.
+        *   **
 ================================================================

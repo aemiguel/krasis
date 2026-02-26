@@ -163,9 +163,13 @@ async def chat_completions(request: Request):
     temperature = body.get("temperature", 0.6)
     top_k = body.get("top_k", 50)
     top_p = body.get("top_p", 0.95)
+    presence_penalty = body.get("presence_penalty", 0.0)
 
     # Tokenize
-    prompt_tokens = _model.tokenizer.apply_chat_template(messages)
+    enable_thinking = body.get("enable_thinking", True)
+    prompt_tokens = _model.tokenizer.apply_chat_template(
+        messages, enable_thinking=enable_thinking
+    )
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
     # Check prompt fits in KV cache (with room for at least some generation)
@@ -183,7 +187,7 @@ async def chat_completions(request: Request):
             }
         }, status_code=413)
 
-    stop_ids = [_model.cfg.eos_token_id]
+    stop_ids = [_model.cfg.eos_token_id] + list(_model.cfg.extra_stop_token_ids)
     # Handle custom stop tokens
     if "stop" in body:
         stop = body["stop"]
@@ -201,6 +205,7 @@ async def chat_completions(request: Request):
         top_k=top_k,
         top_p=top_p,
         stop_token_ids=stop_ids,
+        presence_penalty=presence_penalty,
     )
 
     logger.info(
@@ -210,49 +215,87 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            _stream_response(gen_request),
+            _stream_response(gen_request, request),
             media_type="text/event-stream",
         )
     else:
-        return await _blocking_response(gen_request)
+        return await _blocking_response(gen_request, request)
 
 
-async def _stream_response(request: GenerationRequest):
-    """SSE streaming response."""
+async def _stream_response(gen_request: GenerationRequest, http_request: Request):
+    """SSE streaming response. Cancels generation on client disconnect."""
     created = int(time.time())
 
-    async for output in _scheduler.generate_stream(request):
-        chunk = {
-            "id": request.request_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": _model_name,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": output.text} if output.finish_reason is None else {},
-                "finish_reason": output.finish_reason,
-            }],
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
+    # Disconnect monitor: polls the HTTP connection and signals when closed
+    disconnect_event = asyncio.Event()
 
-    yield "data: [DONE]\n\n"
+    async def _disconnect_monitor():
+        while not disconnect_event.is_set():
+            if await http_request.is_disconnected():
+                disconnect_event.set()
+                return
+            await asyncio.sleep(0.5)
+
+    monitor = asyncio.create_task(_disconnect_monitor())
+
+    try:
+        async for output in _scheduler.generate_stream(gen_request, disconnect_event):
+            if disconnect_event.is_set():
+                break
+            chunk = {
+                "id": gen_request.request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": _model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": output.text} if output.finish_reason is None else {},
+                    "finish_reason": output.finish_reason,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+        yield "data: [DONE]\n\n"
+    finally:
+        disconnect_event.set()
+        monitor.cancel()
 
 
-async def _blocking_response(request: GenerationRequest):
-    """Non-streaming response — collect all tokens then return."""
+async def _blocking_response(gen_request: GenerationRequest, http_request: Request):
+    """Non-streaming response — collect all tokens then return.
+    Cancels generation on client disconnect."""
     created = int(time.time())
     chunks = []
     finish_reason = None
 
-    async for output in _scheduler.generate_stream(request):
-        chunks.append(output.text)
-        if output.finish_reason:
-            finish_reason = output.finish_reason
+    # Disconnect monitor
+    disconnect_event = asyncio.Event()
+
+    async def _disconnect_monitor():
+        while not disconnect_event.is_set():
+            if await http_request.is_disconnected():
+                disconnect_event.set()
+                return
+            await asyncio.sleep(0.5)
+
+    monitor = asyncio.create_task(_disconnect_monitor())
+
+    try:
+        async for output in _scheduler.generate_stream(gen_request, disconnect_event):
+            if disconnect_event.is_set():
+                finish_reason = "cancelled"
+                break
+            chunks.append(output.text)
+            if output.finish_reason:
+                finish_reason = output.finish_reason
+    finally:
+        disconnect_event.set()
+        monitor.cancel()
 
     full_text = "".join(chunks)
 
     return {
-        "id": request.request_id,
+        "id": gen_request.request_id,
         "object": "chat.completion",
         "created": created,
         "model": _model_name,
@@ -262,9 +305,9 @@ async def _blocking_response(request: GenerationRequest):
             "finish_reason": finish_reason or "stop",
         }],
         "usage": {
-            "prompt_tokens": len(request.prompt_tokens),
+            "prompt_tokens": len(gen_request.prompt_tokens),
             "completion_tokens": len(chunks),
-            "total_tokens": len(request.prompt_tokens) + len(chunks),
+            "total_tokens": len(gen_request.prompt_tokens) + len(chunks),
         },
     }
 

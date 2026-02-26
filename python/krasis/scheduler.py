@@ -27,6 +27,7 @@ class GenerationRequest:
     top_k: int = 50
     top_p: float = 0.95
     stop_token_ids: List[int] = field(default_factory=list)
+    presence_penalty: float = 0.0
 
 
 @dataclass
@@ -34,7 +35,7 @@ class GenerationOutput:
     """A single token output."""
     token_id: int
     text: str
-    finish_reason: Optional[str] = None  # "stop", "length", or None
+    finish_reason: Optional[str] = None  # "stop", "length", "cancelled", or None
 
 
 class Scheduler:
@@ -45,14 +46,17 @@ class Scheduler:
         self._lock = asyncio.Lock()
 
     async def generate_stream(
-        self, request: GenerationRequest
+        self, request: GenerationRequest, disconnect_event: Optional[asyncio.Event] = None
     ) -> AsyncIterator[GenerationOutput]:
-        """Generate tokens one at a time, yielding each as it's produced."""
-        async with self._lock:
-            # Run generation in a thread pool to avoid blocking the event loop
-            loop = asyncio.get_event_loop()
+        """Generate tokens one at a time, yielding each as it's produced.
 
-            # We use a queue to pass tokens from the generation thread
+        Args:
+            request: The generation request.
+            disconnect_event: If set, signals that the client has disconnected
+                and generation should be cancelled.
+        """
+        async with self._lock:
+            loop = asyncio.get_event_loop()
             token_queue: asyncio.Queue[Optional[GenerationOutput]] = asyncio.Queue()
 
             async def _produce():
@@ -69,14 +73,30 @@ class Scheduler:
             # Start producer
             producer = asyncio.create_task(_produce())
 
-            # Yield tokens as they arrive
-            while True:
-                output = await token_queue.get()
-                if output is None:
-                    break
-                yield output
-                if output.finish_reason is not None:
-                    break
+            # If we have a disconnect event, start a monitor that cancels
+            # the Rust generate_loop when the client disconnects.
+            cancel_task = None
+            if disconnect_event is not None:
+                async def _cancel_monitor():
+                    await disconnect_event.wait()
+                    cpu_decoder = self.model._cpu_decoder
+                    if cpu_decoder is not None and hasattr(cpu_decoder, '_store'):
+                        cpu_decoder._store.cancel()
+                        logger.info("Client disconnected — cancelled generation for %s", request.request_id)
+                cancel_task = asyncio.create_task(_cancel_monitor())
+
+            try:
+                # Yield tokens as they arrive
+                while True:
+                    output = await token_queue.get()
+                    if output is None:
+                        break
+                    yield output
+                    if output.finish_reason is not None:
+                        break
+            finally:
+                if cancel_task is not None:
+                    cancel_task.cancel()
 
             await producer
 
@@ -91,7 +111,7 @@ class Scheduler:
         cfg = model.cfg
         tokenizer = model.tokenizer
 
-        stop_ids = set(request.stop_token_ids or [cfg.eos_token_id])
+        stop_ids = set(request.stop_token_ids or ([cfg.eos_token_id] + list(cfg.extra_stop_token_ids)))
         prompt_tokens = request.prompt_tokens
         device = torch.device(model.ranks[0].device)
 
@@ -100,6 +120,11 @@ class Scheduler:
 
         # Create sequence states for each rank's KV cache
         seq_states = [SequenceKVState(c, seq_id=0) for c in model.kv_caches]
+
+        # Reset cancel flag before starting
+        cpu_decoder = model._cpu_decoder
+        if cpu_decoder is not None and hasattr(cpu_decoder, '_store'):
+            cpu_decoder._store.reset_cancel()
 
         start_time = time.perf_counter()
         generated_count = 0
@@ -129,7 +154,8 @@ class Scheduler:
                 )
 
                 next_token = sample(
-                    next_logits, request.temperature, request.top_k, request.top_p
+                    next_logits, request.temperature, request.top_k, request.top_p,
+                    presence_penalty=request.presence_penalty,
                 ).item()
                 generated_count += 1
 
@@ -146,7 +172,6 @@ class Scheduler:
                     return
 
             # ── Decode (CPU) — weights already initialized at load time ──
-            cpu_decoder = model._cpu_decoder
             cpu_decoder.prepare(seq_states, request.max_new_tokens)
 
             decode_start = time.perf_counter()
@@ -170,6 +195,7 @@ class Scheduler:
                 stop_ids=list(stop_ids),
                 tokenizer_path=tokenizer_path,
                 callback=_token_callback,
+                presence_penalty=request.presence_penalty,
             )
 
             decode_time = time.perf_counter() - decode_start

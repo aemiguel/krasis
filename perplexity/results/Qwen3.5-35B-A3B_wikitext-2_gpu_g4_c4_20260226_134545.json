@@ -1,0 +1,31 @@
+{
+  "config": {
+    "model_path": "/home/main/.krasis/models/Qwen3.5-35B-A3B",
+    "num_gpus": 1,
+    "cpu_only": false,
+    "gpu_expert_bits": 4,
+    "cpu_expert_bits": 4,
+    "attention_quant": "bf16",
+    "lm_head_quant": "int8",
+    "layer_group_size": 2,
+    "krasis_threads": 16,
+    "kv_cache_mb": 2000,
+    "dataset": "wikitext-2",
+    "window_size": 2048,
+    "stride": 1024,
+    "max_tokens": 30000
+  },
+  "results": {
+    "perplexity": 6.1232582887252685,
+    "bits_per_char": 2.6142995395353372,
+    "mean_loss": 1.8120943549680824,
+    "total_nll": 54361.0185546875,
+    "num_tokens_scored": 29999,
+    "num_tokens_total": 30000,
+    "num_windows": 30,
+    "window_size": 2048,
+    "stride": 1024,
+    "elapsed_s": 131.726204933002,
+    "dataset": "wikitext-2"
+  }
+}

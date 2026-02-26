@@ -22,7 +22,7 @@ Krasis is able to run Qwen3-Coder-Next (Q4 quantised) with **one 16GB GPU** at t
 - 5900X, 3200 DDR4, 1x 5080 16GB (PCIE4.0x16) : **3595 tok/sec prefill, 14.7 tok/sec decode**
 - Epyc 7742, 2666 DDR4, 1x RTX Ada 2000 16GB (PCIE4.0x8) : **1060 tok/sec prefill, 18.9 tok/sec decode**
 
-Krasis can likely run QCN at speed with even more VRAM limited GPUs than these (further testing is planned).
+Krasis can likely run QCN at speed with even lower VRAM limited GPUs than these (further testing is planned).  Qwen 235B will run with a 16GB card given sufficient system RAM (around 230GB).
 
 ## Why LLM's run slow, and how Krasis runs them fast
 
@@ -52,19 +52,32 @@ In order to achieve these speeds, Krasis has a few requirements.
 - Krasis optimises models and caches them in <home folder>/.krasis, these can be large so you may need disk space for the original model BF16 model plus **2x the quantized model** (for QCN at Q4 this would be 149GB + 38GB + 38GB = ~225GB).
 - **Krasis is optimised to run models at Q4 and Q8**, which are generally very good tradeoffs vs either running the full precision weights or heavily quantised models much lowered quality.
 
+## Krasis TODO
+Krasis is a new project, and although I believe the results are very promising there is more work to do in various areas.
+
+- Decode speed would benefit from further optimisation.
+- Decode could benefit significantly from speculative draft models (perhaps 2-3x).
+- Concurrent usage of the server hasn't been tested yet and is likely not optimal.
+- Multi-GPU has been explored but it is generally not as fast as one GPU yet, needs further exploration.
+- More models and architectures to support.
+
 ## Supported Models
 
-| Model | Params | BF16 Size | Experts | Attention |
-|-------|:------:|:---------:|---------|-----------|
-| **Qwen3-Coder-Next** | 80B | 148 GB | 512 routed, top-10 | Hybrid (36 linear + 12 GQA) |
-| **DeepSeek V2-Lite** | 16B | 29 GB | 64 + 2 shared, top-6 | MLA |
+| Model | Params | BF16 Size | Experts | Attention | Status |
+|-------|:------:|:---------:|---------|-----------|--------|
+| **Qwen3-Coder-Next** | 80B | 148 GB | 512 routed, top-10 | Hybrid (36 linear + 12 GQA) | Tested | 
+| **Qwen3.5-35B-A3B** | 35B | 67 GB | 256 routed, top-8 | Hybrid (30 linear + 10 GQA) | Partially Tested |
+| **Qwen3-235B-A22B** | 235B | 438 GB | 128 routed, top-8 | GQA | Partially Tested |
+| **DeepSeek V2-Lite** | 16B | 29 GB | 64 + 2 shared, top-6 | MLA | Tested |
 
 ## Models in progress
 
 | Model | Params | BF16 Size | Experts | Attention |
 |-------|:------:|:---------:|---------|-----------|
-| **Qwen3-235B-A22B** | 235B | 438 GB | 128 routed, top-8 | GQA |
-| **GLM-4.7** | 358B | 667 GB | 160 + 1 shared, top-8 | GQA (partial RoPE, bias) |
+| **GLM-4.7** | 355B | ? GB | ? | ? |
+| **GPT-OSS-120B** | 120B | ? GB | ? | ? |
+| **DeepSeek-VL2** | 27B | ? GB | ? | ? |
+| **DeepSeek-V3.2** | 685B | ? GB | ? | ? |
 
 ## Perplexity (Quantization Quality)
 
@@ -76,6 +89,7 @@ Measured with INT4 GPU + INT4 CPU experts (Q4), BF16 attention, INT8 shared/MLP/
 | **Qwen3-Coder-Next** | C4 validation | 1M | 12.52 | 3.65 |
 | **DeepSeek V2-Lite** | WikiText-2 | 307K | 6.03 | 2.59 |
 | **DeepSeek V2-Lite** | C4 validation | 500K | 9.22 | 3.20 |
+| **Qwen3.5-35B-A3B** | WikiText-2 | 297K | 6.41 | 2.68 |
 
 ## Benchmark: AMD 5900X + 1x RTX 5080 16GB
 
@@ -100,6 +114,8 @@ Benchmark uses 10K–50K token prompts (prefill) and 64-token generation runs (d
 |-------|:------------:|:---------------:|:----------:|:--------------:|:------:|
 | **Qwen3-Coder-Next** | INT4 GPU + INT4 CPU | 1,060 | 18.9s | 15.81 | 63.6 |
 | **Qwen3-Coder-Next** | INT8 GPU + INT8 CPU | 873 | 40.1s | 12.41 | 80.6 |
+| **Qwen3.5-35B-A3B** | INT4 GPU + INT4 CPU | 1374.1 | 14.56s | 15.04 | 66.6 |
+| **Qwen3-235B-A22B** | INT4 GPU + INT4 CPU | 289.3 | 69.13s | 3.36 | 298.3 |
 | **DeepSeek V2-Lite** | INT4 GPU + INT4 CPU | 1,477 | 13.6s | 20.18 | 49.7 |
 | **DeepSeek V2-Lite** | INT8 GPU + INT8 CPU | 1,317 | 15.2s | 17.84 | 56.2 |
 

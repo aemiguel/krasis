@@ -71,11 +71,21 @@ pub struct ModelConfig {
 
 impl ModelConfig {
     /// Parse config.json with support for multiple MoE architectures.
+    /// Parse config.json.  `index_hint` optionally provides the safetensors index
+    /// so we can count `num_hidden_layers` from the weight map when the config
+    /// doesn't contain it (e.g. DeepSeek-VL2's `language_config`).
     pub fn from_json(raw: &serde_json::Value) -> Result<Self, String> {
-        // If there's a text_config (VL wrapper like Kimi K2.5), use that
+        Self::from_json_with_index(raw, None)
+    }
+
+    pub fn from_json_with_index(raw: &serde_json::Value, index: Option<&serde_json::Value>) -> Result<Self, String> {
+        // If there's a text_config or language_config (VL wrapper), use that
         let cfg = if let Some(tc) = raw.get("text_config") {
             log::info!("Found text_config wrapper (VL model), using inner config");
             tc
+        } else if let Some(lc) = raw.get("language_config") {
+            log::info!("Found language_config wrapper (VL model), using inner config");
+            lc
         } else {
             raw
         };
@@ -104,7 +114,19 @@ impl ModelConfig {
 
         let num_hidden_layers = cfg.get("num_hidden_layers")
             .and_then(|v| v.as_u64())
-            .ok_or("Missing num_hidden_layers")? as usize;
+            .or_else(|| {
+                // Infer from safetensors index by counting layer indices in expert weights
+                let wmap = index?.get("weight_map")?.as_object()?;
+                let max_layer = wmap.keys()
+                    .filter(|k| k.contains(".layers.") && k.contains(".mlp.experts."))
+                    .filter_map(|k| {
+                        let after = k.split(".layers.").nth(1)?;
+                        after.split('.').next()?.parse::<u64>().ok()
+                    })
+                    .max()?;
+                Some(max_layer + 1)
+            })
+            .ok_or("Missing num_hidden_layers (not in config and no index to infer from)")? as usize;
 
         // first_k_dense_replace (DeepSeek/Kimi) OR derive from decoder_sparse_step (Qwen3)
         // Default to 0 when neither field exists (e.g. GPT OSS: all layers are MoE)
@@ -1172,7 +1194,13 @@ impl WeightStore {
             .map_err(|e| format!("Failed to read config.json: {e}"))?;
         let raw_json: serde_json::Value = serde_json::from_str(&config_str)
             .map_err(|e| format!("Failed to parse config.json: {e}"))?;
-        let config = ModelConfig::from_json(&raw_json)
+
+        // Load safetensors index early so we can infer num_hidden_layers if missing
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let index_json: Option<serde_json::Value> = std::fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        let config = ModelConfig::from_json_with_index(&raw_json, index_json.as_ref())
             .map_err(|e| format!("Failed to extract MoE config: {e}"))?;
 
         log::info!(
@@ -1900,7 +1928,8 @@ impl WeightStore {
         // Detect prefix and quantization format
         let layers_prefix = detect_expert_prefix(&index.weight_map)?;
         let mxfp4 = is_mxfp4(&index.weight_map);
-        let prequantized = !mxfp4 && is_prequantized(&index.weight_map);
+        let stacked = !mxfp4 && is_stacked_experts(&index.weight_map);
+        let prequantized = !mxfp4 && !stacked && is_prequantized(&index.weight_map);
         let effective_group_size = if prequantized {
             let probe_layer = start_moe_layer + config.first_k_dense_replace;
             let native_gs = detect_prequant_group_size(
@@ -1931,6 +1960,9 @@ impl WeightStore {
         if mxfp4 {
             log::info!("Detected MXFP4 pre-quantized experts — will dequant to BF16 then quantize to INT{gpu_bits}");
         }
+        if stacked {
+            log::info!("Detected stacked expert format (Marlin cache build)");
+        }
 
         // Create cache directory + temp file
         if let Some(parent) = cache_path.parent() {
@@ -1955,8 +1987,28 @@ impl WeightStore {
         let overall_start = std::time::Instant::now();
 
         // Prefetch first layer's expert data asynchronously
-        if !mxfp4 {
-            let first_layer_idx = start_moe_layer + config.first_k_dense_replace;
+        let first_layer_idx = start_moe_layer + config.first_k_dense_replace;
+        if stacked || mxfp4 {
+            // Stacked/MXFP4: prefetch bulk tensors for first layer
+            let suffixes: &[&str] = if stacked {
+                &["gate_up_proj", "down_proj"]
+            } else {
+                &["gate_up_proj_blocks", "gate_up_proj_scales",
+                  "down_proj_blocks", "down_proj_scales"]
+            };
+            for suffix in suffixes {
+                let tensor_name = format!(
+                    "{layers_prefix}.layers.{first_layer_idx}.mlp.experts.{suffix}"
+                );
+                if let Some(shard_name) = index.weight_map.get(&tensor_name) {
+                    if let Some(shard) = shards.get(shard_name) {
+                        shard.prefetch_tensor(&tensor_name);
+                    }
+                }
+            }
+            let fmt = if stacked { "stacked" } else { "MXFP4" };
+            log::info!("Issued {fmt} prefetch for layer {first_layer_idx} bulk tensors");
+        } else {
             let proj_names = if prequantized {
                 vec!["gate_proj.weight_packed", "gate_proj.weight_scale",
                      "up_proj.weight_packed", "up_proj.weight_scale",
@@ -1977,21 +2029,6 @@ impl WeightStore {
                 }
             }
             log::info!("Issued MADV_WILLNEED prefetch for layer {first_layer_idx} experts");
-        } else {
-            // MXFP4: prefetch bulk tensors for first layer
-            let first_layer_idx = start_moe_layer + config.first_k_dense_replace;
-            for suffix in &["gate_up_proj_blocks", "gate_up_proj_scales",
-                            "down_proj_blocks", "down_proj_scales"] {
-                let tensor_name = format!(
-                    "{layers_prefix}.layers.{first_layer_idx}.mlp.experts.{suffix}"
-                );
-                if let Some(shard_name) = index.weight_map.get(&tensor_name) {
-                    if let Some(shard) = shards.get(shard_name) {
-                        shard.prefetch_tensor(&tensor_name);
-                    }
-                }
-            }
-            log::info!("Issued MXFP4 prefetch for layer {first_layer_idx} bulk tensors");
         }
 
         // Stream routed experts layer by layer
@@ -2003,6 +2040,11 @@ impl WeightStore {
             let io_start = std::time::Instant::now();
             let expert_data: Vec<ExpertWeights> = if mxfp4 {
                 load_mxfp4_layer_experts(
+                    layer_idx, &layers_prefix, &index.weight_map, &shards,
+                    config, effective_group_size, gpu_bits,
+                )?
+            } else if stacked {
+                load_stacked_layer_experts(
                     layer_idx, &layers_prefix, &index.weight_map, &shards,
                     config, effective_group_size, gpu_bits,
                 )?
@@ -2044,9 +2086,14 @@ impl WeightStore {
             let next_moe_idx = moe_idx + 1;
             if next_moe_idx < start_moe_layer + num_moe_layers {
                 let next_layer_idx = next_moe_idx + config.first_k_dense_replace;
-                if mxfp4 {
-                    for suffix in &["gate_up_proj_blocks", "gate_up_proj_scales",
-                                    "down_proj_blocks", "down_proj_scales"] {
+                if stacked || mxfp4 {
+                    let suffixes: &[&str] = if stacked {
+                        &["gate_up_proj", "down_proj"]
+                    } else {
+                        &["gate_up_proj_blocks", "gate_up_proj_scales",
+                          "down_proj_blocks", "down_proj_scales"]
+                    };
+                    for suffix in suffixes {
                         let tensor_name = format!(
                             "{layers_prefix}.layers.{next_layer_idx}.mlp.experts.{suffix}"
                         );
@@ -2551,7 +2598,8 @@ impl WeightStore {
         // Detect prefix and quantization format
         let layers_prefix = detect_expert_prefix(&index.weight_map)?;
         let mxfp4 = is_mxfp4(&index.weight_map);
-        let prequantized = !mxfp4 && is_prequantized(&index.weight_map);
+        let stacked = !mxfp4 && is_stacked_experts(&index.weight_map);
+        let prequantized = !mxfp4 && !stacked && is_prequantized(&index.weight_map);
         let effective_group_size = if prequantized {
             let probe_layer = start_moe_layer + config.first_k_dense_replace;
             let native_gs = detect_prequant_group_size(
@@ -2581,6 +2629,9 @@ impl WeightStore {
         if mxfp4 {
             log::info!("Detected MXFP4 experts — will dequant to BF16 then quantize to CPU INT{cpu_num_bits}");
         }
+        if stacked {
+            log::info!("Detected stacked expert format (gate_up_proj [E, 2*I, H] + down_proj [E, H, I])");
+        }
 
         // Create cache directory + temp file
         if let Some(parent) = cache_path.parent() {
@@ -2606,6 +2657,11 @@ impl WeightStore {
             let io_start = std::time::Instant::now();
             let expert_data: Vec<ExpertWeights> = if mxfp4 {
                 load_mxfp4_layer_experts(
+                    layer_idx, &layers_prefix, &index.weight_map, &shards,
+                    config, effective_group_size, cpu_num_bits,
+                )?
+            } else if stacked {
+                load_stacked_layer_experts(
                     layer_idx, &layers_prefix, &index.weight_map, &shards,
                     config, effective_group_size, cpu_num_bits,
                 )?
@@ -3210,7 +3266,11 @@ impl WeightStore {
             .map_err(|e| format!("Failed to read config.json: {e}"))?;
         let raw_json: serde_json::Value = serde_json::from_str(&config_str)
             .map_err(|e| format!("Failed to parse config.json: {e}"))?;
-        let config = ModelConfig::from_json(&raw_json)
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let index_json: Option<serde_json::Value> = std::fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        let config = ModelConfig::from_json_with_index(&raw_json, index_json.as_ref())
             .map_err(|e| format!("Failed to extract MoE config: {e}"))?;
 
         log::info!(
@@ -4589,7 +4649,12 @@ fn detect_expert_prefix(weight_map: &HashMap<String, String>) -> Result<String, 
     for key in weight_map.keys() {
         if let Some(pos) = key.find(".layers.") {
             if key.contains(".mlp.experts.") {
-                return Ok(key[..pos].to_string());
+                let prefix = &key[..pos];
+                // Skip MTP (multi-token prediction) weights — not real model layers
+                if prefix == "mtp" || prefix.ends_with(".mtp") {
+                    continue;
+                }
+                return Ok(prefix.to_string());
             }
         }
     }
@@ -4600,6 +4665,15 @@ fn detect_expert_prefix(weight_map: &HashMap<String, String>) -> Result<String, 
 /// Returns true if pre-quantized (weight_packed tensors found).
 fn is_prequantized(weight_map: &HashMap<String, String>) -> bool {
     weight_map.keys().any(|k| k.ends_with(".weight_packed"))
+}
+
+/// Detect stacked expert format (Qwen3.5).
+/// These models store all experts in stacked 3D tensors per layer:
+///   experts.gate_up_proj [E, 2*inter, hidden]
+///   experts.down_proj [E, hidden, inter]
+/// Instead of per-expert: experts.{E}.gate_proj.weight [inter, hidden]
+fn is_stacked_experts(weight_map: &HashMap<String, String>) -> bool {
+    weight_map.keys().any(|k| k.ends_with(".mlp.experts.gate_up_proj"))
 }
 
 /// Detect MXFP4 pre-quantized format (GPT OSS).
@@ -5012,6 +5086,85 @@ fn load_and_quantize_expert(
         let d = load_int8("down_proj")?;
         Ok((g, u, d))
     }
+}
+
+/// Load all experts from stacked 3D tensors (Qwen3.5 format) and quantize.
+///
+/// Stacked format: experts.gate_up_proj [E, 2*inter, hidden], experts.down_proj [E, hidden, inter]
+/// Splits gate_up into separate gate [inter, hidden] and up [inter, hidden] per expert.
+fn load_stacked_layer_experts(
+    layer_idx: usize,
+    layers_prefix: &str,
+    weight_map: &HashMap<String, String>,
+    shards: &HashMap<String, MmapSafetensors>,
+    config: &ModelConfig,
+    group_size: usize,
+    num_bits: u8,
+) -> Result<Vec<ExpertWeights>, String> {
+    let n_experts = config.n_routed_experts;
+    let inter = config.moe_intermediate_size;
+    let hidden = config.hidden_size;
+
+    // Load stacked gate_up_proj [E, 2*inter, hidden]
+    let gu_name = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.gate_up_proj");
+    let gu_shard_name = weight_map.get(&gu_name)
+        .ok_or_else(|| format!("Stacked tensor not found: {gu_name}"))?;
+    let gu_shard = shards.get(gu_shard_name)
+        .ok_or_else(|| format!("Shard not loaded: {gu_shard_name}"))?;
+    let gu_info = gu_shard.tensor_info(&gu_name)
+        .ok_or_else(|| format!("Tensor not in shard: {gu_name}"))?;
+    if gu_info.shape.len() != 3 || gu_info.shape[0] != n_experts {
+        return Err(format!("gate_up_proj shape mismatch: expected [{n_experts}, {}, {hidden}], got {:?}",
+            2 * inter, gu_info.shape));
+    }
+    let gu_data: &[u16] = gu_shard.tensor_as_slice(&gu_name)
+        .map_err(|e| format!("Failed to read {gu_name}: {e}"))?;
+
+    // Load stacked down_proj [E, hidden, inter]
+    let dp_name = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.down_proj");
+    let dp_shard_name = weight_map.get(&dp_name)
+        .ok_or_else(|| format!("Stacked tensor not found: {dp_name}"))?;
+    let dp_shard = shards.get(dp_shard_name)
+        .ok_or_else(|| format!("Shard not loaded: {dp_shard_name}"))?;
+    let dp_info = dp_shard.tensor_info(&dp_name)
+        .ok_or_else(|| format!("Tensor not in shard: {dp_name}"))?;
+    if dp_info.shape.len() != 3 || dp_info.shape[0] != n_experts {
+        return Err(format!("down_proj shape mismatch: expected [{n_experts}, {hidden}, {inter}], got {:?}",
+            dp_info.shape));
+    }
+    let dp_data: &[u16] = dp_shard.tensor_as_slice(&dp_name)
+        .map_err(|e| format!("Failed to read {dp_name}: {e}"))?;
+
+    // Slice per-expert and quantize
+    let gu_stride = 2 * inter * hidden;  // elements per expert in gate_up
+    let dp_stride = hidden * inter;      // elements per expert in down
+
+    let experts: Vec<ExpertWeights> = (0..n_experts).into_par_iter().map(|eidx| {
+        let gu_start = eidx * gu_stride;
+        let gu_expert = &gu_data[gu_start..gu_start + gu_stride];
+        // Split gate_up [2*inter, hidden] into gate [inter, hidden] and up [inter, hidden]
+        let gate_slice = &gu_expert[..inter * hidden];
+        let up_slice = &gu_expert[inter * hidden..];
+
+        let dp_start = eidx * dp_stride;
+        let down_slice = &dp_data[dp_start..dp_start + dp_stride];
+
+        if num_bits == 4 {
+            ExpertWeights {
+                gate: QuantWeight::Int4(quantize_int4(gate_slice, inter, hidden, group_size)),
+                up: QuantWeight::Int4(quantize_int4(up_slice, inter, hidden, group_size)),
+                down: QuantWeight::Int4(quantize_int4(down_slice, hidden, inter, group_size)),
+            }
+        } else {
+            ExpertWeights {
+                gate: QuantWeight::Int8(quantize_int8(gate_slice, inter, hidden, group_size)),
+                up: QuantWeight::Int8(quantize_int8(up_slice, inter, hidden, group_size)),
+                down: QuantWeight::Int8(quantize_int8(down_slice, hidden, inter, group_size)),
+            }
+        }
+    }).collect();
+
+    Ok(experts)
 }
 
 #[cfg(test)]

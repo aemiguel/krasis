@@ -11,10 +11,57 @@ logger = logging.getLogger(__name__)
 class Tokenizer:
     """Wraps HuggingFace tokenizer with chat template formatting."""
 
+    # DeepSeek-V2/V2-Lite chat format (plain text User:/Assistant:)
+    _DEEPSEEK_CHAT_TEMPLATE = (
+        "{% if not add_generation_prompt is defined %}"
+        "{% set add_generation_prompt = false %}{% endif %}"
+        "{{ bos_token }}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'user' %}"
+        "{{ 'User: ' + message['content'] + '\n\n' }}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ 'Assistant: ' + message['content'] + eos_token }}"
+        "{% elif message['role'] == 'system' %}"
+        "{{ message['content'] + '\n\n' }}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{ 'Assistant:' }}"
+        "{% endif %}"
+    )
+
+    # DeepSeek-VL2 chat format (special <|User|>/<|Assistant|> tokens)
+    _DEEPSEEK_VL2_CHAT_TEMPLATE = (
+        "{% if not add_generation_prompt is defined %}"
+        "{% set add_generation_prompt = false %}{% endif %}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'user' %}"
+        "{{ '<|User|>' + message['content'] + '\n\n' }}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|Assistant|>' + message['content'] + eos_token }}"
+        "{% elif message['role'] == 'system' %}"
+        "{{ message['content'] + '\n\n' }}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{ '<|Assistant|>' }}"
+        "{% endif %}"
+    )
+
     def __init__(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=True
         )
+        # Set fallback chat template if model doesn't have one
+        if not getattr(self.tokenizer, "chat_template", None):
+            # Detect VL2-style models: they have <|User|> as a special token
+            vocab = self.tokenizer.get_vocab()
+            if "<|User|>" in vocab and "<|Assistant|>" in vocab:
+                self.tokenizer.chat_template = self._DEEPSEEK_VL2_CHAT_TEMPLATE
+                logger.info("No chat template found — using DeepSeek-VL2 format (<|User|>/<|Assistant|> tokens)")
+            else:
+                self.tokenizer.chat_template = self._DEEPSEEK_CHAT_TEMPLATE
+                logger.info("No chat template found — using DeepSeek format fallback")
         logger.info(
             "Tokenizer loaded: vocab=%d, eos=%d, bos=%d",
             self.tokenizer.vocab_size,
@@ -34,13 +81,27 @@ class Tokenizer:
         self,
         messages: List[Dict[str, str]],
         add_generation_prompt: bool = True,
+        **kwargs,
     ) -> List[int]:
         """Format messages using the model's chat template and tokenize."""
-        result = self.tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=add_generation_prompt,
-            tokenize=True,
-        )
+        try:
+            result = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True,
+                **kwargs,
+            )
+        except (TypeError, Exception) as e:
+            # Some templates don't accept extra kwargs (enable_thinking, etc.)
+            if kwargs:
+                logger.debug("Chat template failed with kwargs %s, retrying without: %s", list(kwargs), e)
+                result = self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=add_generation_prompt,
+                    tokenize=True,
+                )
+            else:
+                raise
         return self._ensure_int_list(result)
 
     def _ensure_int_list(self, result) -> List[int]:

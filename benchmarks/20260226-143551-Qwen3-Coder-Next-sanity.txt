@@ -1,0 +1,102 @@
+Sanity Test: Qwen3-Coder-Next @ http://localhost:8012
+Date: 2026-02-26T14:35:51.866771
+
+--- Prompt 1/7 ---
+PROMPT: Hi
+RESPONSE: Hello! How can I help you today? ��
+TIME: 2.8s, ~8 tok, ~2.9 tok/s
+
+--- Prompt 2/7 ---
+PROMPT: who trained you?
+RESPONSE: I am a large-scale language model developed by the Tongyi Lab team at Alibaba Group. My name is Qwen. I was trained using a vast amount of text data from the internet (with copyright compliance), and my training was conducted by the Tongyi Lab team at Alibaba Group. If you have any questions or need assistance, feel free to let me know anytime! ��
+TIME: 7.5s, ~87 tok, ~11.6 tok/s
+
+--- Prompt 3/7 ---
+PROMPT: What is 2+2?
+RESPONSE: 2 + 2 = **4**. ��
+TIME: 2.1s, ~4 tok, ~1.9 tok/s
+
+--- Prompt 4/7 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: The **blue whale** (*Balaenoptera musculus*) is the largest animal known to have ever lived on Earth.
+
+- **Length**: Up to **30 meters** (about 98 feet), with some historical reports suggesting individuals over 33 meters (108 feet).
+- **Weight**: Up to an estimated **173 tonnes** (190 short tons), though most adults average around **100–120 tonnes**.
+
+Blue whales are not only the largest animals alive today—they are the **largest animals to have ever existed**, surpassing even the largest dinosaurs.
+
+They feed almost exclusively on tiny crustaceans called **krill**, consuming up to 4 tons per day during feeding season.
+
+Let me know if you'd like more details about their biology, behavior, or conservation status! ���
+TIME: 16.3s, ~181 tok, ~11.1 tok/s
+
+--- Prompt 5/7 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: The **Pacific Ocean** is the largest body of water in the world.
+
+- **Area**: Approximately 165.25 million square kilometers (63,800,000 square miles).  
+- It covers about 30% of Earth’s surface and more than half of the Earth’s total oceanic area.  
+- It’s also the deepest ocean, with the Mariana Trench—the deepest known point on Earth—reaching about 10,984 meters (35,987 feet) at the Challenger Deep.
+
+Let me know if you’d like more details! ��
+TIME: 11.6s, ~112 tok, ~9.6 tok/s
+
+--- Prompt 6/7 ---
+PROMPT: Write me a poem
+RESPONSE: Here’s a poem for you—**"The Quiet Hour"**—a moment of stillness in a busy world:
+
+---
+
+**The Quiet Hour**  
+
+The clock ticks soft, a metronome of grace,  
+while sunlight pools on floorboards, warm and deep.  
+The world outside hums—distant, busy, loud—  
+but here, the air holds its breath, and waits.  
+
+A teacup steams, its lavender scent  
+curling like a question into the hush.  
+A sparrow taps the windowpane—  
+*Is anyone home?*  
+
+The cat stretches, arches,  
+then settles into the lap of a chair  
+that remembers your shape.  
+Outside, wind stirs the maple’s green fire—  
+but here, inside,  
+time unclenches its fist.  
+
+You do not need to *do* anything.  
+You are not late.  
+You are not behind.  
+The kettle sighs. The light shifts.  
+And for this one, tender moment,  
+you are not *waiting* for anything.  
+You are simply  
+*here.*  
+
+—  
+
+Let me know if you’d like another—perhaps one about the sea, a season, or a different mood. I’m here to write with you. ���
+TIME: 21.3s, ~244 tok, ~11.5 tok/s
+
+--- Prompt 7/7 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: This is a classic riddle that tests understanding of **independent drying**.
+
+### Key Insight:
+Drying time for towels in the sun **does not depend on the number of towels**, as long as they're all exposed to the sun and have space to dry (i.e., no shading or crowding). Each towel dries independently.
+
+> Given: 4 towels take 4 hours to dry.
+
+That means **each towel** takes 4 hours to dry — regardless of how many are drying at once (assuming they’re not blocking each other’s sun exposure).
+
+So, if you put **20 towels** out in the sun (properly spaced, not shading each other), **each still takes 4 hours to dry**.
+
+✅ **Answer: 4 hours.**
+
+> ��� **Assumption**: All towels are laid out so they all get equal sun exposure (no shading). If they’re piled or crowded, drying time could increase — but the question implies ideal conditions.
+
+Let me know if you'd like to explore variations (e.g., limited line space)! ��
+TIME: 18.6s, ~229 tok, ~12.3 tok/s
+
