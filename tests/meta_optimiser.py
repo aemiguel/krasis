@@ -5,7 +5,7 @@ Phase 1: Test GPU prefill strategies with a large prompt (~10K tokens)
 Phase 2: Test decode strategies with a short prompt + 64 generated tokens
 
 All instrumentation is OFF during benchmarking for accurate measurements.
-Results saved to {model_path}/.krasis_cache/meta_optimiser.json
+Results saved to ~/.krasis/cache/<model_name>/meta_optimiser.json
 """
 
 import gc
@@ -28,6 +28,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from krasis.model import KrasisModel
+from krasis.config import cache_dir_for_model
 from krasis.timing import TIMING
 
 # ══════════════════════════════════════════════════════════════════
@@ -458,7 +459,7 @@ class MetaOptimiser:
 
     def _save_results(self):
         """Save results to disk."""
-        cache_dir = os.path.join(self.model_path, ".krasis_cache")
+        cache_dir = cache_dir_for_model(self.model_path)
         os.makedirs(cache_dir, exist_ok=True)
         save_path = os.path.join(cache_dir, "meta_optimiser.json")
         with open(save_path, "w") as f:

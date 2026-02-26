@@ -23,7 +23,7 @@ import torch
 
 from krasis.timing import TIMING
 
-from krasis.config import ModelConfig, PPRankConfig, QuantConfig, build_pp_ranks, compute_pp_partition
+from krasis.config import ModelConfig, PPRankConfig, QuantConfig, build_pp_ranks, compute_pp_partition, cache_dir_for_model
 from krasis.weight_loader import WeightLoader, int8_linear
 from krasis.layer import TransformerLayer
 from krasis.kv_cache import PagedKVCache, SequenceKVState
@@ -545,9 +545,9 @@ class KrasisModel:
         cpu_start = time.perf_counter()
         cpu_bits = self.quant_cfg.cpu_expert_bits
         gpu_bits = self.quant_cfg.gpu_expert_bits
-        cache_dir = os.path.join(self.cfg.model_path, ".krasis_cache")
-        has_gpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_marlin_g128.bin"))
-        has_cpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_cpu_{cpu_bits}_g128.bin"))
+        cache_dir = cache_dir_for_model(self.cfg.model_path)
+        has_gpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_marlin_int{gpu_bits}_g128.bin"))
+        has_cpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_cpu_int{cpu_bits}_g128.bin"))
         if has_gpu_cache and has_cpu_cache:
             print(f"\n\033[1m\033[36m▸ Loading expert weights from cache (this loads the full model into RAM, may take a minute)\033[0m", flush=True)
         else:

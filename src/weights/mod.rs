@@ -3,8 +3,8 @@
 //! Loads expert weights from HF safetensors format, quantizes to INT4,
 //! and stores in memory for CPU inference and GPU prefill.
 //!
-//! Disk cache: after first quantization, saves packed INT4 + scales to
-//! `.krasis_cache/experts_int4_g{group_size}.bin` for instant loading.
+//! Disk cache: after first quantization, saves packed weights + scales to
+//! `~/.krasis/cache/<model_name>/` for instant loading.
 
 pub mod marlin;
 pub mod safetensors_io;
@@ -871,39 +871,42 @@ fn fnv1a(data: &[u8]) -> u64 {
     h
 }
 
+/// Resolve the cache directory for a model: `~/.krasis/cache/<model_folder_name>/`.
+/// Falls back to `<model_dir>/.krasis_cache/` if HOME is not set.
+fn cache_dir_for_model(model_dir: &Path) -> PathBuf {
+    let model_name = model_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown_model".to_string());
+    if let Ok(home) = std::env::var("HOME") {
+        Path::new(&home).join(".krasis").join("cache").join(&model_name)
+    } else {
+        model_dir.join(".krasis_cache")
+    }
+}
+
 /// Cache file path for v1 format (separate gate/up/down, [N, K/8] layout).
 #[allow(dead_code)]
 fn cache_path(model_dir: &Path, num_bits: u8, group_size: usize) -> PathBuf {
-    model_dir
-        .join(".krasis_cache")
+    cache_dir_for_model(model_dir)
         .join(format!("experts_int{num_bits}_g{group_size}.bin"))
 }
 
-/// Cache file path for v3 Marlin format (GPU-native Marlin INT4).
+/// Cache file path for Marlin format (GPU-native Marlin INT4/INT8).
 fn cache_path_marlin(model_dir: &Path, group_size: usize, gpu_bits: u8) -> PathBuf {
-    if gpu_bits == 4 {
-        // Backward compatible with existing INT4 caches
-        model_dir
-            .join(".krasis_cache")
-            .join(format!("experts_marlin_g{group_size}.bin"))
-    } else {
-        model_dir
-            .join(".krasis_cache")
-            .join(format!("experts_marlin_{gpu_bits}b_g{group_size}.bin"))
-    }
+    cache_dir_for_model(model_dir)
+        .join(format!("experts_marlin_int{gpu_bits}_g{group_size}.bin"))
 }
 
 /// Cache file path for CPU-optimized transposed format (INT4 or INT8).
 fn cache_path_cpu(model_dir: &Path, num_bits: u8, group_size: usize) -> PathBuf {
-    model_dir
-        .join(".krasis_cache")
+    cache_dir_for_model(model_dir)
         .join(format!("experts_cpu_int{num_bits}_g{group_size}.bin"))
 }
 
 /// Cache file path for GGUF-sourced AVX2 transposed CPU cache.
 fn cache_path_gguf_avx2(model_dir: &Path, group_size: usize) -> PathBuf {
-    model_dir
-        .join(".krasis_cache")
+    cache_dir_for_model(model_dir)
         .join(format!("experts_gguf_avx2_g{group_size}.bin"))
 }
 

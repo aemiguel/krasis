@@ -25,6 +25,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 from krasis.model import KrasisModel
+from krasis.config import cache_dir_for_model
 from krasis.auto_optimise import auto_optimise_or_load
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "DeepSeek-V2-Lite")
@@ -66,7 +67,7 @@ def main():
 
     # Delete any existing auto_optimise.json to force a fresh run
     # (we want to benchmark from scratch for each GPU config)
-    cache_file = os.path.join(MODEL_PATH, ".krasis_cache", "auto_optimise.json")
+    cache_file = os.path.join(cache_dir_for_model(MODEL_PATH), "auto_optimise.json")
     if args.force and os.path.exists(cache_file):
         os.remove(cache_file)
         print(f"Removed cached results: {cache_file}")

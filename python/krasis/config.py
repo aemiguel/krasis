@@ -6,6 +6,35 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
+def cache_dir_for_model(model_path: str) -> str:
+    """Return the cache directory for a model: ~/.krasis/cache/<model_folder_name>/.
+
+    On first call, migrates any existing .krasis_cache/ from the model directory
+    to the new location, renaming GPU Marlin files to include explicit quantization.
+    """
+    model_name = os.path.basename(os.path.normpath(model_path))
+    home = os.path.expanduser("~")
+    new_dir = os.path.join(home, ".krasis", "cache", model_name)
+    old_dir = os.path.join(model_path, ".krasis_cache")
+    if os.path.isdir(old_dir) and not os.path.isdir(new_dir):
+        os.makedirs(new_dir, exist_ok=True)
+        import shutil
+        for name in os.listdir(old_dir):
+            # Rename GPU Marlin files to include explicit int4/int8
+            new_name = name
+            if name.startswith("experts_marlin_") and "int" not in name:
+                if "_8b_" in name:
+                    new_name = name.replace("experts_marlin_8b_", "experts_marlin_int8_")
+                else:
+                    new_name = name.replace("experts_marlin_", "experts_marlin_int4_")
+            src = os.path.join(old_dir, name)
+            dst = os.path.join(new_dir, new_name)
+            shutil.move(src, dst)
+        os.rmdir(old_dir)
+        print(f"\033[33m▸ Migrated cache: {old_dir} → {new_dir}\033[0m", flush=True)
+    return new_dir
+
+
 @dataclass
 class QuantConfig:
     """Per-component quantization config for GPU weights.

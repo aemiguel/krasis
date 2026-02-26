@@ -26,6 +26,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 from krasis.model import KrasisModel
+from krasis.config import cache_dir_for_model
 from krasis.auto_optimise import auto_optimise_or_load
 
 
@@ -78,7 +79,7 @@ def main():
     print(f"Model loaded in {t_load:.1f}s")
 
     # Delete cached results if --force
-    cache_file = os.path.join(model_path, ".krasis_cache", "auto_optimise.json")
+    cache_file = os.path.join(cache_dir_for_model(model_path), "auto_optimise.json")
     if args.force and os.path.exists(cache_file):
         os.remove(cache_file)
         print(f"Removed cached results: {cache_file}")

@@ -26,7 +26,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from krasis.config import QuantConfig
+from krasis.config import QuantConfig, cache_dir_for_model
 from krasis.model import KrasisModel
 from krasis.scheduler import GenerationRequest, Scheduler
 
@@ -97,7 +97,7 @@ async def reload_hcs(request: Request):
     if manager is None:
         manager = list(_model.gpu_prefill_managers.values())[0]
     heatmap_path = _os.path.join(
-        _model.cfg.model_path, ".krasis_cache", "auto_heatmap.json"
+        cache_dir_for_model(_model.cfg.model_path), "auto_heatmap.json"
     )
 
     # Unified budget logic for every GPU — capture devices before clear_hcs
@@ -397,8 +397,7 @@ def _remove_registry() -> None:
     if _registry_file is not None:
         try:
             _registry_file.unlink(missing_ok=True)
-            logger.info("Registry entry removed: %s", _registry_file)
-        except OSError:
+        except Exception:
             pass
         _registry_file = None
 
@@ -637,7 +636,7 @@ def main():
     _model.load()
 
     # Resolve heatmap: cached > build
-    cache_dir = os.path.join(args.model_path, ".krasis_cache")
+    cache_dir = cache_dir_for_model(args.model_path)
     heatmap_path = args.heatmap_path
     if not heatmap_path:
         heatmap_path = os.path.join(cache_dir, "auto_heatmap.json")
@@ -974,7 +973,7 @@ def main():
     max_ctx = _model.get_max_context_tokens()
     _status(f"Server ready on {args.host}:{args.port}")
     print(f"  {_DIM}KV cache: {args.kv_cache_mb:,} MB → {max_ctx:,} max context tokens{_NC}", flush=True)
-    print(f"  {_DIM}Press Q to quit, Ctrl-C to force exit{_NC}", flush=True)
+    print(f"  {_DIM}Press Q or Ctrl-C to stop{_NC}", flush=True)
     logger.info(
         "Model loaded, starting server on %s:%d (max context: %d tokens)",
         args.host, args.port, max_ctx,
@@ -989,19 +988,31 @@ def main():
     # Use uvicorn.Server directly so we can patch handle_exit.
     # Default uvicorn graceful shutdown waits for active connections,
     # but generation threads block in Rust/CUDA and never finish.
+    _shutting_down = False
     config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
     server = uvicorn.Server(config)
 
     def _handle_exit(sig, frame):
-        if server.should_exit:
-            # Second Ctrl-C — force kill immediately
+        nonlocal _shutting_down
+        if _shutting_down:
+            # Second Ctrl-C — force kill immediately (no logging in signal handler)
             _remove_registry()
-            logger.info("Forcing exit...")
             os._exit(0)
-        # First Ctrl-C — tell uvicorn to stop, skip waiting for connections
+        # First Ctrl-C — tell uvicorn to stop, skip waiting for connections.
+        _shutting_down = True
         server.should_exit = True
         server.force_exit = True
-        logger.info("Shutting down (press Ctrl-C again to force)...")
+        # Suppress all output during teardown to avoid "reentrant call
+        # inside buffered writer" and noisy asyncio/uvicorn exceptions.
+        # We'll print a clean message via os.write() which is signal-safe.
+        try:
+            sys.stderr = open(os.devnull, "w")
+            sys.stdout = open(os.devnull, "w")
+            logging.disable(logging.CRITICAL)
+        except Exception:
+            pass
+        # os.write is async-signal-safe (no buffered writer involved)
+        os.write(1, f"\n{_BOLD}{_GREEN}Server stopped.{_NC}\n".encode())
 
     server.handle_exit = _handle_exit
     signal.signal(signal.SIGINT, _handle_exit)
@@ -1015,9 +1026,7 @@ def main():
                 if select.select([sys.stdin], [], [], 0.5)[0]:
                     ch = sys.stdin.read(1)
                     if ch in ("q", "Q"):
-                        logger.info("'Q' pressed — shutting down...")
-                        server.should_exit = True
-                        server.force_exit = True
+                        _handle_exit(None, None)
                         break
         except (OSError, ValueError):
             pass  # stdin closed or not a tty
@@ -1026,6 +1035,11 @@ def main():
         t.start()
 
     server.run()
+
+    # ── Clean exit before Python teardown triggers cascading errors ──
+    _remove_registry()
+    _cleanup_cuda()
+    os._exit(0)
 
 
 if __name__ == "__main__":
