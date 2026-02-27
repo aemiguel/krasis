@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-27 08:55:41
+Krasis Benchmark — 2026-02-27 09:09:41
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -25,16 +25,16 @@ Strategy:
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
 Prefill (3 runs at different lengths):
-  Run 1:  1003.0 tok/s, TTFT=19.94s (20,000 tokens)
-  Run 2:  900.8 tok/s, TTFT=38.86s (35,000 tokens)
-  Run 3:  799.9 tok/s, TTFT=62.51s (50,000 tokens)
-  Best:    1003.0 tok/s, TTFT=19.94s (20,000 tokens)
+  Run 1:  839.1 tok/s, TTFT=24.35s (20,434 tokens)
+  Run 2:  749.9 tok/s, TTFT=46.86s (35,139 tokens)
+  Run 3:  799.7 tok/s, TTFT=62.35s (49,863 tokens)
+  Best:    839.1 tok/s, TTFT=24.35s (20,434 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  12.55 tok/s (79.7ms/tok)
-  Run 2:  11.32 tok/s (88.3ms/tok)
-  Run 3:  15.04 tok/s (66.5ms/tok)
-  Average: 12.97 tok/s (78.2ms/tok)
+  Run 1:  15.66 tok/s (63.9ms/tok)
+  Run 2:  12.17 tok/s (82.1ms/tok)
+  Run 3:  11.94 tok/s (83.8ms/tok)
+  Average: 13.26 tok/s (76.6ms/tok)
 
 Verification:
   Prefill prompt: Summarise the following in one paragraph: THE COUNT OF MONTE CRISTO
@@ -53,7 +53,13 @@ Chapter 2. Father and Son
 Chapter 3. The Cat... [77314 chars total]
   Decode prompt:  Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
   Generated output (64 tokens):
-    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys: a **public key** (freely shared) and a **private key** (kept secret). Unlike symmetric-key cryptography (where the same key encrypts and decrypts), here, encryption
+    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys—**a public key** and a **private key**—to enable secure communication without requiring the parties to share a secret key beforehand.
+    
+    ---
+    
+    ### 🔑 Core Concepts
+    
+    #### 1.
 ================================================================
 
 ────────────────────────────────────────────────────────────────
@@ -61,12 +67,12 @@ Chapter 3. The Cat... [77314 chars total]
 ────────────────────────────────────────────────────────────────
                                          Engine        Network   Overhead
   ────────────────────────────── ────────────── ────────────── ──────────
-  Prefill (best tok/s)                 1003.0          932.0       -7.1%
-  TTFT (s)                              19.94          21.46     +1520ms
-    20,000 tokens                      1003.0          932.0       -7.1%
-    35,000 tokens                       900.8          724.4      -19.6%
-    50,000 tokens                       799.9          775.0       -3.1%
+  Prefill (best tok/s)                  839.1          908.5       +8.3%
+  TTFT (s)                              24.35          22.01     -2340ms
+    20,434 tokens                       839.1          908.5       +8.3%
+    35,139 tokens                       749.9          708.4       -5.5%
+    49,863 tokens                       799.7          774.1       -3.2%
 
-  Decode (avg tok/s)                    12.97          12.13       -6.5%
-  Decode (ms/tok)                        78.2           82.6      +4.4ms
+  Decode (avg tok/s)                    13.26          13.05       -1.6%
+  Decode (ms/tok)                        76.6           76.7      +0.1ms
 ────────────────────────────────────────────────────────────────
