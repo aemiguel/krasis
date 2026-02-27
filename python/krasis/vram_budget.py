@@ -586,9 +586,10 @@ def compute_launcher_budget(
                               ram_decode_lmhead_bytes + ram_decode_norms_bytes +
                               ram_decode_routing_bytes + ram_decode_shared_bytes)
 
-    # ── CPU KV cache: preallocated for decode (FP16, default 32K tokens) ──
+    # ── CPU KV cache: preallocated for decode (FP16, matches GPU KV allocation) ──
     # CPU KV cache uses FP16 (2 bytes per element), converted from GPU FP8 via F16C
-    kv_preallocate_tokens = 32768
+    # Token count matches the GPU KV cache capacity (bottleneck rank)
+    kv_preallocate_tokens = min(r["kv_alloc_tokens"] for r in ranks) if ranks else 0
     if is_mla:
         cpu_kv_per_token = (cfg["kv_lora_rank"] + cfg["qk_rope_head_dim"]) * 2  # FP16
     else:

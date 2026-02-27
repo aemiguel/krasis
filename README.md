@@ -6,6 +6,8 @@ You can [contact me here](https://forms.gle/ue4nvyvNNHtUZ7MQ7) but for bugs, dif
 
 If you want to easily monitor Krasis during runs, [check out ktop](https://github.com/brontoguana/ktop).
 
+![Krasis Server](krasis_server.png)
+
 ## Krasis runs MoE LLMs fast on consumer level hardware
 
 Krasis can run MoE language models that are much too large to fit in a consumer GPU (multi-hundred gigabyte modesl with 100 - 500+ billion parameters) on consumer or accessible server hardware you can actually buy without a second mortgage and your own personal power station. 

@@ -1123,6 +1123,7 @@ class Launcher:
                     vram_mb = rank.get(vkey, 0)
                 elif opt.key == "kv_cache_mb":
                     vram_mb = self.cfg.kv_cache_mb
+                    ram_mb = b.get("ram_cpu_kv_mb", 0)
                 rkey = _ram_map.get(opt.key)
                 if rkey:
                     ram_mb = b.get(rkey, 0)
