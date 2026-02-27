@@ -22,8 +22,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "uvicorn>=0.20",
-    "fastapi>=0.100",
     "safetensors>=0.4",
     "numpy>=1.24",
     "transformers>=4.40",

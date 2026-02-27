@@ -1,14 +1,11 @@
-"""FastAPI HTTP server — OpenAI-compatible /v1/chat/completions.
-
-Supports streaming (SSE) and blocking responses.
+"""Krasis LLM server — Rust HTTP server with Python GPU prefill.
 
 Usage:
-    python -m krasis.server --model-path /path/to/Kimi-K2.5 --pp-partition 31,30
+    python -m krasis.server --model-path /path/to/model
 """
 
 import argparse
 import atexit
-import asyncio
 import gc
 import json
 import logging
@@ -18,17 +15,11 @@ import signal
 import sys
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import List, Optional
 
-import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-
 from krasis.config import QuantConfig, cache_dir_for_model
 from krasis.model import KrasisModel
-from krasis.scheduler import GenerationRequest, Scheduler
 
 logger = logging.getLogger("krasis.server")
 
@@ -45,271 +36,8 @@ def _status(label: str) -> None:
     print(f"\n{_BOLD}{_CYAN}▸ {label}{_NC}", flush=True)
     logger.info("── %s ──", label)
 
-app = FastAPI(title="Krasis", version="0.1.0")
-_scheduler: Optional[Scheduler] = None
 _model: Optional[KrasisModel] = None
 _model_name: str = "unknown"
-
-
-@app.get("/health")
-async def health():
-    if _model is None or not _model._loaded:
-        return JSONResponse({"status": "loading"}, status_code=503)
-    max_ctx = _model.get_max_context_tokens() if _model else 0
-    return {"status": "ok", "max_context_tokens": max_ctx}
-
-
-@app.post("/v1/timing")
-async def toggle_timing(request: Request):
-    """Toggle timing flags at runtime. POST with {"prefill": true/false, "decode": true/false}."""
-    from krasis.timing import TIMING
-    body = await request.json()
-    result = {}
-    if "prefill" in body:
-        TIMING.prefill = bool(body["prefill"])
-        result["prefill"] = TIMING.prefill
-    if "decode" in body:
-        TIMING.decode = bool(body["decode"])
-        result["decode"] = TIMING.decode
-    if "diag" in body:
-        TIMING.diag = bool(body["diag"])
-        result["diag"] = TIMING.diag
-    if not result:
-        result = {"prefill": TIMING.prefill, "decode": TIMING.decode, "diag": TIMING.diag}
-    logger.info("Timing flags: prefill=%s decode=%s diag=%s", TIMING.prefill, TIMING.decode, TIMING.diag)
-    return result
-
-
-@app.post("/v1/hcs/reload")
-async def reload_hcs(request: Request):
-    """Reload HCS with a different allocation mode. POST with {"mode": "greedy"|"uniform"}."""
-    body = await request.json()
-    mode = body.get("mode", "uniform")
-    if mode not in ("greedy", "uniform"):
-        return {"error": f"Unknown mode: {mode}. Use 'greedy' or 'uniform'."}
-
-    import os as _os
-    import torch
-
-    # Use the primary (GPU0) manager which owns HCS state
-    primary_dev = torch.device("cuda:0")
-    manager = _model.gpu_prefill_managers.get(str(primary_dev))
-    if manager is None:
-        manager = list(_model.gpu_prefill_managers.values())[0]
-    heatmap_path = _os.path.join(
-        cache_dir_for_model(_model.cfg.model_path), "auto_heatmap.json"
-    )
-
-    # Unified budget logic for every GPU — capture devices before clear_hcs
-    devices = [hcs_dev.device for hcs_dev in manager._hcs_devices]
-    if not devices:
-        devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
-    device_budgets = {}
-    for hcs_dev in manager._hcs_devices:
-        free = torch.cuda.mem_get_info(hcs_dev.device)[0]
-        # Add back current HCS usage on this device
-        hcs_vram = sum(
-            b["w13"].nbytes + b["w13_scale"].nbytes + b["w2"].nbytes + b["w2_scale"].nbytes
-            for b in hcs_dev.buffers.values()
-        )
-        # Primary needs ~1 GB headroom for inference; others are pure storage
-        headroom = 1000 if hcs_dev.is_primary else 300
-        device_budgets[hcs_dev.device] = max(0, (free + hcs_vram) // (1024 * 1024) - headroom)
-
-    manager.clear_hcs()
-    torch.cuda.empty_cache()
-    manager._init_hot_cached_static(
-        heatmap_path=heatmap_path,
-        allocation_mode=mode,
-        devices=devices,
-        device_budgets=device_budgets,
-    )
-
-    # Update model flags for decode routing
-    if len(manager._hcs_devices) > 1 and _model._multi_gpu_hcs:
-        _model._hcs_device = None
-    else:
-        _model._hcs_device = manager._hcs_devices[0].device if manager._hcs_devices else primary_dev
-        _model._multi_gpu_hcs = False
-
-    total_pinned = sum(sum(d.num_pinned.values()) for d in manager._hcs_devices)
-    device_counts = {str(d.device): sum(d.num_pinned.values()) for d in manager._hcs_devices}
-    logger.info(
-        "HCS reloaded: mode=%s, total_experts=%d, counts=%s",
-        mode, total_pinned, device_counts
-    )
-    return {"mode": mode, "total_experts": total_pinned}
-
-
-@app.get("/v1/models")
-async def list_models():
-    return {
-        "object": "list",
-        "data": [{
-            "id": _model_name,
-            "object": "model",
-            "owned_by": "krasis",
-        }],
-    }
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    body = await request.json()
-
-    messages = body.get("messages", [])
-    stream = body.get("stream", False)
-    max_tokens = body.get("max_tokens", 256)
-    temperature = body.get("temperature", 0.6)
-    top_k = body.get("top_k", 50)
-    top_p = body.get("top_p", 0.95)
-    presence_penalty = body.get("presence_penalty", 0.0)
-
-    # Tokenize
-    enable_thinking = body.get("enable_thinking", True)
-    prompt_tokens = _model.tokenizer.apply_chat_template(
-        messages, enable_thinking=enable_thinking
-    )
-    request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-
-    # Check prompt fits in KV cache (with room for at least some generation)
-    max_ctx = _model.get_max_context_tokens()
-    if len(prompt_tokens) >= max_ctx:
-        return JSONResponse({
-            "error": {
-                "message": f"Prompt too long: {len(prompt_tokens):,} tokens exceeds "
-                           f"KV cache capacity of {max_ctx:,} tokens.",
-                "type": "invalid_request_error",
-                "param": "messages",
-                "code": "context_length_exceeded",
-                "prompt_tokens": len(prompt_tokens),
-                "max_context_tokens": max_ctx,
-            }
-        }, status_code=413)
-
-    stop_ids = [_model.cfg.eos_token_id] + list(_model.cfg.extra_stop_token_ids)
-    # Handle custom stop tokens
-    if "stop" in body:
-        stop = body["stop"]
-        if isinstance(stop, str):
-            stop = [stop]
-        for s in stop:
-            ids = _model.tokenizer.encode(s, add_special_tokens=False)
-            stop_ids.extend(ids)
-
-    gen_request = GenerationRequest(
-        request_id=request_id,
-        prompt_tokens=prompt_tokens,
-        max_new_tokens=max_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        stop_token_ids=stop_ids,
-        presence_penalty=presence_penalty,
-    )
-
-    logger.info(
-        "Request %s: %d prompt tokens, max_new=%d, stream=%s",
-        request_id, len(prompt_tokens), max_tokens, stream,
-    )
-
-    if stream:
-        return StreamingResponse(
-            _stream_response(gen_request, request),
-            media_type="text/event-stream",
-        )
-    else:
-        return await _blocking_response(gen_request, request)
-
-
-async def _stream_response(gen_request: GenerationRequest, http_request: Request):
-    """SSE streaming response. Cancels generation on client disconnect."""
-    created = int(time.time())
-
-    # Disconnect monitor: polls the HTTP connection and signals when closed
-    disconnect_event = asyncio.Event()
-
-    async def _disconnect_monitor():
-        while not disconnect_event.is_set():
-            if await http_request.is_disconnected():
-                disconnect_event.set()
-                return
-            await asyncio.sleep(0.5)
-
-    monitor = asyncio.create_task(_disconnect_monitor())
-
-    try:
-        async for output in _scheduler.generate_stream(gen_request, disconnect_event):
-            if disconnect_event.is_set():
-                break
-            chunk = {
-                "id": gen_request.request_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": _model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": output.text} if output.finish_reason is None else {},
-                    "finish_reason": output.finish_reason,
-                }],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n"
-
-        yield "data: [DONE]\n\n"
-    finally:
-        disconnect_event.set()
-        monitor.cancel()
-
-
-async def _blocking_response(gen_request: GenerationRequest, http_request: Request):
-    """Non-streaming response — collect all tokens then return.
-    Cancels generation on client disconnect."""
-    created = int(time.time())
-    chunks = []
-    finish_reason = None
-
-    # Disconnect monitor
-    disconnect_event = asyncio.Event()
-
-    async def _disconnect_monitor():
-        while not disconnect_event.is_set():
-            if await http_request.is_disconnected():
-                disconnect_event.set()
-                return
-            await asyncio.sleep(0.5)
-
-    monitor = asyncio.create_task(_disconnect_monitor())
-
-    try:
-        async for output in _scheduler.generate_stream(gen_request, disconnect_event):
-            if disconnect_event.is_set():
-                finish_reason = "cancelled"
-                break
-            chunks.append(output.text)
-            if output.finish_reason:
-                finish_reason = output.finish_reason
-    finally:
-        disconnect_event.set()
-        monitor.cancel()
-
-    full_text = "".join(chunks)
-
-    return {
-        "id": gen_request.request_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": _model_name,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": full_text},
-            "finish_reason": finish_reason or "stop",
-        }],
-        "usage": {
-            "prompt_tokens": len(gen_request.prompt_tokens),
-            "completion_tokens": len(chunks),
-            "total_tokens": len(gen_request.prompt_tokens) + len(chunks),
-        },
-    }
 
 
 def _build_heatmap(model: KrasisModel, save_path: str) -> str:
@@ -597,9 +325,6 @@ def main():
     parser.add_argument("--perplexity", action="store_true",
                         help="Run perplexity evaluation and exit")
     parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--python-server", action="store_true",
-                        help="Use legacy Python FastAPI/uvicorn server instead of Rust server")
-
     # Apply config file defaults, then parse CLI (CLI wins over config file)
     if config_defaults:
         parser.set_defaults(**config_defaults)
@@ -628,7 +353,7 @@ def main():
 
     logger.info("Logging to %s", _log_file)
 
-    global _model, _scheduler, _model_name
+    global _model, _model_name
     import torch
 
     kv_dtype = torch.float8_e4m3fn if args.kv_dtype == "fp8_e4m3" else torch.bfloat16
@@ -1028,95 +753,49 @@ def main():
     _write_registry(args.host, args.port, _model_name)
     atexit.register(_remove_registry)
 
-    if args.python_server:
-        # ── Legacy Python server (FastAPI/uvicorn) ──
-        _scheduler = Scheduler(_model)
+    # ── Rust HTTP server — Python only for GPU prefill ──
+    from krasis import RustServer
 
-        _shutting_down = False
-        config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
-        server = uvicorn.Server(config)
+    tokenizer_path = os.path.join(args.model_path, "tokenizer.json")
+    rust_server = RustServer(
+        _model,
+        args.host,
+        args.port,
+        _model_name,
+        tokenizer_path,
+        max_ctx,
+    )
 
-        def _handle_exit(sig, frame):
-            nonlocal _shutting_down
-            if _shutting_down:
-                _remove_registry()
-                os._exit(0)
-            _shutting_down = True
-            server.should_exit = True
-            server.force_exit = True
-            try:
-                sys.stderr = open(os.devnull, "w")
-                sys.stdout = open(os.devnull, "w")
-                logging.disable(logging.CRITICAL)
-            except Exception:
-                pass
-            os.write(1, f"\n{_BOLD}{_GREEN}Server stopped.{_NC}\n".encode())
+    def _handle_exit(sig, frame):
+        rust_server.stop()
+        try:
+            sys.stderr = open(os.devnull, "w")
+            sys.stdout = open(os.devnull, "w")
+            logging.disable(logging.CRITICAL)
+        except Exception:
+            pass
+        os.write(1, f"\n{_BOLD}{_GREEN}Server stopped.{_NC}\n".encode())
 
-        server.handle_exit = _handle_exit
-        signal.signal(signal.SIGINT, _handle_exit)
-        signal.signal(signal.SIGTERM, _handle_exit)
+    signal.signal(signal.SIGINT, _handle_exit)
+    signal.signal(signal.SIGTERM, _handle_exit)
 
-        def _stdin_listener():
-            try:
-                while not server.should_exit:
-                    if select.select([sys.stdin], [], [], 0.5)[0]:
-                        ch = sys.stdin.read(1)
-                        if ch in ("q", "Q"):
-                            _handle_exit(None, None)
-                            break
-            except (OSError, ValueError):
-                pass
-        if sys.stdin.isatty():
-            t = threading.Thread(target=_stdin_listener, daemon=True)
-            t.start()
+    # Q to quit (background thread)
+    def _stdin_listener():
+        try:
+            while rust_server.is_running():
+                if select.select([sys.stdin], [], [], 0.5)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch in ("q", "Q"):
+                        _handle_exit(None, None)
+                        break
+        except (OSError, ValueError):
+            pass
+    if sys.stdin.isatty():
+        t = threading.Thread(target=_stdin_listener, daemon=True)
+        t.start()
 
-        server.run()
-    else:
-        # ── Rust HTTP server (default) — Python only for GPU prefill ──
-        from krasis import RustServer
-
-        tokenizer_path = os.path.join(args.model_path, "tokenizer.json")
-        rust_server = RustServer(
-            _model,
-            args.host,
-            args.port,
-            _model_name,
-            tokenizer_path,
-            max_ctx,
-        )
-
-        print(f"  {_DIM}Using Rust HTTP server (Python only for GPU prefill){_NC}", flush=True)
-
-        def _handle_exit(sig, frame):
-            rust_server.stop()
-            try:
-                sys.stderr = open(os.devnull, "w")
-                sys.stdout = open(os.devnull, "w")
-                logging.disable(logging.CRITICAL)
-            except Exception:
-                pass
-            os.write(1, f"\n{_BOLD}{_GREEN}Server stopped.{_NC}\n".encode())
-
-        signal.signal(signal.SIGINT, _handle_exit)
-        signal.signal(signal.SIGTERM, _handle_exit)
-
-        # Q to quit (background thread)
-        def _stdin_listener():
-            try:
-                while rust_server.is_running():
-                    if select.select([sys.stdin], [], [], 0.5)[0]:
-                        ch = sys.stdin.read(1)
-                        if ch in ("q", "Q"):
-                            _handle_exit(None, None)
-                            break
-            except (OSError, ValueError):
-                pass
-        if sys.stdin.isatty():
-            t = threading.Thread(target=_stdin_listener, daemon=True)
-            t.start()
-
-        # run() releases the GIL and blocks until stop() is called
-        rust_server.run()
+    # run() releases the GIL and blocks until stop() is called
+    rust_server.run()
 
     # ── Clean exit before Python teardown triggers cascading errors ──
     _remove_registry()

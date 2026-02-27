@@ -2,7 +2,7 @@
 
 Handles one-time weight initialization (GPU→CPU copy + quantization into Rust store)
 and per-request preparation (KV cache copy, recurrent state reset). All actual decode
-compute happens in the Rust engine via generate_loop() or generate_batch().
+compute happens in the Rust engine via generate_batch() or generate_stream().
 
 GPU prefill is completely untouched by this module.
 """
@@ -28,7 +28,7 @@ class CpuDecoder:
         # ... later, per request:
         decoder.prepare(seq_states)
         decoder._store.generate_batch(...)  # Batch decode (zero Python per token)
-        decoder._store.generate_loop(...)   # Streaming decode (callback per token)
+        decoder._store.generate_stream(...)  # Streaming decode (Rust HTTP server)
     """
 
     def __init__(self, model):
