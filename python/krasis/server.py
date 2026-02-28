@@ -337,6 +337,8 @@ def main():
                         help="Run stress test (diverse prompts) and exit")
     parser.add_argument("--perplexity", action="store_true",
                         help="Run perplexity evaluation and exit")
+    parser.add_argument("--note", default=None,
+                        help="Description note written to the top of the log file for this run")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction,
                         default=True,
@@ -353,12 +355,40 @@ def main():
     log_format = "%(asctime)s %(name)s %(levelname)s %(message)s"
     logging.basicConfig(level=logging.INFO, format=log_format)
 
-    # Also log to krasis.log file (captures all logger output + uncaught exceptions)
+    # Archive previous krasis.log into logs/ with timestamp before overwriting
     _log_file = os.path.join(os.getcwd(), "krasis.log")
+    _logs_dir = os.path.join(os.getcwd(), "logs")
+    os.makedirs(_logs_dir, exist_ok=True)
+    if os.path.isfile(_log_file) and os.path.getsize(_log_file) > 0:
+        from datetime import datetime
+        _mtime = os.path.getmtime(_log_file)
+        _ts = datetime.fromtimestamp(_mtime).strftime("%Y%m%d_%H%M%S")
+        _archive_name = f"krasis_{_ts}.log"
+        _archive_path = os.path.join(_logs_dir, _archive_name)
+        # Avoid overwriting an existing archive (e.g. rapid restarts)
+        _counter = 1
+        while os.path.exists(_archive_path):
+            _archive_path = os.path.join(_logs_dir, f"krasis_{_ts}_{_counter}.log")
+            _counter += 1
+        import shutil
+        shutil.move(_log_file, _archive_path)
+        print(f"Archived previous log → logs/{os.path.basename(_archive_path)}")
+
     _file_handler = logging.FileHandler(_log_file, mode="w")
     _file_handler.setLevel(logging.DEBUG)
     _file_handler.setFormatter(logging.Formatter(log_format))
     logging.getLogger().addHandler(_file_handler)
+
+    # Write run note to top of log file if provided
+    if args.note:
+        with open(_log_file, "w") as _nf:
+            _nf.write(f"=== RUN NOTE: {args.note} ===\n\n")
+        # Re-open handler in append mode so logging doesn't overwrite the note
+        logging.getLogger().removeHandler(_file_handler)
+        _file_handler = logging.FileHandler(_log_file, mode="a")
+        _file_handler.setLevel(logging.DEBUG)
+        _file_handler.setFormatter(logging.Formatter(log_format))
+        logging.getLogger().addHandler(_file_handler)
 
     # Capture uncaught exceptions to the log file
     _original_excepthook = sys.excepthook
