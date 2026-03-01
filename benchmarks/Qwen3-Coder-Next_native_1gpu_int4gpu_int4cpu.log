@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-22 08:43:29
+Krasis Benchmark — 2026-03-01 02:45:17
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,15 +7,13 @@ PP Partition:     [48] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            995 GB total, 76.4 GB used by process
-  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 5030 MB allocated
-  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
-  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
+  RAM:            1007 GB total, 80.2 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 6571 MB allocated
 
 Quantization:
   GPU experts:    INT4 (Marlin)
   CPU experts:    INT4
-  Attention:      INT8
+  Attention:      BF16
   Shared expert:  INT8
   Dense MLP:      INT8
   LM head:        INT8
@@ -26,30 +24,54 @@ Strategy:
   Prefill threshold: 300
   Mode:           pure_cpu decode, layer_grouped(2) prefill
 
-Prefill (10000 tokens, 3 runs):
-  Run 1:  964.4 tok/s, TTFT=10.37s
-  Run 2:  1046.2 tok/s, TTFT=9.56s
-  Run 3:  1044.6 tok/s, TTFT=9.57s
-  Average: 1018.4 tok/s, TTFT=9.83s
+Prefill (3 runs at different lengths):
+  Run 1:  1016.9 tok/s, TTFT=20.09s (20,434 tokens)
+  Run 2:  754.1 tok/s, TTFT=46.59s (35,139 tokens)
+  Run 3:  809.7 tok/s, TTFT=61.58s (49,863 tokens)
+  Best:    1016.9 tok/s, TTFT=20.09s (20,434 tokens)
 
-Decode (64 tokens, 3 runs):
-  Run 1:  10.52 tok/s (95.1ms/tok)
-  Run 2:  10.66 tok/s (93.8ms/tok)
-  Run 3:  10.52 tok/s (95.1ms/tok)
-  Average: 10.57 tok/s (94.7ms/tok)
+Decode (64 tokens, 3 runs, different prompts):
+  Run 1:  9.18 tok/s (108.9ms/tok)
+  Run 2:  10.02 tok/s (99.8ms/tok)
+  Run 3:  10.74 tok/s (93.1ms/tok)
+  Average: 9.98 tok/s (100.6ms/tok)
 
 Verification:
-  Prefill prompt: user
-Distributed consensus algorithms form the backbone of modern fault-tolerant systems. The Paxos algorithm, proposed by Leslie Lamport, achieves consensus among a group of processes even when some ... [52428 chars total]
-  Decode prompt:  Write a poem about recursion in programming at least 100 words long.
+  Prefill prompt: Summarise the following in one paragraph: THE COUNT OF MONTE CRISTO
+
+by Alexandre Dumas [père]
+
+
+
+
+Contents
+
+
+ VOLUME ONE
+Chapter 1. Marseilles—The Arrival
+Chapter 2. Father and Son
+Chapter 3. The Cat... [77314 chars total]
+  Decode prompt:  Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
   Generated output (64 tokens):
-    **The Recursive Ladder**
+    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically related keys—not a single shared secret—to enable secure communication. Here's a clear breakdown:
     
-    A function calls itself—no error, no dread—  
-    A mirror reflecting the path overhead.  
-    Like a dream within a dream, it descends,  
-    Each call a step where understanding bends.  
+    ---
     
-    *"Base case first!"* the wise coder insists,  
-    A solid foundation where recursion
+    ### 🔑 Core Idea: Key Pair
+    - **Public key**: Freely shared with anyone. Used to
 ================================================================
+
+────────────────────────────────────────────────────────────────
+  ENGINE vs NETWORK COMPARISON
+────────────────────────────────────────────────────────────────
+                                         Engine        Network   Overhead
+  ────────────────────────────── ────────────── ────────────── ──────────
+  Prefill (best tok/s)                 1016.9          925.1       -9.0%
+  TTFT (s)                              20.09          21.62     +1530ms
+    20,434 tokens                      1016.9          925.1       -9.0%
+    35,139 tokens                       754.1          715.2       -5.2%
+    49,863 tokens                       809.7          768.1       -5.1%
+
+  Decode (avg tok/s)                     9.98          10.67       +6.9%
+  Decode (ms/tok)                       100.6           93.8      -6.8ms
+────────────────────────────────────────────────────────────────

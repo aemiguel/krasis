@@ -8,6 +8,10 @@ except PackageNotFoundError:
 
 try:
     from krasis.krasis import KrasisEngine, WeightStore, CpuDecodeStore, RustServer, system_check, bench_decode_synthetic
+    try:
+        from krasis.krasis import GpuDecodeStore
+    except ImportError:
+        pass  # Built without CUDA feature
 except ImportError:
     # Native module not built yet
     pass

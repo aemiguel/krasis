@@ -1551,6 +1551,33 @@ impl KrasisEngine {
     pub(crate) fn get_parallel(&self) -> bool {
         self.parallel
     }
+
+    /// Get routing config for GPU decode setup.
+    pub(crate) fn get_routing_config(&self) -> Option<(/*scoring*/ &str, /*norm_topk*/ bool, /*topk*/ usize, /*n_experts*/ usize, /*hidden*/ usize)> {
+        self.routing_config.as_ref().map(|rc| (
+            rc.scoring_func.as_str(),
+            rc.norm_topk_prob,
+            rc.topk,
+            rc.n_experts,
+            rc.hidden_size,
+        ))
+    }
+
+    /// Get gate weight data (BF16) and optional correction bias (FP32) for a MoE layer.
+    pub(crate) fn get_routing_weights(&self, moe_layer_idx: usize) -> Option<(&[u16], Option<&[f32]>)> {
+        self.layer_routing.get(moe_layer_idx)
+            .and_then(|lr| lr.as_ref())
+            .map(|lr| {
+                let gate = lr.gate_weight.as_slice();
+                let bias = lr.correction_bias.as_deref();
+                (gate, bias)
+            })
+    }
+
+    /// Number of MoE layers with routing weights set.
+    pub(crate) fn num_routing_layers(&self) -> usize {
+        self.layer_routing.len()
+    }
 }
 
 #[pymethods]

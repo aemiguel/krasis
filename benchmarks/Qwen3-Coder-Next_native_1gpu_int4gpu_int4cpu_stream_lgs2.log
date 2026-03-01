@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-27 13:39:55
+Krasis Benchmark — 2026-02-28 23:43:22
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -25,16 +25,16 @@ Strategy:
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
 Prefill (3 runs at different lengths):
-  Run 1:  1037.2 tok/s, TTFT=19.70s (20,434 tokens)
-  Run 2:  753.7 tok/s, TTFT=46.62s (35,139 tokens)
-  Run 3:  809.1 tok/s, TTFT=61.62s (49,863 tokens)
-  Best:    1037.2 tok/s, TTFT=19.70s (20,434 tokens)
+  Run 1:  1011.3 tok/s, TTFT=20.21s (20,434 tokens)
+  Run 2:  755.2 tok/s, TTFT=46.53s (35,139 tokens)
+  Run 3:  803.4 tok/s, TTFT=62.07s (49,863 tokens)
+  Best:    1011.3 tok/s, TTFT=20.21s (20,434 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  13.38 tok/s (74.7ms/tok)
-  Run 2:  14.16 tok/s (70.6ms/tok)
-  Run 3:  15.82 tok/s (63.2ms/tok)
-  Average: 14.45 tok/s (69.5ms/tok)
+  Run 1:  14.03 tok/s (71.3ms/tok)
+  Run 2:  10.75 tok/s (93.0ms/tok)
+  Run 3:  10.54 tok/s (94.9ms/tok)
+  Average: 11.77 tok/s (86.4ms/tok)
 
 Verification:
   Prefill prompt: Summarise the following in one paragraph: THE COUNT OF MONTE CRISTO
@@ -53,7 +53,13 @@ Chapter 2. Father and Son
 Chapter 3. The Cat... [77314 chars total]
   Decode prompt:  Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
   Generated output (64 tokens):
-    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys: a **public key** (shared openly) and a **private key** (kept secret). Unlike symmetric-key cryptography (where the same key encrypts and decrypts), here, encryption with
+    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys—**a public key** and a **private key**—to enable secure communication without requiring the parties to share a secret key beforehand.
+    
+    ---
+    
+    ### 🔑 Core Concepts
+    
+    | Component | Description
 ================================================================
 
 ────────────────────────────────────────────────────────────────
@@ -61,12 +67,12 @@ Chapter 3. The Cat... [77314 chars total]
 ────────────────────────────────────────────────────────────────
                                          Engine        Network   Overhead
   ────────────────────────────── ────────────── ────────────── ──────────
-  Prefill (best tok/s)                 1037.2          930.9      -10.2%
-  TTFT (s)                              19.70          21.49     +1790ms
-    20,434 tokens                      1037.2          930.9      -10.2%
-    35,139 tokens                       753.7          716.9       -4.9%
-    49,863 tokens                       809.1          763.2       -5.7%
+  Prefill (best tok/s)                 1011.3          916.0       -9.4%
+  TTFT (s)                              20.21          21.83     +1620ms
+    20,434 tokens                      1011.3          916.0       -9.4%
+    35,139 tokens                       755.2          716.2       -5.2%
+    49,863 tokens                       803.4          764.6       -4.8%
 
-  Decode (avg tok/s)                    14.45          15.84       +9.6%
-  Decode (ms/tok)                        69.5           63.2      -6.3ms
+  Decode (avg tok/s)                    11.77          12.18       +3.5%
+  Decode (ms/tok)                        86.4           83.7      -2.7ms
 ────────────────────────────────────────────────────────────────

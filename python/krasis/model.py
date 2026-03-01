@@ -399,7 +399,7 @@ class KrasisModel:
         gguf_path: Optional[str] = None,
         gguf_native: bool = False,
         kv_cache_mb: int = 2000,  # MB for KV cache
-        stream_attention: bool = True,
+        stream_attention: bool = False,
     ):
         self.cfg = ModelConfig.from_model_path(model_path)
         self.quant_cfg = quant_cfg or QuantConfig()
@@ -536,10 +536,17 @@ class KrasisModel:
             logger.info("GPU%d: %.0f MB allocated", i, alloc_mb)
         logger.info("GPU weights loaded in %.1fs", gpu_elapsed)
 
-        # Phase 1b: Streaming attention offload (if enabled)
+        # Phase 1b: Streaming attention offload (if enabled) or resident check
         if self.stream_attention:
             print(f"\n\033[1m\033[36m▸ Offloading attention for streaming decode\033[0m", flush=True)
             self._init_stream_attention()
+        else:
+            # GPU-Max: attention weights permanently resident on GPU
+            dev = self.all_devices[0]
+            attn_mb = self._estimate_attention_vram() >> 20
+            free_mb = torch.cuda.mem_get_info(dev)[0] >> 20
+            logger.info("Attention resident on GPU: %d MB, GPU free: %d MB", attn_mb, free_mb)
+            print(f"  \033[0;32mAttention resident on GPU ({attn_mb} MB), {free_mb} MB free\033[0m", flush=True)
 
         # Phase 2: CPU + GPU expert weights (Rust engine)
         cpu_start = time.perf_counter()
@@ -855,8 +862,12 @@ class KrasisModel:
 
         # All attention on GPU0 — single split covering all layers
         self._layer_split = [(0, L)]
-        logger.info("Streaming attention: all %d layers on GPU0, %d GPUs for EP",
-                     L, len(self.all_devices))
+        if self.stream_attention:
+            logger.info("Streaming attention: all %d layers on GPU0, %d GPUs for EP",
+                         L, len(self.all_devices))
+        else:
+            logger.info("Resident attention: all %d layers permanently on GPU0, %d GPUs for EP",
+                         L, len(self.all_devices))
 
         # ── Load layers ──
         logger.info("Loading full base model to %s...", primary_dev)

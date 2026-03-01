@@ -40,7 +40,7 @@ krasis-chat = "krasis.chat:main"
 krasis-setup = "krasis.setup:main"
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "cuda"]
 python-source = "python"
 module-name = "krasis.krasis"
 include = [{path = "python/krasis/prompts/*", format = "wheel"}]
