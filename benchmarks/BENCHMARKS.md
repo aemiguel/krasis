@@ -1,5 +1,46 @@
 # Krasis Benchmark Results
 
+## GPU Decode Benchmark — 2026-03-02 (5090, 40% HCS, pinned memory)
+
+**Hardware:** EPYC 7742, 995 GB RAM, 1x RTX 5090 32 GB, PCIe 4.0 x16 (27 GB/s peak).
+
+**Config:** QCN (Qwen3-Coder-Next), INT4 GPU/CPU, BF16 attention, LGS=2, GPU decode (Rust, zero GIL), HCS 40.2% (9,869/24,576 experts), pinned expert memory for async DMA, no debug/timing instrumentation.
+
+### Decode Speed
+
+| Prompt | Tokens | Decode Time | Decode Speed | TTFT |
+|--------|-------:|------------:|-------------:|-----:|
+| Short (math) | 199 | 7.04s | 28.1 tok/s | 5.31s |
+| Medium (caches) | 499 | 16.43s | 30.3 tok/s | 5.33s |
+| Code (BST) | 499 | 17.29s | 28.8 tok/s | 5.30s |
+| Long (essay) | 799 | 23.16s | 34.5 tok/s | 5.30s |
+| **Average** | | | **30.4 tok/s** | **5.31s** |
+
+### Prefill Speed (from server log, includes ~5.3s layer streaming overhead)
+
+| Input Tokens | TTFT | Prefill Compute (est) | Prefill Speed (est) |
+|-------------:|-----:|----------------------:|--------------------:|
+| 64 | 5.29s | ~0.0s | n/a (streaming dominated) |
+| 576 | 5.31s | ~0.01s | n/a |
+| 1,126 | 5.28s | ~0.0s | n/a |
+| 2,236 | 5.29s | ~0.0s | n/a |
+| 4,456 | 5.32s | ~0.02s | ~838 tok/s |
+| 8,906 | 5.32s | ~0.02s | ~1,674 tok/s |
+| 17,796 | 5.69s | ~0.39s | ~3,129 tok/s |
+| 27,796 | 7.64s | ~2.34s | ~3,636 tok/s |
+
+### Notes
+- TTFT is dominated by layer group streaming (~5.3s constant overhead for lgs=2, 48 layers, 24 groups)
+- Actual prefill compute only becomes visible above ~8K tokens
+- Peak prefill throughput: ~3,636 tok/s at 28K tokens
+- Decode speed varies 28-35 tok/s, higher on longer outputs (routing stabilizes)
+- VRAM: 24,923 MB used, 7,196 MB free during decode, lowest watermark 2,888 MB (during 28K prefill)
+- Rust KV cache limited to 8,192 tokens (prompts >8K skip decode)
+
+Full log: [20260302-gpu-decode-5090-qcn-40pct-hcs.log](20260302-gpu-decode-5090-qcn-40pct-hcs.log)
+
+---
+
 ## Standard Benchmarks — 2026-02-27 (Rust server, unified timing)
 
 **Hardware:** EPYC 7742 (64 cores, 4 NUMA nodes), DDR4-2666 8-channel, 1x RTX 2000 Ada 16 GB, PCIe 4.0 x8.
