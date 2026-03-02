@@ -1119,8 +1119,14 @@ extern "C" __global__ void marlin_gemv_int4_fused_silu_accum(
     int K,              // intermediate_size
     int N,              // hidden_size
     int group_size,
-    float weight        // routing weight for this expert
+    float weight,       // routing weight for this expert
+    const float* weight_ptr  // optional: if non-NULL, weight = sigmoid(*weight_ptr)
 ) {
+    // If weight_ptr is non-NULL, read the gate logit and apply sigmoid on GPU
+    if (weight_ptr != NULL) {
+        weight = 1.0f / (1.0f + expf(-(*weight_ptr)));
+    }
+
     extern __shared__ char smem_raw[];
     unsigned short* s_input = (unsigned short*)smem_raw;
     int* s_inv_wperm = (int*)(smem_raw + K * 2);

@@ -232,7 +232,7 @@ impl ApflState {
 
 /// One expert's Marlin-format weights resident in VRAM.
 struct HcsCacheEntry {
-    d_buf: cudarc::driver::CudaSlice<u8>,
+    d_buf: Option<cudarc::driver::CudaSlice<u8>>,  // owned buffer (None for external)
     w13_packed_offset: usize,
     w13_packed_size: usize,
     w13_scales_offset: usize,
@@ -241,20 +241,33 @@ struct HcsCacheEntry {
     w2_packed_size: usize,
     w2_scales_offset: usize,
     w2_scales_size: usize,
+    // Raw pointers for externally-owned VRAM (Python HCS buffers)
+    ext_w13_packed: u64,
+    ext_w13_scales: u64,
+    ext_w2_packed: u64,
+    ext_w2_scales: u64,
 }
 
 impl HcsCacheEntry {
     fn w13_packed_ptr(&self) -> u64 {
-        *self.d_buf.device_ptr() + self.w13_packed_offset as u64
+        if let Some(ref buf) = self.d_buf {
+            *buf.device_ptr() + self.w13_packed_offset as u64
+        } else { self.ext_w13_packed }
     }
     fn w13_scales_ptr(&self) -> u64 {
-        *self.d_buf.device_ptr() + self.w13_scales_offset as u64
+        if let Some(ref buf) = self.d_buf {
+            *buf.device_ptr() + self.w13_scales_offset as u64
+        } else { self.ext_w13_scales }
     }
     fn w2_packed_ptr(&self) -> u64 {
-        *self.d_buf.device_ptr() + self.w2_packed_offset as u64
+        if let Some(ref buf) = self.d_buf {
+            *buf.device_ptr() + self.w2_packed_offset as u64
+        } else { self.ext_w2_packed }
     }
     fn w2_scales_ptr(&self) -> u64 {
-        *self.d_buf.device_ptr() + self.w2_scales_offset as u64
+        if let Some(ref buf) = self.d_buf {
+            *buf.device_ptr() + self.w2_scales_offset as u64
+        } else { self.ext_w2_scales }
     }
 }
 
@@ -1165,6 +1178,19 @@ impl GpuDecodeStore {
     fn set_timing(&mut self, enabled: bool) -> PyResult<()> {
         if let Some(ref mut graph) = self.graph {
             graph.timing_enabled = enabled;
+            if enabled {
+                // Reset accumulators
+                graph.timing_step_count = 0;
+                graph.t_total = 0.0;
+                graph.t_norm = 0.0;
+                graph.t_attn = 0.0;
+                graph.t_route = 0.0;
+                graph.t_expert_dma = 0.0;
+                graph.t_expert_compute = 0.0;
+                graph.t_shared = 0.0;
+                graph.t_dense_mlp = 0.0;
+                graph.t_lm_head = 0.0;
+            }
         }
         Ok(())
     }
@@ -1969,6 +1995,35 @@ impl GpuDecodeStore {
         self.hcs_pin_expert_internal(layer_idx, expert_idx)
     }
 
+    /// Register external VRAM pointers as HCS entries (no allocation).
+    /// Used to share Python HCS buffers with Rust decode without copying.
+    /// w13p/w13s/w2p/w2s are raw GPU pointers (from tensor.data_ptr()).
+    #[pyo3(signature = (layer_idx, expert_idx, w13p, w13s, w2p, w2s))]
+    fn hcs_register_external(
+        &mut self, layer_idx: usize, expert_idx: usize,
+        w13p: u64, w13s: u64, w2p: u64, w2s: u64,
+    ) -> PyResult<bool> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let hcs = graph.hcs.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call init_hcs first"))?;
+        if hcs.cache.contains_key(&(layer_idx, expert_idx)) {
+            return Ok(false);
+        }
+        let entry = HcsCacheEntry {
+            d_buf: None,
+            w13_packed_offset: 0, w13_packed_size: 0,
+            w13_scales_offset: 0, w13_scales_size: 0,
+            w2_packed_offset: 0, w2_packed_size: 0,
+            w2_scales_offset: 0, w2_scales_size: 0,
+            ext_w13_packed: w13p, ext_w13_scales: w13s,
+            ext_w2_packed: w2p, ext_w2_scales: w2s,
+        };
+        hcs.num_cached += 1;
+        hcs.cache.insert((layer_idx, expert_idx), entry);
+        Ok(true)
+    }
+
     /// Load ALL experts for ALL MoE layers into HCS cache.
     /// For small models like QCN where all experts fit in VRAM.
     fn hcs_pin_all(&mut self) -> PyResult<String> {
@@ -2420,9 +2475,20 @@ impl GpuDecodeStore {
         position: usize,
     ) -> Result<(), String> {
         use cudarc::driver::LaunchConfig;
+        use std::time::Instant;
 
         let hs = graph.hidden_size;
         let eps = graph.eps;
+        let timing = graph.timing_enabled;
+
+        // Timing: sync and take initial timestamp
+        let t0 = if timing {
+            self.device.synchronize().map_err(|e| format!("timing sync: {:?}", e))?;
+            Instant::now()
+        } else {
+            Instant::now() // cheap, no sync
+        };
+
         // Clone kernel handles to avoid holding an immutable borrow on graph
         // (moe_forward_with_graph needs &mut graph)
         let k = graph.kernels.as_ref()
@@ -2485,6 +2551,13 @@ impl GpuDecodeStore {
         let num_layers = graph.layers.len();
         let mut gqa_cache_idx = 0usize; // Track which GQA cache slot we're on
 
+        // Timing accumulators for this token
+        let mut tt_attn = 0.0f64;
+        let mut tt_moe = 0.0f64;
+        let mut tt_norm = 0.0f64;
+        let mut tt_shared = 0.0f64;
+        let mut tt_dense_mlp = 0.0f64;
+
         // ── 2. Layer loop ──
         for layer_idx in 0..num_layers {
             let layer = &graph.layers[layer_idx];
@@ -2510,6 +2583,12 @@ impl GpuDecodeStore {
                 }
             }
             first_residual = false;
+
+            // Timing: after pre-attn norm
+            let t_attn_start = if timing {
+                self.device.synchronize().map_err(|e| format!("timing sync: {:?}", e))?;
+                Instant::now()
+            } else { Instant::now() };
 
             // ── Attention ──
             match &layer.attn {
@@ -3013,6 +3092,12 @@ impl GpuDecodeStore {
                 }
             }
 
+            // Timing: after attention
+            if timing {
+                self.device.synchronize().map_err(|e| format!("timing sync: {:?}", e))?;
+                tt_attn += t_attn_start.elapsed().as_secs_f64();
+            }
+
             // ── Post-attention norm (fused residual add + RMSNorm) ──
             {
                 let smem = (hs as u32) * 4;
@@ -3033,6 +3118,12 @@ impl GpuDecodeStore {
                     )).map_err(|e| format!("post_attn_norm[{}]: {:?}", layer_idx, e))?;
                 }
             }
+
+            // Timing: after post-attn norm, before MLP/MoE
+            let t_mlp_start = if timing {
+                self.device.synchronize().map_err(|e| format!("timing sync: {:?}", e))?;
+                Instant::now()
+            } else { Instant::now() };
 
             // ── MLP / MoE ──
             // Check if this layer has MoE data registered
@@ -3123,6 +3214,17 @@ impl GpuDecodeStore {
             }
             // GpuMlpConfig::None → skip (layer 0 in QCN is dense but registered separately)
 
+            // Timing: after MLP/MoE
+            if timing {
+                self.device.synchronize().map_err(|e| format!("timing sync: {:?}", e))?;
+                let mlp_elapsed = t_mlp_start.elapsed().as_secs_f64();
+                if has_moe {
+                    tt_moe += mlp_elapsed;
+                } else {
+                    tt_dense_mlp += mlp_elapsed;
+                }
+            }
+
             #[cfg(feature = "gpu-debug")]
             {
                 if self.debug_capture_layers {
@@ -3149,6 +3251,11 @@ impl GpuDecodeStore {
         }
 
         // ── 3. Final norm ──
+        let t_lmhead_start = if timing {
+            self.device.synchronize().map_err(|e| format!("timing sync: {:?}", e))?;
+            Instant::now()
+        } else { Instant::now() };
+
         #[cfg(feature = "gpu-debug")]
         {
             self.device.synchronize().map_err(|e| format!("sync after all layers: {:?}", e))?;
@@ -3186,6 +3293,20 @@ impl GpuDecodeStore {
         // ── 5. Sync + D2H logits ──
         self.device.synchronize()
             .map_err(|e| format!("sync: {:?}", e))?;
+
+        // Timing: accumulate per-component times
+        if timing {
+            let tt_lmhead = t_lmhead_start.elapsed().as_secs_f64();
+            let tt_total = t0.elapsed().as_secs_f64();
+            graph.t_attn += tt_attn;
+            graph.t_route += tt_moe; // MoE includes routing + DMA + compute
+            graph.t_shared += tt_shared;
+            graph.t_dense_mlp += tt_dense_mlp;
+            graph.t_lm_head += tt_lmhead;
+            graph.t_total += tt_total;
+            graph.t_norm += tt_total - tt_attn - tt_moe - tt_shared - tt_dense_mlp - tt_lmhead;
+            graph.timing_step_count += 1;
+        }
 
         #[cfg(feature = "gpu-debug")]
         debug_peek_f32("logits[0..4]", *graph.d_logits.device_ptr(), 4);
@@ -3374,6 +3495,54 @@ impl GpuDecodeStore {
                 generated, elapsed, tps);
         }
 
+        // Print timing summary if enabled
+        if let Some(ref mut graph) = self.graph {
+            if graph.timing_enabled && graph.timing_step_count > 0 {
+                let n = graph.timing_step_count as f64;
+                let avg_total = graph.t_total / n * 1000.0;
+                let avg_attn = graph.t_attn / n * 1000.0;
+                let avg_moe = graph.t_route / n * 1000.0;
+                let avg_norm = graph.t_norm / n * 1000.0;
+                let avg_dense = graph.t_dense_mlp / n * 1000.0;
+                let avg_lm = graph.t_lm_head / n * 1000.0;
+
+                log::info!("┌─────────────────────────────────────────────────┐");
+                log::info!("│  GPU DECODE TIMING ({} tokens avg)             │", graph.timing_step_count);
+                log::info!("├─────────────────────────────────────────────────┤");
+                log::info!("│  Total:       {:7.2} ms/tok  ({:5.1} tok/s)    │", avg_total, 1000.0 / avg_total);
+                log::info!("│  Attention:   {:7.2} ms  ({:4.1}%)              │", avg_attn, avg_attn / avg_total * 100.0);
+                log::info!("│  MoE:         {:7.2} ms  ({:4.1}%)              │", avg_moe, avg_moe / avg_total * 100.0);
+                log::info!("│  Norms+Emb:   {:7.2} ms  ({:4.1}%)              │", avg_norm, avg_norm / avg_total * 100.0);
+                log::info!("│  Dense MLP:   {:7.2} ms  ({:4.1}%)              │", avg_dense, avg_dense / avg_total * 100.0);
+                log::info!("│  LM Head:     {:7.2} ms  ({:4.1}%)              │", avg_lm, avg_lm / avg_total * 100.0);
+                log::info!("│  Other:       {:7.2} ms  ({:4.1}%)              │",
+                    avg_total - avg_attn - avg_moe - avg_norm - avg_dense - avg_lm,
+                    (avg_total - avg_attn - avg_moe - avg_norm - avg_dense - avg_lm) / avg_total * 100.0);
+                log::info!("└─────────────────────────────────────────────────┘");
+
+                // PCIe utilization estimate
+                // QCN: 10 experts per layer, ~1.5 MB each, 48 MoE layers
+                let moe_layers = graph.moe_layers.iter().filter(|m| m.is_some()).count();
+                if moe_layers > 0 {
+                    let expert_size_mb = graph.expert_buf_total_size as f64 / (1024.0 * 1024.0);
+                    let topk = graph.h_topk_ids.len();
+                    let data_per_tok_mb = expert_size_mb * topk as f64 * moe_layers as f64;
+                    let (hcs_ratio, hcs_cached, hcs_hits, hcs_misses) = if let Some(ref hcs) = graph.hcs {
+                        let r = if hcs.total_hits + hcs.total_misses > 0 {
+                            hcs.total_hits as f64 / (hcs.total_hits + hcs.total_misses) as f64
+                        } else { 0.0 };
+                        (r, hcs.num_cached, hcs.total_hits, hcs.total_misses)
+                    } else { (0.0, 0, 0, 0) };
+                    let dma_per_tok_mb = data_per_tok_mb * (1.0 - hcs_ratio);
+                    let pcie_bw = if avg_moe > 0.001 { dma_per_tok_mb / (avg_moe / 1000.0) } else { 0.0 };
+                    log::info!("│  MoE data:    {:.1} MB/tok ({:.0}% HCS, {} cached, {}/{} hit/miss) │",
+                        data_per_tok_mb, hcs_ratio * 100.0, hcs_cached, hcs_hits, hcs_misses);
+                    log::info!("│  DMA needed:  {:.1} MB/tok (after HCS)          │", dma_per_tok_mb);
+                    log::info!("│  Est PCIe BW: {:.1} GB/s                        │", pcie_bw / 1024.0);
+                }
+            }
+        }
+
         generated
     }
 }
@@ -3531,7 +3700,7 @@ impl GpuDecodeStore {
                 layer_idx, alloc_bytes as f64 / 1024.0);
 
             graph.shared_expert_vram[layer_idx] = Some(HcsCacheEntry {
-                d_buf,
+                d_buf: Some(d_buf),
                 w13_packed_offset,
                 w13_packed_size: se.w13_packed_bytes,
                 w13_scales_offset,
@@ -3540,6 +3709,7 @@ impl GpuDecodeStore {
                 w2_packed_size: se.w2_packed_bytes,
                 w2_scales_offset,
                 w2_scales_size: se.w2_scales_bytes,
+                ext_w13_packed: 0, ext_w13_scales: 0, ext_w2_packed: 0, ext_w2_scales: 0,
             });
         }
 
@@ -3637,6 +3807,7 @@ impl GpuDecodeStore {
         n: usize,        // hidden_size
         group_size: usize,
         weight: f32,
+        weight_ptr: u64, // optional device ptr: if non-zero, kernel reads sigmoid(*weight_ptr) instead of weight
         kernels: &CachedKernels,
     ) -> PyResult<()> {
         let n_tiles = (n + 15) / 16;
@@ -3659,6 +3830,7 @@ impl GpuDecodeStore {
                 n as i32,
                 group_size as i32,
                 weight,
+                weight_ptr,
             )).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("fused_silu_accum launch: {:?}", e)))?;
         }
@@ -4069,6 +4241,7 @@ impl GpuDecodeStore {
         let device = &self.device;
         let copy_stream = self.copy_stream.0;
         let prefetch_stream = self.prefetch_stream.0;
+        let timing = graph.timing_enabled;
 
         let moe = graph.moe_layers.get(layer_idx)
             .and_then(|m| m.as_ref())
@@ -4198,6 +4371,7 @@ impl GpuDecodeStore {
         }
 
         // ── Step 4: Sync compute + D2H copy topk results ──
+        let t_route_start = Instant::now();
         device.synchronize()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
 
@@ -4555,7 +4729,7 @@ impl GpuDecodeStore {
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
                     intermediate, hs, gs,
-                    weight,
+                    weight, 0u64,
                     k,
                 )?;
             } else if use_double_buf {
@@ -4659,7 +4833,7 @@ impl GpuDecodeStore {
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
                     intermediate, hs, gs,
-                    weight,
+                    weight, 0u64,
                     k,
                 )?;
 
@@ -4758,7 +4932,7 @@ impl GpuDecodeStore {
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
                     intermediate, hs, gs,
-                    weight,
+                    weight, 0u64,
                     k,
                 )?;
             }
@@ -4839,40 +5013,36 @@ impl GpuDecodeStore {
                 }
             }
 
-            // Compute sigmoid gate weight BEFORE accumulating shared expert.
+            // Compute sigmoid gate weight on GPU (no D2H sync needed).
             // The gate must only scale the shared expert, not the routed experts.
             // Python does: output = routed + sigmoid(gate) * shared
-            let shared_weight = if let Some(sg_wid) = moe.shared_gate_wid {
+            // Gate GEMV produces FP32 logit on device; the fused kernel reads it
+            // and applies sigmoid internally.
+            let gate_weight_ptr = if let Some(sg_wid) = moe.shared_gate_wid {
                 let sg_w = &graph.weights[sg_wid];
-                // GEMV: gate_weight[1, hs] @ d_hidden[hs] -> d_scratch[0] (1 BF16 scalar)
-                self.gemv_bf16_internal(
+                // GEMV: gate_weight[1, hs] @ d_hidden[hs] -> d_scratch[0] (1 FP32 scalar)
+                self.gemv_bf16_to_f32(
                     sg_w,
                     *graph.d_hidden.device_ptr(),
                     *graph.d_scratch.device_ptr(),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("shared gate GEMV: {}", e)))?;
-                // Read back the single BF16 gate logit and compute sigmoid
-                let mut gate_bf16 = [0u16; 1];
-                unsafe {
-                    cuda_sys::lib().cuMemcpyDtoH_v2(
-                        gate_bf16.as_mut_ptr() as *mut std::ffi::c_void,
-                        *graph.d_scratch.device_ptr(), 2);
-                }
-                let gate_logit = f32::from_bits((gate_bf16[0] as u32) << 16);
-                let gate_value = 1.0 / (1.0 + (-gate_logit).exp());  // sigmoid
-                gate_value
+                *graph.d_scratch.device_ptr()  // FP32 gate logit on device
             } else {
-                1.0f32
+                0u64  // no gate -> kernel uses weight arg directly
             };
 
-            // Fused: silu_mul + w2 GEMV + add to accumulator (weighted by sigmoid gate)
+            let shared_weight = if gate_weight_ptr != 0 { 0.0f32 } else { 1.0f32 };
+
+            // Fused: silu_mul + w2 GEMV + add to accumulator
+            // When gate_weight_ptr != 0, kernel reads sigmoid(*gate_weight_ptr) as weight
             self.launch_fused_silu_accum(
                 w2p, w2s,
                 *graph.d_expert_gate_up.device_ptr(),
                 *graph.d_moe_out.device_ptr(),
                 inv_wp, inv_sp,
                 intermediate, hs, gs,
-                shared_weight,
+                shared_weight, gate_weight_ptr,
                 k,
             )?;
         }
@@ -5814,7 +5984,7 @@ impl GpuDecodeStore {
         }
 
         let entry = HcsCacheEntry {
-            d_buf,
+            d_buf: Some(d_buf),
             w13_packed_offset,
             w13_packed_size: expert.w13_packed_bytes,
             w13_scales_offset,
@@ -5823,6 +5993,7 @@ impl GpuDecodeStore {
             w2_packed_size: expert.w2_packed_bytes,
             w2_scales_offset,
             w2_scales_size: expert.w2_scales_bytes,
+            ext_w13_packed: 0, ext_w13_scales: 0, ext_w2_packed: 0, ext_w2_scales: 0,
         };
 
         hcs.vram_bytes += alloc_bytes;
@@ -6764,7 +6935,7 @@ impl GpuDecodeStore {
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs, 0.1f32, k,
+                    intermediate, hs, gs, 0.1f32, 0u64, k,
                 )?;
             }
             self.device.synchronize()
@@ -6785,7 +6956,7 @@ impl GpuDecodeStore {
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs, 0.1f32, k,
+                    intermediate, hs, gs, 0.1f32, 0u64, k,
                 )?;
             }
             self.device.synchronize()
@@ -6820,7 +6991,7 @@ impl GpuDecodeStore {
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs, 0.1f32, k,
+                    intermediate, hs, gs, 0.1f32, 0u64, k,
                 )?;
             }
             self.device.synchronize()
@@ -7005,7 +7176,7 @@ impl GpuDecodeStore {
                             *graph.d_expert_gate_up.device_ptr(),
                             *graph.d_moe_out.device_ptr(),
                             inv_wp, inv_sp,
-                            intermediate, hs, gs, 0.1f32, k,
+                            intermediate, hs, gs, 0.1f32, 0u64, k,
                         )?;
                     }
                 }
@@ -7032,7 +7203,7 @@ impl GpuDecodeStore {
                             *graph.d_expert_gate_up.device_ptr(),
                             *graph.d_moe_out.device_ptr(),
                             inv_wp, inv_sp,
-                            intermediate, hs, gs, 0.1f32, k,
+                            intermediate, hs, gs, 0.1f32, 0u64, k,
                         )?;
                     }
                 }

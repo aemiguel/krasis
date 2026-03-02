@@ -3957,6 +3957,12 @@ class KrasisModel:
         logger.info("Rust KV cache allocated")
 
         self._gpu_decode_store = store
+
+        # Enable per-component timing if KRASIS_DECODE_TIMING=1
+        if os.environ.get("KRASIS_DECODE_TIMING", "") == "1":
+            store.set_timing(True)
+            logger.info("GPU decode timing enabled (KRASIS_DECODE_TIMING=1)")
+
         logger.info("GPU decode store configured: %d layers, store_addr=%d",
                      len(self.layers), store.gpu_store_addr())
         return store

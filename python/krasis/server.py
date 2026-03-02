@@ -730,6 +730,41 @@ def main():
             total_pinned, total_experts, pct_cached, len(hcs_devices), hcs_elapsed,
         )
 
+    # ── Bridge HCS to Rust GpuDecodeStore ──
+    # The Python HCS loaded experts into PyTorch tensors. The Rust decode path has its
+    # own HCS (HashMap-based) that needs the same (layer, expert) pairs pinned in VRAM.
+    # We init the Rust HCS with auto-budget (from free VRAM) and pin the same experts.
+    if args.hcs and hasattr(_model, '_gpu_decode_store'):
+        store = _model._gpu_decode_store
+        t_rust_hcs = time.time()
+        store.init_hcs(0, 500)  # auto-budget (unused for external), 500 MB headroom
+        rust_pinned = 0
+        for hcs_dev in hcs_load_manager._hcs_devices:
+            for layer_idx, lookup_tensor in hcs_dev.lookup.items():
+                bufs = hcs_dev.buffers[layer_idx]
+                w13_t = bufs["w13"]        # [n_hot, K/16, N*16/8] packed
+                w13s_t = bufs["w13_scale"]  # [n_hot, ...]
+                w2_t = bufs["w2"]
+                w2s_t = bufs["w2_scale"]
+                lookup_cpu = lookup_tensor.cpu()
+                for eid in range(len(lookup_cpu)):
+                    slot = lookup_cpu[eid].item()
+                    if slot < 0:
+                        continue
+                    # Get VRAM pointers for this expert's data within the HCS buffer
+                    w13p = w13_t[slot].data_ptr()
+                    w13s = w13s_t[slot].data_ptr()
+                    w2p = w2_t[slot].data_ptr()
+                    w2s = w2s_t[slot].data_ptr()
+                    try:
+                        if store.hcs_register_external(layer_idx, eid, w13p, w13s, w2p, w2s):
+                            rust_pinned += 1
+                    except Exception:
+                        break
+        rust_hcs_elapsed = time.time() - t_rust_hcs
+        logger.info("Rust HCS: %d experts registered (shared VRAM) in %.1fs", rust_pinned, rust_hcs_elapsed)
+        _detail(f"Rust HCS: {rust_pinned:,} experts registered (shared VRAM) in {rust_hcs_elapsed:.1f}s")
+
     # ── Decode validation (after HCS) ──
     # CUDA decode allocations already happened in pre-HCS warmup.
     # This validates HCS + decode works and gives the monitor a realistic sample.
