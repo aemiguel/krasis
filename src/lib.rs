@@ -1,3 +1,4 @@
+pub mod chat_template;
 pub mod decode;
 pub mod gguf;
 pub mod gguf_kernels;

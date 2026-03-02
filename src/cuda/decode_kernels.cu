@@ -547,8 +547,8 @@ extern "C" __global__ void apply_rope(
 
 // Write K,V to FP16 KV cache at given position
 extern "C" __global__ void kv_cache_write(
-    __half* __restrict__ k_cache,   // [max_seq, kv_stride]
-    __half* __restrict__ v_cache,   // [max_seq, kv_stride]
+    __nv_bfloat16* __restrict__ k_cache,   // [max_seq, kv_stride] BF16
+    __nv_bfloat16* __restrict__ v_cache,   // [max_seq, kv_stride] BF16
     const float* __restrict__ k,     // [kv_stride]
     const float* __restrict__ v,     // [kv_stride]
     int position,
@@ -556,8 +556,8 @@ extern "C" __global__ void kv_cache_write(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < kv_stride) {
-        k_cache[position * kv_stride + i] = __float2half(k[i]);
-        v_cache[position * kv_stride + i] = __float2half(v[i]);
+        k_cache[position * kv_stride + i] = f32_to_bf16(k[i]);
+        v_cache[position * kv_stride + i] = f32_to_bf16(v[i]);
     }
 }
 
@@ -566,8 +566,8 @@ extern "C" __global__ void kv_cache_write(
 extern "C" __global__ void gqa_attention(
     float* __restrict__ output,          // [num_q_heads * head_dim]
     const float* __restrict__ q,          // [num_q_heads * head_dim]
-    const __half* __restrict__ k_cache,   // [max_seq, kv_stride]
-    const __half* __restrict__ v_cache,   // [max_seq, kv_stride]
+    const __nv_bfloat16* __restrict__ k_cache,   // [max_seq, kv_stride] BF16
+    const __nv_bfloat16* __restrict__ v_cache,   // [max_seq, kv_stride] BF16
     float sm_scale,
     int num_q_heads,
     int num_kv_heads,
@@ -594,9 +594,9 @@ extern "C" __global__ void gqa_attention(
     float max_score = -1e30f;
     for (int pos = tid; pos < seq_len; pos += num_threads) {
         float score = 0.0f;
-        const __half* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        const __nv_bfloat16* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
         for (int d = 0; d < head_dim; d++) {
-            score += q_head[d] * __half2float(k_vec[d]);
+            score += q_head[d] * bf16_to_f32(k_vec[d]);
         }
         score *= sm_scale;
         smem[pos] = score;
@@ -657,7 +657,7 @@ extern "C" __global__ void gqa_attention(
     for (int d = tid; d < head_dim; d += num_threads) {
         float acc = 0.0f;
         for (int pos = 0; pos < seq_len; pos++) {
-            acc += smem[pos] * __half2float(v_cache[pos * kv_stride + kv_head * head_dim + d]);
+            acc += smem[pos] * bf16_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
         }
         out_head[d] = acc;
     }

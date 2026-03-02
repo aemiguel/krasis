@@ -7,6 +7,7 @@
 //! Single-request at a time (matches our hardware constraint).
 
 use crate::decode::CpuDecodeStore;
+use crate::gpu_decode::GpuDecodeStore;
 use pyo3::prelude::*;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -42,6 +43,9 @@ struct ServerState {
     max_context_tokens: usize,
     default_enable_thinking: bool,
     gpu_decode: bool,
+    /// Raw pointer to a GpuDecodeStore instance (set from Python during server init).
+    /// Safety: single-request guarantee means no concurrent access.
+    gpu_store_addr: usize,
 }
 
 /// Parsed HTTP request.
@@ -368,11 +372,13 @@ fn handle_chat_completion(
     let tokenizer = &state.tokenizer;
 
     if state.gpu_decode {
-        // ── GPU decode: per-token Python calls (GIL per step) ──
-        // GPU compute is ~30ms/tok, GIL overhead is <0.1ms. Negligible.
+        // ── GPU decode: pure Rust via GpuDecodeStore (zero Python, zero GIL) ──
+        // Safety: single-request guarantee. gpu_store_addr is a valid *mut GpuDecodeStore.
+        let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
         handle_gpu_decode(
-            stream, is_stream, state, tokenizer,
-            first_token, prompt_len, max_tokens, &stop_ids,
+            stream, is_stream, state, store, tokenizer,
+            first_token, prompt_len, max_tokens, temperature,
+            top_k, top_p, presence_penalty, &stop_ids,
             &request_id, &state.model_name, created,
         );
     } else {
@@ -393,36 +399,37 @@ fn handle_chat_completion(
     });
 }
 
-/// GPU decode: call Python model.server_gpu_decode_step() per token.
-/// Each call runs model.forward() (single token) + sampling on GPU.
+/// GPU decode: GIL-free Rust decode loop via GpuDecodeStore.
+/// Same pattern as handle_cpu_decode — pure Rust, zero Python per token.
 #[allow(clippy::too_many_arguments)]
 fn handle_gpu_decode(
     stream: &mut TcpStream,
     is_stream: bool,
     state: &ServerState,
+    store: &mut GpuDecodeStore,
     tokenizer: &tokenizers::Tokenizer,
     first_token: usize,
     prompt_len: usize,
     max_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    presence_penalty: f32,
     stop_ids: &[usize],
     request_id: &str,
     model_name: &str,
     created: u64,
 ) {
-    let stop_set: std::collections::HashSet<usize> = stop_ids.iter().copied().collect();
-
     if is_stream {
         if let Err(e) = begin_sse(stream) {
             log::error!("Failed to send SSE headers: {}", e);
             return;
         }
 
-        // Emit first token immediately
         let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
         let chunk = format_sse_token(request_id, model_name, &first_text, None, created);
         let _ = send_sse_chunk(stream, &chunk);
 
-        // Channel for decode → writer thread
         let (tx, rx) = mpsc::channel::<String>();
         let writer_disconnected = Arc::new(AtomicBool::new(false));
         let writer_disc_clone = writer_disconnected.clone();
@@ -481,57 +488,28 @@ fn handle_gpu_decode(
 
         let decode_start = Instant::now();
         let mut decode_token_count = 0usize;
-        let mut next_token = first_token;
 
-        for step in 0..max_tokens.saturating_sub(1) {
-            if writer_disconnected.load(Ordering::Acquire) {
-                break;
-            }
-
-            let pos = prompt_len + step;
-
-            // Call Python for one GPU decode step
-            let token_result = Python::with_gil(|py| -> PyResult<usize> {
-                let result = state.py_model.call_method1(
-                    py,
-                    "server_gpu_decode_step",
-                    (next_token as i64, pos as i64),
-                )?;
-                result.extract(py)
-            });
-
-            let token_id = match token_result {
-                Ok(t) => t,
-                Err(e) => {
-                    log::error!("GPU decode step failed: {}", e);
-                    break;
+        store.gpu_generate_stream(
+            first_token,
+            prompt_len,
+            max_tokens.saturating_sub(1),
+            temperature,
+            top_k,
+            top_p,
+            stop_ids,
+            tokenizer,
+            presence_penalty,
+            |_token_id, text, finish_reason| {
+                decode_token_count += 1;
+                let chunk = format_sse_token(request_id, model_name, text, finish_reason, created);
+                let formatted = format!("data: {}\n\n", chunk);
+                if tx.send(formatted).is_err() || writer_disconnected.load(Ordering::Acquire) {
+                    return false;
                 }
-            };
+                true
+            },
+        );
 
-            next_token = token_id;
-            decode_token_count += 1;
-
-            let text = tokenizer.decode(&[token_id as u32], true).unwrap_or_default();
-            let finish_reason = if stop_set.contains(&token_id) {
-                Some("stop")
-            } else if step + 1 >= max_tokens.saturating_sub(1) {
-                Some("length")
-            } else {
-                None
-            };
-
-            let chunk = format_sse_token(request_id, model_name, &text, finish_reason, created);
-            let formatted = format!("data: {}\n\n", chunk);
-            if tx.send(formatted).is_err() {
-                break;
-            }
-
-            if finish_reason.is_some() {
-                break;
-            }
-        }
-
-        // Emit timing + [DONE]
         let elapsed = decode_start.elapsed().as_secs_f64();
         let total_gen = decode_token_count + 1;
         let decode_tok_s = if elapsed > 0.0 && decode_token_count > 0 {
@@ -552,44 +530,31 @@ fn handle_gpu_decode(
         log::info!("Request {} GPU streaming complete ({:.2}s, {} tokens, {:.2} tok/s)",
             request_id, elapsed, total_gen, decode_tok_s);
     } else {
-        // ── Non-streaming GPU decode ──
         let mut all_text = String::new();
         let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
         all_text.push_str(&first_text);
         let mut total_tokens = 1usize;
         let mut finish = "length".to_string();
-        let mut next_token = first_token;
 
-        for step in 0..max_tokens.saturating_sub(1) {
-            let pos = prompt_len + step;
-
-            let token_result = Python::with_gil(|py| -> PyResult<usize> {
-                let result = state.py_model.call_method1(
-                    py,
-                    "server_gpu_decode_step",
-                    (next_token as i64, pos as i64),
-                )?;
-                result.extract(py)
-            });
-
-            let token_id = match token_result {
-                Ok(t) => t,
-                Err(e) => {
-                    log::error!("GPU decode step failed: {}", e);
-                    break;
+        store.gpu_generate_stream(
+            first_token,
+            prompt_len,
+            max_tokens.saturating_sub(1),
+            temperature,
+            top_k,
+            top_p,
+            stop_ids,
+            tokenizer,
+            presence_penalty,
+            |_token_id, text, finish_reason| {
+                all_text.push_str(text);
+                total_tokens += 1;
+                if let Some(fr) = finish_reason {
+                    finish = fr.to_string();
                 }
-            };
-
-            next_token = token_id;
-            total_tokens += 1;
-            let text = tokenizer.decode(&[token_id as u32], true).unwrap_or_default();
-            all_text.push_str(&text);
-
-            if stop_set.contains(&token_id) {
-                finish = "stop".to_string();
-                break;
-            }
-        }
+                true
+            },
+        );
 
         let response = format_completion(
             request_id, model_name, &all_text, prompt_len,
@@ -773,6 +738,7 @@ pub struct RustServer {
     max_context_tokens: usize,
     default_enable_thinking: bool,
     gpu_decode: bool,
+    gpu_store_addr: usize,
     py_model: Py<PyAny>,
     running: Arc<AtomicBool>,
 }
@@ -780,7 +746,7 @@ pub struct RustServer {
 #[pymethods]
 impl RustServer {
     #[new]
-    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, gpu_decode=true))]
+    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, gpu_decode=true, gpu_store_addr=0))]
     fn new(
         py_model: PyObject,
         host: String,
@@ -790,6 +756,7 @@ impl RustServer {
         max_context_tokens: usize,
         enable_thinking: bool,
         gpu_decode: bool,
+        gpu_store_addr: usize,
     ) -> Self {
         Self {
             host,
@@ -799,6 +766,7 @@ impl RustServer {
             max_context_tokens,
             default_enable_thinking: enable_thinking,
             gpu_decode,
+            gpu_store_addr,
             py_model: py_model.into(),
             running: Arc::new(AtomicBool::new(false)),
         }
@@ -816,6 +784,7 @@ impl RustServer {
         let max_context_tokens = self.max_context_tokens;
         let default_enable_thinking = self.default_enable_thinking;
         let gpu_decode = self.gpu_decode;
+        let gpu_store_addr = self.gpu_store_addr;
         let running = self.running.clone();
 
         // Install raw SIGINT handler BEFORE releasing the GIL.
@@ -872,6 +841,7 @@ impl RustServer {
                 max_context_tokens,
                 default_enable_thinking,
                 gpu_decode,
+                gpu_store_addr,
             };
 
             while running.load(Ordering::Acquire) {

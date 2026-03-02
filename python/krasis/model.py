@@ -2562,21 +2562,38 @@ class KrasisModel:
 
                 if timing:
                     torch.cuda.synchronize(layer_dev)
-                    _t_uni0 = time.perf_counter()
+                    _t_la = time.perf_counter()
 
-                # Unified path: everything on layer_dev
+                # Unified path: attention first, then MLP/MoE
+                # Split into forward_attn + MoE to get separate timing
                 if kv_layer_offset < 0:
-                    hidden, residual = layer.forward(
+                    hidden, residual = layer.forward_attn(
                         hidden, residual, layer_positions,
-                        None, None, -1,
-                        moe_layer_idx, num_new_tokens=M,
+                        None, None, -1, num_new_tokens=M,
                     )
                 else:
-                    hidden, residual = layer.forward(
+                    hidden, residual = layer.forward_attn(
                         hidden, residual, layer_positions,
-                        kv_cache, seq_state, kv_layer_offset,
-                        moe_layer_idx, num_new_tokens=M,
+                        kv_cache, seq_state, kv_layer_offset, num_new_tokens=M,
                     )
+
+                if timing:
+                    torch.cuda.synchronize(layer_dev)
+                    _t_la_done = time.perf_counter()
+                    _dt = _t_la_done - _t_la
+                    _t_attn_total += _dt
+                    if layer.layer_type == "linear_attention":
+                        _t_lin_attn_total += _dt
+                        _t_lin_attn_layers += 1
+                    else:
+                        _t_gqa_attn_total += _dt
+                        _t_gqa_layers += 1
+
+                # MLP / MoE
+                if layer.is_moe:
+                    hidden = layer._moe_forward(hidden, moe_layer_idx)
+                else:
+                    hidden = layer._dense_mlp_forward(hidden)
 
                 if _DEBUG_DECODE:
                     torch.cuda.synchronize(layer_dev)
@@ -2585,15 +2602,11 @@ class KrasisModel:
 
                 if timing:
                     torch.cuda.synchronize(layer_dev)
-                    _t_uni1 = time.perf_counter()
+                    _t_moe_done = time.perf_counter()
                     _t_unified_layers += 1
-                    # Unified layers include both attn + MoE in one call
-                    # Attribute to MoE if it's a MoE layer, else attn
                     if layer.is_moe:
-                        _t_moe_total += _t_uni1 - _t_uni0
+                        _t_moe_total += _t_moe_done - _t_la_done
                         _t_moe_layers += 1
-                    else:
-                        _t_attn_total += _t_uni1 - _t_uni0
 
             if TIMING.diag and diag and abs_layer_idx in (0, 1, self.cfg.num_hidden_layers // 2, self.cfg.num_hidden_layers - 1):
                 h = hidden[-1] if hidden.shape[0] > 1 else hidden[0]
@@ -3715,13 +3728,12 @@ class KrasisModel:
             cpu_decoder.prepare(seq_states, max_new_tokens)
             store_addr = cpu_decoder._store.self_addr()
         else:
-            # Store sampling params for GPU decode steps
-            self._gpu_decode_device = device
-            self._gpu_decode_temperature = temperature
-            self._gpu_decode_top_k = top_k
-            self._gpu_decode_top_p = top_p
-            self._gpu_decode_presence_penalty = presence_penalty
-            self._gpu_decode_seen_tokens = {first_token}
+            # GPU decode: export KV cache + LA state to Rust GpuDecodeStore
+            gpu_store = getattr(self, '_gpu_decode_store', None)
+            if gpu_store is not None:
+                self._export_kv_to_rust(seq_states, len(prompt_tokens))
+                self._update_la_state_ptrs()
+                store_addr = gpu_store.gpu_store_addr()
 
         class _Result:
             pass
@@ -3759,6 +3771,244 @@ class KrasisModel:
         self._gpu_decode_seen_tokens.add(next_token)
         return next_token
 
+    def setup_gpu_decode_store(self) -> "GpuDecodeStore":
+        """Create and configure a GpuDecodeStore for Rust-native GPU decode.
+
+        Registers all attention weights, MoE layers, RoPE tables, and KV cache.
+        Called once at startup. Returns the configured store.
+        """
+        from krasis import GpuDecodeStore
+
+        device = torch.device(self.ranks[0].device)
+        gpu_idx = device.index or 0
+
+        store = GpuDecodeStore(gpu_idx)
+        store.configure(
+            hidden_size=self.cfg.hidden_size,
+            num_layers=len(self.layers),
+            vocab_size=self.cfg.vocab_size,
+            eps=self.cfg.rms_norm_eps,
+            max_experts_per_tok=self.cfg.num_experts_per_tok,
+            max_intermediate_size=self.cfg.moe_intermediate_size,
+            group_size=128,
+        )
+
+        # Register embedding
+        store.set_embedding(self.embedding.data_ptr())
+
+        # Register final norm
+        store.set_final_norm(self.final_norm.data_ptr(), self.cfg.hidden_size)
+
+        # Register LM head (always as BF16 for cuBLAS GEMV compatibility)
+        lm_head_w = self.lm_head
+        if isinstance(lm_head_w, tuple):
+            # INT8 (weight, scale) — dequantize to BF16 for Rust decode
+            w_int8, scale = lm_head_w
+            lm_head_bf16 = (w_int8.float() * scale).to(torch.bfloat16).contiguous()
+            self._rust_lm_head = lm_head_bf16  # prevent GC
+            lm_head_ptr = lm_head_bf16.data_ptr()
+            lm_head_rows = lm_head_bf16.shape[0]
+            lm_head_cols = lm_head_bf16.shape[1]
+        else:
+            lm_head_ptr = lm_head_w.data_ptr()
+            lm_head_rows = lm_head_w.shape[0]
+            lm_head_cols = lm_head_w.shape[1]
+        store.set_lm_head(
+            store.register_weight(lm_head_ptr, lm_head_rows, lm_head_cols, 0)  # 0 = BF16
+        )
+
+        # Norm bias flag (Qwen3 uses (1+w)*x)
+        store.set_norm_bias_one(getattr(self.cfg, 'norm_bias_one', False))
+
+        # Track weight IDs for LA layers (needed for re-registration after state reset)
+        self._la_wids = {}
+        rope_set = False
+
+        for layer_idx, layer in enumerate(self.layers):
+            attn = layer.attention
+            inp_norm = layer.input_norm_weight
+            post_norm = layer.post_attn_norm_weight
+
+            if layer.layer_type == "linear_attention":
+                qkvz_w = attn.in_proj_qkvz
+                ba_w = attn.in_proj_ba
+                out_w = attn.out_proj
+                qkvz_wid = store.register_weight(
+                    qkvz_w.data_ptr(), qkvz_w.shape[0], qkvz_w.shape[1], 0)
+                ba_wid = store.register_weight(
+                    ba_w.data_ptr(), ba_w.shape[0], ba_w.shape[1], 0)
+                out_wid = store.register_weight(
+                    out_w.data_ptr(), out_w.shape[0], out_w.shape[1], 0)
+                self._la_wids[layer_idx] = (qkvz_wid, ba_wid, out_wid)
+
+                # Conv weight: [conv_dim, 1, kernel_dim] -> [conv_dim, kernel_dim]
+                conv_w = attn.conv1d_weight.squeeze(1).contiguous()
+                attn._rust_conv_weight = conv_w
+
+                attn._init_state(batch_size=1)
+
+                store.register_la_layer(
+                    layer_idx=layer_idx,
+                    input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
+                    post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
+                    in_proj_qkvz_wid=qkvz_wid, in_proj_ba_wid=ba_wid, out_proj_wid=out_wid,
+                    conv_weight_ptr=conv_w.data_ptr(),
+                    a_log_ptr=attn.A_log.data_ptr(),
+                    dt_bias_ptr=attn.dt_bias.data_ptr(),
+                    norm_weight_ptr=attn.norm_weight.data_ptr(),
+                    conv_state_ptr=attn._conv_state.data_ptr(),
+                    recur_state_ptr=attn._recurrent_state.data_ptr(),
+                    nk=attn.num_k_heads, nv=attn.num_v_heads,
+                    dk=attn.k_head_dim, dv=attn.v_head_dim,
+                    hr=attn.head_ratio,
+                    kernel_dim=attn.kernel_dim, conv_dim=attn.conv_dim,
+                    scale=attn.scale,
+                )
+            else:
+                # GQA attention
+                q_wid = store.register_weight(
+                    attn.q_proj.data_ptr(), attn.q_proj.shape[0], attn.q_proj.shape[1], 0)
+                k_wid = store.register_weight(
+                    attn.k_proj.data_ptr(), attn.k_proj.shape[0], attn.k_proj.shape[1], 0)
+                v_wid = store.register_weight(
+                    attn.v_proj.data_ptr(), attn.v_proj.shape[0], attn.v_proj.shape[1], 0)
+                o_wid = store.register_weight(
+                    attn.o_proj.data_ptr(), attn.o_proj.shape[0], attn.o_proj.shape[1], 0)
+
+                q_norm_ptr = attn.q_norm.data_ptr() if attn.q_norm is not None else 0
+                k_norm_ptr = attn.k_norm.data_ptr() if attn.k_norm is not None else 0
+
+                store.register_gqa_layer(
+                    layer_idx=layer_idx,
+                    input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
+                    post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
+                    q_proj_wid=q_wid, k_proj_wid=k_wid,
+                    v_proj_wid=v_wid, o_proj_wid=o_wid,
+                    fused_qkv_wid=None,
+                    num_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
+                    head_dim=attn.head_dim, sm_scale=attn.sm_scale,
+                    q_norm_ptr=q_norm_ptr, k_norm_ptr=k_norm_ptr,
+                    gated=attn.gated_attention,
+                )
+
+                # Set up RoPE tables from first GQA layer
+                if not rope_set:
+                    max_seq = max(
+                        c.max_context_tokens for c in self.kv_caches if c is not None
+                    )
+                    cos, sin = attn._get_rope_cos_sin(max_seq)
+                    cos_f32 = cos.float().contiguous()
+                    sin_f32 = sin.float().contiguous()
+                    self._rust_rope_cos = cos_f32
+                    self._rust_rope_sin = sin_f32
+                    store.set_rope_tables(
+                        cos_f32.data_ptr(), sin_f32.data_ptr(),
+                        cos_f32.shape[1], max_seq,
+                    )
+                    rope_set = True
+
+            # Register MLP type
+            if layer.is_moe:
+                store.register_mlp(layer_idx, "moe")
+            elif layer.dense_mlp is not None:
+                gp = layer.dense_mlp["gate_proj"]
+                up = layer.dense_mlp["up_proj"]
+                dp = layer.dense_mlp["down_proj"]
+                gp_wid = store.register_weight(gp.data_ptr(), gp.shape[0], gp.shape[1], 0)
+                up_wid = store.register_weight(up.data_ptr(), up.shape[0], up.shape[1], 0)
+                dp_wid = store.register_weight(dp.data_ptr(), dp.shape[0], dp.shape[1], 0)
+                store.register_mlp(layer_idx, "dense",
+                                   gate_proj_wid=gp_wid, up_proj_wid=up_wid, down_proj_wid=dp_wid)
+            else:
+                store.register_mlp(layer_idx, "none")
+
+        # Register MoE expert data from engine (all MoE layers at once)
+        if self.engine is not None:
+            store.setup_from_engine(self.engine)
+
+        # Allocate KV cache
+        max_seq = max(c.max_context_tokens for c in self.kv_caches if c is not None)
+        store.allocate_kv_cache(max_seq)
+
+        self._gpu_decode_store = store
+        logger.info("GPU decode store configured: %d layers, store_addr=%d",
+                     len(self.layers), store.gpu_store_addr())
+        return store
+
+    def _export_kv_to_rust(self, seq_states, prompt_len: int):
+        """Export KV cache from FlashInfer paged layout to Rust contiguous layout."""
+        store = self._gpu_decode_store
+        cache = self.kv_caches[0]
+        if cache is None or cache.k_cache is None:
+            return
+
+        seq_state = seq_states[0]
+        if seq_state is None:
+            return
+
+        kv_data = []
+        self._rust_kv_refs = []
+        pages = seq_state.pages
+        page_size = cache.page_size
+
+        for layer_idx, layer in enumerate(self.layers):
+            if layer.layer_type != "linear_attention":
+                attn = layer.attention
+                nkv = attn.num_kv_heads
+                hd = attn.head_dim
+                kv_stride = nkv * hd
+
+                # k_cache: [num_layers, max_pages, page_size, num_kv_heads, head_dim]
+                k_pages = cache.k_cache[layer_idx, pages]
+                v_pages = cache.v_cache[layer_idx, pages]
+
+                # Reshape to [n_pages * page_size, nkv * hd], trim to seq_len
+                k_cont = k_pages.reshape(-1, nkv * hd)[:prompt_len].contiguous()
+                v_cont = v_pages.reshape(-1, nkv * hd)[:prompt_len].contiguous()
+
+                # Convert to BF16 if needed (KV cache may be FP8)
+                if k_cont.dtype != torch.bfloat16:
+                    k_cont = k_cont.to(torch.bfloat16)
+                    v_cont = v_cont.to(torch.bfloat16)
+
+                kv_data.append((layer_idx, k_cont.data_ptr(), v_cont.data_ptr(), kv_stride))
+                self._rust_kv_refs.extend([k_cont, v_cont])
+
+        store.import_kv_cache(kv_data, prompt_len)
+
+    def _update_la_state_ptrs(self):
+        """Re-register LA state pointers after prefill (states may have been reallocated)."""
+        store = self._gpu_decode_store
+        for layer_idx, layer in enumerate(self.layers):
+            if layer.layer_type == "linear_attention":
+                attn = layer.attention
+                if attn._conv_state is None or attn._recurrent_state is None:
+                    continue
+                wids = self._la_wids.get(layer_idx)
+                if wids is None:
+                    continue
+                inp_norm = layer.input_norm_weight
+                post_norm = layer.post_attn_norm_weight
+                conv_w = attn._rust_conv_weight
+
+                store.register_la_layer(
+                    layer_idx=layer_idx,
+                    input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
+                    post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
+                    in_proj_qkvz_wid=wids[0], in_proj_ba_wid=wids[1], out_proj_wid=wids[2],
+                    conv_weight_ptr=conv_w.data_ptr(),
+                    a_log_ptr=attn.A_log.data_ptr(),
+                    dt_bias_ptr=attn.dt_bias.data_ptr(),
+                    norm_weight_ptr=attn.norm_weight.data_ptr(),
+                    conv_state_ptr=attn._conv_state.data_ptr(),
+                    recur_state_ptr=attn._recurrent_state.data_ptr(),
+                    nk=attn.num_k_heads, nv=attn.num_v_heads,
+                    dk=attn.k_head_dim, dv=attn.v_head_dim,
+                    hr=attn.head_ratio,
+                    kernel_dim=attn.kernel_dim, conv_dim=attn.conv_dim,
+                    scale=attn.scale,
+                )
+
     def server_cleanup(self):
         """Free server request state (KV cache pages, etc.)."""
         states = getattr(self, '_server_seq_states', None)
@@ -3767,3 +4017,4 @@ class KrasisModel:
                 if s is not None:
                     s.free()
             self._server_seq_states = None
+        self._rust_kv_refs = None

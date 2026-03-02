@@ -425,6 +425,7 @@ dependencies = [
  "libc",
  "log",
  "memmap2",
+ "minijinja",
  "pyo3",
  "rand 0.8.5",
  "rayon",
@@ -501,6 +502,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "minijinja"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c54f3bcc034dd74496b5ca929fd0b710186672d5ff0b0f255a9ceb259042ece"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

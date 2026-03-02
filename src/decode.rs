@@ -4253,6 +4253,18 @@ impl CpuDecodeStore {
 
 // ── Sampling (pure Rust, no PyTorch) ──
 
+/// Public wrapper for sample_from_logits, used by GpuDecodeStore.
+pub fn sample_from_logits_pub(
+    logits: &mut [f32],
+    vocab_size: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    rng_next: &mut dyn FnMut() -> u64,
+) -> usize {
+    sample_from_logits(logits, vocab_size, temperature, top_k, top_p, rng_next)
+}
+
 /// Sample a token from logits using temperature, top-k, and top-p.
 fn sample_from_logits(
     logits: &mut [f32],

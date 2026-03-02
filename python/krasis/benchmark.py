@@ -43,16 +43,22 @@ class KrasisBenchmark:
     PREFILL_LENGTHS = [20000, 35000, 50000]  # tokens — timed runs at each length
     WARMUP_MAX_CHARS = 125000  # ~25K tokens — warmup prompt truncation
 
-    def __init__(self, model):
+    def __init__(self, model, timing: bool = False):
         self.model = model
+        self.timing = timing
 
         self.decode_tokens = 64
         self.n_runs = int(os.environ.get("KRASIS_BENCH_RUNS", "3"))
 
-        # Ensure instrumentation is OFF for benchmarking
-        TIMING.decode = False
-        TIMING.prefill = False
-        os.environ.pop("KRASIS_DECODE_TIMING", None)
+        if timing:
+            # Instrumentation mode: enable decode timing for per-layer breakdown
+            TIMING.decode = True
+            TIMING.prefill = False
+        else:
+            # Speed measurement mode: disable all instrumentation
+            TIMING.decode = False
+            TIMING.prefill = False
+            os.environ.pop("KRASIS_DECODE_TIMING", None)
 
     # ──────────────────────────────────────────────────────────
     # System info collection
@@ -675,8 +681,11 @@ class KrasisBenchmark:
         max_ctx = self.model.get_max_context_tokens()
         model_name = os.path.basename(self.model.cfg.model_path)
 
+        gpu_decode = getattr(self.model, 'decode_mode', 'cpu') == 'gpu'
         server = RustServer(
             self.model, host, port, model_name, tokenizer_path, max_ctx,
+            False,  # enable_thinking
+            gpu_decode,
         )
 
         t = threading.Thread(target=server.run, daemon=True)

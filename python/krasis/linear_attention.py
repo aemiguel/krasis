@@ -416,7 +416,7 @@ class GatedDeltaNetAttention:
                 # Sync: wait for graph to finish before returning output
                 torch.cuda.current_stream(self.device).wait_stream(self._la_stream)
                 return self._la_output.clone()
-            elif self._la_input is None and not (TIMING.decode or TIMING.prefill):
+            elif self._la_input is None:
                 # First M=1 call: run normally (warmup), capture graph next call
                 self._la_input = "pending"  # sentinel: capture on next call
                 return self._forward_recurrent(hidden)

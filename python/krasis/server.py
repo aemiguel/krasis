@@ -152,20 +152,30 @@ def _vram_snap(label: str):
 
 
 def _warmup_prefill(model: KrasisModel):
-    """Run a short prefill to warm up GPU kernels, CUDA caches, and lazy allocations.
+    """Run a 50K-token prefill to warm up GPU kernels, CUDA caches, and lazy allocations.
 
-    Prefill-only: does NOT run decode steps. This is called BEFORE HCS allocation
-    to measure the VRAM baseline. Decode warmup happens after HCS is loaded.
+    Uses a large prompt to trigger peak VRAM usage (all layer group buffers,
+    FlashInfer workspace, KV cache pages). This is called BEFORE HCS allocation
+    so the VRAM monitor captures realistic peak usage.
     """
     import json as _json
 
     _vram_snap("before-prefill-warmup")
-    logger.info("Warming up prefill (GPU kernels + CUDA caches)...")
+    logger.info("Warming up prefill (50K tokens, GPU kernels + CUDA caches)...")
     t0 = time.time()
 
     try:
+        # Build a ~50K token prompt by repeating text
+        base_text = (
+            "Explain the architecture of modern mixture-of-experts models "
+            "including their routing mechanisms, load balancing strategies, "
+            "and computational efficiency trade-offs in detail. "
+        )
+        # Each repetition is ~30 tokens, repeat enough for ~50K
+        warmup_text = base_text * 1700  # ~51K tokens
+        messages_json = _json.dumps([{"role": "user", "content": warmup_text}])
+
         # Use GPU decode mode for prefill so it doesn't try to set up CPU decoder
-        messages_json = _json.dumps([{"role": "user", "content": "Hi"}])
         result = model.server_prefill(
             messages_json, max_new_tokens=5, temperature=0.6, top_k=50,
             top_p=0.95, presence_penalty=0.0,
@@ -173,11 +183,12 @@ def _warmup_prefill(model: KrasisModel):
             decode_mode="gpu",
         )
         _vram_snap("after-prefill-warmup-before-cleanup")
+        logger.info("Prefill warmup: %d tokens processed", result.prompt_len)
         model.server_cleanup()
         _vram_snap("after-prefill-warmup-after-cleanup")
 
         elapsed = time.time() - t0
-        logger.info("Prefill warmup complete (%.1fs)", elapsed)
+        logger.info("Prefill warmup complete (%.1fs, %d tokens)", elapsed, result.prompt_len)
     except Exception as e:
         logger.warning("Prefill warmup failed (non-fatal): %s", e)
         try:
@@ -432,6 +443,8 @@ def main():
                         help="Run standardized benchmark before starting server")
     parser.add_argument("--benchmark-only", action="store_true",
                         help="Run benchmark and exit (don't start server)")
+    parser.add_argument("--timing", action="store_true",
+                        help="Enable decode timing instrumentation (per-layer breakdown)")
     parser.add_argument("--stress-test", action="store_true",
                         help="Run stress test (diverse prompts) and exit")
     parser.add_argument("--perplexity", action="store_true",
@@ -742,7 +755,7 @@ def main():
     # Run benchmark if requested (after model load + strategy, before serving)
     if args.benchmark or args.benchmark_only:
         from krasis.benchmark import KrasisBenchmark
-        bench = KrasisBenchmark(_model)
+        bench = KrasisBenchmark(_model, timing=args.timing)
         bench.run()
         if args.benchmark_only:
             sys.exit(0)
@@ -837,6 +850,14 @@ def main():
     _write_registry(args.host, args.port, _model_name)
     atexit.register(_remove_registry)
 
+    # ── GPU decode store setup ──
+    gpu_store_addr = 0
+    if gpu_decode:
+        _status("Setting up GPU decode store")
+        gpu_store = _model.setup_gpu_decode_store()
+        gpu_store_addr = gpu_store.gpu_store_addr()
+        _detail(f"GPU decode store ready (addr={gpu_store_addr:#x})")
+
     # ── Rust HTTP server ──
     from krasis import RustServer
 
@@ -850,6 +871,7 @@ def main():
         max_ctx,
         args.enable_thinking,
         gpu_decode,
+        gpu_store_addr,
     )
 
     def _handle_exit(sig, frame):
