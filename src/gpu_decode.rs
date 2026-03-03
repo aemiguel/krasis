@@ -3756,6 +3756,21 @@ impl GpuDecodeStore {
             hcs.begin_prompt();
         }
 
+        // Reset per-prompt timing accumulators
+        {
+            let g = self.graph.as_mut().unwrap();
+            if g.timing_enabled {
+                g.timing_step_count = 0;
+                g.t_total = 0.0; g.t_norm = 0.0; g.t_attn = 0.0;
+                g.t_route = 0.0; g.t_expert_dma = 0.0; g.t_expert_compute = 0.0;
+                g.t_shared = 0.0; g.t_dense_mlp = 0.0; g.t_lm_head = 0.0;
+                g.t_moe_route_sync = 0.0; g.t_moe_expert_loop = 0.0;
+                g.t_moe_shared = 0.0; g.t_moe_overhead = 0.0;
+                g.dma_bytes_total = 0; g.dma_call_count = 0;
+                g.dma_cold_experts = 0; g.dma_hcs_experts = 0;
+            }
+        }
+
         let decode_start = Instant::now();
         let mut next_token = first_token;
         let mut generated = 0usize;
