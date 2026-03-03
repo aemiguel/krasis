@@ -40,7 +40,7 @@ def _section(label: str) -> str:
 class KrasisBenchmark:
     """Standardized benchmark suite for a loaded KrasisModel."""
 
-    PREFILL_LENGTHS = [20000, 35000, 50000]  # tokens — timed runs at each length
+    PREFILL_LENGTHS = [1000, 5000, 10000, 20000, 35000, 50000]  # tokens — timed runs at each length
     WARMUP_MAX_CHARS = 125000  # ~25K tokens — warmup prompt truncation
 
     def __init__(self, model, timing: bool = False):
@@ -933,7 +933,7 @@ class KrasisBenchmark:
         warmup_s = time.perf_counter() - t0
         print(f"  Warmup complete ({warmup_s:.1f}s). All kernels compiled.")
 
-        # 4. Prefill benchmark (timed — different lengths: 20K/35K/50K tokens)
+        # 4. Prefill benchmark (timed — different lengths: 1K/5K/10K/20K/35K/50K tokens)
         print(_section(f"Running prefill benchmark ({lengths_str} tokens, {n_timed_prefill} runs)"))
         prefill_result = self._benchmark_prefill(timed_prefill_texts)
         for i, run in enumerate(prefill_result["runs"]):
