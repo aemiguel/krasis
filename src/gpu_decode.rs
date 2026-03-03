@@ -60,6 +60,7 @@ const KERNEL_NAMES: &[&str] = &[
     "marlin_gemv_int4_fused_silu_accum_v2",
     "reduce_ksplits_weighted_accum_bf16",
     "sigmoid_gate_inplace_bf16",
+    // "fused_gate_topk" exists in .cu but is not loaded (single-block = slow on multi-SM GPUs)
 ];
 
 const MODULE_NAME: &str = "decode_kernels";
@@ -4340,29 +4341,16 @@ impl GpuDecodeStore {
         // Use pre-allocated events if available, otherwise create on demand
         let pre_ev = &graph.pre_events;
 
-        // ── Step 1: BF16 → FP32 conversion of d_hidden ──
-        {
-            unsafe {
-                k.bf16_to_fp32.clone().launch(
-                    LaunchConfig::for_num_elems(hs as u32),
-                    (
-                        *graph.d_fp32_scratch.device_ptr(),
-                        *graph.d_hidden.device_ptr(),
-                        hs as i32,
-                    ),
-                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("bf16_to_fp32: {:?}", e)))?;
-            }
-        }
-
-        // ── Step 2: FP32 GEMV: route logits = gate[ne, hs] @ hidden_fp32[hs] ──
+        // ── Step 1+2: Gate GEMV (BF16 gate × BF16 hidden → FP32 logits) ──
+        // Gate weights stored as BF16 (saves 50% VRAM vs FP32), hidden is already BF16.
+        // cuBLAS gemm_ex with BF16×BF16→FP32 + COMPUTE_32F eliminates the bf16_to_fp32 step.
+        let logits_ptr = unsafe {
+            (*graph.d_fp32_scratch.device_ptr() as *const f32).add(hs) as u64
+        };
         {
             let w = &graph.weights[gate_wid];
             let alpha: f32 = 1.0;
             let beta: f32 = 0.0;
-            let output_ptr = unsafe {
-                (*graph.d_fp32_scratch.device_ptr() as *const f32).add(hs) as u64
-            };
             unsafe {
                 cublas_result::gemm_ex(
                     *self.blas.handle(),
@@ -4370,23 +4358,20 @@ impl GpuDecodeStore {
                     cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                     w.rows as i32, 1, w.cols as i32,
                     &alpha as *const f32 as *const std::ffi::c_void,
-                    w.ptr as *const std::ffi::c_void, w.cublas_data_type(), w.cols as i32,
-                    *graph.d_fp32_scratch.device_ptr() as *const std::ffi::c_void,
-                    cublas_sys::cudaDataType::CUDA_R_32F, w.cols as i32,
+                    w.ptr as *const std::ffi::c_void, cublas_sys::cudaDataType::CUDA_R_16BF, w.cols as i32,
+                    *graph.d_hidden.device_ptr() as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, hs as i32,
                     &beta as *const f32 as *const std::ffi::c_void,
-                    output_ptr as *mut std::ffi::c_void,
+                    logits_ptr as *mut std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_32F, w.rows as i32,
                     cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                     cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("cuBLAS gate GEMV: {:?}", e)))?;
+                    format!("cuBLAS gate GEMV (bf16): {:?}", e)))?;
             }
         }
 
         // ── Step 3: TopK routing ──
-        let logits_ptr = unsafe {
-            (*graph.d_fp32_scratch.device_ptr() as *const f32).add(hs) as u64
-        };
         {
             let smem = (ne as u32) * 4;
             let cfg = LaunchConfig {
@@ -4484,19 +4469,15 @@ impl GpuDecodeStore {
                     .map_or(5, |s| s.prefetch_count);
 
                 if prefetch_count > 0 {
-                    // Speculative gate GEMV for next layer.
-                    // d_fp32_scratch[0..hs] still holds hidden_fp32 from Step 1.
-                    // We use a separate region of d_fp32_scratch for the spec logits
-                    // to avoid overwriting data the current layer might need.
-                    // Spec logits go to d_fp32_scratch[hs..hs+next_ne] (same as Step 2
-                    // output, but current layer's routing is already D2H'd above).
+                    // Speculative gate GEMV for next layer (BF16 gate × BF16 hidden → FP32).
+                    // Matches the main routing path.
+                    let output_ptr = unsafe {
+                        (*graph.d_fp32_scratch.device_ptr() as *const f32).add(hs) as u64
+                    };
                     {
                         let w = &graph.weights[next_gate_wid];
                         let alpha: f32 = 1.0;
                         let beta: f32 = 0.0;
-                        let output_ptr = unsafe {
-                            (*graph.d_fp32_scratch.device_ptr() as *const f32).add(hs) as u64
-                        };
                         unsafe {
                             cublas_result::gemm_ex(
                                 *self.blas.handle(),
@@ -4504,9 +4485,9 @@ impl GpuDecodeStore {
                                 cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                                 w.rows as i32, 1, w.cols as i32,
                                 &alpha as *const f32 as *const std::ffi::c_void,
-                                w.ptr as *const std::ffi::c_void, w.cublas_data_type(), w.cols as i32,
-                                *graph.d_fp32_scratch.device_ptr() as *const std::ffi::c_void,
-                                cublas_sys::cudaDataType::CUDA_R_32F, w.cols as i32,
+                                w.ptr as *const std::ffi::c_void, cublas_sys::cudaDataType::CUDA_R_16BF, w.cols as i32,
+                                *graph.d_hidden.device_ptr() as *const std::ffi::c_void,
+                                cublas_sys::cudaDataType::CUDA_R_16BF, hs as i32,
                                 &beta as *const f32 as *const std::ffi::c_void,
                                 output_ptr as *mut std::ffi::c_void,
                                 cublas_sys::cudaDataType::CUDA_R_32F, w.rows as i32,
@@ -5372,9 +5353,9 @@ impl GpuDecodeStore {
                 .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("No routing weights for MoE layer {}", moe_idx)))?;
 
-            // Convert BF16 gate to FP32
-            let gate_fp32: Vec<f32> = gate_bf16.iter().map(|&b| bf16_to_f32(b)).collect();
-            let d_gate = self.device.htod_copy(gate_fp32)
+            // Upload gate as BF16 directly (saves VRAM, enables bf16*bf16->fp32 GEMV
+            // which eliminates the separate bf16_to_fp32 conversion step)
+            let d_gate = self.device.htod_copy(gate_bf16.to_vec())
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
 
             let gate_wid = {
@@ -5384,7 +5365,7 @@ impl GpuDecodeStore {
                     ptr: *d_gate.device_ptr(),
                     rows: n_experts,
                     cols: hidden_size,
-                    dtype: 1, // FP32
+                    dtype: 0, // BF16
                 });
                 // Keep the device allocation alive by storing it
                 // (we leak it intentionally - it lives for the lifetime of the process)

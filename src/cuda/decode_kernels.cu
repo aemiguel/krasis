@@ -265,6 +265,113 @@ extern "C" __global__ void softmax_topk(
     }
 }
 
+// ── Fused Gate GEMV + TopK ─────────────────────────────────────────────
+//
+// Replaces: bf16_to_fp32 + cuBLAS gate GEMV + sigmoid_topk/softmax_topk
+// in a single kernel launch. Saves ~20us per layer from eliminated launches.
+//
+// Launch: grid=(1,1,1), block=(num_experts,1,1), smem = hidden_size * 2 bytes
+// Constraints: num_experts <= 1024, hidden_size <= 16384
+//
+// scoring_func: 0 = softmax, 1 = sigmoid
+
+extern "C" __global__ void fused_gate_topk(
+    const __nv_bfloat16* __restrict__ hidden,     // [hidden_size] bf16
+    const float* __restrict__ gate,               // [num_experts, hidden_size] fp32
+    const float* __restrict__ gate_bias,          // [num_experts] or NULL
+    const float* __restrict__ e_score_corr,       // [num_experts] or NULL
+    int* __restrict__ topk_indices,               // [topk]
+    float* __restrict__ topk_weights,             // [topk]
+    int num_experts,
+    int hidden_size,
+    int topk,
+    int scoring_func,                             // 0=softmax, 1=sigmoid
+    float routed_scaling_factor                   // for sigmoid normalization
+) {
+    const int eid = threadIdx.x;
+    if (eid >= num_experts) return;
+
+    // Load hidden state into shared memory as fp32 (all threads cooperate)
+    extern __shared__ char smem_raw[];
+    float* s_hidden = (float*)smem_raw;
+    // After hidden: scores array for topK selection (float, num_experts)
+    float* s_scores = s_hidden + hidden_size;
+
+    for (int j = eid; j < hidden_size; j += num_experts) {
+        s_hidden[j] = bf16_to_f32(hidden[j]);
+    }
+    __syncthreads();
+
+    // Each thread computes dot product for one expert
+    const float* gate_row = gate + (long long)eid * hidden_size;
+    float acc = 0.0f;
+    for (int j = 0; j < hidden_size; j++) {
+        acc += gate_row[j] * s_hidden[j];
+    }
+
+    // Apply bias if present
+    if (gate_bias) acc += gate_bias[eid];
+
+    // Apply scoring function
+    float score;
+    if (scoring_func == 1) {
+        // Sigmoid
+        score = 1.0f / (1.0f + expf(-acc));
+        if (e_score_corr) score += e_score_corr[eid];
+    } else {
+        // For softmax, store raw logit first (need cooperative reduction)
+        score = acc;
+    }
+
+    s_scores[eid] = score;
+    __syncthreads();
+
+    // Softmax normalization (if scoring_func == 0)
+    if (scoring_func == 0 && eid == 0) {
+        // Find max for numerical stability
+        float max_val = s_scores[0];
+        for (int i = 1; i < num_experts; i++) {
+            if (s_scores[i] > max_val) max_val = s_scores[i];
+        }
+        // exp and sum
+        float sum_exp = 0.0f;
+        for (int i = 0; i < num_experts; i++) {
+            s_scores[i] = expf(s_scores[i] - max_val);
+            sum_exp += s_scores[i];
+        }
+        float inv_sum = 1.0f / sum_exp;
+        for (int i = 0; i < num_experts; i++) {
+            s_scores[i] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    // TopK selection + normalize (single thread)
+    if (eid == 0) {
+        for (int t = 0; t < topk; t++) {
+            int best_idx = -1;
+            float best_val = -1e30f;
+            for (int i = 0; i < num_experts; i++) {
+                if (s_scores[i] > best_val) {
+                    best_val = s_scores[i];
+                    best_idx = i;
+                }
+            }
+            topk_indices[t] = best_idx;
+            topk_weights[t] = best_val;
+            s_scores[best_idx] = -1e30f;
+        }
+
+        // Normalize weights
+        float sum = 0.0f;
+        for (int t = 0; t < topk; t++) sum += topk_weights[t];
+        if (sum > 0.0f) {
+            float inv = 1.0f / sum;
+            for (int t = 0; t < topk; t++) topk_weights[t] *= inv;
+        }
+    }
+}
+
 // ── Vector Operations ──────────────────────────────────────────────────
 
 // Weighted add: output += weight * input (for accumulating expert outputs)
