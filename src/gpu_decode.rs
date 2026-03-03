@@ -885,9 +885,10 @@ impl GpuDecodeStore {
                     };
                     if result == cuda_sys::CUresult::CUDA_SUCCESS {
                         gqa_smem_limit = max_smem_i32 as u32;
-                        let max_tokens = (gqa_smem_limit - 128) / 4;
-                        log::info!("GQA attention: opt-in shared memory = {} KB, fast path up to {} tokens",
-                                   gqa_smem_limit / 1024, max_tokens);
+                        // Max tokens depends on head_dim (Q preload takes head_dim*4 bytes)
+                        // but head_dim not known here; log raw limit, actual threshold at dispatch
+                        log::info!("GQA attention: opt-in shared memory = {} KB",
+                                   gqa_smem_limit / 1024);
                     } else {
                         log::warn!("GQA attention: failed to set extended shared memory ({} bytes), result={:?}",
                                    max_smem_i32, result);
@@ -3277,7 +3278,7 @@ impl GpuDecodeStore {
                         if use_tiled {
                             // FlashDecoding: tiled attention + reduce
                             let num_tiles = ((seq_len as usize) + tile_size - 1) / tile_size;
-                            let tile_smem = (tile_size as u32) * 4 + 128;
+                            let tile_smem = (tile_size as u32 + hd as u32) * 4 + 128;
                             let tiled_o = graph.d_gqa_tiled_o.as_ref().unwrap();
                             let tiled_lse = graph.d_gqa_tiled_lse.as_ref().unwrap();
                             unsafe {
@@ -3325,12 +3326,13 @@ impl GpuDecodeStore {
                             }
                         } else {
                             // Original single-block kernel for short sequences
-                            let smem_threshold = (graph.gqa_max_smem_bytes - 128) / 4;
+                            let q_smem = (hd as u32) * 4;
+                            let smem_threshold = graph.gqa_max_smem_bytes.saturating_sub(128 + q_smem) / 4;
                             let use_smem = seq_len <= smem_threshold;
                             let shared_mem_bytes = if use_smem {
-                                seq_len * 4 + 128
+                                q_smem + seq_len * 4 + 128
                             } else {
-                                128
+                                q_smem + 128
                             };
                             let cfg = LaunchConfig {
                                 grid_dim: (nh as u32, 1, 1),

@@ -915,9 +915,12 @@ extern "C" __global__ void kv_cache_write(
 // Single-query GQA attention: scores over all cached K, softmax, weighted V sum.
 // One block per Q head. KV cache is FP8 E4M3 — dequantized to FP32 on the fly.
 //
-// Uses dynamic shared memory to store attention scores when seq_len fits in 48KB
-// (seq_len <= 11776). For longer sequences, falls back to 2-pass approach that
-// recomputes K dot products (slower but uses O(1) shared memory).
+// Q is preloaded into shared memory for fast reuse across KV positions.
+// FP8 K values are loaded 16 at a time via uint4 (16-byte vectorized loads).
+//
+// Uses dynamic shared memory to store attention scores when seq_len fits.
+// For longer sequences, falls back to 2-pass approach that recomputes K dot
+// products (slower but uses O(1) shared memory for scores).
 extern "C" __global__ void gqa_attention(
     float* __restrict__ output,          // [num_q_heads * head_dim]
     const float* __restrict__ q,          // [num_q_heads * head_dim]
@@ -944,34 +947,48 @@ extern "C" __global__ void gqa_attention(
     const float* q_head = q + qh * head_dim;
 
     // Dynamic shared memory layout:
-    //   smem[0..seq_len-1]: attention scores (only when use_smem=1)
-    //   smem_reduce[0..31]: warp reduction scratch (always)
+    //   s_q[0..head_dim-1]:          Q vector preloaded (float)
+    //   smem_scores[0..seq_len-1]:   attention scores (only when use_smem=1)
+    //   smem_reduce[0..31]:          warp reduction scratch (always)
     extern __shared__ float smem[];
-    // Warp reduction scratch at the end of shared memory
-    float* smem_reduce = smem + (use_smem ? seq_len : 0);
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + (use_smem ? seq_len : 0);
 
     int warp_id = tid / warpSize;
     int lane_id = tid % warpSize;
     int num_warps = (num_threads + warpSize - 1) / warpSize;
 
+    // Preload Q into shared memory (reused across all KV positions)
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
     if (use_smem) {
         // ══════ FAST PATH: shared memory for scores ══════
 
-        // Step 1: Compute all attention scores, store in shared memory
+        // Step 1: Compute all attention scores (vectorized FP8 loads)
         for (int pos = tid; pos < seq_len; pos += num_threads) {
             float score = 0.0f;
             const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
-            for (int d = 0; d < head_dim; d++) {
-                score += q_head[d] * fp8e4m3_to_f32(k_vec[d]);
+            for (int d = 0; d < head_dim; d += 16) {
+                uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
+                const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    score += s_q[d + j] * fp8e4m3_to_f32(
+                        *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
+                }
             }
-            smem[pos] = score * sm_scale;
+            smem_scores[pos] = score * sm_scale;
         }
         __syncthreads();
 
         // Step 2: Find max (parallel reduction)
         float local_max = -1e30f;
         for (int pos = tid; pos < seq_len; pos += num_threads) {
-            local_max = fmaxf(local_max, smem[pos]);
+            local_max = fmaxf(local_max, smem_scores[pos]);
         }
         for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
             local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
@@ -989,8 +1006,8 @@ extern "C" __global__ void gqa_attention(
         // Step 3: Compute softmax weights in-place
         float local_sum = 0.0f;
         for (int pos = tid; pos < seq_len; pos += num_threads) {
-            float w = expf(smem[pos] - global_max);
-            smem[pos] = w;
+            float w = expf(smem_scores[pos] - global_max);
+            smem_scores[pos] = w;
             local_sum += w;
         }
         for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
@@ -1008,7 +1025,7 @@ extern "C" __global__ void gqa_attention(
 
         // Normalize weights
         for (int pos = tid; pos < seq_len; pos += num_threads) {
-            smem[pos] *= inv_sum;
+            smem_scores[pos] *= inv_sum;
         }
         __syncthreads();
 
@@ -1017,7 +1034,7 @@ extern "C" __global__ void gqa_attention(
         for (int d = tid; d < head_dim; d += num_threads) {
             float acc = 0.0f;
             for (int pos = 0; pos < seq_len; pos++) {
-                acc += smem[pos] * fp8e4m3_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
+                acc += smem_scores[pos] * fp8e4m3_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
             }
             out_head[d] = acc;
         }
@@ -1025,14 +1042,20 @@ extern "C" __global__ void gqa_attention(
     } else {
         // ══════ SLOW PATH: 2-pass, no score storage ══════
 
-        // Pass 1: Online softmax — find max and sum_exp
+        // Pass 1: Online softmax — find max and sum_exp (vectorized FP8 K loads)
         float local_max = -1e30f;
         float local_sum = 0.0f;
         for (int pos = tid; pos < seq_len; pos += num_threads) {
             float score = 0.0f;
             const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
-            for (int d = 0; d < head_dim; d++) {
-                score += q_head[d] * fp8e4m3_to_f32(k_vec[d]);
+            for (int d = 0; d < head_dim; d += 16) {
+                uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
+                const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    score += s_q[d + j] * fp8e4m3_to_f32(
+                        *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
+                }
             }
             score *= sm_scale;
             if (score > local_max) {
@@ -1070,15 +1093,21 @@ extern "C" __global__ void gqa_attention(
         float global_max = smem_reduce[0];
         float inv_sum = 1.0f / smem_reduce[16];
 
-        // Pass 2: Weighted V sum (recompute scores)
+        // Pass 2: Weighted V sum (recompute scores, vectorized FP8 K loads)
         float* out_head = output + qh * head_dim;
         for (int d = tid; d < head_dim; d += num_threads) {
             float acc = 0.0f;
             for (int pos = 0; pos < seq_len; pos++) {
                 float score = 0.0f;
                 const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
-                for (int dd = 0; dd < head_dim; dd++) {
-                    score += q_head[dd] * fp8e4m3_to_f32(k_vec[dd]);
+                for (int dd = 0; dd < head_dim; dd += 16) {
+                    uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + dd);
+                    const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
+                    #pragma unroll
+                    for (int j = 0; j < 16; j++) {
+                        score += s_q[dd + j] * fp8e4m3_to_f32(
+                            *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
+                    }
                 }
                 float weight = expf(score * sm_scale - global_max) * inv_sum;
                 acc += weight * fp8e4m3_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
@@ -1098,8 +1127,11 @@ extern "C" __global__ void gqa_attention(
 // local sum of exp(score - max).  A lightweight reduce kernel merges
 // tiles using the log-sum-exp identity.
 //
+// Q is preloaded into shared memory for fast reuse across KV positions.
+// FP8 K values are loaded 16 at a time via uint4 (16-byte vectorized loads).
+//
 // Grid: (num_q_heads, num_tiles, 1)   Block: (256, 1, 1)
-// Shared memory: tile_size * 4 + 128 bytes  (scores + warp scratch)
+// Shared memory: (head_dim + tile_size) * 4 + 128 bytes
 
 extern "C" __global__ void gqa_attention_tiled(
     float* __restrict__ partial_o,     // [num_q_heads, num_tiles, head_dim]
@@ -1133,30 +1165,48 @@ extern "C" __global__ void gqa_attention_tiled(
     if (tile_end > seq_len) tile_end = seq_len;
     int tile_len = tile_end - tile_start;
 
-    // Dynamic shared memory: [tile_size] scores + [32] warp scratch
+    // Dynamic shared memory layout:
+    //   s_q[0..head_dim-1]:          Q vector preloaded (float)
+    //   smem_scores[0..tile_size-1]: attention scores (float)
+    //   smem_reduce[0..31]:          warp scratch (float)
     extern __shared__ float smem[];
-    float* smem_reduce = smem + tile_size;
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
 
     int warp_id = tid / warpSize;
     int lane_id = tid % warpSize;
     int num_warps = (num_threads + warpSize - 1) / warpSize;
 
-    // ── Step 1: Q·K dot products for this tile ──
+    // Preload Q into shared memory (reused across all KV positions)
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    // ── Step 1: Q·K dot products for this tile (vectorized FP8 loads) ──
     for (int i = tid; i < tile_len; i += num_threads) {
         int pos = tile_start + i;
         float score = 0.0f;
         const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
-        for (int d = 0; d < head_dim; d++) {
-            score += q_head[d] * fp8e4m3_to_f32(k_vec[d]);
+        // Load 16 FP8 K values at once via uint4 (16 bytes per transaction)
+        for (int d = 0; d < head_dim; d += 16) {
+            uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
+            const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[d + j] * fp8e4m3_to_f32(
+                    *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
+            }
         }
-        smem[i] = score * sm_scale;
+        smem_scores[i] = score * sm_scale;
     }
     __syncthreads();
 
     // ── Step 2: Local max (parallel reduction) ──
     float local_max = -1e30f;
     for (int i = tid; i < tile_len; i += num_threads) {
-        local_max = fmaxf(local_max, smem[i]);
+        local_max = fmaxf(local_max, smem_scores[i]);
     }
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
         local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
@@ -1174,8 +1224,8 @@ extern "C" __global__ void gqa_attention_tiled(
     // ── Step 3: exp(score - max) in-place, compute local sum ──
     float local_sum = 0.0f;
     for (int i = tid; i < tile_len; i += num_threads) {
-        float w = expf(smem[i] - tile_max);
-        smem[i] = w;
+        float w = expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
         local_sum += w;
     }
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
@@ -1196,7 +1246,7 @@ extern "C" __global__ void gqa_attention_tiled(
     for (int d = tid; d < head_dim; d += num_threads) {
         float acc = 0.0f;
         for (int i = 0; i < tile_len; i++) {
-            acc += smem[i] * fp8e4m3_to_f32(
+            acc += smem_scores[i] * fp8e4m3_to_f32(
                 v_cache[(tile_start + i) * kv_stride + kv_head * head_dim + d]);
         }
         out_partial[d] = acc;
