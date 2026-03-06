@@ -773,7 +773,11 @@ def main():
         prefill_kb_per_tok = 0
         decode_kb_per_tok = 0
 
-    hard_budget = max(0, int(prefill_long_free) - SAFETY_MARGIN_MB)
+    # Use the minimum of short/long prefill free — the first prefill allocates
+    # one-time workspace (FlashInfer, torch.compile, fused_marlin_moe buffers)
+    # which makes short_free < long_free. HCS must survive the worst case.
+    prefill_min_free = min(prefill_short_free, prefill_long_free)
+    hard_budget = max(0, int(prefill_min_free) - SAFETY_MARGIN_MB)
     decode_budget = max(0, int(decode_short_free) - SAFETY_MARGIN_MB)
     soft_budget = max(0, decode_budget - hard_budget)
 
@@ -781,10 +785,10 @@ def main():
     _detail(f"Prefill: {prefill_kb_per_tok:.1f} KB/token ({prefill_short_free:,} MB @ {short_tokens} tok → {prefill_long_free:,} MB @ {long_tokens} tok)")
     _detail(f"Decode:  {decode_kb_per_tok:.1f} KB/token ({decode_short_free:,} MB @ short → {decode_long_free:,} MB @ long)")
     _detail(f"Hard HCS budget: {hard_budget:,} MB  |  Soft HCS budget: {soft_budget:,} MB  |  Total: {hard_budget + soft_budget:,} MB")
-    logger.info("VRAM budget: hard=%d MB (prefill_long_free=%d - safety=%d), "
+    logger.info("VRAM budget: hard=%d MB (prefill_min_free=%d - safety=%d), "
                 "decode_budget=%d MB (decode_short_free=%d - safety=%d), "
                 "soft=%d MB (decode_budget - hard)",
-                hard_budget, prefill_long_free, SAFETY_MARGIN_MB,
+                hard_budget, prefill_min_free, SAFETY_MARGIN_MB,
                 decode_budget, decode_short_free, SAFETY_MARGIN_MB,
                 soft_budget)
 

@@ -10,7 +10,6 @@ Usage:
 """
 
 import argparse
-from dataclasses import dataclass
 import json
 import math
 import os
@@ -329,7 +328,7 @@ def scan_gguf_files(search_dir: str) -> List[Dict[str, Any]]:
 
 CONFIG_KEYS = [
     "MODEL_PATH", "CFG_SELECTED_GPUS", "CFG_PP_PARTITION", "CFG_LAYER_GROUP_SIZE",
-    "CFG_KV_CACHE_MB", "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS", "CFG_CPU_EXPERT_BITS",
+    "CFG_KV_CACHE_MB", "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS",
     "CFG_ATTENTION_QUANT", "CFG_SHARED_EXPERT_QUANT", "CFG_DENSE_MLP_QUANT",
     "CFG_LM_HEAD_QUANT", "CFG_KRASIS_THREADS", "CFG_HOST", "CFG_PORT",
     "CFG_GPU_PREFILL_THRESHOLD", "CFG_GGUF_PATH", "CFG_VRAM_SAFETY_MARGIN",
@@ -384,7 +383,6 @@ class LauncherConfig:
         self.kv_cache_mb: int = 1000
         self.kv_dtype: str = "fp8_e4m3"
         self.gpu_expert_bits: int = 4
-        self.cpu_expert_bits: int = 4
         self.attention_quant: str = "bf16"
         self.shared_expert_quant: str = "int8"
         self.dense_mlp_quant: str = "int8"
@@ -441,11 +439,6 @@ class LauncherConfig:
                 self.gpu_expert_bits = int(saved["CFG_GPU_EXPERT_BITS"])
             except ValueError:
                 pass
-        if "CFG_CPU_EXPERT_BITS" in saved:
-            try:
-                self.cpu_expert_bits = int(saved["CFG_CPU_EXPERT_BITS"])
-            except ValueError:
-                pass
         if "CFG_ATTENTION_QUANT" in saved:
             val = saved["CFG_ATTENTION_QUANT"]
             if val == "int8":
@@ -497,7 +490,6 @@ class LauncherConfig:
             "CFG_KV_CACHE_MB": str(self.kv_cache_mb),
             "CFG_KV_DTYPE": self.kv_dtype,
             "CFG_GPU_EXPERT_BITS": str(self.gpu_expert_bits),
-            "CFG_CPU_EXPERT_BITS": str(self.cpu_expert_bits),
             "CFG_ATTENTION_QUANT": self.attention_quant,
             "CFG_SHARED_EXPERT_QUANT": self.shared_expert_quant,
             "CFG_DENSE_MLP_QUANT": self.dense_mlp_quant,
@@ -816,91 +808,6 @@ def _launch_mode_screen() -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CPU expert source selection screen
-# ═══════════════════════════════════════════════════════════════════════
-
-@dataclass
-class CpuExpertChoice:
-    """Result from the CPU expert selection screen."""
-    source: str      # "build" or "gguf"
-    bits: int = 4    # 4 or 8 (for build mode)
-    gguf_path: str = ""  # path to GGUF file (for gguf mode)
-
-
-def _cpu_expert_selection_screen(
-    gguf_files: List[Dict[str, Any]],
-    preselected_gguf: str = "",
-    preselected_bits: int = 4,
-) -> Optional[CpuExpertChoice]:
-    """Select CPU expert source: build from native or use GGUF.
-
-    Returns CpuExpertChoice or None if cancelled.
-    """
-    # Build option list: build options first, then GGUF files
-    options: List[Dict[str, Any]] = [
-        {"source": "build", "bits": 4,
-         "label": "Build INT4 cache from native model",
-         "detail": "Recommended \u2014 best speed/quality tradeoff"},
-        {"source": "build", "bits": 8,
-         "label": "Build INT8 cache from native model",
-         "detail": "Higher quality, ~2x RAM usage"},
-    ]
-    for gf in gguf_files:
-        options.append({
-            "source": "gguf", "gguf_path": gf["path"],
-            "label": f"{gf['dir_name']}/{gf['name']}",
-            "detail": f"{gf['size_gb']:.1f} GB",
-        })
-
-    # Pre-select based on saved config
-    cursor = 0
-    if preselected_gguf:
-        for i, opt in enumerate(options):
-            if opt.get("gguf_path") == preselected_gguf:
-                cursor = i
-                break
-    elif preselected_bits == 8:
-        cursor = 1
-
-    while True:
-        _clear_screen()
-        lines = []
-        lines.append(f"  {BOLD}Select CPU expert source:{NC}\n")
-
-        for i, opt in enumerate(options):
-            # Separator before GGUF section
-            if i == 2:
-                lines.append(f"\n  {DIM}\u2500\u2500\u2500 Available GGUF files \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
-
-            prefix = f"  {CYAN}\u25b8{NC} " if i == cursor else "    "
-            hl = BOLD if i == cursor else ""
-            lines.append(f"{prefix}{hl}{opt['label']}{NC}  {DIM}{opt['detail']}{NC}")
-
-        if not gguf_files:
-            lines.append(f"\n  {DIM}No GGUF files found in models/{NC}")
-
-        lines.append(f"\n  {DIM}[\u2191\u2193] Select  [Enter] Confirm  [q] Quit{NC}")
-
-        sys.stdout.write("\n".join(lines) + "\n")
-        sys.stdout.flush()
-
-        key = _read_key()
-        if key == KEY_UP:
-            cursor = (cursor - 1) % len(options)
-        elif key == KEY_DOWN:
-            cursor = (cursor + 1) % len(options)
-        elif key == KEY_ENTER:
-            opt = options[cursor]
-            return CpuExpertChoice(
-                source=opt["source"],
-                bits=opt.get("bits", 4),
-                gguf_path=opt.get("gguf_path", ""),
-            )
-        elif key == KEY_QUIT or key == KEY_ESCAPE:
-            return None
-
-
-# ═══════════════════════════════════════════════════════════════════════
 # Text/number editing overlay
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1005,7 +912,7 @@ class Launcher:
             return compute_launcher_budget(
                 model_path=self.cfg.model_path,
                 pp_partition=pp,
-                expert_divisor=lgs,
+                layer_group_size=lgs,
                 kv_dtype=self.cfg.kv_dtype,
                 gpu_expert_bits=self.cfg.gpu_expert_bits,
                 attention_quant=self.cfg.attention_quant,
@@ -1086,14 +993,16 @@ class Launcher:
             annotation = _quality_annotation(native_dtype, opt.key, val)
             suffix = f"  {annotation}" if annotation else ""
 
-            # KV cache: show shortened max-context estimate
+            # KV cache: show token capacity and model's max context
             if opt.key == "kv_cache_mb" and self.model_info:
                 mi = self.model_info
                 kv_dim = mi.get("kv_dim", 0)
                 num_kv_layers = mi.get("num_kv_layers", 0)
                 max_ctx = mi.get("max_context", 0)
                 if kv_dim > 0 and num_kv_layers > 0:
-                    suffix = f"  {DIM}(max {max_ctx // 1000}K){NC}"
+                    kv_bytes_per_token = kv_dim * num_kv_layers
+                    alloc_tokens = (self.cfg.kv_cache_mb * 1024 * 1024) // kv_bytes_per_token if kv_bytes_per_token > 0 else 0
+                    suffix = f"  {DIM}(~{_format_tokens(alloc_tokens)} tokens, model max {_format_tokens(max_ctx)}){NC}"
 
             # Compute VRAM and RAM estimates from budget
             vram_mb = 0
@@ -1115,7 +1024,9 @@ class Launcher:
                 if vkey:
                     vram_mb = rank.get(vkey, 0)
                 elif opt.key == "kv_cache_mb":
-                    vram_mb = self.cfg.kv_cache_mb
+                    # Show capped KV allocation (min of config and available VRAM)
+                    free = rank.get("free_mb", 0)
+                    vram_mb = min(self.cfg.kv_cache_mb, max(0, free))
                 rkey = _ram_map.get(opt.key)
                 if rkey:
                     ram_mb = b.get(rkey, 0)
@@ -1546,7 +1457,6 @@ class Launcher:
             "--kv-cache-mb", str(self.cfg.kv_cache_mb),
             "--kv-dtype", self.cfg.kv_dtype,
             "--gpu-expert-bits", str(self.cfg.gpu_expert_bits),
-            "--cpu-expert-bits", str(self.cfg.cpu_expert_bits),
             "--attention-quant", self.cfg.attention_quant,
             "--shared-expert-quant", self.cfg.shared_expert_quant,
             "--dense-mlp-quant", self.cfg.dense_mlp_quant,
@@ -1615,8 +1525,6 @@ def parse_args() -> argparse.Namespace:
                         help="KV cache dtype: fp8_e4m3 or bf16")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
                         help="GPU Marlin expert bits: 4 or 8")
-    parser.add_argument("--cpu-expert-bits", type=int, default=None,
-                        help="CPU expert bits: 4 or 8")
     parser.add_argument("--attention-quant", default=None,
                         help="Attention weight quant: bf16 or int8")
     parser.add_argument("--shared-expert-quant", default=None,
@@ -1671,8 +1579,6 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         cfg.kv_dtype = args.kv_dtype
     if args.gpu_expert_bits is not None:
         cfg.gpu_expert_bits = args.gpu_expert_bits
-    if args.cpu_expert_bits is not None:
-        cfg.cpu_expert_bits = args.cpu_expert_bits
     if args.attention_quant is not None:
         if args.attention_quant == "int8":
             print("[!] --attention-quant int8 is disabled (causes garbage output). Using bf16.")

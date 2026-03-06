@@ -394,6 +394,9 @@ class GpuPrefillManager:
         if self._w2_padded_n != hidden_size:
             logger.info("Marlin w2 padded N: %d → %d (kernel compat)", hidden_size, self._w2_padded_n)
 
+        # HCS-aware prefill: reference to GPU decode store for D2D expert copies
+        self._gpu_decode_store = None  # reserved for future HCS-aware prefill
+
         # Persistent/layer-grouped expert buffers
         self._prefill_mode = "chunked"  # "persistent", "layer_grouped", or "chunked"
         self._persistent: Optional[dict[int, dict[str, torch.Tensor]]] = None
@@ -1412,21 +1415,20 @@ class GpuPrefillManager:
                 t_rust += t1 - t0
 
             # View pinned tensors as typed+shaped (zero-copy, still pinned)
-            w13_packed = buf["w13p"].view(torch.int32).reshape(self._dma_shape_w13p)
-            w13_scale = buf["w13s"].view(torch.bfloat16).reshape(self._dma_shape_w13s)
-            w2_packed = buf["w2p"].view(torch.int32).reshape(self._dma_shape_w2p)
-            w2_scale = buf["w2s"].view(torch.bfloat16).reshape(self._dma_shape_w2s)
+            w13_packed_host = buf["w13p"].view(torch.int32).reshape(self._dma_shape_w13p)
+            w13_scale_host = buf["w13s"].view(torch.bfloat16).reshape(self._dma_shape_w13s)
+            w2_packed_host = buf["w2p"].view(torch.int32).reshape(self._dma_shape_w2p)
+            w2_scale_host = buf["w2s"].view(torch.bfloat16).reshape(self._dma_shape_w2s)
 
             if detailed:
                 t2 = time.perf_counter()
                 t_frombuf += t2 - t1
 
-            # PCIe DMA on default stream: non_blocking returns immediately,
-            # DMA proceeds asynchronously while CPU prepares next layer.
-            w13_packed = w13_packed.to(self.device, non_blocking=True)
-            w13_scale = w13_scale.to(self.device, non_blocking=True)
-            w2_packed = w2_packed.to(self.device, non_blocking=True)
-            w2_scale = w2_scale.to(self.device, non_blocking=True)
+            # Standard path: DMA entire tensor from host
+            w13_packed = w13_packed_host.to(self.device, non_blocking=True)
+            w13_scale = w13_scale_host.to(self.device, non_blocking=True)
+            w2_packed = w2_packed_host.to(self.device, non_blocking=True)
+            w2_scale = w2_scale_host.to(self.device, non_blocking=True)
 
             if detailed:
                 t3 = time.perf_counter()

@@ -272,7 +272,7 @@ def _detect_total_ram_gb() -> int:
 def compute_launcher_budget(
     model_path: str,
     pp_partition: List[int],
-    expert_divisor: int = 1,
+    layer_group_size: int = 1,
     kv_dtype: str = "fp8_e4m3",
     gpu_expert_bits: int = 4,
     attention_quant: str = "bf16",
@@ -285,7 +285,7 @@ def compute_launcher_budget(
 ) -> Dict[str, Any]:
     """Compute VRAM + RAM budget for the launcher TUI.
 
-    Supports per-component quantization and expert_divisor modes.
+    Supports per-component quantization and layer_group_size modes.
     Returns a dict with worst-case rank breakdown for display.
     """
     import math
@@ -424,13 +424,13 @@ def compute_launcher_budget(
         dn = max(0, min(rank_end, first_k_dense) - rank_start)
         mn = n_layers - dn
 
-        # With layer streaming (expert_divisor >= 1), ALL per-layer weights
+        # With layer streaming (layer_group_size >= 1), ALL per-layer weights
         # (attention, shared experts, expert buffers) are streamed through GPU
         # in groups of layer_group_size. Only group_size layers are resident
         # at any time (double-buffered DMA for attention).
-        # With persistent mode (expert_divisor == 0), all layers are on GPU.
-        if expert_divisor >= 1:
-            group_size = min(expert_divisor, max(mn, 1))
+        # With persistent mode (layer_group_size == 0), all layers are on GPU.
+        if layer_group_size >= 1:
+            group_size = min(layer_group_size, max(mn, 1))
             streaming = True
         else:
             group_size = 0  # not used
@@ -459,18 +459,17 @@ def compute_launcher_budget(
         dense_mlp_bytes = _component_weight_bytes(dense_mlp_params_per_layer, dense_mlp_quant) * dn
 
         # Expert buffers (GPU side)
-        # expert_divisor is layer_group_size:
-        #   0 = persistent (all layers), >=1 = N layers at a time
+        # layer_group_size: 0 = persistent (all layers), >=1 = N layers at a time
         # When streaming with DMA pipelining, TWO groups are resident
         # simultaneously: current group computing + next group prefetching.
         if mn > 0 and n_experts > 0:
-            if expert_divisor == 0:
+            if layer_group_size == 0:
                 ebuf_bytes = expert_buf_bytes * n_experts * mn
                 emode = "persistent"
-            elif expert_divisor >= 1:
+            elif layer_group_size >= 1:
                 # Pipeline doubles the buffer: current + prefetched group
                 ebuf_bytes = expert_buf_bytes * n_experts * group_size * 2
-                emode = f"grouped({expert_divisor})"
+                emode = f"grouped({layer_group_size})"
             else:
                 ebuf_bytes = expert_buf_bytes * n_experts * 2
                 emode = "grouped(1)"

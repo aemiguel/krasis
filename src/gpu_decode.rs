@@ -3414,6 +3414,183 @@ impl GpuDecodeStore {
     fn py_hcs_reload_after_prefill(&mut self) -> (usize, f64) {
         self.hcs_reload_after_prefill()
     }
+
+    /// Fill HCS-resident experts into a GPU buffer for prefill via D2D copy.
+    /// For each expert in the given MoE layer that's in HCS VRAM, copies its
+    /// weights into the correct position in the destination GPU tensors.
+    ///
+    /// Args:
+    ///   moe_layer_idx: MoE layer index
+    ///   d_w13p, d_w13s, d_w2p, d_w2s: GPU destination tensor data_ptr() values
+    ///   stride_w13p, stride_w13s, stride_w2p, stride_w2s: per-expert byte stride in each tensor
+    ///   num_experts: total experts in this layer
+    ///
+    /// Returns: list of expert indices that were filled from HCS (cold experts need H2D DMA).
+    #[pyo3(signature = (moe_layer_idx, d_w13p, d_w13s, d_w2p, d_w2s,
+                         stride_w13p, stride_w13s, stride_w2p, stride_w2s,
+                         num_experts))]
+    fn py_hcs_fill_layer_for_prefill(
+        &self,
+        moe_layer_idx: usize,
+        d_w13p: u64, d_w13s: u64, d_w2p: u64, d_w2s: u64,
+        stride_w13p: usize, stride_w13s: usize,
+        stride_w2p: usize, stride_w2s: usize,
+        num_experts: usize,
+    ) -> Vec<usize> {
+        let graph = match self.graph.as_ref() {
+            Some(g) => g,
+            None => return Vec::new(),
+        };
+        let hcs = match graph.hcs.as_ref() {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+
+        let nep = hcs.num_experts_per_layer;
+        if nep == 0 {
+            return Vec::new();
+        }
+
+        let mut filled = Vec::new();
+        for expert_idx in 0..num_experts {
+            let idx = moe_layer_idx * nep + expert_idx;
+            if idx >= hcs.cache_fast.len() {
+                continue;
+            }
+            let ptrs = &hcs.cache_fast[idx];
+            if ptrs[0] == 0 {
+                continue; // not in HCS
+            }
+            // D2D copy from HCS VRAM to destination tensor slot
+            let expert_off = expert_idx as u64;
+            unsafe {
+                let _ = cuda_sys::lib().cuMemcpyDtoD_v2(
+                    d_w13p + expert_off * stride_w13p as u64,
+                    ptrs[0], stride_w13p,
+                );
+                let _ = cuda_sys::lib().cuMemcpyDtoD_v2(
+                    d_w13s + expert_off * stride_w13s as u64,
+                    ptrs[1], stride_w13s,
+                );
+                let _ = cuda_sys::lib().cuMemcpyDtoD_v2(
+                    d_w2p + expert_off * stride_w2p as u64,
+                    ptrs[2], stride_w2p,
+                );
+                let _ = cuda_sys::lib().cuMemcpyDtoD_v2(
+                    d_w2s + expert_off * stride_w2s as u64,
+                    ptrs[3], stride_w2s,
+                );
+            }
+            filled.push(expert_idx);
+        }
+
+        filled
+    }
+
+    /// Fill a prefill layer's GPU tensors using D2D for HCS-resident experts
+    /// and H2D for cold experts, all in Rust with no Python per-expert overhead.
+    ///
+    /// Args:
+    ///   moe_layer_idx: the MoE layer index
+    ///   d_w13p, d_w13s, d_w2p, d_w2s: GPU destination pointers (empty tensors)
+    ///   h_w13p, h_w13s, h_w2p, h_w2s: pinned host source pointers
+    ///   stride_w13p, stride_w13s, stride_w2p, stride_w2s: per-expert byte stride
+    ///   num_experts: total experts in this layer
+    ///   cuda_stream: raw CUDA stream pointer for async H2D (0 = default stream)
+    ///
+    /// Returns: number of HCS-hit experts (D2D'd).
+    #[pyo3(signature = (moe_layer_idx, d_w13p, d_w13s, d_w2p, d_w2s,
+                         h_w13p, h_w13s, h_w2p, h_w2s,
+                         stride_w13p, stride_w13s, stride_w2p, stride_w2s,
+                         num_experts, cuda_stream))]
+    fn py_hcs_fill_layer_selective(
+        &self,
+        moe_layer_idx: usize,
+        d_w13p: u64, d_w13s: u64, d_w2p: u64, d_w2s: u64,
+        h_w13p: u64, h_w13s: u64, h_w2p: u64, h_w2s: u64,
+        stride_w13p: usize, stride_w13s: usize,
+        stride_w2p: usize, stride_w2s: usize,
+        num_experts: usize,
+        cuda_stream: u64,
+    ) -> usize {
+        let graph = match self.graph.as_ref() {
+            Some(g) => g,
+            None => return 0,
+        };
+        let hcs = match graph.hcs.as_ref() {
+            Some(h) => h,
+            None => return 0,
+        };
+
+        let nep = hcs.num_experts_per_layer;
+        if nep == 0 {
+            return 0;
+        }
+
+        let stream = cuda_stream as cuda_sys::CUstream;
+        let mut hcs_hits = 0usize;
+
+        for expert_idx in 0..num_experts {
+            let idx = moe_layer_idx * nep + expert_idx;
+            let expert_off = expert_idx as u64;
+
+            let in_hcs = idx < hcs.cache_fast.len() && hcs.cache_fast[idx][0] != 0;
+
+            if in_hcs {
+                // D2D from HCS VRAM (synchronous, ~700 GB/s)
+                let ptrs = &hcs.cache_fast[idx];
+                unsafe {
+                    let _ = cuda_sys::lib().cuMemcpyDtoD_v2(
+                        d_w13p + expert_off * stride_w13p as u64,
+                        ptrs[0], stride_w13p,
+                    );
+                    let _ = cuda_sys::lib().cuMemcpyDtoD_v2(
+                        d_w13s + expert_off * stride_w13s as u64,
+                        ptrs[1], stride_w13s,
+                    );
+                    let _ = cuda_sys::lib().cuMemcpyDtoD_v2(
+                        d_w2p + expert_off * stride_w2p as u64,
+                        ptrs[2], stride_w2p,
+                    );
+                    let _ = cuda_sys::lib().cuMemcpyDtoD_v2(
+                        d_w2s + expert_off * stride_w2s as u64,
+                        ptrs[3], stride_w2s,
+                    );
+                }
+                hcs_hits += 1;
+            } else {
+                // H2D from pinned host (async on provided stream)
+                unsafe {
+                    let _ = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        d_w13p + expert_off * stride_w13p as u64,
+                        (h_w13p + expert_off * stride_w13p as u64) as *const std::ffi::c_void,
+                        stride_w13p,
+                        stream,
+                    );
+                    let _ = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        d_w13s + expert_off * stride_w13s as u64,
+                        (h_w13s + expert_off * stride_w13s as u64) as *const std::ffi::c_void,
+                        stride_w13s,
+                        stream,
+                    );
+                    let _ = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        d_w2p + expert_off * stride_w2p as u64,
+                        (h_w2p + expert_off * stride_w2p as u64) as *const std::ffi::c_void,
+                        stride_w2p,
+                        stream,
+                    );
+                    let _ = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        d_w2s + expert_off * stride_w2s as u64,
+                        (h_w2s + expert_off * stride_w2s as u64) as *const std::ffi::c_void,
+                        stride_w2s,
+                        stream,
+                    );
+                }
+            }
+        }
+
+        hcs_hits
+    }
 }
 
 // ── Pure-Rust methods for GPU decode (no PyO3, used by Rust HTTP server) ──
