@@ -6891,6 +6891,11 @@ impl GpuDecodeStore {
         let mut seen_tokens: std::collections::HashSet<usize> = std::collections::HashSet::new();
         seen_tokens.insert(first_token);
 
+        // Streaming detokenizer: buffers incomplete UTF-8 byte sequences
+        // (e.g. emojis split across multiple BPE tokens) and emits only
+        // when the decoded text is complete.
+        let mut detok = crate::server::StreamDetokenizer::new(tokenizer);
+
         #[cfg(feature = "gpu-debug")]
         let debug_logits = std::env::var("KRASIS_DEBUG_LOGITS").ok()
             .map(|v| v.parse::<usize>().unwrap_or(0)).unwrap_or(0);
@@ -6993,10 +6998,11 @@ impl GpuDecodeStore {
                     generated += 1;
                     step += 1;
                     next_token = target_pred;
-                    let text = tokenizer.decode(&[target_pred as u32], true).unwrap_or_default();
+                    let mut text = detok.add(target_pred as u32);
                     let finish_reason = if stop_set.contains(&target_pred) { Some("stop") }
                         else if generated >= max_tokens { Some("length") }
                         else { None };
+                    if finish_reason.is_some() { text.push_str(&detok.flush()); }
                     let finished = finish_reason.is_some();
                     let cont = on_token(target_pred, &text, finish_reason);
                     if finished || !cont { break; }
@@ -7064,10 +7070,11 @@ impl GpuDecodeStore {
 
                 let mut stopped = false;
                 {
-                    let text = tokenizer.decode(&[target_pred as u32], true).unwrap_or_default();
+                    let mut text = detok.add(target_pred as u32);
                     let finish_reason = if stop_set.contains(&target_pred) { Some("stop") }
                         else if generated >= max_tokens { Some("length") }
                         else { None };
+                    if finish_reason.is_some() { text.push_str(&detok.flush()); }
                     let finished = finish_reason.is_some();
                     let cont = on_token(target_pred, &text, finish_reason);
                     if finished || !cont {
@@ -7110,11 +7117,11 @@ impl GpuDecodeStore {
                             step += 1;
                             next_token = draft_tokens[i];
 
-                            let text = tokenizer.decode(&[draft_tokens[i] as u32], true)
-                                .unwrap_or_default();
+                            let mut text = detok.add(draft_tokens[i] as u32);
                             let finish_reason = if stop_set.contains(&draft_tokens[i]) { Some("stop") }
                                 else if generated >= max_tokens { Some("length") }
                                 else { None };
+                            if finish_reason.is_some() { text.push_str(&detok.flush()); }
                             let finished = finish_reason.is_some();
                             let cont = on_token(draft_tokens[i], &text, finish_reason);
                             if finished || !cont { stopped = true; break; }
@@ -7125,11 +7132,11 @@ impl GpuDecodeStore {
                             generated += 1;
                             step += 1;
 
-                            let text = tokenizer.decode(&[next_token as u32], true)
-                                .unwrap_or_default();
+                            let mut text = detok.add(next_token as u32);
                             let finish_reason = if stop_set.contains(&next_token) { Some("stop") }
                                 else if generated >= max_tokens { Some("length") }
                                 else { None };
+                            if finish_reason.is_some() { text.push_str(&detok.flush()); }
                             let finished = finish_reason.is_some();
                             let cont = on_token(next_token, &text, finish_reason);
                             if finished || !cont { stopped = true; }
@@ -7159,11 +7166,11 @@ impl GpuDecodeStore {
                         generated += 1;
                         step += 1;
 
-                        let text = tokenizer.decode(&[next_token as u32], true)
-                            .unwrap_or_default();
+                        let mut text = detok.add(next_token as u32);
                         let finish_reason = if stop_set.contains(&next_token) { Some("stop") }
                             else if generated >= max_tokens { Some("length") }
                             else { None };
+                        if finish_reason.is_some() { text.push_str(&detok.flush()); }
                         let finished = finish_reason.is_some();
                         let cont = on_token(next_token, &text, finish_reason);
                         if finished || !cont { stopped = true; }
@@ -7263,8 +7270,7 @@ impl GpuDecodeStore {
                 step += 1;
                 next_token = target_pred;
 
-                let text = tokenizer.decode(&[target_pred as u32], true)
-                    .unwrap_or_default();
+                let mut text = detok.add(target_pred as u32);
                 let finish_reason = if stop_set.contains(&target_pred) {
                     Some("stop")
                 } else if generated >= max_tokens {
@@ -7272,6 +7278,9 @@ impl GpuDecodeStore {
                 } else {
                     None
                 };
+                if finish_reason.is_some() {
+                    text.push_str(&detok.flush());
+                }
                 let finished = finish_reason.is_some();
                 let cont = on_token(target_pred, &text, finish_reason);
                 if finished || !cont { break; }

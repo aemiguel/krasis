@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-06 23:50:49
+Krasis Benchmark — 2026-03-07 12:20:04
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -8,7 +8,7 @@ PP Partition:     [48] (1 GPUs)
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
   RAM:            1007 GB total, 79.1 GB used by process
-  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 6409 MB allocated
+  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 6410 MB allocated
   GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
 
 Quantization:
@@ -25,57 +25,26 @@ Strategy:
   Prefill threshold: 1
   Mode:           gpu_decode (layer_grouped(2))
 
-Prefill (6 runs at different lengths):
-  Run 1:  692.7 tok/s, TTFT=1.59s (1,101 tokens)
-  Run 2:  2306.2 tok/s, TTFT=2.34s (5,407 tokens)
-  Run 3:  2922.3 tok/s, TTFT=3.41s (9,961 tokens)
-  Run 4:  3314.3 tok/s, TTFT=6.13s (20,309 tokens)
-  Run 5:  3461.8 tok/s, TTFT=10.15s (35,122 tokens)
-  Run 6:  3377.6 tok/s, TTFT=14.93s (50,418 tokens)
-  Best:    3461.8 tok/s, TTFT=10.15s (35,122 tokens)
+Engine Prefill (6 runs at different lengths):
+  Run 1:  689.5 tok/s (1,101 tokens in 1596.9ms)
+  Run 2:  2,337.6 tok/s (5,407 tokens in 2313.1ms)
+  Run 3:  2,957.2 tok/s (9,961 tokens in 3368.4ms)
+  Run 4:  3,347.8 tok/s (20,309 tokens in 6066.4ms)
+  Run 5:  3,497.0 tok/s (35,122 tokens in 10043.6ms)
+  Run 6:  3,390.5 tok/s (50,418 tokens in 14870.2ms)
+  Best:   3,497.0 tok/s (35,122 tokens)
 
-Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  40.47 tok/s (24.7ms/tok)
-  Run 2:  42.17 tok/s (23.7ms/tok)
-  Run 3:  42.01 tok/s (23.8ms/tok)
-  Average: 41.55 tok/s (24.1ms/tok)
+Engine Decode (64 tokens, 3 runs, different prompts):
+  Run 1:  42.32 tok/s (23.6ms/tok)
+  Run 2:  47.56 tok/s (21.0ms/tok)
+  Run 3:  49.82 tok/s (20.1ms/tok)
+  Average: 46.57 tok/s (21.6ms/tok)
 
-Verification:
-  Prefill prompt: Summarise the following in one paragraph: THE COUNT OF MONTE CRISTO
-
-by Alexandre Dumas [père]
-
-
-
-
-Contents
-
-
- VOLUME ONE
-Chapter 1. Marseilles—The Arrival
-Chapter 2. Father and Son
-Chapter 3. The Cat... [3252 chars total]
-  Decode prompt:  Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
-  Generated output (64 tokens):
-    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys: a **public key** and a **private key**. Unlike symmetric cryptography (where the same secret key is used for encryption and decryption), in public key cryptography:
-    
-    - The **public key
+Client TTFT (6 runs via HTTP at different lengths):
+   1,101 tokens:  1.61s
+   5,407 tokens:  2.38s
+   9,961 tokens:  3.47s
+  20,309 tokens:  6.23s
+  35,122 tokens:  10.27s
+  50,418 tokens:  15.01s
 ================================================================
-
-────────────────────────────────────────────────────────────────
-  ENGINE vs NETWORK COMPARISON
-────────────────────────────────────────────────────────────────
-                                         Engine        Network   Overhead
-  ────────────────────────────── ────────────── ────────────── ──────────
-  Prefill (best tok/s)                 3461.8         3429.6       -0.9%
-  TTFT (s)                              10.15          10.21       +60ms
-    1,101 tokens                        692.7          623.0      -10.1%
-    5,407 tokens                       2306.2         2137.0       -7.3%
-    9,961 tokens                       2922.3         2941.0       +0.6%
-    20,309 tokens                      3314.3         3265.1       -1.5%
-    35,122 tokens                      3461.8         3429.6       -0.9%
-    50,418 tokens                      3377.6         3315.0       -1.9%
-
-  Decode (avg tok/s)                    41.55          45.27       +9.0%
-  Decode (ms/tok)                        24.1           22.3      -1.8ms
-────────────────────────────────────────────────────────────────

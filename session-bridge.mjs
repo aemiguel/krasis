@@ -63,12 +63,98 @@ function loadOrCreateIdentity() {
 // ── Per-conversation history ────────────────────────────────────────
 
 const conversations = new Map(); // sessionID -> [{role, content}, ...]
+const MAX_HISTORY_TOKENS = 8000; // token budget for conversation context
+const SUMMARISE_THRESHOLD = 6000; // start summarising when we exceed this
+
+function estimateTokens(text) {
+  // Rough estimate: ~4 chars per token for English text
+  return Math.ceil((text || '').length / 4);
+}
+
+function historyTokens(history) {
+  let total = 0;
+  for (const msg of history) {
+    total += estimateTokens(msg.content) + 4; // +4 for role/framing overhead
+  }
+  return total;
+}
 
 function getHistory(from) {
   if (!conversations.has(from)) {
     conversations.set(from, []);
   }
   return conversations.get(from);
+}
+
+async function summariseOldMessages(history) {
+  // Find how many recent messages we can keep under half the budget
+  let kept = 0;
+  let keptTokens = 0;
+  const halfBudget = MAX_HISTORY_TOKENS / 2;
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msgTokens = estimateTokens(history[i].content) + 4;
+    if (keptTokens + msgTokens > halfBudget) break;
+    keptTokens += msgTokens;
+    kept++;
+  }
+  // Keep at least the last message
+  if (kept < 1) kept = 1;
+
+  const cutoff = history.length - kept;
+  if (cutoff < 2) return; // not enough old messages to summarise
+
+  const oldMessages = history.slice(0, cutoff);
+  const recentMessages = history.slice(cutoff);
+
+  // Build a summary request
+  const summaryPrompt = oldMessages.map(
+    m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`
+  ).join('\n\n');
+
+  try {
+    const res = await fetch(KRASIS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'krasis',
+        messages: [{
+          role: 'user',
+          content: `Summarise this conversation concisely in 2-4 sentences, capturing the key topics discussed and any important context or decisions. Do not add commentary, just the summary.\n\n${summaryPrompt}`
+        }],
+        stream: false,
+        max_tokens: 256,
+      }),
+    });
+
+    if (!res.ok) {
+      console.error(`[session-bridge] Summary request failed: HTTP ${res.status}`);
+      // Fallback: just trim old messages without summary
+      history.splice(0, cutoff);
+      return;
+    }
+
+    const data = await res.json();
+    const summary = data.choices?.[0]?.message?.content?.trim();
+
+    if (summary) {
+      // Replace history: summary system message + recent messages
+      history.length = 0;
+      history.push({
+        role: 'system',
+        content: `Summary of earlier conversation: ${summary}`
+      });
+      history.push(...recentMessages);
+      console.log(`[session-bridge] Summarised ${oldMessages.length} old messages (${estimateTokens(summaryPrompt)} tok → ${estimateTokens(summary)} tok)`);
+    } else {
+      // No summary generated, just trim
+      history.splice(0, cutoff);
+    }
+  } catch (e) {
+    console.error(`[session-bridge] Summary error: ${e.message}`);
+    // Fallback: just trim
+    history.splice(0, cutoff);
+  }
 }
 
 // ── Stream a chat completion from Krasis ────────────────────────────
@@ -174,9 +260,9 @@ async function main() {
     const history = getHistory(from);
     history.push({ role: 'user', content: text });
 
-    // Keep history reasonable (last 20 messages)
-    while (history.length > 20) {
-      history.shift();
+    // Token-aware history management: summarise old messages when over budget
+    if (historyTokens(history) > SUMMARISE_THRESHOLD) {
+      await summariseOldMessages(history);
     }
 
     try {

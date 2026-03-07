@@ -112,33 +112,18 @@ phase_setup() {
     source "$VENV_DIR/$VENV_BIN/activate"
     info "Venv active: $(which python3)"
 
-    # Check krasis importable
-    if ! python3 -c "from krasis import KrasisEngine" 2>/dev/null; then
-        warn "Krasis not installed — building from source..."
-
-        # Try sourcing cargo env in case Rust was just installed
-        if ! command -v cargo &>/dev/null && [[ -f "$HOME/.cargo/env" ]]; then
-            source "$HOME/.cargo/env"
+    # Check krasis is importable
+    if ! python3 -c "from krasis.krasis import RustServer" 2>/dev/null; then
+        if [[ -d "$SCRIPT_DIR/src" ]]; then
+            err "Krasis native module not found. Build it first:"
+            echo "  ./dev build"
+        else
+            err "Krasis native module not found. Reinstall:"
+            echo "  curl -fsSL https://raw.githubusercontent.com/skunkworx/krasis/main/install.sh | bash"
         fi
-        if ! command -v cargo &>/dev/null; then
-            err "cargo not found. Install Rust, then restart your shell:"
-            echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-            echo "  source ~/.cargo/env"
-            exit 1
-        fi
-        info "cargo found: $(cargo --version)"
-
-        if ! python3 -c "import maturin" 2>/dev/null; then
-            info "Installing maturin..."
-            pip install maturin
-        fi
-
-        info "Building krasis (pip install -e .) — this may take a few minutes..."
-        (cd "$SCRIPT_DIR" && pip install -e .)
-        info "Krasis built successfully"
-    else
-        info "Krasis importable"
+        exit 1
     fi
+    info "Krasis importable"
 
     # torch — don't auto-install, just check
     if ! python3 -c "import torch" 2>/dev/null; then

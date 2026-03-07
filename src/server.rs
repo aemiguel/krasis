@@ -7,6 +7,50 @@
 //! Single-request at a time (matches our hardware constraint).
 
 use crate::gpu_decode::GpuDecodeStore;
+
+/// Streaming detokenizer that buffers incomplete UTF-8 sequences.
+///
+/// Some characters (emojis, CJK, etc.) span multiple tokens in byte-level BPE.
+/// Decoding each token individually produces incomplete UTF-8 bytes → U+FFFD.
+/// This struct buffers tokens until the decoded text contains no trailing FFFD,
+/// then emits the complete text.
+pub struct StreamDetokenizer<'a> {
+    tokenizer: &'a tokenizers::Tokenizer,
+    pending: Vec<u32>,
+}
+
+impl<'a> StreamDetokenizer<'a> {
+    pub fn new(tokenizer: &'a tokenizers::Tokenizer) -> Self {
+        Self { tokenizer, pending: Vec::new() }
+    }
+
+    /// Add a token. Returns the decoded text if the sequence is complete UTF-8,
+    /// or an empty string if we're still buffering incomplete bytes.
+    pub fn add(&mut self, token_id: u32) -> String {
+        self.pending.push(token_id);
+        let decoded = self.tokenizer.decode(&self.pending, true).unwrap_or_default();
+        if decoded.is_empty() {
+            return String::new();
+        }
+        // If the decoded text ends with U+FFFD, we likely have incomplete bytes.
+        // Buffer up to 8 tokens before giving up and emitting anyway.
+        if decoded.ends_with('\u{FFFD}') && self.pending.len() < 8 {
+            return String::new();
+        }
+        self.pending.clear();
+        decoded
+    }
+
+    /// Flush any remaining buffered tokens (end of stream).
+    pub fn flush(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let decoded = self.tokenizer.decode(&self.pending, true).unwrap_or_default();
+        self.pending.clear();
+        decoded
+    }
+}
 use pyo3::prelude::*;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -185,6 +229,173 @@ fn format_completion(
     )
 }
 
+// ── Tool use support ──────────────────────────────────────────────
+
+/// A parsed tool call extracted from model output.
+struct ParsedToolCall {
+    id: String,
+    name: String,
+    arguments_json: String,
+}
+
+/// Parse tool calls from model-generated text (Qwen XML format).
+/// Returns (content_text, tool_calls).
+/// Content is everything outside `<tool_call>...</tool_call>` blocks.
+fn parse_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
+    let mut tool_calls = Vec::new();
+    let mut content = String::new();
+    let mut remaining = text;
+    let mut call_idx = 0u64;
+
+    while let Some(start) = remaining.find("<tool_call>") {
+        content.push_str(&remaining[..start]);
+        remaining = &remaining[start + "<tool_call>".len()..];
+
+        if let Some(end) = remaining.find("</tool_call>") {
+            let block = remaining[..end].trim();
+            remaining = &remaining[end + "</tool_call>".len()..];
+
+            // Parse <function=name>
+            if let Some(fn_start) = block.find("<function=") {
+                let after = &block[fn_start + "<function=".len()..];
+                if let Some(fn_end) = after.find('>') {
+                    let name = after[..fn_end].to_string();
+                    let inner = &after[fn_end + 1..];
+
+                    // Find </function> boundary
+                    let params_text = if let Some(fe) = inner.find("</function>") {
+                        &inner[..fe]
+                    } else {
+                        inner
+                    };
+
+                    // Parse <parameter=name>value</parameter> pairs
+                    let mut args = serde_json::Map::new();
+                    let mut param_rem = params_text;
+                    while let Some(p_start) = param_rem.find("<parameter=") {
+                        let after_p = &param_rem[p_start + "<parameter=".len()..];
+                        if let Some(p_name_end) = after_p.find('>') {
+                            let param_name = after_p[..p_name_end].to_string();
+                            let value_text = &after_p[p_name_end + 1..];
+                            if let Some(p_end) = value_text.find("</parameter>") {
+                                let value = value_text[..p_end]
+                                    .trim_start_matches('\n')
+                                    .trim_end_matches('\n');
+                                // Try JSON parse (objects, arrays, numbers, bools)
+                                let json_value = serde_json::from_str(value)
+                                    .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+                                args.insert(param_name, json_value);
+                                param_rem = &value_text[p_end + "</parameter>".len()..];
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Generate unique call ID
+                    let id = format!("call_{:016x}", {
+                        let mut s = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        s ^= call_idx;
+                        s
+                    });
+                    call_idx += 1;
+
+                    tool_calls.push(ParsedToolCall {
+                        id,
+                        name,
+                        arguments_json: serde_json::Value::Object(args).to_string(),
+                    });
+                }
+            }
+        } else {
+            // No closing tag — treat as content
+            content.push_str("<tool_call>");
+            content.push_str(remaining);
+            remaining = "";
+        }
+    }
+
+    content.push_str(remaining);
+    (content.trim().to_string(), tool_calls)
+}
+
+/// Escape a string for embedding inside a JSON string value.
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+/// Format SSE chunk: tool call start (name + empty args).
+fn format_sse_tool_call_start(
+    request_id: &str,
+    model_name: &str,
+    call_index: usize,
+    call_id: &str,
+    function_name: &str,
+    created: u64,
+) -> String {
+    format!(
+        r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{},"id":"{}","type":"function","function":{{"name":"{}","arguments":""}}}}]}},"finish_reason":null}}]}}"#,
+        request_id, created, model_name, call_index, call_id, function_name
+    )
+}
+
+/// Format SSE chunk: tool call arguments fragment.
+fn format_sse_tool_call_args(
+    request_id: &str,
+    model_name: &str,
+    call_index: usize,
+    arguments_json: &str,
+    created: u64,
+) -> String {
+    let escaped = json_escape(arguments_json);
+    format!(
+        r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{},"function":{{"arguments":"{}"}}}}]}},"finish_reason":null}}]}}"#,
+        request_id, created, model_name, call_index, escaped
+    )
+}
+
+/// Format non-streaming response with tool calls.
+fn format_completion_with_tool_calls(
+    request_id: &str,
+    model_name: &str,
+    content: &str,
+    tool_calls: &[ParsedToolCall],
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    created: u64,
+) -> String {
+    let mut tc_parts = Vec::new();
+    for tc in tool_calls {
+        let escaped_args = json_escape(&tc.arguments_json);
+        tc_parts.push(format!(
+            r#"{{"id":"{}","type":"function","function":{{"name":"{}","arguments":"{}"}}}}"#,
+            tc.id, tc.name, escaped_args
+        ));
+    }
+    let content_field = if content.is_empty() {
+        "null".to_string()
+    } else {
+        format!(r#""{}""#, json_escape(content))
+    };
+    format!(
+        r#"{{"id":"{}","object":"chat.completion","created":{},"model":"{}","choices":[{{"index":0,"message":{{"role":"assistant","content":{},"tool_calls":[{}]}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{}}}}}"#,
+        request_id, created, model_name, content_field, tc_parts.join(","),
+        prompt_tokens, completion_tokens, prompt_tokens + completion_tokens
+    )
+}
+
 /// Handle a single HTTP request.
 fn handle_request(
     mut tcp_stream: TcpStream,
@@ -316,6 +527,22 @@ fn handle_chat_completion(
         _ => vec![],
     };
 
+    // Tool use: extract tools array and tool_choice
+    let tools_json = match req.get("tools") {
+        Some(t) if t.is_array() => {
+            let tool_choice = req.get("tool_choice")
+                .and_then(|v| v.as_str())
+                .unwrap_or("auto");
+            if tool_choice == "none" {
+                String::new()
+            } else {
+                t.to_string()
+            }
+        }
+        _ => String::new(),
+    };
+    let has_tools = !tools_json.is_empty();
+
     // ── Estimate prompt tokens for soft-tier HCS eviction ──
     let estimated_tokens = {
         // Extract text from messages JSON and tokenize with Rust tokenizer
@@ -361,6 +588,7 @@ fn handle_chat_completion(
                 enable_thinking,
                 stop_tokens.clone(),
                 "gpu",
+                &tools_json,
             ),
             None,
         )?;
@@ -458,7 +686,7 @@ fn handle_chat_completion(
         first_token, prompt_len, max_tokens, temperature,
         top_k, top_p, presence_penalty, &stop_ids,
         &request_id, &state.model_name, created,
-        &overhead,
+        &overhead, has_tools,
     );
 
     // ── Cleanup (GIL required) ──
@@ -496,6 +724,7 @@ fn handle_gpu_decode(
     model_name: &str,
     created: u64,
     overhead: &RequestOverhead,
+    has_tools: bool,
 ) {
     if is_stream {
         if let Err(e) = begin_sse(stream) {
@@ -504,8 +733,13 @@ fn handle_gpu_decode(
         }
 
         let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
-        let chunk = format_sse_token(request_id, model_name, &first_text, None, created);
-        let _ = send_sse_chunk(stream, &chunk);
+
+        // When tool use is active, buffer first token (might need tool call parsing).
+        // Otherwise send immediately for lowest latency.
+        if !has_tools {
+            let chunk = format_sse_token(request_id, model_name, &first_text, None, created);
+            let _ = send_sse_chunk(stream, &chunk);
+        }
 
         let (tx, rx) = mpsc::channel::<String>();
         let writer_disconnected = Arc::new(AtomicBool::new(false));
@@ -566,6 +800,35 @@ fn handle_gpu_decode(
         let decode_start = Instant::now();
         let mut decode_token_count = 0usize;
 
+        // ── Tool call detection state ──
+        // When tools are present: stream content normally, detect <tool_call>,
+        // buffer everything from that point, then send structured tool_calls
+        // at the end.  Content before tool calls streams with full latency.
+        let mut tc_all_text = String::new();
+        let mut tc_in_tool_call = false;
+        let mut tc_found = false;
+        let mut tc_finish = String::new();
+
+        if has_tools {
+            tc_all_text.push_str(&first_text);
+            // Send first token if it's safe (doesn't contain tool call marker)
+            if first_text.contains("<tool_call>") {
+                tc_in_tool_call = true;
+                tc_found = true;
+                // Send content before the marker
+                if let Some(idx) = first_text.find("<tool_call>") {
+                    let before = &first_text[..idx];
+                    if !before.is_empty() {
+                        let chunk = format_sse_token(request_id, model_name, before, None, created);
+                        let _ = tx.send(format!("data: {}\n\n", chunk));
+                    }
+                }
+            } else if !first_text.is_empty() {
+                let chunk = format_sse_token(request_id, model_name, &first_text, None, created);
+                let _ = tx.send(format!("data: {}\n\n", chunk));
+            }
+        }
+
         store.gpu_generate_stream(
             first_token,
             prompt_len,
@@ -578,14 +841,92 @@ fn handle_gpu_decode(
             presence_penalty,
             |_token_id, text, finish_reason| {
                 decode_token_count += 1;
-                let chunk = format_sse_token(request_id, model_name, text, finish_reason, created);
-                let formatted = format!("data: {}\n\n", chunk);
-                if tx.send(formatted).is_err() || writer_disconnected.load(Ordering::Acquire) {
-                    return false;
+
+                if has_tools {
+                    tc_all_text.push_str(text);
+                    if let Some(fr) = finish_reason {
+                        tc_finish = fr.to_string();
+                    }
+
+                    if tc_in_tool_call {
+                        // Inside a tool call block — buffer silently
+                    } else if text.contains("<tool_call>") {
+                        // Entering tool call territory
+                        tc_in_tool_call = true;
+                        tc_found = true;
+                        // Send any content before the marker in this text
+                        if let Some(idx) = text.find("<tool_call>") {
+                            let before = &text[..idx];
+                            if !before.is_empty() {
+                                let chunk = format_sse_token(
+                                    request_id, model_name, before, None, created,
+                                );
+                                let _ = tx.send(format!("data: {}\n\n", chunk));
+                            }
+                        }
+                    } else {
+                        // Normal content — stream it (no finish_reason; handled post-generation)
+                        if !text.is_empty() {
+                            let chunk = format_sse_token(
+                                request_id, model_name, text, None, created,
+                            );
+                            let _ = tx.send(format!("data: {}\n\n", chunk));
+                        }
+                    }
+
+                    if writer_disconnected.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    true
+                } else {
+                    // Original non-tool path
+                    let chunk = format_sse_token(
+                        request_id, model_name, text, finish_reason, created,
+                    );
+                    let formatted = format!("data: {}\n\n", chunk);
+                    if tx.send(formatted).is_err()
+                        || writer_disconnected.load(Ordering::Acquire)
+                    {
+                        return false;
+                    }
+                    true
                 }
-                true
             },
         );
+
+        // ── Post-generation: emit tool calls or finish ──
+        if has_tools {
+            let (_content, tool_calls) = parse_tool_calls(&tc_all_text);
+            if !tool_calls.is_empty() {
+                // Content before tool calls was already streamed in the callback.
+                // Now send the structured tool_call chunks.
+                for (i, tc) in tool_calls.iter().enumerate() {
+                    let start_chunk = format_sse_tool_call_start(
+                        request_id, model_name, i, &tc.id, &tc.name, created,
+                    );
+                    let _ = tx.send(format!("data: {}\n\n", start_chunk));
+                    let args_chunk = format_sse_tool_call_args(
+                        request_id, model_name, i, &tc.arguments_json, created,
+                    );
+                    let _ = tx.send(format!("data: {}\n\n", args_chunk));
+                }
+                let finish_chunk = format_sse_token(
+                    request_id, model_name, "", Some("tool_calls"), created,
+                );
+                let _ = tx.send(format!("data: {}\n\n", finish_chunk));
+                log::info!(
+                    "Request {}: {} tool call(s) detected",
+                    request_id, tool_calls.len()
+                );
+            } else {
+                // No tool calls — send finish with original reason
+                let fr = if tc_finish.is_empty() { "stop" } else { &tc_finish };
+                let finish_chunk = format_sse_token(
+                    request_id, model_name, "", Some(fr), created,
+                );
+                let _ = tx.send(format!("data: {}\n\n", finish_chunk));
+            }
+        }
 
         let elapsed = decode_start.elapsed().as_secs_f64();
         let total_gen = decode_token_count + 1;
@@ -614,6 +955,7 @@ fn handle_gpu_decode(
             overhead_total_ms, overhead.parse_ms, overhead.evict_ms, overhead.prefill_ms, overhead.reload_ms
         );
     } else {
+        // ── Non-streaming path ──
         let mut all_text = String::new();
         let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
         all_text.push_str(&first_text);
@@ -640,11 +982,32 @@ fn handle_gpu_decode(
             },
         );
 
-        let response = format_completion(
-            request_id, model_name, &all_text, prompt_len,
-            total_tokens, &finish, created,
-        );
-        let _ = send_json(stream, 200, &response);
+        if has_tools {
+            let (content, tool_calls) = parse_tool_calls(&all_text);
+            if !tool_calls.is_empty() {
+                let response = format_completion_with_tool_calls(
+                    request_id, model_name, &content, &tool_calls,
+                    prompt_len, total_tokens, created,
+                );
+                let _ = send_json(stream, 200, &response);
+                log::info!(
+                    "Request {}: {} tool call(s) (non-streaming)",
+                    request_id, tool_calls.len()
+                );
+            } else {
+                let response = format_completion(
+                    request_id, model_name, &all_text, prompt_len,
+                    total_tokens, &finish, created,
+                );
+                let _ = send_json(stream, 200, &response);
+            }
+        } else {
+            let response = format_completion(
+                request_id, model_name, &all_text, prompt_len,
+                total_tokens, &finish, created,
+            );
+            let _ = send_json(stream, 200, &response);
+        }
     }
 }
 

@@ -4195,6 +4195,8 @@ impl CpuDecodeStore {
         let mut seen_tokens: std::collections::HashSet<usize> = std::collections::HashSet::new();
         seen_tokens.insert(first_token);
 
+        let mut detok = crate::server::StreamDetokenizer::new(tokenizer);
+
         for step in 0..max_tokens {
             if self.cancel_flag.load(Ordering::Acquire) {
                 log::info!("generate_stream: cancelled after {} tokens", generated);
@@ -4221,8 +4223,7 @@ impl CpuDecodeStore {
             seen_tokens.insert(next_token);
             generated += 1;
 
-            let text = tokenizer.decode(&[next_token as u32], true)
-                .unwrap_or_default();
+            let mut text = detok.add(next_token as u32);
 
             let finish_reason = if stop_set.contains(&next_token) {
                 Some("stop")
@@ -4231,6 +4232,9 @@ impl CpuDecodeStore {
             } else {
                 None
             };
+            if finish_reason.is_some() {
+                text.push_str(&detok.flush());
+            }
 
             let finished = finish_reason.is_some();
             let cont = on_token(next_token, &text, finish_reason);

@@ -735,9 +735,14 @@ class KrasisModel:
                     w13s_marlin = torch.zeros(n_dummy, K // gs, 2 * N, dtype=torch.bfloat16)
                     w13_std = inverse_marlin_repack(w13_marlin, K, 2*N, bits).to(device)
                     w13s_std = inverse_scale_permute(w13s_marlin, K, 2*N, gs).to(device)
+                    # w2 (down projection) has different dimensions: input=N, output=K
+                    w2_marlin = torch.zeros(n_dummy, N // 16, K * nb2, dtype=torch.int32)
+                    w2s_marlin = torch.zeros(n_dummy, N // gs, K, dtype=torch.bfloat16)
+                    w2_std = inverse_marlin_repack(w2_marlin, N, K, bits).to(device)
+                    w2s_std = inverse_scale_permute(w2s_marlin, N, K, gs).to(device)
                     lookup = torch.tensor([0, 1], dtype=torch.int32, device=device)
                     x = torch.zeros(1, K, dtype=torch.bfloat16, device=device)
-                    triton_moe_decode(x, [0,1], [0.5,0.5], w13_std, w13s_std, w13_std, w13s_std, lookup, None, None, self.cfg.swiglu_limit, 1.702, gs)
+                    triton_moe_decode(x, [0,1], [0.5,0.5], w13_std, w13s_std, w2_std, w2s_std, lookup, None, None, self.cfg.swiglu_limit, 1.702, gs)
 
             except Exception as e:
                 logger.warning("CUDA warmup (Triton/Marlin) on %s failed: %s", device, e)
@@ -3628,6 +3633,7 @@ class KrasisModel:
         enable_thinking: bool,
         extra_stop_tokens: List[str],
         decode_mode: str = "gpu",
+        tools_json: str = "",
     ):
         """GPU prefill for Rust server. Returns result object with first_token, etc.
 
@@ -3637,8 +3643,25 @@ class KrasisModel:
         import json
 
         parsed = json.loads(messages_json)
+
+        # Tool use: parse tools and preprocess messages
+        template_kwargs = {"enable_thinking": enable_thinking}
+        if tools_json:
+            tools = json.loads(tools_json)
+            template_kwargs["tools"] = tools
+            # Convert string arguments to dicts for the Jinja2 template
+            for msg in parsed:
+                if msg.get("role") == "assistant" and "tool_calls" in msg:
+                    for tc in msg["tool_calls"]:
+                        fn_obj = tc.get("function", tc)
+                        if isinstance(fn_obj.get("arguments"), str):
+                            try:
+                                fn_obj["arguments"] = json.loads(fn_obj["arguments"])
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
         prompt_tokens = self.tokenizer.apply_chat_template(
-            parsed, enable_thinking=enable_thinking
+            parsed, **template_kwargs
         )
 
         stop_ids = [self.cfg.eos_token_id] + list(self.cfg.extra_stop_token_ids)

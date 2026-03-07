@@ -681,12 +681,35 @@ def main():
         _file_handler.setFormatter(logging.Formatter(log_format))
         logging.getLogger().addHandler(_file_handler)
 
-    # Capture uncaught exceptions to the log file
+    # Capture uncaught exceptions to the log file (main thread)
     _original_excepthook = sys.excepthook
     def _log_excepthook(exc_type, exc_value, exc_tb):
         logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
         _original_excepthook(exc_type, exc_value, exc_tb)
     sys.excepthook = _log_excepthook
+
+    # Capture thread exceptions to the log file too
+    def _log_threading_excepthook(args):
+        logger.critical("Exception in thread %s", args.thread.name if args.thread else "?",
+                        exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+    threading.excepthook = _log_threading_excepthook
+
+    # Redirect stderr to log file so any stray prints/errors are captured
+    class _StderrLogger:
+        def __init__(self, original, log):
+            self._original = original
+            self._log = log
+        def write(self, msg):
+            if msg and msg.strip():
+                self._log.error("[stderr] %s", msg.rstrip())
+            if self._original:
+                self._original.write(msg)
+        def flush(self):
+            if self._original:
+                self._original.flush()
+        def fileno(self):
+            return self._original.fileno() if self._original else 2
+    sys.stderr = _StderrLogger(sys.stderr, logger)
 
     logger.info("Logging to %s", _log_file)
 
@@ -1171,6 +1194,17 @@ def main():
 
             if _benchmark_only:
                 rust_server.stop()
+            else:
+                _status(f"Server ready on {args.host}:{args.port}")
+                # Show Session ID again so it's visible after benchmark output
+                if getattr(args, 'session_enabled', False):
+                    sid_path = Path.home() / ".krasis" / "session_id"
+                    if sid_path.is_file():
+                        sid = sid_path.read_text().strip()
+                        if sid:
+                            _detail("Session messenger: ON")
+                            print(f"  {_BOLD}Session ID: {sid}{_NC}", flush=True)
+                _dim("Press Q or Ctrl-C to stop")
 
         bench_thread = threading.Thread(target=_run_benchmark, daemon=True)
         bench_thread.start()
