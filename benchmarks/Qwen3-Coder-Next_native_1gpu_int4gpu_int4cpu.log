@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-03 15:19:41
+Krasis Benchmark — 2026-03-06 23:50:49
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,9 +7,9 @@ PP Partition:     [48] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            1007 GB total, 79.9 GB used by process
-  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 22932 MB allocated
-  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
+  RAM:            1007 GB total, 79.1 GB used by process
+  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 6409 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
 
 Quantization:
   GPU experts:    INT4 (Marlin)
@@ -21,24 +21,24 @@ Quantization:
   KV cache:       FP8 E4M3
 
 Strategy:
-  Layer group size: 2 (hcs + layer_grouped(2))
+  Layer group size: 2 (layer_grouped(2))
   Prefill threshold: 1
-  Mode:           gpu_decode (hcs + layer_grouped(2))
+  Mode:           gpu_decode (layer_grouped(2))
 
 Prefill (6 runs at different lengths):
-  Run 1:  692.2 tok/s, TTFT=1.59s (1,101 tokens)
-  Run 2:  2330.9 tok/s, TTFT=2.32s (5,407 tokens)
-  Run 3:  2991.6 tok/s, TTFT=3.33s (9,961 tokens)
-  Run 4:  3360.0 tok/s, TTFT=6.04s (20,309 tokens)
-  Run 5:  3588.1 tok/s, TTFT=9.79s (35,122 tokens)
-  Run 6:  3482.4 tok/s, TTFT=14.48s (50,418 tokens)
-  Best:    3588.1 tok/s, TTFT=9.79s (35,122 tokens)
+  Run 1:  692.7 tok/s, TTFT=1.59s (1,101 tokens)
+  Run 2:  2306.2 tok/s, TTFT=2.34s (5,407 tokens)
+  Run 3:  2922.3 tok/s, TTFT=3.41s (9,961 tokens)
+  Run 4:  3314.3 tok/s, TTFT=6.13s (20,309 tokens)
+  Run 5:  3461.8 tok/s, TTFT=10.15s (35,122 tokens)
+  Run 6:  3377.6 tok/s, TTFT=14.93s (50,418 tokens)
+  Best:    3461.8 tok/s, TTFT=10.15s (35,122 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  33.09 tok/s (30.2ms/tok)
-  Run 2:  33.53 tok/s (29.8ms/tok)
-  Run 3:  33.21 tok/s (30.1ms/tok)
-  Average: 33.28 tok/s (30.0ms/tok)
+  Run 1:  40.47 tok/s (24.7ms/tok)
+  Run 2:  42.17 tok/s (23.7ms/tok)
+  Run 3:  42.01 tok/s (23.8ms/tok)
+  Average: 41.55 tok/s (24.1ms/tok)
 
 Verification:
   Prefill prompt: Summarise the following in one paragraph: THE COUNT OF MONTE CRISTO
@@ -57,11 +57,9 @@ Chapter 2. Father and Son
 Chapter 3. The Cat... [3252 chars total]
   Decode prompt:  Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
   Generated output (64 tokens):
-    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys—**a public key** and **a private key**—to enable secure communication without requiring the parties to share a secret key beforehand.
+    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys: a **public key** and a **private key**. Unlike symmetric cryptography (where the same secret key is used for encryption and decryption), in public key cryptography:
     
-    ### Core Concepts
-    
-    | Key Type | Who Has It
+    - The **public key
 ================================================================
 
 ────────────────────────────────────────────────────────────────
@@ -69,15 +67,15 @@ Chapter 3. The Cat... [3252 chars total]
 ────────────────────────────────────────────────────────────────
                                          Engine        Network   Overhead
   ────────────────────────────── ────────────── ────────────── ──────────
-  Prefill (best tok/s)                 3588.1         3583.4       -0.1%
-  TTFT (s)                               9.79           9.77       -20ms
-    1,101 tokens                        692.2          624.2       -9.8%
-    5,407 tokens                       2330.9         2171.6       -6.8%
-    9,961 tokens                       2991.6         3041.8       +1.7%
-    20,309 tokens                      3360.0         3396.0       +1.1%
-    35,122 tokens                      3588.1         3583.4       -0.1%
-    50,418 tokens                      3482.4         3425.1       -1.6%
+  Prefill (best tok/s)                 3461.8         3429.6       -0.9%
+  TTFT (s)                              10.15          10.21       +60ms
+    1,101 tokens                        692.7          623.0      -10.1%
+    5,407 tokens                       2306.2         2137.0       -7.3%
+    9,961 tokens                       2922.3         2941.0       +0.6%
+    20,309 tokens                      3314.3         3265.1       -1.5%
+    35,122 tokens                      3461.8         3429.6       -0.9%
+    50,418 tokens                      3377.6         3315.0       -1.9%
 
-  Decode (avg tok/s)                    33.28          33.46       +0.5%
-  Decode (ms/tok)                        30.0           29.9      -0.1ms
+  Decode (avg tok/s)                    41.55          45.27       +9.0%
+  Decode (ms/tok)                        24.1           22.3      -1.8ms
 ────────────────────────────────────────────────────────────────

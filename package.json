@@ -1,0 +1,28 @@
+{
+  "name": "krasis",
+  "version": "1.0.0",
+  "description": "Python-orchestrated Rust MoE runtime for large mixture-of-experts LLMs. Runs 200B+ parameter models on commodity hardware with full GPU prefill and efficient CPU decode.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brontoguana/krasis.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/brontoguana/krasis/issues"
+  },
+  "homepage": "https://github.com/brontoguana/krasis#readme",
+  "dependencies": {
+    "@session.js/client": "^0.0.57",
+    "@session.js/keypair": "^1.0.8",
+    "@session.js/mnemonic": "^1.0.6"
+  }
+}

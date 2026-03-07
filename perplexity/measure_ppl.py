@@ -209,6 +209,12 @@ def evaluate_perplexity(
                 if layer.layer_type == "linear_attention":
                     layer.attention.reset_state()
 
+        # Evict soft-tier HCS experts before prefill (same as Rust server)
+        gpu_store = getattr(model, '_gpu_decode_store', None)
+        evicted = 0
+        if gpu_store is not None:
+            evicted, _freed = gpu_store.py_hcs_evict_for_prefill(win_len)
+
         try:
             token_tensor = torch.tensor(tokens[begin:end], dtype=torch.long, device=device)
             positions = torch.arange(win_len, dtype=torch.int32, device=device)
@@ -254,6 +260,9 @@ def evaluate_perplexity(
             del logits, shift_logits, loss_per_pos, scored_loss
 
         finally:
+            # Reload soft-tier HCS experts after prefill
+            if gpu_store is not None and evicted > 0:
+                gpu_store.py_hcs_reload_after_prefill()
             for s in seq_states:
                 s.free()
 

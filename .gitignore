@@ -16,3 +16,4 @@ krasis.log
 server_init.log
 logs/*.log
 perplexity/datasets/
+node_modules/

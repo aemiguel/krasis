@@ -392,9 +392,10 @@ class LauncherConfig:
         self.port: int = 8012
         self.gpu_prefill_threshold: int = 300
         self.gguf_path: str = ""
-        self.vram_safety_margin: int = 1500
+        self.vram_safety_margin: int = 1000
         self.force_load: bool = False
         self.enable_thinking: bool = True
+        self.session_enabled: bool = False
 
     def apply_saved(self, saved: Dict[str, str]) -> None:
         """Apply loaded config values."""
@@ -479,6 +480,8 @@ class LauncherConfig:
             self.force_load = saved["CFG_FORCE_LOAD"] == "1"
         if "CFG_ENABLE_THINKING" in saved:
             self.enable_thinking = saved["CFG_ENABLE_THINKING"] != "0"
+        if "CFG_SESSION_ENABLED" in saved:
+            self.session_enabled = saved["CFG_SESSION_ENABLED"] == "1"
 
     def to_save_dict(self) -> Dict[str, Any]:
         """Convert to dict for saving."""
@@ -502,6 +505,7 @@ class LauncherConfig:
             "CFG_VRAM_SAFETY_MARGIN": str(self.vram_safety_margin),
             "CFG_FORCE_LOAD": "1" if self.force_load else "",
             "CFG_ENABLE_THINKING": "1" if self.enable_thinking else "0",
+            "CFG_SESSION_ENABLED": "1" if self.session_enabled else "0",
         }
 
 
@@ -559,6 +563,8 @@ OPTIONS = [
                  opt_type="number", min_val=1, max_val=256),
     ConfigOption("Host/Port", "host", opt_type="text"),
     ConfigOption("Enable thinking", "enable_thinking",
+                 choices=[True, False]),
+    ConfigOption("Session messenger", "session_enabled",
                  choices=[True, False]),
 ]
 
@@ -716,7 +722,9 @@ def _gpu_selection_screen(
     if preselected:
         selected = [g["index"] in preselected for g in gpus]
     else:
-        selected = [True] * len(gpus)  # all enabled by default
+        # Default: only the GPU with the largest VRAM
+        best_idx = max(gpus, key=lambda g: g["vram_mb"])["index"]
+        selected = [g["index"] == best_idx for g in gpus]
 
     while True:
         _clear_screen()
@@ -891,9 +899,10 @@ class Launcher:
                     g for g in self.hw["gpus"] if g["index"] in valid
                 ]
                 return
-        # Default: use all detected GPUs
-        self.selected_gpus = list(self.hw["gpus"])
-        self.cfg.selected_gpu_indices = [g["index"] for g in self.selected_gpus]
+        # Default: use the GPU with the largest VRAM
+        best = max(self.hw["gpus"], key=lambda g: g["vram_mb"])
+        self.selected_gpus = [best]
+        self.cfg.selected_gpu_indices = [best["index"]]
 
     def _compute_budget(self) -> Optional[Dict[str, Any]]:
         """Compute VRAM/RAM budget from current config."""
@@ -1446,33 +1455,28 @@ class Launcher:
 
     def launch_server(self, benchmark: bool = False, benchmark_only: bool = False,
                       stress_test: bool = False) -> None:
-        """Build args and exec the Krasis server."""
-        num_gpus = len(self.selected_gpus) if self.selected_gpus else self.hw["gpu_count"]
+        """Write a temp config file and exec the Krasis server with --config."""
+        import tempfile
 
+        # Write the full config to a temp file
+        config_dict = self.cfg.to_save_dict()
+        # Add num_gpus (derived from selected GPUs, not stored in LauncherConfig)
+        num_gpus = len(self.selected_gpus) if self.selected_gpus else self.hw["gpu_count"]
+        config_dict["CFG_NUM_GPUS"] = str(num_gpus)
+
+        fd, config_path = tempfile.mkstemp(prefix="krasis-", suffix=".conf")
+        with os.fdopen(fd, "w") as f:
+            import datetime
+            f.write(f"# Krasis launch config — {datetime.datetime.now().isoformat()}\n")
+            for key, val in config_dict.items():
+                f.write(f'{key}="{val}"\n')
+
+        # Build minimal command: just --config plus any action flags
         cmd_args = [
             sys.executable, "-m", "krasis.server",
-            "--model-path", self.cfg.model_path,
-            "--num-gpus", str(num_gpus),
-            "--layer-group-size", str(self.cfg.layer_group_size),
-            "--kv-cache-mb", str(self.cfg.kv_cache_mb),
-            "--kv-dtype", self.cfg.kv_dtype,
-            "--gpu-expert-bits", str(self.cfg.gpu_expert_bits),
-            "--attention-quant", self.cfg.attention_quant,
-            "--shared-expert-quant", self.cfg.shared_expert_quant,
-            "--dense-mlp-quant", self.cfg.dense_mlp_quant,
-            "--lm-head-quant", self.cfg.lm_head_quant,
-            "--krasis-threads", str(self.cfg.krasis_threads),
-            "--host", self.cfg.host,
-            "--port", str(self.cfg.port),
-            "--vram-safety-margin", str(self.cfg.vram_safety_margin),
+            "--config", config_path,
         ]
 
-        if self.cfg.gguf_path:
-            cmd_args.extend(["--gguf-path", self.cfg.gguf_path])
-        if self.cfg.force_load:
-            cmd_args.append("--force-load")
-        if not self.cfg.enable_thinking:
-            cmd_args.append("--no-enable-thinking")
         if benchmark or benchmark_only:
             cmd_args.append("--benchmark")
         if benchmark_only:
@@ -1487,6 +1491,7 @@ class Launcher:
             print(f"  CUDA_VISIBLE_DEVICES={cvd}")
 
         print(f"\n{GREEN}Starting Krasis server...{NC}\n")
+        print(f"  Config: {config_path}")
         print(f"{DIM}$ {' '.join(cmd_args)}{NC}\n")
 
         os.execvp(cmd_args[0], cmd_args)
@@ -1520,7 +1525,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-cache-mb", type=int, default=None,
                         help="KV cache size in MB (default: 1000)")
     parser.add_argument("--vram-safety-margin", type=int, default=None,
-                        help="VRAM safety margin in MB (default: 1500)")
+                        help="VRAM safety margin in MB (default: 1000)")
     parser.add_argument("--kv-dtype", default=None,
                         help="KV cache dtype: fp8_e4m3 or bf16")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
@@ -1545,6 +1550,8 @@ def parse_args() -> argparse.Namespace:
                         help="Min tokens for GPU prefill (default: 300)")
     parser.add_argument("--force-load", action="store_true",
                         help="Force reload cached weights")
+    parser.add_argument("--session-enabled", action="store_true",
+                        help="Enable Session messenger bridge")
     parser.add_argument("--benchmark", action="store_true",
                         help="Run standardized benchmark before starting server")
     parser.add_argument("--benchmark-suite", nargs="?", const="", default=None,
@@ -1603,6 +1610,8 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         cfg.gguf_path = args.gguf_path
     if args.force_load:
         cfg.force_load = True
+    if getattr(args, 'session_enabled', False):
+        cfg.session_enabled = True
 
 
 def _check_gpu_deps():

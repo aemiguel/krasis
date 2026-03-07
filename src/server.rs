@@ -803,6 +803,130 @@ impl RustServer {
         Ok(())
     }
 
+    /// Run a single benchmark request through the engine (no HTTP/SSE).
+    /// Same operations as handle_chat_completion but without network I/O.
+    /// Returns JSON string with engine-internal timing breakdown.
+    ///
+    /// Safety: assumes no concurrent HTTP requests during benchmark.
+    #[pyo3(signature = (messages_json, max_new_tokens, temperature=0.6, enable_thinking=false))]
+    fn benchmark_request(
+        &self,
+        py: Python<'_>,
+        messages_json: String,
+        max_new_tokens: usize,
+        temperature: f32,
+        enable_thinking: bool,
+    ) -> PyResult<String> {
+        // Load tokenizer (same as server path)
+        let tokenizer = tokenizers::Tokenizer::from_file(&self.tokenizer_path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to load tokenizer: {}", e)))?;
+
+        // Estimate tokens for HCS budget (same logic as server)
+        let estimated_tokens = {
+            let mut text = String::new();
+            if let Ok(msgs) = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json) {
+                for msg in &msgs {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        text.push_str(content);
+                        text.push(' ');
+                    }
+                }
+            }
+            let base_count = tokenizer.encode(text, false)
+                .map(|e| e.len())
+                .unwrap_or(200);
+            base_count + 200
+        };
+
+        // Evict soft HCS before prefill
+        let store = unsafe { &mut *(self.gpu_store_addr as *mut GpuDecodeStore) };
+        let t_evict = Instant::now();
+        let (evicted, _) = store.hcs_evict_for_prefill(estimated_tokens);
+        let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
+
+        // Prefill (Python, GIL held)
+        let t_prefill = Instant::now();
+        let stop_tokens: Vec<String> = Vec::new();
+        let result = self.py_model.call_method(
+            py,
+            "server_prefill",
+            (
+                &messages_json,
+                max_new_tokens,
+                temperature,
+                50usize,        // top_k
+                0.95f32,        // top_p
+                0.0f32,         // presence_penalty
+                enable_thinking,
+                stop_tokens,
+                "gpu",
+            ),
+            None,
+        )?;
+        let first_token: usize = result.getattr(py, "first_token")?.extract(py)?;
+        let prompt_len: usize = result.getattr(py, "prompt_len")?.extract(py)?;
+        let stop_ids: Vec<usize> = result.getattr(py, "stop_ids")?.extract(py)?;
+        let kv_overflow: bool = result.getattr(py, "kv_overflow")
+            .and_then(|v| v.extract(py))
+            .unwrap_or(false);
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+
+        // Reload soft HCS after prefill
+        let t_reload = Instant::now();
+        if evicted > 0 {
+            store.hcs_reload_after_prefill_async();
+        }
+        let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
+
+        // Decode (pure Rust, GIL held but unused by decode loop)
+        let (decode_ms, decode_tokens, decode_tok_s) = if kv_overflow || max_new_tokens <= 1 {
+            (0.0f64, 1usize, 0.0f64)
+        } else {
+            let decode_start = Instant::now();
+            let mut count = 0usize;
+            store.gpu_generate_stream(
+                first_token,
+                prompt_len,
+                max_new_tokens.saturating_sub(1),
+                temperature,
+                50,     // top_k
+                0.95,   // top_p
+                &stop_ids,
+                &tokenizer,
+                0.0,    // presence_penalty
+                |_token_id, _text, _finish_reason| {
+                    count += 1;
+                    true
+                },
+            );
+            let elapsed = decode_start.elapsed().as_secs_f64();
+            let total = count + 1; // includes first_token from prefill
+            let tok_s = if elapsed > 0.0 && count > 0 {
+                count as f64 / elapsed
+            } else {
+                0.0
+            };
+            (elapsed * 1000.0, total, tok_s)
+        };
+
+        // Cleanup
+        self.py_model.call_method0(py, "server_cleanup")?;
+
+        let prefill_tok_s = if prefill_ms > 0.0 {
+            prompt_len as f64 / (prefill_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        Ok(format!(
+            r#"{{"prefill_ms":{:.1},"prefill_tok_s":{:.1},"prompt_tokens":{},"decode_ms":{:.1},"decode_tok_s":{:.2},"decode_tokens":{},"evict_ms":{:.1},"reload_ms":{:.1}}}"#,
+            prefill_ms, prefill_tok_s, prompt_len,
+            decode_ms, decode_tok_s, decode_tokens,
+            evict_ms, reload_ms
+        ))
+    }
+
     /// Signal the server to stop.
     fn stop(&self) {
         self.running.store(false, Ordering::Release);

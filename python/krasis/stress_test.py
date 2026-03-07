@@ -264,6 +264,12 @@ class StressTest:
         vocab_size = self.model.cfg.vocab_size
         seq_states = [SequenceKVState(c, seq_id=0) for c in self.model.kv_caches]
 
+        # Evict soft-tier HCS experts before prefill (same as Rust server)
+        gpu_store = getattr(self.model, '_gpu_decode_store', None)
+        evicted = 0
+        if gpu_store is not None:
+            evicted, _freed = gpu_store.py_hcs_evict_for_prefill(len(tokens))
+
         try:
             with torch.inference_mode():
                 # ── Prefill ──
@@ -361,6 +367,9 @@ class StressTest:
             result["error"] = f"{type(e).__name__}: {e}"
             logger.debug("Full traceback:\n%s", traceback.format_exc())
         finally:
+            # Reload soft-tier HCS experts after prefill/decode
+            if gpu_store is not None and evicted > 0:
+                gpu_store.py_hcs_reload_after_prefill()
             for s in seq_states:
                 s.free()
 

@@ -1,14 +1,18 @@
 """Standardized benchmark for Krasis model + hardware combinations.
 
-Runs after model load (in server.py), before serving begins.
-Results are printed to stdout and appended to benchmark_results.log.
+Two measurement tiers:
+  1. Engine — calls Rust engine directly (no HTTP/SSE). Rust Instant timing.
+     Reports: prefill tok/s, decode tok/s.
+  2. Client — sends HTTP requests to the Rust server. Client-side wall clock.
+     Reports: TTFT (time to first token).
 
 Usage (from server.py):
     from krasis.benchmark import KrasisBenchmark
-    bench = KrasisBenchmark(model)
+    bench = KrasisBenchmark(model, rust_server=rust_server, host="127.0.0.1", port=8012)
     bench.run()
 """
 
+import http.client
 import json
 import logging
 import os
@@ -18,8 +22,6 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import torch
-
-from krasis.timing import TIMING
 
 logger = logging.getLogger("krasis.benchmark")
 
@@ -38,24 +40,28 @@ def _section(label: str) -> str:
 
 
 class KrasisBenchmark:
-    """Standardized benchmark suite for a loaded KrasisModel."""
+    """Standardized benchmark suite — engine timing + HTTP TTFT."""
 
-    PREFILL_LENGTHS = [1000, 5000, 10000, 20000, 35000, 50000]  # tokens — timed runs at each length
-    WARMUP_MAX_CHARS = 125000  # ~25K tokens — warmup prompt truncation
+    PREFILL_LENGTHS = [1000, 5000, 10000, 20000, 35000, 50000]
+    WARMUP_MAX_CHARS = 125000  # ~25K tokens
 
-    def __init__(self, model, timing: bool = False):
-        self.model = model
+    def __init__(self, model, rust_server=None, host: str = "127.0.0.1",
+                 port: int = 8012, timing: bool = False):
+        self.model = model  # for system/model info collection + tokenizer
+        self.rust_server = rust_server  # for engine benchmarks
+        self.host = host
+        self.port = port
         self.timing = timing
 
         self.decode_tokens = 64
         self.n_runs = int(os.environ.get("KRASIS_BENCH_RUNS", "3"))
 
         if timing:
-            # Instrumentation mode: enable decode timing for per-layer breakdown
+            from krasis.timing import TIMING
             TIMING.decode = True
             TIMING.prefill = False
         else:
-            # Speed measurement mode: disable all instrumentation
+            from krasis.timing import TIMING
             TIMING.decode = False
             TIMING.prefill = False
             os.environ.pop("KRASIS_DECODE_TIMING", None)
@@ -74,7 +80,6 @@ class KrasisBenchmark:
             "gpus": [],
         }
 
-        # CPU model
         try:
             with open("/proc/cpuinfo") as f:
                 for line in f:
@@ -84,7 +89,6 @@ class KrasisBenchmark:
         except (OSError, ValueError):
             pass
 
-        # Physical cores
         try:
             result = subprocess.run(
                 ["lscpu"], capture_output=True, text=True, timeout=5,
@@ -101,7 +105,6 @@ class KrasisBenchmark:
         except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
             pass
 
-        # Total RAM
         try:
             with open("/proc/meminfo") as f:
                 for line in f:
@@ -112,7 +115,6 @@ class KrasisBenchmark:
         except (OSError, ValueError):
             pass
 
-        # Process RSS
         try:
             with open("/proc/self/status") as f:
                 for line in f:
@@ -123,7 +125,6 @@ class KrasisBenchmark:
         except (OSError, ValueError):
             pass
 
-        # GPUs via nvidia-smi
         try:
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=index,name,memory.total",
@@ -160,7 +161,6 @@ class KrasisBenchmark:
         cfg = self.model.cfg
         qcfg = self.model.quant_cfg
 
-        # Read model_type from config.json (not stored on ModelConfig)
         model_type = "unknown"
         config_path = os.path.join(cfg.model_path, "config.json")
         try:
@@ -170,33 +170,25 @@ class KrasisBenchmark:
         except (OSError, json.JSONDecodeError):
             pass
 
-        # Determine strategy description
         lgs = self.model.layer_group_size
         if lgs == 0:
             expert_mode = "persistent"
         else:
             expert_mode = f"layer_grouped({lgs})"
-        # Check if HCS is active
         first_mgr = next(iter(self.model.gpu_prefill_managers.values()), None)
         if first_mgr and getattr(first_mgr, '_hcs_initialized', False):
             expert_mode = f"hcs + {expert_mode}"
 
-        # Streaming attention
         if getattr(self.model, '_stream_attn_enabled', False):
             expert_mode += " + stream_attn"
 
-        # Decode mode
         gpu_threshold = getattr(self.model, 'gpu_prefill_threshold', 300)
         if gpu_threshold <= 1:
             decode_mode = f"gpu_decode ({expert_mode})"
         else:
             decode_mode = f"pure_cpu decode, {expert_mode} prefill"
 
-        # KV dtype
         kv_dtype_str = "FP8 E4M3" if self.model.kv_dtype == torch.float8_e4m3fn else "BF16"
-
-        # Actual GPU count: may differ from PP partition length (e.g. HCS uses
-        # extra GPUs for pinned experts without splitting layers across them).
         num_gpus_used = getattr(self.model, '_num_gpus', len(self.model.pp_partition))
 
         return {
@@ -243,7 +235,7 @@ class KrasisBenchmark:
         for cache in self.model.kv_caches:
             if cache is not None:
                 return cache.max_pages * cache.page_size
-        return 100000  # fallback
+        return 100000
 
     def _discover_prefill_files(self) -> List[str]:
         """Discover available prefill_prompt_N files."""
@@ -257,25 +249,12 @@ class KrasisBenchmark:
         return files
 
     def _make_prefill_prompts(self, n: int, max_tokens_override: int = 0) -> tuple:
-        """Build n different prefill prompts from separate numbered files.
-
-        Loads prefill_prompt_1 through prefill_prompt_N — each file
-        covers a completely different domain to ensure different expert
-        activation patterns across runs.  Truncates to KV cache capacity
-        (with margin for decode tokens).
-
-        If max_tokens_override > 0, truncate to that instead of KV cache limit.
-        Cycles through files if n > number of files available.
-
-        Returns (token_lists, content_texts).
-        """
-        # Leave room for decode tokens after prefill
+        """Build n different prefill prompts from separate numbered files."""
         kv_limit = self._kv_cache_max_tokens() - 200
         cap = max_tokens_override if max_tokens_override > 0 else kv_limit
-        cap = min(cap, kv_limit)  # never exceed KV cache
+        cap = min(cap, kv_limit)
 
         files = self._discover_prefill_files()
-
         if not files:
             raise FileNotFoundError(
                 "No prefill prompt files found. Expected prefill_prompt_1, prefill_prompt_2, etc."
@@ -299,18 +278,7 @@ class KrasisBenchmark:
     def _make_prefill_prompts_at_lengths(
         self, lengths: List[int], file_offset: int = 0,
     ) -> tuple:
-        """Build one prefill prompt per target length from different files.
-
-        Each prompt uses a different file and is truncated to exactly the
-        target token count.  Falls back gracefully if a file doesn't have
-        enough tokens (uses what's available).
-
-        file_offset: start from this index into the discovered files list,
-        so timed runs can use different files from warmup runs.
-
-        Returns (token_lists, content_texts) — content_texts are the raw
-        prompt strings (pre-chat-template) for network benchmark use.
-        """
+        """Build one prefill prompt per target length from different files."""
         kv_limit = self._kv_cache_max_tokens() - 200
         files = self._discover_prefill_files()
 
@@ -323,8 +291,6 @@ class KrasisBenchmark:
         content_texts = []
         for i, target in enumerate(lengths):
             content = self._load_prompt_file(files[(i + file_offset) % len(files)])
-            # Truncate raw text to ~5 chars/tok as a rough upper bound before tokenizing
-            # to avoid tokenizing huge texts when we only need a fraction
             char_limit = target * 6
             if len(content) > char_limit:
                 content = content[:char_limit]
@@ -334,7 +300,6 @@ class KrasisBenchmark:
             if len(tokens) > cap:
                 orig_len = len(tokens)
                 tokens = tokens[:cap]
-                # Truncate content text proportionally to match token truncation
                 ratio = cap / orig_len
                 content = content[:int(len(content) * ratio)]
             prompts.append(tokens)
@@ -342,16 +307,7 @@ class KrasisBenchmark:
         return prompts, content_texts
 
     def _make_decode_prompts(self, n: int) -> tuple:
-        """Build n different decode prompts from separate numbered files.
-
-        Loads decode_prompt_1 through decode_prompt_N — each file has a
-        different topic to ensure varied expert activation.
-
-        Cycles through files if n > number of files available.
-
-        Returns (token_lists, content_texts).
-        """
-        # Discover available decode prompt files
+        """Build n different decode prompts from separate numbered files."""
         files = []
         for i in range(1, 100):
             try:
@@ -361,7 +317,6 @@ class KrasisBenchmark:
                 break
 
         if not files:
-            # Fall back to legacy single file
             files = ["decode_prompt"]
 
         prompts = []
@@ -374,142 +329,170 @@ class KrasisBenchmark:
         return prompts, content_texts
 
     # ──────────────────────────────────────────────────────────
-    # Core engine request (same path as network, minus HTTP)
+    # Engine request (direct Rust, no HTTP/SSE)
     # ──────────────────────────────────────────────────────────
 
-    def _engine_request(
-        self, content_text: str, max_new_tokens: int,
-        temperature: float = 0.6, top_k: int = 50,
-    ) -> Dict:
-        """Run a request through the exact same path as the Rust HTTP server.
+    def _engine_request(self, content_text: str, max_new_tokens: int,
+                        temperature: float = 0.6) -> Dict:
+        """Single request through the Rust engine (no HTTP/SSE).
 
-        Uses server_prefill() → Rust GPU decode → server_cleanup().
-        The ONLY difference vs the network path is no HTTP/SSE transport.
+        Calls RustServer.benchmark_request() which runs the full
+        evict -> prefill -> reload -> decode pipeline with Rust
+        Instant timing. Returns dict with engine-internal timings.
         """
-        import time as _time
-
         messages = [{"role": "user", "content": content_text}]
         messages_json = json.dumps(messages)
+        result_json = self.rust_server.benchmark_request(
+            messages_json, max_new_tokens, temperature, False)
+        return json.loads(result_json)
 
-        result = self.model.server_prefill(
-            messages_json, max_new_tokens, temperature, top_k,
-            top_p=0.95, presence_penalty=0.0,
-            enable_thinking=False, extra_stop_tokens=[],
-            decode_mode="gpu",
-        )
+    # ──────────────────────────────────────────────────────────
+    # HTTP TTFT measurement (client-side wall clock)
+    # ──────────────────────────────────────────────────────────
 
-        generated = [result.first_token]
-        decode_time = 0.0
+    def _http_ttft(self, content_text: str) -> Dict:
+        """Send an HTTP request and measure client-side TTFT only.
 
-        if max_new_tokens > 1 and result.first_token not in result.stop_ids:
-            # GPU decode: Rust gpu_generate_batch — zero Python per token
-            gpu_store = getattr(self.model, '_gpu_decode_store', None)
-            if gpu_store is None:
-                raise RuntimeError("GpuDecodeStore not configured. Call setup_gpu_decode_store() first.")
-            decode_tokens = gpu_store.gpu_generate_batch(
-                first_token=result.first_token,
-                start_position=result.prompt_len,
-                max_tokens=max_new_tokens - 1,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=0.95,
-                stop_ids=result.stop_ids,
-                presence_penalty=0.0,
-            )
-            generated.extend(decode_tokens)
-            decode_time = gpu_store.last_decode_elapsed_s
-
-        prefill_time = result.prefill_time
-        prompt_len = result.prompt_len
-
-        self.model.server_cleanup()
-
-        return {
-            "prompt_len": prompt_len,
-            "prefill_time": prefill_time,
-            "generated": generated,
-            "decode_time": decode_time,
+        TTFT = wall clock from HTTP request sent to first SSE content token.
+        This is what the user actually experiences.
+        """
+        req_body = {
+            "messages": [{"role": "user", "content": content_text}],
+            "max_tokens": 1,
+            "temperature": 0.6,
+            "stream": True,
+            "enable_thinking": False,
         }
+        body = json.dumps(req_body).encode()
+
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=600)
+        t_start = time.perf_counter()
+        conn.request("POST", "/v1/chat/completions", body=body,
+                      headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+
+        t_first = None
+        prompt_tokens = 0
+        buf = b""
+
+        while True:
+            chunk = resp.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n\n" in buf:
+                line, buf = buf.split(b"\n\n", 1)
+                line = line.strip()
+                if not line or line == b"data: [DONE]":
+                    continue
+                if line.startswith(b"data: "):
+                    try:
+                        data = json.loads(line[6:])
+                        if "krasis_timing" in data:
+                            prompt_tokens = data["krasis_timing"].get("prompt_tokens", 0)
+                            continue
+                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        if "content" in delta and t_first is None:
+                            t_first = time.perf_counter()
+                    except json.JSONDecodeError:
+                        pass
+
+        conn.close()
+
+        ttft = (t_first - t_start) if t_first else 0
+        return {"ttft": round(ttft, 3), "prompt_tokens": prompt_tokens}
+
+    def _wait_for_server(self) -> bool:
+        """Wait for HTTP server to be ready (up to 10s)."""
+        import urllib.request
+        for _ in range(100):
+            time.sleep(0.1)
+            try:
+                req = urllib.request.Request(f"http://{self.host}:{self.port}/health")
+                with urllib.request.urlopen(req, timeout=1) as resp:
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                pass
+        return False
 
     # ──────────────────────────────────────────────────────────
     # Benchmark phases
     # ──────────────────────────────────────────────────────────
 
-    def _warmup(self):
-        """Run 2 short generations to warm up CUDA graphs and caches."""
-        print("  Warmup: 2 short generations...")
-        for i in range(2):
-            self._engine_request("Hello, how are you?", max_new_tokens=8)
+    def _warmup_engine(self):
+        """Warmup via engine path — compile kernels + warm caches."""
+        print("  Warmup: 2 short engine requests...")
+        self._engine_request("Hello, how are you?", max_new_tokens=8)
+        self._engine_request("What is 2+2?", max_new_tokens=8)
         print("  Warmup complete.")
 
-    def _benchmark_prefill(self, prompt_texts: List[str]) -> Dict:
-        """Measure prefill speed — one run per prompt (each may be different length).
-
-        Uses server_prefill() + server_cleanup() — same path as the HTTP server.
-        Reports the **best** (maximum) tok/s across runs.
-        """
+    def _benchmark_prefill_engine(self, prompt_tokens: List[List[int]],
+                                  prompt_texts: List[str]) -> Dict:
+        """Engine prefill benchmark — Rust Instant timing, no HTTP."""
         runs = []
-        for text in prompt_texts:
+        for tokens, text in zip(prompt_tokens, prompt_texts):
+            n_tokens = len(tokens)
             r = self._engine_request(text, max_new_tokens=1)
 
-            ttft = r["prefill_time"]
-            n_tokens = r["prompt_len"]
-            tok_s = n_tokens / ttft if ttft > 0 else 0
-            runs.append({"ttft": round(ttft, 2), "tok_s": round(tok_s, 1), "num_tokens": n_tokens})
+            tok_s = r["prefill_tok_s"]
+            ms = r["prefill_ms"]
+            srv_toks = r["prompt_tokens"]
+            if abs(srv_toks - n_tokens) > n_tokens * 0.05:
+                print(f"  {YELLOW}WARNING: token mismatch — expected {n_tokens:,} vs engine {srv_toks:,}{NC}")
+
+            runs.append({
+                "tok_s": round(tok_s, 1),
+                "ms": round(ms, 1),
+                "num_tokens": srv_toks or n_tokens,
+            })
 
         best_run = max(runs, key=lambda r: r["tok_s"])
         return {
             "best_tok_s": best_run["tok_s"],
-            "best_ttft": best_run["ttft"],
+            "best_ms": best_run["ms"],
             "best_num_tokens": best_run["num_tokens"],
             "runs": runs,
         }
 
-    def _benchmark_decode(self, prompt_texts: List[str]) -> Dict:
-        """Measure decode speed — one run per prompt. Captures output from last run.
-
-        Uses server_prefill() + generate_batch() + server_cleanup() — same path
-        as the HTTP server. Decode timing from Rust's Instant clock.
-        """
+    def _benchmark_decode_engine(self, prompt_texts: List[str]) -> Dict:
+        """Engine decode benchmark — Rust Instant timing, no HTTP."""
         runs = []
-        last_generated_ids = []
         for text in prompt_texts:
             r = self._engine_request(text, max_new_tokens=self.decode_tokens)
 
-            generated = r["generated"]
-            n_decode = len(generated) - 1  # First token is from prefill
-            decode_s = r["decode_time"]
-            if decode_s > 0 and n_decode > 0:
-                tok_s = n_decode / decode_s
-                ms_per_tok = (decode_s / n_decode) * 1000
-            else:
-                tok_s = 0
-                ms_per_tok = 0
+            tok_s = r["decode_tok_s"]
+            decode_ms = r["decode_ms"]
+            # decode_tokens includes first_token; decode_tok_s excludes it
+            ms_per_tok = (1000.0 / tok_s) if tok_s > 0 else 0
             runs.append({
                 "tok_s": round(tok_s, 2),
                 "ms_per_tok": round(ms_per_tok, 1),
-                "n_gen": len(generated),
+                "n_gen": r["decode_tokens"],
             })
-            last_generated_ids = generated
 
-        avg_tok_s = sum(r["tok_s"] for r in runs) / len(runs)
-        avg_ms = sum(r["ms_per_tok"] for r in runs) / len(runs)
-
-        # Decode the generated output text for verification
-        output_text = ""
-        if last_generated_ids:
-            try:
-                output_text = self.model.tokenizer.decode(last_generated_ids)
-            except Exception:
-                output_text = f"[{len(last_generated_ids)} tokens, decode failed]"
+        avg_tok_s = sum(r["tok_s"] for r in runs) / len(runs) if runs else 0
+        avg_ms = sum(r["ms_per_tok"] for r in runs) / len(runs) if runs else 0
 
         return {
             "num_tokens": self.decode_tokens,
             "avg_tok_s": round(avg_tok_s, 2),
             "avg_ms_per_tok": round(avg_ms, 1),
             "runs": runs,
-            "output_text": output_text,
         }
+
+    def _benchmark_http_ttft(self, prompt_tokens: List[List[int]],
+                             prompt_texts: List[str]) -> Dict:
+        """HTTP TTFT benchmark — client-side wall clock at different lengths."""
+        runs = []
+        for tokens, text in zip(prompt_tokens, prompt_texts):
+            n_tokens = len(tokens)
+            r = self._http_ttft(text)
+            runs.append({
+                "ttft": r["ttft"],
+                "num_tokens": r["prompt_tokens"] or n_tokens,
+            })
+        return {"runs": runs}
 
     # ──────────────────────────────────────────────────────────
     # Output formatting
@@ -517,7 +500,7 @@ class KrasisBenchmark:
 
     def _format_results(self, sys_info, model_info, vram_usage,
                         prefill_result, decode_result,
-                        prefill_prompt: str = "", decode_prompt: str = "") -> str:
+                        ttft_result) -> str:
         """Format results as a human-readable block."""
         lines = []
         sep = "=" * 64
@@ -573,39 +556,27 @@ class KrasisBenchmark:
         lines.append(f"  Prefill threshold: {model_info['gpu_prefill_threshold']}")
         lines.append(f"  Mode:           {model_info['decode_mode']}")
 
-        # Prefill results
+        # Engine prefill
         n_prefill_runs = len(prefill_result["runs"])
         lines.append("")
-        lines.append(f"Prefill ({n_prefill_runs} runs at different lengths):")
+        lines.append(f"Engine Prefill ({n_prefill_runs} runs at different lengths):")
         for i, run in enumerate(prefill_result["runs"]):
-            lines.append(f"  Run {i+1}:  {run['tok_s']:.1f} tok/s, TTFT={run['ttft']:.2f}s ({run['num_tokens']:,} tokens)")
-        lines.append(f"  Best:    {prefill_result['best_tok_s']:.1f} tok/s, TTFT={prefill_result['best_ttft']:.2f}s ({prefill_result['best_num_tokens']:,} tokens)")
+            lines.append(f"  Run {i+1}:  {run['tok_s']:,.1f} tok/s ({run['num_tokens']:,} tokens in {run['ms']:.1f}ms)")
+        lines.append(f"  Best:   {prefill_result['best_tok_s']:,.1f} tok/s ({prefill_result['best_num_tokens']:,} tokens)")
 
-        # Decode results
+        # Engine decode
         lines.append("")
-        lines.append(f"Decode ({self.decode_tokens} tokens, {self.n_runs} runs, different prompts):")
+        lines.append(f"Engine Decode ({self.decode_tokens} tokens, {self.n_runs} runs, different prompts):")
         for i, run in enumerate(decode_result["runs"]):
             lines.append(f"  Run {i+1}:  {run['tok_s']:.2f} tok/s ({run['ms_per_tok']:.1f}ms/tok)")
         lines.append(f"  Average: {decode_result['avg_tok_s']:.2f} tok/s ({decode_result['avg_ms_per_tok']:.1f}ms/tok)")
 
-        # Verification: prompts and generated output
-        lines.append("")
-        lines.append("Verification:")
-        if prefill_prompt:
-            # Show first 200 chars of prefill prompt
-            truncated = prefill_prompt[:200]
-            if len(prefill_prompt) > 200:
-                truncated += f"... [{len(prefill_prompt)} chars total]"
-            lines.append(f"  Prefill prompt: {truncated}")
-        if decode_prompt:
-            lines.append(f"  Decode prompt:  {decode_prompt}")
-        output_text = decode_result.get("output_text", "")
-        if output_text:
-            last_run = decode_result["runs"][-1] if decode_result["runs"] else {}
-            n_gen = last_run.get("n_gen", "?")
-            lines.append(f"  Generated output ({n_gen} tokens):")
-            for out_line in output_text.split("\n"):
-                lines.append(f"    {out_line}")
+        # Client TTFT
+        if ttft_result:
+            lines.append("")
+            lines.append(f"Client TTFT ({len(ttft_result['runs'])} runs via HTTP at different lengths):")
+            for run in ttft_result["runs"]:
+                lines.append(f"  {run['num_tokens']:>6,} tokens:  {run['ttft']:.2f}s")
 
         lines.append(sep)
         return "\n".join(lines)
@@ -615,16 +586,12 @@ class KrasisBenchmark:
     # ──────────────────────────────────────────────────────────
 
     def _archive_benchmark(self, model_info: Dict, report: str) -> Optional[str]:
-        """Write benchmark report to benchmarks/<name>.log for archival.
-
-        Returns the relative path (benchmarks/<filename>) or None on failure.
-        """
+        """Write benchmark report to benchmarks/<name>.log for archival."""
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)
         )))
         benchmarks_dir = os.path.join(repo_root, "benchmarks")
 
-        # Build filename: <model>_<gguf>_<N>gpu_int<X>gpu_int<Y>cpu.log
         model_name = model_info["model_name"]
         gguf_path = getattr(self.model, "gguf_path", None)
         if gguf_path:
@@ -634,7 +601,6 @@ class KrasisBenchmark:
         num_gpus = model_info["num_gpus"]
         gpu_quant = f"int{model_info['gpu_expert_bits']}gpu"
         cpu_quant = f"int{model_info['cpu_expert_bits']}cpu"
-        # Add stream_attn and layer_group_size to filename for differentiation
         suffix = ""
         if getattr(self.model, '_stream_attn_enabled', False):
             lgs = getattr(self.model, 'layer_group_size', 0)
@@ -651,236 +617,6 @@ class KrasisBenchmark:
         except OSError as e:
             logger.warning("Could not archive benchmark: %s", e)
             return None
-
-    # ──────────────────────────────────────────────────────────
-    # Network benchmark (same prompts through HTTP)
-    # ──────────────────────────────────────────────────────────
-
-    def _start_temp_server(self, host: str = "127.0.0.1", port: int = 18199) -> "RustServer":
-        """Start a temporary Rust HTTP server for network benchmarking."""
-        import threading
-        from krasis import RustServer
-
-        tokenizer_path = os.path.join(self.model.cfg.model_path, "tokenizer.json")
-        max_ctx = self.model.get_max_context_tokens()
-        model_name = os.path.basename(self.model.cfg.model_path)
-
-        gpu_store = getattr(self.model, '_gpu_decode_store', None)
-        gpu_store_addr = gpu_store.gpu_store_addr() if gpu_store is not None else 0
-        server = RustServer(
-            self.model, host, port, model_name, tokenizer_path, max_ctx,
-            False,  # enable_thinking
-            gpu_store_addr,
-        )
-
-        t = threading.Thread(target=server.run, daemon=True)
-        t.start()
-
-        # Wait for server to be ready
-        import urllib.request
-        for _ in range(50):
-            time.sleep(0.1)
-            try:
-                req = urllib.request.Request(f"http://{host}:{port}/health")
-                with urllib.request.urlopen(req, timeout=1) as resp:
-                    if resp.status == 200:
-                        break
-            except Exception:
-                pass
-        else:
-            raise RuntimeError("Temp server failed to start")
-
-        return server
-
-    def _network_request(
-        self, host: str, port: int, content_text: str,
-        expected_tokens: int, max_new_tokens: int, temperature: float = 0.6,
-    ) -> Dict:
-        """Send a prompt over HTTP and measure TTFT + decode speed.
-
-        Args:
-            content_text: Raw prompt content (sent as user message, server applies chat template).
-            expected_tokens: Engine's token count for this prompt (for fair tok/s comparison)
-
-        Returns dict with ttft, decode_tok_s, total_time, num_generated, num_prompt.
-        """
-        import http.client
-        import json as _json
-
-        req_body = {
-            "messages": [{"role": "user", "content": content_text}],
-            "max_tokens": max_new_tokens,
-            "temperature": temperature,
-            "stream": True,
-            "enable_thinking": False,
-        }
-        body = _json.dumps(req_body).encode()
-
-        conn = http.client.HTTPConnection(host, port, timeout=600)
-        t_start = time.perf_counter()
-        conn.request("POST", "/v1/chat/completions", body=body,
-                      headers={"Content-Type": "application/json"})
-        resp = conn.getresponse()
-
-        t_first = None
-        n_tokens = 0
-        server_timing = None
-        buf = b""
-
-        while True:
-            chunk = resp.read(4096)
-            if not chunk:
-                break
-            buf += chunk
-            while b"\n\n" in buf:
-                line, buf = buf.split(b"\n\n", 1)
-                line = line.strip()
-                if not line or line == b"data: [DONE]":
-                    continue
-                if line.startswith(b"data: "):
-                    try:
-                        data = _json.loads(line[6:])
-                        # Check for server-side timing event
-                        if "krasis_timing" in data:
-                            server_timing = data["krasis_timing"]
-                            continue
-                        delta = data.get("choices", [{}])[0].get("delta", {})
-                        if "content" in delta:
-                            now = time.perf_counter()
-                            if t_first is None:
-                                t_first = now
-                            n_tokens += 1
-                    except _json.JSONDecodeError:
-                        pass
-
-        conn.close()
-
-        ttft = (t_first - t_start) if t_first else 0
-
-        # Use server-side timing for decode (immune to TCP buffering)
-        if server_timing:
-            decode_tok_s = server_timing.get("decode_tok_s", 0)
-            decode_ms = server_timing.get("decode_time_ms", 0)
-            decode_ms_per_tok = (decode_ms / server_timing["decode_tokens"]
-                                 if server_timing.get("decode_tokens", 0) > 0 else 0)
-            n_tokens = server_timing.get("total_generated", n_tokens)
-            server_prompt_tokens = server_timing.get("prompt_tokens", 0)
-        else:
-            decode_tok_s = 0
-            decode_ms_per_tok = 0
-            server_prompt_tokens = 0
-
-        return {
-            "ttft": round(ttft, 2),
-            "tok_s": round(expected_tokens / ttft, 1) if ttft > 0 else 0,
-            "decode_tok_s": round(decode_tok_s, 2),
-            "decode_ms_per_tok": round(decode_ms_per_tok, 1),
-            "num_tokens": expected_tokens,
-            "server_prompt_tokens": server_prompt_tokens,
-            "num_generated": n_tokens,
-            "total_time": round(time.perf_counter() - t_start, 2),
-        }
-
-    def _benchmark_network_prefill(
-        self, prompt_tokens: List[List[int]], prompt_texts: List[str],
-        host: str, port: int,
-    ) -> Dict:
-        """Measure prefill speed over HTTP (SSE streaming, 1 decode token).
-
-        Sends text to the server (same as a real client). Both engine and
-        server use enable_thinking=False so token counts should match.
-        """
-        runs = []
-        for tokens, text in zip(prompt_tokens, prompt_texts):
-            n_tokens = len(tokens)
-            r = self._network_request(host, port, text, n_tokens,
-                                       max_new_tokens=1)
-            # Log token count comparison for debugging
-            srv_toks = r.get("server_prompt_tokens", 0)
-            if srv_toks and abs(srv_toks - n_tokens) > n_tokens * 0.05:
-                print(f"  {YELLOW}WARNING: token mismatch — engine {n_tokens:,} vs server {srv_toks:,} ({(srv_toks/n_tokens-1)*100:+.1f}%){NC}")
-            runs.append(r)
-
-        best_run = max(runs, key=lambda r: r["tok_s"])
-        return {
-            "best_tok_s": best_run["tok_s"],
-            "best_ttft": best_run["ttft"],
-            "best_num_tokens": best_run["num_tokens"],
-            "runs": runs,
-        }
-
-    def _benchmark_network_decode(
-        self, prompt_tokens: List[List[int]], prompt_texts: List[str],
-        host: str, port: int,
-    ) -> Dict:
-        """Measure decode speed over HTTP. Sends text like a real client."""
-        runs = []
-        for tokens, text in zip(prompt_tokens, prompt_texts):
-            n_tokens = len(tokens)
-            r = self._network_request(host, port, text, n_tokens,
-                                       max_new_tokens=self.decode_tokens)
-            runs.append({
-                "tok_s": r["decode_tok_s"],
-                "ms_per_tok": r["decode_ms_per_tok"],
-                "n_gen": r["num_generated"],
-            })
-
-        avg_tok_s = sum(r["tok_s"] for r in runs) / len(runs) if runs else 0
-        avg_ms = sum(r["ms_per_tok"] for r in runs) / len(runs) if runs else 0
-
-        return {
-            "num_tokens": self.decode_tokens,
-            "avg_tok_s": round(avg_tok_s, 2),
-            "avg_ms_per_tok": round(avg_ms, 1),
-            "runs": runs,
-        }
-
-    def _format_comparison(
-        self, engine_prefill, engine_decode, network_prefill, network_decode,
-    ) -> str:
-        """Format engine vs network results side by side."""
-        lines = []
-        lines.append("")
-        lines.append(f"{'─' * 64}")
-        lines.append(f"  ENGINE vs NETWORK COMPARISON")
-        lines.append(f"{'─' * 64}")
-        lines.append(f"  {'':30s} {'Engine':>14s} {'Network':>14s} {'Overhead':>10s}")
-        lines.append(f"  {'─'*30} {'─'*14} {'─'*14} {'─'*10}")
-
-        # Prefill comparison
-        e_pf = engine_prefill["best_tok_s"]
-        n_pf = network_prefill["best_tok_s"]
-        pf_pct = ((n_pf / e_pf - 1) * 100) if e_pf > 0 else 0
-        lines.append(f"  {'Prefill (best tok/s)':30s} {e_pf:>12.1f}   {n_pf:>12.1f}   {pf_pct:>+8.1f}%")
-
-        e_ttft = engine_prefill["best_ttft"]
-        n_ttft = network_prefill["best_ttft"]
-        ttft_diff = (n_ttft - e_ttft) * 1000  # ms
-        lines.append(f"  {'TTFT (s)':30s} {e_ttft:>12.2f}   {n_ttft:>12.2f}   {ttft_diff:>+7.0f}ms")
-
-        # Per-length prefill
-        for i, (er, nr) in enumerate(zip(engine_prefill["runs"], network_prefill["runs"])):
-            e_t = er["tok_s"]
-            n_t = nr["tok_s"]
-            pct = ((n_t / e_t - 1) * 100) if e_t > 0 else 0
-            label = f"  {er['num_tokens']:,} tokens"
-            lines.append(f"  {label:30s} {e_t:>12.1f}   {n_t:>12.1f}   {pct:>+8.1f}%")
-
-        lines.append("")
-
-        # Decode comparison
-        e_dec = engine_decode["avg_tok_s"]
-        n_dec = network_decode["avg_tok_s"]
-        dec_pct = ((n_dec / e_dec - 1) * 100) if e_dec > 0 else 0
-        lines.append(f"  {'Decode (avg tok/s)':30s} {e_dec:>12.2f}   {n_dec:>12.2f}   {dec_pct:>+8.1f}%")
-
-        e_ms = engine_decode["avg_ms_per_tok"]
-        n_ms = network_decode["avg_ms_per_tok"]
-        ms_diff = n_ms - e_ms
-        lines.append(f"  {'Decode (ms/tok)':30s} {e_ms:>12.1f}   {n_ms:>12.1f}   {ms_diff:>+7.1f}ms")
-
-        lines.append(f"{'─' * 64}")
-        return "\n".join(lines)
 
     # ──────────────────────────────────────────────────────────
     # Main entry point
@@ -903,8 +639,6 @@ class KrasisBenchmark:
         print(f"  Strategy: {model_info['decode_mode']}")
 
         # 2. Build prompts
-        # Warmup: n_runs prefill at ~25K tokens + n_runs decode
-        # Timed:  len(PREFILL_LENGTHS) prefill at varying lengths + n_runs decode
         n_timed_prefill = len(self.PREFILL_LENGTHS)
         lengths_str = "/".join(f"{l//1000}K" for l in self.PREFILL_LENGTHS)
         print(_section(f"Loading benchmark prompts (warmup + timed at {lengths_str})"))
@@ -923,129 +657,83 @@ class KrasisBenchmark:
         warmup_decode_texts = decode_texts_all[:self.n_runs]
         timed_decode_texts = decode_texts_all[self.n_runs:]
 
-        # 3. Warmup — compile kernels + warm caches with DIFFERENT prompts than timed runs
-        print(_section(f"Warmup ({self.n_runs} prefill + {self.n_runs} decode, all different prompts)"))
-        self._warmup()
+        # 3. Warmup — compile kernels + warm caches (engine path)
+        print(_section(f"Warmup ({self.n_runs} prefill + {self.n_runs} decode via engine)"))
+        self._warmup_engine()
         t0 = time.perf_counter()
         print(f"  Prefill warmup ({self.n_runs} runs, ~25K tokens each)...")
-        self._benchmark_prefill(warmup_prefill_texts)
+        for i, (tokens, text) in enumerate(zip(warmup_prefill_tokens, warmup_prefill_texts)):
+            self._engine_request(text, max_new_tokens=1)
+            print(f"    [{i+1}/{self.n_runs}] {len(tokens):,} tokens")
         print(f"  Decode warmup ({self.n_runs} runs, different prompts)...")
-        self._benchmark_decode(warmup_decode_texts)
+        for i, text in enumerate(warmup_decode_texts):
+            self._engine_request(text, max_new_tokens=8)
         warmup_s = time.perf_counter() - t0
         print(f"  Warmup complete ({warmup_s:.1f}s). All kernels compiled.")
 
-        # 4. Prefill benchmark (timed — different lengths: 1K/5K/10K/20K/35K/50K tokens)
-        print(_section(f"Running prefill benchmark ({lengths_str} tokens, {n_timed_prefill} runs)"))
-        prefill_result = self._benchmark_prefill(timed_prefill_texts)
+        # 4. Engine prefill benchmark
+        print(_section(f"Engine prefill benchmark ({lengths_str} tokens, {n_timed_prefill} runs)"))
+        prefill_result = self._benchmark_prefill_engine(timed_prefill_tokens, timed_prefill_texts)
         for i, run in enumerate(prefill_result["runs"]):
-            print(f"  Run {i+1}: {run['tok_s']:.1f} tok/s, TTFT={run['ttft']:.2f}s ({run['num_tokens']:,} tokens)")
-        print(f"  {BOLD}Best: {prefill_result['best_tok_s']:.1f} tok/s, TTFT={prefill_result['best_ttft']:.2f}s ({prefill_result['best_num_tokens']:,} tokens){NC}")
+            print(f"  Run {i+1}: {run['tok_s']:,.1f} tok/s ({run['num_tokens']:,} tokens in {run['ms']:.1f}ms)")
+        print(f"  {BOLD}Best: {prefill_result['best_tok_s']:,.1f} tok/s ({prefill_result['best_num_tokens']:,} tokens){NC}")
 
-        # 5. Decode benchmark (timed — different prompts from warmup)
-        print(_section(f"Running decode benchmark ({self.decode_tokens} tokens, {self.n_runs} runs, different prompts)"))
-        decode_result = self._benchmark_decode(timed_decode_texts)
+        # 5. Engine decode benchmark
+        print(_section(f"Engine decode benchmark ({self.decode_tokens} tokens, {self.n_runs} runs, different prompts)"))
+        decode_result = self._benchmark_decode_engine(timed_decode_texts)
         for i, run in enumerate(decode_result["runs"]):
             print(f"  Run {i+1}: {run['tok_s']:.2f} tok/s ({run['ms_per_tok']:.1f}ms/tok)")
         print(f"  {BOLD}Average: {decode_result['avg_tok_s']:.2f} tok/s ({decode_result['avg_ms_per_tok']:.1f}ms/tok){NC}")
 
-        # 6. Network benchmark — same prompts through HTTP
-        net_prefill_result = None
-        net_decode_result = None
-        comparison_text = ""
-        try:
-            print(_section("Starting Rust HTTP server for network benchmark"))
-            bench_host = "127.0.0.1"
-            bench_port = 18199
-            temp_server = self._start_temp_server(bench_host, bench_port)
-            print(f"  Server running on {bench_host}:{bench_port}")
+        # 6. Client TTFT benchmark (requires HTTP server)
+        ttft_result = None
+        print(_section(f"Client TTFT benchmark ({lengths_str} tokens via HTTP)"))
+        if self._wait_for_server():
+            # HTTP warmup
+            self._http_ttft("warmup")
+            ttft_result = self._benchmark_http_ttft(timed_prefill_tokens, timed_prefill_texts)
+            for run in ttft_result["runs"]:
+                print(f"  {run['num_tokens']:>6,} tokens:  {run['ttft']:.2f}s")
+        else:
+            print(f"  {YELLOW}Server not ready — skipping HTTP TTFT benchmark{NC}")
 
-            # Network warmup — send text through HTTP (same as real client)
-            n_prefill_warmup = len(warmup_prefill_tokens)
-            print(_section(f"Network warmup ({n_prefill_warmup} prefill + {self.n_runs} decode requests)"))
-            for i, (tokens, text) in enumerate(zip(warmup_prefill_tokens, warmup_prefill_texts)):
-                self._network_request(bench_host, bench_port, text, len(tokens),
-                                      max_new_tokens=1)
-                print(f"  Prefill warmup {i+1}/{n_prefill_warmup} complete ({len(tokens):,} tokens)")
-            for i, text in enumerate(warmup_decode_texts):
-                self._network_request(bench_host, bench_port, text, 0,
-                                      max_new_tokens=8)
-                print(f"  Decode warmup {i+1}/{self.n_runs} complete")
-            print(f"  Network warmup complete.")
-
-            # Network prefill (text through HTTP, same enable_thinking=False as engine)
-            print(_section(f"Network prefill benchmark ({lengths_str} tokens)"))
-            net_prefill_result = self._benchmark_network_prefill(
-                timed_prefill_tokens, timed_prefill_texts,
-                bench_host, bench_port)
-            for i, run in enumerate(net_prefill_result["runs"]):
-                print(f"  Run {i+1}: {run['tok_s']:.1f} tok/s, TTFT={run['ttft']:.2f}s ({run['num_tokens']:,} tokens)")
-            print(f"  {BOLD}Best: {net_prefill_result['best_tok_s']:.1f} tok/s, TTFT={net_prefill_result['best_ttft']:.2f}s{NC}")
-
-            # Network decode (text through HTTP, same enable_thinking=False as engine)
-            print(_section(f"Network decode benchmark ({self.decode_tokens} tokens, {self.n_runs} runs)"))
-            net_decode_result = self._benchmark_network_decode(
-                decode_tokens_all[self.n_runs:], timed_decode_texts,
-                bench_host, bench_port)
-            for i, run in enumerate(net_decode_result["runs"]):
-                print(f"  Run {i+1}: {run['tok_s']:.2f} tok/s ({run['ms_per_tok']:.1f}ms/tok)")
-            print(f"  {BOLD}Average: {net_decode_result['avg_tok_s']:.2f} tok/s ({net_decode_result['avg_ms_per_tok']:.1f}ms/tok){NC}")
-
-            # Comparison
-            comparison_text = self._format_comparison(
-                prefill_result, decode_result,
-                net_prefill_result, net_decode_result,
-            )
-            print(comparison_text)
-
-            temp_server.stop()
-            time.sleep(0.2)
-        except Exception as e:
-            logger.warning("Network benchmark failed (non-fatal): %s", e, exc_info=True)
-            print(f"  {YELLOW}Network benchmark skipped: {e}{NC}")
-
-        # 7. Decode prompt text for the log (use saved content texts)
-        prefill_prompt_text = timed_prefill_texts[0] if timed_prefill_texts else ""
-        decode_prompt_text = timed_decode_texts[-1] if timed_decode_texts else ""
-
-        # 8. Format and write report
+        # 7. Format and write report
         print(_section("Writing results"))
         report = self._format_results(
             sys_info, model_info, vram_usage,
-            prefill_result, decode_result,
-            prefill_prompt=prefill_prompt_text,
-            decode_prompt=decode_prompt_text,
+            prefill_result, decode_result, ttft_result,
         )
-        if comparison_text:
-            report += "\n" + comparison_text
 
-        # 9. Archive to benchmarks/ directory
+        # 8. Archive to benchmarks/ directory
         archive_path = self._archive_benchmark(model_info, report)
 
-        # 10. Final summary
+        # 9. Final summary
         print(f"\n{BOLD}{'─' * 48}")
         print(f"  BENCHMARK COMPLETE")
         print(f"{'─' * 48}{NC}")
-        print(f"  {BOLD}Engine:{NC}")
-        print(f"    Prefill: {GREEN}{BOLD}{prefill_result['best_tok_s']:.1f} tok/s{NC}  TTFT={prefill_result['best_ttft']:.2f}s  (best of {lengths_str})")
-        print(f"    Decode:  {GREEN}{BOLD}{decode_result['avg_tok_s']:.2f} tok/s{NC}  ({decode_result['avg_ms_per_tok']:.1f}ms/tok)")
-        if net_prefill_result and net_decode_result:
-            print(f"  {BOLD}Network:{NC}")
-            print(f"    Prefill: {GREEN}{BOLD}{net_prefill_result['best_tok_s']:.1f} tok/s{NC}  TTFT={net_prefill_result['best_ttft']:.2f}s")
-            print(f"    Decode:  {GREEN}{BOLD}{net_decode_result['avg_tok_s']:.2f} tok/s{NC}  ({net_decode_result['avg_ms_per_tok']:.1f}ms/tok)")
+        print(f"  Prefill: {GREEN}{BOLD}{prefill_result['best_tok_s']:,.1f} tok/s{NC}  (engine, best of {lengths_str})")
+        print(f"  Decode:  {GREEN}{BOLD}{decode_result['avg_tok_s']:.2f} tok/s{NC}  (engine, {decode_result['avg_ms_per_tok']:.1f}ms/tok)")
+        if ttft_result:
+            # Show TTFT for ~10K tokens if available, else middle run
+            ttft_runs = ttft_result["runs"]
+            ttft_show = None
+            for r in ttft_runs:
+                if 8000 <= r["num_tokens"] <= 12000:
+                    ttft_show = r
+                    break
+            if not ttft_show:
+                ttft_show = ttft_runs[len(ttft_runs) // 2]
+            print(f"  TTFT:    {GREEN}{BOLD}{ttft_show['ttft']:.2f}s{NC}  (client HTTP, {ttft_show['num_tokens']:,} tokens)")
         if archive_path:
             print(f"  Log:     {DIM}{archive_path}{NC}")
         print()
 
-        # 11. Return structured results
-        result = {
+        # 10. Return structured results
+        return {
             "system": sys_info,
             "model": model_info,
             "vram": vram_usage,
             "prefill": prefill_result,
             "decode": decode_result,
+            "ttft": ttft_result,
         }
-        if net_prefill_result:
-            result["network_prefill"] = net_prefill_result
-        if net_decode_result:
-            result["network_decode"] = net_decode_result
-        return result

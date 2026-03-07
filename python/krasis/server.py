@@ -12,6 +12,7 @@ import logging
 import os
 import select
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -55,6 +56,121 @@ def _warn(text: str) -> None:
 
 _model: Optional[KrasisModel] = None
 _model_name: str = "unknown"
+
+
+def _start_session_bridge(host: str, port: int) -> Optional[subprocess.Popen]:
+    """Start the Session messenger bridge as a subprocess.
+
+    Returns the Popen object, or None if startup fails.
+    """
+    import shutil
+
+    krasis_dir = Path(__file__).resolve().parent.parent.parent  # krasis repo root
+    bridge_script = krasis_dir / "session-bridge.mjs"
+
+    if not bridge_script.is_file():
+        _warn(f"Session bridge script not found: {bridge_script}")
+        return None
+
+    # Find bun or node (prefer bun, fall back to node)
+    runtime_bin = shutil.which("bun")
+    # Also check ~/.bun/bin which the installer uses
+    if not runtime_bin:
+        bun_home = Path.home() / ".bun" / "bin" / "bun"
+        if bun_home.is_file():
+            runtime_bin = str(bun_home)
+    if not runtime_bin:
+        runtime_bin = shutil.which("node")
+    if not runtime_bin:
+        _warn("Session bridge: neither bun nor node found in PATH.")
+        _warn("Run 'krasis-setup' to install Session messenger dependencies.")
+        return None
+
+    # Check if @session.js/client is installed, auto-install if not
+    node_modules = krasis_dir / "node_modules" / "@session.js" / "client"
+    if not node_modules.is_dir():
+        pkg_json = krasis_dir / "package.json"
+        if not pkg_json.is_file():
+            _warn("Session bridge: package.json not found, cannot install dependencies.")
+            return None
+        # Pick installer: prefer bun install, fall back to npm install
+        installer = None
+        if "bun" in str(runtime_bin):
+            installer = [runtime_bin, "install"]
+        else:
+            npm_bin = shutil.which("npm")
+            if npm_bin:
+                installer = [npm_bin, "install"]
+        if not installer:
+            _warn("Session bridge: npm not found, cannot install dependencies.")
+            _warn("Run 'krasis-setup' to install Session messenger dependencies.")
+            return None
+        _detail("Installing Session messenger dependencies...")
+        try:
+            ret = subprocess.run(
+                installer, cwd=str(krasis_dir),
+                capture_output=True, timeout=120,
+            )
+            if ret.returncode != 0:
+                stderr = ret.stderr.decode("utf-8", errors="replace")[:500]
+                _warn(f"Session dependency install failed: {stderr}")
+                return None
+            _detail("Session dependencies installed.")
+        except subprocess.TimeoutExpired:
+            _warn("Session dependency install timed out.")
+            return None
+        except Exception as e:
+            _warn(f"Session dependency install error: {e}")
+            return None
+
+    identity_path = Path.home() / ".krasis" / "session_identity"
+    session_id_path = Path.home() / ".krasis" / "session_id"
+
+    env = os.environ.copy()
+    env["KRASIS_HOST"] = "127.0.0.1"  # bridge always connects locally
+    env["KRASIS_PORT"] = str(port)
+
+    try:
+        run_args = [runtime_bin, "run", str(bridge_script)] if "bun" in str(runtime_bin) else [runtime_bin, str(bridge_script)]
+        proc = subprocess.Popen(
+            run_args + ["--host", "127.0.0.1", "--port", str(port)],
+            cwd=str(krasis_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        # Wait briefly for identity to be created and Session ID written
+        for _ in range(30):  # up to 3 seconds
+            time.sleep(0.1)
+            if session_id_path.is_file():
+                sid = session_id_path.read_text().strip()
+                if sid:
+                    _detail(f"Session messenger: ON")
+                    print(f"  {_BOLD}Session ID: {sid}{_NC}", flush=True)
+                    logger.info("Session bridge started, ID: %s", sid)
+                    break
+        else:
+            _detail("Session messenger: starting (ID pending...)")
+
+        # Log bridge output in background
+        def _log_session_output():
+            try:
+                for line in proc.stdout:
+                    decoded = line.decode("utf-8", errors="replace").rstrip()
+                    if decoded:
+                        logger.info("[session-bridge] %s", decoded)
+            except Exception:
+                pass
+        t = threading.Thread(target=_log_session_output, daemon=True)
+        t.start()
+
+        atexit.register(lambda: proc.terminate())
+        return proc
+
+    except Exception as e:
+        _warn(f"Session bridge failed to start: {e}")
+        return None
 
 
 def _build_heatmap(model: KrasisModel, save_path: str) -> str:
@@ -394,6 +510,8 @@ def main():
             "CFG_KV_CACHE_MB": "kv_cache_mb",
             "CFG_VRAM_SAFETY_MARGIN": "vram_safety_margin",
             "CFG_ENABLE_THINKING": "enable_thinking",
+            "CFG_SESSION_ENABLED": "session_enabled",
+            "CFG_NUM_GPUS": "num_gpus",
             "CFG_CPU_DECODE": None,  # CPU decode removed, ignore config key
         }
         with open(config_path) as f:
@@ -418,7 +536,7 @@ def main():
                         if gpu_list:
                             config_defaults["num_gpus"] = len(gpu_list)
                         continue
-                    if key in ("CFG_FORCE_LOAD", "CFG_ENABLE_THINKING", "CFG_HCS", "CFG_MULTI_GPU_HCS", "CFG_CPU_DECODE"):
+                    if key in ("CFG_FORCE_LOAD", "CFG_ENABLE_THINKING", "CFG_SESSION_ENABLED", "CFG_HCS", "CFG_MULTI_GPU_HCS", "CFG_CPU_DECODE"):
                         # CFG_ format uses "1"/"" for booleans
                         config_defaults[dest] = val == "1"
                         continue
@@ -502,9 +620,9 @@ def main():
     parser.add_argument("--draft-context", type=int, default=512,
                         help="Context window for draft model warmup (default: 512)")
     parser.add_argument("--benchmark", action="store_true",
-                        help="Run standardized benchmark before starting server")
+                        help="Run standardized benchmark via HTTP (same path as production)")
     parser.add_argument("--benchmark-only", action="store_true",
-                        help="Run benchmark and exit (don't start server)")
+                        help="Run benchmark via HTTP and exit (don't keep server running)")
     parser.add_argument("--timing", action="store_true",
                         help="Enable decode timing instrumentation (per-layer breakdown)")
     parser.add_argument("--stress-test", action="store_true",
@@ -517,6 +635,9 @@ def main():
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Enable thinking/reasoning mode (default: on)")
+    parser.add_argument("--session-enabled", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Enable Session messenger bridge (default: off)")
     # Apply config file defaults, then parse CLI (CLI wins over config file)
     if config_defaults:
         parser.set_defaults(**config_defaults)
@@ -568,6 +689,21 @@ def main():
     sys.excepthook = _log_excepthook
 
     logger.info("Logging to %s", _log_file)
+
+    # Dump config to log for easier debugging
+    if pre_args.config:
+        logger.info("=== Config file: %s ===", pre_args.config)
+        try:
+            with open(pre_args.config) as _cf:
+                for _line in _cf:
+                    logger.info("  %s", _line.rstrip())
+        except Exception as _e:
+            logger.warning("Could not read config file: %s", _e)
+    else:
+        logger.info("No config file — using CLI args / defaults")
+    logger.info("=== Resolved arguments ===")
+    for _k, _v in sorted(vars(args).items()):
+        logger.info("  %s = %r", _k, _v)
 
     global _model, _model_name
     import torch
@@ -792,6 +928,13 @@ def main():
                 decode_budget, decode_short_free, SAFETY_MARGIN_MB,
                 soft_budget)
 
+    # Free PyTorch's cached CUDA blocks before HCS allocation.
+    # After calibration, PyTorch holds freed KV/expert blocks in its caching allocator.
+    # These are "allocated" from CUDA's perspective, reducing cudaMemGetInfo free.
+    # HCS uses cuMemAlloc (not PyTorch), so it needs CUDA-level free memory.
+    gc.collect()
+    torch.cuda.empty_cache()
+
     if not args.hcs:
         _status("GPU decode (no HCS)")
         _warn("All experts streamed via DMA per token (slow for decode)")
@@ -872,13 +1015,10 @@ def main():
     vram_monitor.enable_warnings()
     logger.info("VRAM monitor: runtime warnings enabled (safety margin: %d MB)", SAFETY_MARGIN_MB)
 
-    # Run benchmark if requested (after model load + strategy, before serving)
-    if args.benchmark or args.benchmark_only:
-        from krasis.benchmark import KrasisBenchmark
-        bench = KrasisBenchmark(_model, timing=args.timing)
-        bench.run()
-        if args.benchmark_only:
-            sys.exit(0)
+    # Benchmark runs AFTER server starts (same HTTP path as production).
+    # We set up the benchmark thread here; it launches after rust_server.run().
+    _benchmark_requested = args.benchmark or args.benchmark_only
+    _benchmark_only = args.benchmark_only
 
     # Run stress test if requested
     if args.stress_test:
@@ -957,6 +1097,12 @@ def main():
     _status(f"Server ready on {args.host}:{args.port}")
     _detail(f"Decode: GPU  |  HCS: {'on' if args.hcs else 'off'}  |  Max context: {max_ctx:,} tokens")
     _dim(f"KV cache: {args.kv_cache_mb:,} MB")
+
+    # ── Session messenger bridge ──
+    _session_proc = None
+    if getattr(args, 'session_enabled', False):
+        _session_proc = _start_session_bridge(args.host, args.port)
+
     _dim("Press Q or Ctrl-C to stop")
     logger.info(
         "Model loaded, starting server on %s:%d (max context: %d, decode: GPU)",
@@ -983,6 +1129,8 @@ def main():
     )
 
     def _handle_exit(sig, frame):
+        if _session_proc and _session_proc.poll() is None:
+            _session_proc.terminate()
         rust_server.stop()
         try:
             sys.stderr = open(os.devnull, "w")
@@ -1009,6 +1157,23 @@ def main():
     if sys.stdin.isatty():
         t = threading.Thread(target=_stdin_listener, daemon=True)
         t.start()
+
+    # Benchmark thread: engine benchmarks run immediately (no HTTP needed),
+    # HTTP TTFT benchmark waits for server to be ready internally.
+    if _benchmark_requested:
+        def _run_benchmark():
+            from krasis.benchmark import KrasisBenchmark
+            bench = KrasisBenchmark(
+                _model, rust_server=rust_server,
+                host=args.host, port=args.port, timing=args.timing,
+            )
+            bench.run()
+
+            if _benchmark_only:
+                rust_server.stop()
+
+        bench_thread = threading.Thread(target=_run_benchmark, daemon=True)
+        bench_thread.start()
 
     # run() releases the GIL and blocks until stop() is called
     rust_server.run()
