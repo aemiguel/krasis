@@ -239,10 +239,12 @@ def _expert_bytes_per_expert(cfg: Dict[str, Any], bits: int = 4) -> int:
 
 
 def _component_weight_bytes(params: int, quant: str) -> int:
-    """Weight bytes for per-component quant ("int4", "int8", or "bf16").
-    For Marlin formats, includes packed weights + group scales (gs=128)."""
-    if quant == "int4":
+    """Weight bytes for per-component quant ("int4", "int8", "awq", or "bf16").
+    For Marlin formats, includes packed weights + group scales (gs=128).
+    AWQ uses INT4 estimate for budget (most tensors go INT4 after calibration)."""
+    if quant in ("int4", "awq"):
         # Marlin INT4: packed = params/2, scales = params/128 * 2
+        # AWQ: per-tensor mix, but budget assumes INT4 (conservative for VRAM)
         return params // 2 + (params // 128) * 2
     if quant == "int8":
         # Marlin INT8: packed = params, scales = params/128 * 2

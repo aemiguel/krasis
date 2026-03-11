@@ -583,8 +583,8 @@ def main():
                         help="Marlin quantization bits for GPU prefill experts")
     parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bits for CPU decode experts")
-    parser.add_argument("--attention-quant", default="bf16", choices=["bf16", "int4", "int8"],
-                        help="Attention weight precision: bf16 (default), int4 Marlin W4A16, int8 Marlin W8A16")
+    parser.add_argument("--attention-quant", default="bf16", choices=["bf16", "int4", "int8", "awq"],
+                        help="Attention weight precision: bf16 (default), int4 Marlin W4A16, int8 Marlin W8A16, awq (calibrated per-tensor)")
     parser.add_argument("--shared-expert-quant", default="int8", choices=["bf16", "int8"],
                         help="Quantization for shared expert weights")
     parser.add_argument("--dense-mlp-quant", default="int8", choices=["bf16", "int8"],

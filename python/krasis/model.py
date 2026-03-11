@@ -3842,21 +3842,48 @@ class KrasisModel:
         # always sees correct weights for every layer.
         self._rust_decode_weights = []  # prevent GC of permanent GPU copies
 
-        attn_quant = self.quant_cfg.attention  # "bf16", "int8", or "int4"
+        attn_quant = self.quant_cfg.attention  # "bf16", "int8", "int4", or "awq"
         marlin_gs = 128  # Marlin group size for both INT8 and INT4
+
+        # AWQ template: per-tensor precision decisions from calibration
+        _awq_template = None
+        if attn_quant == "awq":
+            from krasis.awq_calibrate import load_template
+            import os
+            template_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), "templates", "attention")
+            _awq_template = load_template(template_dir, self.cfg.model_path)
+            if _awq_template is not None:
+                n_int4 = _awq_template["summary"]["int4"]
+                n_int8 = _awq_template["summary"]["int8"]
+                n_bf16 = _awq_template["summary"]["bf16"]
+                logger.info("AWQ template loaded: %d INT4, %d INT8, %d BF16 tensors",
+                            n_int4, n_int8, n_bf16)
+            else:
+                logger.warning("No AWQ template found for model %s — falling back to INT4 for all attention",
+                               self.cfg.model_path)
 
         # Marlin quantization helpers (lazy import, only when quantizing)
         _marlin_workspace = None
-        _marlin_scalar_type = None
+        _marlin_scalar_type_int4 = None
+        _marlin_scalar_type_int8 = None
         _marlin_num_bits = 0
         if attn_quant in ("int8", "int4"):
             from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
             from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import get_scalar_type
             _marlin_workspace = marlin_make_workspace(device)
             _marlin_num_bits = 4 if attn_quant == "int4" else 8
-            _marlin_scalar_type = get_scalar_type(_marlin_num_bits, False)
+            _marlin_scalar_type_int4 = get_scalar_type(4, False)
+            _marlin_scalar_type_int8 = get_scalar_type(8, False)
+        elif attn_quant == "awq":
+            from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import get_scalar_type
+            _marlin_workspace = marlin_make_workspace(device)
+            _marlin_scalar_type_int4 = get_scalar_type(4, False)
+            _marlin_scalar_type_int8 = get_scalar_type(8, False)
 
-        def _register_attn_weight(w: torch.Tensor) -> int:
+        def _register_attn_weight(w: torch.Tensor, layer_idx: int = -1,
+                                  layer_type: str = "", tensor_name: str = "") -> int:
             """Register an attention weight as BF16, Marlin INT8, or Marlin INT4.
 
             For Marlin quantization: Rust does quantize + repack on CPU,
@@ -3869,14 +3896,26 @@ class KrasisModel:
             Returns weight ID in the Rust store. For quantized weights, also
             stores (packed, scales, workspace, scalar_type, N, K) on
             self._marlin_attn_weights[wid] for prefill GEMM."""
-            if attn_quant in ("int8", "int4") and w.dtype == torch.bfloat16:
+            # Determine effective quantization for this tensor
+            effective_quant = attn_quant
+            if attn_quant == "awq":
+                if _awq_template is not None:
+                    from krasis.awq_calibrate import get_tensor_decision
+                    effective_quant = get_tensor_decision(
+                        _awq_template, layer_idx, layer_type, tensor_name)
+                else:
+                    effective_quant = "int4"  # fallback when no template
+
+            if effective_quant in ("int8", "int4") and w.dtype == torch.bfloat16:
+                use_int4 = (effective_quant == "int4")
+                num_bits = 4 if use_int4 else 8
                 n, k = w.shape[0], w.shape[1]
                 if n % 64 == 0 and k % 16 == 0 and k % marlin_gs == 0:
                     # Step 1: Get contiguous CPU BF16 data
                     w_cpu = w.cpu().contiguous() if w.is_cuda else w.contiguous()
 
                     # Step 2: Rust quantizes + repacks on CPU (same format as expert weights)
-                    if attn_quant == "int4":
+                    if use_int4:
                         packed_bytes, scales_bytes, rn, rk = store.repack_marlin_int4_cpu(
                             w_cpu.data_ptr(), n, k, marlin_gs)
                     else:
@@ -3893,26 +3932,27 @@ class KrasisModel:
                     scale_perm = torch.from_numpy(scales_np.copy()).to(
                         dtype=torch.bfloat16, device=device)
                     # Reshape for gptq_marlin_gemm: packed [K/16, pack_factor*N], scales [K/gs, N]
-                    if attn_quant == "int4":
+                    if use_int4:
                         repacked = repacked.reshape(k // 16, 2 * n)
                     else:
                         repacked = repacked.reshape(k // 16, 4 * n)
                     scale_perm = scale_perm.reshape(k // marlin_gs, n)
 
                     # Step 4: Register GPU pointer with Rust store
-                    if attn_quant == "int8":
-                        wid = store.register_marlin_int8_weight(
+                    scalar_type = _marlin_scalar_type_int4 if use_int4 else _marlin_scalar_type_int8
+                    if use_int4:
+                        wid = store.register_marlin_int4_weight(
                             repacked.data_ptr(), scale_perm.data_ptr(),
                             n, k, marlin_gs)
                     else:
-                        wid = store.register_marlin_int4_weight(
+                        wid = store.register_marlin_int8_weight(
                             repacked.data_ptr(), scale_perm.data_ptr(),
                             n, k, marlin_gs)
 
                     # Step 5: Keep PyTorch tensors alive and accessible for prefill
                     self._marlin_attn_weights[wid] = (
                         repacked, scale_perm, _marlin_workspace,
-                        _marlin_scalar_type, n, k,
+                        scalar_type, n, k,
                     )
                     return wid
                 else:
@@ -3921,6 +3961,7 @@ class KrasisModel:
             # BF16 path: weight must be on GPU
             if not w.is_cuda:
                 w = w.to(device, non_blocking=True)
+                self._rust_decode_weights.append(w)  # prevent GC
             return store.register_weight(
                 w.data_ptr(), w.shape[0], w.shape[1], _weight_dtype_code(w))
 
@@ -3950,9 +3991,9 @@ class KrasisModel:
                     qkvz_w = attn.in_proj_qkvz
                     ba_w = attn.in_proj_ba
                     out_w = attn.out_proj
-                qkvz_wid = _register_attn_weight(qkvz_w)
-                ba_wid = _register_attn_weight(ba_w)
-                out_wid = _register_attn_weight(out_w)
+                qkvz_wid = _register_attn_weight(qkvz_w, layer_idx, "linear_attention", "in_proj_qkvz")
+                ba_wid = _register_attn_weight(ba_w, layer_idx, "linear_attention", "in_proj_ba")
+                out_wid = _register_attn_weight(out_w, layer_idx, "linear_attention", "out_proj")
                 self._la_wids[layer_idx] = (qkvz_wid, ba_wid, out_wid)
 
                 # Replace attention weight attributes with MarlinWeight for prefill
@@ -4036,17 +4077,20 @@ class KrasisModel:
                     k_w = attn.k_proj
                     v_w = attn.v_proj
                     o_w = attn.o_proj
-                q_wid = _register_attn_weight(q_w)
-                k_wid = _register_attn_weight(k_w)
-                v_wid = _register_attn_weight(v_w)
-                o_wid = _register_attn_weight(o_w)
+                q_wid = _register_attn_weight(q_w, layer_idx, "gqa", "q_proj")
+                k_wid = _register_attn_weight(k_w, layer_idx, "gqa", "k_proj")
+                v_wid = _register_attn_weight(v_w, layer_idx, "gqa", "v_proj")
+                o_wid = _register_attn_weight(o_w, layer_idx, "gqa", "o_proj")
 
                 # Replace attention weight attributes with MarlinWeight for prefill
+                from krasis.attention import MarlinWeight
                 if q_wid in self._marlin_attn_weights:
-                    from krasis.attention import MarlinWeight
                     attn.q_proj = MarlinWeight(*self._marlin_attn_weights[q_wid])
+                if k_wid in self._marlin_attn_weights:
                     attn.k_proj = MarlinWeight(*self._marlin_attn_weights[k_wid])
+                if v_wid in self._marlin_attn_weights:
                     attn.v_proj = MarlinWeight(*self._marlin_attn_weights[v_wid])
+                if o_wid in self._marlin_attn_weights:
                     attn.o_proj = MarlinWeight(*self._marlin_attn_weights[o_wid])
 
                 # QK norm weights are BF16, Rust per_head_rmsnorm kernel needs FP32
@@ -4241,9 +4285,9 @@ class KrasisModel:
                     ba_w = attn.in_proj_ba.to(aux_device, non_blocking=True)
                     out_w = attn.out_proj.to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([qkvz_w, ba_w, out_w])
-                    qkvz_wid = _register_attn_weight(qkvz_w)
-                    ba_wid = _register_attn_weight(ba_w)
-                    out_wid = _register_attn_weight(out_w)
+                    qkvz_wid = _register_attn_weight(qkvz_w, layer_idx, "linear_attention", "in_proj_qkvz")
+                    ba_wid = _register_attn_weight(ba_w, layer_idx, "linear_attention", "in_proj_ba")
+                    out_wid = _register_attn_weight(out_w, layer_idx, "linear_attention", "out_proj")
 
                     # Copy norm weights to aux GPU
                     inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
@@ -4282,9 +4326,9 @@ class KrasisModel:
                         layer_idx=layer_idx,
                         input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
                         post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
-                        in_proj_qkvz_wid=_register_attn_weight(attn.in_proj_qkvz),
-                        in_proj_ba_wid=_register_attn_weight(attn.in_proj_ba),
-                        out_proj_wid=_register_attn_weight(attn.out_proj),
+                        in_proj_qkvz_wid=_register_attn_weight(attn.in_proj_qkvz, layer_idx, "linear_attention", "in_proj_qkvz"),
+                        in_proj_ba_wid=_register_attn_weight(attn.in_proj_ba, layer_idx, "linear_attention", "in_proj_ba"),
+                        out_proj_wid=_register_attn_weight(attn.out_proj, layer_idx, "linear_attention", "out_proj"),
                         conv_weight_ptr=attn._rust_conv_weight.data_ptr() if hasattr(attn, '_rust_conv_weight') else 0,
                         a_log_ptr=attn._rust_a_log.data_ptr() if hasattr(attn, '_rust_a_log') else 0,
                         dt_bias_ptr=attn._rust_dt_bias.data_ptr() if hasattr(attn, '_rust_dt_bias') else 0,
@@ -4360,10 +4404,10 @@ class KrasisModel:
                         aux_rope_set = True
                 else:
                     # Layers before split — register placeholder
-                    q_wid = _register_attn_weight(attn.q_proj)
-                    k_wid = _register_attn_weight(attn.k_proj)
-                    v_wid = _register_attn_weight(attn.v_proj)
-                    o_wid = _register_attn_weight(attn.o_proj)
+                    q_wid = _register_attn_weight(attn.q_proj, layer_idx, "gqa", "q_proj")
+                    k_wid = _register_attn_weight(attn.k_proj, layer_idx, "gqa", "k_proj")
+                    v_wid = _register_attn_weight(attn.v_proj, layer_idx, "gqa", "v_proj")
+                    o_wid = _register_attn_weight(attn.o_proj, layer_idx, "gqa", "o_proj")
                     if attn.q_norm is not None:
                         q_norm_ptr = attn._rust_q_norm.data_ptr() if hasattr(attn, '_rust_q_norm') else 0
                     else:

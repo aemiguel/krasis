@@ -441,7 +441,11 @@ class LauncherConfig:
             except ValueError:
                 pass
         if "CFG_ATTENTION_QUANT" in saved:
-            self.attention_quant = saved["CFG_ATTENTION_QUANT"]
+            val = saved["CFG_ATTENTION_QUANT"]
+            # Migrate legacy naive int4/int8 to AWQ (calibrated per-tensor)
+            if val in ("int4", "int8"):
+                val = "awq"
+            self.attention_quant = val
         if "CFG_SHARED_EXPERT_QUANT" in saved:
             self.shared_expert_quant = saved["CFG_SHARED_EXPERT_QUANT"]
         if "CFG_DENSE_MLP_QUANT" in saved:
@@ -546,7 +550,7 @@ OPTIONS = [
     ConfigOption("GPU expert bits", "gpu_expert_bits",
                  choices=[4, 8], affects_budget=True),
     ConfigOption("Attention quant", "attention_quant",
-                 choices=["bf16", "int4", "int8"], affects_budget=True),
+                 choices=["bf16", "awq"], affects_budget=True),
     ConfigOption("Shared expert", "shared_expert_quant",
                  choices=["int8", "bf16"], affects_budget=True),
     ConfigOption("Dense MLP quant", "dense_mlp_quant",
@@ -574,6 +578,12 @@ def _format_value(opt: ConfigOption, val: Any) -> str:
         return f"{val:,} MB"
     if opt.key == "vram_safety_margin":
         return f"{val:,} MB"
+    if opt.key == "attention_quant":
+        labels = {
+            "bf16": "BF16",
+            "awq": "AWQ (calibrated INT4/BF16)",
+        }
+        return labels.get(str(val), str(val))
     return str(val)
 
 
@@ -603,13 +613,15 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
 
     if config_key in ("attention_quant", "shared_expert_quant",
                       "dense_mlp_quant", "lm_head_quant"):
-        current = str(current_val)  # "int8" or "bf16"
+        current = str(current_val)  # "int8", "int4", "bf16", or "awq"
         if current == native_label or current == native_dtype:
             return f"{DIM}{native_label} \u2192 {current} \u2014 lossless{NC}"
         elif current == "int8":
             return f"{DIM}{native_label} \u2192 int8 \u2014 ~lossless{NC}"
         elif current == "int4":
             return f"{DIM}{native_label} \u2192 int4 \u2014 {YELLOW}slight loss{NC}{DIM}{NC}"
+        elif current == "awq":
+            return f"{DIM}{native_label} \u2192 AWQ \u2014 {GREEN}calibrated per-tensor{NC}{DIM}{NC}"
         return f"{DIM}{native_label} \u2192 {current}{NC}"
 
     elif config_key == "gpu_expert_bits":
@@ -1527,7 +1539,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
                         help="GPU Marlin expert bits: 4 or 8")
     parser.add_argument("--attention-quant", default=None,
-                        help="Attention weight quant: bf16 or int8")
+                        help="Attention weight quant: bf16 or awq")
     parser.add_argument("--shared-expert-quant", default=None,
                         help="Shared expert quant: bf16 or int8")
     parser.add_argument("--dense-mlp-quant", default=None,
@@ -1583,7 +1595,10 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
     if args.gpu_expert_bits is not None:
         cfg.gpu_expert_bits = args.gpu_expert_bits
     if args.attention_quant is not None:
-        cfg.attention_quant = args.attention_quant
+        val = args.attention_quant
+        if val in ("int4", "int8"):
+            val = "awq"
+        cfg.attention_quant = val
     if args.shared_expert_quant is not None:
         cfg.shared_expert_quant = args.shared_expert_quant
     if args.dense_mlp_quant is not None:

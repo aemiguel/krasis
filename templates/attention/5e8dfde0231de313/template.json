@@ -1,0 +1,1735 @@
+{
+  "version": 1,
+  "model_hash": "5e8dfde0231de313",
+  "model_path": "Qwen3-Coder-Next",
+  "calibration": {
+    "tokens": 256000,
+    "dataset": "wikitext-2",
+    "group_size": 128,
+    "date": "2026-03-11T08:01:40.110458"
+  },
+  "summary": {
+    "total_tensors": 156,
+    "int4": 150,
+    "int8": 0,
+    "bf16": 6
+  },
+  "decisions": {
+    "layers.0.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12158436,
+      "int4_cos_sim": 0.993819,
+      "int8_nrmse": 0.0069398,
+      "int8_cos_sim": 1.00276923
+    },
+    "layers.0.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.12229297,
+      "int4_cos_sim": 0.9926194,
+      "int8_nrmse": 0.00694416,
+      "int8_cos_sim": 0.99997538
+    },
+    "layers.0.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.13206671,
+      "int4_cos_sim": 0.99135363,
+      "int8_nrmse": 0.00751016,
+      "int8_cos_sim": 1.00012779
+    },
+    "layers.1.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.1257279,
+      "int4_cos_sim": 0.99257898,
+      "int8_nrmse": 0.00715824,
+      "int8_cos_sim": 1.00252771
+    },
+    "layers.1.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.134761,
+      "int4_cos_sim": 0.99105257,
+      "int8_nrmse": 0.0076757,
+      "int8_cos_sim": 0.99996769
+    },
+    "layers.1.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12623435,
+      "int4_cos_sim": 0.99210715,
+      "int8_nrmse": 0.00720389,
+      "int8_cos_sim": 1.00012934
+    },
+    "layers.2.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12605701,
+      "int4_cos_sim": 0.99250269,
+      "int8_nrmse": 0.00717895,
+      "int8_cos_sim": 1.0026325
+    },
+    "layers.2.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.13914206,
+      "int4_cos_sim": 0.99046534,
+      "int8_nrmse": 0.00783732,
+      "int8_cos_sim": 0.99996591
+    },
+    "layers.2.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12939769,
+      "int4_cos_sim": 0.99176723,
+      "int8_nrmse": 0.00737454,
+      "int8_cos_sim": 1.00018609
+    },
+    "layers.3.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12434329,
+      "int4_cos_sim": 0.99277091,
+      "int8_nrmse": 0.00709135,
+      "int8_cos_sim": 1.00108051
+    },
+    "layers.3.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12461961,
+      "int4_cos_sim": 0.99226654,
+      "int8_nrmse": 0.00706385,
+      "int8_cos_sim": 0.99990308
+    },
+    "layers.3.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.1416492,
+      "int4_cos_sim": 0.99005044,
+      "int8_nrmse": 0.00799426,
+      "int8_cos_sim": 0.99990219
+    },
+    "layers.3.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12521095,
+      "int4_cos_sim": 0.99215418,
+      "int8_nrmse": 0.00715535,
+      "int8_cos_sim": 1.00001383
+    },
+    "layers.4.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12480871,
+      "int4_cos_sim": 0.99257213,
+      "int8_nrmse": 0.00711437,
+      "int8_cos_sim": 1.0025636
+    },
+    "layers.4.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14888448,
+      "int4_cos_sim": 0.98910338,
+      "int8_nrmse": 0.00838444,
+      "int8_cos_sim": 0.99996179
+    },
+    "layers.4.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12586984,
+      "int4_cos_sim": 0.99220687,
+      "int8_nrmse": 0.0071766,
+      "int8_cos_sim": 1.00017214
+    },
+    "layers.5.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12455426,
+      "int4_cos_sim": 0.99265641,
+      "int8_nrmse": 0.0070945,
+      "int8_cos_sim": 1.00253904
+    },
+    "layers.5.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14734107,
+      "int4_cos_sim": 0.98934031,
+      "int8_nrmse": 0.00829247,
+      "int8_cos_sim": 0.99996173
+    },
+    "layers.5.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12549781,
+      "int4_cos_sim": 0.99226308,
+      "int8_nrmse": 0.00714981,
+      "int8_cos_sim": 1.00019217
+    },
+    "layers.6.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12702174,
+      "int4_cos_sim": 0.99261123,
+      "int8_nrmse": 0.00722351,
+      "int8_cos_sim": 1.00261736
+    },
+    "layers.6.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14761828,
+      "int4_cos_sim": 0.98931241,
+      "int8_nrmse": 0.00829734,
+      "int8_cos_sim": 0.99996555
+    },
+    "layers.6.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.126843,
+      "int4_cos_sim": 0.99206829,
+      "int8_nrmse": 0.00720611,
+      "int8_cos_sim": 1.00019789
+    },
+    "layers.7.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12598775,
+      "int4_cos_sim": 0.99260616,
+      "int8_nrmse": 0.00717794,
+      "int8_cos_sim": 1.00107574
+    },
+    "layers.7.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12164773,
+      "int4_cos_sim": 0.99263483,
+      "int8_nrmse": 0.00691042,
+      "int8_cos_sim": 0.99991077
+    },
+    "layers.7.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12748794,
+      "int4_cos_sim": 0.99190205,
+      "int8_nrmse": 0.00725794,
+      "int8_cos_sim": 0.9999007
+    },
+    "layers.7.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12498501,
+      "int4_cos_sim": 0.99214262,
+      "int8_nrmse": 0.00714125,
+      "int8_cos_sim": 1.00000751
+    },
+    "layers.8.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12709917,
+      "int4_cos_sim": 0.99270248,
+      "int8_nrmse": 0.00723726,
+      "int8_cos_sim": 1.00280166
+    },
+    "layers.8.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14520852,
+      "int4_cos_sim": 0.98962724,
+      "int8_nrmse": 0.00818927,
+      "int8_cos_sim": 0.99996573
+    },
+    "layers.8.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12882702,
+      "int4_cos_sim": 0.99186099,
+      "int8_nrmse": 0.00734947,
+      "int8_cos_sim": 1.00022733
+    },
+    "layers.9.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12637151,
+      "int4_cos_sim": 0.9924469,
+      "int8_nrmse": 0.00718389,
+      "int8_cos_sim": 1.00248051
+    },
+    "layers.9.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14555104,
+      "int4_cos_sim": 0.98958057,
+      "int8_nrmse": 0.00818235,
+      "int8_cos_sim": 0.99996662
+    },
+    "layers.9.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12777432,
+      "int4_cos_sim": 0.99200165,
+      "int8_nrmse": 0.00725485,
+      "int8_cos_sim": 1.00021887
+    },
+    "layers.10.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12653471,
+      "int4_cos_sim": 0.99284738,
+      "int8_nrmse": 0.0071892,
+      "int8_cos_sim": 1.00261915
+    },
+    "layers.10.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14357923,
+      "int4_cos_sim": 0.98986959,
+      "int8_nrmse": 0.00810866,
+      "int8_cos_sim": 0.99996597
+    },
+    "layers.10.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.1273544,
+      "int4_cos_sim": 0.99204814,
+      "int8_nrmse": 0.0072397,
+      "int8_cos_sim": 1.00022995
+    },
+    "layers.11.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12577526,
+      "int4_cos_sim": 0.99261868,
+      "int8_nrmse": 0.00715023,
+      "int8_cos_sim": 1.00110579
+    },
+    "layers.11.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.13653293,
+      "int4_cos_sim": 0.99074817,
+      "int8_nrmse": 0.00772477,
+      "int8_cos_sim": 0.99990213
+    },
+    "layers.11.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12848366,
+      "int4_cos_sim": 0.99177492,
+      "int8_nrmse": 0.00729752,
+      "int8_cos_sim": 0.99990296
+    },
+    "layers.11.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12406227,
+      "int4_cos_sim": 0.99231988,
+      "int8_nrmse": 0.00707955,
+      "int8_cos_sim": 1.00004113
+    },
+    "layers.12.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12664437,
+      "int4_cos_sim": 0.99234283,
+      "int8_nrmse": 0.00720131,
+      "int8_cos_sim": 1.0024817
+    },
+    "layers.12.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15536834,
+      "int4_cos_sim": 0.98814631,
+      "int8_nrmse": 0.00875086,
+      "int8_cos_sim": 0.99995947
+    },
+    "layers.12.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12561375,
+      "int4_cos_sim": 0.99224246,
+      "int8_nrmse": 0.00714358,
+      "int8_cos_sim": 1.00022924
+    },
+    "layers.13.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12704347,
+      "int4_cos_sim": 0.99264884,
+      "int8_nrmse": 0.00722121,
+      "int8_cos_sim": 1.00248754
+    },
+    "layers.13.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15104563,
+      "int4_cos_sim": 0.98881233,
+      "int8_nrmse": 0.00850303,
+      "int8_cos_sim": 0.99996328
+    },
+    "layers.13.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12541069,
+      "int4_cos_sim": 0.99229312,
+      "int8_nrmse": 0.00713466,
+      "int8_cos_sim": 1.00022984
+    },
+    "layers.14.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12921166,
+      "int4_cos_sim": 0.99249899,
+      "int8_nrmse": 0.00733625,
+      "int8_cos_sim": 1.00268447
+    },
+    "layers.14.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14982414,
+      "int4_cos_sim": 0.98899204,
+      "int8_nrmse": 0.00843741,
+      "int8_cos_sim": 0.99996209
+    },
+    "layers.14.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12661017,
+      "int4_cos_sim": 0.99214512,
+      "int8_nrmse": 0.00720165,
+      "int8_cos_sim": 1.00024951
+    },
+    "layers.15.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12331313,
+      "int4_cos_sim": 0.99284399,
+      "int8_nrmse": 0.00702917,
+      "int8_cos_sim": 1.00113618
+    },
+    "layers.15.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12843086,
+      "int4_cos_sim": 0.99180019,
+      "int8_nrmse": 0.00729105,
+      "int8_cos_sim": 0.99990499
+    },
+    "layers.15.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12653716,
+      "int4_cos_sim": 0.99202085,
+      "int8_nrmse": 0.00721492,
+      "int8_cos_sim": 0.99989891
+    },
+    "layers.15.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12205389,
+      "int4_cos_sim": 0.9925611,
+      "int8_nrmse": 0.00697891,
+      "int8_cos_sim": 1.0000484
+    },
+    "layers.16.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12716037,
+      "int4_cos_sim": 0.99260771,
+      "int8_nrmse": 0.00723214,
+      "int8_cos_sim": 1.00268972
+    },
+    "layers.16.linear_attention.in_proj_ba": {
+      "decision": "bf16",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15732248,
+      "int4_cos_sim": 0.98787475,
+      "int8_nrmse": 0.00881644,
+      "int8_cos_sim": 0.99995804
+    },
+    "layers.16.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12656452,
+      "int4_cos_sim": 0.99210536,
+      "int8_nrmse": 0.00721602,
+      "int8_cos_sim": 1.00014865
+    },
+    "layers.17.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12568829,
+      "int4_cos_sim": 0.99258828,
+      "int8_nrmse": 0.00715687,
+      "int8_cos_sim": 1.00264418
+    },
+    "layers.17.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15371378,
+      "int4_cos_sim": 0.98840034,
+      "int8_nrmse": 0.00864587,
+      "int8_cos_sim": 0.99996263
+    },
+    "layers.17.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12557075,
+      "int4_cos_sim": 0.99224234,
+      "int8_nrmse": 0.00714748,
+      "int8_cos_sim": 1.00017989
+    },
+    "layers.18.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12842544,
+      "int4_cos_sim": 0.99249101,
+      "int8_nrmse": 0.00730046,
+      "int8_cos_sim": 1.00266171
+    },
+    "layers.18.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15195879,
+      "int4_cos_sim": 0.98867118,
+      "int8_nrmse": 0.00849701,
+      "int8_cos_sim": 0.99996221
+    },
+    "layers.18.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12739464,
+      "int4_cos_sim": 0.99202317,
+      "int8_nrmse": 0.00724336,
+      "int8_cos_sim": 1.00018728
+    },
+    "layers.19.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12354029,
+      "int4_cos_sim": 0.99286693,
+      "int8_nrmse": 0.00704243,
+      "int8_cos_sim": 1.00108969
+    },
+    "layers.19.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.13281344,
+      "int4_cos_sim": 0.99123973,
+      "int8_nrmse": 0.00750335,
+      "int8_cos_sim": 0.99990189
+    },
+    "layers.19.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12857134,
+      "int4_cos_sim": 0.99176711,
+      "int8_nrmse": 0.00732355,
+      "int8_cos_sim": 0.99990165
+    },
+    "layers.19.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12492078,
+      "int4_cos_sim": 0.99216616,
+      "int8_nrmse": 0.00714092,
+      "int8_cos_sim": 1.0000267
+    },
+    "layers.20.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12812976,
+      "int4_cos_sim": 0.99266839,
+      "int8_nrmse": 0.00728556,
+      "int8_cos_sim": 1.00283659
+    },
+    "layers.20.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15118762,
+      "int4_cos_sim": 0.98877013,
+      "int8_nrmse": 0.0084946,
+      "int8_cos_sim": 0.99996316
+    },
+    "layers.20.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12706041,
+      "int4_cos_sim": 0.99207813,
+      "int8_nrmse": 0.00724021,
+      "int8_cos_sim": 1.00023735
+    },
+    "layers.21.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12639545,
+      "int4_cos_sim": 0.99252856,
+      "int8_nrmse": 0.0071836,
+      "int8_cos_sim": 1.00248981
+    },
+    "layers.21.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14760079,
+      "int4_cos_sim": 0.98930401,
+      "int8_nrmse": 0.00833022,
+      "int8_cos_sim": 0.99996525
+    },
+    "layers.21.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12685363,
+      "int4_cos_sim": 0.9920935,
+      "int8_nrmse": 0.00720787,
+      "int8_cos_sim": 1.00022912
+    },
+    "layers.22.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12607907,
+      "int4_cos_sim": 0.9929536,
+      "int8_nrmse": 0.00715868,
+      "int8_cos_sim": 1.00257373
+    },
+    "layers.22.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15040731,
+      "int4_cos_sim": 0.9889071,
+      "int8_nrmse": 0.00845368,
+      "int8_cos_sim": 0.99996346
+    },
+    "layers.22.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12654279,
+      "int4_cos_sim": 0.99215746,
+      "int8_nrmse": 0.00718659,
+      "int8_cos_sim": 1.00025237
+    },
+    "layers.23.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12262318,
+      "int4_cos_sim": 0.99300718,
+      "int8_nrmse": 0.00697835,
+      "int8_cos_sim": 1.00107193
+    },
+    "layers.23.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.13188509,
+      "int4_cos_sim": 0.99136901,
+      "int8_nrmse": 0.00746939,
+      "int8_cos_sim": 0.99990344
+    },
+    "layers.23.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12688786,
+      "int4_cos_sim": 0.99196655,
+      "int8_nrmse": 0.00723737,
+      "int8_cos_sim": 0.9999001
+    },
+    "layers.23.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12182429,
+      "int4_cos_sim": 0.99261409,
+      "int8_nrmse": 0.00694901,
+      "int8_cos_sim": 1.00008404
+    },
+    "layers.24.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12721023,
+      "int4_cos_sim": 0.99251509,
+      "int8_nrmse": 0.00722801,
+      "int8_cos_sim": 1.00255907
+    },
+    "layers.24.linear_attention.in_proj_ba": {
+      "decision": "bf16",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.16162632,
+      "int4_cos_sim": 0.98717797,
+      "int8_nrmse": 0.00907965,
+      "int8_cos_sim": 0.99995792
+    },
+    "layers.24.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12554918,
+      "int4_cos_sim": 0.99227542,
+      "int8_nrmse": 0.00713555,
+      "int8_cos_sim": 1.00024796
+    },
+    "layers.25.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12741757,
+      "int4_cos_sim": 0.99271518,
+      "int8_nrmse": 0.00723055,
+      "int8_cos_sim": 1.00259817
+    },
+    "layers.25.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15423822,
+      "int4_cos_sim": 0.98833376,
+      "int8_nrmse": 0.00865683,
+      "int8_cos_sim": 0.9999609
+    },
+    "layers.25.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12559759,
+      "int4_cos_sim": 0.99225968,
+      "int8_nrmse": 0.00714823,
+      "int8_cos_sim": 1.00024247
+    },
+    "layers.26.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.13046924,
+      "int4_cos_sim": 0.99247336,
+      "int8_nrmse": 0.0074084,
+      "int8_cos_sim": 1.00277305
+    },
+    "layers.26.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15223798,
+      "int4_cos_sim": 0.98862362,
+      "int8_nrmse": 0.0085815,
+      "int8_cos_sim": 0.9999603
+    },
+    "layers.26.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12737385,
+      "int4_cos_sim": 0.99205148,
+      "int8_nrmse": 0.00723445,
+      "int8_cos_sim": 1.00024033
+    },
+    "layers.27.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12154468,
+      "int4_cos_sim": 0.99309444,
+      "int8_nrmse": 0.00693052,
+      "int8_cos_sim": 1.00115907
+    },
+    "layers.27.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12805378,
+      "int4_cos_sim": 0.99183714,
+      "int8_nrmse": 0.00727983,
+      "int8_cos_sim": 0.99990559
+    },
+    "layers.27.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12463162,
+      "int4_cos_sim": 0.99223953,
+      "int8_nrmse": 0.00713666,
+      "int8_cos_sim": 0.99990141
+    },
+    "layers.27.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12124613,
+      "int4_cos_sim": 0.99266839,
+      "int8_nrmse": 0.00692315,
+      "int8_cos_sim": 1.00004661
+    },
+    "layers.28.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12863252,
+      "int4_cos_sim": 0.99241751,
+      "int8_nrmse": 0.00730975,
+      "int8_cos_sim": 1.00273013
+    },
+    "layers.28.linear_attention.in_proj_ba": {
+      "decision": "bf16",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.16021413,
+      "int4_cos_sim": 0.98740608,
+      "int8_nrmse": 0.00899783,
+      "int8_cos_sim": 0.99995637
+    },
+    "layers.28.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12686517,
+      "int4_cos_sim": 0.99202108,
+      "int8_nrmse": 0.00722459,
+      "int8_cos_sim": 1.00012708
+    },
+    "layers.29.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12650196,
+      "int4_cos_sim": 0.99272156,
+      "int8_nrmse": 0.00719506,
+      "int8_cos_sim": 1.00274253
+    },
+    "layers.29.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14968821,
+      "int4_cos_sim": 0.98899364,
+      "int8_nrmse": 0.00842153,
+      "int8_cos_sim": 0.99996424
+    },
+    "layers.29.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12584813,
+      "int4_cos_sim": 0.99218988,
+      "int8_nrmse": 0.00715705,
+      "int8_cos_sim": 1.00016856
+    },
+    "layers.30.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12694123,
+      "int4_cos_sim": 0.99283594,
+      "int8_nrmse": 0.00721843,
+      "int8_cos_sim": 1.00276387
+    },
+    "layers.30.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15012441,
+      "int4_cos_sim": 0.98893607,
+      "int8_nrmse": 0.0084291,
+      "int8_cos_sim": 0.9999631
+    },
+    "layers.30.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12735973,
+      "int4_cos_sim": 0.9920094,
+      "int8_nrmse": 0.00724007,
+      "int8_cos_sim": 1.00017238
+    },
+    "layers.31.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12357761,
+      "int4_cos_sim": 0.99280214,
+      "int8_nrmse": 0.00704103,
+      "int8_cos_sim": 1.00103271
+    },
+    "layers.31.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.1257868,
+      "int4_cos_sim": 0.99212372,
+      "int8_nrmse": 0.00714271,
+      "int8_cos_sim": 0.99990737
+    },
+    "layers.31.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12778475,
+      "int4_cos_sim": 0.99185801,
+      "int8_nrmse": 0.00729982,
+      "int8_cos_sim": 0.99990022
+    },
+    "layers.31.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12361216,
+      "int4_cos_sim": 0.99230391,
+      "int8_nrmse": 0.00706915,
+      "int8_cos_sim": 1.00002289
+    },
+    "layers.32.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12823022,
+      "int4_cos_sim": 0.99271393,
+      "int8_nrmse": 0.00728323,
+      "int8_cos_sim": 1.00289309
+    },
+    "layers.32.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14997281,
+      "int4_cos_sim": 0.98895264,
+      "int8_nrmse": 0.00844587,
+      "int8_cos_sim": 0.99996203
+    },
+    "layers.32.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12866681,
+      "int4_cos_sim": 0.9918856,
+      "int8_nrmse": 0.00732187,
+      "int8_cos_sim": 1.00021148
+    },
+    "layers.33.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12569643,
+      "int4_cos_sim": 0.99269301,
+      "int8_nrmse": 0.00714678,
+      "int8_cos_sim": 1.00253844
+    },
+    "layers.33.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14737763,
+      "int4_cos_sim": 0.9893443,
+      "int8_nrmse": 0.00829218,
+      "int8_cos_sim": 0.99996489
+    },
+    "layers.33.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12890863,
+      "int4_cos_sim": 0.99183583,
+      "int8_nrmse": 0.00731977,
+      "int8_cos_sim": 1.00020254
+    },
+    "layers.34.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12555308,
+      "int4_cos_sim": 0.9929266,
+      "int8_nrmse": 0.00713688,
+      "int8_cos_sim": 1.00255179
+    },
+    "layers.34.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15155194,
+      "int4_cos_sim": 0.98871344,
+      "int8_nrmse": 0.00851899,
+      "int8_cos_sim": 0.99996006
+    },
+    "layers.34.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12790844,
+      "int4_cos_sim": 0.99195778,
+      "int8_nrmse": 0.00726711,
+      "int8_cos_sim": 1.00021553
+    },
+    "layers.35.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12609983,
+      "int4_cos_sim": 0.99254739,
+      "int8_nrmse": 0.00716648,
+      "int8_cos_sim": 1.00111616
+    },
+    "layers.35.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.13692803,
+      "int4_cos_sim": 0.9906975,
+      "int8_nrmse": 0.0077486,
+      "int8_cos_sim": 0.99989867
+    },
+    "layers.35.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.1271321,
+      "int4_cos_sim": 0.99194497,
+      "int8_nrmse": 0.0072584,
+      "int8_cos_sim": 0.99990231
+    },
+    "layers.35.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12281245,
+      "int4_cos_sim": 0.99248224,
+      "int8_nrmse": 0.0070165,
+      "int8_cos_sim": 1.00003064
+    },
+    "layers.36.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12666026,
+      "int4_cos_sim": 0.99247456,
+      "int8_nrmse": 0.00719674,
+      "int8_cos_sim": 1.00264263
+    },
+    "layers.36.linear_attention.in_proj_ba": {
+      "decision": "bf16",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15636436,
+      "int4_cos_sim": 0.98801339,
+      "int8_nrmse": 0.00880439,
+      "int8_cos_sim": 0.99995929
+    },
+    "layers.36.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12667078,
+      "int4_cos_sim": 0.99208045,
+      "int8_nrmse": 0.00719167,
+      "int8_cos_sim": 1.00021493
+    },
+    "layers.37.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12625751,
+      "int4_cos_sim": 0.99262434,
+      "int8_nrmse": 0.00717318,
+      "int8_cos_sim": 1.00250673
+    },
+    "layers.37.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14964546,
+      "int4_cos_sim": 0.98898786,
+      "int8_nrmse": 0.00841893,
+      "int8_cos_sim": 0.99996394
+    },
+    "layers.37.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12741361,
+      "int4_cos_sim": 0.99197751,
+      "int8_nrmse": 0.00723735,
+      "int8_cos_sim": 1.00017905
+    },
+    "layers.38.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12790767,
+      "int4_cos_sim": 0.99279124,
+      "int8_nrmse": 0.00726521,
+      "int8_cos_sim": 1.00276339
+    },
+    "layers.38.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14781548,
+      "int4_cos_sim": 0.98925918,
+      "int8_nrmse": 0.00832572,
+      "int8_cos_sim": 0.99996328
+    },
+    "layers.38.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12897121,
+      "int4_cos_sim": 0.99183011,
+      "int8_nrmse": 0.00731614,
+      "int8_cos_sim": 1.00021267
+    },
+    "layers.39.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12209103,
+      "int4_cos_sim": 0.99299699,
+      "int8_nrmse": 0.00695823,
+      "int8_cos_sim": 1.0011555
+    },
+    "layers.39.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12863836,
+      "int4_cos_sim": 0.9917677,
+      "int8_nrmse": 0.00730759,
+      "int8_cos_sim": 0.99990088
+    },
+    "layers.39.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12718405,
+      "int4_cos_sim": 0.99193108,
+      "int8_nrmse": 0.00725232,
+      "int8_cos_sim": 0.99990046
+    },
+    "layers.39.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12199275,
+      "int4_cos_sim": 0.99253082,
+      "int8_nrmse": 0.00699009,
+      "int8_cos_sim": 1.00000501
+    },
+    "layers.40.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12718951,
+      "int4_cos_sim": 0.99279618,
+      "int8_nrmse": 0.0072194,
+      "int8_cos_sim": 1.00266337
+    },
+    "layers.40.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15269047,
+      "int4_cos_sim": 0.98855364,
+      "int8_nrmse": 0.00856795,
+      "int8_cos_sim": 0.99996078
+    },
+    "layers.40.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.13251903,
+      "int4_cos_sim": 0.99145246,
+      "int8_nrmse": 0.00751297,
+      "int8_cos_sim": 1.00027728
+    },
+    "layers.41.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12849442,
+      "int4_cos_sim": 0.99270552,
+      "int8_nrmse": 0.00729933,
+      "int8_cos_sim": 1.00289214
+    },
+    "layers.41.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.1539241,
+      "int4_cos_sim": 0.98836541,
+      "int8_nrmse": 0.00864273,
+      "int8_cos_sim": 0.99996012
+    },
+    "layers.41.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.1333883,
+      "int4_cos_sim": 0.99130172,
+      "int8_nrmse": 0.00755837,
+      "int8_cos_sim": 1.00024211
+    },
+    "layers.42.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12701807,
+      "int4_cos_sim": 0.992616,
+      "int8_nrmse": 0.00721536,
+      "int8_cos_sim": 1.00260496
+    },
+    "layers.42.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14519159,
+      "int4_cos_sim": 0.9896372,
+      "int8_nrmse": 0.00817494,
+      "int8_cos_sim": 0.99996519
+    },
+    "layers.42.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.13423364,
+      "int4_cos_sim": 0.99116898,
+      "int8_nrmse": 0.00760596,
+      "int8_cos_sim": 1.00023699
+    },
+    "layers.43.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12392331,
+      "int4_cos_sim": 0.99262375,
+      "int8_nrmse": 0.00705214,
+      "int8_cos_sim": 1.00131941
+    },
+    "layers.43.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.12764538,
+      "int4_cos_sim": 0.9918952,
+      "int8_nrmse": 0.00723566,
+      "int8_cos_sim": 0.99990821
+    },
+    "layers.43.gqa.v_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.14846909,
+      "int4_cos_sim": 0.98910719,
+      "int8_nrmse": 0.00839486,
+      "int8_cos_sim": 0.99989945
+    },
+    "layers.43.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.12621872,
+      "int4_cos_sim": 0.99214303,
+      "int8_nrmse": 0.00718921,
+      "int8_cos_sim": 1.00012255
+    },
+    "layers.44.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.12917733,
+      "int4_cos_sim": 0.99280149,
+      "int8_nrmse": 0.00732547,
+      "int8_cos_sim": 1.00263202
+    },
+    "layers.44.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15219351,
+      "int4_cos_sim": 0.9886297,
+      "int8_nrmse": 0.00855004,
+      "int8_cos_sim": 0.99996114
+    },
+    "layers.44.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.14445616,
+      "int4_cos_sim": 0.98980904,
+      "int8_nrmse": 0.0081632,
+      "int8_cos_sim": 1.00028777
+    },
+    "layers.45.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.13019644,
+      "int4_cos_sim": 0.99256456,
+      "int8_nrmse": 0.0073729,
+      "int8_cos_sim": 1.00239086
+    },
+    "layers.45.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.14494268,
+      "int4_cos_sim": 0.98965847,
+      "int8_nrmse": 0.00814862,
+      "int8_cos_sim": 0.99996316
+    },
+    "layers.45.linear_attention.out_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.15300277,
+      "int4_cos_sim": 0.98865533,
+      "int8_nrmse": 0.00861476,
+      "int8_cos_sim": 1.00034225
+    },
+    "layers.46.linear_attention.in_proj_qkvz": {
+      "decision": "int4",
+      "shape": [
+        12288,
+        2048
+      ],
+      "int4_nrmse": 0.13005211,
+      "int4_cos_sim": 0.99247259,
+      "int8_nrmse": 0.00736585,
+      "int8_cos_sim": 1.00250983
+    },
+    "layers.46.linear_attention.in_proj_ba": {
+      "decision": "int4",
+      "shape": [
+        64,
+        2048
+      ],
+      "int4_nrmse": 0.15357638,
+      "int4_cos_sim": 0.98841774,
+      "int8_nrmse": 0.00863833,
+      "int8_cos_sim": 0.99995953
+    },
+    "layers.46.linear_attention.out_proj": {
+      "decision": "bf16",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.15937409,
+      "int4_cos_sim": 0.98772234,
+      "int8_nrmse": 0.00896439,
+      "int8_cos_sim": 1.00037372
+    },
+    "layers.47.gqa.q_proj": {
+      "decision": "int4",
+      "shape": [
+        8192,
+        2048
+      ],
+      "int4_nrmse": 0.12760796,
+      "int4_cos_sim": 0.9922666,
+      "int8_nrmse": 0.00724927,
+      "int8_cos_sim": 1.00124955
+    },
+    "layers.47.gqa.k_proj": {
+      "decision": "int4",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.1543334,
+      "int4_cos_sim": 0.98823202,
+      "int8_nrmse": 0.00867832,
+      "int8_cos_sim": 0.99990046
+    },
+    "layers.47.gqa.v_proj": {
+      "decision": "bf16",
+      "shape": [
+        512,
+        2048
+      ],
+      "int4_nrmse": 0.16789129,
+      "int4_cos_sim": 0.98614484,
+      "int8_nrmse": 0.00940858,
+      "int8_cos_sim": 0.99989378
+    },
+    "layers.47.gqa.o_proj": {
+      "decision": "int4",
+      "shape": [
+        2048,
+        4096
+      ],
+      "int4_nrmse": 0.13178195,
+      "int4_cos_sim": 0.9914006,
+      "int8_nrmse": 0.00748633,
+      "int8_cos_sim": 1.00007772
+    }
+  }
+}
