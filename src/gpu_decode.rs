@@ -87,6 +87,8 @@ const KERNEL_NAMES: &[&str] = &[
     "gated_rmsnorm_silu_bf16",
     "gqa_attention_g_bf16",
     "apply_gated_attn_bf16",
+    "la_fused_post_proj",
+    "expert_classify_prepare",
 ];
 
 const MODULE_NAME: &str = "decode_kernels";
@@ -935,6 +937,10 @@ struct CachedKernels {
     gated_rmsnorm_silu_bf16: cudarc::driver::CudaFunction,
     gqa_attention_g_bf16: cudarc::driver::CudaFunction,
     apply_gated_attn_bf16: cudarc::driver::CudaFunction,
+    // Fused LA post-projection: repeat_interleave + l2norm + delta_net + rmsnorm → BF16
+    la_fused_post_proj: cudarc::driver::CudaFunction,
+    // GPU-side expert classification (eliminates cuStreamSynchronize in route sync)
+    expert_classify_prepare: cudarc::driver::CudaFunction,
 }
 
 // ── Main GPU decode graph ──────────────────────────────────────────────
@@ -1082,6 +1088,12 @@ struct GpuDecodeGraph {
     // Pinned mapped memory for zero-copy topk (replaces d_topk_indices/weights + D2H)
     pinned_topk_ids: Option<PinnedMapped>,
     pinned_topk_weights: Option<PinnedMapped>,
+
+    // GPU-side route sync: mapped memory for cold expert communication
+    // Layout: [cold_count(i32), ready_flag(i32), cold_ids[topk](i32), cold_slots[topk](i32)]
+    mapped_cold_buf: Option<PinnedMapped>,
+    /// Whether GPU-side route sync is active (classify kernel available + HCS has d_expert_ptrs)
+    gpu_route_sync: bool,
 
     // Cached kernel function handles (populated after configure)
     kernels: Option<CachedKernels>,
@@ -1744,6 +1756,9 @@ impl GpuDecodeStore {
             h_logits: vec![0.0f32; vocab_size],
             pinned_topk_ids: PinnedMapped::new(max_experts_per_tok * 4).ok(),
             pinned_topk_weights: PinnedMapped::new(max_experts_per_tok * 4).ok(),
+            // GPU-side route sync: [cold_count, ready_flag, cold_ids[topk], cold_slots[topk]]
+            mapped_cold_buf: PinnedMapped::new((2 + max_experts_per_tok * 2) * 4).ok(),
+            gpu_route_sync: false,
             kernels: None,
             pre_events: None,
             norm_bias_one: false,
@@ -1887,9 +1902,11 @@ impl GpuDecodeStore {
                 gated_rmsnorm_silu_bf16: get("gated_rmsnorm_silu_bf16")?,
                 gqa_attention_g_bf16: get("gqa_attention_g_bf16")?,
                 apply_gated_attn_bf16: get("apply_gated_attn_bf16")?,
+                la_fused_post_proj: get("la_fused_post_proj")?,
+                expert_classify_prepare: get("expert_classify_prepare")?,
             };
             self.graph.as_mut().unwrap().kernels = Some(kernels);
-            log::info!("GpuDecodeStore: cached 40 kernel function handles");
+            log::info!("GpuDecodeStore: cached 41 kernel function handles");
         }
 
         // Pre-allocate CUDA events (reuse across MoE forward calls)
@@ -5525,81 +5542,27 @@ impl GpuDecodeStore {
                             }
                         }
 
-                        // Head repeat-interleave (if hr > 1)
-                        let q_ptr_for_recur: u64;
-                        let k_ptr_for_recur: u64;
-                        if hr_ > 1 {
-                            let total_q = (nv_ * dk_) as u32;
-                            let threads = 256u32;
-                            let blocks = (total_q + threads - 1) / threads;
-                            unsafe {
-                                k.repeat_interleave_heads.clone().launch(
-                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                    (
-                                        *graph.d_la_recur_out.device_ptr(),
-                                        *graph.d_la_qkvz.device_ptr(),
-                                        nk_ as i32, dk_ as i32, hr_ as i32,
-                                    ),
-                                ).map_err(|e| format!("repeat_interleave q[{}]: {:?}", layer_idx, e))?;
-                                let k_in = (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64;
-                                let k_out = (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64;
-                                k.repeat_interleave_heads.clone().launch(
-                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                    (k_out, k_in, nk_ as i32, dk_ as i32, hr_ as i32),
-                                ).map_err(|e| format!("repeat_interleave k[{}]: {:?}", layer_idx, e))?;
-                            }
-                            q_ptr_for_recur = *graph.d_la_recur_out.device_ptr();
-                            k_ptr_for_recur = unsafe { (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64 };
-                        } else {
-                            q_ptr_for_recur = *graph.d_la_qkvz.device_ptr();
-                            k_ptr_for_recur = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64 };
-                        }
-
-                        // L2 normalize + scale
+                        // Fused: repeat-interleave + l2norm + delta_net + rmsnorm → BF16
                         {
+                            let q_conv_ptr = *graph.d_la_qkvz.device_ptr();
+                            let k_conv_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64 };
+                            let v_conv_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(2 * key_dim) as u64 };
                             let threads = 256u32;
+                            let smem = ((dk_ * 2 + dv_ + 32) as u32) * 4;
                             unsafe {
-                                k.l2norm_scale_per_head.clone().launch(
-                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                    (q_ptr_for_recur, *scale, nv_ as i32, dk_ as i32),
-                                ).map_err(|e| format!("l2norm q[{}]: {:?}", layer_idx, e))?;
-                                k.l2norm_scale_per_head.clone().launch(
-                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                    (k_ptr_for_recur, 1.0f32, nv_ as i32, dk_ as i32),
-                                ).map_err(|e| format!("l2norm k[{}]: {:?}", layer_idx, e))?;
-                            }
-                        }
-
-                        // Gated delta net recurrence
-                        let v_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(2 * key_dim) as u64 };
-                        unsafe {
-                            k.gated_delta_net_step.clone().launch(
-                                LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                                (
-                                    *recur_state_ptr,
-                                    q_ptr_for_recur, k_ptr_for_recur, v_ptr,
-                                    gate_ptr_local, beta_ptr_local,
-                                    *graph.d_la_ba.device_ptr(),
-                                    nv_ as i32, dk_ as i32, dv_ as i32,
-                                ),
-                            ).map_err(|e| format!("delta_net_step[{}]: {:?}", layer_idx, e))?;
-                        }
-
-                        // Gated RMSNorm + SiLU → BF16 directly
-                        {
-                            let threads = 256u32;
-                            let smem = (dv_ as u32 + 32) * 4;
-                            unsafe {
-                                k.gated_rmsnorm_silu_bf16.clone().launch(
+                                k.la_fused_post_proj.clone().launch(
                                     LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
                                     (
-                                        *graph.d_scratch.device_ptr(),
-                                        *graph.d_la_ba.device_ptr(),
+                                        *recur_state_ptr,
+                                        q_conv_ptr, k_conv_ptr, v_conv_ptr,
+                                        gate_ptr_local, beta_ptr_local,
                                         *graph.d_la_gated_out.device_ptr(),
-                                        *norm_weight_ptr, eps,
-                                        nv_ as i32, dv_ as i32,
+                                        *norm_weight_ptr,
+                                        *graph.d_scratch.device_ptr(),
+                                        *scale, eps,
+                                        ((((nv_ << 16) | dk_) as i64) << 32) | (((dv_ << 16) | hr_) as i64 & 0xFFFFFFFF_i64),
                                     ),
-                                ).map_err(|e| format!("gated_rmsnorm_silu_bf16[{}]: {:?}", layer_idx, e))?;
+                                ).map_err(|e| format!("la_fused_post_proj[{}]: {:?}", layer_idx, e))?;
                             }
                         }
 
@@ -5911,6 +5874,40 @@ impl GpuDecodeStore {
                             }
                         }
                     }
+
+                    // GPU-side expert classification: check HCS table and prepare batch upload
+                    if graph.gpu_route_sync {
+                        if let Some(ref hcs) = graph.hcs {
+                            if let Some(ref d_eptrs) = hcs.d_expert_ptrs {
+                                let d_eptrs_ptr = *d_eptrs.device_ptr();
+                                let d_upload_ptr = *graph.d_batch_upload.device_ptr();
+                                let cold_buf_dptr = graph.mapped_cold_buf.as_ref().unwrap().device_ptr;
+                                let max_ept = graph.max_experts_per_tok;
+
+                                // Get dummy expert pointers
+                                let dummy_base = graph.d_dummy_expert.as_ref()
+                                    .map(|b| *b.device_ptr()).unwrap_or(0);
+
+                                unsafe {
+                                    k.expert_classify_prepare.clone().launch(
+                                        LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                                        (
+                                            topk_ids_dptr,
+                                            topk_wts_dptr,
+                                            d_eptrs_ptr,
+                                            d_upload_ptr,
+                                            cold_buf_dptr,
+                                            layer_idx as i32,
+                                            ne as i32,
+                                            topk as i32,
+                                            max_ept as i32,
+                                            dummy_base,      // dummy_ptr (same for all 4 arrays)
+                                        ),
+                                    ).map_err(|e| format!("expert_classify[{}]: {:?}", layer_idx, e))?;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -6026,65 +6023,231 @@ impl GpuDecodeStore {
         let w2p_off = graph.expert_buf_w2p_offset;
         let w2s_off = graph.expert_buf_w2s_offset;
 
+        // GPU-side route sync state
+        let gpu_rs = graph.gpu_route_sync;
+        let cold_buf_host = if gpu_rs {
+            graph.mapped_cold_buf.as_ref().map(|m| m.host_ptr as *mut i32)
+        } else { None };
+
+        // Pre-clear ready flag before the first graph (which contains the first classify kernel)
+        if gpu_rs {
+            unsafe {
+                let cold_ptr = cold_buf_host.unwrap();
+                std::ptr::write_volatile(cold_ptr.add(1), 0i32);
+            }
+        }
+
         for graph_idx in 0..num_graphs {
             // ── If not first graph: populate d_batch_upload with expert pointers ──
-            // (The previous graph's routing results are now on GPU after sync)
             if graph_idx > 0 {
                 let moe_layer_idx = moe_indices[graph_idx - 1];
                 let topk = graph.moe_layers[moe_layer_idx].as_ref()
                     .map(|m| m.topk).unwrap_or(10);
 
-                // Sync to get routing results
-                unsafe {
-                    let err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
-                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                        return Err(format!("sync routing[{}]: {:?}", moe_layer_idx, err));
-                    }
-                }
+                if gpu_rs {
+                    // ── GPU-side route sync path ──
+                    // The classify kernel (part of previous graph) already:
+                    // 1. Checked d_expert_ptrs for each topk expert
+                    // 2. Wrote HCS-hit pointers directly to d_batch_upload
+                    // 3. Wrote cold expert IDs + count to mapped_cold_buf
+                    // 4. Filled unused slots with dummy pointers
+                    // We just need to wait for it and handle cold experts.
 
-                // Read topk indices/weights from GPU
-                if use_pinned {
+                    let cold_ptr = cold_buf_host.unwrap();
+
+                    // Poll mapped memory ready_flag (CPU spin-wait, ~microseconds)
                     unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            graph.pinned_topk_ids.as_ref().unwrap().host_ptr as *const i32,
-                            graph.h_topk_ids.as_mut_ptr(), topk);
-                        std::ptr::copy_nonoverlapping(
-                            graph.pinned_topk_weights.as_ref().unwrap().host_ptr as *const f32,
-                            graph.h_topk_weights.as_mut_ptr(), topk);
+                        let ready_ptr = cold_ptr.add(1) as *const std::sync::atomic::AtomicI32;
+                        loop {
+                            let val = (*ready_ptr).load(std::sync::atomic::Ordering::Acquire);
+                            if val != 0 { break; }
+                            std::hint::spin_loop();
+                        }
+                        // Clear ready flag for next layer
+                        (*ready_ptr).store(0, std::sync::atomic::Ordering::Release);
+                    }
+
+                    let cold_count = unsafe { std::ptr::read_volatile(cold_ptr) } as usize;
+
+                    // Record activations for HCS heatmap (read topk IDs from pinned memory)
+                    if let Some(ref pm) = graph.pinned_topk_ids {
+                        let ids = pm.host_ptr as *const i32;
+                        for i in 0..topk {
+                            let eid = unsafe { *ids.add(i) };
+                            if eid >= 0 {
+                                if let Some(ref mut hcs) = graph.hcs {
+                                    hcs.record_activation(moe_layer_idx, eid as usize);
+                                }
+                            }
+                        }
+                    }
+
+                    // DMA cold experts into VRAM buffers and update their d_batch_upload slots
+                    if cold_count > 0 {
+                        let moe_data = graph.moe_layers[moe_layer_idx].as_ref().unwrap();
+
+                        for ci in 0..cold_count {
+                            let eid = unsafe { std::ptr::read_volatile(cold_ptr.add(2 + ci)) } as usize;
+                            let batch_slot = unsafe { std::ptr::read_volatile(cold_ptr.add(2 + topk + ci)) } as usize;
+                            let expert = &moe_data.experts[eid];
+
+                            // Choose a VRAM buffer: first 2 use double-buffer, rest use APFL slots
+                            let (w13p, w13s, w2p, w2s) = if ci < 2 {
+                                let base = buf_base[ci];
+                                (base + w13p_off as u64, base + w13s_off as u64,
+                                 base + w2p_off as u64, base + w2s_off as u64)
+                            } else if let Some(ref apfl) = graph.apfl {
+                                let apfl_idx = ci - 2;
+                                if apfl_idx < apfl.slots.len() {
+                                    let slot = &apfl.slots[apfl_idx];
+                                    (slot.w13_packed_ptr(), slot.w13_scales_ptr(),
+                                     slot.w2_packed_ptr(), slot.w2_scales_ptr())
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            };
+
+                            // DMA expert weights from system RAM to VRAM
+                            unsafe {
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    w13p, expert.w13_packed_ptr as *const std::ffi::c_void,
+                                    expert.w13_packed_bytes, copy_stream);
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    w13s, expert.w13_scales_ptr as *const std::ffi::c_void,
+                                    expert.w13_scales_bytes, copy_stream);
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    w2p, expert.w2_packed_ptr as *const std::ffi::c_void,
+                                    expert.w2_packed_bytes, copy_stream);
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    w2s, expert.w2_scales_ptr as *const std::ffi::c_void,
+                                    expert.w2_scales_bytes, copy_stream);
+                                cuda_sys::lib().cuStreamSynchronize(copy_stream);
+                            }
+
+                            // Update the batch_upload slot for this cold expert
+                            // Write the 4 VRAM pointers to the correct slot in d_batch_upload
+                            if batch_slot < max_ept {
+                                let d_upload_base = *graph.d_batch_upload.device_ptr();
+                                let ptrs: [u64; 4] = [w13p, w13s, w2p, w2s];
+                                unsafe {
+                                    // Each pointer array is max_ept u64s apart
+                                    for (arr_idx, &ptr_val) in ptrs.iter().enumerate() {
+                                        let dst = d_upload_base + ((arr_idx * max_ept + batch_slot) * 8) as u64;
+                                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                            dst,
+                                            &ptr_val as *const u64 as *const std::ffi::c_void,
+                                            8, replay_stream);
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else {
+                    // ── Legacy CPU-side route sync path ──
+
+                    // Sync to get routing results
                     unsafe {
-                        cuda_sys::lib().cuMemcpyDtoH_v2(
-                            graph.h_topk_ids.as_mut_ptr() as *mut std::ffi::c_void,
-                            *graph.d_topk_indices.device_ptr(), topk * 4);
-                        cuda_sys::lib().cuMemcpyDtoH_v2(
-                            graph.h_topk_weights.as_mut_ptr() as *mut std::ffi::c_void,
-                            *graph.d_topk_weights.device_ptr(), topk * 4);
-                    }
-                }
-
-                // Classify experts: HCS hit vs cold (need DMA)
-                let mut batch_count = 0usize;
-                let mut cold_experts: Vec<(usize, usize, f32)> = Vec::new(); // (topk_pos, expert_id, weight)
-                let moe_data = graph.moe_layers[moe_layer_idx].as_ref().unwrap();
-
-                for i in 0..topk {
-                    let eid = graph.h_topk_ids[i];
-                    if eid < 0 { continue; }
-                    let eid = eid as usize;
-                    let weight = graph.h_topk_weights[i];
-
-                    // Record activation for HCS heatmap
-                    if let Some(ref mut hcs) = graph.hcs {
-                        hcs.record_activation(moe_layer_idx, eid);
+                        let err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(format!("sync routing[{}]: {:?}", moe_layer_idx, err));
+                        }
                     }
 
-                    // Check HCS cache
-                    let hcs_ptrs = if let Some(ref hcs) = graph.hcs {
-                        hcs.get_fast(moe_layer_idx, eid)
-                    } else { None };
+                    // Read topk indices/weights from GPU
+                    if use_pinned {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                graph.pinned_topk_ids.as_ref().unwrap().host_ptr as *const i32,
+                                graph.h_topk_ids.as_mut_ptr(), topk);
+                            std::ptr::copy_nonoverlapping(
+                                graph.pinned_topk_weights.as_ref().unwrap().host_ptr as *const f32,
+                                graph.h_topk_weights.as_mut_ptr(), topk);
+                        }
+                    } else {
+                        unsafe {
+                            cuda_sys::lib().cuMemcpyDtoH_v2(
+                                graph.h_topk_ids.as_mut_ptr() as *mut std::ffi::c_void,
+                                *graph.d_topk_indices.device_ptr(), topk * 4);
+                            cuda_sys::lib().cuMemcpyDtoH_v2(
+                                graph.h_topk_weights.as_mut_ptr() as *mut std::ffi::c_void,
+                                *graph.d_topk_weights.device_ptr(), topk * 4);
+                        }
+                    }
 
-                    if let Some((w13p, w13s, w2p, w2s)) = hcs_ptrs {
+                    // Classify experts: HCS hit vs cold (need DMA)
+                    let mut batch_count = 0usize;
+                    let mut cold_experts: Vec<(usize, usize, f32)> = Vec::new();
+                    let moe_data = graph.moe_layers[moe_layer_idx].as_ref().unwrap();
+
+                    for i in 0..topk {
+                        let eid = graph.h_topk_ids[i];
+                        if eid < 0 { continue; }
+                        let eid = eid as usize;
+                        let weight = graph.h_topk_weights[i];
+
+                        if let Some(ref mut hcs) = graph.hcs {
+                            hcs.record_activation(moe_layer_idx, eid);
+                        }
+
+                        let hcs_ptrs = if let Some(ref hcs) = graph.hcs {
+                            hcs.get_fast(moe_layer_idx, eid)
+                        } else { None };
+
+                        if let Some((w13p, w13s, w2p, w2s)) = hcs_ptrs {
+                            if batch_count < max_ept {
+                                graph.h_batch_w13_packed_ptrs[batch_count] = w13p;
+                                graph.h_batch_w13_scales_ptrs[batch_count] = w13s;
+                                graph.h_batch_w2_packed_ptrs[batch_count] = w2p;
+                                graph.h_batch_w2_scales_ptrs[batch_count] = w2s;
+                                graph.h_batch_weights[batch_count] = weight;
+                                batch_count += 1;
+                            }
+                        } else {
+                            cold_experts.push((i, eid, weight));
+                        }
+                    }
+
+                    for (ci, &(_topk_pos, eid, weight)) in cold_experts.iter().enumerate() {
+                        let expert = &moe_data.experts[eid];
+
+                        let (base, w13p, w13s, w2p, w2s) = if ci < 2 {
+                            let base = buf_base[ci];
+                            (base,
+                             base + w13p_off as u64, base + w13s_off as u64,
+                             base + w2p_off as u64, base + w2s_off as u64)
+                        } else if let Some(ref apfl) = graph.apfl {
+                            let apfl_idx = ci - 2;
+                            if apfl_idx < apfl.slots.len() {
+                                let slot = &apfl.slots[apfl_idx];
+                                let base = *slot.d_buf.device_ptr();
+                                (base,
+                                 slot.w13_packed_ptr(), slot.w13_scales_ptr(),
+                                 slot.w2_packed_ptr(), slot.w2_scales_ptr())
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        };
+
+                        unsafe {
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                w13p, expert.w13_packed_ptr as *const std::ffi::c_void,
+                                expert.w13_packed_bytes, copy_stream);
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                w13s, expert.w13_scales_ptr as *const std::ffi::c_void,
+                                expert.w13_scales_bytes, copy_stream);
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                w2p, expert.w2_packed_ptr as *const std::ffi::c_void,
+                                expert.w2_packed_bytes, copy_stream);
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                w2s, expert.w2_scales_ptr as *const std::ffi::c_void,
+                                expert.w2_scales_bytes, copy_stream);
+                            cuda_sys::lib().cuStreamSynchronize(copy_stream);
+                        }
+
                         if batch_count < max_ept {
                             graph.h_batch_w13_packed_ptrs[batch_count] = w13p;
                             graph.h_batch_w13_scales_ptrs[batch_count] = w13s;
@@ -6093,119 +6256,62 @@ impl GpuDecodeStore {
                             graph.h_batch_weights[batch_count] = weight;
                             batch_count += 1;
                         }
-                    } else {
-                        cold_experts.push((i, eid, weight));
                     }
-                }
 
-                // DMA cold experts: use double-buffer slots (0,1) then APFL slots for overflow.
-                // Each cold expert needs its own buffer since all must be valid simultaneously
-                // when the expert graph replays.
-                for (ci, &(_topk_pos, eid, weight)) in cold_experts.iter().enumerate() {
-                    let expert = &moe_data.experts[eid];
-
-                    // Choose a buffer: first 2 use double-buffer, rest use APFL slots
-                    let (base, w13p, w13s, w2p, w2s) = if ci < 2 {
-                        let base = buf_base[ci];
-                        (base,
-                         base + w13p_off as u64, base + w13s_off as u64,
-                         base + w2p_off as u64, base + w2s_off as u64)
-                    } else if let Some(ref apfl) = graph.apfl {
-                        let apfl_idx = ci - 2;
-                        if apfl_idx < apfl.slots.len() {
-                            let slot = &apfl.slots[apfl_idx];
-                            let base = *slot.d_buf.device_ptr();
-                            (base,
-                             slot.w13_packed_ptr(), slot.w13_scales_ptr(),
-                             slot.w2_packed_ptr(), slot.w2_scales_ptr())
+                    if batch_count < topk {
+                        let dummy_base = graph.d_dummy_expert.as_ref()
+                            .map(|b| *b.device_ptr()).unwrap_or(buf_base[0]);
+                        let dummy_ptrs = if let Some(ref dp) = graph.d_dummy_ptrs {
+                            let mut ptrs = [0u64; 4];
+                            unsafe {
+                                cuda_sys::lib().cuMemcpyDtoH_v2(
+                                    ptrs.as_mut_ptr() as *mut std::ffi::c_void,
+                                    *dp.device_ptr(), 32);
+                            }
+                            ptrs
                         } else {
-                            // No more slots — skip this expert (will use stale/zero pointer)
-                            continue;
+                            [dummy_base, dummy_base, dummy_base, dummy_base]
+                        };
+                        for i in batch_count..topk.min(max_ept) {
+                            graph.h_batch_w13_packed_ptrs[i] = dummy_ptrs[0];
+                            graph.h_batch_w13_scales_ptrs[i] = dummy_ptrs[1];
+                            graph.h_batch_w2_packed_ptrs[i] = dummy_ptrs[2];
+                            graph.h_batch_w2_scales_ptrs[i] = dummy_ptrs[3];
+                            graph.h_batch_weights[i] = 0.0;
                         }
-                    } else {
-                        continue;
-                    };
-
-                    // DMA all 4 weight arrays
-                    unsafe {
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            w13p, expert.w13_packed_ptr as *const std::ffi::c_void,
-                            expert.w13_packed_bytes, copy_stream);
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            w13s, expert.w13_scales_ptr as *const std::ffi::c_void,
-                            expert.w13_scales_bytes, copy_stream);
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            w2p, expert.w2_packed_ptr as *const std::ffi::c_void,
-                            expert.w2_packed_bytes, copy_stream);
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            w2s, expert.w2_scales_ptr as *const std::ffi::c_void,
-                            expert.w2_scales_bytes, copy_stream);
                     }
 
-                    // Wait for this expert's DMA
+                    let ptr_stride = max_ept * 8;
+                    let fill_count = topk.min(max_ept);
                     unsafe {
-                        cuda_sys::lib().cuStreamSynchronize(copy_stream);
-                    }
+                        let h = graph.h_batch_upload.as_mut_ptr();
+                        std::ptr::copy_nonoverlapping(
+                            graph.h_batch_w13_packed_ptrs.as_ptr() as *const u8, h, fill_count * 8);
+                        std::ptr::copy_nonoverlapping(
+                            graph.h_batch_w13_scales_ptrs.as_ptr() as *const u8, h.add(ptr_stride), fill_count * 8);
+                        std::ptr::copy_nonoverlapping(
+                            graph.h_batch_w2_packed_ptrs.as_ptr() as *const u8, h.add(ptr_stride * 2), fill_count * 8);
+                        std::ptr::copy_nonoverlapping(
+                            graph.h_batch_w2_scales_ptrs.as_ptr() as *const u8, h.add(ptr_stride * 3), fill_count * 8);
+                        std::ptr::copy_nonoverlapping(
+                            graph.h_batch_weights.as_ptr() as *const u8, h.add(ptr_stride * 4), fill_count * 4);
 
-                    // Add to batch
-                    if batch_count < max_ept {
-                        graph.h_batch_w13_packed_ptrs[batch_count] = w13p;
-                        graph.h_batch_w13_scales_ptrs[batch_count] = w13s;
-                        graph.h_batch_w2_packed_ptrs[batch_count] = w2p;
-                        graph.h_batch_w2_scales_ptrs[batch_count] = w2s;
-                        graph.h_batch_weights[batch_count] = weight;
-                        batch_count += 1;
+                        let upload_bytes = ptr_stride * 4 + max_ept * 4;
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            *graph.d_batch_upload.device_ptr(),
+                            h as *const std::ffi::c_void,
+                            upload_bytes, replay_stream);
                     }
                 }
+            }
 
-                // Fill unused batch slots with dummy expert pointers (zero weight = no contribution).
-                // The graph was captured with grid.z = topk, so all topk slots must have valid pointers.
-                if batch_count < topk {
-                    let dummy_base = graph.d_dummy_expert.as_ref()
-                        .map(|b| *b.device_ptr()).unwrap_or(buf_base[0]);
-                    let dummy_ptrs = if let Some(ref dp) = graph.d_dummy_ptrs {
-                        // Read the 4 dummy pointers from the GPU-side array
-                        let mut ptrs = [0u64; 4];
-                        unsafe {
-                            cuda_sys::lib().cuMemcpyDtoH_v2(
-                                ptrs.as_mut_ptr() as *mut std::ffi::c_void,
-                                *dp.device_ptr(), 32);
-                        }
-                        ptrs
-                    } else {
-                        [dummy_base, dummy_base, dummy_base, dummy_base]
-                    };
-                    for i in batch_count..topk.min(max_ept) {
-                        graph.h_batch_w13_packed_ptrs[i] = dummy_ptrs[0];
-                        graph.h_batch_w13_scales_ptrs[i] = dummy_ptrs[1];
-                        graph.h_batch_w2_packed_ptrs[i] = dummy_ptrs[2];
-                        graph.h_batch_w2_scales_ptrs[i] = dummy_ptrs[3];
-                        graph.h_batch_weights[i] = 0.0; // zero weight = no contribution
-                    }
-                }
-
-                // Upload pointer table to GPU (d_batch_upload)
-                // The graph's expert kernels read from d_batch_upload at fixed addresses
-                let ptr_stride = max_ept * 8;
-                let fill_count = topk.min(max_ept); // fill all topk slots
+            // ── Pre-graph: clear mapped cold buffer ready flag for GPU classify kernel ──
+            if gpu_rs && graph_idx < num_graphs - 1 {
+                // The graph about to be replayed contains a classify kernel at the end.
+                // Clear ready_flag so the classify kernel can set it when done.
                 unsafe {
-                    let h = graph.h_batch_upload.as_mut_ptr();
-                    std::ptr::copy_nonoverlapping(
-                        graph.h_batch_w13_packed_ptrs.as_ptr() as *const u8, h, fill_count * 8);
-                    std::ptr::copy_nonoverlapping(
-                        graph.h_batch_w13_scales_ptrs.as_ptr() as *const u8, h.add(ptr_stride), fill_count * 8);
-                    std::ptr::copy_nonoverlapping(
-                        graph.h_batch_w2_packed_ptrs.as_ptr() as *const u8, h.add(ptr_stride * 2), fill_count * 8);
-                    std::ptr::copy_nonoverlapping(
-                        graph.h_batch_w2_scales_ptrs.as_ptr() as *const u8, h.add(ptr_stride * 3), fill_count * 8);
-                    std::ptr::copy_nonoverlapping(
-                        graph.h_batch_weights.as_ptr() as *const u8, h.add(ptr_stride * 4), fill_count * 4);
-
-                    let upload_bytes = ptr_stride * 4 + max_ept * 4;
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        *graph.d_batch_upload.device_ptr(),
-                        h as *const std::ffi::c_void,
-                        upload_bytes, replay_stream);
+                    let cold_ptr = cold_buf_host.unwrap();
+                    std::ptr::write_volatile(cold_ptr.add(1), 0i32); // clear ready_flag
                 }
             }
 
@@ -6529,82 +6635,36 @@ impl GpuDecodeStore {
                     }
                     let t_la_s5 = Instant::now();
 
-                    // ── LA Step 5: Head repeat-interleave (if hr > 1) ──
-                    // q and k are [nk, dk]. Need to expand to [nv, dk] for the recurrence.
+                    // ── LA Steps 5-8 FUSED: repeat-interleave + l2norm + delta_net + rmsnorm → BF16 ──
                     // Conv output in d_la_qkvz: [q(key_dim), k(key_dim), v(nv*dv)]
-                    // After repeat-interleave: q[nv*dk], k[nv*dk] in d_la_recur_out (temp)
-                    let q_ptr_for_recur: u64;
-                    let k_ptr_for_recur: u64;
-                    if hr_ > 1 {
-                        // q: d_la_qkvz[0..key_dim] → d_la_recur_out[0..nv*dk]
-                        let total_q = (nv_ * dk_) as u32;
-                        let threads = 256u32;
-                        let blocks = (total_q + threads - 1) / threads;
-                        unsafe {
-                            // Q
-                            k.repeat_interleave_heads.clone().launch(
-                                LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                (
-                                    *graph.d_la_recur_out.device_ptr(),  // output [nv*dk]
-                                    *graph.d_la_qkvz.device_ptr(),      // input q [nk*dk]
-                                    nk_ as i32, dk_ as i32, hr_ as i32,
-                                ),
-                            ).map_err(|e| format!("repeat_interleave q[{}]: {:?}", layer_idx, e))?;
-                            // K: input at offset key_dim, output at offset nv*dk
-                            let k_in = (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64;
-                            let k_out = (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64;
-                            k.repeat_interleave_heads.clone().launch(
-                                LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                (
-                                    k_out, k_in,
-                                    nk_ as i32, dk_ as i32, hr_ as i32,
-                                ),
-                            ).map_err(|e| format!("repeat_interleave k[{}]: {:?}", layer_idx, e))?;
-                        }
-                        q_ptr_for_recur = *graph.d_la_recur_out.device_ptr();
-                        k_ptr_for_recur = unsafe { (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64 };
-                    } else {
-                        q_ptr_for_recur = *graph.d_la_qkvz.device_ptr();
-                        k_ptr_for_recur = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64 };
-                    }
-
-                    // ── LA Step 6: L2 normalize + scale Q and K ──
+                    // Gate/beta in d_la_conv_out (from step 4)
+                    // Z saved in d_la_gated_out (from step 2)
+                    // Output: BF16 in d_scratch (ready for output projection)
                     {
+                        let q_conv_ptr = *graph.d_la_qkvz.device_ptr();
+                        let k_conv_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64 };
+                        let v_conv_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(2 * key_dim) as u64 };
                         let threads = 256u32;
+                        // Shared memory: dk*2 (Q+K) + dv + 32 (warp scratch) floats
+                        let smem = ((dk_ * 2 + dv_ + 32) as u32) * 4;
                         unsafe {
-                            // Q: normalize with scale
-                            k.l2norm_scale_per_head.clone().launch(
-                                LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                (q_ptr_for_recur, *scale, nv_ as i32, dk_ as i32),
-                            ).map_err(|e| format!("l2norm q[{}]: {:?}", layer_idx, e))?;
-                            // K: normalize without scale (scale=1.0)
-                            k.l2norm_scale_per_head.clone().launch(
-                                LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                (k_ptr_for_recur, 1.0f32, nv_ as i32, dk_ as i32),
-                            ).map_err(|e| format!("l2norm k[{}]: {:?}", layer_idx, e))?;
-                        }
-                    }
-
-                    // ── LA Step 7: Gated delta net recurrence ──
-                    // v is at offset 2*key_dim in d_la_qkvz (conv output)
-                    // Output to d_la_ba (free after step 4) to avoid overlap with q/k in d_la_recur_out
-                    let v_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(2 * key_dim) as u64 };
-                    {
-                        let threads = 256u32;
-                        unsafe {
-                            k.gated_delta_net_step.clone().launch(
-                                LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                            k.la_fused_post_proj.clone().launch(
+                                LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
                                 (
-                                    *recur_state_ptr,
-                                    q_ptr_for_recur,
-                                    k_ptr_for_recur,
-                                    v_ptr,
-                                    gate_ptr_local,
-                                    beta_ptr_local,
-                                    *graph.d_la_ba.device_ptr(),  // output: use d_la_ba (free after step 4)
-                                    nv_ as i32, dk_ as i32, dv_ as i32,
+                                    *recur_state_ptr,                   // state [nv, dk, dv]
+                                    q_conv_ptr,                         // q from conv output [nk*dk]
+                                    k_conv_ptr,                         // k from conv output [nk*dk]
+                                    v_conv_ptr,                         // v from conv output [nv*dv]
+                                    gate_ptr_local,                     // gate [nv]
+                                    beta_ptr_local,                     // beta [nv]
+                                    *graph.d_la_gated_out.device_ptr(), // z [nv*dv]
+                                    *norm_weight_ptr,                   // norm weight [dv]
+                                    *graph.d_scratch.device_ptr(),      // BF16 output
+                                    *scale,                             // q_scale
+                                    eps,
+                                    ((((nv_ << 16) | dk_) as i64) << 32) | (((dv_ << 16) | hr_) as i64 & 0xFFFFFFFF_i64),
                                 ),
-                            ).map_err(|e| format!("gated_delta_net_step[{}]: {:?}", layer_idx, e))?;
+                            ).map_err(|e| format!("la_fused_post_proj[{}]: {:?}", layer_idx, e))?;
                         }
                     }
 
@@ -6613,28 +6673,6 @@ impl GpuDecodeStore {
                         graph.t_la_recur += (Instant::now() - t_la_s5).as_secs_f64();
                     }
                     let t_la_s8 = Instant::now();
-
-                    // ── LA Step 8: Gated RMSNorm + SiLU → BF16 directly ──
-                    // z was saved in d_la_gated_out earlier
-                    // recurrence output is in d_la_ba
-                    // Outputs BF16 directly to d_scratch (eliminates separate fp32_to_bf16 kernel)
-                    {
-                        let threads = 256u32;
-                        let smem = (dv_ as u32 + 32) * 4;
-                        unsafe {
-                            k.gated_rmsnorm_silu_bf16.clone().launch(
-                                LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
-                                (
-                                    *graph.d_scratch.device_ptr(),      // output BF16 (direct to GEMV input)
-                                    *graph.d_la_ba.device_ptr(),        // recurrence output (from step 7)
-                                    *graph.d_la_gated_out.device_ptr(), // z (saved earlier)
-                                    *norm_weight_ptr,
-                                    eps,
-                                    nv_ as i32, dv_ as i32,
-                                ),
-                            ).map_err(|e| format!("gated_rmsnorm_silu_bf16[{}]: {:?}", layer_idx, e))?;
-                        }
-                    }
 
                     // ── LA Step 9: Output projection ──
                     let out_w = &graph.weights[*out_proj];
@@ -13585,14 +13623,17 @@ impl GpuDecodeStore {
         hcs.replacement_pct = replacement_pct as f32 / 100.0;
         hcs.rebalance_enabled = true;
 
+        // Enable GPU-side route sync if we have both d_expert_ptrs and mapped_cold_buf
+        let gpu_rs = hcs.d_expert_ptrs.is_some() && graph.mapped_cold_buf.is_some();
         graph.hcs = Some(hcs);
+        graph.gpu_route_sync = gpu_rs;
 
         let msg = format!(
             "HCS pool: {}/{} experts loaded in {:.2}s ({:.1}% coverage), {:.1} MB VRAM, \
-             {} free slots, window={}, replace={:.0}%",
+             {} free slots, window={}, replace={:.0}%, gpu_route_sync={}",
             loaded, total_experts, load_elapsed, pct,
             pool_alloc_bytes as f64 / (1024.0 * 1024.0),
-            num_slots - loaded, window_size, replacement_pct,
+            num_slots - loaded, window_size, replacement_pct, gpu_rs,
         );
         log::info!("{}", msg);
         Ok(msg)

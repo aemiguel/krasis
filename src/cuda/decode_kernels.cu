@@ -274,6 +274,104 @@ extern "C" __global__ void softmax_topk(
     }
 }
 
+// ── Expert Classify + Batch Prepare ───────────────────────────────────
+//
+// GPU-side route sync: after topk, check the device-side HCS lookup table
+// and populate d_batch_upload directly for cached experts.
+// Cold (uncached) expert IDs are written to mapped host memory for CPU to DMA.
+// This eliminates cuStreamSynchronize and CPU-side classification.
+//
+// d_expert_ptrs layout: [num_layers * num_experts * 4] u64 values.
+//   For expert (layer, eid): base = (layer * num_experts + eid) * 4
+//     [base+0] = w13_packed VRAM ptr (0 if not cached)
+//     [base+1] = w13_scales VRAM ptr
+//     [base+2] = w2_packed VRAM ptr
+//     [base+3] = w2_scales VRAM ptr
+//
+// d_batch_upload layout: [max_ept * 8] * 4 pointer arrays + [max_ept * 4] weights
+//   Stride between arrays = max_ept * 8 bytes
+//   Array 0: w13_packed ptrs [max_ept]
+//   Array 1: w13_scales ptrs [max_ept]
+//   Array 2: w2_packed ptrs  [max_ept]
+//   Array 3: w2_scales ptrs  [max_ept]
+//   Array 4: weights (f32)   [max_ept] at offset max_ept*8*4
+//
+// mapped_cold_buf layout (host-visible via PCIe BAR):
+//   [0]:       cold_count (int32) — number of cold experts
+//   [1]:       ready_flag (int32) — set to 1 when classification is done
+//   [2..2+topk]: cold expert IDs (int32)
+//   [2+topk..2+2*topk]: cold topk positions (int32) — slot index in batch
+//
+// Launch: grid=(1,1,1), block=(1,1,1), smem=0
+// Single-threaded: topk <= 16, trivial work.
+
+extern "C" __global__ void expert_classify_prepare(
+    const int* __restrict__ topk_ids,           // [topk] from topk kernel
+    const float* __restrict__ topk_weights,     // [topk] from topk kernel
+    const unsigned long long* __restrict__ d_expert_ptrs, // [num_layers * num_experts * 4]
+    unsigned long long* __restrict__ d_batch_upload,      // batch pointer table
+    volatile int* __restrict__ mapped_cold_buf, // host-visible mapped memory
+    int layer_idx,
+    int num_experts,
+    int topk,
+    int max_ept,
+    unsigned long long dummy_ptr  // dummy expert pointer for unfilled slots (same for all 4)
+) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    // Pointer strides in d_batch_upload (in u64 units)
+    // Array layout: [w13p_ptrs | w13s_ptrs | w2p_ptrs | w2s_ptrs | weights(f32)]
+    unsigned long long* w13p_arr = d_batch_upload;
+    unsigned long long* w13s_arr = d_batch_upload + max_ept;
+    unsigned long long* w2p_arr  = d_batch_upload + max_ept * 2;
+    unsigned long long* w2s_arr  = d_batch_upload + max_ept * 3;
+    float* wts_arr = (float*)(d_batch_upload + max_ept * 4);
+
+    int batch_count = 0;
+    int cold_count = 0;
+    int layer_base = layer_idx * num_experts * 4;
+
+    for (int i = 0; i < topk && batch_count < max_ept; i++) {
+        int eid = topk_ids[i];
+        if (eid < 0) continue;
+
+        int ptr_base = layer_base + eid * 4;
+        unsigned long long w13p = d_expert_ptrs[ptr_base + 0];
+
+        if (w13p != 0) {
+            // HCS hit — write VRAM pointers directly to batch upload
+            w13p_arr[batch_count] = w13p;
+            w13s_arr[batch_count] = d_expert_ptrs[ptr_base + 1];
+            w2p_arr[batch_count]  = d_expert_ptrs[ptr_base + 2];
+            w2s_arr[batch_count]  = d_expert_ptrs[ptr_base + 3];
+            wts_arr[batch_count]  = topk_weights[i];
+            batch_count++;
+        } else {
+            // Cold miss — record for CPU DMA
+            mapped_cold_buf[2 + cold_count] = eid;
+            mapped_cold_buf[2 + topk + cold_count] = batch_count;
+            wts_arr[batch_count] = topk_weights[i];
+            batch_count++;
+            cold_count++;
+        }
+    }
+
+    // Fill remaining slots with dummy expert (zero weight)
+    for (int i = batch_count; i < topk && i < max_ept; i++) {
+        w13p_arr[i] = dummy_ptr;
+        w13s_arr[i] = dummy_ptr;
+        w2p_arr[i]  = dummy_ptr;
+        w2s_arr[i]  = dummy_ptr;
+        wts_arr[i]  = 0.0f;
+    }
+
+    // Write cold count and ready flag (CPU polls these)
+    // Use __threadfence_system to ensure all writes are visible to CPU
+    mapped_cold_buf[0] = cold_count;
+    __threadfence_system();
+    mapped_cold_buf[1] = 1;  // ready flag — CPU can now read
+}
+
 // ── Fused Gate GEMV + TopK ─────────────────────────────────────────────
 //
 // Replaces: bf16_to_fp32 + cuBLAS gate GEMV + sigmoid_topk/softmax_topk
@@ -3607,5 +3705,168 @@ extern "C" __global__ void marlin_gemv_int8_f32(
 
     if (k_slice == 0) {
         output[n] = acc;
+    }
+}
+
+// ── Fused LA Post-Projection Kernel ─────────────────────────────────────
+//
+// Combines 6 separate kernels into one per-head launch:
+//   1. Repeat-interleave Q and K from [nk, dk] to [nv, dk]
+//   2. L2 normalize Q (with scale) and K (scale=1.0)
+//   3. Gated delta net step (state decay, recall, update, readout)
+//   4. Gated RMSNorm + SiLU → BF16 output
+//
+// One block per head (gridDim.x = nv). Eliminates 5 kernel launches per LA layer.
+// Requires shared memory: dk * 2 (Q and K) + dv + 32 (for warp reduction) floats.
+//
+extern "C" __global__ void la_fused_post_proj(
+    float* __restrict__ state,             // [nv, dk, dv] in/out (recurrence state)
+    const float* __restrict__ q_in,        // [nk * dk] (from conv1d output: SiLU(conv(proj_q)))
+    const float* __restrict__ k_in,        // [nk * dk] (from conv1d output: SiLU(conv(proj_k)))
+    const float* __restrict__ v_in,        // [nv * dv] (from conv1d output: SiLU(conv(proj_v)))
+    const float* __restrict__ gate,        // [nv] (from compute_gate_beta)
+    const float* __restrict__ beta,        // [nv] (from compute_gate_beta)
+    const float* __restrict__ z,           // [nv * dv] (saved from uninterleave)
+    const float* __restrict__ norm_weight, // [dv] (per-head norm weights)
+    unsigned short* __restrict__ bf16_out, // [nv * dv] BF16 output
+    float q_scale,                         // L2 norm scale for Q
+    float eps,                             // RMSNorm epsilon
+    long long dims_packed                  // (nv_dk << 32) | dv_ratio, each 16-bit packed
+) {
+    // Unpack: high 32 bits = (nv << 16) | dk, low 32 bits = (dv << 16) | ratio
+    int nv_dk = (int)(dims_packed >> 32);
+    int dv_ratio = (int)(dims_packed & 0xFFFFFFFF);
+    int nv = (nv_dk >> 16) & 0xFFFF;
+    int dk = nv_dk & 0xFFFF;
+    int dv = (dv_ratio >> 16) & 0xFFFF;
+    int ratio = dv_ratio & 0xFFFF;
+
+    int head = blockIdx.x;
+    if (head >= nv) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    // Shared memory layout: [dk] Q + [dk] K + [dv + 32] scratch
+    extern __shared__ float smem[];
+    float* s_q = smem;              // [dk]
+    float* s_k = smem + dk;         // [dk]
+    float* s_scratch = smem + 2 * dk; // [dv + 32]
+
+    // ── Step 1: Repeat-interleave Q and K ──
+    // Map output head -> input head: in_head = head / ratio
+    int in_head = head / ratio;
+    for (int i = tid; i < dk; i += num_threads) {
+        s_q[i] = q_in[in_head * dk + i];
+        s_k[i] = k_in[in_head * dk + i];
+    }
+    __syncthreads();
+
+    // ── Step 2: L2 normalize Q (with scale) and K (scale=1.0) ──
+    float sum_sq_q = 0.0f;
+    float sum_sq_k = 0.0f;
+    for (int i = tid; i < dk; i += num_threads) {
+        sum_sq_q += s_q[i] * s_q[i];
+        sum_sq_k += s_k[i] * s_k[i];
+    }
+
+    // Warp reduction for both
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq_q += __shfl_down_sync(0xffffffff, sum_sq_q, offset);
+        sum_sq_k += __shfl_down_sync(0xffffffff, sum_sq_k, offset);
+    }
+
+    __shared__ float warp_sums_q[32];
+    __shared__ float warp_sums_k[32];
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    if (lane_id == 0) {
+        warp_sums_q[warp_id] = sum_sq_q;
+        warp_sums_k[warp_id] = sum_sq_k;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float total_q = 0.0f, total_k = 0.0f;
+        int num_warps = (num_threads + warpSize - 1) / warpSize;
+        for (int w = 0; w < num_warps; w++) {
+            total_q += warp_sums_q[w];
+            total_k += warp_sums_k[w];
+        }
+        warp_sums_q[0] = rsqrtf(total_q + 1e-12f) * q_scale;
+        warp_sums_k[0] = rsqrtf(total_k + 1e-12f);
+    }
+    __syncthreads();
+
+    float norm_q = warp_sums_q[0];
+    float norm_k = warp_sums_k[0];
+    for (int i = tid; i < dk; i += num_threads) {
+        s_q[i] *= norm_q;
+        s_k[i] *= norm_k;
+    }
+    __syncthreads();
+
+    // ── Step 3: Gated delta net step ──
+    float g = gate[head];
+    float b = beta[head];
+    int mat_size = dk * dv;
+    float* S = state + head * mat_size;
+    const float* v_h = v_in + head * dv;
+
+    // Decay state
+    for (int idx = tid; idx < mat_size; idx += num_threads) {
+        S[idx] *= g;
+    }
+    __syncthreads();
+
+    // Memory recall + delta + state update + readout
+    // Store recurrence output in s_scratch[0..dv]
+    for (int j = tid; j < dv; j += num_threads) {
+        float kv_mem = 0.0f;
+        for (int i = 0; i < dk; i++) {
+            kv_mem += S[i * dv + j] * s_k[i];
+        }
+        float delta = (v_h[j] - kv_mem) * b;
+        for (int i = 0; i < dk; i++) {
+            S[i * dv + j] += s_k[i] * delta;
+        }
+        // Readout
+        float acc = 0.0f;
+        for (int i = 0; i < dk; i++) {
+            acc += s_q[i] * S[i * dv + j];
+        }
+        s_scratch[j] = acc;
+    }
+    __syncthreads();
+
+    // ── Step 4: Gated RMSNorm + SiLU → BF16 ──
+    // RMSNorm on s_scratch[0..dv]
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dv; i += num_threads) {
+        sum_sq += s_scratch[i] * s_scratch[i];
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+    if (lane_id == 0) warp_sums_q[warp_id] = sum_sq;  // reuse warp_sums_q
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        int num_warps = (num_threads + warpSize - 1) / warpSize;
+        for (int w = 0; w < num_warps; w++) total += warp_sums_q[w];
+        warp_sums_q[0] = rsqrtf(total / (float)dv + eps);
+    }
+    __syncthreads();
+    float rms_scale = warp_sums_q[0];
+
+    const float* z_h = z + head * dv;
+    unsigned short* out_h = bf16_out + head * dv;
+    for (int i = tid; i < dv; i += num_threads) {
+        float normed = s_scratch[i] * rms_scale * norm_weight[i];
+        float zv = z_h[i];
+        float silu_z = zv / (1.0f + expf(-zv));
+        __nv_bfloat16 result = __float2bfloat16(silu_z * normed);
+        out_h[i] = *reinterpret_cast<unsigned short*>(&result);
     }
 }

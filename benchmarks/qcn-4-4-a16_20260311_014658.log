@@ -1,0 +1,656 @@
+Loaded config from /home/main/Documents/Claude/krasis/testconfigs/qcn-4-4-a16.conf: {'model_path': '/home/main/.krasis/models/Qwen3-Coder-Next', 'num_gpus': 1, 'layer_group_size': 2, 'kv_dtype': 'fp8_e4m3', 'gpu_expert_bits': 4, 'cpu_expert_bits': 4, 'attention_quant': 'bf16', 'shared_expert_quant': 'int8', 'dense_mlp_quant': 'int8', 'lm_head_quant': 'int8', 'krasis_threads': 16, 'host': '0.0.0.0', 'port': 8012, 'gpu_prefill_threshold': 300, 'gguf_path': '', 'force_load': False}
+Archived previous log → logs/krasis_20260311_014505.log
+2026-03-11 01:47:02,023 krasis.server INFO Logging to /home/main/Documents/Claude/krasis/krasis.log
+2026-03-11 01:47:02,023 krasis.server INFO === Config file: /home/main/Documents/Claude/krasis/testconfigs/qcn-4-4-a16.conf ===
+2026-03-11 01:47:02,023 krasis.server INFO   # QCN benchmark config — BF16 attention
+2026-03-11 01:47:02,023 krasis.server INFO   MODEL_PATH="/home/main/.krasis/models/Qwen3-Coder-Next"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_SELECTED_GPUS="0"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_PP_PARTITION="48"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_LAYER_GROUP_SIZE="2"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_KV_DTYPE="fp8_e4m3"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_GPU_EXPERT_BITS="4"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_CPU_EXPERT_BITS="4"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_ATTENTION_QUANT="bf16"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_SHARED_EXPERT_QUANT="int8"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_DENSE_MLP_QUANT="int8"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_LM_HEAD_QUANT="int8"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_KRASIS_THREADS="16"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_HOST="0.0.0.0"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_PORT="8012"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_GPU_PREFILL_THRESHOLD="300"
+2026-03-11 01:47:02,023 krasis.server INFO   CFG_GGUF_PATH=""
+2026-03-11 01:47:02,024 krasis.server INFO   CFG_FORCE_LOAD=""
+2026-03-11 01:47:02,024 krasis.server INFO === Resolved arguments ===
+2026-03-11 01:47:02,024 krasis.server INFO   attention_quant = 'bf16'
+2026-03-11 01:47:02,024 krasis.server INFO   benchmark = False
+2026-03-11 01:47:02,024 krasis.server INFO   benchmark_only = True
+2026-03-11 01:47:02,024 krasis.server INFO   config = None
+2026-03-11 01:47:02,024 krasis.server INFO   cpu_expert_bits = 4
+2026-03-11 01:47:02,024 krasis.server INFO   dense_mlp_quant = 'int8'
+2026-03-11 01:47:02,024 krasis.server INFO   draft_context = 512
+2026-03-11 01:47:02,024 krasis.server INFO   draft_k = 3
+2026-03-11 01:47:02,024 krasis.server INFO   draft_model = None
+2026-03-11 01:47:02,024 krasis.server INFO   enable_thinking = True
+2026-03-11 01:47:02,024 krasis.server INFO   force_load = False
+2026-03-11 01:47:02,024 krasis.server INFO   gguf_path = ''
+2026-03-11 01:47:02,024 krasis.server INFO   gpu_decode = True
+2026-03-11 01:47:02,024 krasis.server INFO   gpu_expert_bits = 4
+2026-03-11 01:47:02,024 krasis.server INFO   gpu_prefill_threshold = 300
+2026-03-11 01:47:02,024 krasis.server INFO   hcs = True
+2026-03-11 01:47:02,024 krasis.server INFO   hcs_headroom_mb = 1024
+2026-03-11 01:47:02,024 krasis.server INFO   heatmap_path = None
+2026-03-11 01:47:02,024 krasis.server INFO   host = '0.0.0.0'
+2026-03-11 01:47:02,024 krasis.server INFO   krasis_threads = 16
+2026-03-11 01:47:02,024 krasis.server INFO   kv_cache_mb = 1000
+2026-03-11 01:47:02,024 krasis.server INFO   kv_dtype = 'fp8_e4m3'
+2026-03-11 01:47:02,024 krasis.server INFO   layer_group_size = 2
+2026-03-11 01:47:02,024 krasis.server INFO   lm_head_quant = 'int8'
+2026-03-11 01:47:02,024 krasis.server INFO   model_path = '/home/main/.krasis/models/Qwen3-Coder-Next'
+2026-03-11 01:47:02,024 krasis.server INFO   multi_gpu_hcs = False
+2026-03-11 01:47:02,024 krasis.server INFO   no_stream_attention = False
+2026-03-11 01:47:02,024 krasis.server INFO   note = None
+2026-03-11 01:47:02,025 krasis.server INFO   num_gpus = 1
+2026-03-11 01:47:02,025 krasis.server INFO   perplexity = False
+2026-03-11 01:47:02,025 krasis.server INFO   port = 8012
+2026-03-11 01:47:02,025 krasis.server INFO   session_enabled = False
+2026-03-11 01:47:02,025 krasis.server INFO   shared_expert_quant = 'int8'
+2026-03-11 01:47:02,025 krasis.server INFO   stream_attention = False
+2026-03-11 01:47:02,025 krasis.server INFO   stress_test = False
+2026-03-11 01:47:02,025 krasis.server INFO   temperature = 0.6
+2026-03-11 01:47:02,025 krasis.server INFO   timing = False
+2026-03-11 01:47:02,025 krasis.server INFO   vram_safety_margin = 1000
+
+[1m[36m▸ Krasis — Qwen3-Coder-Next[0m
+2026-03-11 01:47:02,103 krasis.server INFO ── Krasis — Qwen3-Coder-Next ──
+  [32mDecode: GPU  |  HCS: on  |  GPUs: 1[0m
+  [32mExperts: GPU INT4  |  Attention: bf16  |  KV: fp8_e4m3[0m
+  [32mLayer groups: 2  |  KV cache: 1000 MB  |  Threads: 16[0m
+  [2mGPU-only mode: CPU expert weights and CPU decoder skipped[0m
+2026-03-11 01:47:02,103 krasis.server INFO HCS strategy: PP=1, 1 GPUs available
+2026-03-11 01:47:02,179 krasis.model INFO KrasisModel: 48 layers, PP=[48], 1 GPUs, attn=flashinfer, hybrid=12 full + 36 linear
+
+[1m[36m▸ Loading model weights[0m
+2026-03-11 01:47:02,216 krasis.server INFO ── Loading model weights ──
+  [33m[VRAM before-load][0m cuda:0: alloc=0 MB, reserved=0 MB, used=518 MB, free=31600 MB, total=32119 MB
+2026-03-11 01:47:02,375 krasis.model INFO VRAM_CHECKPOINT [before-load] cuda:0: alloc=0 MB, reserved=0 MB, driver_used=518 MB, free=31600 MB, total=32119 MB
+  [33m[VRAM before-load][0m cuda:1: alloc=0 MB, reserved=0 MB, used=100 MB, free=15857 MB, total=15957 MB
+2026-03-11 01:47:02,511 krasis.model INFO VRAM_CHECKPOINT [before-load] cuda:1: alloc=0 MB, reserved=0 MB, driver_used=100 MB, free=15857 MB, total=15957 MB
+2026-03-11 01:47:02,512 krasis.model INFO RAM watchdog started: will exit if < 5.0% free
+
+[1m[36m▸ Loading GPU weights[0m
+2026-03-11 01:47:02,512 krasis.model INFO Phase 1: Loading GPU weights (streaming INT8)...
+2026-03-11 01:47:02,545 krasis.model INFO Resident attention: all 48 layers permanently on GPU0, 1 GPUs for EP
+2026-03-11 01:47:02,545 krasis.model INFO Loading full base model to cuda:0...
+2026-03-11 01:47:02,545 krasis.weight_loader INFO Loading embedding: model.embed_tokens.weight
+2026-03-11 01:47:02,712 krasis.weight_loader INFO Layer 0 loaded in 0.1s (GPU alloc: 663 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:02,776 krasis.weight_loader INFO Layer 1 loaded in 0.0s (GPU alloc: 737 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:02,806 krasis.weight_loader INFO Layer 2 loaded in 0.0s (GPU alloc: 810 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:02,833 krasis.weight_loader INFO Layer 3 loaded in 0.0s (GPU alloc: 871 MB, moe=True, type=full_attention)
+2026-03-11 01:47:02,834 krasis.attention INFO Layer 3: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:02,871 krasis.weight_loader INFO Layer 4 loaded in 0.0s (GPU alloc: 1208 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:02,901 krasis.weight_loader INFO Layer 5 loaded in 0.0s (GPU alloc: 1282 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:02,931 krasis.weight_loader INFO Layer 6 loaded in 0.0s (GPU alloc: 1355 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:02,958 krasis.weight_loader INFO Layer 7 loaded in 0.0s (GPU alloc: 1416 MB, moe=True, type=full_attention)
+2026-03-11 01:47:02,958 krasis.attention INFO Layer 7: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:02,995 krasis.weight_loader INFO Layer 8 loaded in 0.0s (GPU alloc: 1498 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,026 krasis.weight_loader INFO Layer 9 loaded in 0.0s (GPU alloc: 1571 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,056 krasis.weight_loader INFO Layer 10 loaded in 0.0s (GPU alloc: 1644 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,084 krasis.weight_loader INFO Layer 11 loaded in 0.0s (GPU alloc: 1705 MB, moe=True, type=full_attention)
+2026-03-11 01:47:03,084 krasis.attention INFO Layer 11: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:03,122 krasis.weight_loader INFO Layer 12 loaded in 0.0s (GPU alloc: 1787 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,150 krasis.weight_loader INFO Layer 13 loaded in 0.0s (GPU alloc: 1860 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,180 krasis.weight_loader INFO Layer 14 loaded in 0.0s (GPU alloc: 1933 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,209 krasis.weight_loader INFO Layer 15 loaded in 0.0s (GPU alloc: 1994 MB, moe=True, type=full_attention)
+2026-03-11 01:47:03,209 krasis.attention INFO Layer 15: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:03,247 krasis.weight_loader INFO Layer 16 loaded in 0.0s (GPU alloc: 2076 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,278 krasis.weight_loader INFO Layer 17 loaded in 0.0s (GPU alloc: 2149 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,306 krasis.weight_loader INFO Layer 18 loaded in 0.0s (GPU alloc: 2223 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,334 krasis.weight_loader INFO Layer 19 loaded in 0.0s (GPU alloc: 2284 MB, moe=True, type=full_attention)
+2026-03-11 01:47:03,334 krasis.attention INFO Layer 19: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:03,372 krasis.weight_loader INFO Layer 20 loaded in 0.0s (GPU alloc: 2365 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,403 krasis.weight_loader INFO Layer 21 loaded in 0.0s (GPU alloc: 2438 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,434 krasis.weight_loader INFO Layer 22 loaded in 0.0s (GPU alloc: 2512 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,463 krasis.weight_loader INFO Layer 23 loaded in 0.0s (GPU alloc: 2573 MB, moe=True, type=full_attention)
+2026-03-11 01:47:03,463 krasis.attention INFO Layer 23: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:03,499 krasis.weight_loader INFO Layer 24 loaded in 0.0s (GPU alloc: 2654 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,531 krasis.weight_loader INFO Layer 25 loaded in 0.0s (GPU alloc: 2727 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,562 krasis.weight_loader INFO Layer 26 loaded in 0.0s (GPU alloc: 2801 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,590 krasis.weight_loader INFO Layer 27 loaded in 0.0s (GPU alloc: 2862 MB, moe=True, type=full_attention)
+2026-03-11 01:47:03,591 krasis.attention INFO Layer 27: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:03,629 krasis.weight_loader INFO Layer 28 loaded in 0.0s (GPU alloc: 2943 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,661 krasis.weight_loader INFO Layer 29 loaded in 0.0s (GPU alloc: 3017 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,690 krasis.weight_loader INFO Layer 30 loaded in 0.0s (GPU alloc: 3090 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,719 krasis.weight_loader INFO Layer 31 loaded in 0.0s (GPU alloc: 3151 MB, moe=True, type=full_attention)
+2026-03-11 01:47:03,720 krasis.attention INFO Layer 31: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:03,759 krasis.weight_loader INFO Layer 32 loaded in 0.0s (GPU alloc: 3232 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,791 krasis.weight_loader INFO Layer 33 loaded in 0.0s (GPU alloc: 3306 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,822 krasis.weight_loader INFO Layer 34 loaded in 0.0s (GPU alloc: 3379 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,849 krasis.weight_loader INFO Layer 35 loaded in 0.0s (GPU alloc: 3440 MB, moe=True, type=full_attention)
+2026-03-11 01:47:03,849 krasis.attention INFO Layer 35: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:03,887 krasis.weight_loader INFO Layer 36 loaded in 0.0s (GPU alloc: 3522 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,919 krasis.weight_loader INFO Layer 37 loaded in 0.0s (GPU alloc: 3595 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,950 krasis.weight_loader INFO Layer 38 loaded in 0.0s (GPU alloc: 3668 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:03,979 krasis.weight_loader INFO Layer 39 loaded in 0.0s (GPU alloc: 3729 MB, moe=True, type=full_attention)
+2026-03-11 01:47:03,979 krasis.attention INFO Layer 39: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:04,018 krasis.weight_loader INFO Layer 40 loaded in 0.0s (GPU alloc: 3811 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:04,046 krasis.weight_loader INFO Layer 41 loaded in 0.0s (GPU alloc: 3884 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:04,078 krasis.weight_loader INFO Layer 42 loaded in 0.0s (GPU alloc: 3957 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:04,108 krasis.weight_loader INFO Layer 43 loaded in 0.0s (GPU alloc: 4018 MB, moe=True, type=full_attention)
+2026-03-11 01:47:04,108 krasis.attention INFO Layer 43: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:04,146 krasis.weight_loader INFO Layer 44 loaded in 0.0s (GPU alloc: 4100 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:04,178 krasis.weight_loader INFO Layer 45 loaded in 0.0s (GPU alloc: 4173 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:04,210 krasis.weight_loader INFO Layer 46 loaded in 0.0s (GPU alloc: 4247 MB, moe=True, type=linear_attention)
+2026-03-11 01:47:04,236 krasis.weight_loader INFO Layer 47 loaded in 0.0s (GPU alloc: 4308 MB, moe=True, type=full_attention)
+2026-03-11 01:47:04,236 krasis.attention INFO Layer 47: gated attention detected (q_proj dim=8192, expected=4096)
+2026-03-11 01:47:04,245 krasis.weight_loader INFO Loading final norm: model.norm.weight
+2026-03-11 01:47:04,246 krasis.weight_loader INFO Loading LM head: lm_head.weight (precision=int8)
+2026-03-11 01:47:05,348 krasis.model INFO VRAM[after-layers-loaded] GPU0: free=26796 MB, alloc=4616 MB, reserved=4636 MB, non-pytorch=686 MB
+2026-03-11 01:47:05,583 krasis.model INFO GPU0: 4617 MB allocated
+2026-03-11 01:47:05,583 krasis.model INFO GPU weights loaded in 3.4s
+  [33m[VRAM after-phase1-gpu-weights][0m cuda:0: alloc=4616 MB, reserved=4636 MB, used=5322 MB, free=26796 MB, total=32119 MB
+2026-03-11 01:47:05,584 krasis.model INFO VRAM_CHECKPOINT [after-phase1-gpu-weights] cuda:0: alloc=4616 MB, reserved=4636 MB, driver_used=5322 MB, free=26796 MB, total=32119 MB
+  [33m[VRAM after-phase1-gpu-weights][0m cuda:1: alloc=0 MB, reserved=0 MB, used=100 MB, free=15857 MB, total=15957 MB
+2026-03-11 01:47:05,584 krasis.model INFO VRAM_CHECKPOINT [after-phase1-gpu-weights] cuda:1: alloc=0 MB, reserved=0 MB, driver_used=100 MB, free=15857 MB, total=15957 MB
+2026-03-11 01:47:05,586 krasis.model INFO Attention resident on GPU: 3180 MB, GPU free: 26796 MB
+  [0;32mAttention resident on GPU (3180 MB), 26796 MB free[0m
+
+[1m[36m▸ Loading GPU expert weights from cache (GPU-only mode, no CPU experts)[0m
+2026-03-11 01:47:05,586 krasis.model INFO Phase 2: Loading GPU expert weights only (GPU INT4, skipping CPU)...
+2026-03-11 01:47:05,586 krasis.model INFO shared_expert_gate detected — Rust engine will skip shared experts (handled on GPU)
+2026-03-11 01:47:31,800 krasis.model INFO Krasis engine: 48 MoE layers, 512 experts, hidden=2048
+2026-03-11 01:47:31,883 krasis.model INFO Routing weights sent to Rust engine (48 MoE layers)
+2026-03-11 01:47:31,884 krasis.model INFO Expert weights loaded in 26.3s
+  [0;32mExpert weights loaded in 26s.[0m
+  [33m[VRAM after-phase2-expert-weights][0m cuda:0: alloc=4616 MB, reserved=4636 MB, used=5322 MB, free=26796 MB, total=32119 MB
+2026-03-11 01:47:31,884 krasis.model INFO VRAM_CHECKPOINT [after-phase2-expert-weights] cuda:0: alloc=4616 MB, reserved=4636 MB, driver_used=5322 MB, free=26796 MB, total=32119 MB
+  [33m[VRAM after-phase2-expert-weights][0m cuda:1: alloc=0 MB, reserved=0 MB, used=100 MB, free=15857 MB, total=15957 MB
+2026-03-11 01:47:31,885 krasis.model INFO VRAM_CHECKPOINT [after-phase2-expert-weights] cuda:1: alloc=0 MB, reserved=0 MB, driver_used=100 MB, free=15857 MB, total=15957 MB
+
+[1m[36m▸ Initializing GPU prefill managers[0m
+2026-03-11 01:47:31,885 krasis.gpu_prefill INFO GpuPrefillManager(rank 0/1): expert_slice=[0, 512), local_count=512
+2026-03-11 01:47:31,885 krasis.gpu_prefill INFO GPU prefill group_size=128
+2026-03-11 01:47:31,885 krasis.gpu_prefill INFO Auto chunk_size: 512 experts (1.6 MB each, 11134.4 MB budget of 28098.2 MB free)
+2026-03-11 01:47:31,885 krasis.gpu_prefill INFO Layer-grouped mode: 2 layers/group, 24 groups, ~1660.9 MB per group, 48 total MoE layers
+2026-03-11 01:47:31,885 krasis.gpu_prefill INFO GpuPrefillManager(engine): experts=512, hidden=2048, intermediate=512, chunk_size=512, num_chunks=1, shared=1, scale=1.000, num_bits=4, prefill_mode=layer_grouped, layer_group_size=2
+2026-03-11 01:47:31,885 krasis.model INFO GPU prefill manager created for cuda:0 (rank 0/1)
+2026-03-11 01:47:31,886 krasis.gpu_prefill INFO Engine path: Marlin-native DMA copy (zero conversion, zero RAM cache)
+2026-03-11 01:47:31,886 krasis.model INFO Building prefill pinned buffers for cuda:0...
+2026-03-11 01:47:31,886 krasis.gpu_prefill INFO Pre-allocating double-buffered pinned DMA buffers: 2x 830.5 MB (w13p=536.9, w13s=16.8, w2p=268.4, w2s=8.4)
+2026-03-11 01:47:33,232 krasis.gpu_prefill INFO Double-buffered pinned DMA allocated: 2x 830.5 MB in 1.3s
+2026-03-11 01:47:40,509 krasis.gpu_prefill INFO   Prefill pinned bufs: 10/48 layers (8.3 GB)
+2026-03-11 01:47:47,701 krasis.gpu_prefill INFO   Prefill pinned bufs: 20/48 layers (16.6 GB)
+2026-03-11 01:47:54,956 krasis.gpu_prefill INFO   Prefill pinned bufs: 30/48 layers (24.9 GB)
+2026-03-11 01:48:02,531 krasis.gpu_prefill INFO   Prefill pinned bufs: 40/48 layers (33.2 GB)
+2026-03-11 01:48:09,423 krasis.gpu_prefill INFO   Prefill pinned bufs: 48/48 layers (39.9 GB)
+2026-03-11 01:48:09,423 krasis.gpu_prefill INFO Prefill pinned buffers built: 48 layers, 39.9 GB pinned RAM, 36.2s (1.1 GB/s)
+2026-03-11 01:48:09,423 krasis.model INFO GPU prefill: 1 managers, threshold=1 tokens
+  [33m[VRAM after-phase3-prefill-managers][0m cuda:0: alloc=4616 MB, reserved=4636 MB, used=5400 MB, free=26718 MB, total=32119 MB
+2026-03-11 01:48:09,424 krasis.model INFO VRAM_CHECKPOINT [after-phase3-prefill-managers] cuda:0: alloc=4616 MB, reserved=4636 MB, driver_used=5400 MB, free=26718 MB, total=32119 MB
+  [33m[VRAM after-phase3-prefill-managers][0m cuda:1: alloc=0 MB, reserved=0 MB, used=178 MB, free=15779 MB, total=15957 MB
+2026-03-11 01:48:09,424 krasis.model INFO VRAM_CHECKPOINT [after-phase3-prefill-managers] cuda:1: alloc=0 MB, reserved=0 MB, driver_used=178 MB, free=15779 MB, total=15957 MB
+2026-03-11 01:48:09,424 krasis.kv_cache INFO KV cache: 1000 MB → 5333 pages (85.3K tokens)
+2026-03-11 01:48:09,441 krasis.kv_cache INFO KV cache allocated: 12 layers × 5333 pages × 16 tokens = 1000 MB (gqa, gqa-split)
+2026-03-11 01:48:09,441 krasis.model INFO Hybrid model: 12 full attention layers (KV cache), 36 linear attention layers
+  [33m[VRAM after-kv-cache-init][0m cuda:0: alloc=5616 MB, reserved=5636 MB, used=6400 MB, free=25718 MB, total=32119 MB
+2026-03-11 01:48:09,442 krasis.model INFO VRAM_CHECKPOINT [after-kv-cache-init] cuda:0: alloc=5616 MB, reserved=5636 MB, driver_used=6400 MB, free=25718 MB, total=32119 MB
+  [33m[VRAM after-kv-cache-init][0m cuda:1: alloc=0 MB, reserved=0 MB, used=178 MB, free=15779 MB, total=15957 MB
+2026-03-11 01:48:09,442 krasis.model INFO VRAM_CHECKPOINT [after-kv-cache-init] cuda:1: alloc=0 MB, reserved=0 MB, driver_used=178 MB, free=15779 MB, total=15957 MB
+2026-03-11 01:48:10,282 krasis.tokenizer INFO Tokenizer loaded: vocab=151643, eos=151645, bos=-1
+  [33m[VRAM after-full-load][0m cuda:0: alloc=5616 MB, reserved=5636 MB, used=6400 MB, free=25718 MB, total=32119 MB
+2026-03-11 01:48:10,282 krasis.model INFO VRAM_CHECKPOINT [after-full-load] cuda:0: alloc=5616 MB, reserved=5636 MB, driver_used=6400 MB, free=25718 MB, total=32119 MB
+  [33m[VRAM after-full-load][0m cuda:1: alloc=0 MB, reserved=0 MB, used=178 MB, free=15779 MB, total=15957 MB
+2026-03-11 01:48:10,282 krasis.model INFO VRAM_CHECKPOINT [after-full-load] cuda:1: alloc=0 MB, reserved=0 MB, driver_used=178 MB, free=15779 MB, total=15957 MB
+2026-03-11 01:48:10,283 krasis.model INFO Model fully loaded in 68.1s
+
+[1m[36m▸ CUDA runtime warmup[0m
+2026-03-11 01:48:10,292 krasis.server INFO ── CUDA runtime warmup ──
+2026-03-11 01:48:10,295 krasis.model INFO Warming up CUDA runtime on all devices: ['cuda:0']
+2026-03-11 01:48:10,296 krasis.model WARNING CUDA warmup (cuBLAS) on cuda:0 failed: Boolean value of Tensor with more than one value is ambiguous
+2026-03-11 01:48:14,215 krasis.server ERROR [stderr] <frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+2026-03-11 01:48:14,216 krasis.server ERROR [stderr] <frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+<frozen importlib._bootstrap_external>:1241: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+2026-03-11 01:48:14,394 krasis.linear_attention INFO Compiled linear attention chunk step (default/Inductor mode)
+2026-03-11 01:48:15,233 krasis.linear_attention INFO Linear attention torch.compile warmup complete on cuda:0
+2026-03-11 01:48:15,504 krasis.model INFO CUDA runtime warmup on cuda:0 complete: 10 MB consumed (26968 MB free before → 26957 MB free after)
+  [32mcuBLAS + Triton kernel compilation done[0m
+
+[1m[36m▸ Setting up GPU decode store[0m
+2026-03-11 01:48:15,505 krasis.server INFO ── Setting up GPU decode store ──
+2026-03-11 01:49:09,646 krasis.model INFO Registered shared_expert_gate for layer 0: wid=205 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 1: wid=206 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 2: wid=207 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 3: wid=208 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 4: wid=209 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 5: wid=210 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 6: wid=211 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 7: wid=212 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 8: wid=213 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 9: wid=214 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 10: wid=215 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,647 krasis.model INFO Registered shared_expert_gate for layer 11: wid=216 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 12: wid=217 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 13: wid=218 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 14: wid=219 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 15: wid=220 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 16: wid=221 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 17: wid=222 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 18: wid=223 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 19: wid=224 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 20: wid=225 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 21: wid=226 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 22: wid=227 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 23: wid=228 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 24: wid=229 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 25: wid=230 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 26: wid=231 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 27: wid=232 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 28: wid=233 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 29: wid=234 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 30: wid=235 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 31: wid=236 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 32: wid=237 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 33: wid=238 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 34: wid=239 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,648 krasis.model INFO Registered shared_expert_gate for layer 35: wid=240 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 36: wid=241 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 37: wid=242 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 38: wid=243 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 39: wid=244 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 40: wid=245 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 41: wid=246 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 42: wid=247 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 43: wid=248 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 44: wid=249 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 45: wid=250 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 46: wid=251 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,649 krasis.model INFO Registered shared_expert_gate for layer 47: wid=252 shape=torch.Size([1, 2048])
+2026-03-11 01:49:09,660 krasis.model INFO Shared FP8 KV cache: 12 GQA layers, max_seq=85328 (5333 pages × 16)
+2026-03-11 01:49:09,660 krasis.model INFO GPU decode store configured: 48 layers, store_addr=434436096
+  [32mGPU decode store ready (addr=0x19e4f800)[0m
+  [2mVRAM monitor started (tracking warmup)[0m
+  [2mcuda:0: 0 MB total[0m
+
+[1m[36m▸ Warmup (prefill + decode, no HCS)[0m
+2026-03-11 01:49:09,661 krasis.server INFO ── Warmup (prefill + decode, no HCS) ──
+  [2mTriggering lazy CUDA allocations (torch.compile, FlashInfer, cuBLAS)[0m
+2026-03-11 01:49:09,661 krasis.gpu_prefill INFO Engine path: Marlin-native DMA copy (zero conversion, zero RAM cache)
+2026-03-11 01:49:09,661 krasis.model INFO Building prefill pinned buffers for cuda:0...
+2026-03-11 01:49:09,661 krasis.model INFO GPU prefill: 1 managers, threshold=1 tokens
+  [33m[VRAM before-prefill-warmup][0m cuda:0: alloc=6332 MB, reserved=8022 MB, used=9129 MB, free=22990 MB
+2026-03-11 01:49:09,662 krasis.server INFO VRAM_SNAP [before-prefill-warmup] cuda:0: alloc=6332 MB, reserved=8022 MB, used=9129 MB, free=22990 MB, total=32119 MB
+  [33m[VRAM before-prefill-warmup][0m cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB
+2026-03-11 01:49:09,666 krasis.server INFO VRAM_SNAP [before-prefill-warmup] cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB, total=15957 MB
+2026-03-11 01:49:09,666 krasis.server INFO Warming up prefill (50K tokens, GPU kernels + CUDA caches)...
+2026-03-11 01:49:09,700 krasis.model INFO DMA pipelining ENABLED (1 managers, 48 groups)
+2026-03-11 01:49:09,732 krasis.gpu_prefill INFO Layer group loaded: 1 MoE layers = 830.5 MB in 0.03s (GPU total: 7468.8 MB)
+2026-03-11 01:49:12,082 krasis.model INFO server_prefill: 37 tokens in 2.35s (16 tok/s), decode_mode=gpu
+  [33m[VRAM after-prefill-warmup-before-cleanup][0m cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB
+2026-03-11 01:49:12,085 krasis.server INFO VRAM_SNAP [after-prefill-warmup-before-cleanup] cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB, total=32119 MB
+  [33m[VRAM after-prefill-warmup-before-cleanup][0m cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB
+2026-03-11 01:49:12,087 krasis.server INFO VRAM_SNAP [after-prefill-warmup-before-cleanup] cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB, total=15957 MB
+2026-03-11 01:49:12,087 krasis.server INFO Prefill warmup: 37 tokens processed
+  [33m[VRAM after-prefill-warmup-after-cleanup][0m cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB
+2026-03-11 01:49:12,087 krasis.server INFO VRAM_SNAP [after-prefill-warmup-after-cleanup] cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB, total=32119 MB
+  [33m[VRAM after-prefill-warmup-after-cleanup][0m cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB
+2026-03-11 01:49:12,088 krasis.server INFO VRAM_SNAP [after-prefill-warmup-after-cleanup] cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB, total=15957 MB
+2026-03-11 01:49:12,088 krasis.server INFO Prefill warmup complete (2.4s, 37 tokens)
+2026-03-11 01:49:12,088 krasis.server INFO Warming up GPU decode (1 steps)...
+  [33m[VRAM before-decode-warmup][0m cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB
+2026-03-11 01:49:12,088 krasis.server INFO VRAM_SNAP [before-decode-warmup] cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB, total=32119 MB
+  [33m[VRAM before-decode-warmup][0m cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB
+2026-03-11 01:49:12,089 krasis.server INFO VRAM_SNAP [before-decode-warmup] cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB, total=15957 MB
+2026-03-11 01:49:12,090 krasis.model INFO DMA pipelining ENABLED (1 managers, 48 groups)
+2026-03-11 01:49:12,121 krasis.gpu_prefill INFO Layer group loaded: 1 MoE layers = 830.5 MB in 0.03s (GPU total: 7468.8 MB)
+2026-03-11 01:49:13,691 krasis.model INFO server_prefill: 9 tokens in 1.60s (6 tok/s), decode_mode=gpu
+  [33m[VRAM decode-warmup-after-prefill][0m cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB
+2026-03-11 01:49:13,693 krasis.server INFO VRAM_SNAP [decode-warmup-after-prefill] cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB, total=32119 MB
+  [33m[VRAM decode-warmup-after-prefill][0m cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB
+2026-03-11 01:49:13,693 krasis.server INFO VRAM_SNAP [decode-warmup-after-prefill] cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB, total=15957 MB
+  [33m[VRAM decode-warmup-after-gpu-decode][0m cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB
+2026-03-11 01:49:13,813 krasis.server INFO VRAM_SNAP [decode-warmup-after-gpu-decode] cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB, total=32119 MB
+  [33m[VRAM decode-warmup-after-gpu-decode][0m cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB
+2026-03-11 01:49:13,813 krasis.server INFO VRAM_SNAP [decode-warmup-after-gpu-decode] cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB, total=15957 MB
+  [33m[VRAM decode-warmup-after-cleanup][0m cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB
+2026-03-11 01:49:13,814 krasis.server INFO VRAM_SNAP [decode-warmup-after-cleanup] cuda:0: alloc=6404 MB, reserved=6838 MB, used=7947 MB, free=24172 MB, total=32119 MB
+  [33m[VRAM decode-warmup-after-cleanup][0m cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB
+2026-03-11 01:49:13,814 krasis.server INFO VRAM_SNAP [decode-warmup-after-cleanup] cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB, total=15957 MB
+2026-03-11 01:49:13,814 krasis.server INFO Decode warmup complete (1.7s)
+2026-03-11 01:49:13,814 krasis.gpu_prefill INFO Engine path: Marlin-native DMA copy (zero conversion, zero RAM cache)
+2026-03-11 01:49:13,814 krasis.model INFO Building prefill pinned buffers for cuda:0...
+2026-03-11 01:49:13,815 krasis.model INFO GPU prefill: 1 managers, threshold=1 tokens
+  [32mWarmup complete in 4.2s[0m
+  [2mcuda:0 warmup:  peak 9,554 MB used / 32,119 MB total  (min free: 22,564 MB)[0m
+2026-03-11 01:49:13,815 krasis.server INFO VRAM warmup cuda:0: peak_used=9554 MB, min_free=22564 MB, total=32119 MB
+
+[1m[36m▸ VRAM calibration (4-point measurement)[0m
+2026-03-11 01:49:13,815 krasis.server INFO ── VRAM calibration (4-point measurement) ──
+  [32mSafety margin: 1,000 MB[0m
+  [32mUsing layer_group_size=2 (same as runtime)[0m
+  [32mBaseline free VRAM: 24,174 MB / 32,119 MB[0m
+  [2mCapture: short prompt prefill (~500 tokens)[0m
+2026-03-11 01:49:14,113 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:49:14,174 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8301.2 MB)
+2026-03-11 01:49:15,705 krasis.model INFO server_prefill: 469 tokens in 1.59s (295 tok/s), decode_mode=gpu
+  [2m  short prefill: 469 tokens, min_free=20,988 MB[0m
+  [2mCapture: short prompt decode[0m
+  [2m  short decode: min_free=24,172 MB[0m
+  [2mCapture: long prompt prefill (~68K tokens)[0m
+2026-03-11 01:49:16,450 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:49:16,511 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8552.2 MB)
+2026-03-11 01:49:34,678 krasis.model INFO server_prefill: 61435 tokens in 18.23s (3370 tok/s), decode_mode=gpu
+  [2m  long prefill: 61435 tokens, min_free=19,344 MB[0m
+  [2mCapture: long prompt decode[0m
+  [2m  long decode: min_free=23,612 MB[0m
+
+[1m[36m▸ VRAM calibration complete[0m
+2026-03-11 01:49:35,557 krasis.server INFO ── VRAM calibration complete ──
+  [32mPrefill: 27.6 KB/token (20,988 MB @ 469 tok -> 19,344 MB @ 61435 tok)[0m
+  [32mDecode:  9.4 KB/token (24,172 MB @ short -> 23,612 MB @ long)[0m
+  [32mHard HCS budget: 18,344 MB  |  Soft HCS budget: 4,828 MB  |  Total: 23,172 MB[0m
+  [32mFree VRAM: 23,734 MB / 32,119 MB[0m
+2026-03-11 01:49:35,557 krasis.server INFO VRAM budget (4-point): hard=18344 MB, soft=4828 MB, free=23734 MB, prefill=27.6 KB/tok, decode=9.4 KB/tok
+
+[1m[36m▸ Calculating HCS budget[0m
+2026-03-11 01:49:35,782 krasis.server INFO ── Calculating HCS budget ──
+  [2mUsing cached heatmap: auto_heatmap.json[0m
+  [32mHeatmap: 15,923 experts ranked from 15,923 entries[0m
+  [2mVRAM calibration: prefill 27.6 KB/tok, decode 9.4 KB/tok | hard HCS: 18344 MB, soft HCS: 4828 MB, total: 23172 MB[0m
+  [2mGPU0 HCS: 24576 experts (15923 ranked + 8653 unranked), hard: 18,344 MB, soft: 4,828 MB[0m
+
+[1m[36m▸ Loading HCS pool (hard + soft tier)[0m
+2026-03-11 01:49:35,802 krasis.server INFO ── Loading HCS pool (hard + soft tier) ──
+
+[1m[36m▸ HCS pool loaded[0m
+2026-03-11 01:49:37,400 krasis.server INFO ── HCS pool loaded ──
+  [32mHCS pool: 11858/24576 experts loaded in 1.20s (48.3% coverage), 18342.8 MB VRAM, 0 free slots, window=10, replace=25% | soft: 3121 experts in 0.32s (4827.8 MB) | total: 14979/24576 (60.9%) coverage[0m
+  [2mLoaded in 1.6s[0m
+2026-03-11 01:49:37,400 krasis.server INFO HCS pool: HCS pool: 11858/24576 experts loaded in 1.20s (48.3% coverage), 18342.8 MB VRAM, 0 free slots, window=10, replace=25% | soft: 3121 experts in 0.32s (4827.8 MB) | total: 14979/24576 (60.9%) coverage (1.6s)
+
+[1m[36m▸ Decode validation[0m
+2026-03-11 01:49:37,400 krasis.server INFO ── Decode validation ──
+2026-03-11 01:49:37,401 krasis.server INFO Warming up GPU decode (2 steps)...
+  [33m[VRAM before-decode-warmup][0m cuda:0: alloc=6504 MB, reserved=7276 MB, used=31553 MB, free=566 MB
+2026-03-11 01:49:37,401 krasis.server INFO VRAM_SNAP [before-decode-warmup] cuda:0: alloc=6504 MB, reserved=7276 MB, used=31553 MB, free=566 MB, total=32119 MB
+  [33m[VRAM before-decode-warmup][0m cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB
+2026-03-11 01:49:37,401 krasis.server INFO VRAM_SNAP [before-decode-warmup] cuda:1: alloc=0 MB, reserved=0 MB, used=274 MB, free=15683 MB, total=15957 MB
+2026-03-11 01:49:37,403 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:49:37,468 krasis.model WARNING Prefill OOM (attempt 1/3): reducing chunk_size 9 → 128
+2026-03-11 01:49:37,468 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:49:37,504 krasis.server WARNING Decode warmup failed (non-fatal): CUDA out of memory. Tried to allocate 512.00 MiB. GPU 0 has a total capacity of 31.37 GiB of which 56.56 MiB is free. Including non-PyTorch memory, this process has 31.12 GiB memory in use. Of the allocated memory 7.04 GiB is allocated by PyTorch, and 578.56 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+  [32mDecode validation passed[0m
+
+[1m[36m▸ VRAM monitor: runtime warnings enabled[0m
+2026-03-11 01:49:37,505 krasis.server INFO ── VRAM monitor: runtime warnings enabled ──
+  [32mSafety margin: 1,000 MB — warnings on every new low below this[0m
+2026-03-11 01:49:37,505 krasis.server INFO VRAM monitor: runtime warnings enabled (safety margin: 1000 MB)
+
+[1m[36m▸ Server ready on 0.0.0.0:8012[0m
+2026-03-11 01:49:37,505 krasis.server INFO ── Server ready on 0.0.0.0:8012 ──
+  [32mDecode: GPU  |  HCS: on  |  Max context: 85,328 tokens[0m
+  [2mKV cache: 1,000 MB[0m
+  [2mPress Q or Ctrl-C to stop[0m
+2026-03-11 01:49:37,505 krasis.server INFO Model loaded, starting server on 0.0.0.0:8012 (max context: 85328, decode: GPU)
+2026-03-11 01:49:37,505 krasis.server INFO Registry entry written: /home/main/.krasis/servers/1272514.json
+
+[1m════════════════════════════════════════════════
+  KRASIS BENCHMARK
+════════════════════════════════════════════════[0m
+
+[1m[36m▸ Collecting system info[0m
+[1;33m⚠ VRAM MONITOR: new low on cuda:0 — 56 MB free (safety margin: 1000 MB, deficit: 944 MB)[0m
+  Model:    [1mQwen3-Coder-Next[0m
+  GPUs:     2x NVIDIA GeForce RTX 5090
+  Strategy: gpu_decode (layer_grouped(2))
+
+[1m[36m▸ Loading benchmark prompts (warmup + timed at 1K/5K/10K/20K/35K/50K)[0m
+  Warmup prefill:  3 prompts, ~25,000 tokens each
+  Timed prefill:   6 prompts at 1K/5K/10K/20K/35K/50K tokens
+    [1] 1,000 tokens
+    [2] 5,000 tokens
+    [3] 10,000 tokens
+    [4] 20,000 tokens
+    [5] 35,000 tokens
+    [6] 50,000 tokens
+  Decode:          6 prompts (50/100/250 tokens, warmup + timed)
+
+[1m[36m▸ Warmup (3 prefill + 3 decode via engine)[0m
+  Warmup: 2 short engine requests...
+  [33mHCS soft: evicted 3121 experts (4827.8 MB freed) in 0.6ms for prefill (~14 tokens)[0m
+2026-03-11 01:49:47,183 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:49:47,245 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8388.0 MB)
+2026-03-11 01:49:48,777 krasis.model INFO server_prefill: 14 tokens in 1.60s (9 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.3ms[0m
+[krasis] gpu_generate_stream called: first_token=9707, start_pos=14, max_tokens=7
+[krasis] CUDA graph infrastructure initialized (has_dummy=true, workspace=32KB)
+[krasis] CUDA graph buffers initialized
+[krasis] step=0 has_graph_bufs=true
+[krasis] Capturing 49 per-layer graphs (48 MoE layers, range 0-48, emb=true, final=true)
+[krasis] Captured graph 0 (routing-L0)
+[krasis] Captured graph 1 (experts-L0-routing-L1)
+[krasis] Captured graph 2 (experts-L1-routing-L2)
+[krasis] Captured graph 3 (experts-L2-routing-L3)
+[krasis] Captured graph 4 (experts-L3-routing-L4)
+[krasis] Captured graph 5 (experts-L4-routing-L5)
+[krasis] Captured graph 6 (experts-L5-routing-L6)
+[krasis] Captured graph 7 (experts-L6-routing-L7)
+[krasis] Captured graph 8 (experts-L7-routing-L8)
+[krasis] Captured graph 9 (experts-L8-routing-L9)
+[krasis] Captured graph 10 (experts-L9-routing-L10)
+[krasis] Captured graph 11 (experts-L10-routing-L11)
+[krasis] Captured graph 12 (experts-L11-routing-L12)
+[krasis] Captured graph 13 (experts-L12-routing-L13)
+[krasis] Captured graph 14 (experts-L13-routing-L14)
+[krasis] Captured graph 15 (experts-L14-routing-L15)
+[krasis] Captured graph 16 (experts-L15-routing-L16)
+[krasis] Captured graph 17 (experts-L16-routing-L17)
+[krasis] Captured graph 18 (experts-L17-routing-L18)
+[krasis] Captured graph 19 (experts-L18-routing-L19)
+[krasis] Captured graph 20 (experts-L19-routing-L20)
+[krasis] Captured graph 21 (experts-L20-routing-L21)
+[krasis] Captured graph 22 (experts-L21-routing-L22)
+[krasis] Captured graph 23 (experts-L22-routing-L23)
+[krasis] Captured graph 24 (experts-L23-routing-L24)
+[krasis] Captured graph 25 (experts-L24-routing-L25)
+[krasis] Captured graph 26 (experts-L25-routing-L26)
+[krasis] Captured graph 27 (experts-L26-routing-L27)
+[krasis] Captured graph 28 (experts-L27-routing-L28)
+[krasis] Captured graph 29 (experts-L28-routing-L29)
+[krasis] Captured graph 30 (experts-L29-routing-L30)
+[krasis] Captured graph 31 (experts-L30-routing-L31)
+[krasis] Captured graph 32 (experts-L31-routing-L32)
+[krasis] Captured graph 33 (experts-L32-routing-L33)
+[krasis] Captured graph 34 (experts-L33-routing-L34)
+[krasis] Captured graph 35 (experts-L34-routing-L35)
+[krasis] Captured graph 36 (experts-L35-routing-L36)
+[krasis] Captured graph 37 (experts-L36-routing-L37)
+[krasis] Captured graph 38 (experts-L37-routing-L38)
+[krasis] Captured graph 39 (experts-L38-routing-L39)
+[krasis] Captured graph 40 (experts-L39-routing-L40)
+[krasis] Captured graph 41 (experts-L40-routing-L41)
+[krasis] Captured graph 42 (experts-L41-routing-L42)
+[krasis] Captured graph 43 (experts-L42-routing-L43)
+[krasis] Captured graph 44 (experts-L43-routing-L44)
+[krasis] Captured graph 45 (experts-L44-routing-L45)
+[krasis] Captured graph 46 (experts-L45-routing-L46)
+[krasis] Captured graph 47 (experts-L46-routing-L47)
+[krasis] Captured graph 48 (experts-L47-final)
+[krasis] Per-layer graphs captured: 49 graphs
+[krasis] Per-layer CUDA graphs captured after token 0
+  [32mHCS soft: async reload complete — 3121 experts activated[0m
+  [32mdecode: 4 tokens in 0.11s (35.6 tok/s)  VRAM: 508 MB free now, 508 MB min free during decode[0m
+  [33mHCS soft: evicted 3121 experts (4827.8 MB freed) in 0.6ms for prefill (~15 tokens)[0m
+2026-03-11 01:49:49,367 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:49:49,429 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.3 MB)
+2026-03-11 01:49:50,963 krasis.model INFO server_prefill: 15 tokens in 1.60s (9 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.3ms[0m
+[krasis] gpu_generate_stream called: first_token=17, start_pos=15, max_tokens=7
+  [32mHCS soft: async reload complete — 3121 experts activated[0m
+  [32mdecode: 2 tokens in 0.06s (33.1 tok/s)  VRAM: 508 MB free now, 508 MB min free during decode[0m
+  Warmup complete.
+  Prefill warmup (3 runs, ~25K tokens each)...
+  [33mHCS soft: evicted 3121 experts (4827.8 MB freed) in 0.6ms for prefill (~25000 tokens)[0m
+2026-03-11 01:49:51,676 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:49:51,738 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8499.0 MB)
+2026-03-11 01:49:58,954 krasis.model INFO server_prefill: 25000 tokens in 7.28s (3435 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 199.0ms[0m
+    [1/3] 25,000 tokens
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:49:59,555 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:49:59,617 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8499.1 MB)
+2026-03-11 01:50:06,819 krasis.model INFO server_prefill: 25000 tokens in 7.26s (3441 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.9ms[0m
+    [2/3] 25,000 tokens
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:50:07,427 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:50:07,489 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8499.1 MB)
+2026-03-11 01:50:14,710 krasis.model INFO server_prefill: 25000 tokens in 7.28s (3433 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.8ms[0m
+    [3/3] 25,000 tokens
+  Decode warmup (50/100/250 tokens, 3 separate prompts)...
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:50:15,211 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:50:15,273 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.6 MB)
+2026-03-11 01:50:16,808 krasis.model INFO server_prefill: 55 tokens in 1.60s (34 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.7ms[0m
+[krasis] gpu_generate_stream called: first_token=334, start_pos=55, max_tokens=49
+  [32mdecode: 1 tokens in 0.03s (29.3 tok/s)  VRAM: 508 MB free now, 508 MB min free during decode[0m
+    50 tokens done
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:50:17,376 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:50:17,438 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.5 MB)
+2026-03-11 01:50:18,969 krasis.model INFO server_prefill: 61 tokens in 1.59s (38 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.3ms[0m
+[krasis] gpu_generate_stream called: first_token=2, start_pos=61, max_tokens=99
+  [32mHCS soft: async reload complete — 3121 experts activated[0m
+  [32mdecode: 2 tokens in 0.06s (36.3 tok/s)  VRAM: 508 MB free now, 508 MB min free during decode[0m
+    100 tokens done
+  [33mHCS soft: evicted 3121 experts (4827.8 MB freed) in 0.6ms for prefill (~59 tokens)[0m
+2026-03-11 01:50:19,522 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:50:19,583 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.5 MB)
+2026-03-11 01:50:21,114 krasis.model INFO server_prefill: 59 tokens in 1.59s (37 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.2ms[0m
+[krasis] gpu_generate_stream called: first_token=334, start_pos=59, max_tokens=249
+  [32mHCS soft: async reload complete — 3121 experts activated[0m
+  [32mdecode: 4 tokens in 0.08s (49.3 tok/s)  VRAM: 506 MB free now, 506 MB min free during decode[0m
+    250 tokens done
+  Warmup complete (30.1s). All kernels compiled.
+
+[1m[36m▸ Prefill (internal) — 1K/5K/10K/20K/35K/50K tokens, 6 runs[0m
+  [33mHCS soft: evicted 3121 experts (4827.8 MB freed) in 0.6ms for prefill (~1000 tokens)[0m
+2026-03-11 01:50:21,710 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:50:21,772 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8401.3 MB)
+2026-03-11 01:50:23,301 krasis.model INFO server_prefill: 1000 tokens in 1.59s (629 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.7ms[0m
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:50:23,812 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:50:23,874 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8416.8 MB)
+2026-03-11 01:50:25,983 krasis.model INFO server_prefill: 5000 tokens in 2.17s (2303 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.9ms[0m
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:50:26,518 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:50:26,580 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8437.4 MB)
+2026-03-11 01:50:29,976 krasis.model INFO server_prefill: 10000 tokens in 3.46s (2892 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 199.0ms[0m
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:50:30,552 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:50:30,614 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8478.5 MB)
+2026-03-11 01:50:36,560 krasis.model INFO server_prefill: 20000 tokens in 6.01s (3329 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.8ms[0m
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:50:37,212 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:50:37,274 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8540.1 MB)
+2026-03-11 01:50:46,998 krasis.model INFO server_prefill: 35000 tokens in 9.79s (3576 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.8ms[0m
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:50:47,718 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:50:47,779 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8601.8 MB)
+2026-03-11 01:51:02,141 krasis.model INFO server_prefill: 50000 tokens in 14.42s (3466 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 199.0ms[0m
+  Run 1: 618.2 tok/s (1,000 tokens in 1617.7ms)
+  Run 2: 2,266.9 tok/s (5,000 tokens in 2205.7ms)
+  Run 3: 2,852.6 tok/s (10,000 tokens in 3505.6ms)
+  Run 4: 3,292.1 tok/s (20,000 tokens in 6075.1ms)
+  Run 5: 3,536.9 tok/s (35,000 tokens in 9895.7ms)
+  Run 6: 3,429.9 tok/s (50,000 tokens in 14577.9ms)
+  [1mBest: 3,536.9 tok/s (35,000 tokens)[0m
+
+[1m[36m▸ Decode (internal) — 50/100/250 tokens, 3 separate prompts[0m
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:51:02,639 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:51:02,701 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.7 MB)
+2026-03-11 01:51:04,233 krasis.model INFO server_prefill: 57 tokens in 1.60s (36 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.2ms[0m
+[krasis] gpu_generate_stream called: first_token=334, start_pos=57, max_tokens=49
+  [32mHCS soft: async reload complete — 3121 experts activated[0m
+  [32mdecode: 2 tokens in 0.05s (38.0 tok/s)  VRAM: 508 MB free now, 508 MB min free during decode[0m
+  [33mHCS soft: evicted 3121 experts (4827.8 MB freed) in 0.6ms for prefill (~62 tokens)[0m
+2026-03-11 01:51:04,783 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:51:04,844 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.5 MB)
+2026-03-11 01:51:06,378 krasis.model INFO server_prefill: 62 tokens in 1.60s (39 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.3ms[0m
+[krasis] gpu_generate_stream called: first_token=334, start_pos=62, max_tokens=99
+  [32mdecode: 1 tokens in 0.03s (30.4 tok/s)  VRAM: 504 MB free now, 504 MB min free during decode[0m
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:51:06,950 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:51:07,011 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.5 MB)
+2026-03-11 01:51:08,546 krasis.model INFO server_prefill: 57 tokens in 1.60s (36 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.5ms[0m
+[krasis] gpu_generate_stream called: first_token=334, start_pos=57, max_tokens=249
+  [32mdecode: 1 tokens in 0.03s (37.9 tok/s)  VRAM: 508 MB free now, 508 MB min free during decode[0m
+   50 tokens: [33mFAILED (EOS at 3 tokens)[0m
+  100 tokens: [33mFAILED (EOS at 2 tokens)[0m
+  250 tokens: [33mFAILED (EOS at 2 tokens)[0m
+  [33m[1mAll decode runs failed (EOS too early)[0m
+  HCS:  11858/24576 experts loaded (48.3%)
+  VRAM: 504 MB min free during benchmark
+
+[1m[36m▸ Round trip (network) — 50/100/250 tokens via HTTP[0m
+  [33mHCS soft: cancelled pending async reload (4827.8 MB freed)[0m
+2026-03-11 01:51:08,945 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:51:09,007 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.3 MB)
+2026-03-11 01:51:10,539 krasis.model INFO server_prefill: 10 tokens in 1.59s (6 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.4ms[0m
+[krasis] gpu_generate_stream called: first_token=39814, start_pos=10, max_tokens=7
+  [32mHCS soft: async reload complete — 3121 experts activated[0m
+  [32mdecode: 2 tokens in 0.05s (38.5 tok/s)  VRAM: 508 MB free now, 508 MB min free during decode[0m
+  [33mHCS soft: evicted 3121 experts (4827.8 MB freed) in 0.4ms for prefill (~57 tokens)[0m
+2026-03-11 01:51:10,837 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:51:10,899 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.5 MB)
+2026-03-11 01:51:12,434 krasis.model INFO server_prefill: 57 tokens in 1.60s (36 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.2ms[0m
+[krasis] gpu_generate_stream called: first_token=2, start_pos=57, max_tokens=49
+  [32mHCS soft: async reload complete — 3121 experts activated[0m
+  [32mdecode: 2 tokens in 0.05s (38.4 tok/s)  VRAM: 508 MB free now, 508 MB min free during decode[0m
+  [33mHCS soft: evicted 3121 experts (4827.8 MB freed) in 0.3ms for prefill (~62 tokens)[0m
+2026-03-11 01:51:12,725 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:51:12,787 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.5 MB)
+2026-03-11 01:51:14,318 krasis.model INFO server_prefill: 62 tokens in 1.59s (39 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.3ms[0m
+[krasis] gpu_generate_stream called: first_token=334, start_pos=62, max_tokens=99
+  [32mHCS soft: async reload complete — 3121 experts activated[0m
+  [32mdecode: 7 tokens in 0.13s (55.8 tok/s)  VRAM: 508 MB free now, 508 MB min free during decode[0m
+  [33mHCS soft: evicted 3121 experts (4827.8 MB freed) in 0.4ms for prefill (~57 tokens)[0m
+2026-03-11 01:51:14,697 krasis.model INFO DMA pipelining ENABLED (1 managers, 24 groups)
+2026-03-11 01:51:14,759 krasis.gpu_prefill INFO Layer group loaded: 2 MoE layers = 1660.9 MB in 0.06s (GPU total: 8396.5 MB)
+2026-03-11 01:51:16,293 krasis.model INFO server_prefill: 57 tokens in 1.60s (36 tok/s), decode_mode=gpu
+  [36mHCS soft: async reload queued 3121 experts (4827.8 MB) in 198.2ms[0m
+[krasis] gpu_generate_stream called: first_token=334, start_pos=57, max_tokens=249
+  [32mdecode: 1 tokens in 0.03s (30.5 tok/s)  VRAM: 508 MB free now, 508 MB min free during decode[0m
+   50 tokens: [33mFAILED (EOS at 2 tokens)[0m
+  100 tokens: [33mFAILED (EOS at 7 tokens)[0m
+  250 tokens: [33mFAILED (EOS at 1 tokens)[0m
+  [33m[1mAll round trip runs failed (EOS too early)[0m
+
+[1m[36m▸ Writing results[0m
+
+[1m────────────────────────────────────────────────
+  BENCHMARK COMPLETE
+────────────────────────────────────────────────[0m
+  Prefill (internal):    [32m[1m3,536.9 tok/s[0m  (best of 1K/5K/10K/20K/35K/50K)
+  Decode (internal):     [33m[1mFAILED[0m  (all runs hit EOS early)
+  Round trip (network):  [33m[1mFAILED[0m  (all runs hit EOS early)
+  HCS coverage:          11858/24576 (48.3%)
+  Min free VRAM:         504 MB
+  Log:     [2mbenchmarks/Qwen3-Coder-Next_native_1gpu_int4gpu_int4cpu.log[0m
+
