@@ -315,7 +315,9 @@ extern "C" __global__ void expert_classify_prepare(
     int num_experts,
     int topk,
     int max_ept,
-    unsigned long long dummy_ptr  // dummy expert pointer for unfilled slots (same for all 4)
+    unsigned long long dummy_ptr,  // dummy expert pointer for unfilled slots (same for all 4)
+    volatile int* __restrict__ mapped_activations, // [num_moe * topk] for post-hoc recording (NULL to skip)
+    int moe_seq_idx   // sequential index of this MoE layer (0, 1, 2, ...)
 ) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
@@ -339,7 +341,7 @@ extern "C" __global__ void expert_classify_prepare(
         unsigned long long w13p = d_expert_ptrs[ptr_base + 0];
 
         if (w13p != 0) {
-            // HCS hit — write VRAM pointers directly to batch upload
+            // HCS hit (or mapped host pointer) — write pointers directly to batch upload
             w13p_arr[batch_count] = w13p;
             w13s_arr[batch_count] = d_expert_ptrs[ptr_base + 1];
             w2p_arr[batch_count]  = d_expert_ptrs[ptr_base + 2];
@@ -363,6 +365,15 @@ extern "C" __global__ void expert_classify_prepare(
         w2p_arr[i]  = dummy_ptr;
         w2s_arr[i]  = dummy_ptr;
         wts_arr[i]  = 0.0f;
+    }
+
+    // Write topk IDs to mapped activations buffer for post-hoc HCS recording
+    if (mapped_activations != NULL) {
+        int act_base = moe_seq_idx * topk;
+        for (int i = 0; i < topk; i++) {
+            mapped_activations[act_base + i] = topk_ids[i];
+        }
+        __threadfence_system();  // ensure visible to CPU after final sync
     }
 
     // Write cold count and ready flag (CPU polls these)

@@ -447,6 +447,15 @@ struct HcsState {
     d_expert_ptrs_ne: usize,
     /// Number of layers for d_expert_ptrs indexing.
     d_expert_ptrs_nl: usize,
+
+    // ── Mapped host memory fallback pointers ──
+    /// Mapped device pointers for ALL experts (GPU-accessible host memory via PCIe).
+    /// Same shape as cache_fast: [num_layers * num_experts_per_layer] x 4 pointers.
+    /// When an expert is evicted from HCS, d_expert_ptrs reverts to these instead of zero.
+    /// This allows GPU to read cold expert data directly over PCIe without CPU-initiated DMA.
+    mapped_fallback: Vec<[u64; 4]>,
+    /// Whether mapped reads are available (all experts have mapped device pointers).
+    mapped_reads_available: bool,
 }
 
 impl HcsState {
@@ -492,6 +501,8 @@ impl HcsState {
             d_expert_ptrs: None,
             d_expert_ptrs_ne: 0,
             d_expert_ptrs_nl: 0,
+            mapped_fallback: Vec::new(),
+            mapped_reads_available: false,
         }
     }
 
@@ -594,15 +605,25 @@ impl HcsState {
     }
 
     /// Clear the GPU-side expert pointer table when an expert is evicted.
+    /// If mapped fallback is available, writes mapped host device pointers instead of zeros
+    /// so the GPU can still read this expert directly over PCIe.
     fn gpu_expert_ptrs_clear(&self, layer: usize, expert: usize) {
         if let Some(ref buf) = self.d_expert_ptrs {
             let idx = (layer * self.d_expert_ptrs_ne + expert) * 4;
-            let zeros = [0u64; 4];
+            // Use mapped fallback pointers if available, otherwise zeros
+            let fallback_idx = if self.num_experts_per_layer > 0 {
+                layer * self.num_experts_per_layer + expert
+            } else { usize::MAX };
+            let ptrs = if self.mapped_reads_available && fallback_idx < self.mapped_fallback.len() {
+                self.mapped_fallback[fallback_idx]
+            } else {
+                [0u64; 4]
+            };
             unsafe {
                 let dst = *buf.device_ptr() + (idx * 8) as u64;
                 let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
                     dst,
-                    zeros.as_ptr() as *const std::ffi::c_void,
+                    ptrs.as_ptr() as *const std::ffi::c_void,
                     32,
                     std::ptr::null_mut(),
                 );
@@ -676,6 +697,13 @@ struct ExpertDataPtr {
     /// When set, DMA can use a single cuMemcpyHtoDAsync call.
     contiguous_ptr: usize,
     contiguous_bytes: usize,
+    /// GPU-accessible device pointers to mapped host memory (for zero-copy GPU reads).
+    /// Set when cuMemHostRegister with CU_MEMHOSTREGISTER_DEVICEMAP succeeds.
+    /// GPU SMs can read this data directly over PCIe without CPU-initiated DMA.
+    mapped_w13_packed_dptr: u64,
+    mapped_w13_scales_dptr: u64,
+    mapped_w2_packed_dptr: u64,
+    mapped_w2_scales_dptr: u64,
 }
 
 /// Per-layer expert data for DMA.
@@ -1094,6 +1122,13 @@ struct GpuDecodeGraph {
     mapped_cold_buf: Option<PinnedMapped>,
     /// Whether GPU-side route sync is active (classify kernel available + HCS has d_expert_ptrs)
     gpu_route_sync: bool,
+    /// Whether mapped host memory reads are active (GPU reads cold experts directly over PCIe).
+    /// When true, d_expert_ptrs contains valid pointers for ALL experts (VRAM for cached,
+    /// mapped host for cold), and no CPU sync/DMA is needed between graph replays.
+    mapped_reads_active: bool,
+    /// Mapped activation buffer for recording topk IDs when mapped reads bypass CPU sync.
+    /// Layout: [num_moe_layers * topk] i32 — classify kernel writes per-layer topk IDs here.
+    mapped_activations: Option<PinnedMapped>,
 
     // Cached kernel function handles (populated after configure)
     kernels: Option<CachedKernels>,
@@ -1759,6 +1794,8 @@ impl GpuDecodeStore {
             // GPU-side route sync: [cold_count, ready_flag, cold_ids[topk], cold_slots[topk]]
             mapped_cold_buf: PinnedMapped::new((2 + max_experts_per_tok * 2) * 4).ok(),
             gpu_route_sync: false,
+            mapped_reads_active: false,
+            mapped_activations: None,
             kernels: None,
             pre_events: None,
             norm_bias_one: false,
@@ -5158,7 +5195,9 @@ impl GpuDecodeStore {
         // Include embedding only in first graph AND if segment owns it
         let include_embedding = is_first && seg_do_embedding;
 
-        self.run_segment_kernels(graph, expert_layer, routing_range, include_embedding, include_final)
+        // moe_seq_idx: the index of the MoE layer being routed in this segment
+        let moe_seq_idx = if !is_last { graph_idx } else { 0 };
+        self.run_segment_kernels(graph, expert_layer, routing_range, include_embedding, include_final, moe_seq_idx)
     }
 
     /// Run the actual kernels for one graph segment.
@@ -5166,6 +5205,7 @@ impl GpuDecodeStore {
     /// - routing_range: if Some((start, end)), run routing for layers start..=end
     /// - include_embedding: run embedding lookup
     /// - include_final: run final norm + LM head
+    /// - moe_seq_idx: sequential index of the MoE layer being routed (for mapped activations)
     fn run_segment_kernels(
         &self,
         graph: &mut GpuDecodeGraph,
@@ -5173,6 +5213,7 @@ impl GpuDecodeStore {
         routing_range: Option<(usize, usize)>,
         include_embedding: bool,
         include_final: bool,
+        moe_seq_idx: usize,
     ) -> Result<(), String> {
         use cudarc::driver::LaunchConfig;
 
@@ -5897,6 +5938,9 @@ impl GpuDecodeStore {
                                         layer_idx, layer_idx, ne, max_access, table_entries));
                                 }
 
+                                // Mapped activations buffer device pointer (0 if not available)
+                                let act_dptr = graph.mapped_activations.as_ref()
+                                    .map(|m| m.device_ptr).unwrap_or(0);
                                 unsafe {
                                     k.expert_classify_prepare.clone().launch(
                                         LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
@@ -5911,6 +5955,8 @@ impl GpuDecodeStore {
                                             topk as i32,
                                             max_ept as i32,
                                             dummy_base,
+                                            act_dptr,
+                                            moe_seq_idx as i32,
                                         ),
                                     ).map_err(|e| format!("expert_classify[{}]: ptrs=[ids={:#x} wts={:#x} eptrs={:#x} upload={:#x} cold={:#x} dummy={:#x}] err={:?}",
                                         layer_idx, topk_ids_dptr, topk_wts_dptr, d_eptrs_ptr, d_upload_ptr, cold_buf_dptr, dummy_base, e))?;
@@ -6022,6 +6068,7 @@ impl GpuDecodeStore {
         let hs = graph.hidden_size;
         let max_ept = graph.max_experts_per_tok;
         let use_pinned = graph.pinned_topk_ids.is_some() && graph.pinned_topk_weights.is_some();
+        let mapped_reads = graph.mapped_reads_active;
 
         // Double-buffer base pointers for cold expert DMA
         let buf_base = [
@@ -6035,17 +6082,76 @@ impl GpuDecodeStore {
 
         // GPU-side route sync state
         let gpu_rs = graph.gpu_route_sync;
-        let cold_buf_host = if gpu_rs {
+        let cold_buf_host = if gpu_rs && !mapped_reads {
             graph.mapped_cold_buf.as_ref().map(|m| m.host_ptr as *mut i32)
         } else { None };
 
-        // Pre-clear ready flag before the first graph (which contains the first classify kernel)
-        if gpu_rs {
+        // Pre-clear ready flag before the first graph (only needed for non-mapped GPU route sync)
+        if gpu_rs && !mapped_reads {
             unsafe {
                 let cold_ptr = cold_buf_host.unwrap();
                 std::ptr::write_volatile(cold_ptr.add(1), 0i32);
             }
         }
+
+        if mapped_reads {
+            // ═══ MAPPED READS FAST PATH ═══
+            // All experts (hot + cold) have valid pointers in d_expert_ptrs.
+            // The classify kernel writes pointers to d_batch_upload for ALL experts.
+            // No CPU sync, no DMA, no classification between graphs.
+            // Just launch all graphs back-to-back on the same stream.
+            for graph_idx in 0..num_graphs {
+                let exec = &graph.per_layer_graphs[graph_idx];
+                let err = unsafe { cuda_sys::lib().cuGraphLaunch(exec.0, replay_stream) };
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("cuGraphLaunch[{}]: {:?}", graph_idx, err));
+                }
+            }
+
+            // Single final sync — all 49 graphs execute sequentially on the stream
+            unsafe {
+                let err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("mapped reads final sync: {:?}", err));
+                }
+            }
+
+            // Record activations from mapped activation buffer (post-sync)
+            if let Some(ref act_buf) = graph.mapped_activations {
+                let act_ptr = act_buf.host_ptr as *const i32;
+                let mut moe_seq = 0usize;
+                for &moe_layer_idx in &moe_indices {
+                    let topk = graph.moe_layers[moe_layer_idx].as_ref()
+                        .map(|m| m.topk).unwrap_or(10);
+                    for i in 0..topk {
+                        let eid = unsafe { *act_ptr.add(moe_seq * topk + i) };
+                        if eid >= 0 {
+                            if let Some(ref mut hcs) = graph.hcs {
+                                hcs.record_activation(moe_layer_idx, eid as usize);
+                            }
+                        }
+                    }
+                    moe_seq += 1;
+                }
+            }
+
+            // D2H logits
+            if do_final {
+                unsafe {
+                    let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                        graph.h_logits.as_mut_ptr() as *mut std::ffi::c_void,
+                        *graph.d_logits.device_ptr(),
+                        graph.vocab_size * 4);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("D2H logits: {:?}", err));
+                    }
+                }
+            }
+
+            return Ok(());
+        }
+
+        // ═══ LEGACY PATH (non-mapped reads) ═══
 
         for graph_idx in 0..num_graphs {
             // ── If not first graph: populate d_batch_upload with expert pointers ──
@@ -10588,6 +10694,10 @@ impl GpuDecodeStore {
                     w2_scales_bytes: w2sb,
                     contiguous_ptr: 0,
                     contiguous_bytes: 0,
+                    mapped_w13_packed_dptr: 0,
+                    mapped_w13_scales_dptr: 0,
+                    mapped_w2_packed_dptr: 0,
+                    mapped_w2_scales_dptr: 0,
                 }
             }
         ).collect();
@@ -10605,6 +10715,10 @@ impl GpuDecodeStore {
                     w2_scales_bytes: w2sb,
                     contiguous_ptr: 0,
                     contiguous_bytes: 0,
+                    mapped_w13_packed_dptr: 0,
+                    mapped_w13_scales_dptr: 0,
+                    mapped_w2_packed_dptr: 0,
+                    mapped_w2_scales_dptr: 0,
                 }
             }
         );
@@ -12836,6 +12950,8 @@ impl GpuDecodeStore {
 
         // Step 4: Pin expert weight memory for async DMA (page-lock for full PCIe bandwidth)
         // Without pinning, CUDA must bounce through a staging buffer, halving effective bandwidth.
+        // NOTE: We use DEFAULT flag (0), NOT DEVICEMAP (0x02). Benchmarking showed DEVICEMAP
+        // causes a 30% DMA regression even when not using mapped reads.
         let t_pin = std::time::Instant::now();
         let mut pinned_regions = 0usize;
         let mut pinned_bytes = 0usize;
@@ -13642,12 +13758,114 @@ impl GpuDecodeStore {
         graph.hcs = Some(hcs);
         graph.gpu_route_sync = gpu_rs;
 
+        // ── Populate mapped fallback + d_expert_ptrs for cold experts ──
+        // If experts have mapped device pointers, fill d_expert_ptrs for ALL uncached experts
+        // so the GPU can read cold expert data directly via PCIe without CPU intervention.
+        {
+            let hcs = graph.hcs.as_mut().unwrap();
+            let total_flat = num_layers * num_experts_per_layer;
+            let mut fallback = vec![[0u64; 4]; total_flat];
+            let mut fully_mapped = 0usize;
+
+            for (layer_idx, moe_opt) in graph.moe_layers.iter().enumerate() {
+                if let Some(ref moe) = moe_opt {
+                    for (eidx, expert) in moe.experts.iter().enumerate() {
+                        if expert.mapped_w13_packed_dptr != 0 && expert.mapped_w13_scales_dptr != 0 &&
+                           expert.mapped_w2_packed_dptr != 0 && expert.mapped_w2_scales_dptr != 0 {
+                            let flat_idx = layer_idx * num_experts_per_layer + eidx;
+                            if flat_idx < total_flat {
+                                fallback[flat_idx] = [
+                                    expert.mapped_w13_packed_dptr,
+                                    expert.mapped_w13_scales_dptr,
+                                    expert.mapped_w2_packed_dptr,
+                                    expert.mapped_w2_scales_dptr,
+                                ];
+                                fully_mapped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            hcs.mapped_fallback = fallback;
+            hcs.mapped_reads_available = fully_mapped == total_experts;
+
+            if hcs.mapped_reads_available {
+                // Upload mapped pointers for all cold (uncached) experts to d_expert_ptrs
+                if let Some(ref d_ptrs_buf) = hcs.d_expert_ptrs {
+                    let mut cold_uploaded = 0usize;
+                    for layer_idx in 0..num_layers {
+                        for eidx in 0..num_experts_per_layer {
+                            // If this expert is NOT in the HCS cache, set its mapped pointer
+                            let is_cached = {
+                                let flat = layer_idx * num_experts_per_layer + eidx;
+                                flat < hcs.cache_fast.len() && hcs.cache_fast[flat][0] != 0
+                            };
+                            if !is_cached {
+                                let flat = layer_idx * num_experts_per_layer + eidx;
+                                let ptrs = hcs.mapped_fallback[flat];
+                                if ptrs[0] != 0 {
+                                    let gpu_idx = (layer_idx * hcs.d_expert_ptrs_ne + eidx) * 4;
+                                    unsafe {
+                                        let dst = *d_ptrs_buf.device_ptr() + (gpu_idx * 8) as u64;
+                                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                            dst,
+                                            ptrs.as_ptr() as *const std::ffi::c_void,
+                                            32,
+                                            std::ptr::null_mut(),
+                                        );
+                                    }
+                                    cold_uploaded += 1;
+                                }
+                            }
+                        }
+                    }
+                    log::info!(
+                        "Mapped reads: uploaded {} cold expert mapped pointers to d_expert_ptrs",
+                        cold_uploaded,
+                    );
+                }
+
+                // Allocate mapped activation buffer: [num_moe_layers * topk] i32
+                let topk_val = graph.moe_layers.iter()
+                    .filter_map(|m| m.as_ref())
+                    .map(|m| m.topk)
+                    .max()
+                    .unwrap_or(10);
+                let num_moe = graph.moe_layers.iter().filter(|m| m.is_some()).count();
+                let act_size = num_moe * topk_val * 4; // i32 per topk per MoE layer
+                graph.mapped_activations = PinnedMapped::new(act_size).ok();
+
+                // Mapped reads: disabled by default. Benchmarking showed 30% regression due to
+                // SM stalls during PCIe reads (Marlin GEMV access pattern generates many small
+                // non-coalesced reads, effective bandwidth << 25 GB/s). The 2ms sync savings
+                // from eliminating CPU round-trips is dwarfed by ~8.7ms of SM stall time.
+                // Enable with KRASIS_MAPPED_READS=1 for testing.
+                let mapped_reads_enabled = std::env::var("KRASIS_MAPPED_READS").map(|v| v == "1").unwrap_or(false);
+                graph.mapped_reads_active = mapped_reads_enabled;
+
+                log::info!(
+                    "Mapped reads {}: {}/{} experts mapped, GPU {}read cold experts via PCIe",
+                    if mapped_reads_enabled { "ACTIVE" } else { "AVAILABLE (disabled, use KRASIS_MAPPED_READS=1)" },
+                    fully_mapped, total_experts,
+                    if mapped_reads_enabled { "will " } else { "can " },
+                );
+            } else {
+                graph.mapped_reads_active = false;
+                log::info!(
+                    "Mapped reads NOT available: {}/{} experts mapped (need all)",
+                    fully_mapped, total_experts,
+                );
+            }
+        }
+
+        let mapped_reads = graph.mapped_reads_active;
         let msg = format!(
             "HCS pool: {}/{} experts loaded in {:.2}s ({:.1}% coverage), {:.1} MB VRAM, \
-             {} free slots, window={}, replace={:.0}%, gpu_route_sync={}",
+             {} free slots, window={}, replace={:.0}%, gpu_route_sync={}, mapped_reads={}",
             loaded, total_experts, load_elapsed, pct,
             pool_alloc_bytes as f64 / (1024.0 * 1024.0),
-            num_slots - loaded, window_size, replacement_pct, gpu_rs,
+            num_slots - loaded, window_size, replacement_pct, gpu_rs, mapped_reads,
         );
         log::info!("{}", msg);
         Ok(msg)
