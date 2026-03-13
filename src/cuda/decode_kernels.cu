@@ -3181,14 +3181,8 @@ extern "C" __global__ void gqa_attention_g(
     __syncthreads();
     float global_max = smem_reduce[0];
 
-    // Pass 2: compute exp-sum and weighted V accumulation
+    // Pass 1b: compute sum_exp using online softmax (distribute positions across threads)
     float local_sum = 0.0f;
-    float local_out[256]; // per-thread V accumulator (head_dim elements this thread handles)
-    int my_count = 0;
-    for (int d = tid; d < head_dim; d += num_threads) {
-        local_out[my_count++] = 0.0f;
-    }
-
     for (int pos = tid; pos < seq_len; pos += num_threads) {
         float score = 0.0f;
         const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
@@ -3201,15 +3195,7 @@ extern "C" __global__ void gqa_attention_g(
                     *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
             }
         }
-        float w = expf(score * sm_scale - global_max);
-        local_sum += w;
-
-        // Accumulate weighted V (each thread handles its own V elements)
-        const __nv_fp8_e4m3* v_vec = v_cache + pos * kv_stride + kv_head * head_dim;
-        int vi = 0;
-        for (int d = tid; d < head_dim; d += num_threads) {
-            local_out[vi++] += w * fp8e4m3_to_f32(v_vec[d]);
-        }
+        local_sum += expf(score * sm_scale - global_max);
     }
 
     // Warp reduce sum
@@ -3224,14 +3210,29 @@ extern "C" __global__ void gqa_attention_g(
         smem_reduce[0] = s;
     }
     __syncthreads();
-    float total_sum = smem_reduce[0];
-    float inv_sum = (total_sum > 0.0f) ? 1.0f / total_sum : 0.0f;
+    float inv_sum = (smem_reduce[0] > 0.0f) ? 1.0f / smem_reduce[0] : 0.0f;
 
-    // Write normalised output
+    // Pass 2: Weighted V sum — distribute DIMENSIONS across threads, each loops over ALL positions.
+    // Recomputes scores (same as non-graph slow path) to avoid storing them.
     float* out = output + qh * head_dim;
-    int vi = 0;
     for (int d = tid; d < head_dim; d += num_threads) {
-        out[d] = local_out[vi++] * inv_sum;
+        float acc = 0.0f;
+        for (int pos = 0; pos < seq_len; pos++) {
+            float score = 0.0f;
+            const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+            for (int dd = 0; dd < head_dim; dd += 16) {
+                uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + dd);
+                const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    score += s_q[dd + j] * fp8e4m3_to_f32(
+                        *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
+                }
+            }
+            float weight = expf(score * sm_scale - global_max) * inv_sum;
+            acc += weight * fp8e4m3_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
+        }
+        out[d] = acc;
     }
 }
 
@@ -3303,13 +3304,8 @@ extern "C" __global__ void gqa_attention_g_bf16(
     __syncthreads();
     float global_max = smem_reduce[0];
 
+    // Pass 1b: compute sum_exp (distribute positions across threads)
     float local_sum = 0.0f;
-    float local_out[256];
-    int my_count = 0;
-    for (int d = tid; d < head_dim; d += num_threads) {
-        local_out[my_count++] = 0.0f;
-    }
-
     for (int pos = tid; pos < seq_len; pos += num_threads) {
         float score = 0.0f;
         const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
@@ -3322,14 +3318,7 @@ extern "C" __global__ void gqa_attention_g_bf16(
                     *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
             }
         }
-        float w = expf(score * sm_scale - global_max);
-        local_sum += w;
-
-        const __nv_fp8_e4m3* v_vec = v_cache + pos * kv_stride + kv_head * head_dim;
-        int vi = 0;
-        for (int d = tid; d < head_dim; d += num_threads) {
-            local_out[vi++] += w * fp8e4m3_to_f32(v_vec[d]);
-        }
+        local_sum += expf(score * sm_scale - global_max);
     }
 
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
@@ -3343,14 +3332,28 @@ extern "C" __global__ void gqa_attention_g_bf16(
         smem_reduce[0] = s;
     }
     __syncthreads();
-    float total_sum = smem_reduce[0];
-    float inv_sum = (total_sum > 0.0f) ? 1.0f / total_sum : 0.0f;
+    float inv_sum = (smem_reduce[0] > 0.0f) ? 1.0f / smem_reduce[0] : 0.0f;
 
-    // Write normalised output as BF16 directly
+    // Pass 2: Weighted V sum — distribute DIMENSIONS across threads, each loops over ALL positions.
     unsigned short* out = output + qh * head_dim;
-    int vi = 0;
     for (int d = tid; d < head_dim; d += num_threads) {
-        __nv_bfloat16 result = __float2bfloat16(local_out[vi++] * inv_sum);
+        float acc = 0.0f;
+        for (int pos = 0; pos < seq_len; pos++) {
+            float score = 0.0f;
+            const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+            for (int dd = 0; dd < head_dim; dd += 16) {
+                uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + dd);
+                const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    score += s_q[dd + j] * fp8e4m3_to_f32(
+                        *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
+                }
+            }
+            float weight = expf(score * sm_scale - global_max) * inv_sum;
+            acc += weight * fp8e4m3_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
+        }
+        __nv_bfloat16 result = __float2bfloat16(acc);
         out[d] = *reinterpret_cast<unsigned short*>(&result);
     }
 }

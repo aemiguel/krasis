@@ -394,6 +394,8 @@ class LauncherConfig:
         self.gguf_path: str = ""
         self.vram_safety_margin: int = 1000
         self.force_load: bool = False
+        self.force_rebuild_cache: bool = False
+        self.build_cache: bool = False
         self.enable_thinking: bool = True
         self.session_enabled: bool = False
 
@@ -478,6 +480,10 @@ class LauncherConfig:
                 pass
         if "CFG_FORCE_LOAD" in saved and saved["CFG_FORCE_LOAD"]:
             self.force_load = saved["CFG_FORCE_LOAD"] == "1"
+        if "CFG_FORCE_REBUILD_CACHE" in saved and saved["CFG_FORCE_REBUILD_CACHE"]:
+            self.force_rebuild_cache = saved["CFG_FORCE_REBUILD_CACHE"] == "1"
+        if "CFG_BUILD_CACHE" in saved and saved["CFG_BUILD_CACHE"]:
+            self.build_cache = saved["CFG_BUILD_CACHE"] == "1"
         if "CFG_ENABLE_THINKING" in saved:
             self.enable_thinking = saved["CFG_ENABLE_THINKING"] != "0"
         if "CFG_SESSION_ENABLED" in saved:
@@ -504,6 +510,8 @@ class LauncherConfig:
             "CFG_GGUF_PATH": self.gguf_path,
             "CFG_VRAM_SAFETY_MARGIN": str(self.vram_safety_margin),
             "CFG_FORCE_LOAD": "1" if self.force_load else "",
+            "CFG_FORCE_REBUILD_CACHE": "1" if self.force_rebuild_cache else "",
+            "CFG_BUILD_CACHE": "1" if self.build_cache else "",
             "CFG_ENABLE_THINKING": "1" if self.enable_thinking else "0",
             "CFG_SESSION_ENABLED": "1" if self.session_enabled else "0",
         }
@@ -1557,7 +1565,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-prefill-threshold", type=int, default=None,
                         help="Min tokens for GPU prefill (default: 300)")
     parser.add_argument("--force-load", action="store_true",
-                        help="Force reload cached weights")
+                        help="Override RAM safety checks and load anyway")
+    parser.add_argument("--force-rebuild-cache", action="store_true",
+                        help="Delete existing expert caches and rebuild from safetensors")
+    parser.add_argument("--build-cache", action="store_true",
+                        help="Build expert caches (if missing) and exit without starting server")
     parser.add_argument("--session-enabled", action="store_true",
                         help="Enable Session messenger bridge")
     parser.add_argument("--benchmark", action="store_true",
@@ -1617,6 +1629,10 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         cfg.gguf_path = args.gguf_path
     if args.force_load:
         cfg.force_load = True
+    if getattr(args, 'force_rebuild_cache', False):
+        cfg.force_rebuild_cache = True
+    if getattr(args, 'build_cache', False):
+        cfg.build_cache = True
     if getattr(args, 'session_enabled', False):
         cfg.session_enabled = True
 
@@ -1734,6 +1750,13 @@ def _check_gpu_deps():
 
 
 def main():
+    # Handle "krasis chat [args]" subcommand early — no GPU detection needed
+    if len(sys.argv) > 1 and sys.argv[1] == "chat":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]  # strip "chat" from argv
+        from krasis.chat import main as chat_main
+        chat_main()
+        return
+
     args = parse_args()
 
     # Check GPU dependencies are present

@@ -12,6 +12,7 @@
 #   ./dev network <port> --large    Include large-prompt tests
 #   ./dev benchmark <config>        Run standard benchmark (prefill/decode/round trip) and exit
 #   ./dev perplexity <config>       Run perplexity eval (WikiText-2 by default) and exit
+#   ./dev release-test <model>      Run full release test (4 configs, produces report)
 #   ./dev awq-calibrate <config>    Run AWQ calibration, produce attention template
 #   ./dev kill                      Kill all krasis processes and free GPU memory
 #   ./dev shell                     Drop into a Python shell with the dev env
@@ -324,6 +325,17 @@ do_test() {
     info "Full log: $logfile"
 }
 
+do_release_test() {
+    [[ $# -lt 1 ]] && err "Usage: ./dev release-test <model> [--force-rebuild-cache]
+  model = directory name under ~/.krasis/models/
+  Example: ./dev release-test Qwen3-Coder-Next"
+    local model="$1"
+    shift
+    cleanup_gpu
+    info "Starting release test for model: $model"
+    KRASIS_DEV_SCRIPT=1 "$PYTHON" "$SCRIPT_DIR/tests/release_test.py" "$model" "$@"
+}
+
 do_benchmark() {
     [[ $# -lt 1 ]] && err "Usage: ./dev benchmark <config>"
     local conf
@@ -474,6 +486,7 @@ case "$cmd" in
     run)            do_run "$@" ;;
     test)           do_test "$@" ;;
     benchmark)      do_benchmark "$@" ;;
+    release-test)   do_release_test "$@" ;;
     perplexity)     do_perplexity "$@" ;;
     awq-calibrate)  do_awq_calibrate "$@" ;;
     network)        do_network "$@" ;;
@@ -488,6 +501,7 @@ case "$cmd" in
         echo "  build                     Rebuild Rust extension"
         echo "  run <config> [flags]      Launch server (add --benchmark for benchmarks)"
         echo "  benchmark <config>        Run standard benchmark and exit"
+        echo "  release-test <model>      Run full release test (4 configs, report)"
         echo "  perplexity <config>       Run perplexity eval (WikiText-2) and exit"
         echo "  awq-calibrate <config>    Run AWQ attention calibration (produces template)"
         echo "  test <config>             Short model test (benchmark + network tests)"
@@ -511,6 +525,7 @@ case "$cmd" in
         echo "  ./dev run qcn --benchmark"
         echo "  ./dev benchmark qcn --timing    Profile decode components"
         echo "  ./dev benchmark qcn             Normal speed benchmark"
+        echo "  ./dev release-test Qwen3-Coder-Next    Full release test"
         echo "  ./dev awq-calibrate qcn    Build AWQ attention template"
         echo "  ./dev perplexity qcn"
         echo "  ./dev test qcn"

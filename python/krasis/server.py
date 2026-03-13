@@ -505,6 +505,8 @@ def main():
             "CFG_GPU_PREFILL_THRESHOLD": "gpu_prefill_threshold",
             "CFG_GGUF_PATH": "gguf_path",
             "CFG_FORCE_LOAD": "force_load",
+            "CFG_FORCE_REBUILD_CACHE": "force_rebuild_cache",
+            "CFG_BUILD_CACHE": "build_cache",
             "CFG_HCS": "hcs",
             "CFG_MULTI_GPU_HCS": "multi_gpu_hcs",
             "CFG_KV_CACHE_MB": "kv_cache_mb",
@@ -598,7 +600,11 @@ def main():
     parser.add_argument("--gguf-path", default=None,
                         help="Path to GGUF file for CPU experts")
     parser.add_argument("--force-load", action="store_true",
-                        help="Force reload of cached weights")
+                        help="Override RAM safety checks and load anyway")
+    parser.add_argument("--force-rebuild-cache", action="store_true",
+                        help="Delete existing expert caches and rebuild from safetensors")
+    parser.add_argument("--build-cache", action="store_true",
+                        help="Build expert caches (if missing) and exit without starting server")
     parser.add_argument("--hcs", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable Hot Cache Strategy (default: on for GPU decode, use --no-hcs to disable)")
     parser.add_argument("--multi-gpu-hcs", action="store_true", default=False,
@@ -773,6 +779,20 @@ def main():
     _detail(f"Layer groups: {args.layer_group_size}  |  KV cache: {args.kv_cache_mb} MB  |  Threads: {args.krasis_threads}")
     _dim("GPU-only mode: CPU expert weights and CPU decoder skipped")
 
+    # ── Force rebuild: delete existing expert caches before loading ──
+    if getattr(args, 'force_rebuild_cache', False):
+        _cache_dir = cache_dir_for_model(args.model_path)
+        _deleted = []
+        for pattern in ["experts_marlin_*.bin", "experts_cpu_*.bin"]:
+            import glob as _glob
+            for f in _glob.glob(os.path.join(_cache_dir, pattern)):
+                os.unlink(f)
+                _deleted.append(os.path.basename(f))
+        if _deleted:
+            _status(f"Deleted {len(_deleted)} cache files: {', '.join(_deleted)}")
+        else:
+            _detail("No existing cache files to delete")
+
     pp_partition = [num_layers]  # PP=1: all layers on primary GPU
     logger.info("HCS strategy: PP=1, %d GPUs available", num_gpus_available)
 
@@ -799,6 +819,21 @@ def main():
         _detail(f"Attention skip: layers >= {attn_skip} will skip attention")
 
     _status("Loading model weights")
+    if getattr(args, 'build_cache', False):
+        # --build-cache: load full model (GPU+CPU caches) then exit
+        _detail("Build-cache mode: loading model to build/verify expert caches")
+        _model.load(gpu_only=False)
+        import glob as _glob
+        _cache_dir = cache_dir_for_model(args.model_path)
+        gpu_bits = args.gpu_expert_bits
+        cpu_bits = args.cpu_expert_bits
+        has_gpu = bool(_glob.glob(os.path.join(_cache_dir, f"experts_marlin_int{gpu_bits}_g*.bin")))
+        has_cpu = bool(_glob.glob(os.path.join(_cache_dir, f"experts_cpu_int{cpu_bits}_g*.bin")))
+        _status("Cache build complete")
+        _detail(f"GPU Marlin INT{gpu_bits}: {'exists' if has_gpu else 'MISSING'}")
+        _detail(f"CPU INT{cpu_bits}: {'exists' if has_cpu else 'MISSING'}")
+        print("BUILD CACHE COMPLETE", flush=True)
+        return
     _model.load(gpu_only=gpu_only)
 
     # Resolve heatmap: cached > build
