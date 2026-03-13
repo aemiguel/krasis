@@ -335,7 +335,7 @@ extern "C" __global__ void expert_classify_prepare(
 
     for (int i = 0; i < topk && batch_count < max_ept; i++) {
         int eid = topk_ids[i];
-        if (eid < 0) continue;
+        if (eid < 0 || eid >= num_experts) continue;
 
         int ptr_base = layer_base + eid * 4;
         unsigned long long w13p = d_expert_ptrs[ptr_base + 0];

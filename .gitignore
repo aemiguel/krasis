@@ -13,7 +13,8 @@ models/
 .DS_Store
 ._*
 krasis.log
-server_init.log
-logs/*.log
+logs/**/*.log
+logs/**/*.txt
+logs/**/*.md
 perplexity/datasets/
 node_modules/

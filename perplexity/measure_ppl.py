@@ -266,16 +266,17 @@ def evaluate_perplexity(
             for s in seq_states:
                 s.free()
 
-        # Progress
+        # Progress — print every window on its own line so running PPL is visible
         elapsed = time.perf_counter() - t_start
         running_ppl = math.exp(total_nll / total_scored) if total_scored > 0 else float("inf")
         tok_per_s = total_scored / elapsed if elapsed > 0 else 0
+        pct = 100.0 * (win_idx + 1) / total_windows
         print(
-            f"\r  Window {win_idx + 1}/{total_windows} | "
-            f"scored {total_scored}/{total_tokens} tokens | "
-            f"running PPL={running_ppl:.2f} | "
+            f"  [{pct:5.1f}%] Window {win_idx + 1}/{total_windows} | "
+            f"scored {total_scored}/{total_tokens} | "
+            f"PPL={running_ppl:.4f} | "
             f"{tok_per_s:.0f} tok/s",
-            end="", flush=True,
+            flush=True,
         )
 
     elapsed_s = time.perf_counter() - t_start

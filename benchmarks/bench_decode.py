@@ -19,15 +19,26 @@ PORT = int(os.environ.get("PORT", 8080))
 SERVER = f"http://localhost:{PORT}"
 MODEL = os.environ.get("MODEL", "Qwen3-235B-A22B")
 
-FILLER = "The quick brown fox jumps over the lazy dog. "
-
-# Test configs: (label, approximate input tokens, max_output_tokens)
+# Test configs: (label, approximate input chars, max_output_tokens)
 TESTS = [
-    ("short",     50,   80),
-    ("medium",   200,   80),
-    ("long",     500,   80),
-    ("1k",      1000,   80),
+    ("short",     200,   80),
+    ("medium",    800,   80),
+    ("long",     2000,   80),
+    ("1k",       4000,   80),
 ]
+
+
+def _load_gutenberg_text() -> str:
+    """Load the first available Gutenberg prompt from benchmarks/prompts/."""
+    prompts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
+    prompt_files = sorted(f for f in os.listdir(prompts_dir) if f.endswith(".txt"))
+    if not prompt_files:
+        raise FileNotFoundError(f"No prompt files in {prompts_dir}")
+    with open(os.path.join(prompts_dir, prompt_files[0])) as f:
+        return f.read()
+
+
+_GUTENBERG_TEXT = None
 
 
 def check_server():
@@ -39,10 +50,12 @@ def check_server():
         return False
 
 
-def make_prompt(target_tokens):
-    repeats = max(1, target_tokens // 9)
-    filler = FILLER * repeats
-    return f"Please summarize the following text in exactly 3 sentences:\n\n{filler}\n\nSummary:"
+def make_prompt(target_chars):
+    global _GUTENBERG_TEXT
+    if _GUTENBERG_TEXT is None:
+        _GUTENBERG_TEXT = _load_gutenberg_text()
+    excerpt = _GUTENBERG_TEXT[:target_chars]
+    return f"Please summarize the following text in exactly 3 sentences:\n\n{excerpt}\n\nSummary:"
 
 
 def run_streaming_test(prompt, max_tokens, temperature=0.7):

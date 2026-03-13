@@ -197,7 +197,47 @@ def _check_system_ram(cfg, cpu_expert_bits: int = 4, force_load: bool = False):
     mem_avail_gb = meminfo.get("MemAvailable", 0) / 1024 / 1024
 
     expert_ram_gb = _estimate_expert_ram_gb(cfg, cpu_expert_bits)
-    overhead_gb = 20.0  # system overhead estimate
+    # Compute non-expert RAM overhead from model dimensions:
+    # - GPU weights (attention, embedding, lm_head, norms, gates, shared experts) are loaded
+    #   to GPU but PyTorch/CUDA uses staging buffers in system RAM during loading.
+    # - Estimate ~2x the BF16 weight size for staging overhead (load + transfer).
+    # - Add 10% of total expert RAM for PyTorch/CUDA runtime, page tables, etc.
+    h = cfg.hidden_size
+    n_layers = cfg.num_hidden_layers
+    n_heads = cfg.num_attention_heads
+    n_kv = cfg.num_key_value_heads
+    # Attention projection params per layer
+    if cfg.kv_lora_rank is not None:
+        # MLA: Q (or q_a + q_b), KV_A, KV_B, O
+        kv_lora = cfg.kv_lora_rank
+        qk_nope = cfg.qk_nope_head_dim or 128
+        qk_rope = cfg.qk_rope_head_dim or 64
+        v_hd = cfg.v_head_dim or 128
+        q_params = h * n_heads * (qk_nope + qk_rope)
+        if cfg.q_lora_rank:
+            q_params = h * cfg.q_lora_rank + cfg.q_lora_rank * n_heads * (qk_nope + qk_rope)
+        kv_a_params = h * (kv_lora + qk_rope)
+        kv_b_params = kv_lora * n_heads * (qk_nope + v_hd)
+        o_params = n_heads * v_hd * h
+        attn_params = q_params + kv_a_params + kv_b_params + o_params
+    else:
+        # GQA: Q + K + V + O
+        head_dim = cfg.gqa_head_dim or (h // n_heads)
+        attn_params = h * n_heads * head_dim + 2 * h * n_kv * head_dim + n_heads * head_dim * h
+    attn_bytes = attn_params * 2 * n_layers  # BF16
+    # Embedding + lm_head
+    embed_bytes = cfg.vocab_size * h * 2
+    lm_head_bytes = 0 if cfg.tie_word_embeddings else cfg.vocab_size * h * 2
+    # Gates, norms, shared experts
+    n_moe = n_layers - cfg.first_k_dense_replace
+    gate_bytes = h * cfg.n_routed_experts * 2 * n_moe if cfg.n_routed_experts > 0 else 0
+    norm_bytes = 2 * h * 2 * n_layers
+    shared_inter = cfg.shared_expert_intermediate_size or (cfg.n_shared_experts * cfg.moe_intermediate_size)
+    shared_bytes = 3 * h * shared_inter * 2 * n_moe if shared_inter > 0 else 0
+    gpu_weight_bytes = attn_bytes + embed_bytes + lm_head_bytes + gate_bytes + norm_bytes + shared_bytes
+    # Staging overhead (2x GPU weights for load/transfer) + runtime overhead (10% of expert RAM)
+    overhead_gb = (gpu_weight_bytes * 2 / 1e9) + (expert_ram_gb * 0.10)
+    overhead_gb = max(overhead_gb, 2.0)  # floor at 2 GB for minimal PyTorch/CUDA runtime
     total_needed_gb = expert_ram_gb + overhead_gb
 
     logger.info(
@@ -1262,7 +1302,7 @@ class KrasisModel:
                 if "post_attention_layernorm" in norms:
                     layer.post_attn_norm_weight = norms["post_attention_layernorm"].to(dev)
 
-                # Gate weights (MoE routing, ~2 MB per layer)
+                # Gate weights (MoE routing)
                 if layer.is_moe and "gate" in cpu_w:
                     gate_d = cpu_w["gate"]
                     layer.gate_weight = gate_d["weight"].to(dev)
@@ -1274,7 +1314,7 @@ class KrasisModel:
                         layer.e_score_correction_bias = gate_d["e_score_correction_bias"].to(dev)
                         layer._e_score_correction_bias_f32 = layer.e_score_correction_bias.float()
 
-                # Shared expert (MoE, ~5-30 MB per layer)
+                # Shared expert (MoE)
                 if layer.is_moe and "shared_expert" in cpu_w:
                     se = self._copy_weights_dict(cpu_w["shared_expert"], dev)
                     layer.shared_expert = se
@@ -1615,6 +1655,7 @@ class KrasisModel:
                     swiglu_limit=self.cfg.swiglu_limit,
                     rank=i,
                     num_ranks=num_ranks,
+                    num_experts_per_tok=self.cfg.num_experts_per_tok,
                 )
                 self.gpu_prefill_managers[dev_str] = manager
                 logger.info("GPU prefill manager created for %s (rank %d/%d)", dev_str, i, num_ranks)
@@ -3842,10 +3883,10 @@ class KrasisModel:
         # always sees correct weights for every layer.
         self._rust_decode_weights = []  # prevent GC of permanent GPU copies
 
-        attn_quant = self.quant_cfg.attention  # "bf16", "int8", "int4", or "awq"
+        attn_quant = self.quant_cfg.attention  # "bf16" or "awq"
         marlin_gs = 128  # Marlin group size for both INT8 and INT4
 
-        # AWQ template: per-tensor precision decisions from calibration
+        # AWQ template: per-layer channel scales from calibration
         _awq_template = None
         if attn_quant == "awq":
             from krasis.awq_calibrate import load_template
@@ -3853,28 +3894,34 @@ class KrasisModel:
                 os.path.abspath(__file__)))), "templates", "attention")
             _awq_template = load_template(template_dir, self.cfg.model_path)
             if _awq_template is not None:
-                n_int4 = _awq_template["summary"]["int4"]
-                n_int8 = _awq_template["summary"]["int8"]
-                n_bf16 = _awq_template["summary"]["bf16"]
-                logger.info("AWQ template loaded: %d INT4, %d INT8, %d BF16 tensors",
-                            n_int4, n_int8, n_bf16)
+                tmpl_version = _awq_template.get("version", 1)
+                if tmpl_version >= 2:
+                    summary = _awq_template["summary"]
+                    logger.info("AWQ v2 template loaded: %d AWQ-scaled, %d plain INT4, %d BF16 tensors "
+                                "(avg error reduction: %.1f%%)",
+                                summary["awq_scaled_tensors"],
+                                summary["plain_int4_tensors"],
+                                summary["bf16_tensors"],
+                                summary["avg_error_reduction"] * 100)
+                else:
+                    # v1 template (old per-tensor decisions, no per-channel scaling)
+                    n_int4 = _awq_template["summary"]["int4"]
+                    n_int8 = _awq_template["summary"]["int8"]
+                    n_bf16 = _awq_template["summary"]["bf16"]
+                    logger.info("AWQ v1 template loaded: %d INT4, %d INT8, %d BF16 tensors",
+                                n_int4, n_int8, n_bf16)
             else:
-                logger.warning("No AWQ template found for model %s — falling back to INT4 for all attention",
-                               self.cfg.model_path)
+                raise RuntimeError(
+                    f"AWQ attention requested but no calibration template found for model "
+                    f"{self.cfg.model_path}. Run 'krasis-calibrate' first to generate an AWQ "
+                    f"template, or use --attention-quant bf16 for unquantized attention."
+                )
 
         # Marlin quantization helpers (lazy import, only when quantizing)
         _marlin_workspace = None
         _marlin_scalar_type_int4 = None
         _marlin_scalar_type_int8 = None
-        _marlin_num_bits = 0
-        if attn_quant in ("int8", "int4"):
-            from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
-            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import get_scalar_type
-            _marlin_workspace = marlin_make_workspace(device)
-            _marlin_num_bits = 4 if attn_quant == "int4" else 8
-            _marlin_scalar_type_int4 = get_scalar_type(4, False)
-            _marlin_scalar_type_int8 = get_scalar_type(8, False)
-        elif attn_quant == "awq":
+        if attn_quant == "awq":
             from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
             from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import get_scalar_type
             _marlin_workspace = marlin_make_workspace(device)
@@ -3882,7 +3929,8 @@ class KrasisModel:
             _marlin_scalar_type_int8 = get_scalar_type(8, False)
 
         def _register_attn_weight(w: torch.Tensor, layer_idx: int = -1,
-                                  layer_type: str = "", tensor_name: str = "") -> int:
+                                  layer_type: str = "", tensor_name: str = "",
+                                  awq_scales: Optional[torch.Tensor] = None) -> int:
             """Register an attention weight as BF16, Marlin INT8, or Marlin INT4.
 
             For Marlin quantization: Rust does quantize + repack on CPU,
@@ -3891,6 +3939,12 @@ class KrasisModel:
             for both paths. No BF16 ever touches VRAM.
 
             For BF16: weight must already be on GPU.
+
+            Args:
+                awq_scales: Optional per-channel scales [K] from AWQ calibration.
+                    When provided, weight columns are scaled by s[j] before
+                    quantization: W[:,j] *= s[j]. The caller is responsible
+                    for folding 1/s[j] into the preceding RMSNorm weight.
 
             Returns weight ID in the Rust store. For quantized weights, also
             stores (packed, scales, workspace, scalar_type, N, K) on
@@ -3903,7 +3957,10 @@ class KrasisModel:
                     effective_quant = get_tensor_decision(
                         _awq_template, layer_idx, layer_type, tensor_name)
                 else:
-                    effective_quant = "int4"  # fallback when no template
+                    # This should be unreachable — we raise at template load time above
+                    raise RuntimeError(
+                        "AWQ attention active but no template loaded — this is a bug"
+                    )
 
             if effective_quant in ("int8", "int4") and w.dtype == torch.bfloat16:
                 use_int4 = (effective_quant == "int4")
@@ -3912,6 +3969,16 @@ class KrasisModel:
                 if n % 64 == 0 and k % 16 == 0 and k % marlin_gs == 0:
                     # Step 1: Get contiguous CPU BF16 data
                     w_cpu = w.cpu().contiguous() if w.is_cuda else w.contiguous()
+
+                    # Step 1.5: AWQ per-channel scaling (if provided)
+                    # Scale weight columns: W[:,j] *= s[j] to protect channels
+                    # with high activation magnitude during quantization.
+                    if awq_scales is not None:
+                        assert awq_scales.shape[0] == k, \
+                            f"AWQ scales size {awq_scales.shape[0]} != weight K dim {k}"
+                        # Apply in float32 for precision, then convert back to BF16
+                        w_cpu = (w_cpu.float() * awq_scales.float().unsqueeze(0)).to(torch.bfloat16)
+                        w_cpu = w_cpu.contiguous()
 
                     # Step 2: Rust quantizes + repacks on CPU (same format as expert weights)
                     if use_int4:
@@ -3975,6 +4042,13 @@ class KrasisModel:
             inp_norm = layer.input_norm_weight
             post_norm = layer.post_attn_norm_weight
 
+            # AWQ v2: load per-layer per-channel scales for input projections
+            _layer_awq_scales = None
+            if attn_quant == "awq" and _awq_template is not None:
+                from krasis.awq_calibrate import (
+                    get_layer_scales, is_awq_scaled_tensor)
+                _layer_awq_scales = get_layer_scales(_awq_template, layer_idx)
+
             if layer.layer_type == "linear_attention":
                 # Source projection weights — when quantizing, keep on CPU to avoid
                 # putting full BF16 in VRAM. Only upload to GPU for BF16 mode.
@@ -3994,8 +4068,21 @@ class KrasisModel:
                     qkvz_w = attn.in_proj_qkvz
                     ba_w = attn.in_proj_ba
                     out_w = attn.out_proj
-                qkvz_wid = _register_attn_weight(qkvz_w, layer_idx, "linear_attention", "in_proj_qkvz")
-                ba_wid = _register_attn_weight(ba_w, layer_idx, "linear_attention", "in_proj_ba")
+
+                # AWQ v2: pass per-channel scales for input projections only
+                _qkvz_scales = _layer_awq_scales if (
+                    _layer_awq_scales is not None and _awq_template is not None
+                    and is_awq_scaled_tensor(_awq_template, layer_idx, "in_proj_qkvz")
+                ) else None
+                _ba_scales = _layer_awq_scales if (
+                    _layer_awq_scales is not None and _awq_template is not None
+                    and is_awq_scaled_tensor(_awq_template, layer_idx, "in_proj_ba")
+                ) else None
+
+                qkvz_wid = _register_attn_weight(qkvz_w, layer_idx, "linear_attention",
+                                                  "in_proj_qkvz", awq_scales=_qkvz_scales)
+                ba_wid = _register_attn_weight(ba_w, layer_idx, "linear_attention",
+                                               "in_proj_ba", awq_scales=_ba_scales)
                 out_wid = _register_attn_weight(out_w, layer_idx, "linear_attention", "out_proj")
                 self._la_wids[layer_idx] = (qkvz_wid, ba_wid, out_wid)
 
@@ -4012,6 +4099,19 @@ class KrasisModel:
                     from krasis.attention import MarlinWeight
                     mw = self._marlin_attn_weights[out_wid]
                     attn.out_proj = MarlinWeight(*mw)
+
+                # AWQ v2: fold 1/s into input_norm_weight.
+                # This makes RMSNorm output X_scaled = X / s, which compensates
+                # for the W * s scaling applied to weight columns above.
+                # Mathematical identity: (X/s) @ (W*s)^T = X @ W^T
+                if _layer_awq_scales is not None and (_qkvz_scales is not None
+                                                       or _ba_scales is not None):
+                    s = _layer_awq_scales.to(inp_norm.device)
+                    # In-place modification: norm_weight[j] /= s[j]
+                    inp_norm.data.copy_(
+                        (inp_norm.float() / s.float()).to(inp_norm.dtype))
+                    logger.debug("AWQ: folded scales into input_norm for layer %d "
+                                 "(mean_scale=%.4f)", layer_idx, s.mean().item())
 
                 # Conv weight: [conv_dim, 1, kernel_dim] -> [conv_dim, kernel_dim]
                 # Rust LA kernels work in FP32, so create FP32 copies of BF16 tensors.
@@ -4080,9 +4180,27 @@ class KrasisModel:
                     k_w = attn.k_proj
                     v_w = attn.v_proj
                     o_w = attn.o_proj
-                q_wid = _register_attn_weight(q_w, layer_idx, "gqa", "q_proj")
-                k_wid = _register_attn_weight(k_w, layer_idx, "gqa", "k_proj")
-                v_wid = _register_attn_weight(v_w, layer_idx, "gqa", "v_proj")
+
+                # AWQ v2: pass per-channel scales for input projections (q/k/v)
+                _q_scales = _layer_awq_scales if (
+                    _layer_awq_scales is not None and _awq_template is not None
+                    and is_awq_scaled_tensor(_awq_template, layer_idx, "q_proj")
+                ) else None
+                _k_scales = _layer_awq_scales if (
+                    _layer_awq_scales is not None and _awq_template is not None
+                    and is_awq_scaled_tensor(_awq_template, layer_idx, "k_proj")
+                ) else None
+                _v_scales = _layer_awq_scales if (
+                    _layer_awq_scales is not None and _awq_template is not None
+                    and is_awq_scaled_tensor(_awq_template, layer_idx, "v_proj")
+                ) else None
+
+                q_wid = _register_attn_weight(q_w, layer_idx, "gqa", "q_proj",
+                                              awq_scales=_q_scales)
+                k_wid = _register_attn_weight(k_w, layer_idx, "gqa", "k_proj",
+                                              awq_scales=_k_scales)
+                v_wid = _register_attn_weight(v_w, layer_idx, "gqa", "v_proj",
+                                              awq_scales=_v_scales)
                 o_wid = _register_attn_weight(o_w, layer_idx, "gqa", "o_proj")
 
                 # Replace attention weight attributes with MarlinWeight for prefill
@@ -4095,6 +4213,17 @@ class KrasisModel:
                     attn.v_proj = MarlinWeight(*self._marlin_attn_weights[v_wid])
                 if o_wid in self._marlin_attn_weights:
                     attn.o_proj = MarlinWeight(*self._marlin_attn_weights[o_wid])
+
+                # AWQ v2: fold 1/s into input_norm_weight for GQA layers
+                if _layer_awq_scales is not None and (
+                    _q_scales is not None or _k_scales is not None
+                    or _v_scales is not None
+                ):
+                    s = _layer_awq_scales.to(inp_norm.device)
+                    inp_norm.data.copy_(
+                        (inp_norm.float() / s.float()).to(inp_norm.dtype))
+                    logger.debug("AWQ: folded scales into input_norm for GQA layer %d "
+                                 "(mean_scale=%.4f)", layer_idx, s.mean().item())
 
                 # QK norm weights are BF16, Rust per_head_rmsnorm kernel needs FP32
                 # When streaming, use CPU-pinned source for these small weights

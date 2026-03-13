@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -323,122 +324,63 @@ def run_multi_prompt_tests(base_url: str) -> List[TestResult]:
 # Test 5: Large prompt validation
 # ═══════════════════════════════════════════════════════════════════
 
-def _build_large_text(target_tokens: int) -> str:
-    """Build a large text block targeting approximately target_tokens tokens.
+def _load_gutenberg_prompt(target_chars: int, prompt_index: int = 0) -> str:
+    """Load a Gutenberg prompt from benchmarks/prompts/ and truncate to target size.
 
-    Uses repetitive but varied text to hit the target.
-    Rough estimate: 1 token ~ 3.5 chars for English text.
+    Uses real literary text (Moby Dick, War and Peace, etc.) instead of
+    generated garbage. These are consistent, unique, and representative of
+    real-world content — essential for meaningful test results.
     """
-    sections = [
-        "Section {n}: The principles of distributed systems involve consensus algorithms "
-        "such as Paxos and Raft, which ensure that multiple nodes in a network can agree "
-        "on a single value even in the presence of failures. These algorithms are critical "
-        "for building reliable database systems, distributed file systems, and cloud "
-        "infrastructure. The CAP theorem states that it is impossible for a distributed "
-        "system to simultaneously provide all three of consistency, availability, and "
-        "partition tolerance. In practice, systems must make trade-offs between these "
-        "properties based on their specific requirements and use cases. ",
+    prompts_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "benchmarks", "prompts",
+    )
+    prompt_files = sorted(f for f in os.listdir(prompts_dir) if f.endswith(".txt"))
+    if not prompt_files:
+        raise FileNotFoundError(f"No prompt files found in {prompts_dir}")
 
-        "Section {n}: Modern compiler optimization techniques include dead code elimination, "
-        "constant folding, loop unrolling, register allocation, and instruction scheduling. "
-        "These optimizations work at different levels of the compilation pipeline, from "
-        "high-level IR transformations to low-level machine code generation. Profile-guided "
-        "optimization (PGO) uses runtime execution data to make better optimization decisions. "
-        "Link-time optimization (LTO) enables optimizations across compilation unit boundaries. ",
+    path = os.path.join(prompts_dir, prompt_files[prompt_index % len(prompt_files)])
+    with open(path) as f:
+        text = f.read()
 
-        "Section {n}: Neural network architectures have evolved from simple perceptrons to "
-        "complex transformer models with billions of parameters. The attention mechanism, "
-        "introduced in the transformer architecture, allows models to focus on relevant parts "
-        "of the input when producing each output element. Key innovations include multi-head "
-        "attention, positional encoding, layer normalization, and residual connections. "
-        "Modern training techniques include mixed-precision training, gradient accumulation, "
-        "distributed data parallelism, and model parallelism across multiple devices. ",
-
-        "Section {n}: Operating system memory management involves virtual memory, page tables, "
-        "TLBs, and various page replacement algorithms including LRU, FIFO, and clock algorithms. "
-        "Modern operating systems use demand paging to load only needed pages into physical memory, "
-        "with the page fault handler managing the loading of pages from disk or swap space. "
-        "Memory-mapped files allow processes to access file contents as if they were in memory, "
-        "while copy-on-write semantics reduce memory usage for forked processes. ",
-
-        "Section {n}: Cryptographic systems rely on mathematical hardness assumptions such as "
-        "the difficulty of factoring large integers (RSA) or computing discrete logarithms "
-        "(Diffie-Hellman, elliptic curves). Symmetric encryption algorithms like AES provide "
-        "fast bulk encryption, while asymmetric algorithms enable key exchange and digital "
-        "signatures without pre-shared secrets. Hash functions like SHA-256 provide collision "
-        "resistance for data integrity verification and proof-of-work systems. ",
-    ]
-
-    target_chars = int(target_tokens * 3.5)
-    text_parts = []
-    total_chars = 0
-    n = 1
-    while total_chars < target_chars:
-        for section_template in sections:
-            part = section_template.format(n=n)
-            text_parts.append(part)
-            total_chars += len(part)
-            n += 1
-            if total_chars >= target_chars:
-                break
-
-    return "".join(text_parts)
+    if len(text) > target_chars:
+        text = text[:target_chars]
+    return text
 
 
 def run_large_prompt_tests(base_url: str) -> List[TestResult]:
-    """Test 5: large prompts over the network."""
+    """Test 5: large prompts over the network.
+
+    Uses real Gutenberg literary texts (Moby Dick, War and Peace, etc.)
+    from benchmarks/prompts/. These are consistent across runs, unique,
+    and representative of real-world content.
+    """
     results = []
 
     print(f"\n{BOLD}{CYAN}Test 5: Network Large-Prompt Validation{NC}")
     print("=" * 60)
 
-    # Test 5a: ~2K tokens (warmup / sanity)
-    print(f"  Building ~2K token prompt...", end="", flush=True)
-    text_2k = _build_large_text(2000)
-    prompt_2k = f"{text_2k}\n\nSummarize the above text in exactly 2 sentences."
-    print(f" done ({len(prompt_2k)} chars)")
+    # Each test uses a different book for content diversity.
+    # ~3.5 chars per token is the rough ratio for English literary text.
+    test_configs = [
+        ("large_2k",   7_000,   0, "Summarize the above text in one paragraph.",             128, 120),
+        ("large_10k",  35_000,  1, "What are the main themes in the text above?",            128, 300),
+        ("large_25k",  87_500,  2, "Summarize the key events described in the text above.",  128, 600),
+        ("large_100k", 350_000, 3, "What is the overall narrative arc of the text above?",   128, 1200),
+    ]
 
-    r = test_coherent_response(base_url, "large_2k", [
-        {"role": "user", "content": prompt_2k},
-    ], max_tokens=128, timeout=120, stream=True, min_words=5)
-    results.append(r)
-    print(f"  {_pass(r.detail) if r.passed else _fail(r.detail)} [{r.name}]")
+    for name, target_chars, prompt_idx, question, max_tokens, timeout in test_configs:
+        approx_tokens = target_chars // 4
+        print(f"  Loading ~{approx_tokens // 1000}K token prompt...", end="", flush=True)
+        text = _load_gutenberg_prompt(target_chars, prompt_index=prompt_idx)
+        prompt = f"{text}\n\n{question}"
+        print(f" done ({len(prompt)} chars)")
 
-    # Test 5b: ~10K tokens
-    print(f"  Building ~10K token prompt...", end="", flush=True)
-    text_10k = _build_large_text(10000)
-    prompt_10k = f"{text_10k}\n\nWhat topic was discussed in Section 15?"
-    print(f" done ({len(prompt_10k)} chars)")
-
-    r = test_coherent_response(base_url, "large_10k", [
-        {"role": "user", "content": prompt_10k},
-    ], max_tokens=128, timeout=300, stream=True, min_words=5)
-    results.append(r)
-    print(f"  {_pass(r.detail) if r.passed else _fail(r.detail)} [{r.name}]")
-
-    # Test 5c: ~25K tokens
-    print(f"  Building ~25K token prompt...", end="", flush=True)
-    text_25k = _build_large_text(25000)
-    prompt_25k = f"{text_25k}\n\nWhat was the main theme of Section 40? Answer briefly."
-    print(f" done ({len(prompt_25k)} chars)")
-
-    r = test_coherent_response(base_url, "large_25k", [
-        {"role": "user", "content": prompt_25k},
-    ], max_tokens=128, timeout=600, stream=True, min_words=3)
-    results.append(r)
-    print(f"  {_pass(r.detail) if r.passed else _fail(r.detail)} [{r.name}]")
-
-    # Test 5d: ~100K tokens
-    print(f"  Building ~100K token prompt...", end="", flush=True)
-    text_100k = _build_large_text(100000)
-    prompt_100k = f"{text_100k}\n\nWhat was the main theme of Section 100? Answer briefly."
-    print(f" done ({len(prompt_100k)} chars)")
-
-    r = test_coherent_response(base_url, "large_100k", [
-        {"role": "user", "content": prompt_100k},
-    ], max_tokens=128, timeout=1200, stream=True, min_words=3)
-    results.append(r)
-    print(f"  {_pass(r.detail) if r.passed else _fail(r.detail)} [{r.name}]")
+        r = test_coherent_response(base_url, name, [
+            {"role": "user", "content": prompt},
+        ], max_tokens=max_tokens, timeout=timeout, stream=True, min_words=3)
+        results.append(r)
+        print(f"  {_pass(r.detail) if r.passed else _fail(r.detail)} [{r.name}]")
 
     return results
 

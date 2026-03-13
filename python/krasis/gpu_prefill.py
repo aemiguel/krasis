@@ -319,8 +319,8 @@ class GpuPrefillManager:
     """Manages GPU expert buffer and INT4 Marlin weights for prefill.
 
     The manager owns a fixed-size GPU buffer that holds one chunk of experts.
-    For models with many experts (e.g. Kimi K2.5 with 384), experts are
-    processed in chunks that fit in VRAM.
+    For models with many experts, experts are processed in chunks that fit
+    in VRAM.
     """
 
     def __init__(
@@ -343,12 +343,14 @@ class GpuPrefillManager:
         swiglu_limit: float = 0.0,
         rank: int = 0,
         num_ranks: int = 1,
+        num_experts_per_tok: int = 8,
     ):
         self.model_path = model_path
         self.device = device
         self.num_experts = num_experts
         self.rank = rank
         self.num_ranks = num_ranks
+        self.num_experts_per_tok = num_experts_per_tok
         
         # Internalize expert slicing for EP prefill
         self.expert_start = rank * (num_experts // num_ranks)
@@ -676,6 +678,20 @@ class GpuPrefillManager:
         w2_bytes = (N // 16) * (K_w2 * nb2) * 4 + (N // gs) * K_w2 * 2
         return w13_bytes + w2_bytes
 
+    def _kernel_intermediate_bytes(self, num_tokens: int) -> int:
+        """Compute kernel intermediate VRAM for fused_marlin_moe.
+
+        fused_marlin_moe allocates:
+          intermediate_cache13: [M * topk * max(2*N, K)] bf16
+          intermediate_cache2:  [M * topk, K] bf16
+        """
+        K = self.hidden_size
+        N = self.intermediate_size
+        topk = self.num_experts_per_tok
+        cache13 = num_tokens * topk * max(2 * N, K) * 2
+        cache2 = num_tokens * topk * K * 2
+        return cache13 + cache2
+
     def _select_prefill_mode(self):
         """Select prefill mode based on layer_group_size setting.
 
@@ -700,7 +716,11 @@ class GpuPrefillManager:
 
             try:
                 free_vram = torch.cuda.mem_get_info(self.device)[0]
-                budget = free_vram - 500 * 1024 * 1024  # 500 MB headroom
+                # Reserve room for kernel intermediates (based on ~1K token prefill)
+                # plus 10% of free VRAM for attention weights, KV cache, workspace
+                intermediate_reserve = self._kernel_intermediate_bytes(1024)
+                headroom = intermediate_reserve + int(free_vram * 0.10)
+                budget = free_vram - headroom
                 if total_vram <= budget:
                     self._prefill_mode = "persistent"
                     logger.info(
@@ -742,14 +762,18 @@ class GpuPrefillManager:
         try:
             free_vram = torch.cuda.mem_get_info(self.device)[0]
             # Use at most 40% of free VRAM for expert buffer,
-            # minus 100 MB for kernel intermediate allocations
-            # (fused_marlin_moe allocates M * topk * max(2N, K) * 2 bytes)
-            budget = int(free_vram * 0.4) - 100 * 1024 * 1024
+            # minus kernel intermediate allocations computed from model dimensions.
+            # fused_marlin_moe allocates intermediates proportional to M * topk.
+            # Estimate for a 5K token prefill chunk (typical upper bound).
+            intermediate_bytes = self._kernel_intermediate_bytes(5000)
+            budget = int(free_vram * 0.4) - intermediate_bytes
             chunk = max(1, budget // per_expert)
             chunk = min(chunk, self.num_experts)
             logger.info(
-                "Auto chunk_size: %d experts (%.1f MB each, %.1f MB budget of %.1f MB free)",
+                "Auto chunk_size: %d experts (%.1f MB each, %.1f MB budget of %.1f MB free, "
+                "%.1f MB reserved for intermediates)",
                 chunk, per_expert / 1e6, budget / 1e6, free_vram / 1e6,
+                intermediate_bytes / 1e6,
             )
             return chunk
         except Exception:
@@ -1281,8 +1305,8 @@ class GpuPrefillManager:
         per-request CPU memcpy in preload_layer_group() — prefill just
         kicks async DMA directly from these pre-built buffers.
 
-        Total pinned RAM cost: num_moe_layers * per_layer_bytes
-        (e.g. 48 * 792 MB = 38 GB for QCN). Acceptable on high-RAM systems.
+        Total pinned RAM cost: num_moe_layers * per_layer_bytes.
+        Acceptable on high-RAM systems.
         """
         if self._prefill_pinned_built:
             return
@@ -1837,15 +1861,14 @@ class GpuPrefillManager:
 
         try:
             free_vram = torch.cuda.mem_get_info(self.device)[0]
-            # Reserve VRAM for KV cache + attention intermediates + kernel workspace.
-            # KV cache needs ~100 KB/token/layer; for 10K tokens × 94 layers ≈ 1 GB.
-            # Add 1 GB for intermediates/workspace → 2 GB total headroom.
-            kv_headroom = 2 * 1024 * 1024 * 1024  # 2 GB for KV cache + intermediates
-            budget = free_vram - kv_headroom
-            if budget < per_expert * self.num_experts:
-                # Not enough VRAM for even num_experts LRU slots after KV reservation;
-                # reduce headroom to minimum (still risky for large prompts)
-                budget = free_vram - 500 * 1024 * 1024
+            # Reserve VRAM for kernel intermediates (compute from model dimensions).
+            # Use a conservative 5K token estimate for prefill chunk size.
+            intermediate_reserve = self._kernel_intermediate_bytes(5000)
+            # Reserve 15% of free VRAM for KV cache growth + attention weights + workspace.
+            # This scales with GPU size: ~4.8 GB on 32 GB GPU, ~2.4 GB on 16 GB.
+            kv_workspace_reserve = int(free_vram * 0.15)
+            headroom = intermediate_reserve + kv_workspace_reserve
+            budget = free_vram - headroom
             cache_size = max(self.num_experts, budget // per_expert)
         except Exception:
             cache_size = self.num_experts * 2  # Fallback
@@ -2516,7 +2539,9 @@ class GpuPrefillManager:
         if budget_mb <= 0:
             try:
                 free_vram = torch.cuda.mem_get_info(self.device)[0]
-                budget_mb = (free_vram - 200 * 1024 * 1024) / 1e6  # Leave 200 MB headroom
+                # Reserve 10% of free VRAM for runtime state (KV cache growth, workspace)
+                headroom = int(free_vram * 0.10)
+                budget_mb = (free_vram - headroom) / 1e6
             except Exception:
                 budget_mb = 1000  # Fallback
         self._pin_budget_mb = budget_mb
@@ -2588,14 +2613,17 @@ class GpuPrefillManager:
             per_expert = self._per_expert_vram_bytes()
             # Leave room for active_only buffer to be re-allocated
             ao_buffer_bytes = per_expert * self.num_experts if had_ao_buffer else 0
-            # Reserve: AO buffer + 3.5GB for KV cache growth, attention intermediates,
-            # kernel workspace, and PyTorch allocator fragmentation overhead
-            headroom = int(3.5 * 1024 * 1024 * 1024)
+            # Reserve: AO buffer + kernel intermediates + 15% for KV cache/workspace
+            intermediate_reserve = self._kernel_intermediate_bytes(5000)
+            kv_workspace_reserve = int(free_vram * 0.15)
+            headroom = intermediate_reserve + kv_workspace_reserve
             available = free_vram - ao_buffer_bytes - headroom
             max_slots = min(max_slots, max(0, available // per_expert))
             logger.info(
-                "Pin budget recalculated: %.1f MB free, %d slots after reserving AO buffer + 3.5GB headroom",
+                "Pin budget recalculated: %.1f MB free, %d slots after reserving AO buffer + "
+                "%.1f MB intermediates + %.1f MB KV/workspace",
                 free_vram / 1e6, max_slots,
+                intermediate_reserve / 1e6, kv_workspace_reserve / 1e6,
             )
         except Exception:
             pass
@@ -2714,7 +2742,9 @@ class GpuPrefillManager:
             free_vram = torch.cuda.mem_get_info(self.device)[0]
             per_expert = self._per_expert_vram_bytes()
             ao_buffer_bytes = per_expert * self.num_experts if had_ao_buffer else 0
-            headroom = int(3.5 * 1024 * 1024 * 1024)
+            intermediate_reserve = self._kernel_intermediate_bytes(5000)
+            kv_workspace_reserve = int(free_vram * 0.15)
+            headroom = intermediate_reserve + kv_workspace_reserve
             available = free_vram - ao_buffer_bytes - headroom
             max_slots = min(max_slots, max(0, available // per_expert))
         except Exception:
@@ -2863,7 +2893,7 @@ class GpuPrefillManager:
             heatmap_path: Path to expert_heatmap.json. If None, uses
                           accumulated warmup heatmap from self._heatmap.
             expert_budget_mb: Max MB on primary GPU for expert weights.
-                             If None, uses free VRAM minus 1 GB headroom.
+                             If None, uses device_budgets from server calibration.
             allocation_mode: "greedy" (globally hottest experts) or
                             "uniform" (equal experts per layer).
             devices: List of all torch.device objects to use.

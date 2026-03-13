@@ -24,7 +24,7 @@ def test_pp2():
     print("=" * 60)
 
     quant = QuantConfig(
-        attention="int8", shared_expert="int8",
+        attention="awq", shared_expert="int8",
         dense_mlp="int8", lm_head="int8",
         gpu_expert_bits=4, cpu_expert_bits=4,
     )

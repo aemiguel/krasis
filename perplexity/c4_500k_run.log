@@ -1,1121 +1,0 @@
-14:48:53 krasis.model INFO: KrasisModel: 48 layers, PP=[48], 1 GPUs, attn=flashinfer, hybrid=12 full + 36 linear
-14:48:53 krasis.model INFO: RAM budget: experts=39.9 GB, overhead=20.0 GB, total=59.9 GB needed | system: 995.5 GB total, 930.8 GB available
-14:48:53 krasis.model INFO: RAM budget OK: 59.9 GB needed, 935.6 GB headroom
-14:48:53 krasis.model INFO: RAM watchdog started: will exit if < 5.0% free
-Krasis Perplexity Measurement
-==================================================
-Model:       /home/main/.krasis/models/Qwen3-Coder-Next
-Dataset:     c4
-Mode:        GPU prefill (Marlin)
-GPU bits:    4
-CPU bits:    4
-Window:      2048, stride=1024
-Max tokens:  500000
-
-Loading model...
-
-[1m[36m▸ Loading GPU weights[0m
-14:48:53 krasis.model INFO: Phase 1: Loading GPU weights (streaming INT8)...
-14:48:53 krasis.model INFO: Streaming attention: all 48 layers on GPU0, 1 GPUs for EP
-14:48:53 krasis.model INFO: Loading full base model to cuda:0...
-14:48:53 krasis.weight_loader INFO: Loading embedding: model.embed_tokens.weight
-14:48:53 krasis.weight_loader INFO: Layer 0 loaded in 0.1s (GPU alloc: 663 MB, moe=True, type=linear_attention)
-14:48:53 krasis.weight_loader INFO: Layer 1 loaded in 0.0s (GPU alloc: 737 MB, moe=True, type=linear_attention)
-14:48:53 krasis.weight_loader INFO: Layer 2 loaded in 0.0s (GPU alloc: 810 MB, moe=True, type=linear_attention)
-14:48:53 krasis.weight_loader INFO: Layer 3 loaded in 0.0s (GPU alloc: 871 MB, moe=True, type=full_attention)
-14:48:53 krasis.attention INFO: Layer 3: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:53 krasis.weight_loader INFO: Layer 4 loaded in 0.0s (GPU alloc: 1080 MB, moe=True, type=linear_attention)
-14:48:53 krasis.weight_loader INFO: Layer 5 loaded in 0.0s (GPU alloc: 1154 MB, moe=True, type=linear_attention)
-14:48:53 krasis.weight_loader INFO: Layer 6 loaded in 0.0s (GPU alloc: 1227 MB, moe=True, type=linear_attention)
-14:48:53 krasis.weight_loader INFO: Layer 7 loaded in 0.0s (GPU alloc: 1288 MB, moe=True, type=full_attention)
-14:48:53 krasis.attention INFO: Layer 7: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:54 krasis.weight_loader INFO: Layer 8 loaded in 0.0s (GPU alloc: 1370 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 9 loaded in 0.0s (GPU alloc: 1443 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 10 loaded in 0.1s (GPU alloc: 1516 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 11 loaded in 0.0s (GPU alloc: 1577 MB, moe=True, type=full_attention)
-14:48:54 krasis.attention INFO: Layer 11: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:54 krasis.weight_loader INFO: Layer 12 loaded in 0.1s (GPU alloc: 1659 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 13 loaded in 0.0s (GPU alloc: 1732 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 14 loaded in 0.1s (GPU alloc: 1805 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 15 loaded in 0.1s (GPU alloc: 1866 MB, moe=True, type=full_attention)
-14:48:54 krasis.attention INFO: Layer 15: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:54 krasis.weight_loader INFO: Layer 16 loaded in 0.1s (GPU alloc: 1948 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 17 loaded in 0.1s (GPU alloc: 2021 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 18 loaded in 0.0s (GPU alloc: 2095 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 19 loaded in 0.0s (GPU alloc: 2156 MB, moe=True, type=full_attention)
-14:48:54 krasis.attention INFO: Layer 19: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:54 krasis.weight_loader INFO: Layer 20 loaded in 0.1s (GPU alloc: 2237 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 21 loaded in 0.1s (GPU alloc: 2310 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 22 loaded in 0.1s (GPU alloc: 2384 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 23 loaded in 0.0s (GPU alloc: 2445 MB, moe=True, type=full_attention)
-14:48:54 krasis.attention INFO: Layer 23: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:54 krasis.weight_loader INFO: Layer 24 loaded in 0.0s (GPU alloc: 2526 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 25 loaded in 0.1s (GPU alloc: 2599 MB, moe=True, type=linear_attention)
-14:48:54 krasis.weight_loader INFO: Layer 26 loaded in 0.1s (GPU alloc: 2673 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 27 loaded in 0.0s (GPU alloc: 2734 MB, moe=True, type=full_attention)
-14:48:55 krasis.attention INFO: Layer 27: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:55 krasis.weight_loader INFO: Layer 28 loaded in 0.0s (GPU alloc: 2815 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 29 loaded in 0.0s (GPU alloc: 2889 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 30 loaded in 0.0s (GPU alloc: 2962 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 31 loaded in 0.0s (GPU alloc: 3023 MB, moe=True, type=full_attention)
-14:48:55 krasis.attention INFO: Layer 31: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:55 krasis.weight_loader INFO: Layer 32 loaded in 0.0s (GPU alloc: 3104 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 33 loaded in 0.0s (GPU alloc: 3178 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 34 loaded in 0.0s (GPU alloc: 3251 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 35 loaded in 0.0s (GPU alloc: 3312 MB, moe=True, type=full_attention)
-14:48:55 krasis.attention INFO: Layer 35: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:55 krasis.weight_loader INFO: Layer 36 loaded in 0.0s (GPU alloc: 3394 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 37 loaded in 0.0s (GPU alloc: 3467 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 38 loaded in 0.0s (GPU alloc: 3540 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 39 loaded in 0.0s (GPU alloc: 3601 MB, moe=True, type=full_attention)
-14:48:55 krasis.attention INFO: Layer 39: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:55 krasis.weight_loader INFO: Layer 40 loaded in 0.0s (GPU alloc: 3683 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 41 loaded in 0.0s (GPU alloc: 3756 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 42 loaded in 0.0s (GPU alloc: 3829 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 43 loaded in 0.0s (GPU alloc: 3890 MB, moe=True, type=full_attention)
-14:48:55 krasis.attention INFO: Layer 43: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:55 krasis.weight_loader INFO: Layer 44 loaded in 0.0s (GPU alloc: 3972 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 45 loaded in 0.0s (GPU alloc: 4045 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 46 loaded in 0.0s (GPU alloc: 4119 MB, moe=True, type=linear_attention)
-14:48:55 krasis.weight_loader INFO: Layer 47 loaded in 0.0s (GPU alloc: 4180 MB, moe=True, type=full_attention)
-14:48:55 krasis.attention INFO: Layer 47: gated attention detected (q_proj dim=8192, expected=4096)
-14:48:56 krasis.weight_loader INFO: Loading final norm: model.norm.weight
-14:48:56 krasis.weight_loader INFO: Loading LM head: lm_head.weight (precision=int8)
-14:48:57 krasis.model INFO: VRAM[after-all-layers-loaded] GPU0: free=11317 MB, alloc=4488 MB, reserved=4508 MB, non-pytorch=132 MB
-14:48:58 krasis.model INFO: GPU0: 4489 MB allocated
-14:48:58 krasis.model INFO: GPU weights loaded in 4.8s
-
-[1m[36m▸ Offloading attention for streaming decode[0m
-14:49:00 krasis.model INFO: Attention offloaded: 48 layers, 3180 MB to CPU RAM in 2.3s
-14:49:03 krasis.model INFO: Streaming attention: 2 buffer set(s) for 2 layer type(s) (double-buffered)
-14:49:03 krasis.model INFO: Streaming attention decode: 48 layers, 2939 MB pinned, 232 MB GPU buffers (2 type(s), 2x ping-pong), GPU free: 13999 MB, 5.7s
-
-[1m[36m▸ Building CPU INT4 expert cache (one-time, may take several minutes)[0m
-  [2mCache will be saved to /home/main/.krasis/models/Qwen3-Coder-Next/.krasis_cache for instant loading next time.[0m
-14:49:03 krasis.model INFO: Phase 2: Loading expert weights (CPU INT4 + GPU INT4)...
-14:49:03 krasis.model INFO: shared_expert_gate detected — Rust engine will skip shared experts (handled on GPU)
-14:49:57 krasis.model INFO: Krasis engine: 48 MoE layers, 512 experts, hidden=2048
-14:49:57 krasis.model INFO: Routing weights sent to Rust engine (48 MoE layers)
-14:49:57 krasis.model INFO: Expert weights loaded in 53.8s
-  [0;32mExpert cache built in 54s — next launch will be much faster.[0m
-14:49:57 krasis.model WARNING: RAM estimate deviation: estimated 39.9 GB, actual VmRSS 82.5 GB (107% off) — estimates may need recalibration
-
-[1m[36m▸ Initializing GPU prefill managers[0m
-14:49:57 krasis.gpu_prefill INFO: GpuPrefillManager(rank 0/1): expert_slice=[0, 512), local_count=512
-14:49:57 krasis.gpu_prefill INFO: GPU prefill group_size=128
-14:49:57 krasis.gpu_prefill INFO: Auto chunk_size: 512 experts (1.6 MB each, 5766.7 MB budget of 14679.0 MB free)
-14:49:57 krasis.gpu_prefill INFO: Layer-grouped mode: 2 layers/group, 24 groups, ~1660.9 MB per group, 48 total MoE layers
-14:49:57 krasis.gpu_prefill INFO: GpuPrefillManager(engine): experts=512, hidden=2048, intermediate=512, chunk_size=512, num_chunks=1, shared=1, scale=1.000, num_bits=4, prefill_mode=layer_grouped, layer_group_size=2
-14:49:57 krasis.model INFO: GPU prefill manager created for cuda:0 (rank 0/1)
-14:49:57 krasis.gpu_prefill INFO: Engine path: Marlin-native DMA copy (zero conversion, zero RAM cache)
-14:49:57 krasis.model INFO: GPU prefill: 1 managers, threshold=300 tokens
-14:49:57 krasis.kv_cache INFO: KV cache: 2000 MB → 10666 pages (170.7K tokens)
-14:49:57 krasis.kv_cache INFO: KV cache allocated: 12 layers × 10666 pages × 16 tokens = 2000 MB (gqa, gqa-split)
-14:49:57 krasis.model INFO: Hybrid model: 12 full attention layers (KV cache), 36 linear attention layers
-14:49:57 krasis.tokenizer INFO: Tokenizer loaded: vocab=151643, eos=151645, bos=-1
-14:49:57 krasis.model INFO: Model fully loaded in 64.6s
-14:49:57 __main__ INFO: Loading cached c4 from /home/main/Documents/Claude/krasis/perplexity/datasets/c4-en-validation.txt
-14:50:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:50:11 krasis.gpu_prefill INFO: Pre-allocating pinned DMA buffers: 830.5 MB (w13p=536.9, w13s=16.8, w2p=268.4, w2s=8.4)
-14:50:11 krasis.gpu_prefill INFO: Pinned DMA buffers allocated: 830.5 MB in 0.6s
-14:50:12 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5635.3 MB)
-
-  Loading C4 validation (standard LLM benchmark, 364K docs)...
-  Dataset: 784,744,691 chars
-  Pre-truncating text to ~3.0M chars (for 500,000 token target)
-  Tokenizing...
-  Tokens: 656,505
-  Truncated to: 500,000
-
-  Evaluating perplexity...
-14:50:12 krasis.linear_attention INFO: Compiled linear attention chunk step (default/Inductor mode)
-<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
-<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
-  Window 1/489 | scored 2047/500000 tokens | running PPL=14.48 | 145 tok/s14:50:21 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:50:22 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 2/489 | scored 3071/500000 tokens | running PPL=16.20 | 139 tok/s14:50:29 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:50:30 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 3/489 | scored 4095/500000 tokens | running PPL=15.36 | 136 tok/s14:50:37 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:50:37 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 4/489 | scored 5119/500000 tokens | running PPL=14.81 | 128 tok/s14:50:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:50:47 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 5/489 | scored 6143/500000 tokens | running PPL=15.81 | 128 tok/s14:50:55 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:50:55 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 6/489 | scored 7167/500000 tokens | running PPL=15.49 | 128 tok/s14:51:03 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:51:03 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 7/489 | scored 8191/500000 tokens | running PPL=15.67 | 128 tok/s14:51:11 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:51:11 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 8/489 | scored 9215/500000 tokens | running PPL=15.02 | 128 tok/s14:51:19 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:51:19 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 9/489 | scored 10239/500000 tokens | running PPL=14.73 | 128 tok/s14:51:27 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:51:27 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 10/489 | scored 11263/500000 tokens | running PPL=14.09 | 128 tok/s14:51:35 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:51:35 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 11/489 | scored 12287/500000 tokens | running PPL=13.96 | 128 tok/s14:51:43 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:51:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 12/489 | scored 13311/500000 tokens | running PPL=13.60 | 128 tok/s14:51:51 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:51:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 13/489 | scored 14335/500000 tokens | running PPL=13.02 | 128 tok/s14:51:59 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:51:59 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 14/489 | scored 15359/500000 tokens | running PPL=12.13 | 127 tok/s14:52:08 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:52:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 15/489 | scored 16383/500000 tokens | running PPL=11.77 | 127 tok/s14:52:16 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:52:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 16/489 | scored 17407/500000 tokens | running PPL=12.17 | 127 tok/s14:52:24 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:52:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 17/489 | scored 18431/500000 tokens | running PPL=12.21 | 127 tok/s14:52:32 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:52:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 18/489 | scored 19455/500000 tokens | running PPL=12.40 | 128 tok/s14:52:40 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:52:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 19/489 | scored 20479/500000 tokens | running PPL=12.47 | 128 tok/s14:52:48 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:52:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 20/489 | scored 21503/500000 tokens | running PPL=12.34 | 128 tok/s14:52:56 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:52:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 21/489 | scored 22527/500000 tokens | running PPL=11.90 | 127 tok/s14:53:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:53:05 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 22/489 | scored 23551/500000 tokens | running PPL=12.07 | 127 tok/s14:53:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:53:13 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 23/489 | scored 24575/500000 tokens | running PPL=12.24 | 127 tok/s14:53:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:53:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 24/489 | scored 25599/500000 tokens | running PPL=12.33 | 127 tok/s14:53:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:53:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 25/489 | scored 26623/500000 tokens | running PPL=12.46 | 127 tok/s14:53:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:53:36 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 26/489 | scored 27647/500000 tokens | running PPL=12.13 | 127 tok/s14:53:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:53:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 27/489 | scored 28671/500000 tokens | running PPL=12.25 | 127 tok/s14:53:52 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:53:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 28/489 | scored 29695/500000 tokens | running PPL=12.07 | 127 tok/s14:54:00 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:54:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 29/489 | scored 30719/500000 tokens | running PPL=12.12 | 128 tok/s14:54:08 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:54:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 30/489 | scored 31743/500000 tokens | running PPL=12.11 | 125 tok/s14:54:21 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:54:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 31/489 | scored 32767/500000 tokens | running PPL=12.04 | 124 tok/s14:54:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:54:31 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 32/489 | scored 33791/500000 tokens | running PPL=11.89 | 124 tok/s14:54:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:54:39 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 33/489 | scored 34815/500000 tokens | running PPL=11.80 | 124 tok/s14:54:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:54:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 34/489 | scored 35839/500000 tokens | running PPL=11.83 | 124 tok/s14:54:56 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:54:57 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 35/489 | scored 36863/500000 tokens | running PPL=12.06 | 124 tok/s14:55:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:55:04 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 36/489 | scored 37887/500000 tokens | running PPL=12.05 | 124 tok/s14:55:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:55:12 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 37/489 | scored 38911/500000 tokens | running PPL=12.16 | 124 tok/s14:55:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:55:20 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 38/489 | scored 39935/500000 tokens | running PPL=12.07 | 124 tok/s14:55:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:55:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 39/489 | scored 40959/500000 tokens | running PPL=12.05 | 125 tok/s14:55:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:55:36 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 40/489 | scored 41983/500000 tokens | running PPL=12.04 | 125 tok/s14:55:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:55:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 41/489 | scored 43007/500000 tokens | running PPL=11.93 | 125 tok/s14:55:52 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:55:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 42/489 | scored 44031/500000 tokens | running PPL=11.96 | 125 tok/s14:56:00 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:56:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 43/489 | scored 45055/500000 tokens | running PPL=12.06 | 125 tok/s14:56:08 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:56:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 44/489 | scored 46079/500000 tokens | running PPL=12.14 | 125 tok/s14:56:16 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:56:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 45/489 | scored 47103/500000 tokens | running PPL=12.20 | 125 tok/s14:56:24 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:56:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 46/489 | scored 48127/500000 tokens | running PPL=12.35 | 125 tok/s14:56:32 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:56:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 47/489 | scored 49151/500000 tokens | running PPL=12.43 | 125 tok/s14:56:40 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:56:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 48/489 | scored 50175/500000 tokens | running PPL=12.54 | 125 tok/s14:56:48 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:56:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 49/489 | scored 51199/500000 tokens | running PPL=12.58 | 125 tok/s14:56:56 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:56:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 50/489 | scored 52223/500000 tokens | running PPL=12.60 | 125 tok/s14:57:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:57:04 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 51/489 | scored 53247/500000 tokens | running PPL=12.59 | 125 tok/s14:57:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:57:12 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 52/489 | scored 54271/500000 tokens | running PPL=12.57 | 125 tok/s14:57:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:57:20 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 53/489 | scored 55295/500000 tokens | running PPL=12.52 | 126 tok/s14:57:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:57:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 54/489 | scored 56319/500000 tokens | running PPL=12.51 | 126 tok/s14:57:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:57:36 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 55/489 | scored 57343/500000 tokens | running PPL=12.55 | 126 tok/s14:57:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:57:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 56/489 | scored 58367/500000 tokens | running PPL=12.47 | 126 tok/s14:57:51 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:57:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 57/489 | scored 59391/500000 tokens | running PPL=12.34 | 126 tok/s14:57:59 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:58:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 58/489 | scored 60415/500000 tokens | running PPL=12.34 | 126 tok/s14:58:08 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:58:09 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.61s (GPU total: 5647.0 MB)
-  Window 59/489 | scored 61439/500000 tokens | running PPL=12.48 | 125 tok/s14:58:17 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:58:17 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 60/489 | scored 62463/500000 tokens | running PPL=12.71 | 125 tok/s14:58:25 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:58:25 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 61/489 | scored 63487/500000 tokens | running PPL=12.77 | 126 tok/s14:58:33 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:58:33 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 62/489 | scored 64511/500000 tokens | running PPL=12.79 | 126 tok/s14:58:41 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:58:41 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 63/489 | scored 65535/500000 tokens | running PPL=12.88 | 126 tok/s14:58:49 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:58:49 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 64/489 | scored 66559/500000 tokens | running PPL=13.02 | 126 tok/s14:58:57 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:58:57 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 65/489 | scored 67583/500000 tokens | running PPL=13.07 | 126 tok/s14:59:05 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:59:05 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.56s (GPU total: 5647.0 MB)
-  Window 66/489 | scored 68607/500000 tokens | running PPL=13.18 | 125 tok/s14:59:15 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:59:15 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 67/489 | scored 69631/500000 tokens | running PPL=13.24 | 125 tok/s14:59:24 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:59:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 68/489 | scored 70655/500000 tokens | running PPL=13.44 | 125 tok/s14:59:32 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:59:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 69/489 | scored 71679/500000 tokens | running PPL=13.35 | 125 tok/s14:59:40 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:59:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 70/489 | scored 72703/500000 tokens | running PPL=13.32 | 125 tok/s14:59:48 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:59:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 71/489 | scored 73727/500000 tokens | running PPL=13.28 | 125 tok/s14:59:56 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-14:59:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 72/489 | scored 74751/500000 tokens | running PPL=13.30 | 125 tok/s15:00:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:00:04 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 73/489 | scored 75775/500000 tokens | running PPL=13.32 | 125 tok/s15:00:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:00:12 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 74/489 | scored 76799/500000 tokens | running PPL=13.50 | 125 tok/s15:00:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:00:20 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 75/489 | scored 77823/500000 tokens | running PPL=13.49 | 125 tok/s15:00:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:00:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 76/489 | scored 78847/500000 tokens | running PPL=13.49 | 125 tok/s15:00:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:00:36 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 77/489 | scored 79871/500000 tokens | running PPL=13.49 | 125 tok/s15:00:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:00:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 78/489 | scored 80895/500000 tokens | running PPL=14.09 | 125 tok/s15:00:52 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:00:53 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 79/489 | scored 81919/500000 tokens | running PPL=13.99 | 125 tok/s15:01:01 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:01:01 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 80/489 | scored 82943/500000 tokens | running PPL=13.86 | 125 tok/s15:01:09 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:01:09 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 81/489 | scored 83967/500000 tokens | running PPL=13.68 | 125 tok/s15:01:17 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:01:17 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 82/489 | scored 84991/500000 tokens | running PPL=13.53 | 125 tok/s15:01:25 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:01:26 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 83/489 | scored 86015/500000 tokens | running PPL=13.34 | 125 tok/s15:01:33 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:01:34 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 84/489 | scored 87039/500000 tokens | running PPL=13.15 | 125 tok/s15:01:41 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:01:42 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 85/489 | scored 88063/500000 tokens | running PPL=13.04 | 125 tok/s15:01:52 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:01:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 86/489 | scored 89087/500000 tokens | running PPL=12.92 | 125 tok/s15:02:00 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:02:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 87/489 | scored 90111/500000 tokens | running PPL=12.85 | 125 tok/s15:02:08 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:02:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 88/489 | scored 91135/500000 tokens | running PPL=12.76 | 125 tok/s15:02:16 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:02:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 89/489 | scored 92159/500000 tokens | running PPL=12.66 | 125 tok/s15:02:24 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:02:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 90/489 | scored 93183/500000 tokens | running PPL=12.64 | 125 tok/s15:02:32 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:02:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 91/489 | scored 94207/500000 tokens | running PPL=12.58 | 125 tok/s15:02:40 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:02:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 92/489 | scored 95231/500000 tokens | running PPL=12.64 | 125 tok/s15:02:48 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:02:49 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 93/489 | scored 96255/500000 tokens | running PPL=12.68 | 125 tok/s15:02:56 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:02:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 94/489 | scored 97279/500000 tokens | running PPL=12.55 | 125 tok/s15:03:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:03:05 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.89s (GPU total: 5647.0 MB)
-  Window 95/489 | scored 98303/500000 tokens | running PPL=12.46 | 124 tok/s15:03:19 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:03:19 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 96/489 | scored 99327/500000 tokens | running PPL=12.56 | 124 tok/s15:03:27 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:03:27 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 97/489 | scored 100351/500000 tokens | running PPL=12.59 | 124 tok/s15:03:35 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:03:35 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 98/489 | scored 101375/500000 tokens | running PPL=12.64 | 124 tok/s15:03:43 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:03:43 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 99/489 | scored 102399/500000 tokens | running PPL=12.70 | 124 tok/s15:03:51 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:03:51 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 100/489 | scored 103423/500000 tokens | running PPL=12.69 | 124 tok/s15:03:59 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:03:59 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 101/489 | scored 104447/500000 tokens | running PPL=12.54 | 124 tok/s15:04:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:04:07 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 102/489 | scored 105471/500000 tokens | running PPL=12.54 | 124 tok/s15:04:15 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:04:15 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 103/489 | scored 106495/500000 tokens | running PPL=12.53 | 124 tok/s15:04:23 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:04:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 104/489 | scored 107519/500000 tokens | running PPL=12.52 | 124 tok/s15:04:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:04:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 105/489 | scored 108543/500000 tokens | running PPL=12.51 | 124 tok/s15:04:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:04:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 106/489 | scored 109567/500000 tokens | running PPL=12.53 | 124 tok/s15:04:50 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:04:50 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 107/489 | scored 110591/500000 tokens | running PPL=12.52 | 124 tok/s15:04:58 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:04:58 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 108/489 | scored 111615/500000 tokens | running PPL=12.54 | 124 tok/s15:05:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:05:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 109/489 | scored 112639/500000 tokens | running PPL=12.55 | 124 tok/s15:05:15 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:05:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 110/489 | scored 113663/500000 tokens | running PPL=12.54 | 124 tok/s15:05:24 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:05:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 111/489 | scored 114687/500000 tokens | running PPL=12.48 | 124 tok/s15:05:32 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:05:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 112/489 | scored 115711/500000 tokens | running PPL=12.47 | 124 tok/s15:05:40 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:05:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 113/489 | scored 116735/500000 tokens | running PPL=12.42 | 124 tok/s15:05:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:05:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 114/489 | scored 117759/500000 tokens | running PPL=12.50 | 124 tok/s15:05:55 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:05:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 115/489 | scored 118783/500000 tokens | running PPL=12.51 | 124 tok/s15:06:03 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:06:04 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 116/489 | scored 119807/500000 tokens | running PPL=12.53 | 124 tok/s15:06:11 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:06:12 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 117/489 | scored 120831/500000 tokens | running PPL=12.49 | 124 tok/s15:06:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:06:20 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 118/489 | scored 121855/500000 tokens | running PPL=12.55 | 124 tok/s15:06:29 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:06:29 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 119/489 | scored 122879/500000 tokens | running PPL=12.42 | 124 tok/s15:06:37 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:06:37 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 120/489 | scored 123903/500000 tokens | running PPL=12.23 | 124 tok/s15:06:45 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:06:45 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 121/489 | scored 124927/500000 tokens | running PPL=12.25 | 124 tok/s15:06:53 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:06:53 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 122/489 | scored 125951/500000 tokens | running PPL=12.28 | 124 tok/s15:07:01 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:07:01 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 123/489 | scored 126975/500000 tokens | running PPL=12.30 | 124 tok/s15:07:09 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:07:10 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 124/489 | scored 127999/500000 tokens | running PPL=12.32 | 124 tok/s15:07:17 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:07:18 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 125/489 | scored 129023/500000 tokens | running PPL=12.33 | 124 tok/s15:07:25 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:07:26 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 126/489 | scored 130047/500000 tokens | running PPL=12.34 | 124 tok/s15:07:33 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:07:34 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.90s (GPU total: 5647.0 MB)
-  Window 127/489 | scored 131071/500000 tokens | running PPL=12.33 | 124 tok/s15:07:42 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:07:43 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 128/489 | scored 132095/500000 tokens | running PPL=12.36 | 124 tok/s15:07:50 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:07:50 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 129/489 | scored 133119/500000 tokens | running PPL=12.40 | 124 tok/s15:07:58 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:07:58 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 130/489 | scored 134143/500000 tokens | running PPL=12.41 | 124 tok/s15:08:06 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:08:06 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 131/489 | scored 135167/500000 tokens | running PPL=12.41 | 124 tok/s15:08:15 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:08:15 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 132/489 | scored 136191/500000 tokens | running PPL=12.47 | 124 tok/s15:08:23 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:08:23 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 133/489 | scored 137215/500000 tokens | running PPL=12.46 | 124 tok/s15:08:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:08:31 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 134/489 | scored 138239/500000 tokens | running PPL=12.42 | 124 tok/s15:08:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:08:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 135/489 | scored 139263/500000 tokens | running PPL=12.31 | 124 tok/s15:08:48 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:08:49 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.90s (GPU total: 5647.0 MB)
-  Window 136/489 | scored 140287/500000 tokens | running PPL=12.30 | 124 tok/s15:09:01 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:09:02 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.89s (GPU total: 5647.0 MB)
-  Window 137/489 | scored 141311/500000 tokens | running PPL=12.30 | 124 tok/s15:09:10 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:09:11 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 138/489 | scored 142335/500000 tokens | running PPL=12.27 | 124 tok/s15:09:18 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:09:19 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 139/489 | scored 143359/500000 tokens | running PPL=12.27 | 124 tok/s15:09:26 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:09:27 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 140/489 | scored 144383/500000 tokens | running PPL=12.30 | 124 tok/s15:09:35 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:09:35 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 141/489 | scored 145407/500000 tokens | running PPL=12.33 | 124 tok/s15:09:43 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:09:43 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 142/489 | scored 146431/500000 tokens | running PPL=12.35 | 124 tok/s15:09:51 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:09:51 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 143/489 | scored 147455/500000 tokens | running PPL=12.33 | 124 tok/s15:09:59 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:09:59 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 144/489 | scored 148479/500000 tokens | running PPL=12.33 | 124 tok/s15:10:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:10:07 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 145/489 | scored 149503/500000 tokens | running PPL=12.34 | 124 tok/s15:10:14 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:10:15 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 146/489 | scored 150527/500000 tokens | running PPL=12.38 | 124 tok/s15:10:22 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:10:23 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 147/489 | scored 151551/500000 tokens | running PPL=12.41 | 124 tok/s15:10:30 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:10:31 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 148/489 | scored 152575/500000 tokens | running PPL=12.44 | 124 tok/s15:10:38 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:10:39 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 149/489 | scored 153599/500000 tokens | running PPL=12.49 | 124 tok/s15:10:46 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:10:47 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 150/489 | scored 154623/500000 tokens | running PPL=12.53 | 124 tok/s15:10:55 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:10:55 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 151/489 | scored 155647/500000 tokens | running PPL=12.56 | 124 tok/s15:11:02 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:11:03 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 152/489 | scored 156671/500000 tokens | running PPL=12.57 | 124 tok/s15:11:10 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:11:11 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 153/489 | scored 157695/500000 tokens | running PPL=12.54 | 124 tok/s15:11:19 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:11:19 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 154/489 | scored 158719/500000 tokens | running PPL=12.56 | 124 tok/s15:11:27 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:11:27 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 155/489 | scored 159743/500000 tokens | running PPL=12.56 | 124 tok/s15:11:34 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:11:35 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 156/489 | scored 160767/500000 tokens | running PPL=12.57 | 124 tok/s15:11:43 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:11:43 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 157/489 | scored 161791/500000 tokens | running PPL=12.56 | 124 tok/s15:11:51 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:11:51 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 158/489 | scored 162815/500000 tokens | running PPL=12.57 | 124 tok/s15:11:59 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:12:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 159/489 | scored 163839/500000 tokens | running PPL=12.53 | 124 tok/s15:12:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:12:07 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 160/489 | scored 164863/500000 tokens | running PPL=12.56 | 124 tok/s15:12:15 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:12:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.53s (GPU total: 5647.0 MB)
-  Window 161/489 | scored 165887/500000 tokens | running PPL=12.61 | 124 tok/s15:12:25 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:12:25 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 162/489 | scored 166911/500000 tokens | running PPL=12.63 | 124 tok/s15:12:33 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:12:33 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 163/489 | scored 167935/500000 tokens | running PPL=12.70 | 124 tok/s15:12:41 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:12:41 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 164/489 | scored 168959/500000 tokens | running PPL=12.79 | 124 tok/s15:12:49 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:12:50 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 165/489 | scored 169983/500000 tokens | running PPL=12.89 | 124 tok/s15:12:57 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:12:57 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 166/489 | scored 171007/500000 tokens | running PPL=13.00 | 124 tok/s15:13:05 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:13:06 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 167/489 | scored 172031/500000 tokens | running PPL=13.11 | 124 tok/s15:13:13 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:13:14 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 168/489 | scored 173055/500000 tokens | running PPL=13.19 | 124 tok/s15:13:21 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:13:22 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 169/489 | scored 174079/500000 tokens | running PPL=13.19 | 124 tok/s15:13:29 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:13:29 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 170/489 | scored 175103/500000 tokens | running PPL=13.15 | 124 tok/s15:13:37 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:13:38 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 171/489 | scored 176127/500000 tokens | running PPL=13.18 | 124 tok/s15:13:45 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:13:46 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 172/489 | scored 177151/500000 tokens | running PPL=13.25 | 124 tok/s15:13:53 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:13:53 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 173/489 | scored 178175/500000 tokens | running PPL=13.22 | 124 tok/s15:14:01 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:14:01 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 174/489 | scored 179199/500000 tokens | running PPL=13.21 | 124 tok/s15:14:09 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:14:09 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 175/489 | scored 180223/500000 tokens | running PPL=13.26 | 124 tok/s15:14:17 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:14:17 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 176/489 | scored 181247/500000 tokens | running PPL=13.29 | 124 tok/s15:14:25 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:14:25 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 177/489 | scored 182271/500000 tokens | running PPL=13.19 | 124 tok/s15:14:33 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:14:33 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 178/489 | scored 183295/500000 tokens | running PPL=13.10 | 124 tok/s15:14:41 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:14:41 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 179/489 | scored 184319/500000 tokens | running PPL=13.04 | 124 tok/s15:14:49 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:14:49 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 180/489 | scored 185343/500000 tokens | running PPL=13.02 | 124 tok/s15:14:57 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:14:57 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 181/489 | scored 186367/500000 tokens | running PPL=12.99 | 124 tok/s15:15:05 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:15:05 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 182/489 | scored 187391/500000 tokens | running PPL=12.98 | 124 tok/s15:15:13 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:15:13 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 183/489 | scored 188415/500000 tokens | running PPL=13.00 | 124 tok/s15:15:21 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:15:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 184/489 | scored 189439/500000 tokens | running PPL=13.02 | 124 tok/s15:15:29 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:15:29 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 185/489 | scored 190463/500000 tokens | running PPL=12.98 | 125 tok/s15:15:37 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:15:37 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 186/489 | scored 191487/500000 tokens | running PPL=12.98 | 125 tok/s15:15:45 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:15:45 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 187/489 | scored 192511/500000 tokens | running PPL=13.00 | 125 tok/s15:15:53 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:15:53 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 188/489 | scored 193535/500000 tokens | running PPL=13.01 | 125 tok/s15:16:01 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:16:01 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 189/489 | scored 194559/500000 tokens | running PPL=12.99 | 125 tok/s15:16:09 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:16:09 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.33s (GPU total: 5647.0 MB)
-  Window 190/489 | scored 195583/500000 tokens | running PPL=12.99 | 125 tok/s15:16:17 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:16:17 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 191/489 | scored 196607/500000 tokens | running PPL=13.04 | 125 tok/s15:16:25 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:16:25 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 192/489 | scored 197631/500000 tokens | running PPL=13.05 | 125 tok/s15:16:34 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:16:34 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 193/489 | scored 198655/500000 tokens | running PPL=13.03 | 125 tok/s15:16:42 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:16:42 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 194/489 | scored 199679/500000 tokens | running PPL=13.03 | 125 tok/s15:16:51 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:16:51 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 195/489 | scored 200703/500000 tokens | running PPL=13.03 | 125 tok/s15:16:59 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:16:59 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 196/489 | scored 201727/500000 tokens | running PPL=13.04 | 125 tok/s15:17:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:17:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.64s (GPU total: 5647.0 MB)
-  Window 197/489 | scored 202751/500000 tokens | running PPL=13.09 | 125 tok/s15:17:15 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:17:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 198/489 | scored 203775/500000 tokens | running PPL=13.05 | 125 tok/s15:17:23 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:17:23 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 199/489 | scored 204799/500000 tokens | running PPL=13.05 | 125 tok/s15:17:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:17:31 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 200/489 | scored 205823/500000 tokens | running PPL=13.05 | 124 tok/s15:17:40 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:17:41 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 201/489 | scored 206847/500000 tokens | running PPL=13.05 | 125 tok/s15:17:48 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:17:49 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 202/489 | scored 207871/500000 tokens | running PPL=13.05 | 125 tok/s15:17:56 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:17:57 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 203/489 | scored 208895/500000 tokens | running PPL=13.07 | 124 tok/s15:18:06 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:18:06 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 204/489 | scored 209919/500000 tokens | running PPL=13.07 | 124 tok/s15:18:14 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:18:15 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 205/489 | scored 210943/500000 tokens | running PPL=13.06 | 124 tok/s15:18:22 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:18:23 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 206/489 | scored 211967/500000 tokens | running PPL=13.06 | 124 tok/s15:18:30 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:18:31 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 207/489 | scored 212991/500000 tokens | running PPL=13.06 | 124 tok/s15:18:38 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:18:39 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 208/489 | scored 214015/500000 tokens | running PPL=13.06 | 124 tok/s15:18:46 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:18:47 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 209/489 | scored 215039/500000 tokens | running PPL=13.05 | 124 tok/s15:18:54 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:18:55 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 210/489 | scored 216063/500000 tokens | running PPL=13.03 | 125 tok/s15:19:02 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:19:03 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 211/489 | scored 217087/500000 tokens | running PPL=13.05 | 125 tok/s15:19:10 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:19:11 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 212/489 | scored 218111/500000 tokens | running PPL=13.04 | 125 tok/s15:19:19 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:19:20 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.90s (GPU total: 5647.0 MB)
-  Window 213/489 | scored 219135/500000 tokens | running PPL=13.05 | 124 tok/s15:19:29 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:19:29 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 214/489 | scored 220159/500000 tokens | running PPL=13.05 | 124 tok/s15:19:37 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:19:37 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 215/489 | scored 221183/500000 tokens | running PPL=13.08 | 124 tok/s15:19:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:19:45 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 216/489 | scored 222207/500000 tokens | running PPL=13.12 | 124 tok/s15:19:52 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:19:53 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 217/489 | scored 223231/500000 tokens | running PPL=13.11 | 124 tok/s15:20:01 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:20:01 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 218/489 | scored 224255/500000 tokens | running PPL=13.07 | 124 tok/s15:20:09 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:20:09 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 219/489 | scored 225279/500000 tokens | running PPL=12.99 | 124 tok/s15:20:24 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:20:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 220/489 | scored 226303/500000 tokens | running PPL=12.89 | 124 tok/s15:20:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:20:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 221/489 | scored 227327/500000 tokens | running PPL=12.88 | 124 tok/s15:20:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:20:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 222/489 | scored 228351/500000 tokens | running PPL=12.87 | 124 tok/s15:20:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:20:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 223/489 | scored 229375/500000 tokens | running PPL=12.90 | 124 tok/s15:20:55 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:20:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 224/489 | scored 230399/500000 tokens | running PPL=12.92 | 124 tok/s15:21:03 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:21:04 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.89s (GPU total: 5647.0 MB)
-  Window 225/489 | scored 231423/500000 tokens | running PPL=12.92 | 124 tok/s15:21:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:21:20 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.49s (GPU total: 5647.0 MB)
-  Window 226/489 | scored 232447/500000 tokens | running PPL=12.92 | 124 tok/s15:21:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:21:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 227/489 | scored 233471/500000 tokens | running PPL=12.90 | 124 tok/s15:21:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:21:36 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 228/489 | scored 234495/500000 tokens | running PPL=12.93 | 124 tok/s15:21:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:21:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 229/489 | scored 235519/500000 tokens | running PPL=12.91 | 124 tok/s15:21:52 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:21:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 230/489 | scored 236543/500000 tokens | running PPL=12.89 | 124 tok/s15:21:59 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:22:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 231/489 | scored 237567/500000 tokens | running PPL=12.87 | 124 tok/s15:22:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:22:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 232/489 | scored 238591/500000 tokens | running PPL=12.89 | 124 tok/s15:22:18 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:22:18 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 233/489 | scored 239615/500000 tokens | running PPL=12.89 | 124 tok/s15:22:26 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:22:26 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 234/489 | scored 240639/500000 tokens | running PPL=12.86 | 124 tok/s15:22:33 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:22:34 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 235/489 | scored 241663/500000 tokens | running PPL=12.85 | 124 tok/s15:22:41 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:22:42 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.82s (GPU total: 5647.0 MB)
-  Window 236/489 | scored 242687/500000 tokens | running PPL=12.85 | 124 tok/s15:22:50 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:22:50 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 237/489 | scored 243711/500000 tokens | running PPL=12.86 | 124 tok/s15:22:58 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:22:58 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 238/489 | scored 244735/500000 tokens | running PPL=12.85 | 124 tok/s15:23:06 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:23:06 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 239/489 | scored 245759/500000 tokens | running PPL=12.85 | 124 tok/s15:23:14 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:23:14 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 240/489 | scored 246783/500000 tokens | running PPL=12.86 | 124 tok/s15:23:25 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:23:25 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 241/489 | scored 247807/500000 tokens | running PPL=12.86 | 124 tok/s15:23:33 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:23:34 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 242/489 | scored 248831/500000 tokens | running PPL=12.87 | 124 tok/s15:23:41 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:23:42 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 243/489 | scored 249855/500000 tokens | running PPL=12.84 | 124 tok/s15:23:49 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:23:49 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 244/489 | scored 250879/500000 tokens | running PPL=12.85 | 124 tok/s15:23:58 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:23:58 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 245/489 | scored 251903/500000 tokens | running PPL=12.90 | 124 tok/s15:24:06 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:24:06 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 246/489 | scored 252927/500000 tokens | running PPL=12.93 | 124 tok/s15:24:14 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:24:14 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 247/489 | scored 253951/500000 tokens | running PPL=12.92 | 124 tok/s15:24:22 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:24:22 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 248/489 | scored 254975/500000 tokens | running PPL=12.91 | 124 tok/s15:24:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:24:31 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 249/489 | scored 255999/500000 tokens | running PPL=12.82 | 124 tok/s15:24:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:24:39 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 250/489 | scored 257023/500000 tokens | running PPL=12.72 | 124 tok/s15:24:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:24:47 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 251/489 | scored 258047/500000 tokens | running PPL=12.62 | 124 tok/s15:24:56 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:24:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 252/489 | scored 259071/500000 tokens | running PPL=12.53 | 124 tok/s15:25:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:25:04 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 253/489 | scored 260095/500000 tokens | running PPL=12.45 | 124 tok/s15:25:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:25:12 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 254/489 | scored 261119/500000 tokens | running PPL=12.47 | 124 tok/s15:25:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:25:20 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 255/489 | scored 262143/500000 tokens | running PPL=12.47 | 124 tok/s15:25:27 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:25:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 256/489 | scored 263167/500000 tokens | running PPL=12.46 | 124 tok/s15:25:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:25:36 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 257/489 | scored 264191/500000 tokens | running PPL=12.47 | 124 tok/s15:25:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:25:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 258/489 | scored 265215/500000 tokens | running PPL=12.48 | 124 tok/s15:25:51 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:25:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 259/489 | scored 266239/500000 tokens | running PPL=12.47 | 124 tok/s15:26:00 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:26:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 260/489 | scored 267263/500000 tokens | running PPL=12.46 | 124 tok/s15:26:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:26:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 261/489 | scored 268287/500000 tokens | running PPL=12.48 | 124 tok/s15:26:15 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:26:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 262/489 | scored 269311/500000 tokens | running PPL=12.49 | 124 tok/s15:26:23 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:26:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 263/489 | scored 270335/500000 tokens | running PPL=12.48 | 124 tok/s15:26:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:26:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 264/489 | scored 271359/500000 tokens | running PPL=12.49 | 124 tok/s15:26:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:26:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 265/489 | scored 272383/500000 tokens | running PPL=12.49 | 124 tok/s15:26:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:26:47 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 266/489 | scored 273407/500000 tokens | running PPL=12.51 | 124 tok/s15:26:55 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:26:55 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 267/489 | scored 274431/500000 tokens | running PPL=12.51 | 124 tok/s15:27:03 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:27:03 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 268/489 | scored 275455/500000 tokens | running PPL=12.51 | 124 tok/s15:27:11 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:27:11 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 269/489 | scored 276479/500000 tokens | running PPL=12.50 | 124 tok/s15:27:19 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:27:19 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 270/489 | scored 277503/500000 tokens | running PPL=12.49 | 124 tok/s15:27:27 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:27:27 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 271/489 | scored 278527/500000 tokens | running PPL=12.50 | 124 tok/s15:27:35 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:27:35 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 272/489 | scored 279551/500000 tokens | running PPL=12.52 | 124 tok/s15:27:43 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:27:43 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 273/489 | scored 280575/500000 tokens | running PPL=12.55 | 124 tok/s15:27:51 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:27:51 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 274/489 | scored 281599/500000 tokens | running PPL=12.55 | 124 tok/s15:27:59 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:27:59 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 275/489 | scored 282623/500000 tokens | running PPL=12.55 | 124 tok/s15:28:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:28:07 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 276/489 | scored 283647/500000 tokens | running PPL=12.55 | 124 tok/s15:28:15 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:28:15 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 277/489 | scored 284671/500000 tokens | running PPL=12.56 | 124 tok/s15:28:23 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:28:23 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 278/489 | scored 285695/500000 tokens | running PPL=12.58 | 124 tok/s15:28:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:28:31 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 279/489 | scored 286719/500000 tokens | running PPL=12.57 | 124 tok/s15:28:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:28:39 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 280/489 | scored 287743/500000 tokens | running PPL=12.56 | 124 tok/s15:28:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:28:47 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 281/489 | scored 288767/500000 tokens | running PPL=12.56 | 124 tok/s15:28:55 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:28:55 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 282/489 | scored 289791/500000 tokens | running PPL=12.59 | 124 tok/s15:29:03 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:29:03 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 283/489 | scored 290815/500000 tokens | running PPL=12.55 | 124 tok/s15:29:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:29:12 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 284/489 | scored 291839/500000 tokens | running PPL=12.55 | 124 tok/s15:29:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:29:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 285/489 | scored 292863/500000 tokens | running PPL=12.55 | 124 tok/s15:29:29 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:29:30 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 286/489 | scored 293887/500000 tokens | running PPL=12.56 | 124 tok/s15:29:37 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:29:38 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 287/489 | scored 294911/500000 tokens | running PPL=12.57 | 124 tok/s15:29:45 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:29:45 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 288/489 | scored 295935/500000 tokens | running PPL=12.57 | 124 tok/s15:29:53 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:29:53 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 289/489 | scored 296959/500000 tokens | running PPL=12.57 | 124 tok/s15:30:01 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:30:01 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 290/489 | scored 297983/500000 tokens | running PPL=12.58 | 124 tok/s15:30:09 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:30:09 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 291/489 | scored 299007/500000 tokens | running PPL=12.59 | 124 tok/s15:30:17 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:30:17 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 292/489 | scored 300031/500000 tokens | running PPL=12.61 | 124 tok/s15:30:25 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:30:25 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 293/489 | scored 301055/500000 tokens | running PPL=12.59 | 124 tok/s15:30:33 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:30:33 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 294/489 | scored 302079/500000 tokens | running PPL=12.60 | 124 tok/s15:30:41 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:30:41 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 295/489 | scored 303103/500000 tokens | running PPL=12.61 | 124 tok/s15:30:49 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:30:49 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 296/489 | scored 304127/500000 tokens | running PPL=12.62 | 124 tok/s15:30:57 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:30:57 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 297/489 | scored 305151/500000 tokens | running PPL=12.63 | 124 tok/s15:31:05 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:31:06 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.77s (GPU total: 5647.0 MB)
-  Window 298/489 | scored 306175/500000 tokens | running PPL=12.63 | 124 tok/s15:31:14 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:31:14 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 299/489 | scored 307199/500000 tokens | running PPL=12.62 | 124 tok/s15:31:22 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:31:22 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 300/489 | scored 308223/500000 tokens | running PPL=12.63 | 124 tok/s15:31:30 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:31:30 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 301/489 | scored 309247/500000 tokens | running PPL=12.63 | 124 tok/s15:31:38 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:31:38 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 302/489 | scored 310271/500000 tokens | running PPL=12.64 | 124 tok/s15:31:50 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:31:50 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 303/489 | scored 311295/500000 tokens | running PPL=12.66 | 124 tok/s15:31:58 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:31:58 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 304/489 | scored 312319/500000 tokens | running PPL=12.66 | 124 tok/s15:32:06 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:32:06 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 305/489 | scored 313343/500000 tokens | running PPL=12.67 | 124 tok/s15:32:14 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:32:14 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 306/489 | scored 314367/500000 tokens | running PPL=12.66 | 124 tok/s15:32:22 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:32:22 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.33s (GPU total: 5647.0 MB)
-  Window 307/489 | scored 315391/500000 tokens | running PPL=12.66 | 124 tok/s15:32:30 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:32:30 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 308/489 | scored 316415/500000 tokens | running PPL=12.67 | 124 tok/s15:32:38 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:32:38 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 309/489 | scored 317439/500000 tokens | running PPL=12.68 | 124 tok/s15:32:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:32:47 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 310/489 | scored 318463/500000 tokens | running PPL=12.60 | 124 tok/s15:32:54 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:32:55 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 311/489 | scored 319487/500000 tokens | running PPL=12.55 | 124 tok/s15:33:02 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:33:03 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 312/489 | scored 320511/500000 tokens | running PPL=12.47 | 124 tok/s15:33:10 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:33:11 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 313/489 | scored 321535/500000 tokens | running PPL=12.42 | 124 tok/s15:33:18 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:33:19 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 314/489 | scored 322559/500000 tokens | running PPL=12.35 | 124 tok/s15:33:26 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:33:26 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 315/489 | scored 323583/500000 tokens | running PPL=12.32 | 124 tok/s15:33:34 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:33:34 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 316/489 | scored 324607/500000 tokens | running PPL=12.31 | 124 tok/s15:33:42 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:33:42 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 317/489 | scored 325631/500000 tokens | running PPL=12.31 | 124 tok/s15:33:50 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:33:50 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 318/489 | scored 326655/500000 tokens | running PPL=12.30 | 124 tok/s15:33:58 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:33:58 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 319/489 | scored 327679/500000 tokens | running PPL=12.30 | 124 tok/s15:34:06 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:34:06 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 320/489 | scored 328703/500000 tokens | running PPL=12.29 | 124 tok/s15:34:14 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:34:14 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 321/489 | scored 329727/500000 tokens | running PPL=12.29 | 124 tok/s15:34:22 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:34:22 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 322/489 | scored 330751/500000 tokens | running PPL=12.28 | 124 tok/s15:34:30 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:34:31 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 323/489 | scored 331775/500000 tokens | running PPL=12.30 | 124 tok/s15:34:38 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:34:39 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 324/489 | scored 332799/500000 tokens | running PPL=12.31 | 124 tok/s15:34:46 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:34:47 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 325/489 | scored 333823/500000 tokens | running PPL=12.32 | 124 tok/s15:34:54 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:34:55 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 326/489 | scored 334847/500000 tokens | running PPL=12.33 | 124 tok/s15:35:02 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:35:03 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 327/489 | scored 335871/500000 tokens | running PPL=12.34 | 124 tok/s15:35:10 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:35:11 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 328/489 | scored 336895/500000 tokens | running PPL=12.34 | 124 tok/s15:35:18 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:35:19 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 329/489 | scored 337919/500000 tokens | running PPL=12.36 | 124 tok/s15:35:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:35:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 330/489 | scored 338943/500000 tokens | running PPL=12.35 | 124 tok/s15:35:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:35:36 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 331/489 | scored 339967/500000 tokens | running PPL=12.36 | 124 tok/s15:35:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:35:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 332/489 | scored 340991/500000 tokens | running PPL=12.38 | 124 tok/s15:35:52 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:35:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 333/489 | scored 342015/500000 tokens | running PPL=12.39 | 124 tok/s15:36:00 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:36:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 334/489 | scored 343039/500000 tokens | running PPL=12.42 | 124 tok/s15:36:08 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:36:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 335/489 | scored 344063/500000 tokens | running PPL=12.46 | 124 tok/s15:36:16 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:36:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 336/489 | scored 345087/500000 tokens | running PPL=12.48 | 124 tok/s15:36:24 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:36:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 337/489 | scored 346111/500000 tokens | running PPL=12.50 | 124 tok/s15:36:32 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:36:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 338/489 | scored 347135/500000 tokens | running PPL=12.53 | 124 tok/s15:36:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:36:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 339/489 | scored 348159/500000 tokens | running PPL=12.55 | 124 tok/s15:36:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:36:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 340/489 | scored 349183/500000 tokens | running PPL=12.55 | 124 tok/s15:36:55 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:36:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 341/489 | scored 350207/500000 tokens | running PPL=12.57 | 124 tok/s15:37:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:37:04 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 342/489 | scored 351231/500000 tokens | running PPL=12.58 | 124 tok/s15:37:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:37:12 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 343/489 | scored 352255/500000 tokens | running PPL=12.58 | 124 tok/s15:37:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:37:20 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 344/489 | scored 353279/500000 tokens | running PPL=12.59 | 124 tok/s15:37:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:37:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 345/489 | scored 354303/500000 tokens | running PPL=12.59 | 124 tok/s15:37:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:37:37 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.90s (GPU total: 5647.0 MB)
-  Window 346/489 | scored 355327/500000 tokens | running PPL=12.58 | 124 tok/s15:37:53 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:37:54 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 347/489 | scored 356351/500000 tokens | running PPL=12.59 | 124 tok/s15:38:01 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:38:02 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.89s (GPU total: 5647.0 MB)
-  Window 348/489 | scored 357375/500000 tokens | running PPL=12.58 | 124 tok/s15:38:13 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:38:14 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 349/489 | scored 358399/500000 tokens | running PPL=12.58 | 124 tok/s15:38:21 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:38:22 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 350/489 | scored 359423/500000 tokens | running PPL=12.59 | 124 tok/s15:38:29 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:38:30 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 351/489 | scored 360447/500000 tokens | running PPL=12.60 | 124 tok/s15:38:37 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:38:38 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 352/489 | scored 361471/500000 tokens | running PPL=12.61 | 124 tok/s15:38:45 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:38:46 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 353/489 | scored 362495/500000 tokens | running PPL=12.61 | 124 tok/s15:38:53 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:38:54 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 354/489 | scored 363519/500000 tokens | running PPL=12.62 | 124 tok/s15:39:01 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:39:02 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 355/489 | scored 364543/500000 tokens | running PPL=12.62 | 124 tok/s15:39:09 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:39:10 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 356/489 | scored 365567/500000 tokens | running PPL=12.62 | 124 tok/s15:39:17 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:39:18 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 357/489 | scored 366591/500000 tokens | running PPL=12.63 | 124 tok/s15:39:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:39:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 358/489 | scored 367615/500000 tokens | running PPL=12.62 | 124 tok/s15:39:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:39:36 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 359/489 | scored 368639/500000 tokens | running PPL=12.63 | 124 tok/s15:39:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:39:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 360/489 | scored 369663/500000 tokens | running PPL=12.64 | 124 tok/s15:39:52 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:39:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 361/489 | scored 370687/500000 tokens | running PPL=12.65 | 124 tok/s15:40:00 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:40:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 362/489 | scored 371711/500000 tokens | running PPL=12.64 | 124 tok/s15:40:08 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:40:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 363/489 | scored 372735/500000 tokens | running PPL=12.62 | 124 tok/s15:40:15 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:40:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 364/489 | scored 373759/500000 tokens | running PPL=12.61 | 124 tok/s15:40:23 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:40:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 365/489 | scored 374783/500000 tokens | running PPL=12.61 | 124 tok/s15:40:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:40:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 366/489 | scored 375807/500000 tokens | running PPL=12.62 | 124 tok/s15:40:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:40:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 367/489 | scored 376831/500000 tokens | running PPL=12.63 | 124 tok/s15:40:48 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:40:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 368/489 | scored 377855/500000 tokens | running PPL=12.63 | 124 tok/s15:40:56 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:40:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 369/489 | scored 378879/500000 tokens | running PPL=12.61 | 124 tok/s15:41:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:41:04 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 370/489 | scored 379903/500000 tokens | running PPL=12.61 | 124 tok/s15:41:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:41:13 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.55s (GPU total: 5647.0 MB)
-  Window 371/489 | scored 380927/500000 tokens | running PPL=12.64 | 124 tok/s15:41:22 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:41:22 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 372/489 | scored 381951/500000 tokens | running PPL=12.66 | 124 tok/s15:41:30 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:41:30 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 373/489 | scored 382975/500000 tokens | running PPL=12.65 | 124 tok/s15:41:38 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:41:38 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 374/489 | scored 383999/500000 tokens | running PPL=12.65 | 124 tok/s15:41:46 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:41:46 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 375/489 | scored 385023/500000 tokens | running PPL=12.66 | 124 tok/s15:41:54 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:41:54 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 376/489 | scored 386047/500000 tokens | running PPL=12.67 | 124 tok/s15:42:02 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:42:02 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 377/489 | scored 387071/500000 tokens | running PPL=12.68 | 124 tok/s15:42:10 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:42:10 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 378/489 | scored 388095/500000 tokens | running PPL=12.68 | 124 tok/s15:42:18 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:42:18 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 379/489 | scored 389119/500000 tokens | running PPL=12.69 | 124 tok/s15:42:26 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:42:26 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 380/489 | scored 390143/500000 tokens | running PPL=12.70 | 124 tok/s15:42:34 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:42:35 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 381/489 | scored 391167/500000 tokens | running PPL=12.71 | 124 tok/s15:42:42 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:42:43 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 382/489 | scored 392191/500000 tokens | running PPL=12.71 | 124 tok/s15:42:50 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:42:51 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 383/489 | scored 393215/500000 tokens | running PPL=12.72 | 124 tok/s15:42:58 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:42:59 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 384/489 | scored 394239/500000 tokens | running PPL=12.75 | 124 tok/s15:43:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:43:07 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 385/489 | scored 395263/500000 tokens | running PPL=12.73 | 124 tok/s15:43:15 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:43:15 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 386/489 | scored 396287/500000 tokens | running PPL=12.74 | 124 tok/s15:43:23 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:43:23 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 387/489 | scored 397311/500000 tokens | running PPL=12.74 | 124 tok/s15:43:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:43:31 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 388/489 | scored 398335/500000 tokens | running PPL=12.74 | 124 tok/s15:43:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:43:39 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 389/489 | scored 399359/500000 tokens | running PPL=12.73 | 124 tok/s15:43:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:43:47 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 390/489 | scored 400383/500000 tokens | running PPL=12.71 | 124 tok/s15:43:55 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:43:55 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 391/489 | scored 401407/500000 tokens | running PPL=12.65 | 124 tok/s15:44:03 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:44:03 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 392/489 | scored 402431/500000 tokens | running PPL=12.63 | 124 tok/s15:44:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:44:12 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 393/489 | scored 403455/500000 tokens | running PPL=12.65 | 124 tok/s15:44:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:44:20 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 394/489 | scored 404479/500000 tokens | running PPL=12.65 | 124 tok/s15:44:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:44:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 395/489 | scored 405503/500000 tokens | running PPL=12.66 | 124 tok/s15:44:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:44:36 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 396/489 | scored 406527/500000 tokens | running PPL=12.68 | 124 tok/s15:44:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:44:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 397/489 | scored 407551/500000 tokens | running PPL=12.70 | 124 tok/s15:44:52 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:44:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 398/489 | scored 408575/500000 tokens | running PPL=12.71 | 124 tok/s15:45:00 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:45:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 399/489 | scored 409599/500000 tokens | running PPL=12.71 | 124 tok/s15:45:08 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:45:08 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 400/489 | scored 410623/500000 tokens | running PPL=12.72 | 124 tok/s15:45:16 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:45:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 401/489 | scored 411647/500000 tokens | running PPL=12.73 | 124 tok/s15:45:24 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:45:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 402/489 | scored 412671/500000 tokens | running PPL=12.74 | 124 tok/s15:45:31 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:45:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 403/489 | scored 413695/500000 tokens | running PPL=12.75 | 124 tok/s15:45:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:45:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 404/489 | scored 414719/500000 tokens | running PPL=12.74 | 124 tok/s15:45:47 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:45:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 405/489 | scored 415743/500000 tokens | running PPL=12.73 | 124 tok/s15:45:55 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:45:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 406/489 | scored 416767/500000 tokens | running PPL=12.74 | 124 tok/s15:46:03 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:46:04 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 407/489 | scored 417791/500000 tokens | running PPL=12.73 | 124 tok/s15:46:11 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:46:12 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 408/489 | scored 418815/500000 tokens | running PPL=12.73 | 124 tok/s15:46:19 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:46:20 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 409/489 | scored 419839/500000 tokens | running PPL=12.73 | 124 tok/s15:46:27 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:46:28 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 410/489 | scored 420863/500000 tokens | running PPL=12.74 | 124 tok/s15:46:35 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:46:36 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 411/489 | scored 421887/500000 tokens | running PPL=12.75 | 124 tok/s15:46:43 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:46:44 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 412/489 | scored 422911/500000 tokens | running PPL=12.82 | 124 tok/s15:46:51 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:46:52 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 413/489 | scored 423935/500000 tokens | running PPL=12.81 | 124 tok/s15:46:59 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:47:00 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 414/489 | scored 424959/500000 tokens | running PPL=12.81 | 124 tok/s15:47:07 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:47:07 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 415/489 | scored 425983/500000 tokens | running PPL=12.80 | 124 tok/s15:47:16 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:47:16 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 416/489 | scored 427007/500000 tokens | running PPL=12.80 | 124 tok/s15:47:24 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:47:24 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 417/489 | scored 428031/500000 tokens | running PPL=12.81 | 124 tok/s15:47:32 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:47:32 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 418/489 | scored 429055/500000 tokens | running PPL=12.81 | 124 tok/s15:47:40 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:47:40 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 419/489 | scored 430079/500000 tokens | running PPL=12.81 | 124 tok/s15:47:48 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:47:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 420/489 | scored 431103/500000 tokens | running PPL=12.81 | 124 tok/s15:47:56 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:47:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 421/489 | scored 432127/500000 tokens | running PPL=12.80 | 124 tok/s15:48:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:48:05 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 422/489 | scored 433151/500000 tokens | running PPL=12.81 | 124 tok/s15:48:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:48:13 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 423/489 | scored 434175/500000 tokens | running PPL=12.82 | 124 tok/s15:48:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:48:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 424/489 | scored 435199/500000 tokens | running PPL=12.82 | 124 tok/s15:48:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:48:29 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 425/489 | scored 436223/500000 tokens | running PPL=12.81 | 124 tok/s15:48:36 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:48:37 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 426/489 | scored 437247/500000 tokens | running PPL=12.80 | 124 tok/s15:48:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:48:45 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.91s (GPU total: 5647.0 MB)
-  Window 427/489 | scored 438271/500000 tokens | running PPL=12.78 | 124 tok/s15:48:53 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:48:54 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 428/489 | scored 439295/500000 tokens | running PPL=12.78 | 124 tok/s15:49:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:49:04 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 429/489 | scored 440319/500000 tokens | running PPL=12.80 | 124 tok/s15:49:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:49:13 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.76s (GPU total: 5647.0 MB)
-  Window 430/489 | scored 441343/500000 tokens | running PPL=12.83 | 124 tok/s15:49:21 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:49:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 431/489 | scored 442367/500000 tokens | running PPL=12.83 | 124 tok/s15:49:29 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:49:29 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 432/489 | scored 443391/500000 tokens | running PPL=12.83 | 124 tok/s15:49:38 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:49:39 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 433/489 | scored 444415/500000 tokens | running PPL=12.82 | 124 tok/s15:49:48 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:49:48 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 434/489 | scored 445439/500000 tokens | running PPL=12.81 | 124 tok/s15:49:55 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:49:56 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 435/489 | scored 446463/500000 tokens | running PPL=12.81 | 124 tok/s15:50:05 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:50:05 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 436/489 | scored 447487/500000 tokens | running PPL=12.81 | 124 tok/s15:50:13 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:50:13 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 437/489 | scored 448511/500000 tokens | running PPL=12.82 | 124 tok/s15:50:21 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:50:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 438/489 | scored 449535/500000 tokens | running PPL=12.80 | 124 tok/s15:50:30 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:50:30 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 439/489 | scored 450559/500000 tokens | running PPL=12.80 | 124 tok/s15:50:38 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:50:38 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 440/489 | scored 451583/500000 tokens | running PPL=12.80 | 124 tok/s15:50:46 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:50:46 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 441/489 | scored 452607/500000 tokens | running PPL=12.79 | 124 tok/s15:50:54 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:50:54 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.61s (GPU total: 5647.0 MB)
-  Window 442/489 | scored 453631/500000 tokens | running PPL=12.80 | 124 tok/s15:51:05 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:51:05 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 443/489 | scored 454655/500000 tokens | running PPL=12.80 | 124 tok/s15:51:13 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:51:14 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.90s (GPU total: 5647.0 MB)
-  Window 444/489 | scored 455679/500000 tokens | running PPL=12.80 | 124 tok/s15:51:25 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:51:25 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 445/489 | scored 456703/500000 tokens | running PPL=12.80 | 124 tok/s15:51:33 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:51:33 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 446/489 | scored 457727/500000 tokens | running PPL=12.81 | 124 tok/s15:51:41 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:51:41 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 447/489 | scored 458751/500000 tokens | running PPL=12.82 | 124 tok/s15:51:49 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:51:49 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.31s (GPU total: 5647.0 MB)
-  Window 448/489 | scored 459775/500000 tokens | running PPL=12.81 | 124 tok/s15:51:57 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:51:57 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 449/489 | scored 460799/500000 tokens | running PPL=12.80 | 124 tok/s15:52:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:52:05 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 450/489 | scored 461823/500000 tokens | running PPL=12.80 | 124 tok/s15:52:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:52:13 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 451/489 | scored 462847/500000 tokens | running PPL=12.80 | 124 tok/s15:52:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:52:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 452/489 | scored 463871/500000 tokens | running PPL=12.80 | 124 tok/s15:52:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:52:29 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 453/489 | scored 464895/500000 tokens | running PPL=12.80 | 124 tok/s15:52:39 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:52:39 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 454/489 | scored 465919/500000 tokens | running PPL=12.79 | 124 tok/s15:52:48 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:52:49 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.70s (GPU total: 5647.0 MB)
-  Window 455/489 | scored 466943/500000 tokens | running PPL=12.78 | 124 tok/s15:52:56 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:52:57 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 456/489 | scored 467967/500000 tokens | running PPL=12.77 | 124 tok/s15:53:04 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:53:05 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.33s (GPU total: 5647.0 MB)
-  Window 457/489 | scored 468991/500000 tokens | running PPL=12.78 | 124 tok/s15:53:12 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:53:13 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 458/489 | scored 470015/500000 tokens | running PPL=12.78 | 124 tok/s15:53:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:53:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 459/489 | scored 471039/500000 tokens | running PPL=12.79 | 124 tok/s15:53:28 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:53:29 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 460/489 | scored 472063/500000 tokens | running PPL=12.79 | 124 tok/s15:53:37 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:53:37 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 461/489 | scored 473087/500000 tokens | running PPL=12.78 | 124 tok/s15:53:44 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:53:45 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 462/489 | scored 474111/500000 tokens | running PPL=12.76 | 124 tok/s15:53:52 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:53:53 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 463/489 | scored 475135/500000 tokens | running PPL=12.76 | 124 tok/s15:54:00 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:54:01 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 464/489 | scored 476159/500000 tokens | running PPL=12.77 | 124 tok/s15:54:08 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:54:09 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 465/489 | scored 477183/500000 tokens | running PPL=12.77 | 124 tok/s15:54:17 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:54:17 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 466/489 | scored 478207/500000 tokens | running PPL=12.78 | 124 tok/s15:54:25 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:54:25 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 467/489 | scored 479231/500000 tokens | running PPL=12.78 | 124 tok/s15:54:33 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:54:33 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 468/489 | scored 480255/500000 tokens | running PPL=12.78 | 124 tok/s15:54:41 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:54:41 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 469/489 | scored 481279/500000 tokens | running PPL=12.76 | 124 tok/s15:54:49 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:54:49 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 470/489 | scored 482303/500000 tokens | running PPL=12.75 | 124 tok/s15:54:57 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:54:57 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 471/489 | scored 483327/500000 tokens | running PPL=12.72 | 124 tok/s15:55:05 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:55:05 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 472/489 | scored 484351/500000 tokens | running PPL=12.69 | 124 tok/s15:55:13 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:55:13 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 473/489 | scored 485375/500000 tokens | running PPL=12.66 | 124 tok/s15:55:21 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:55:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 474/489 | scored 486399/500000 tokens | running PPL=12.62 | 124 tok/s15:55:29 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:55:30 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 475/489 | scored 487423/500000 tokens | running PPL=12.59 | 124 tok/s15:55:37 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:55:38 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 476/489 | scored 488447/500000 tokens | running PPL=12.57 | 124 tok/s15:55:45 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:55:46 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 477/489 | scored 489471/500000 tokens | running PPL=12.55 | 124 tok/s15:55:53 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:55:54 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 478/489 | scored 490495/500000 tokens | running PPL=12.51 | 124 tok/s15:56:01 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:56:02 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 479/489 | scored 491519/500000 tokens | running PPL=12.49 | 124 tok/s15:56:09 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:56:10 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 480/489 | scored 492543/500000 tokens | running PPL=12.47 | 124 tok/s15:56:20 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:56:21 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 481/489 | scored 493567/500000 tokens | running PPL=12.44 | 124 tok/s15:56:29 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:56:29 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 482/489 | scored 494591/500000 tokens | running PPL=12.44 | 124 tok/s15:56:37 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:56:37 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.77s (GPU total: 5647.0 MB)
-  Window 483/489 | scored 495615/500000 tokens | running PPL=12.44 | 124 tok/s15:56:46 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:56:47 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 484/489 | scored 496639/500000 tokens | running PPL=12.43 | 124 tok/s15:56:54 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:56:55 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 485/489 | scored 497663/500000 tokens | running PPL=12.44 | 124 tok/s15:57:02 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:57:03 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 486/489 | scored 498687/500000 tokens | running PPL=12.44 | 124 tok/s15:57:10 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:57:11 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5647.0 MB)
-  Window 487/489 | scored 499711/500000 tokens | running PPL=12.44 | 124 tok/s15:57:18 krasis.model INFO: DMA pipelining ENABLED (1 managers, 24 groups)
-15:57:19 krasis.gpu_prefill INFO: Layer group loaded: 2 MoE layers = 1660.9 MB in 0.32s (GPU total: 5644.0 MB)
-/home/main/Documents/Claude/krasis/.venv/lib/python3.12/site-packages/torch/_inductor/compile_fx.py:312: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
-  warnings.warn(
-W0223 15:57:19.588000 2237641 /home/main/ktransformers-env/lib/python3.12/site-packages/torch/_inductor/utils.py:1613] [0/1] Not enough SMs to use max_autotune_gemm mode
-  Window 488/489 | scored 499999/500000 tokens | running PPL=12.44 | 124 tok/s  Window 489/489 | scored 499999/500000 tokens | running PPL=12.44 | 123 tok/s
-
-════════════════════════════════════════════════════════
-  PERPLEXITY COMPLETE — c4
-════════════════════════════════════════════════════════
-  Perplexity:    12.44
-  BPC:           3.64
-  Tokens scored: 499,999
-  Elapsed:       4052.1s (123 tok/s)
-  Log:           /home/main/Documents/Claude/krasis/perplexity/results/Qwen3-Coder-Next_c4_gpu_g4_c4_20260223_155739.log
-════════════════════════════════════════════════════════

@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "<frozen runpy>", line 198, in _run_module_as_main
-  File "<frozen runpy>", line 88, in _run_code
-  File "/home/main/Documents/Claude/krasis/python/krasis/server.py", line 23, in <module>
-    from krasis.model import KrasisModel
-  File "/home/main/Documents/Claude/krasis/python/krasis/model.py", line 24, in <module>
-    from krasis.timing import TIMING
-ModuleNotFoundError: No module named 'krasis.timing'

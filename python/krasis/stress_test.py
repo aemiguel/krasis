@@ -39,6 +39,21 @@ DIM = "\033[2m"
 NC = "\033[0m"
 
 # ──────────────────────────────────────────────────────────────────
+# Gutenberg text for long prompts (loaded once at import)
+# ──────────────────────────────────────────────────────────────────
+
+def _load_gutenberg_excerpt(max_chars: int, index: int = 0) -> str:
+    """Load a Gutenberg prompt excerpt from the canonical benchmarks/prompts/ dir."""
+    _prompts_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "benchmarks", "prompts",
+    )
+    _files = sorted(f for f in os.listdir(_prompts_dir) if f.endswith(".txt"))
+    with open(os.path.join(_prompts_dir, _files[index % len(_files)])) as f:
+        text = f.read()
+    return text[:max_chars] if len(text) > max_chars else text
+
+# ──────────────────────────────────────────────────────────────────
 # Prompt bank — diverse prompts covering edge cases
 # ──────────────────────────────────────────────────────────────────
 
@@ -148,13 +163,8 @@ PROMPTS = [
     "What is 999999999 * 999999999?",
     "Calculate: (3.14159 * 2.71828) / 1.41421",
 
-    # ── Long context prompt (many tokens) ──
-    "The following is a long document about various topics. " +
-    " ".join(f"Section {i}: This is paragraph {i} which discusses topic number {i} in detail, "
-             f"covering aspects like methodology, results, and implications for the field. "
-             f"The key finding in section {i} was that performance improved by {i*2}% "
-             f"when applying the new technique."
-             for i in range(1, 51)),
+    # ── Long context prompt (many tokens) — Gutenberg text (Moby Dick) ──
+    _load_gutenberg_excerpt(7000, index=0) + "\n\nSummarize the above text briefly.",
 
     # ── System-prompt-like instructions ──
     "You are a helpful assistant. You always respond in bullet points. User: Tell me about dogs.",
@@ -163,24 +173,10 @@ PROMPTS = [
     # ── Edge case: very long single word ──
     "Supercalifragilisticexpialidocious " * 20,
 
-    # ── Very long input (~60K words / ~80K tokens) ──
+    # ── Very long input (~60K words) — full Gutenberg book (War and Peace) ──
     # Tests numerical stability of linear attention recurrent state,
     # KV cache capacity, and RoPE at extreme context lengths.
-    "Analyze the following comprehensive technical document and provide a brief summary. " +
-    " ".join(
-        f"Chapter {ch}: Section {s}. "
-        f"In this section we examine the theoretical foundations of distributed system design "
-        f"with particular focus on consensus protocol {ch}.{s}. "
-        f"The key insight from experiment {ch * 100 + s} is that latency scales logarithmically "
-        f"with the number of replicas when using optimistic concurrency control. "
-        f"Furthermore, the throughput measurements from benchmark run {ch * 1000 + s} "
-        f"demonstrate that the proposed algorithm achieves {90 + (ch * s) % 10}% "
-        f"efficiency compared to the theoretical maximum under realistic network conditions. "
-        f"The statistical analysis with p-value {0.001 + (ch + s) * 0.0001:.4f} confirms "
-        f"the significance of these results across all tested configurations."
-        for ch in range(1, 101)
-        for s in range(1, 8)
-    ),
+    _load_gutenberg_excerpt(260000, index=1) + "\n\nProvide a brief summary.",
 
     # ── Whitespace variations ──
     "   spaces before and after   ",
@@ -463,8 +459,8 @@ def main():
     parser.add_argument("--kv-dtype", default="fp8_e4m3")
     parser.add_argument("--gpu-expert-bits", type=int, default=4)
     parser.add_argument("--cpu-expert-bits", type=int, default=4)
-    parser.add_argument("--attention-quant", default="bf16", choices=["bf16", "int4", "int8"],
-                        help="Attention weight precision: bf16 (default), int4 Marlin W4A16, int8 Marlin W8A16")
+    parser.add_argument("--attention-quant", default="bf16", choices=["bf16", "awq"],
+                        help="Attention weight precision: bf16 (default), awq (calibrated per-tensor via AWQ)")
     parser.add_argument("--shared-expert-quant", default="int8")
     parser.add_argument("--dense-mlp-quant", default="int8")
     parser.add_argument("--lm-head-quant", default="int8")

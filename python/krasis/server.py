@@ -558,6 +558,10 @@ def main():
                             config_defaults[dest] = float(val)
                         except ValueError:
                             config_defaults[dest] = val
+        # Migrate legacy naive int4/int8 attention to AWQ
+        if config_defaults.get("attention_quant") in ("int4", "int8"):
+            print(f"Migrating attention_quant={config_defaults['attention_quant']} → awq (naive int4/int8 removed)")
+            config_defaults["attention_quant"] = "awq"
         # Expand ~ in model_path
         if "model_path" in config_defaults and isinstance(config_defaults["model_path"], str):
             config_defaults["model_path"] = os.path.expanduser(config_defaults["model_path"])
@@ -583,8 +587,8 @@ def main():
                         help="Marlin quantization bits for GPU prefill experts")
     parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bits for CPU decode experts")
-    parser.add_argument("--attention-quant", default="bf16", choices=["bf16", "int4", "int8", "awq"],
-                        help="Attention weight precision: bf16 (default), int4 Marlin W4A16, int8 Marlin W8A16, awq (calibrated per-tensor)")
+    parser.add_argument("--attention-quant", default="bf16", choices=["bf16", "awq"],
+                        help="Attention weight precision: bf16 (default), awq (calibrated per-tensor via AWQ)")
     parser.add_argument("--shared-expert-quant", default="int8", choices=["bf16", "int8"],
                         help="Quantization for shared expert weights")
     parser.add_argument("--dense-mlp-quant", default="int8", choices=["bf16", "int8"],
@@ -599,8 +603,7 @@ def main():
                         help="Enable Hot Cache Strategy (default: on for GPU decode, use --no-hcs to disable)")
     parser.add_argument("--multi-gpu-hcs", action="store_true", default=False,
                         help="Pin HCS experts across ALL GPUs (more capacity, but cross-device transfer)")
-    parser.add_argument("--hcs-headroom-mb", type=int, default=1024,
-                        help="VRAM headroom to reserve after warmup before HCS allocation (default: 1024 MB)")
+    # NOTE: --hcs-headroom-mb removed — HCS budget is computed from 4-point VRAM calibration, not a fixed headroom
     parser.add_argument("--vram-safety-margin", type=int, default=1000,
                         help="VRAM safety margin in MB — reserved free VRAM below which warnings fire (default: 1000)")
     parser.add_argument("--stream-attention", action="store_true",
@@ -914,6 +917,7 @@ def main():
         _baseline_free = torch.cuda.mem_get_info(dev_idx)[0] // (1024 * 1024)
         _baseline_total = torch.cuda.mem_get_info(dev_idx)[1] // (1024 * 1024)
         _detail(f"Baseline free VRAM: {_baseline_free:,} MB / {_baseline_total:,} MB")
+        logger.info("VRAM calibration baseline: free=%d MB, total=%d MB", _baseline_free, _baseline_total)
 
         # ── 2a: Short prompt prefill ──
         vram_monitor.reset(dev_idx)
@@ -924,6 +928,7 @@ def main():
         prefill_short_free = vram_monitor.min_free_mb(dev_idx)
         short_tokens = short_prompt_len or 500
         _dim(f"  short prefill: {short_tokens} tokens, min_free={prefill_short_free:,} MB")
+        logger.info("VRAM cal short prefill: %d tokens, min_free=%d MB", short_tokens, prefill_short_free)
 
         # ── 2b: Short prompt decode ──
         if short_result is not None:
@@ -934,6 +939,7 @@ def main():
             time.sleep(0.1)
             decode_short_free = vram_monitor.min_free_mb(dev_idx)
             _dim(f"  short decode: min_free={decode_short_free:,} MB")
+            logger.info("VRAM cal short decode: min_free=%d MB", decode_short_free)
         else:
             _model.server_cleanup()
 
@@ -947,6 +953,7 @@ def main():
         prefill_long_free = vram_monitor.min_free_mb(dev_idx)
         long_tokens = long_prompt_len or 51000
         _dim(f"  long prefill: {long_tokens} tokens, min_free={prefill_long_free:,} MB")
+        logger.info("VRAM cal long prefill: %d tokens, min_free=%d MB", long_tokens, prefill_long_free)
 
         # ── 2d: Long prompt decode ──
         if long_result is not None:
@@ -957,6 +964,7 @@ def main():
             time.sleep(0.1)
             decode_long_free = vram_monitor.min_free_mb(dev_idx)
             _dim(f"  long decode: min_free={decode_long_free:,} MB")
+            logger.info("VRAM cal long decode: min_free=%d MB", decode_long_free)
         else:
             _model.server_cleanup()
 
@@ -982,11 +990,13 @@ def main():
         prefill_kb_per_tok = 0
         decode_kb_per_tok = 0
 
-    # Hard budget = what survives worst-case (long) prefill
-    hard_budget = max(0, int(prefill_long_free) - SAFETY_MARGIN_MB)
-    # Soft budget = extra VRAM available during decode (short prompt = best case)
-    decode_budget = max(0, int(decode_short_free) - SAFETY_MARGIN_MB)
-    soft_budget = max(0, decode_budget - hard_budget)
+    # Compute transient VRAM requirements (deltas from baseline).
+    # Calibration measures min_free relative to the pre-calibration baseline, but
+    # after calibration the actual free VRAM may differ (PyTorch caching allocator
+    # retains some blocks). Using deltas and applying them to actual post-cleanup
+    # free VRAM gives correct budgets regardless of allocator state.
+    prefill_transient = max(0, _baseline_free - prefill_long_free)   # worst-case prefill VRAM consumed
+    decode_transient = max(0, _baseline_free - decode_short_free)    # best-case decode VRAM consumed
 
     torch.cuda.synchronize()
     gc.collect()
@@ -994,13 +1004,19 @@ def main():
     _free_mb = torch.cuda.mem_get_info(dev_idx)[0] // (1024 * 1024)
     _total_mb = torch.cuda.mem_get_info(dev_idx)[1] // (1024 * 1024)
 
+    # Hard budget = actual free minus worst-case prefill transient minus safety
+    hard_budget = max(0, _free_mb - prefill_transient - SAFETY_MARGIN_MB)
+    # Soft budget = extra VRAM available during decode (evicted before prefill)
+    decode_available = max(0, _free_mb - decode_transient - SAFETY_MARGIN_MB)
+    soft_budget = max(0, decode_available - hard_budget)
+
     _status("VRAM calibration complete")
     _detail(f"Prefill: {prefill_kb_per_tok:.1f} KB/token ({prefill_short_free:,} MB @ {short_tokens} tok -> {prefill_long_free:,} MB @ {long_tokens} tok)")
     _detail(f"Decode:  {decode_kb_per_tok:.1f} KB/token ({decode_short_free:,} MB @ short -> {decode_long_free:,} MB @ long)")
+    _detail(f"Transient: prefill={prefill_transient:,} MB, decode={decode_transient:,} MB  |  Actual free: {_free_mb:,} MB / {_total_mb:,} MB")
     _detail(f"Hard HCS budget: {hard_budget:,} MB  |  Soft HCS budget: {soft_budget:,} MB  |  Total: {hard_budget + soft_budget:,} MB")
-    _detail(f"Free VRAM: {_free_mb:,} MB / {_total_mb:,} MB")
-    logger.info("VRAM budget (4-point): hard=%d MB, soft=%d MB, free=%d MB, prefill=%.1f KB/tok, decode=%.1f KB/tok",
-                hard_budget, soft_budget, _free_mb, prefill_kb_per_tok, decode_kb_per_tok)
+    logger.info("VRAM budget (4-point): hard=%d MB, soft=%d MB, actual_free=%d MB, prefill_transient=%d MB, decode_transient=%d MB, prefill=%.1f KB/tok, decode=%.1f KB/tok",
+                hard_budget, soft_budget, _free_mb, prefill_transient, decode_transient, prefill_kb_per_tok, decode_kb_per_tok)
 
     # Free PyTorch's cached CUDA blocks before HCS allocation.
     # After calibration, PyTorch holds freed KV/expert blocks in its caching allocator.
@@ -1021,23 +1037,81 @@ def main():
 
         # GPU1: total VRAM minus overhead. Iterate to find self-consistent split.
         gpu1_total = vram_monitor.total_mb(device_indices[1])
-        gpu1_base_overhead = 500  # CUDA driver + runtime + norms + lmhead + RoPE + embedding
         num_layers = len(_model.layers)
 
-        # Iterate: estimate split → compute GPU1 attention cost → recompute split
+        # Compute per-layer VRAM cost from actual loaded weights (not hardcoded estimates).
+        # Each layer's cost = attention weights + norms + gate + shared expert.
+        # For full attention (GQA) layers, also include KV cache contribution.
+        _layer_vram_mb = []
+        kv_cache = _model.kv_caches[0] if _model.kv_caches else None
+        kv_total_mb = 0
+        if kv_cache is not None:
+            # Total KV cache VRAM across all layers (will be split proportionally)
+            kv_total_bytes = sum(
+                t.nelement() * t.element_size()
+                for t in kv_cache.k_cache + kv_cache.v_cache
+            )
+            kv_total_mb = kv_total_bytes / (1024 * 1024)
+            num_kv_layers = len(kv_cache.k_cache)
+            kv_per_layer_mb = kv_total_mb / num_kv_layers if num_kv_layers > 0 else 0
+        else:
+            kv_per_layer_mb = 0
+
+        for layer in _model.layers:
+            layer_bytes = 0
+            # Norms
+            layer_bytes += layer.input_norm_weight.nelement() * layer.input_norm_weight.element_size()
+            layer_bytes += layer.post_attn_norm_weight.nelement() * layer.post_attn_norm_weight.element_size()
+            # Attention weights
+            attn = layer.attention
+            for attr_name in dir(attn):
+                val = getattr(attn, attr_name, None)
+                if isinstance(val, torch.Tensor) and val.device.type == 'cuda':
+                    layer_bytes += val.nelement() * val.element_size()
+                elif isinstance(val, tuple) and len(val) == 2:
+                    for t in val:
+                        if isinstance(t, torch.Tensor) and t.device.type == 'cuda':
+                            layer_bytes += t.nelement() * t.element_size()
+            # Gate + shared expert
+            if layer.is_moe:
+                for w in [layer.gate_weight, layer.gate_bias, layer.e_score_correction_bias]:
+                    if w is not None:
+                        layer_bytes += w.nelement() * w.element_size()
+                if layer.shared_expert is not None:
+                    for v in layer.shared_expert.values():
+                        if isinstance(v, torch.Tensor):
+                            layer_bytes += v.nelement() * v.element_size()
+                        elif isinstance(v, tuple):
+                            for t in v:
+                                if isinstance(t, torch.Tensor):
+                                    layer_bytes += t.nelement() * t.element_size()
+            layer_mb = layer_bytes / (1024 * 1024)
+            # Add KV cache cost for full attention layers
+            if layer.layer_type != "linear_attention":
+                layer_mb += kv_per_layer_mb
+            _layer_vram_mb.append(layer_mb)
+
+        # Compute GPU1 base overhead from actual model state:
+        # embedding + lm_head + final_norm (replicated on GPU1)
+        gpu1_base_overhead_bytes = 0
+        gpu1_base_overhead_bytes += _model.embedding.nelement() * _model.embedding.element_size()
+        gpu1_base_overhead_bytes += _model.final_norm.nelement() * _model.final_norm.element_size()
+        if isinstance(_model.lm_head_data, tuple):
+            for t in _model.lm_head_data:
+                if isinstance(t, torch.Tensor):
+                    gpu1_base_overhead_bytes += t.nelement() * t.element_size()
+        elif isinstance(_model.lm_head_data, torch.Tensor):
+            gpu1_base_overhead_bytes += _model.lm_head_data.nelement() * _model.lm_head_data.element_size()
+        gpu1_base_overhead = gpu1_base_overhead_bytes / (1024 * 1024)
+
+        # Iterate: estimate split -> compute GPU1 attention cost -> recompute split
         # Converges in 2-3 iterations since attention cost changes discretely.
         _multi_gpu_split = num_layers // 2  # initial guess
         for _iter in range(5):
             prev_split = _multi_gpu_split
 
-            # Estimate attention + KV cost for GPU1's layers at this split
-            gpu1_attn_cost = 0
-            for i in range(_multi_gpu_split, num_layers):
-                layer = _model.layers[i]
-                if layer.layer_type == "linear_attention":
-                    gpu1_attn_cost += 73  # ~73 MB per LA layer
-                else:
-                    gpu1_attn_cost += 337  # ~337 MB per GQA layer (with KV cache)
+            # Sum per-layer VRAM costs for GPU1's layers at this split
+            gpu1_attn_cost = sum(_layer_vram_mb[i] for i in range(_multi_gpu_split, num_layers))
 
             gpu1_hcs_total = max(0, gpu1_total - gpu1_base_overhead - gpu1_attn_cost - SAFETY_MARGIN_MB)
             total_hcs = gpu0_hcs_total + gpu1_hcs_total
@@ -1155,8 +1229,22 @@ def main():
             logger.info("HCS pool: %s (%.1fs)", result, hcs_elapsed)
 
     # ── Decode validation (after HCS) ──
+    # Must evict soft tier before prefill (same as runtime request flow).
+    # The Rust server does this at server.rs:590; here we mirror that for the
+    # Python-side warmup path. Without this, prefill OOMs when hard+soft fill
+    # VRAM to within the safety margin.
     _status("Decode validation")
+    gpu_store = getattr(_model, '_gpu_decode_store', None)
+    if gpu_store is not None:
+        evicted, freed = gpu_store.py_hcs_evict_for_prefill(500)
+        if evicted > 0:
+            _dim(f"Evicted {evicted} soft experts for validation prefill ({freed:.0f} MB)")
     _warmup_decode(_model, num_steps=2)
+    # Reload soft tier after validation
+    if gpu_store is not None:
+        reloaded, reloaded_mb = gpu_store.py_hcs_reload_after_prefill()
+        if reloaded > 0:
+            _dim(f"Reloaded {reloaded} soft experts after validation ({reloaded_mb:.0f} MB)")
     _detail("Decode validation passed")
 
     # ── Enable VRAM monitor runtime warnings ──

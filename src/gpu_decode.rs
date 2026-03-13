@@ -5620,7 +5620,7 @@ impl GpuDecodeStore {
                         q_norm_ptr, k_norm_ptr, gated,
                     } => {
                         let nh = *num_heads; let nkv = *num_kv_heads;
-                        let hd = *head_dim; let half_dim = hd / 2;
+                        let hd = *head_dim; let half_dim = graph.rope_half_dim;
                         let kv_stride = nkv * hd;
 
                         // QKV projection
@@ -9490,11 +9490,22 @@ impl GpuDecodeStore {
             None => return (0, 0.0),
         };
 
-        // Cancel any pending async reload first
-        if hcs.soft_reload_pending {
-            if let Some(ref stream) = hcs.soft_reload_stream {
-                unsafe { let _ = cuda_sys::lib().cuStreamSynchronize(stream.0); }
+        // Always sync the reload stream before eviction to prevent races between
+        // async DMA (reload stream) and prefill (default stream). Without this,
+        // cuMemFree on soft_buf can free memory that has in-flight DMA, and PyTorch
+        // may then reallocate the same address — causing ILLEGAL_ADDRESS when the
+        // stale DMA writes to PyTorch's tensor.
+        if let Some(ref stream) = hcs.soft_reload_stream {
+            unsafe {
+                let err = cuda_sys::lib().cuStreamSynchronize(stream.0);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    log::warn!("HCS soft evict: reload stream sync failed: {:?}", err);
+                }
             }
+        }
+
+        // Cancel any pending async reload
+        if hcs.soft_reload_pending {
             hcs.soft_reload_pending = false;
             hcs.soft_reload_entries.clear();
             // The soft_buf was already allocated by async reload; need to free it
@@ -11111,10 +11122,13 @@ impl GpuDecodeStore {
         let n_tiles = (n + 15) / 16;
         let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
 
+        // Must use async memset so it's captured inside CUDA graphs.
+        // cuMemsetD32_v2 is synchronous (runs on stream 0, not captured).
         unsafe {
-            let err = cuda_sys::lib().cuMemsetD32_v2(output_ptr, 0, n);
+            let stream = *self.device.cu_stream();
+            let err = cuda_sys::lib().cuMemsetD32Async(output_ptr, 0, n, stream);
             if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                return Err(format!("cuMemsetD32 for int8 fused v2: {:?}", err));
+                return Err(format!("cuMemsetD32Async for int8 fused v2: {:?}", err));
             }
         }
 
@@ -11247,11 +11261,13 @@ impl GpuDecodeStore {
         let n_tiles = (n + 15) / 16;
         let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
 
-        // Zero output buffer (cudaMemsetAsync, async on default stream)
+        // Must use async memset so it's captured inside CUDA graphs.
+        // cuMemsetD32_v2 is synchronous (runs on stream 0, not captured).
         unsafe {
-            let err = cuda_sys::lib().cuMemsetD32_v2(output_ptr, 0, n);
+            let stream = *self.device.cu_stream();
+            let err = cuda_sys::lib().cuMemsetD32Async(output_ptr, 0, n, stream);
             if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                return Err(format!("cuMemsetD32 for fused v2: {:?}", err));
+                return Err(format!("cuMemsetD32Async for fused v2: {:?}", err));
             }
         }
 
@@ -13749,12 +13765,12 @@ impl GpuDecodeStore {
         hcs.replacement_pct = replacement_pct as f32 / 100.0;
         hcs.rebalance_enabled = true;
 
-        let gpu_rs = hcs.d_expert_ptrs.is_some() && graph.mapped_cold_buf.is_some();
-        if gpu_rs {
-            log::info!("GPU-side route sync ENABLED: d_expert_ptrs={} entries, mapped_cold_buf={} bytes",
-                hcs.d_expert_ptrs_nl * hcs.d_expert_ptrs_ne * 4,
-                graph.mapped_cold_buf.as_ref().map(|m| m.size).unwrap_or(0));
-        }
+        // GPU-side route sync: disabled. Benchmarking showed zero speed gain (+0.4%,
+        // within noise) because the classify kernel runs at end of graph segment — by the
+        // time it writes to mapped memory, cuStreamSynchronize would have returned anyway.
+        // The kernel also has persistent CUDA_ERROR_ILLEGAL_ADDRESS issues on first token.
+        // Keeping d_expert_ptrs for HCS bookkeeping but not running the classify kernel.
+        let gpu_rs = false;
         graph.hcs = Some(hcs);
         graph.gpu_route_sync = gpu_rs;
 

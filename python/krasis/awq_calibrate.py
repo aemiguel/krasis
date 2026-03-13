@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""AWQ-informed attention calibration for Krasis.
+"""AWQ (Activation-Aware Weight Quantization) calibration for Krasis.
 
-Runs calibration tokens through a model with BF16 attention, measures per-tensor
-sensitivity to INT4/INT8 quantization, and produces a lightweight template JSON
-containing only per-tensor precision decisions (no weights).
+Implements the AWQ algorithm from Lin et al. (2023):
+  1. Run calibration tokens through BF16 model, capture per-layer per-channel
+     activation magnitudes at each attention input.
+  2. For each layer, grid search alpha in [0,1] to find optimal per-channel
+     scaling s[j] = activation_magnitude[j]^alpha that minimizes
+     activation-weighted INT4 quantization error across all input projections.
+  3. Save per-layer scales in a template.
+  4. At load time: scale weight columns by s[j] before INT4 quantization,
+     fold 1/s[j] into the preceding RMSNorm weight (zero runtime overhead).
 
-The template is used at load time: each attention tensor is group-quantized
-per the template's decision from the user's own safetensors.
+The key insight: ~1% of weight channels carry most information (because they
+multiply with high-magnitude activation channels). AWQ gives these channels
+finer quantization grid resolution by pre-scaling, achieving near-INT8 quality
+at INT4 size.
 
 Usage:
     python -m krasis.awq_calibrate --config testconfigs/qcn-4-4-a16.conf
-    python -m krasis.awq_calibrate --config testconfigs/qcn-4-4-a16.conf --tokens 256000
-    python -m krasis.awq_calibrate --config testconfigs/qcn-4-4-a16.conf --dataset c4
-
-Or via dev script:
     ./dev awq-calibrate qcn [--tokens 256000] [--dataset wikitext-2]
 """
 
@@ -26,7 +30,6 @@ import os
 import struct
 import sys
 import time
-from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,26 +53,18 @@ from krasis.config import QuantConfig, ModelConfig
 def compute_model_hash(model_path: str) -> str:
     """Compute a fast fingerprint of a model for template matching.
 
-    Hashes:
-    - config.json contents (architecture, layer count, etc.)
-    - Attention weight tensor names + shapes + dtypes from safetensors index
-    - First/last 64 bytes of each attention weight tensor's data range
-
-    Returns:
-        SHA-256, truncated to first 16 hex chars (64 bits).
+    Hashes config.json, attention tensor names/shapes/dtypes, and first/last
+    64 bytes of each attention tensor's data. Returns SHA-256[:16].
     """
     h = hashlib.sha256()
 
-    # 1. config.json
     config_path = os.path.join(model_path, "config.json")
     if os.path.exists(config_path):
         with open(config_path, "rb") as f:
             h.update(f.read())
 
-    # 2. safetensors index
     index_path = os.path.join(model_path, "model.safetensors.index.json")
     if not os.path.exists(index_path):
-        # Single-file model — hash the whole file name and size
         for fn in sorted(os.listdir(model_path)):
             if fn.endswith(".safetensors"):
                 fp = os.path.join(model_path, fn)
@@ -81,8 +76,6 @@ def compute_model_hash(model_path: str) -> str:
         index = json.load(f)
 
     weight_map = index.get("weight_map", {})
-
-    # Identify attention tensor names
     attn_keys = sorted(k for k in weight_map
                        if any(p in k for p in (
                            "q_proj", "k_proj", "v_proj", "o_proj",
@@ -90,15 +83,10 @@ def compute_model_hash(model_path: str) -> str:
                            "kv_a_proj", "kv_b_proj",
                        )) and "weight" in k)
 
-    # Hash tensor names, shapes from metadata
-    metadata = index.get("metadata", {})
     for key in attn_keys:
         h.update(key.encode())
-        shard_file = weight_map[key]
-        h.update(shard_file.encode())
+        h.update(weight_map[key].encode())
 
-    # 3. First/last 64 bytes per attention tensor from safetensors files
-    # Group by shard file for efficiency
     from collections import defaultdict
     shard_tensors = defaultdict(list)
     for key in attn_keys:
@@ -108,19 +96,15 @@ def compute_model_hash(model_path: str) -> str:
         shard_path = os.path.join(model_path, shard_name)
         if not os.path.exists(shard_path):
             continue
-
-        # Read safetensors header to get offsets
         with open(shard_path, "rb") as f:
             header_size_bytes = f.read(8)
             header_size = struct.unpack("<Q", header_size_bytes)[0]
             header_json = f.read(header_size)
             data_start = 8 + header_size
-
             try:
                 header = json.loads(header_json)
             except json.JSONDecodeError:
                 continue
-
             for tname in tensor_names:
                 if tname not in header:
                     continue
@@ -128,18 +112,12 @@ def compute_model_hash(model_path: str) -> str:
                 offsets = info.get("data_offsets", [0, 0])
                 dtype = info.get("dtype", "")
                 shape = info.get("shape", [])
-
                 h.update(f"{tname}:{dtype}:{shape}".encode())
-
                 abs_start = data_start + offsets[0]
                 abs_end = data_start + offsets[1]
                 tensor_size = abs_end - abs_start
-
-                # Read first 64 bytes
                 f.seek(abs_start)
                 h.update(f.read(min(64, tensor_size)))
-
-                # Read last 64 bytes
                 if tensor_size > 64:
                     f.seek(abs_end - 64)
                     h.update(f.read(64))
@@ -148,504 +126,451 @@ def compute_model_hash(model_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Quantization error measurement
+# INT4 quantization simulation (matches Marlin symmetric group quantization)
 # ---------------------------------------------------------------------------
 
-def _quantize_tensor_int4(w: torch.Tensor, group_size: int = 128) -> torch.Tensor:
-    """Simulate INT4 group quantization and return dequantized result."""
+def _quantize_dequantize_int4(w: torch.Tensor, group_size: int = 128) -> torch.Tensor:
+    """Simulate INT4 symmetric group quantization: quantize then dequantize."""
     assert w.ndim == 2
     N, K = w.shape
     assert K % group_size == 0, f"K={K} not divisible by group_size={group_size}"
 
     w_flat = w.reshape(N, K // group_size, group_size).float()
-    # Symmetric quantization: scale = max(|w|) / 7
     scales = w_flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10) / 7.0
-    # Quantize
     w_q = (w_flat / scales).round().clamp(-8, 7)
-    # Dequantize
-    w_deq = (w_q * scales).reshape(N, K).to(w.dtype)
+    w_deq = (w_q * scales).reshape(N, K)
     return w_deq
 
 
-def _quantize_tensor_int8(w: torch.Tensor, group_size: int = 128) -> torch.Tensor:
-    """Simulate INT8 group quantization and return dequantized result."""
-    assert w.ndim == 2
-    N, K = w.shape
-    assert K % group_size == 0, f"K={K} not divisible by group_size={group_size}"
-
-    w_flat = w.reshape(N, K // group_size, group_size).float()
-    scales = w_flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10) / 127.0
-    w_q = (w_flat / scales).round().clamp(-128, 127)
-    w_deq = (w_q * scales).reshape(N, K).to(w.dtype)
-    return w_deq
-
-
-def _measure_quant_error(w: torch.Tensor, w_deq: torch.Tensor) -> Dict[str, float]:
-    """Measure quantization error between original and dequantized weights."""
-    diff = (w.float() - w_deq.float())
-    mse = diff.pow(2).mean().item()
-    rmse = math.sqrt(mse)
-    w_norm = w.float().pow(2).mean().sqrt().item()
-    # Normalized RMSE (relative to weight magnitude)
-    nrmse = rmse / max(w_norm, 1e-10)
-    # Max absolute error
-    max_err = diff.abs().max().item()
-    # Cosine similarity
-    w_flat = w.float().flatten()
-    d_flat = w_deq.float().flatten()
-    cos_sim = torch.nn.functional.cosine_similarity(
-        w_flat.unsqueeze(0), d_flat.unsqueeze(0)
-    ).item()
-
-    return {
-        "mse": mse,
-        "rmse": rmse,
-        "nrmse": nrmse,
-        "max_err": max_err,
-        "cos_sim": cos_sim,
-    }
-
-
 # ---------------------------------------------------------------------------
-# AWQ sensitivity measurement
+# Phase 1: Per-layer per-channel activation capture
 # ---------------------------------------------------------------------------
 
-@dataclass
-class TensorResult:
-    """Calibration result for one attention tensor."""
-    layer_idx: int
-    layer_type: str       # "linear_attention" or "gqa"
-    tensor_name: str      # "in_proj_qkvz", "q_proj", etc.
-    shape: List[int]
-    int4_error: Dict[str, float] = field(default_factory=dict)
-    int8_error: Dict[str, float] = field(default_factory=dict)
-    act_mean_magnitude: float = 0.0
-    act_max_magnitude: float = 0.0
-    decision: str = "int4"  # "int4", "int8", or "bf16"
+class ActivationCapture:
+    """Context manager that captures per-layer per-channel activation magnitudes.
+
+    Monkey-patches TransformerLayer.forward and forward_attn to compute
+    the post-input-RMSNorm hidden state (what attention projections see)
+    and accumulate per-channel mean |X[:,j]| statistics.
+    """
+
+    def __init__(self):
+        self.stats = {}  # layer_idx -> {sum: Tensor[hidden_size], count: int}
+        self._orig_forward = None
+        self._orig_forward_attn = None
+
+    def __enter__(self):
+        from krasis.layer import TransformerLayer
+        import flashinfer
+
+        self._orig_forward = TransformerLayer.forward
+        self._orig_forward_attn = TransformerLayer.forward_attn
+        capture = self
+
+        def _capture_activations(layer_self, hidden, residual):
+            """Compute post-norm hidden state and accumulate per-channel stats."""
+            with torch.no_grad():
+                if residual is None:
+                    post_norm = flashinfer.norm.rmsnorm(
+                        hidden.clone(), layer_self.input_norm_weight,
+                        layer_self.cfg.rms_norm_eps)
+                else:
+                    h = hidden.clone()
+                    r = residual.clone()
+                    flashinfer.norm.fused_add_rmsnorm(
+                        h, r, layer_self.input_norm_weight,
+                        layer_self.cfg.rms_norm_eps)
+                    post_norm = h
+
+                # Per-channel mean magnitude: [hidden_size]
+                channel_mag = post_norm.float().abs().mean(dim=0)
+                idx = layer_self.layer_idx
+
+                if idx not in capture.stats:
+                    capture.stats[idx] = {
+                        'sum': torch.zeros(channel_mag.shape[0], dtype=torch.float64),
+                        'count': 0,
+                    }
+                capture.stats[idx]['sum'] += channel_mag.cpu().double()
+                capture.stats[idx]['count'] += 1
+
+        def patched_forward(layer_self, hidden, residual, positions, *args, **kwargs):
+            _capture_activations(layer_self, hidden, residual)
+            return capture._orig_forward(layer_self, hidden, residual, positions,
+                                         *args, **kwargs)
+
+        def patched_forward_attn(layer_self, hidden, residual, positions, *args, **kwargs):
+            _capture_activations(layer_self, hidden, residual)
+            return capture._orig_forward_attn(layer_self, hidden, residual, positions,
+                                              *args, **kwargs)
+
+        TransformerLayer.forward = patched_forward
+        TransformerLayer.forward_attn = patched_forward_attn
+        return self
+
+    def __exit__(self, *exc):
+        from krasis.layer import TransformerLayer
+        TransformerLayer.forward = self._orig_forward
+        TransformerLayer.forward_attn = self._orig_forward_attn
+
+    def get_per_layer_activations(self) -> Dict[int, torch.Tensor]:
+        """Return per-layer mean per-channel activation magnitudes.
+
+        Returns:
+            dict: layer_idx -> Tensor[hidden_size] of mean |activation| per channel
+        """
+        result = {}
+        for idx, s in self.stats.items():
+            if s['count'] > 0:
+                result[idx] = (s['sum'] / s['count']).float()
+        return result
 
 
-def _collect_tensor_info(model) -> List[TensorResult]:
-    """Enumerate all attention weight tensors in the model."""
-    results = []
-    for layer_idx, layer in enumerate(model.layers):
-        lt = layer.layer_type
-        attn = layer.attention
-
-        if lt == "linear_attention":
-            for name in ("in_proj_qkvz", "in_proj_ba", "out_proj"):
-                w = getattr(attn, name, None)
-                if w is None:
-                    continue
-                # Handle MarlinWeight (already quantized) — skip
-                if not isinstance(w, torch.Tensor):
-                    continue
-                results.append(TensorResult(
-                    layer_idx=layer_idx,
-                    layer_type="linear_attention",
-                    tensor_name=name,
-                    shape=list(w.shape),
-                ))
-        else:
-            # GQA / full attention — use "gqa" key to match model.py template lookup
-            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                w = getattr(attn, name, None)
-                if w is None:
-                    continue
-                if not isinstance(w, torch.Tensor):
-                    continue
-                results.append(TensorResult(
-                    layer_idx=layer_idx,
-                    layer_type="gqa",
-                    tensor_name=name,
-                    shape=list(w.shape),
-                ))
-
-    return results
-
-
-def _measure_activation_stats(
+def _collect_activations(
     model,
     tokens: List[int],
-    window_size: int = 4096,
-    stride: int = 2048,
-    max_windows: int = 50,
-) -> Dict[Tuple[int, str], Dict[str, float]]:
-    """Run calibration tokens through model, collect activation statistics.
+    window_size: int = 2048,
+    stride: int = 1024,
+    max_windows: int = 32,
+) -> Dict[int, torch.Tensor]:
+    """Run calibration tokens through model, capture per-layer activations.
 
-    Returns dict of (layer_idx, tensor_name) -> {mean_mag, max_mag} from
-    input activations to each attention projection.
+    Args:
+        model: Loaded KrasisModel with BF16 attention
+        tokens: Calibration token IDs
+        window_size: Tokens per calibration window
+        stride: Stride between windows
+        max_windows: Max windows to process
+
+    Returns:
+        dict: layer_idx -> Tensor[hidden_size] of mean per-channel |activation|
     """
     from krasis.kv_cache import SequenceKVState
 
     device = torch.device(model.ranks[0].device)
     total_tokens = len(tokens)
-
-    # Accumulators: (layer_idx, tensor_name) -> (sum_of_means, max_seen, count)
-    stats = {}
-
-    # Register hooks on attention projections to capture input activations
-    hooks = []
-
-    def _make_hook(layer_idx, tensor_name):
-        def hook_fn(module, input, output):
-            # input is typically a tuple, first element is the activation tensor
-            if isinstance(input, tuple) and len(input) > 0:
-                x = input[0]
-            else:
-                x = input
-            if not isinstance(x, torch.Tensor):
-                return
-
-            key = (layer_idx, tensor_name)
-            mag = x.float().abs()
-            mean_m = mag.mean().item()
-            max_m = mag.max().item()
-
-            if key not in stats:
-                stats[key] = {"sum_mean": 0.0, "max": 0.0, "count": 0}
-            stats[key]["sum_mean"] += mean_m
-            stats[key]["max"] = max(stats[key]["max"], max_m)
-            stats[key]["count"] += 1
-
-        return hook_fn
-
-    # For torch.nn.Module-based models we'd use register_forward_hook.
-    # But Krasis attention classes aren't nn.Modules — they're plain classes
-    # with manual forward(). We need a different approach: instrument the
-    # forward pass directly by wrapping the weight matmul.
-    #
-    # Instead, we'll measure activation stats by running windows through the
-    # model and using the weight tensors + hidden states to compute sensitivity
-    # offline. The AWQ method actually doesn't need runtime hooks — it uses
-    # weight-only analysis informed by activation magnitudes.
-    #
-    # Simpler approach: for each window, capture the hidden state going INTO
-    # each layer's attention, and compute per-channel magnitude statistics.
-
-    # We'll instrument model.forward by patching the per-layer attention calls.
-    # Actually, the simplest correct approach for AWQ:
-    # 1. Run tokens through model with BF16 to get per-layer input hidden states
-    # 2. For each attention weight tensor W and its input activation X:
-    #    - AWQ sensitivity = ||X||_per_channel (channel-wise L2 norm of activations)
-    #    - Higher activation channels = more sensitive to quantization error
-    # 3. Use sensitivity to weight the quantization error measurement
-
-    # Since we can't easily hook into the non-Module forward, we'll use a
-    # simpler but effective approach: run windows, save layer-input hidden states
-    # via a patched forward, then compute offline.
-
-    # Actually for the template decision, we don't strictly need runtime activation
-    # hooks. The key insight from AWQ: quantization error is amplified by activation
-    # magnitude. We can approximate this by:
-    # 1. Measuring weight-only quantization error (NRMSE, cosine sim)
-    # 2. Running a few windows to get per-layer activation variance
-    # 3. Combining them for the decision
-
-    # For now, let's measure activation magnitudes by running the model and
-    # capturing hidden states at each layer boundary.
-
     starts = list(range(0, total_tokens - 1, stride))[:max_windows]
     total_windows = len(starts)
 
-    per_layer_act_stats = {}  # layer_idx -> {sum_mean, max, count}
+    # GPU prefill uses layer.forward() / layer.forward_attn() which our
+    # monkey-patches intercept, so we keep it enabled for speed.
+    print(f"\n  Phase 1: Capturing per-layer per-channel activations "
+          f"({total_windows} windows, {window_size} tokens each)...")
 
-    print(f"\n  Collecting activation statistics ({total_windows} windows)...")
+    capture = ActivationCapture()
+    with capture:
+        for win_idx, begin in enumerate(starts):
+            end = min(begin + window_size, total_tokens)
+            win_len = end - begin
+            if win_len < 2:
+                break
 
-    for win_idx, begin in enumerate(starts):
-        end = min(begin + window_size, total_tokens)
-        win_len = end - begin
-        if win_len < 2:
-            break
+            seq_states = [SequenceKVState(c, seq_id=0) for c in model.kv_caches]
 
-        seq_states = [SequenceKVState(c, seq_id=0) for c in model.kv_caches]
+            # Reset LA states
+            if model.cfg.is_hybrid:
+                for layer in model.layers:
+                    if layer.layer_type == "linear_attention":
+                        layer.attention.reset_state()
 
-        # Reset LA states
-        if model.cfg.is_hybrid:
-            for layer in model.layers:
-                if layer.layer_type == "linear_attention":
-                    layer.attention.reset_state()
+            try:
+                token_tensor = torch.tensor(tokens[begin:end], dtype=torch.long, device=device)
+                positions = torch.arange(win_len, dtype=torch.int32, device=device)
 
-        # Evict soft tier for prefill
-        gpu_store = getattr(model, '_gpu_decode_store', None)
-        evicted = 0
-        if gpu_store is not None:
-            evicted, _ = gpu_store.py_hcs_evict_for_prefill(win_len)
+                with torch.inference_mode():
+                    model.forward(token_tensor, positions, seq_states)
 
-        try:
-            token_tensor = torch.tensor(tokens[begin:end], dtype=torch.long, device=device)
-            positions = torch.arange(win_len, dtype=torch.int32, device=device)
+            finally:
+                for s in seq_states:
+                    s.free()
 
-            # We need to capture per-layer hidden states. Patch the model's
-            # internal _layer_forward or use a simpler approach.
-            # For efficiency, just run full forward and capture the hidden state
-            # norm at the embedding level — this gives us overall activation scale.
-            with torch.inference_mode():
-                hidden = model.embedding[token_tensor.to(device)]
-                mag = hidden.float().abs()
-                embed_mean = mag.mean().item()
-                embed_max = mag.max().item()
-
-            # The hidden state magnitude is relatively stable across layers
-            # (due to RMSNorm), so we use the embedding activation as proxy.
-            # Per-layer variation comes from the RMSNorm output, which we
-            # can measure more precisely if needed.
-            for layer_idx in range(len(model.layers)):
-                if layer_idx not in per_layer_act_stats:
-                    per_layer_act_stats[layer_idx] = {
-                        "sum_mean": 0.0, "max": 0.0, "count": 0
-                    }
-                per_layer_act_stats[layer_idx]["sum_mean"] += embed_mean
-                per_layer_act_stats[layer_idx]["max"] = max(
-                    per_layer_act_stats[layer_idx]["max"], embed_max)
-                per_layer_act_stats[layer_idx]["count"] += 1
-
-        finally:
-            if gpu_store is not None and evicted > 0:
-                gpu_store.py_hcs_reload_after_prefill()
-            for s in seq_states:
-                s.free()
-
-        print(f"\r  Window {win_idx + 1}/{total_windows}", end="", flush=True)
+            print(f"\r  Window {win_idx + 1}/{total_windows}", end="", flush=True)
 
     print()
 
-    # Convert to per-channel averages
-    result = {}
-    for layer_idx, s in per_layer_act_stats.items():
-        layer = model.layers[layer_idx]
-        lt = layer.layer_type
-        act_mean = s["sum_mean"] / max(s["count"], 1)
-        act_max = s["max"]
-
-        if lt == "linear_attention":
-            for name in ("in_proj_qkvz", "in_proj_ba", "out_proj"):
-                result[(layer_idx, name)] = {
-                    "mean_mag": act_mean, "max_mag": act_max
-                }
-        else:
-            # GQA / full attention
-            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                result[(layer_idx, name)] = {
-                    "mean_mag": act_mean, "max_mag": act_max
-                }
-
-    return result
+    activations = capture.get_per_layer_activations()
+    print(f"  Captured activations for {len(activations)} layers")
+    return activations
 
 
-def calibrate(
-    model,
-    tokens: List[int],
+# ---------------------------------------------------------------------------
+# Phase 2: Per-layer alpha grid search
+# ---------------------------------------------------------------------------
+
+def _get_weight_tensor(model, layer_idx: int, tensor_name: str) -> Optional[torch.Tensor]:
+    """Get the original BF16 weight tensor for an attention projection."""
+    cpu_weights = getattr(model, '_stream_attn_cpu', {})
+    layer = model.layers[layer_idx]
+    attn = layer.attention
+
+    w = None
+    if layer_idx in cpu_weights:
+        w = cpu_weights[layer_idx].get(tensor_name)
+    if w is None:
+        w = getattr(attn, tensor_name, None)
+
+    if w is not None and isinstance(w, torch.Tensor):
+        return w.cpu().to(torch.bfloat16) if w.is_cuda else w.to(torch.bfloat16)
+    return None
+
+
+def _is_marlin_compatible(w: torch.Tensor, group_size: int = 128) -> bool:
+    """Check if a weight tensor is compatible with Marlin quantization."""
+    if w.ndim != 2:
+        return False
+    N, K = w.shape
+    return N % 64 == 0 and K % 16 == 0 and K % group_size == 0
+
+
+# Which projections take the post-input-norm hidden state as input
+# (these can have AWQ scaling folded into the preceding norm)
+# Keys must match layer_type values from weight_loader: "linear_attention",
+# "full_attention", "sliding_attention"
+INPUT_PROJECTIONS = {
+    "linear_attention": ["in_proj_qkvz", "in_proj_ba"],
+    "full_attention": ["q_proj", "k_proj", "v_proj"],
+    "sliding_attention": ["q_proj", "k_proj", "v_proj"],
+}
+
+# Which projections take attention output as input (no norm folding possible)
+OUTPUT_PROJECTIONS = {
+    "linear_attention": ["out_proj"],
+    "full_attention": ["o_proj"],
+    "sliding_attention": ["o_proj"],
+}
+
+
+def _search_alpha_for_layer(
+    s_x: torch.Tensor,          # [hidden_size] per-channel activation magnitudes
+    weights: List[torch.Tensor], # list of [N_i, K] BF16 weight tensors
     group_size: int = 128,
-    int4_nrmse_threshold: float = 0.02,
-    int8_nrmse_threshold: float = 0.005,
-    window_size: int = 4096,
-    stride: int = 2048,
-    max_windows: int = 50,
-) -> List[TensorResult]:
-    """Run full AWQ calibration on a model's attention tensors.
+    alpha_steps: int = 21,
+) -> Tuple[float, float, float]:
+    """Grid search for optimal alpha that minimizes activation-weighted INT4 error.
 
-    Args:
-        model: Loaded KrasisModel with BF16 attention
-        tokens: Calibration token IDs
-        group_size: Quantization group size (matches Marlin)
-        int4_nrmse_threshold: Max NRMSE for INT4 decision (lower = stricter)
-        int8_nrmse_threshold: Max NRMSE for INT8 decision
-        window_size: Tokens per calibration window
-        stride: Stride between windows
-        max_windows: Max calibration windows
+    For each candidate alpha:
+      s = s_x^alpha (per-channel scale)
+      For each weight W:
+        W_scaled = W * s (scale columns to protect high-activation channels)
+        W_deq = quantize_dequantize(W_scaled) / s (quantize, then unscale)
+        error += mean(((W - W_deq) * s_x)^2)  (activation-weighted MSE)
 
     Returns:
-        List of TensorResult with per-tensor decisions
+        (best_alpha, best_error, baseline_error)
     """
-    print("\n  Phase 1: Enumerating attention tensors...")
-    results = _collect_tensor_info(model)
-    print(f"  Found {len(results)} attention tensors")
+    s_x_f = s_x.float().clamp(min=1e-6)
+    alphas = torch.linspace(0.0, 1.0, alpha_steps)
 
-    # Phase 2: Collect activation statistics
-    act_stats = _measure_activation_stats(
-        model, tokens, window_size, stride, max_windows)
+    best_alpha = 0.0
+    best_error = float('inf')
+    baseline_error = None
 
-    # Phase 3: Measure quantization error per tensor
-    print(f"\n  Phase 3: Measuring quantization error per tensor...")
+    for alpha in alphas:
+        alpha_val = alpha.item()
+        s = s_x_f.pow(alpha_val).clamp(min=1e-5)
 
-    # We need access to the original BF16 weights. For streamed attention models,
-    # weights may be in _stream_attn_cpu. For non-streamed, on the layer objects.
-    cpu_weights = getattr(model, '_stream_attn_cpu', {})
+        total_error = 0.0
+        for w in weights:
+            w_f = w.float()
 
-    for i, tr in enumerate(results):
-        layer = model.layers[tr.layer_idx]
-        attn = layer.attention
+            # Scale weight columns: W_scaled[:,j] = W[:,j] * s[j]
+            w_scaled = w_f * s.unsqueeze(0)
 
-        # Get the original BF16 weight tensor
-        w = None
-        if tr.layer_idx in cpu_weights:
-            w = cpu_weights[tr.layer_idx].get(tr.tensor_name)
-        if w is None:
-            w = getattr(attn, tr.tensor_name, None)
+            # Quantize and dequantize at INT4
+            w_deq_scaled = _quantize_dequantize_int4(
+                w_scaled.to(torch.bfloat16), group_size).float()
 
-        if w is None or not isinstance(w, torch.Tensor):
-            # Can't calibrate — keep at BF16
-            tr.decision = "bf16"
-            print(f"\r  [{i+1}/{len(results)}] layer {tr.layer_idx} {tr.tensor_name}: "
-                  f"SKIP (not a tensor)", end="", flush=True)
+            # Unscale: W_deq[:,j] = W_deq_scaled[:,j] / s[j]
+            w_deq = w_deq_scaled / s.unsqueeze(0)
+
+            # Activation-weighted MSE: weight each column's error by its
+            # activation magnitude (channels with higher activation matter more)
+            err = ((w_f - w_deq) * s_x_f.unsqueeze(0)).pow(2).mean().item()
+            total_error += err
+
+        if alpha_val == 0.0:
+            baseline_error = total_error
+
+        if total_error < best_error:
+            best_error = total_error
+            best_alpha = alpha_val
+
+    return best_alpha, best_error, baseline_error or best_error
+
+
+def _search_all_layers(
+    model,
+    per_layer_activations: Dict[int, torch.Tensor],
+    group_size: int = 128,
+    alpha_steps: int = 21,
+) -> Dict[int, Dict]:
+    """Run alpha search for all layers.
+
+    Returns:
+        dict: layer_idx -> {
+            'alpha': float,
+            'scales': list[float],   # s[j] = s_x[j]^alpha, len=hidden_size
+            'best_mse': float,
+            'baseline_mse': float,
+            'improvement': float,     # (baseline - best) / baseline
+            'input_projs': list[str], # names of scaled input projections
+            'output_projs': list[str], # names of unscaled output projections
+            'bf16_projs': list[str],  # Marlin-incompatible projections
+        }
+    """
+    results = {}
+    num_layers = len(model.layers)
+
+    print(f"\n  Phase 2: Searching optimal alpha per layer ({alpha_steps} candidates)...")
+
+    for layer_idx, layer in enumerate(model.layers):
+        if layer_idx not in per_layer_activations:
             continue
 
-        # Ensure BF16 and on CPU for measurement
-        w_cpu = w.cpu().to(torch.bfloat16) if w.is_cuda else w.to(torch.bfloat16)
+        s_x = per_layer_activations[layer_idx]
+        lt = layer.layer_type
+        input_proj_names = INPUT_PROJECTIONS.get(lt, [])
+        output_proj_names = OUTPUT_PROJECTIONS.get(lt, [])
 
-        # Check Marlin compatibility
-        N, K = w_cpu.shape
-        if N % 64 != 0 or K % 16 != 0 or K % group_size != 0:
-            tr.decision = "bf16"
-            print(f"\r  [{i+1}/{len(results)}] layer {tr.layer_idx} {tr.tensor_name}: "
-                  f"BF16 (shape {N}x{K} not Marlin-compatible)", end="", flush=True)
+        # Collect Marlin-compatible input projection weights
+        input_weights = []
+        scaled_proj_names = []
+        bf16_proj_names = []
+
+        for name in input_proj_names:
+            w = _get_weight_tensor(model, layer_idx, name)
+            if w is None:
+                bf16_proj_names.append(name)
+                continue
+            if not _is_marlin_compatible(w, group_size):
+                bf16_proj_names.append(name)
+                continue
+            input_weights.append(w)
+            scaled_proj_names.append(name)
+
+        # Check output projections for Marlin compatibility
+        valid_output_projs = []
+        for name in output_proj_names:
+            w = _get_weight_tensor(model, layer_idx, name)
+            if w is not None and _is_marlin_compatible(w, group_size):
+                valid_output_projs.append(name)
+            else:
+                bf16_proj_names.append(name)
+
+        if not input_weights:
+            # No scalable projections — skip layer
+            results[layer_idx] = {
+                'alpha': 0.0,
+                'scales': [1.0] * s_x.shape[0],
+                'best_mse': 0.0,
+                'baseline_mse': 0.0,
+                'improvement': 0.0,
+                'input_projs': [],
+                'output_projs': valid_output_projs,
+                'bf16_projs': bf16_proj_names,
+            }
             continue
 
-        # INT4 quantization error
-        w_deq4 = _quantize_tensor_int4(w_cpu, group_size)
-        tr.int4_error = _measure_quant_error(w_cpu, w_deq4)
-        del w_deq4
+        # Grid search alpha
+        best_alpha, best_mse, baseline_mse = _search_alpha_for_layer(
+            s_x, input_weights, group_size, alpha_steps)
 
-        # INT8 quantization error
-        w_deq8 = _quantize_tensor_int8(w_cpu, group_size)
-        tr.int8_error = _measure_quant_error(w_cpu, w_deq8)
-        del w_deq8
+        # Compute final scales
+        s_x_f = s_x.float().clamp(min=1e-6)
+        final_scales = s_x_f.pow(best_alpha).clamp(min=1e-5)
 
-        # Activation stats
-        key = (tr.layer_idx, tr.tensor_name)
-        if key in act_stats:
-            tr.act_mean_magnitude = act_stats[key]["mean_mag"]
-            tr.act_max_magnitude = act_stats[key]["max_mag"]
+        improvement = (baseline_mse - best_mse) / max(baseline_mse, 1e-10)
 
-        # Decisions are deferred until we have all errors — mark as pending
-        tr.decision = "pending"
+        results[layer_idx] = {
+            'alpha': best_alpha,
+            'scales': final_scales.tolist(),
+            'best_mse': best_mse,
+            'baseline_mse': baseline_mse,
+            'improvement': improvement,
+            'input_projs': scaled_proj_names,
+            'output_projs': valid_output_projs,
+            'bf16_projs': bf16_proj_names,
+        }
 
-        print(f"\r  [{i+1}/{len(results)}] layer {tr.layer_idx} {tr.tensor_name}: "
-              f"nrmse4={tr.int4_error.get('nrmse', -1):.6f} "
-              f"cos4={tr.int4_error.get('cos_sim', -1):.6f} "
-              f"nrmse8={tr.int8_error.get('nrmse', -1):.6f} "
-              f"cos8={tr.int8_error.get('cos_sim', -1):.6f}",
+        # Clean up weight tensors
+        del input_weights
+
+        print(f"\r  [{layer_idx + 1}/{num_layers}] layer {layer_idx} ({lt}): "
+              f"alpha={best_alpha:.2f}  "
+              f"error reduction={improvement * 100:.1f}%  "
+              f"scaled={len(scaled_proj_names)} output={len(valid_output_projs)} "
+              f"bf16={len(bf16_proj_names)}",
               end="", flush=True)
 
-        del w_cpu
-
-    print()  # newline after progress
-
-    # Phase 4: AWQ-informed decisions using relative outlier detection
-    # INT4 quantization naturally has ~12-16% NRMSE — that's expected.
-    # We use the distribution of errors across tensors to find outliers:
-    # tensors with significantly higher error than average get promoted.
-    print(f"\n  Phase 4: Making per-tensor decisions...")
-
-    # Collect all INT4 NRMSEs for tensors that have valid measurements
-    int4_nrmses = [tr.int4_error["nrmse"] for tr in results
-                   if tr.int4_error and "nrmse" in tr.int4_error]
-    int8_nrmses = [tr.int8_error["nrmse"] for tr in results
-                   if tr.int8_error and "nrmse" in tr.int8_error]
-
-    if int4_nrmses:
-        mean_nrmse4 = sum(int4_nrmses) / len(int4_nrmses)
-        std_nrmse4 = (sum((x - mean_nrmse4) ** 2 for x in int4_nrmses) / len(int4_nrmses)) ** 0.5
-        # Tensors with NRMSE > mean + 2*std are outliers -> promote to INT8
-        int4_outlier_threshold = mean_nrmse4 + 2 * std_nrmse4
-    else:
-        int4_outlier_threshold = float('inf')
-
-    if int8_nrmses:
-        mean_nrmse8 = sum(int8_nrmses) / len(int8_nrmses)
-        std_nrmse8 = (sum((x - mean_nrmse8) ** 2 for x in int8_nrmses) / len(int8_nrmses)) ** 0.5
-        # Tensors with INT8 NRMSE > mean + 2*std -> keep at BF16
-        int8_outlier_threshold = mean_nrmse8 + 2 * std_nrmse8
-    else:
-        int8_outlier_threshold = float('inf')
-
-    print(f"  INT4 NRMSE: mean={mean_nrmse4:.6f}, std={std_nrmse4:.6f}, "
-          f"outlier threshold={int4_outlier_threshold:.6f}")
-    print(f"  INT8 NRMSE: mean={mean_nrmse8:.6f}, std={std_nrmse8:.6f}, "
-          f"outlier threshold={int8_outlier_threshold:.6f}")
-
-    for tr in results:
-        if tr.decision != "pending":
-            continue  # already decided (e.g. Marlin-incompatible -> BF16)
-
-        int4_nrmse = tr.int4_error.get("nrmse", float('inf'))
-        int4_cos = tr.int4_error.get("cos_sim", 0)
-        int8_nrmse = tr.int8_error.get("nrmse", float('inf'))
-        int8_cos = tr.int8_error.get("cos_sim", 0)
-
-        # Decision tree:
-        # 1. If INT4 error is within normal range -> INT4
-        # 2. If INT4 is an outlier but INT8 is normal -> INT8
-        # 3. If both are outliers -> BF16
-        if int4_nrmse <= int4_outlier_threshold and int4_cos >= 0.98:
-            tr.decision = "int4"
-        elif int8_nrmse <= int8_outlier_threshold and int8_cos >= 0.999:
-            tr.decision = "int8"
-        else:
-            tr.decision = "bf16"
-
+    print()
     return results
 
 
 # ---------------------------------------------------------------------------
-# Template I/O
+# Phase 3: Template building and I/O
 # ---------------------------------------------------------------------------
 
-def build_template(
+def build_template_v2(
     model_path: str,
-    results: List[TensorResult],
+    layer_results: Dict[int, Dict],
     num_tokens: int,
     dataset: str,
     group_size: int = 128,
+    alpha_steps: int = 21,
 ) -> Dict[str, Any]:
-    """Build the template JSON from calibration results."""
+    """Build a v2 AWQ template with per-layer channel scales."""
     model_hash = compute_model_hash(model_path)
 
-    # Per-tensor decisions
-    decisions = {}
-    for tr in results:
-        key = f"layers.{tr.layer_idx}.{tr.layer_type}.{tr.tensor_name}"
-        decisions[key] = {
-            "decision": tr.decision,
-            "shape": tr.shape,
-            "int4_nrmse": round(tr.int4_error.get("nrmse", -1), 8),
-            "int4_cos_sim": round(tr.int4_error.get("cos_sim", -1), 8),
-            "int8_nrmse": round(tr.int8_error.get("nrmse", -1), 8),
-            "int8_cos_sim": round(tr.int8_error.get("cos_sim", -1), 8),
-        }
+    # Per-layer data (scales stored as lists of rounded floats)
+    layers = {}
+    total_scaled = 0
+    total_output = 0
+    total_bf16 = 0
 
-    # Summary
-    n_int4 = sum(1 for tr in results if tr.decision == "int4")
-    n_int8 = sum(1 for tr in results if tr.decision == "int8")
-    n_bf16 = sum(1 for tr in results if tr.decision == "bf16")
+    for layer_idx, lr in sorted(layer_results.items()):
+        layers[str(layer_idx)] = {
+            "alpha": round(lr['alpha'], 4),
+            "scales": [round(s, 6) for s in lr['scales']],
+            "improvement": round(lr['improvement'], 4),
+            "input_projs": lr['input_projs'],
+            "output_projs": lr['output_projs'],
+            "bf16_projs": lr['bf16_projs'],
+        }
+        total_scaled += len(lr['input_projs'])
+        total_output += len(lr['output_projs'])
+        total_bf16 += len(lr['bf16_projs'])
+
+    # Compute average improvement
+    improvements = [lr['improvement'] for lr in layer_results.values()
+                    if lr['input_projs']]
+    avg_improvement = sum(improvements) / max(len(improvements), 1)
 
     template = {
-        "version": 1,
+        "version": 2,
         "model_hash": model_hash,
         "model_path": os.path.basename(model_path),
         "calibration": {
             "tokens": num_tokens,
             "dataset": dataset,
             "group_size": group_size,
+            "alpha_steps": alpha_steps,
             "date": datetime.now().isoformat(),
         },
         "summary": {
-            "total_tensors": len(results),
-            "int4": n_int4,
-            "int8": n_int8,
-            "bf16": n_bf16,
+            "total_layers": len(layer_results),
+            "awq_scaled_tensors": total_scaled,
+            "plain_int4_tensors": total_output,
+            "bf16_tensors": total_bf16,
+            "avg_error_reduction": round(avg_improvement, 4),
         },
-        "decisions": decisions,
+        "layers": layers,
     }
 
     return template
 
 
 def save_template(template: Dict, output_dir: str) -> str:
-    """Save template to the standard directory structure.
-
-    Returns path to saved template.
-    """
+    """Save template to the standard directory structure."""
     model_hash = template["model_hash"]
     out_dir = os.path.join(output_dir, model_hash)
     os.makedirs(out_dir, exist_ok=True)
@@ -663,12 +588,9 @@ def load_template(template_dir: str, model_path: str) -> Optional[Dict]:
     Searches:
     1. Bundled templates in template_dir/<model_hash>/template.json
     2. User cache in ~/.krasis/templates/<model_hash>/template.json
-
-    Returns template dict or None.
     """
     model_hash = compute_model_hash(model_path)
 
-    # Search order
     search_paths = [
         os.path.join(template_dir, model_hash, "template.json"),
         os.path.expanduser(f"~/.krasis/templates/{model_hash}/template.json"),
@@ -678,7 +600,6 @@ def load_template(template_dir: str, model_path: str) -> Optional[Dict]:
         if os.path.exists(path):
             with open(path) as f:
                 template = json.load(f)
-            # Verify hash matches
             if template.get("model_hash") == model_hash:
                 return template
             else:
@@ -688,16 +609,98 @@ def load_template(template_dir: str, model_path: str) -> Optional[Dict]:
     return None
 
 
+def get_layer_scales(template: Dict, layer_idx: int) -> Optional[torch.Tensor]:
+    """Get per-channel AWQ scales for a layer from a v2 template.
+
+    Returns:
+        Tensor[hidden_size] of per-channel scales, or None if layer not in template
+        or template is v1.
+    """
+    if template.get("version", 1) < 2:
+        return None
+
+    layers = template.get("layers", {})
+    layer_data = layers.get(str(layer_idx))
+    if layer_data is None:
+        return None
+
+    scales = layer_data.get("scales")
+    if scales is None:
+        return None
+
+    return torch.tensor(scales, dtype=torch.float32)
+
+
 def get_tensor_decision(template: Dict, layer_idx: int, layer_type: str,
                         tensor_name: str) -> str:
-    """Get the quantization decision for a specific tensor from a template.
+    """Get the quantization decision for a specific tensor.
 
-    Returns "int4", "int8", or "bf16".
+    For v2 templates: input projections get "int4" (AWQ-scaled at load time),
+    output projections get "int4" (plain), incompatible get "bf16".
+
+    For v1 templates: returns per-tensor decision from old format.
     """
-    key = f"layers.{layer_idx}.{layer_type}.{tensor_name}"
-    decisions = template.get("decisions", {})
-    entry = decisions.get(key, {})
-    return entry.get("decision", "bf16")  # default to BF16 if not in template
+    if template.get("version", 1) >= 2:
+        layers = template.get("layers", {})
+        layer_data = layers.get(str(layer_idx))
+        if layer_data is None:
+            return "bf16"
+
+        if tensor_name in layer_data.get("input_projs", []):
+            return "int4"
+        elif tensor_name in layer_data.get("output_projs", []):
+            return "int4"
+        elif tensor_name in layer_data.get("bf16_projs", []):
+            return "bf16"
+        return "int4"  # default to INT4 for unknown tensors
+    else:
+        # v1 fallback
+        key = f"layers.{layer_idx}.{layer_type}.{tensor_name}"
+        decisions = template.get("decisions", {})
+        entry = decisions.get(key, {})
+        return entry.get("decision", "bf16")
+
+
+def is_awq_scaled_tensor(template: Dict, layer_idx: int, tensor_name: str) -> bool:
+    """Check if a tensor should have AWQ per-channel scaling applied."""
+    if template.get("version", 1) < 2:
+        return False
+
+    layers = template.get("layers", {})
+    layer_data = layers.get(str(layer_idx))
+    if layer_data is None:
+        return False
+
+    return tensor_name in layer_data.get("input_projs", [])
+
+
+# ---------------------------------------------------------------------------
+# Main calibration
+# ---------------------------------------------------------------------------
+
+def calibrate(
+    model,
+    tokens: List[int],
+    group_size: int = 128,
+    window_size: int = 2048,
+    stride: int = 1024,
+    max_windows: int = 32,
+    alpha_steps: int = 21,
+) -> Dict[int, Dict]:
+    """Run full AWQ calibration.
+
+    Returns:
+        dict: layer_idx -> per-layer results (alpha, scales, etc.)
+    """
+    # Phase 1: Collect per-layer per-channel activation magnitudes
+    per_layer_activations = _collect_activations(
+        model, tokens, window_size, stride, max_windows)
+
+    # Phase 2: Search optimal alpha per layer
+    layer_results = _search_all_layers(
+        model, per_layer_activations, group_size, alpha_steps)
+
+    return layer_results
 
 
 # ---------------------------------------------------------------------------
@@ -752,23 +755,20 @@ def main():
                         help="Calibration dataset (default: wikitext-2)")
     parser.add_argument("--group-size", type=int, default=128,
                         help="Quantization group size (default: 128)")
-    parser.add_argument("--int4-threshold", type=float, default=0.02,
-                        help="Max NRMSE for INT4 decision (default: 0.02)")
-    parser.add_argument("--int8-threshold", type=float, default=0.005,
-                        help="Max NRMSE for INT8 decision (default: 0.005)")
     parser.add_argument("--output-dir", default=None,
                         help="Template output directory (default: krasis/templates/attention)")
-    parser.add_argument("--window-size", type=int, default=4096,
+    parser.add_argument("--window-size", type=int, default=2048,
                         help="Tokens per calibration window")
-    parser.add_argument("--stride", type=int, default=2048,
+    parser.add_argument("--stride", type=int, default=1024,
                         help="Stride between windows")
-    parser.add_argument("--max-windows", type=int, default=50,
-                        help="Max calibration windows for activation stats")
+    parser.add_argument("--max-windows", type=int, default=32,
+                        help="Max calibration windows")
+    parser.add_argument("--alpha-steps", type=int, default=21,
+                        help="Number of alpha candidates to search (default: 21)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    # Parse config file directly
     cfg = _parse_config_file(args.config)
     model_path = cfg.get("model_path")
     if not model_path:
@@ -776,13 +776,14 @@ def main():
         sys.exit(1)
 
     print(f"\n{'='*60}")
-    print(f"  AWQ Attention Calibration")
+    print(f"  AWQ Attention Calibration (v2 — proper per-channel scaling)")
     print(f"{'='*60}")
-    print(f"  Model:    {model_path}")
-    print(f"  Dataset:  {args.dataset}")
-    print(f"  Tokens:   {args.tokens:,}")
-    print(f"  Group:    {args.group_size}")
-    print(f"  Thresholds: INT4 NRMSE < {args.int4_threshold}, INT8 NRMSE < {args.int8_threshold}")
+    print(f"  Model:       {model_path}")
+    print(f"  Dataset:     {args.dataset}")
+    print(f"  Tokens:      {args.tokens:,}")
+    print(f"  Group size:  {args.group_size}")
+    print(f"  Alpha steps: {args.alpha_steps}")
+    print(f"  Windows:     {args.max_windows} x {args.window_size} tokens")
     print(f"{'='*60}")
 
     # Load model with BF16 attention — calibration always uses full precision
@@ -825,7 +826,6 @@ def main():
     cal_tokens = all_tokens[:args.tokens]
     print(f"  Tokenized: {len(all_tokens):,} total, using {len(cal_tokens):,}")
 
-    # Model hash
     model_hash = compute_model_hash(model_path)
     print(f"  Model hash: {model_hash}")
 
@@ -833,66 +833,65 @@ def main():
     print(f"\n  Starting calibration...")
     t_start = time.perf_counter()
 
-    results = calibrate(
+    layer_results = calibrate(
         model=model,
         tokens=cal_tokens,
         group_size=args.group_size,
-        int4_nrmse_threshold=args.int4_threshold,
-        int8_nrmse_threshold=args.int8_threshold,
         window_size=args.window_size,
         stride=args.stride,
         max_windows=args.max_windows,
+        alpha_steps=args.alpha_steps,
     )
 
     elapsed = time.perf_counter() - t_start
 
-    # Build template
-    template = build_template(
+    # Build and save template
+    template = build_template_v2(
         model_path=model_path,
-        results=results,
+        layer_results=layer_results,
         num_tokens=len(cal_tokens),
         dataset=args.dataset,
         group_size=args.group_size,
+        alpha_steps=args.alpha_steps,
     )
 
-    # Save
     if args.output_dir:
         output_dir = args.output_dir
     else:
-        output_dir = str(Path(__file__).resolve().parent.parent.parent / "templates" / "attention")
+        output_dir = str(Path(__file__).resolve().parent.parent.parent
+                         / "templates" / "attention")
 
     out_path = save_template(template, output_dir)
 
     # Summary
-    n_int4 = sum(1 for tr in results if tr.decision == "int4")
-    n_int8 = sum(1 for tr in results if tr.decision == "int8")
-    n_bf16 = sum(1 for tr in results if tr.decision == "bf16")
-
+    summary = template["summary"]
     print(f"\n{'='*60}")
     print(f"  Calibration Complete ({elapsed:.1f}s)")
     print(f"{'='*60}")
-    print(f"  Total tensors: {len(results)}")
-    print(f"  INT4 (AWQ):    {n_int4}")
-    print(f"  INT8 (AWQ):    {n_int8}")
-    print(f"  BF16 (keep):   {n_bf16}")
-    print(f"  Template:      {out_path}")
-    print(f"  Model hash:    {model_hash}")
+    print(f"  Total layers:         {summary['total_layers']}")
+    print(f"  AWQ-scaled tensors:   {summary['awq_scaled_tensors']} (INT4 with per-channel scaling)")
+    print(f"  Plain INT4 tensors:   {summary['plain_int4_tensors']} (output projections)")
+    print(f"  BF16 tensors:         {summary['bf16_tensors']} (Marlin-incompatible)")
+    print(f"  Avg error reduction:  {summary['avg_error_reduction'] * 100:.1f}%")
+    print(f"  Template:             {out_path}")
+    print(f"  Model hash:           {model_hash}")
 
-    # Print per-layer breakdown
+    # Per-layer breakdown
     print(f"\n  Per-layer breakdown:")
-    print(f"  {'Layer':>6} {'Type':>15} {'Tensor':>15} {'Decision':>8} "
-          f"{'INT4 NRMSE':>12} {'INT4 CosSim':>12} {'INT8 NRMSE':>12} {'INT8 CosSim':>12}")
-    print(f"  {'-'*100}")
-    for tr in results:
-        d = tr.decision.upper()
-        n4 = tr.int4_error.get("nrmse", -1)
-        c4 = tr.int4_error.get("cos_sim", -1)
-        n8 = tr.int8_error.get("nrmse", -1)
-        c8 = tr.int8_error.get("cos_sim", -1)
-        print(f"  {tr.layer_idx:>6} {tr.layer_type:>15} {tr.tensor_name:>15} {d:>8} "
-              f"{n4:>12.8f} {c4:>12.8f} {n8:>12.8f} {c8:>12.8f}")
+    print(f"  {'Layer':>6} {'Type':>15} {'Alpha':>6} {'Error Reduction':>16} "
+          f"{'Scaled':>7} {'Output':>7} {'BF16':>5}")
+    print(f"  {'-'*70}")
+    for layer_idx in sorted(layer_results.keys()):
+        lr = layer_results[layer_idx]
+        layer = model.layers[layer_idx]
+        lt = layer.layer_type
+        print(f"  {layer_idx:>6} {lt:>15} {lr['alpha']:>6.2f} "
+              f"{lr['improvement'] * 100:>15.1f}% "
+              f"{len(lr['input_projs']):>7} {len(lr['output_projs']):>7} "
+              f"{len(lr['bf16_projs']):>5}")
 
-    print(f"\n  To use: set attention_quant=awq in config, template auto-loaded by model hash.")
+    print(f"\n  To use: set CFG_ATTENTION_QUANT=awq in config. "
+          f"Template auto-loaded by model hash.")
     print()
 
 

@@ -98,7 +98,7 @@ class SuiteRunner:
             os.path.abspath(__file__)
         )))
         if not output_dir:
-            output_dir = os.path.join(self.repo_root, "benchmarks", "suite_logs")
+            output_dir = os.path.join(self.repo_root, "logs", "benchmarks")
         self.output_dir = output_dir
         self.krasis_home = os.environ.get(
             "KRASIS_HOME",
@@ -553,7 +553,7 @@ def main():
     )
     parser.add_argument(
         "--output-dir", default="",
-        help="Directory for logs and summary (default: benchmarks/suite_logs/)",
+        help="Directory for logs and summary (default: logs/benchmarks/)",
     )
     parser.add_argument(
         "--reparse", action="store_true",

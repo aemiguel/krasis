@@ -37,11 +37,13 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Fixed overhead per GPU that SGLang/PyTorch/CUDA/NCCL consume beyond model
-# weights. Measured empirically on RTX 2000 Ada + CUDA 12.6:
-#   PP0: 1716 MB, PP1: 1743 MB, PP2: 1912 MB overhead.
-# Using 2000 MB as a conservative upper bound.
-SGLANG_OVERHEAD_MB = 2000
+# Default CUDA/PyTorch runtime overhead estimate for pre-launch VRAM budgets.
+# This is a conservative estimate used ONLY in the launcher TUI (before the model
+# is loaded). Actual VRAM availability is measured at runtime via 4-point calibration
+# in server.py, which supersedes this estimate entirely.
+# Can be overridden via compute_launcher_budget(cuda_overhead_mb=...) or
+# compute_vram_budget(overhead_mb=...).
+DEFAULT_CUDA_OVERHEAD_MB = 2000
 
 
 def _read_model_config(model_path: str) -> Dict[str, Any]:
@@ -289,6 +291,7 @@ def compute_launcher_budget(
     gpu_vram_mb: int = 0,
     total_ram_gb: int = 0,
     kv_cache_mb: int = 1000,
+    prefill_chunk_size: int = 10000,
 ) -> Dict[str, Any]:
     """Compute VRAM + RAM budget for the launcher TUI.
 
@@ -376,7 +379,7 @@ def compute_launcher_budget(
         head_dim = cfg.get("head_dim", cfg["hidden_size"] // cfg["num_attention_heads"])
         kv_ptl = 2 * n_kv_heads * head_dim * kv_b
 
-    cuda_overhead = SGLANG_OVERHEAD_MB
+    cuda_overhead = DEFAULT_CUDA_OVERHEAD_MB
 
     # Per-rank budget
     ranks = []
@@ -389,22 +392,27 @@ def compute_launcher_budget(
         base_lmhead_bytes = _component_weight_bytes(cfg["vocab_size"] * hidden, lm_head_quant)
 
     # Gate weights and norms are PERMANENT on GPU for ALL layers (not streamed).
-    # They're small enough to keep resident: ~1 MB/layer for gates, ~28 KB/layer for norms.
     # Additionally, f32 copies of gate weights are kept for routing precision.
     total_moe_layers_all = total_layers - first_k_dense
     gate_bytes_all_layers = hidden * n_experts * 2 * total_moe_layers_all  # BF16
     gate_f32_bytes_all_layers = hidden * n_experts * 4 * total_moe_layers_all  # F32 routing copy
     norm_bytes_all_layers = 2 * hidden * 2 * total_layers  # BF16
 
-    # FlashInfer workspace (128 MB fixed allocation for attention)
-    flashinfer_workspace_bytes = 128 * 1024 * 1024
+    # FlashInfer workspace allocation (matches attention.py _get_workspace: 256 MB)
+    flashinfer_workspace_bytes = 256 * 1024 * 1024
 
     # Prefill workspace: intermediate tensors during MoE forward.
     # fused_marlin_moe allocates intermediate_cache1/3 and intermediate_cache2.
-    # Size depends on prefill chunk size; estimate based on ~5000 tokens.
+    # Estimate up to 10k tokens, but cap to what the KV cache can actually hold.
     top_k = cfg.get("num_experts_per_tok", cfg.get("num_selected_experts", 8))
     moe_inter = cfg.get("moe_intermediate_size", 0)
-    prefill_chunk = 5000  # typical chunk size
+    if hybrid:
+        total_full_attn = sum(1 for i in range(total_model_layers) if (i + 1) % full_attn_interval == 0)
+    else:
+        total_full_attn = total_model_layers
+    kv_total_per_token = kv_ptl * total_full_attn
+    max_kv_tokens = int(kv_cache_mb * 1024 * 1024 // kv_total_per_token) if kv_total_per_token > 0 else 10000
+    prefill_chunk = min(prefill_chunk_size, max_kv_tokens)
     prefill_workspace_bytes = 0
     if moe_inter > 0 and top_k > 0:
         # intermediate_cache13: [M * topk, 2*N] bf16
@@ -617,7 +625,7 @@ def compute_vram_budget(
 
     max_position_embeddings = cfg.get("max_position_embeddings", 131072)
     headroom_bytes = headroom_mb * 1024 * 1024
-    overhead_bytes = SGLANG_OVERHEAD_MB * 1024 * 1024
+    overhead_bytes = DEFAULT_CUDA_OVERHEAD_MB * 1024 * 1024
 
     expert_bytes = _expert_bytes_per_expert(cfg) if num_gpu_experts > 0 else 0
     linear_attn_bpl = _linear_attention_bytes_per_layer(cfg, quantization) if hybrid else 0
@@ -753,7 +761,7 @@ def compute_vram_budget(
         "pp_partition": pp_partition,
         "gpu_vram_mb": gpu_vram_bytes / (1024**2),
         "headroom_mb": headroom_mb,
-        "overhead_mb": SGLANG_OVERHEAD_MB,
+        "overhead_mb": DEFAULT_CUDA_OVERHEAD_MB,
         "quantization": quantization,
         "kv_cache_dtype": kv_cache_dtype,
         "max_position_embeddings": max_position_embeddings,

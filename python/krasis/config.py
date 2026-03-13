@@ -35,20 +35,36 @@ def cache_dir_for_model(model_path: str) -> str:
     return new_dir
 
 
-def _parse_eos_token_id(raw: dict, cfg: dict) -> int:
-    """Parse eos_token_id which may be int or list of ints."""
-    eos = raw.get("eos_token_id", cfg.get("eos_token_id", 0))
-    if isinstance(eos, list):
-        return eos[0] if eos else 0
-    return eos
+def _collect_eos_ids(raw: dict, cfg: dict, gen_cfg: dict) -> list:
+    """Collect all unique EOS token IDs from config.json and generation_config.json.
+
+    generation_config.json is authoritative for stop tokens (often has the full
+    list while config.json only has one).  Merge both, preserving order.
+    """
+    ids = []
+    seen = set()
+    # generation_config.json first (authoritative for generation)
+    for source in (gen_cfg, raw, cfg):
+        eos = source.get("eos_token_id")
+        if eos is None:
+            continue
+        items = eos if isinstance(eos, list) else [eos]
+        for v in items:
+            if isinstance(v, int) and v not in seen:
+                ids.append(v)
+                seen.add(v)
+    return ids if ids else [0]
 
 
-def _parse_extra_stop_ids(raw: dict, cfg: dict) -> tuple:
-    """Parse additional stop token IDs from array eos_token_id."""
-    eos = raw.get("eos_token_id", cfg.get("eos_token_id", 0))
-    if isinstance(eos, list) and len(eos) > 1:
-        return tuple(eos[1:])
-    return ()
+def _parse_eos_token_id(raw: dict, cfg: dict, gen_cfg: dict) -> int:
+    """Primary EOS token ID (first from merged list)."""
+    return _collect_eos_ids(raw, cfg, gen_cfg)[0]
+
+
+def _parse_extra_stop_ids(raw: dict, cfg: dict, gen_cfg: dict) -> tuple:
+    """Additional stop token IDs beyond the primary EOS."""
+    ids = _collect_eos_ids(raw, cfg, gen_cfg)
+    return tuple(ids[1:]) if len(ids) > 1 else ()
 
 
 def _infer_from_weights(model_path: str, cfg: dict) -> dict:
@@ -206,11 +222,20 @@ class QuantConfig:
     layernorms, gate weight. These are either too quality-critical or too small.
     """
     lm_head: str = "int8"          # "bf16" or "int8"
-    attention: str = "bf16" # "bf16", "int8", "int4", or "awq" (calibrated per-tensor)
+    attention: str = "bf16" # "bf16" or "awq" (calibrated per-tensor)
     shared_expert: str = "int8"    # "bf16" or "int8"
     dense_mlp: str = "int8"        # "bf16" or "int8"
     gpu_expert_bits: int = 4       # 4 or 8 for Marlin kernel
     cpu_expert_bits: int = 4       # 4 or 8 for CPU expert quantization
+
+    def __post_init__(self):
+        # Migrate legacy naive int4/int8 attention to AWQ
+        if self.attention in ("int4", "int8"):
+            import warnings
+            warnings.warn(
+                f"Naive attention quant '{self.attention}' is deprecated, migrating to 'awq'",
+                DeprecationWarning, stacklevel=2)
+            self.attention = "awq"
 
 
 @dataclass
@@ -292,6 +317,13 @@ class ModelConfig:
         config_path = os.path.join(model_path, "config.json")
         with open(config_path) as f:
             raw = json.load(f)
+
+        # generation_config.json has the authoritative eos_token_id list
+        gen_cfg_path = os.path.join(model_path, "generation_config.json")
+        gen_cfg = {}
+        if os.path.exists(gen_cfg_path):
+            with open(gen_cfg_path) as f:
+                gen_cfg = json.load(f)
 
         # Some models nest config: Kimi K2.5 → text_config, DeepSeek-VL2 → language_config
         cfg = raw.get("text_config", raw.get("language_config", raw))
@@ -428,8 +460,8 @@ class ModelConfig:
             norm_bias_one=norm_bias_one,
             tie_word_embeddings=tie,
             bos_token_id=raw.get("bos_token_id", cfg.get("bos_token_id", 0)),
-            eos_token_id=_parse_eos_token_id(raw, cfg),
-            extra_stop_token_ids=_parse_extra_stop_ids(raw, cfg),
+            eos_token_id=_parse_eos_token_id(raw, cfg, gen_cfg),
+            extra_stop_token_ids=_parse_extra_stop_ids(raw, cfg, gen_cfg),
             layers_prefix=_detect_layers_prefix(model_path),
         )
 

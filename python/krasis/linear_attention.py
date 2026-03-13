@@ -442,10 +442,17 @@ class GatedDeltaNetAttention:
                 self._la_input = "pending"  # sentinel: capture on next call
                 return self._forward_recurrent(hidden)
             elif self._la_input == "pending":
-                # Second M=1 call: capture the graph (requires ~20-30 MB free VRAM)
+                # Second M=1 call: capture the graph.
+                # Graph capture cost: forward intermediates (~5 * hidden_size * 2 bytes per
+                # projection) + recurrent state (nv * dk * dv * 4) + CUDA graph overhead.
+                # Use 3x multiplier for graph's internal bookkeeping.
+                forward_bytes = 5 * self.hidden_size * 2  # projections
+                state_bytes = self.num_v_heads * self.k_head_dim * self.v_head_dim * 4
+                graph_capture_mb = (forward_bytes + state_bytes) * 3 / (1024 * 1024)
+                min_free_mb = max(10, graph_capture_mb)  # floor 10 MB
                 free_mb = torch.cuda.mem_get_info(self.device)[0] / (1024 * 1024)
-                if free_mb < 50:
-                    logger.debug("Skipping LA graph capture for layer %d: only %.0f MB free (need ~50 MB)", self.layer_idx, free_mb)
+                if free_mb < min_free_mb:
+                    logger.debug("Skipping LA graph capture for layer %d: only %.0f MB free (need ~%.0f MB)", self.layer_idx, free_mb, min_free_mb)
                     self._la_input = None  # disable graph attempts
                     return self._forward_recurrent(hidden)
                 try:

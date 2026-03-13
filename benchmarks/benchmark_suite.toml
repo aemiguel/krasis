@@ -18,7 +18,7 @@
 #   num_gpus           — number of GPUs to use (required)
 #   gpu_expert_bits    — Marlin GPU expert bits: 4 or 8 (default: 4)
 #   cpu_expert_bits    — CPU expert bits: 4 or 8 (default: 4)
-#   attention_quant    — "int8" or "bf16" (default: "int8")
+#   attention_quant    — "awq" or "bf16" (default: "bf16")
 #   shared_expert_quant — "int8" or "bf16" (default: "int8")
 #   dense_mlp_quant    — "int8" or "bf16" (default: "int8")
 #   lm_head_quant      — "int8" or "bf16" (default: "int8")

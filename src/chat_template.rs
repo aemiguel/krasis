@@ -141,6 +141,37 @@ impl ChatTemplateEngine {
                     })?;
                     Ok(minijinja::Value::from(s.trim()))
                 }
+                "lstrip" => {
+                    let s = value.as_str().ok_or_else(|| {
+                        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "lstrip requires a string")
+                    })?;
+                    let chars = args.first().and_then(|a| a.as_str());
+                    Ok(minijinja::Value::from(match chars {
+                        Some(c) => s.trim_start_matches(|ch: char| c.contains(ch)),
+                        None => s.trim_start(),
+                    }))
+                }
+                "rstrip" => {
+                    let s = value.as_str().ok_or_else(|| {
+                        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "rstrip requires a string")
+                    })?;
+                    let chars = args.first().and_then(|a| a.as_str());
+                    Ok(minijinja::Value::from(match chars {
+                        Some(c) => s.trim_end_matches(|ch: char| c.contains(ch)),
+                        None => s.trim_end(),
+                    }))
+                }
+                "split" => {
+                    let s = value.as_str().ok_or_else(|| {
+                        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "split requires a string")
+                    })?;
+                    let sep = args.first().and_then(|a| a.as_str());
+                    let parts: Vec<minijinja::Value> = match sep {
+                        Some(sep) => s.split(sep).map(minijinja::Value::from).collect(),
+                        None => s.split_whitespace().map(minijinja::Value::from).collect(),
+                    };
+                    Ok(minijinja::Value::from(parts))
+                }
                 _ => Err(minijinja::Error::new(
                     minijinja::ErrorKind::UnknownMethod,
                     format!("unknown method: {}", method),

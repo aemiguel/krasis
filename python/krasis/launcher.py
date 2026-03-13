@@ -581,7 +581,7 @@ def _format_value(opt: ConfigOption, val: Any) -> str:
     if opt.key == "attention_quant":
         labels = {
             "bf16": "BF16",
-            "awq": "AWQ (calibrated INT4/BF16)",
+            "awq": "AWQ (calibrated per-tensor)",
         }
         return labels.get(str(val), str(val))
     return str(val)

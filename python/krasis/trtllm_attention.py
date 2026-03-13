@@ -35,9 +35,6 @@ def _linear(x: torch.Tensor, weight_data) -> torch.Tensor:
         return int8_linear(x, *weight_data)
     return torch.nn.functional.linear(x, weight_data)
 
-WORKSPACE_SIZE_MB = 150
-
-
 class TRTLLMMLAAttention:
     """Multi-head Latent Attention using TRTLLM kernels for one layer."""
 
@@ -88,9 +85,17 @@ class TRTLLMMLAAttention:
         self.rope_theta = cfg.rope_theta
         self._rope_cos_sin = None
 
-        # Workspace
+        # Workspace: sized from model dimensions.
+        # TRTLLM attention needs scratch for softmax partial sums and output accumulation.
+        # Conservative estimate: num_heads * absorbed_head_dim * max_batch_blocks * sizeof(float).
+        # For single-sequence inference with up to 64K tokens (1K pages of 64 tokens):
+        #   prefill: num_heads * q_head_dim * max_seq_len * 4 (softmax scratch)
+        #   decode:  num_heads * absorbed_head_dim * num_pages * 4
+        # We size for the larger (prefill) case with 8K tokens as conservative upper bound.
+        workspace_bytes = self.num_heads * self.q_head_dim * 8192 * 4
+        workspace_mb = max(32, (workspace_bytes + 1024 * 1024 - 1) // (1024 * 1024))
         self._workspace = torch.zeros(
-            WORKSPACE_SIZE_MB * 1024 * 1024,
+            workspace_mb * 1024 * 1024,
             dtype=torch.uint8, device=device,
         )
 

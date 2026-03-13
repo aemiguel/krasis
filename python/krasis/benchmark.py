@@ -387,6 +387,8 @@ class KrasisBenchmark:
 
         t_first = None
         token_count = 0
+        server_finish_reason = None
+        server_decode_tokens = 0
         buf = b""
 
         while True:
@@ -402,9 +404,16 @@ class KrasisBenchmark:
                 if line.startswith(b"data: "):
                     try:
                         data = json.loads(line[6:])
+                        # Server timing chunk has authoritative token count
                         if "krasis_timing" in data:
+                            kt = data["krasis_timing"]
+                            server_decode_tokens = kt.get("total_generated", 0)
                             continue
-                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        choice = data.get("choices", [{}])[0]
+                        fr = choice.get("finish_reason")
+                        if fr is not None:
+                            server_finish_reason = fr
+                        delta = choice.get("delta", {})
                         if delta.get("content"):
                             now = time.perf_counter()
                             if t_first is None:
@@ -418,21 +427,26 @@ class KrasisBenchmark:
         t_end = time.perf_counter()
         total_s = t_end - t_start
 
+        # Use server's authoritative token count if available (content chunk
+        # counting undercounts when the stream detokenizer buffers multi-byte
+        # sequences, producing empty text for some tokens).
+        actual_tokens = server_decode_tokens if server_decode_tokens > 0 else token_count
+
         # Decode tok/s: tokens after first / time from first to last
-        if t_first and token_count > 1:
+        if t_first and actual_tokens > 1:
             decode_time = t_end - t_first
-            decode_tokens = token_count - 1
+            decode_tokens = actual_tokens - 1
             decode_tok_s = decode_tokens / decode_time
         else:
             decode_tok_s = 0
 
-        # EOS hit early
-        failed = token_count < max_tokens
+        # EOS: use server's finish_reason (authoritative) instead of counting
+        failed = server_finish_reason == "stop" and actual_tokens < max_tokens
 
         return {
             "total_s": round(total_s, 2),
             "decode_tok_s": round(decode_tok_s, 2),
-            "tokens": token_count,
+            "tokens": actual_tokens,
             "target_tokens": max_tokens,
             "failed": failed,
         }
