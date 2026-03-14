@@ -799,8 +799,7 @@ def main():
         ok("All caches ready")
     else:
         failed_bits = [str(b) for b, ok_ in cache_results.items() if not ok_]
-        warn(f"Cache build failed for INT{', INT'.join(failed_bits)} — "
-             f"configs using these will likely fail")
+        die(f"Cache build failed for INT{', INT'.join(failed_bits)} — aborting release test")
     print()
 
     # ── Run each config variant ──────────────────────────────────

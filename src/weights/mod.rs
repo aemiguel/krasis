@@ -1343,13 +1343,18 @@ impl WeightStore {
                             effective_gs = *try_gs;
                             gpu_loaded = true;
                         }
-                        Err(_) => {}
+                        Err(e) => {
+                            log::warn!("Failed to load just-built Marlin cache (gs={}): {e}", try_gs);
+                        }
                     }
                 }
             }
 
             if !gpu_loaded {
-                log::warn!("All Marlin cache attempts failed — GPU prefill will not be available");
+                return Err(format!(
+                    "All Marlin INT{} cache attempts failed — cannot proceed without GPU expert cache",
+                    gpu_num_bits,
+                ));
             }
         }
 
@@ -1416,12 +1421,15 @@ impl WeightStore {
                             effective_gs = built_gs;
                         }
                     }
-                    Err(e) => log::warn!("Failed to load built CPU cache: {e}"),
+                    Err(e) => return Err(format!("Failed to load just-built CPU INT{} cache: {e}", cpu_num_bits)),
                 }
             }
 
             if !cpu_loaded {
-                log::warn!("CPU cache not loaded — CPU decode will use legacy path if available");
+                return Err(format!(
+                    "CPU INT{} cache not loaded and could not be built — cannot proceed without CPU expert cache",
+                    cpu_num_bits,
+                ));
             }
         }
 

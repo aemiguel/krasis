@@ -306,11 +306,15 @@ def _warmup_prefill(model: KrasisModel):
         elapsed = time.time() - t0
         logger.info("Prefill warmup complete (%.1fs, %d tokens)", elapsed, result.prompt_len)
     except Exception as e:
-        logger.warning("Prefill warmup failed (non-fatal): %s", e)
         try:
             model.server_cleanup()
         except Exception:
             pass
+        raise RuntimeError(
+            f"Prefill warmup failed: {e}\n"
+            "This means prefill is broken and the server cannot serve requests. "
+            "Fix the underlying issue before starting."
+        ) from e
 
 
 def _capture_prefill(model: KrasisModel, num_repeats: int):
@@ -413,11 +417,15 @@ def _warmup_decode(model: KrasisModel, num_steps: int = 4):
         elapsed = time.time() - t0
         logger.info("Decode warmup complete (%.1fs)", elapsed)
     except Exception as e:
-        logger.warning("Decode warmup failed (non-fatal): %s", e)
         try:
             model.server_cleanup()
         except Exception:
             pass
+        raise RuntimeError(
+            f"Decode warmup failed: {e}\n"
+            "This means decode is broken and the server cannot generate tokens. "
+            "Fix the underlying issue before starting."
+        ) from e
 
 
 _registry_file: Optional[Path] = None
@@ -1510,12 +1518,15 @@ def main():
                          f"current_free={current_free:,.0f} MB / {total_mb:,} MB total")
 
             except Exception as e:
-                _warn(f"Multi-GPU decode validation FAILED: {e}")
-                logger.error("Multi-GPU decode validation failed: %s", e, exc_info=True)
                 try:
                     _model.server_cleanup()
                 except Exception:
                     pass
+                raise RuntimeError(
+                    f"Multi-GPU decode validation failed: {e}\n"
+                    "Cannot start server with broken multi-GPU decode. "
+                    "Fix the underlying issue or disable multi-GPU."
+                ) from e
 
             multi_gpu_split_layer = split_layer
             multi_gpu_gqa_offset = gqa_offset

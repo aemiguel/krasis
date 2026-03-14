@@ -1514,7 +1514,10 @@ impl GpuDecodeStore {
         }
 
         #[cfg(not(has_decode_kernels))]
-        log::warn!("GpuDecodeStore: decode kernels not available (nvcc not found at build time)");
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Decode kernels not available (nvcc not found at build time). \
+             GPU decode requires compiled CUDA kernels. Rebuild with nvcc in PATH."
+        ));
 
         let kernels_loaded = cfg!(has_decode_kernels);
 

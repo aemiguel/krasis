@@ -553,32 +553,30 @@ fn handle_chat_completion(
     // ── Estimate prompt tokens for soft-tier HCS eviction ──
     let estimated_tokens = {
         // Apply actual chat template to get full rendered text, then tokenize
-        let rendered = state.chat_template.apply(&messages_json, true)
-            .unwrap_or_else(|e| {
-                log::warn!("Chat template failed ({}), falling back to raw content extraction", e);
-                // Fallback: extract raw content from messages
-                let mut text = String::new();
-                if let Ok(msgs) = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json) {
-                    for msg in &msgs {
-                        if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                            text.push_str(content);
-                            text.push(' ');
-                        }
-                    }
-                }
-                text
-            });
-        let token_count = state.tokenizer.encode(rendered.as_str(), false)
-            .map(|e| e.len())
-            .map_err(|e| {
+        let rendered = match state.chat_template.apply(&messages_json, true) {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("Chat template failed: {}", e);
+                let _ = send_json(
+                    stream,
+                    500,
+                    &format!(r#"{{"error":"Chat template failed: {}. This indicates a broken model setup."}}"#, e),
+                );
+                return;
+            }
+        };
+        let token_count = match state.tokenizer.encode(rendered.as_str(), false) {
+            Ok(e) => e.len(),
+            Err(e) => {
                 log::error!("Tokenizer failed to encode prompt: {}", e);
-                e
-            })
-            .unwrap_or_else(|_| {
-                // Tokenizer failure is not fatal for HCS estimation -- use conservative estimate
-                // to avoid blocking requests. The actual prefill will tokenize correctly via Python.
-                rendered.len() / 3
-            });
+                let _ = send_json(
+                    stream,
+                    500,
+                    &format!(r#"{{"error":"Tokenizer failed: {}. This indicates a broken model setup."}}"#, e),
+                );
+                return;
+            }
+        };
         log::info!("Soft HCS: estimated {} tokens (rendered_len={})", token_count, rendered.len());
         token_count
     };
@@ -638,19 +636,16 @@ fn handle_chat_completion(
         }
     };
 
-    // If prompt exceeded Rust KV cache, skip decode (return first token only)
+    // If prompt exceeded Rust KV cache, return error (not a silent 200 with truncated output)
     if kv_overflow {
-        log::warn!("Request {}: prompt {} tokens exceeds Rust KV cache, returning first token only",
+        log::error!("Request {}: prompt {} tokens exceeds Rust KV cache capacity",
             request_id, prompt_len);
-        let text = state.tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
         let _ = send_json(
             stream,
-            200,
+            507,
             &format!(
-                r#"{{"id":"chatcmpl-{}","object":"chat.completion","created":{},"model":"{}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"length"}}],"usage":{{"prompt_tokens":{},"completion_tokens":1,"total_tokens":{}}}}}"#,
-                request_id, created, &state.model_name,
-                text.replace('\\', "\\\\").replace('"', "\\\""),
-                prompt_len, prompt_len + 1,
+                r#"{{"error":{{"message":"Prompt ({} tokens) exceeds KV cache capacity. Increase CFG_KV_CACHE_MB or reduce prompt length.","type":"insufficient_storage","code":"kv_cache_overflow","prompt_tokens":{}}}}}"#,
+                prompt_len, prompt_len,
             ),
         );
         Python::with_gil(|py| {

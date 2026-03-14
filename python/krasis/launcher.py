@@ -328,7 +328,7 @@ def scan_gguf_files(search_dir: str) -> List[Dict[str, Any]]:
 
 CONFIG_KEYS = [
     "MODEL_PATH", "CFG_SELECTED_GPUS", "CFG_PP_PARTITION", "CFG_LAYER_GROUP_SIZE",
-    "CFG_KV_CACHE_MB", "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS",
+    "CFG_KV_CACHE_MB", "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS", "CFG_CPU_EXPERT_BITS",
     "CFG_ATTENTION_QUANT", "CFG_SHARED_EXPERT_QUANT", "CFG_DENSE_MLP_QUANT",
     "CFG_LM_HEAD_QUANT", "CFG_KRASIS_THREADS", "CFG_HOST", "CFG_PORT",
     "CFG_GPU_PREFILL_THRESHOLD", "CFG_GGUF_PATH", "CFG_VRAM_SAFETY_MARGIN",
@@ -383,6 +383,7 @@ class LauncherConfig:
         self.kv_cache_mb: int = 1000
         self.kv_dtype: str = "fp8_e4m3"
         self.gpu_expert_bits: int = 4
+        self.cpu_expert_bits: int = 4
         self.attention_quant: str = "bf16"
         self.shared_expert_quant: str = "int8"
         self.dense_mlp_quant: str = "int8"
@@ -442,6 +443,11 @@ class LauncherConfig:
                 self.gpu_expert_bits = int(saved["CFG_GPU_EXPERT_BITS"])
             except ValueError:
                 pass
+        if "CFG_CPU_EXPERT_BITS" in saved:
+            try:
+                self.cpu_expert_bits = int(saved["CFG_CPU_EXPERT_BITS"])
+            except ValueError:
+                pass
         if "CFG_ATTENTION_QUANT" in saved:
             val = saved["CFG_ATTENTION_QUANT"]
             # Migrate legacy naive int4/int8 to AWQ (calibrated per-tensor)
@@ -499,6 +505,7 @@ class LauncherConfig:
             "CFG_KV_CACHE_MB": str(self.kv_cache_mb),
             "CFG_KV_DTYPE": self.kv_dtype,
             "CFG_GPU_EXPERT_BITS": str(self.gpu_expert_bits),
+            "CFG_CPU_EXPERT_BITS": str(self.cpu_expert_bits),
             "CFG_ATTENTION_QUANT": self.attention_quant,
             "CFG_SHARED_EXPERT_QUANT": self.shared_expert_quant,
             "CFG_DENSE_MLP_QUANT": self.dense_mlp_quant,

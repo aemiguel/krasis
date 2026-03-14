@@ -758,7 +758,11 @@ class KrasisModel:
                         w = torch.randint(-127, 127, (max_n, max_k), dtype=torch.int8, device=device)
                         _ = torch._int_mm(x, w.t())
             except Exception as e:
-                logger.warning("CUDA warmup (cuBLAS) on %s failed: %s", device, e)
+                raise RuntimeError(
+                    f"CUDA warmup (cuBLAS) on {device} failed: {e}\n"
+                    "cuBLAS is required for INT8 matmuls (attention/gates). "
+                    "Cannot start without working cuBLAS."
+                ) from e
 
             # ── 2. Triton/Marlin JIT Compilation ──
             try:
@@ -809,7 +813,11 @@ class KrasisModel:
                     triton_moe_decode(x, [0,1], [0.5,0.5], w13_std, w13s_std, w2_std, w2s_std, lookup, None, None, self.cfg.swiglu_limit, 1.702, gs)
 
             except Exception as e:
-                logger.warning("CUDA warmup (Triton/Marlin) on %s failed: %s", device, e)
+                raise RuntimeError(
+                    f"CUDA warmup (Triton/Marlin) on {device} failed: {e}\n"
+                    "Marlin kernels are required for expert computation. "
+                    "Cannot start without working Triton/Marlin JIT."
+                ) from e
             
             torch.cuda.synchronize(device)
 
@@ -825,7 +833,11 @@ class KrasisModel:
                     dv=self.cfg.linear_value_head_dim,
                 )
             except Exception as e:
-                logger.warning("Linear attention torch.compile warmup failed: %s", e)
+                raise RuntimeError(
+                    f"Linear attention torch.compile warmup failed: {e}\n"
+                    "Linear attention layers require torch.compile. "
+                    "Cannot start without working compiled LA kernels."
+                ) from e
 
         # ── Clean up and measure ──
         gc.collect()
@@ -2238,23 +2250,11 @@ class KrasisModel:
                 torch.cuda.synchronize(hcs_dev)
                 _xdev_fwd_ms = (time.perf_counter() - _xdev_t1) * 1000
         else:
-            # Fallback: CPU path (should not happen with HCS but be safe)
-            if _DEBUG_DECODE:
-                print(f"[DBG] _xdev FALLBACK CPU path!", file=sys.stderr, flush=True)
-            routed_output = layer._routed_expert_forward(
-                hidden_on_layer_dev, topk_ids, topk_weights, moe_layer_idx,
+            raise RuntimeError(
+                f"HCS manager is None during GPU decode at MoE layer {moe_layer_idx}. "
+                "GPU decode requires HCS to be initialized. This indicates a bug in "
+                "server initialization -- HCS should always be set up before decode starts."
             )
-            # Already on layer_dev, skip transfer back
-            rsf = self.cfg.routed_scaling_factor
-            if rsf != 1.0:
-                routed_output = routed_output * rsf
-            if has_shared:
-                torch.cuda.current_stream(layer_dev).wait_stream(layer._shared_stream)
-                shared_output = layer._se_output if layer._se_graph is not None else shared_output
-                routed_output = routed_output + shared_output
-            elif shared_output is not None:
-                routed_output = routed_output + shared_output
-            return routed_output
 
         if timing:
             torch.cuda.synchronize(hcs_dev)
@@ -2554,9 +2554,10 @@ class KrasisModel:
                         routed_only=True,
                     )
                 else:
-                    # Fallback: CPU path
-                    routed_output = layer._routed_expert_forward(
-                        hidden, topk_ids, topk_weights, moe_layer_idx,
+                    raise RuntimeError(
+                        f"GPU prefill manager is None at MoE layer {moe_layer_idx} on {layer_dev}. "
+                        "GPU prefill requires the prefill manager to be initialized. "
+                        "This indicates a bug in server initialization."
                     )
 
                 # Combine: apply routed scaling + shared expert
@@ -2815,11 +2816,12 @@ class KrasisModel:
                                 else:
                                     manager._init_cuda_graphs()
                                 logger.info("CUDA graphs re-captured after OOM recovery")
-                            except torch.OutOfMemoryError:
-                                logger.warning(
-                                    "Could not re-capture CUDA graphs after OOM recovery "
-                                    "(decode will use non-graphed path)"
-                                )
+                            except torch.OutOfMemoryError as graph_e:
+                                raise RuntimeError(
+                                    "Could not re-capture CUDA graphs after OOM recovery. "
+                                    "Decode requires CUDA graphs for acceptable performance. "
+                                    "Reduce KV cache size or expert cache budget to free VRAM."
+                                ) from graph_e
 
                 return result
             except torch.OutOfMemoryError:
