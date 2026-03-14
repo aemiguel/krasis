@@ -3389,6 +3389,209 @@ extern "C" __global__ void gqa_attention_g_bf16(
     }
 }
 
+// ── FlashDecoding-style tiled GQA for CUDA graph capture ─────────────
+//
+// Replaces the 2-pass gqa_attention_g with a tiled approach that:
+//   1. Reads K cache ONCE per tile (not twice)
+//   2. Uses grid.y = max_tiles for SM utilization (excess tiles early-exit)
+//   3. Reads seq_len from GPU pointer for graph replay compatibility
+//
+// Each block handles one Q head × one KV tile.
+// Output per tile: unnormalised weighted V (FP32), local max, local sum_exp.
+// A reduce kernel merges tiles using log-sum-exp rescaling.
+//
+// Grid: (num_q_heads, max_tiles, 1)   Block: (256, 1, 1)
+// Shared memory: (head_dim + tile_size) * 4 + 128 bytes
+
+extern "C" __global__ void gqa_attention_tiled_g(
+    float* __restrict__ partial_o,     // [num_q_heads, max_tiles, head_dim]
+    float* __restrict__ partial_lse,   // [num_q_heads, max_tiles, 2] (max, sum_exp)
+    const float* __restrict__ q,       // [num_q_heads * head_dim]
+    const __nv_fp8_e4m3* __restrict__ k_cache,  // [max_seq, kv_stride] FP8
+    const __nv_fp8_e4m3* __restrict__ v_cache,  // [max_seq, kv_stride] FP8
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,    // read from GPU pointer
+    int tile_size,
+    int max_tiles
+) {
+    int seq_len = *d_seq_len;
+    int qh = blockIdx.x;
+    int tile_idx = (int)blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (qh >= num_q_heads || tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+
+    const float* q_head = q + qh * head_dim;
+
+    int tile_start = tile_idx * tile_size;
+    int tile_end = tile_start + tile_size;
+    if (tile_end > seq_len) tile_end = seq_len;
+    int tile_len = tile_end - tile_start;
+
+    // Dynamic shared memory layout:
+    //   s_q[0..head_dim-1]:          Q vector preloaded (float)
+    //   smem_scores[0..tile_size-1]: attention scores (float)
+    //   smem_reduce[0..31]:          warp scratch (float)
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
+
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    // Preload Q into shared memory
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    // Step 1: Q·K dot products for this tile (vectorized FP8 loads)
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        float score = 0.0f;
+        const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        for (int d = 0; d < head_dim; d += 16) {
+            uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
+            const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[d + j] * fp8e4m3_to_f32(
+                    *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
+            }
+        }
+        smem_scores[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    // Step 2: Local max (parallel reduction)
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem_scores[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    // Step 3: exp(score - max) in-place, compute local sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    // Step 4: Unnormalised weighted V sum
+    float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int i = 0; i < tile_len; i++) {
+            acc += smem_scores[i] * fp8e4m3_to_f32(
+                v_cache[(tile_start + i) * kv_stride + kv_head * head_dim + d]);
+        }
+        out_partial[d] = acc;
+    }
+
+    // Step 5: Store tile statistics
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * max_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
+    }
+}
+
+// Merge tiled GQA attention partials for CUDA graph capture.
+// Reads seq_len from GPU pointer, computes num_tiles at runtime.
+// Excess blocks early-exit when qh >= num_q_heads.
+//
+// Grid: (num_q_heads, 1, 1)   Block: (256, 1, 1)
+// Shared memory: max_tiles * 4 bytes
+
+extern "C" __global__ void gqa_attention_reduce_g(
+    float* __restrict__ output,            // [num_q_heads * head_dim]
+    const float* __restrict__ partial_o,   // [num_q_heads, max_tiles, head_dim]
+    const float* __restrict__ partial_lse, // [num_q_heads, max_tiles, 2]
+    int num_q_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int tile_size,
+    int max_tiles
+) {
+    int seq_len = *d_seq_len;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    extern __shared__ float smem[];
+    // smem[0..max_tiles-1] = per-tile normalised correction weight
+
+    const float* lse = partial_lse + qh * max_tiles * 2;
+
+    // Thread 0 computes correction weights
+    if (tid == 0) {
+        float global_max = -1e30f;
+        for (int t = 0; t < num_tiles; t++) {
+            global_max = fmaxf(global_max, lse[t * 2]);
+        }
+        float global_sum = 0.0f;
+        for (int t = 0; t < num_tiles; t++) {
+            float correction = expf(lse[t * 2] - global_max);
+            global_sum += correction * lse[t * 2 + 1];
+            smem[t] = correction;
+        }
+        float inv_sum = 1.0f / global_sum;
+        for (int t = 0; t < num_tiles; t++) {
+            smem[t] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    // All threads cooperate on output dimensions
+    const float* po = partial_o + qh * max_tiles * head_dim;
+    float* out = output + qh * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int t = 0; t < num_tiles; t++) {
+            acc += smem[t] * po[t * head_dim + d];
+        }
+        out[d] = acc;
+    }
+}
+
 // ── Simple INT4 GEMV (for draft model) ───────────────────────────────
 //
 // Row-major packed INT4 weights: each byte holds 2 values (low nibble = even col, high nibble = odd col).

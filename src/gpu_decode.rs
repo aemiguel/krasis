@@ -28,6 +28,24 @@ const DECODE_KERNELS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/decode_
 type CUgraph = cuda_sys::CUgraph;
 type CUgraphExec = cuda_sys::CUgraphExec;
 
+/// Extract raw CUfunction handle from cudarc's CudaFunction.
+/// CudaFunction has two pointer-sized fields (CUfunction + Arc<CudaDevice>);
+/// since #[repr(Rust)] doesn't guarantee field order, we try both offsets
+/// and validate via cuFuncGetAttribute.
+fn extract_cu_function(func: &cudarc::driver::CudaFunction) -> cuda_sys::CUfunction {
+    unsafe {
+        let struct_ptr = func as *const _ as *const u8;
+        let word0: cuda_sys::CUfunction = std::ptr::read(struct_ptr as *const _);
+        let mut dummy = 0i32;
+        let w0_valid = cuda_sys::lib().cuFuncGetAttribute(
+            &mut dummy,
+            cuda_sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_NUM_REGS,
+            word0,
+        ) == cuda_sys::CUresult::CUDA_SUCCESS;
+        if w0_valid { word0 } else { std::ptr::read(struct_ptr.add(8) as *const _) }
+    }
+}
+
 /// All kernel function names from decode_kernels.cu.
 const KERNEL_NAMES: &[&str] = &[
     "embedding_lookup",
@@ -87,6 +105,8 @@ const KERNEL_NAMES: &[&str] = &[
     "gated_rmsnorm_silu_bf16",
     "gqa_attention_g_bf16",
     "apply_gated_attn_bf16",
+    "gqa_attention_tiled_g",
+    "gqa_attention_reduce_g",
     "la_fused_post_proj",
     "expert_classify_prepare",
 ];
@@ -206,61 +226,23 @@ impl VramCalibration {
     }
 }
 
-/// Per-layer APFL statistics for adaptive prefetch count.
+/// Per-layer APFL statistics.
 struct ApflLayerStats {
     hits: u64,
     misses: u64,
-    /// Current number of experts to prefetch for this layer's NEXT layer.
-    prefetch_count: usize,
-    /// Window for recent accuracy (last N predictions).
-    recent_hits: u32,
-    recent_total: u32,
 }
 
 impl ApflLayerStats {
-    fn new(initial_prefetch: usize) -> Self {
-        ApflLayerStats {
-            hits: 0,
-            misses: 0,
-            prefetch_count: initial_prefetch,
-            recent_hits: 0,
-            recent_total: 0,
-        }
+    fn new() -> Self {
+        ApflLayerStats { hits: 0, misses: 0 }
     }
 
     fn record_hit(&mut self) {
         self.hits += 1;
-        self.recent_hits += 1;
-        self.recent_total += 1;
     }
 
     fn record_miss(&mut self) {
         self.misses += 1;
-        self.recent_total += 1;
-    }
-
-    /// Adapt prefetch count based on recent hit rate.
-    /// Called after processing a layer's experts.
-    fn adapt(&mut self, max_prefetch: usize) {
-        // Adapt every 8 tokens (enough data to be meaningful)
-        if self.recent_total < 8 {
-            return;
-        }
-
-        let hit_rate = self.recent_hits as f32 / self.recent_total as f32;
-
-        if hit_rate > 0.6 && self.prefetch_count < max_prefetch {
-            // Good predictions → prefetch more
-            self.prefetch_count += 1;
-        } else if hit_rate < 0.3 && self.prefetch_count > 0 {
-            // Bad predictions → prefetch less
-            self.prefetch_count = self.prefetch_count.saturating_sub(1);
-        }
-        // else: keep current count (0.3-0.6 hit rate is the "hold steady" band)
-
-        // Reset window
-        self.recent_hits = 0;
-        self.recent_total = 0;
     }
 
     fn hit_rate(&self) -> f32 {
@@ -276,17 +258,23 @@ impl ApflLayerStats {
 struct ApflState {
     /// Ring buffer of prefetch slots.
     slots: Vec<PrefetchSlot>,
-    /// Per-layer adaptation stats.
+    /// Per-layer stats.
     layer_stats: Vec<ApflLayerStats>,
     /// Global stats.
     total_hits: u64,
     total_misses: u64,
-    /// Maximum experts to prefetch per layer (cap).
-    max_prefetch: usize,
+    /// Fixed number of experts to prefetch per layer.
+    prefetch_count: usize,
     /// Whether APFL is enabled.
     enabled: bool,
     /// Host-side buffer for speculative routing results.
     h_spec_topk_ids: Vec<i32>,
+    /// Deferred spec routing: pending results from previous layer's spec.
+    /// When true, spec_stream has completed GEMV+topk and h_spec_topk_ids
+    /// contains the predicted expert IDs for pending_next_layer.
+    pending_prefetch: bool,
+    pending_next_layer: usize,
+    pending_spec_count: usize,
 }
 
 impl ApflState {
@@ -912,6 +900,9 @@ struct CachedKernels {
     gated_rmsnorm_silu_bf16: cudarc::driver::CudaFunction,
     gqa_attention_g_bf16: cudarc::driver::CudaFunction,
     apply_gated_attn_bf16: cudarc::driver::CudaFunction,
+    // Tiled GQA for CUDA graph capture (reads d_seq_len from GPU pointer)
+    gqa_attention_tiled_g: cudarc::driver::CudaFunction,
+    gqa_attention_reduce_g: cudarc::driver::CudaFunction,
     // Fused LA post-projection: repeat_interleave + l2norm + delta_net + rmsnorm → BF16
     la_fused_post_proj: cudarc::driver::CudaFunction,
     // GPU-side expert classification (eliminates cuStreamSynchronize in route sync)
@@ -1258,6 +1249,16 @@ struct CudaEvent(cuda_sys::CUevent);
 unsafe impl Send for CudaEvent {}
 unsafe impl Sync for CudaEvent {}
 
+/// Wrapper for cublas handle to allow Send+Sync (CUDA handles are thread-safe).
+struct CublasHandle(cublas_sys::cublasHandle_t);
+unsafe impl Send for CublasHandle {}
+unsafe impl Sync for CublasHandle {}
+
+/// Wrapper for CUfunction to allow Send+Sync (CUDA function handles are thread-safe).
+struct CudaFunc(cuda_sys::CUfunction);
+unsafe impl Send for CudaFunc {}
+unsafe impl Sync for CudaFunc {}
+
 struct CudaGraphExecPtr(CUgraphExec);
 unsafe impl Send for CudaGraphExecPtr {}
 unsafe impl Sync for CudaGraphExecPtr {}
@@ -1270,9 +1271,17 @@ pub struct GpuDecodeStore {
     blas: CudaBlas,
     compute_stream: CudaStream,
     copy_stream: CudaStream,
-    /// Dedicated stream for APFL prefetch DMA (Options 1+2).
+    /// Dedicated stream for APFL prefetch DMA.
     /// Runs independently from copy_stream so prefetch can overlap with on-demand DMA.
     prefetch_stream: CudaStream,
+    /// Dedicated stream for APFL speculative routing (gate GEMV + topk).
+    /// Runs independently from default stream so spec routing overlaps with expert loop.
+    spec_stream: CudaStream,
+    /// cuBLAS handle bound to spec_stream for speculative gate GEMV.
+    spec_blas_handle: CublasHandle,
+    /// Raw CUfunction handles for launching topk kernels on spec_stream via cuLaunchKernel.
+    raw_sigmoid_topk: CudaFunc,
+    raw_softmax_topk: CudaFunc,
     graph: Option<Box<GpuDecodeGraph>>,
     kernels_loaded: bool,
     /// Cached Marlin perm table device pointers (set during configure, never change).
@@ -1363,6 +1372,29 @@ impl GpuDecodeStore {
             }
             stream
         };
+
+        let spec_stream = unsafe {
+            let mut stream: cuda_sys::CUstream = std::ptr::null_mut();
+            let err = cuda_sys::lib().cuStreamCreate(
+                &mut stream,
+                cuda_sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Failed to create spec stream: {:?}", err)));
+            }
+            stream
+        };
+
+        // Create a dedicated cuBLAS handle for speculative routing on spec_stream.
+        let spec_blas_handle = cublas_result::create_handle()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to create spec cuBLAS handle: {:?}", e)))?;
+        unsafe {
+            cublas_result::set_stream(spec_blas_handle, spec_stream as cublas_sys::cudaStream_t)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Failed to set spec cuBLAS stream: {:?}", e)))?;
+        }
 
         let mut gqa_smem_limit: u32 = 48 * 1024; // default
 
@@ -1486,7 +1518,7 @@ impl GpuDecodeStore {
 
         let kernels_loaded = cfg!(has_decode_kernels);
 
-        log::info!("GpuDecodeStore: initialized on device {} with compute + copy + prefetch streams",
+        log::info!("GpuDecodeStore: initialized on device {} with compute + copy + prefetch + spec streams",
                    device_ordinal);
 
         Ok(GpuDecodeStore {
@@ -1495,6 +1527,10 @@ impl GpuDecodeStore {
             compute_stream: CudaStream(compute_stream),
             copy_stream: CudaStream(copy_stream),
             prefetch_stream: CudaStream(prefetch_stream),
+            spec_stream: CudaStream(spec_stream),
+            spec_blas_handle: CublasHandle(spec_blas_handle),
+            raw_sigmoid_topk: CudaFunc(std::ptr::null_mut()),
+            raw_softmax_topk: CudaFunc(std::ptr::null_mut()),
             graph: None,
             kernels_loaded,
             perm_inv_weight_int4: 0,
@@ -1886,9 +1922,14 @@ impl GpuDecodeStore {
                 gated_rmsnorm_silu_bf16: get("gated_rmsnorm_silu_bf16")?,
                 gqa_attention_g_bf16: get("gqa_attention_g_bf16")?,
                 apply_gated_attn_bf16: get("apply_gated_attn_bf16")?,
+                gqa_attention_tiled_g: get("gqa_attention_tiled_g")?,
+                gqa_attention_reduce_g: get("gqa_attention_reduce_g")?,
                 la_fused_post_proj: get("la_fused_post_proj")?,
                 expert_classify_prepare: get("expert_classify_prepare")?,
             };
+            // Extract raw CUfunction handles for spec routing on spec_stream.
+            self.raw_sigmoid_topk = CudaFunc(extract_cu_function(&kernels.sigmoid_topk));
+            self.raw_softmax_topk = CudaFunc(extract_cu_function(&kernels.softmax_topk));
             self.graph.as_mut().unwrap().kernels = Some(kernels);
             log::info!("GpuDecodeStore: cached 41 kernel function handles");
         }
@@ -2356,16 +2397,13 @@ impl GpuDecodeStore {
     ///   More slots = more experts can be prefetched simultaneously.
     ///   Typical: 16-32 (costs ~24-48 MB for QCN's 1.5 MB experts).
     ///
-    /// initial_prefetch: starting number of experts to prefetch per layer (APFL adapts this).
+    /// prefetch_count: fixed number of experts to prefetch per layer.
     ///   0 = disabled, N = prefetch top-N predicted experts for next layer.
-    ///
-    /// max_prefetch: cap on adaptive prefetch count (prevents runaway VRAM/PCIe use).
-    #[pyo3(signature = (num_slots=16, initial_prefetch=5, max_prefetch=10))]
+    #[pyo3(signature = (num_slots=16, prefetch_count=1))]
     fn init_apfl(
         &mut self,
         num_slots: usize,
-        initial_prefetch: usize,
-        max_prefetch: usize,
+        prefetch_count: usize,
     ) -> PyResult<()> {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
@@ -2376,12 +2414,21 @@ impl GpuDecodeStore {
         }
 
         // Each slot holds one complete expert: w13_packed + w13_scales + w2_packed + w2_scales.
-        // For QCN: expert_buf_size covers the largest single component (w13_packed or w2_packed).
-        // A full expert needs roughly 4x expert_buf_size (packed+scales for both w13 and w2).
-        // Align to 512 bytes for CUDA async DMA
-        let align = 512usize;
-        let ebs_aligned = (graph.expert_buf_size + align - 1) & !(align - 1);
-        let slot_size = ebs_aligned * 4;
+        // Layout matches the GPU double-buffer (expert_buf_* offsets) so that contiguous
+        // host-to-device DMA works with identical data placement.
+        let slot_size = if graph.expert_buf_total_size > 0 {
+            graph.expert_buf_total_size
+        } else {
+            // Fallback: equal-sized regions (legacy)
+            let align = 512usize;
+            let ebs = (graph.expert_buf_size + align - 1) & !(align - 1);
+            ebs * 4
+        };
+
+        let w13p_off = graph.expert_buf_w13p_offset;
+        let w13s_off = graph.expert_buf_w13s_offset;
+        let w2p_off = graph.expert_buf_w2p_offset;
+        let w2s_off = graph.expert_buf_w2s_offset;
 
         let mut slots = Vec::with_capacity(num_slots);
         for _ in 0..num_slots {
@@ -2399,21 +2446,18 @@ impl GpuDecodeStore {
                 ev
             };
 
-            // Layout: w13_packed | w13_scales | w2_packed | w2_scales
-            // Each region is aligned to 512 bytes for CUDA async DMA.
-            let align = 512usize;
-            let ebs_aligned = (graph.expert_buf_size + align - 1) & !(align - 1);
+            // Layout matches GPU double-buffer for contiguous DMA compatibility
             slots.push(PrefetchSlot {
                 d_buf,
                 buf_size: slot_size,
-                w13_packed_offset: 0,
-                w13_packed_size: ebs_aligned,
-                w13_scales_offset: ebs_aligned,
-                w13_scales_size: ebs_aligned,
-                w2_packed_offset: ebs_aligned * 2,
-                w2_packed_size: ebs_aligned,
-                w2_scales_offset: ebs_aligned * 3,
-                w2_scales_size: ebs_aligned,
+                w13_packed_offset: w13p_off,
+                w13_packed_size: w13s_off - w13p_off,
+                w13_scales_offset: w13s_off,
+                w13_scales_size: w2p_off - w13s_off,
+                w2_packed_offset: w2p_off,
+                w2_packed_size: w2s_off - w2p_off,
+                w2_scales_offset: w2s_off,
+                w2_scales_size: slot_size - w2s_off,
                 layer_idx: -1,
                 expert_idx: -1,
                 dma_event: CudaEvent(event),
@@ -2423,7 +2467,7 @@ impl GpuDecodeStore {
 
         let num_layers = graph.moe_layers.len();
         let layer_stats: Vec<ApflLayerStats> = (0..num_layers)
-            .map(|_| ApflLayerStats::new(initial_prefetch))
+            .map(|_| ApflLayerStats::new())
             .collect();
 
         let topk = graph.moe_layers.iter()
@@ -2437,15 +2481,18 @@ impl GpuDecodeStore {
             layer_stats,
             total_hits: 0,
             total_misses: 0,
-            max_prefetch,
-            enabled: initial_prefetch > 0,
+            prefetch_count,
+            enabled: prefetch_count > 0,
             h_spec_topk_ids: vec![0i32; topk],
+            pending_prefetch: false,
+            pending_next_layer: 0,
+            pending_spec_count: 0,
         });
 
         let total_mb = (slot_size * num_slots) as f64 / (1024.0 * 1024.0);
         log::info!(
-            "APFL: initialized {} slots x {:.1} KB = {:.1} MB VRAM, initial_prefetch={}, max={}",
-            num_slots, slot_size as f64 / 1024.0, total_mb, initial_prefetch, max_prefetch,
+            "APFL: initialized {} slots x {:.1} KB = {:.1} MB VRAM, prefetch_count={}",
+            num_slots, slot_size as f64 / 1024.0, total_mb, prefetch_count,
         );
         Ok(())
     }
@@ -2459,8 +2506,9 @@ impl GpuDecodeStore {
 
         let mut lines = Vec::new();
         lines.push(format!(
-            "APFL: enabled={}, {} slots, total hits={}, misses={}, hit_rate={:.1}%",
-            apfl.enabled, apfl.slots.len(), apfl.total_hits, apfl.total_misses,
+            "APFL: enabled={}, {} slots, prefetch_count={}, total hits={}, misses={}, hit_rate={:.1}%",
+            apfl.enabled, apfl.slots.len(), apfl.prefetch_count,
+            apfl.total_hits, apfl.total_misses,
             if apfl.total_hits + apfl.total_misses > 0 {
                 apfl.total_hits as f64 / (apfl.total_hits + apfl.total_misses) as f64 * 100.0
             } else { 0.0 },
@@ -2469,8 +2517,8 @@ impl GpuDecodeStore {
         for (i, stats) in apfl.layer_stats.iter().enumerate() {
             if stats.hits + stats.misses > 0 {
                 lines.push(format!(
-                    "  Layer {}: prefetch_count={}, hits={}, misses={}, hit_rate={:.1}%",
-                    i, stats.prefetch_count, stats.hits, stats.misses,
+                    "  Layer {}: hits={}, misses={}, hit_rate={:.1}%",
+                    i, stats.hits, stats.misses,
                     stats.hit_rate() * 100.0,
                 ));
             }
@@ -3103,16 +3151,15 @@ impl GpuDecodeStore {
     }
 
     /// Full APFL end-to-end test: load model, set up all layers, test prefetch.
-    #[pyo3(signature = (model_dir, num_tokens=10, initial_prefetch=5, max_prefetch=10, num_slots=16))]
+    #[pyo3(signature = (model_dir, num_tokens=10, prefetch_count=1, num_slots=16))]
     fn test_apfl_e2e_py(
         &mut self,
         model_dir: &str,
         num_tokens: usize,
-        initial_prefetch: usize,
-        max_prefetch: usize,
+        prefetch_count: usize,
         num_slots: usize,
     ) -> PyResult<String> {
-        self.test_apfl_e2e(model_dir, num_tokens, initial_prefetch, max_prefetch, num_slots)
+        self.test_apfl_e2e(model_dir, num_tokens, prefetch_count, num_slots)
     }
 
     // ── HCS: Hot Cache Strategy methods ──
@@ -5652,31 +5699,81 @@ impl GpuDecodeStore {
                             }
                         }
 
-                        // GQA attention
+                        // GQA attention (tiled + reduce for SM utilization + single K read)
                         {
                             let threads = 256u32;
-                            let q_smem = (hd as u32) * 4;       // s_q[head_dim]
-                            let reduce_smem = 32 * 4;            // smem_reduce[num_warps] (256/32=8, pad to 32)
-                            let tile_smem = 4096 * 4;            // smem_weights[GQA_TILE_SIZE]
-                            let shared_mem_bytes = q_smem + reduce_smem + tile_smem;
-                            unsafe {
-                                k.gqa_attention_g.clone().launch(
-                                    LaunchConfig {
-                                        grid_dim: (nh as u32, 1, 1),
-                                        block_dim: (threads, 1, 1),
-                                        shared_mem_bytes,
-                                    },
-                                    (
-                                        *graph.d_gqa_out.device_ptr(),
-                                        *graph.d_gqa_q.device_ptr(),
-                                        graph.kv_k_ptrs[layer_idx],
-                                        graph.kv_v_ptrs[layer_idx],
-                                        *sm_scale,
-                                        nh as i32, nkv as i32, hd as i32,
-                                        d_seq_len_ptr,
-                                        graph.kv_max_seq as i32,
-                                    ),
-                                ).map_err(|e| format!("gqa_attention_g[{}]: {:?}", layer_idx, e))?;
+                            let tile_size = graph.gqa_tile_size;
+                            let max_tiles = graph.gqa_max_tiles;
+
+                            if tile_size > 0 && max_tiles > 0 && graph.d_gqa_tiled_o.is_some() {
+                                // Tiled path: grid.y = max_tiles, excess tiles early-exit
+                                let tiled_o = graph.d_gqa_tiled_o.as_ref().unwrap();
+                                let tiled_lse = graph.d_gqa_tiled_lse.as_ref().unwrap();
+                                let tile_smem = ((tile_size + hd) as u32) * 4 + 128;
+                                unsafe {
+                                    k.gqa_attention_tiled_g.clone().launch(
+                                        LaunchConfig {
+                                            grid_dim: (nh as u32, max_tiles as u32, 1),
+                                            block_dim: (threads, 1, 1),
+                                            shared_mem_bytes: tile_smem,
+                                        },
+                                        (
+                                            *tiled_o.device_ptr(),
+                                            *tiled_lse.device_ptr(),
+                                            *graph.d_gqa_q.device_ptr(),
+                                            graph.kv_k_ptrs[layer_idx],
+                                            graph.kv_v_ptrs[layer_idx],
+                                            *sm_scale,
+                                            nh as i32, nkv as i32, hd as i32,
+                                            d_seq_len_ptr,
+                                            tile_size as i32,
+                                            max_tiles as i32,
+                                        ),
+                                    ).map_err(|e| format!("gqa_attention_tiled_g[{}]: {:?}", layer_idx, e))?;
+
+                                    let reduce_smem = (max_tiles as u32) * 4;
+                                    k.gqa_attention_reduce_g.clone().launch(
+                                        LaunchConfig {
+                                            grid_dim: (nh as u32, 1, 1),
+                                            block_dim: (threads, 1, 1),
+                                            shared_mem_bytes: reduce_smem,
+                                        },
+                                        (
+                                            *graph.d_gqa_out.device_ptr(),
+                                            *tiled_o.device_ptr(),
+                                            *tiled_lse.device_ptr(),
+                                            nh as i32, hd as i32,
+                                            d_seq_len_ptr,
+                                            tile_size as i32,
+                                            max_tiles as i32,
+                                        ),
+                                    ).map_err(|e| format!("gqa_attention_reduce_g[{}]: {:?}", layer_idx, e))?;
+                                }
+                            } else {
+                                // Fallback: single-block 2-pass kernel
+                                let q_smem = (hd as u32) * 4;
+                                let reduce_smem = 32 * 4;
+                                let tile_smem = 4096 * 4;
+                                let shared_mem_bytes = q_smem + reduce_smem + tile_smem;
+                                unsafe {
+                                    k.gqa_attention_g.clone().launch(
+                                        LaunchConfig {
+                                            grid_dim: (nh as u32, 1, 1),
+                                            block_dim: (threads, 1, 1),
+                                            shared_mem_bytes,
+                                        },
+                                        (
+                                            *graph.d_gqa_out.device_ptr(),
+                                            *graph.d_gqa_q.device_ptr(),
+                                            graph.kv_k_ptrs[layer_idx],
+                                            graph.kv_v_ptrs[layer_idx],
+                                            *sm_scale,
+                                            nh as i32, nkv as i32, hd as i32,
+                                            d_seq_len_ptr,
+                                            graph.kv_max_seq as i32,
+                                        ),
+                                    ).map_err(|e| format!("gqa_attention_g[{}]: {:?}", layer_idx, e))?;
+                                }
                             }
                         }
 
@@ -9051,18 +9148,24 @@ impl GpuDecodeStore {
 
                 unsafe {
                     let base = buf_base[slot];
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        base + w13p_off as u64, expert.w13_packed_ptr as *const std::ffi::c_void,
-                        expert.w13_packed_bytes, copy_stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        base + w13s_off as u64, expert.w13_scales_ptr as *const std::ffi::c_void,
-                        expert.w13_scales_bytes, copy_stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        base + w2p_off as u64, expert.w2_packed_ptr as *const std::ffi::c_void,
-                        expert.w2_packed_bytes, copy_stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        base + w2s_off as u64, expert.w2_scales_ptr as *const std::ffi::c_void,
-                        expert.w2_scales_bytes, copy_stream);
+                    if expert.contiguous_ptr != 0 {
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            base, expert.contiguous_ptr as *const std::ffi::c_void,
+                            expert.contiguous_bytes, copy_stream);
+                    } else {
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            base + w13p_off as u64, expert.w13_packed_ptr as *const std::ffi::c_void,
+                            expert.w13_packed_bytes, copy_stream);
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            base + w13s_off as u64, expert.w13_scales_ptr as *const std::ffi::c_void,
+                            expert.w13_scales_bytes, copy_stream);
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            base + w2p_off as u64, expert.w2_packed_ptr as *const std::ffi::c_void,
+                            expert.w2_packed_bytes, copy_stream);
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            base + w2s_off as u64, expert.w2_scales_ptr as *const std::ffi::c_void,
+                            expert.w2_scales_bytes, copy_stream);
+                    }
                     cuda_sys::lib().cuEventRecord(ev_dma[slot], copy_stream);
                     cuda_sys::lib().cuStreamWaitEvent(default_stream, ev_dma[slot], 0);
                 }
@@ -11664,19 +11767,121 @@ impl GpuDecodeStore {
         }
         if timing { graph.t_moe_d2h_topk += (Instant::now() - t_d2h_start).as_secs_f64(); }
 
-        // ── Step 4.5: Early speculative routing for NEXT layer (Options 1+2) ──
+        // ── Step 4.5a: Process PENDING spec results from previous layer ──
         //
-        // CRITICAL CHANGE: speculative routing runs HERE, immediately after
-        // current routing. This gives the prefetch DMAs maximum time to complete
-        // by overlapping with ALL of the current layer's expert compute.
-        //
-        // The speculative GEMV + topk run on the default stream. D2H is async.
-        // Prefetch DMAs run on the dedicated prefetch_stream (not copy_stream),
-        // so they don't interfere with on-demand expert DMA.
+        // The previous layer's moe_forward queued spec GEMV+topk on spec_stream.
+        // That work has been executing in parallel with everything since then
+        // (residual add, attention, norm). Now sync spec_stream, D2H the topk
+        // IDs, and queue prefetch DMAs so Phase 1 can find them.
         let apfl_enabled = graph.apfl.as_ref().map_or(false, |a| a.enabled);
-        let mut prefetch_queued = false;
         let t_apfl_start = Instant::now();
 
+        if apfl_enabled {
+            let apfl = graph.apfl.as_mut().unwrap();
+            if apfl.pending_prefetch {
+                let pending_layer = apfl.pending_next_layer;
+                let pending_count = apfl.pending_spec_count;
+                apfl.pending_prefetch = false;
+
+                // Sync spec_stream — should be long done (spec work is ~0.02ms,
+                // and we've had the entire previous layer's expert loop + attention
+                // + norm since it was queued).
+                unsafe {
+                    let err = cuda_sys::lib().cuStreamSynchronize(self.spec_stream.0);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            format!("APFL spec_stream sync: {:?}", err)));
+                    }
+                }
+
+                // D2H: speculative topk indices (spec_stream is done, data is valid)
+                if apfl.h_spec_topk_ids.len() < pending_count {
+                    apfl.h_spec_topk_ids.resize(pending_count, 0);
+                }
+                unsafe {
+                    let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                        apfl.h_spec_topk_ids.as_mut_ptr() as *mut std::ffi::c_void,
+                        *graph.d_topk_indices.device_ptr(),
+                        pending_count * 4);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            format!("APFL D2H spec_topk: {:?}", err)));
+                    }
+                }
+
+                // Queue prefetch DMAs for the predicted experts
+                if pending_layer < graph.moe_layers.len() {
+                    if let Some(ref next_moe) = graph.moe_layers[pending_layer] {
+                        let next_experts = &next_moe.experts;
+                        for s in 0..pending_count {
+                            let pred_eid = apfl.h_spec_topk_ids[s];
+                            if pred_eid < 0 || pred_eid as usize >= next_experts.len() { continue; }
+                            let pred_eid = pred_eid as usize;
+
+                            if apfl.find_slot(pending_layer, pred_eid).is_some() { continue; }
+
+                            if let Some(ref hcs) = graph.hcs {
+                                if hcs.get_fast(pending_layer, pred_eid).is_some() { continue; }
+                            }
+
+                            let slot_idx = apfl.find_evict_slot(layer_idx);
+                            let slot = &mut apfl.slots[slot_idx];
+                            let pred_expert = &next_experts[pred_eid];
+                            let slot_base = *slot.d_buf.device_ptr();
+
+                            unsafe {
+                                if pred_expert.contiguous_ptr != 0 {
+                                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                        slot_base, pred_expert.contiguous_ptr as *const std::ffi::c_void,
+                                        pred_expert.contiguous_bytes, prefetch_stream);
+                                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                        log::warn!("APFL DMA contiguous[{}] failed: {:?}", pred_eid, err);
+                                        continue;
+                                    }
+                                } else {
+                                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                        slot_base + slot.w13_packed_offset as u64,
+                                        pred_expert.w13_packed_ptr as *const std::ffi::c_void,
+                                        pred_expert.w13_packed_bytes, prefetch_stream);
+                                    if err != cuda_sys::CUresult::CUDA_SUCCESS { continue; }
+                                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                        slot_base + slot.w13_scales_offset as u64,
+                                        pred_expert.w13_scales_ptr as *const std::ffi::c_void,
+                                        pred_expert.w13_scales_bytes, prefetch_stream);
+                                    if err != cuda_sys::CUresult::CUDA_SUCCESS { continue; }
+                                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                        slot_base + slot.w2_packed_offset as u64,
+                                        pred_expert.w2_packed_ptr as *const std::ffi::c_void,
+                                        pred_expert.w2_packed_bytes, prefetch_stream);
+                                    if err != cuda_sys::CUresult::CUDA_SUCCESS { continue; }
+                                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                        slot_base + slot.w2_scales_offset as u64,
+                                        pred_expert.w2_scales_ptr as *const std::ffi::c_void,
+                                        pred_expert.w2_scales_bytes, prefetch_stream);
+                                    if err != cuda_sys::CUresult::CUDA_SUCCESS { continue; }
+                                }
+                                cuda_sys::lib().cuEventRecord(slot.dma_event.0, prefetch_stream);
+                            }
+
+                            slot.layer_idx = pending_layer as i32;
+                            slot.expert_idx = pred_eid as i32;
+                            slot.dma_queued = true;
+                            slot.w13_packed_size = pred_expert.w13_packed_bytes;
+                            slot.w13_scales_size = pred_expert.w13_scales_bytes;
+                            slot.w2_packed_size = pred_expert.w2_packed_bytes;
+                            slot.w2_scales_size = pred_expert.w2_scales_bytes;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Step 4.5b: Queue speculative routing for NEXT layer on spec_stream ──
+        //
+        // Spec GEMV + topk run on the dedicated spec_stream with its own cuBLAS
+        // handle. This is non-blocking: the GPU executes spec work on spec_stream
+        // in parallel with the expert loop on the default stream. Results are
+        // consumed at the start of the NEXT layer's moe_forward call.
         if apfl_enabled {
             let next_layer = layer_idx + 1;
             let has_next = next_layer < graph.moe_layers.len()
@@ -11691,13 +11896,11 @@ impl GpuDecodeStore {
                 let next_gate_bias = next_moe.gate_bias_ptr;
                 let next_e_score_corr = next_moe.e_score_corr_ptr;
 
-                let prefetch_count = graph.apfl.as_ref().unwrap()
-                    .layer_stats.get(layer_idx)
-                    .map_or(5, |s| s.prefetch_count);
+                let prefetch_count = graph.apfl.as_ref().unwrap().prefetch_count;
+                let spec_topk = prefetch_count.min(next_topk * 2).min(graph.max_experts_per_tok);
 
-                if prefetch_count > 0 {
-                    // Speculative gate GEMV for next layer (BF16 gate × BF16 hidden → FP32).
-                    // Matches the main routing path.
+                if spec_topk > 0 {
+                    // Spec gate GEMV on spec_stream (via dedicated cuBLAS handle).
                     let output_ptr = unsafe {
                         (*graph.d_fp32_scratch.device_ptr() as *const f32).add(hs) as u64
                     };
@@ -11707,7 +11910,7 @@ impl GpuDecodeStore {
                         let beta: f32 = 0.0;
                         unsafe {
                             cublas_result::gemm_ex(
-                                *self.blas.handle(),
+                                self.spec_blas_handle.0,
                                 cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                                 cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                                 w.rows as i32, 1, w.cols as i32,
@@ -11725,133 +11928,71 @@ impl GpuDecodeStore {
                         }
                     }
 
-                    // Speculative topk. We write to d_topk_indices/weights (safe: current
-                    // layer's routing results are already in h_topk_ids/weights on CPU).
-                    let spec_logits_ptr = unsafe {
-                        (*graph.d_fp32_scratch.device_ptr() as *const f32).add(hs) as u64
-                    };
-                    let spec_topk = prefetch_count.min(next_topk * 2);
-                    {
-                        let smem = (next_ne as u32) * 4;
-                        let cfg = LaunchConfig {
-                            grid_dim: (1, 1, 1),
-                            block_dim: (1, 1, 1),
-                            shared_mem_bytes: smem,
-                        };
+                    // Spec topk on spec_stream via raw cuLaunchKernel.
+                    let spec_logits_ptr = output_ptr;
+                    let smem = (next_ne as u32) * 4;
+                    let spec_stream_raw = self.spec_stream.0;
+                    unsafe {
                         if next_sf == 1 {
-                            unsafe {
-                                k.sigmoid_topk.clone().launch(cfg, (
-                                    spec_logits_ptr,
-                                    next_gate_bias,
-                                    next_e_score_corr,
-                                    *graph.d_topk_indices.device_ptr(),
-                                    *graph.d_topk_weights.device_ptr(),
-                                    next_ne as i32,
-                                    spec_topk as i32,
-                                )).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                                    format!("APFL spec sigmoid_topk: {:?}", e)))?;
+                            let mut p0 = spec_logits_ptr;
+                            let mut p1 = next_gate_bias;
+                            let mut p2 = next_e_score_corr;
+                            let mut p3 = *graph.d_topk_indices.device_ptr();
+                            let mut p4 = *graph.d_topk_weights.device_ptr();
+                            let mut p5 = next_ne as i32;
+                            let mut p6 = spec_topk as i32;
+                            let mut params: [*mut std::ffi::c_void; 7] = [
+                                &mut p0 as *mut _ as *mut std::ffi::c_void,
+                                &mut p1 as *mut _ as *mut std::ffi::c_void,
+                                &mut p2 as *mut _ as *mut std::ffi::c_void,
+                                &mut p3 as *mut _ as *mut std::ffi::c_void,
+                                &mut p4 as *mut _ as *mut std::ffi::c_void,
+                                &mut p5 as *mut _ as *mut std::ffi::c_void,
+                                &mut p6 as *mut _ as *mut std::ffi::c_void,
+                            ];
+                            let err = cuda_sys::lib().cuLaunchKernel(
+                                self.raw_sigmoid_topk.0,
+                                1, 1, 1, 1, 1, 1, smem,
+                                spec_stream_raw,
+                                params.as_mut_ptr(),
+                                std::ptr::null_mut(),
+                            );
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!("APFL spec sigmoid_topk launch: {:?}", err)));
                             }
                         } else {
-                            unsafe {
-                                k.softmax_topk.clone().launch(cfg, (
-                                    spec_logits_ptr,
-                                    *graph.d_topk_indices.device_ptr(),
-                                    *graph.d_topk_weights.device_ptr(),
-                                    next_ne as i32,
-                                    spec_topk as i32,
-                                )).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                                    format!("APFL spec softmax_topk: {:?}", e)))?;
+                            let mut p0 = spec_logits_ptr;
+                            let mut p1 = *graph.d_topk_indices.device_ptr();
+                            let mut p2 = *graph.d_topk_weights.device_ptr();
+                            let mut p3 = next_ne as i32;
+                            let mut p4 = spec_topk as i32;
+                            let mut params: [*mut std::ffi::c_void; 5] = [
+                                &mut p0 as *mut _ as *mut std::ffi::c_void,
+                                &mut p1 as *mut _ as *mut std::ffi::c_void,
+                                &mut p2 as *mut _ as *mut std::ffi::c_void,
+                                &mut p3 as *mut _ as *mut std::ffi::c_void,
+                                &mut p4 as *mut _ as *mut std::ffi::c_void,
+                            ];
+                            let err = cuda_sys::lib().cuLaunchKernel(
+                                self.raw_softmax_topk.0,
+                                1, 1, 1, 1, 1, 1, smem,
+                                spec_stream_raw,
+                                params.as_mut_ptr(),
+                                std::ptr::null_mut(),
+                            );
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!("APFL spec softmax_topk launch: {:?}", err)));
                             }
                         }
                     }
 
-                    // Sync ONLY the speculative compute (not the whole device).
-                    // This is fast since the GEMV + topk are tiny kernels (~10us total).
-                    device.synchronize()
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
-
-                    // D2H: speculative topk indices
+                    // Mark pending — results consumed at start of next layer's moe_forward
                     let apfl = graph.apfl.as_mut().unwrap();
-                    if apfl.h_spec_topk_ids.len() < spec_topk {
-                        apfl.h_spec_topk_ids.resize(spec_topk, 0);
-                    }
-                    unsafe {
-                        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
-                            apfl.h_spec_topk_ids.as_mut_ptr() as *mut std::ffi::c_void,
-                            *graph.d_topk_indices.device_ptr(),
-                            spec_topk * 4);
-                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                format!("APFL D2H spec_topk: {:?}", err)));
-                        }
-                    }
-
-                    // Queue prefetch DMAs on the DEDICATED prefetch_stream.
-                    // This is the key difference from old Step 9: prefetch_stream
-                    // runs independently from copy_stream, so these DMAs overlap
-                    // with the current layer's on-demand expert DMAs.
-                    let next_experts = &graph.moe_layers[next_layer].as_ref().unwrap().experts;
-                    for s in 0..spec_topk {
-                        let pred_eid = apfl.h_spec_topk_ids[s];
-                        if pred_eid < 0 || pred_eid as usize >= next_experts.len() { continue; }
-                        let pred_eid = pred_eid as usize;
-
-                        if apfl.find_slot(next_layer, pred_eid).is_some() { continue; }
-
-                        let slot_idx = apfl.find_evict_slot(layer_idx);
-                        let slot = &mut apfl.slots[slot_idx];
-                        let pred_expert = &next_experts[pred_eid];
-
-                        let slot_base = *slot.d_buf.device_ptr();
-
-                        unsafe {
-                            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                slot_base + slot.w13_packed_offset as u64,
-                                pred_expert.w13_packed_ptr as *const std::ffi::c_void,
-                                pred_expert.w13_packed_bytes, prefetch_stream);
-                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                                log::warn!("APFL DMA w13p[{}] failed: {:?}", pred_eid, err);
-                                continue;
-                            }
-                            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                slot_base + slot.w13_scales_offset as u64,
-                                pred_expert.w13_scales_ptr as *const std::ffi::c_void,
-                                pred_expert.w13_scales_bytes, prefetch_stream);
-                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                                log::warn!("APFL DMA w13s[{}] failed: {:?}", pred_eid, err);
-                                continue;
-                            }
-                            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                slot_base + slot.w2_packed_offset as u64,
-                                pred_expert.w2_packed_ptr as *const std::ffi::c_void,
-                                pred_expert.w2_packed_bytes, prefetch_stream);
-                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                                log::warn!("APFL DMA w2p[{}] failed: {:?}", pred_eid, err);
-                                continue;
-                            }
-                            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                slot_base + slot.w2_scales_offset as u64,
-                                pred_expert.w2_scales_ptr as *const std::ffi::c_void,
-                                pred_expert.w2_scales_bytes, prefetch_stream);
-                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                                log::warn!("APFL DMA w2s[{}] failed: {:?}", pred_eid, err);
-                                continue;
-                            }
-
-                            // Record event on prefetch_stream (not copy_stream!)
-                            cuda_sys::lib().cuEventRecord(slot.dma_event.0, prefetch_stream);
-                        }
-
-                        slot.layer_idx = next_layer as i32;
-                        slot.expert_idx = pred_eid as i32;
-                        slot.dma_queued = true;
-
-                        slot.w13_packed_size = pred_expert.w13_packed_bytes;
-                        slot.w13_scales_size = pred_expert.w13_scales_bytes;
-                        slot.w2_packed_size = pred_expert.w2_packed_bytes;
-                        slot.w2_scales_size = pred_expert.w2_scales_bytes;
-                    }
-                    prefetch_queued = true;
+                    apfl.pending_prefetch = true;
+                    apfl.pending_next_layer = next_layer;
+                    apfl.pending_spec_count = spec_topk;
                 }
             }
         }
@@ -11966,9 +12107,52 @@ impl GpuDecodeStore {
                     graph.dma_hcs_experts += 1;
                 }
             } else {
-                if dma_count < 10 {
-                    dma_experts[dma_count] = (i, weight);
-                    dma_count += 1;
+                // Check APFL slots before marking as cold (DMA-needed).
+                // APFL prefetches for this layer were queued by the previous layer's processing.
+                // The device.synchronize() above guarantees those DMAs are complete.
+                let apfl_ptrs = if let Some(ref apfl) = graph.apfl {
+                    if apfl.enabled {
+                        apfl.find_slot(layer_idx, eid).and_then(|slot_idx| {
+                            let slot = &apfl.slots[slot_idx];
+                            if slot.dma_queued {
+                                // Verify DMA is complete (should always be true after device sync)
+                                let result = unsafe {
+                                    cuda_sys::lib().cuEventQuery(slot.dma_event.0)
+                                };
+                                if result == cuda_sys::CUresult::CUDA_SUCCESS {
+                                    Some((slot.w13_packed_ptr(), slot.w13_scales_ptr(),
+                                          slot.w2_packed_ptr(), slot.w2_scales_ptr()))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some((w13p, w13s, w2p, w2s)) = apfl_ptrs {
+                    // APFL hit: expert is already in VRAM from speculative prefetch
+                    if hcs_batch_count < graph.max_experts_per_tok {
+                        graph.h_batch_w13_packed_ptrs[hcs_batch_count] = w13p;
+                        graph.h_batch_w13_scales_ptrs[hcs_batch_count] = w13s;
+                        graph.h_batch_w2_packed_ptrs[hcs_batch_count] = w2p;
+                        graph.h_batch_w2_scales_ptrs[hcs_batch_count] = w2s;
+                        graph.h_batch_weights[hcs_batch_count] = weight;
+                        hcs_batch_count += 1;
+                        apfl_hits += 1;
+                    }
+                } else {
+                    // Cold expert: needs DMA from CPU RAM
+                    if dma_count < 10 {
+                        dma_experts[dma_count] = (i, weight);
+                        dma_count += 1;
+                    }
                 }
             }
         }
@@ -12158,7 +12342,7 @@ impl GpuDecodeStore {
                     let dma_bytes = expert.w13_packed_bytes + expert.w13_scales_bytes
                                   + expert.w2_packed_bytes + expert.w2_scales_bytes;
                     graph.dma_bytes_total += dma_bytes as u64;
-                    graph.dma_call_count += 4;
+                    graph.dma_call_count += if expert.contiguous_ptr != 0 { 1 } else { 4 };
                 }
 
                 let slot = (dma_expert_count % 2) as usize;
@@ -12170,36 +12354,48 @@ impl GpuDecodeStore {
                     }
                 }
 
-                // DMA all 4 weight arrays to contiguous buffer[slot]
                 unsafe {
                     let base = buf_base[slot];
-                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        base + w13p_off as u64, expert.w13_packed_ptr as *const std::ffi::c_void,
-                        expert.w13_packed_bytes, copy_stream);
-                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                            format!("DMA w13p[{}]: {:?}", eid, err)));
-                    }
-                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        base + w13s_off as u64, expert.w13_scales_ptr as *const std::ffi::c_void,
-                        expert.w13_scales_bytes, copy_stream);
-                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                            format!("DMA w13s[{}]: {:?}", eid, err)));
-                    }
-                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        base + w2p_off as u64, expert.w2_packed_ptr as *const std::ffi::c_void,
-                        expert.w2_packed_bytes, copy_stream);
-                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                            format!("DMA w2p[{}]: {:?}", eid, err)));
-                    }
-                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        base + w2s_off as u64, expert.w2_scales_ptr as *const std::ffi::c_void,
-                        expert.w2_scales_bytes, copy_stream);
-                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                            format!("DMA w2s[{}]: {:?}", eid, err)));
+                    if expert.contiguous_ptr != 0 {
+                        // Single-call DMA: host contiguous buffer → GPU contiguous buffer
+                        // Both use identical layout (256-byte aligned components).
+                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            base, expert.contiguous_ptr as *const std::ffi::c_void,
+                            expert.contiguous_bytes, copy_stream);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                format!("DMA contiguous[{}]: {:?}", eid, err)));
+                        }
+                    } else {
+                        // Fallback: 4 separate DMA calls
+                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            base + w13p_off as u64, expert.w13_packed_ptr as *const std::ffi::c_void,
+                            expert.w13_packed_bytes, copy_stream);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                format!("DMA w13p[{}]: {:?}", eid, err)));
+                        }
+                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            base + w13s_off as u64, expert.w13_scales_ptr as *const std::ffi::c_void,
+                            expert.w13_scales_bytes, copy_stream);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                format!("DMA w13s[{}]: {:?}", eid, err)));
+                        }
+                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            base + w2p_off as u64, expert.w2_packed_ptr as *const std::ffi::c_void,
+                            expert.w2_packed_bytes, copy_stream);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                format!("DMA w2p[{}]: {:?}", eid, err)));
+                        }
+                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            base + w2s_off as u64, expert.w2_scales_ptr as *const std::ffi::c_void,
+                            expert.w2_scales_bytes, copy_stream);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                format!("DMA w2s[{}]: {:?}", eid, err)));
+                        }
                     }
                     cuda_sys::lib().cuEventRecord(ev_dma[slot], copy_stream);
                 }
@@ -12540,7 +12736,6 @@ impl GpuDecodeStore {
                 let stats = &mut apfl.layer_stats[layer_idx];
                 for _ in 0..apfl_hits { stats.record_hit(); }
                 for _ in 0..apfl_misses { stats.record_miss(); }
-                stats.adapt(apfl.max_prefetch);
             }
 
             // Invalidate slots for this layer (already consumed)
@@ -12833,6 +13028,19 @@ impl GpuDecodeStore {
                 config.routed_scaling_factor, gate_wid, gate_bias_ptr as usize,
                 0, None,
             )?;
+
+            // Set contiguous_ptr on ExpertDataPtrs for experts with contiguous backing.
+            // This enables single-call DMA (1 cuMemcpyHtoDAsync instead of 4 per expert).
+            if let Some(ref mut graph) = self.graph {
+                if let Some(ref mut moe_layer) = graph.moe_layers[abs_layer_idx] {
+                    for (eidx, expert) in gpu_experts.iter().enumerate() {
+                        if let Some(ref backing) = expert.contiguous_backing {
+                            moe_layer.experts[eidx].contiguous_ptr = backing.as_ptr() as usize;
+                            moe_layer.experts[eidx].contiguous_bytes = backing.len();
+                        }
+                    }
+                }
+            }
         }
 
         // Step 3: size expert DMA buffers (need to hold largest packed + scales)
@@ -12854,30 +13062,51 @@ impl GpuDecodeStore {
         for moe_idx in 0..n_moe_layers {
             let gpu_experts = &store.experts_gpu[moe_idx];
             for expert in gpu_experts.iter() {
-                // Pin each weight buffer (w13_packed, w13_scales, w2_packed, w2_scales)
-                let regions: [(usize, usize); 4] = [
-                    (expert.w13_packed.as_ptr() as usize, expert.w13_packed.len() * 4),
-                    (expert.w13_scales.as_ptr() as usize, expert.w13_scales.len() * 2),
-                    (expert.w2_packed.as_ptr() as usize, expert.w2_packed.len() * 4),
-                    (expert.w2_scales.as_ptr() as usize, expert.w2_scales.len() * 2),
-                ];
-                for (ptr, size) in regions {
-                    if size == 0 { continue; }
+                if let Some(ref backing) = expert.contiguous_backing {
+                    // Pin contiguous backing buffer (1 call instead of 4)
                     let err = unsafe {
                         cuda_sys::lib().cuMemHostRegister_v2(
-                            ptr as *mut std::ffi::c_void,
-                            size,
+                            backing.as_ptr() as *mut std::ffi::c_void,
+                            backing.len(),
                             0, // CU_MEMHOSTREGISTER_DEFAULT
                         )
                     };
                     if err == cuda_sys::CUresult::CUDA_SUCCESS {
                         pinned_regions += 1;
-                        pinned_bytes += size;
+                        pinned_bytes += backing.len();
                     } else {
                         pin_failures += 1;
                         if pin_failures == 1 {
                             log::warn!("First pin failure at moe_idx={}: {:?} (size={})",
-                                moe_idx, err, size);
+                                moe_idx, err, backing.len());
+                        }
+                    }
+                } else {
+                    // Fallback: pin each weight buffer separately (4 calls)
+                    let regions: [(usize, usize); 4] = [
+                        (expert.w13_packed.as_ptr() as usize, expert.w13_packed.len() * 4),
+                        (expert.w13_scales.as_ptr() as usize, expert.w13_scales.len() * 2),
+                        (expert.w2_packed.as_ptr() as usize, expert.w2_packed.len() * 4),
+                        (expert.w2_scales.as_ptr() as usize, expert.w2_scales.len() * 2),
+                    ];
+                    for (ptr, size) in regions {
+                        if size == 0 { continue; }
+                        let err = unsafe {
+                            cuda_sys::lib().cuMemHostRegister_v2(
+                                ptr as *mut std::ffi::c_void,
+                                size,
+                                0, // CU_MEMHOSTREGISTER_DEFAULT
+                            )
+                        };
+                        if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                            pinned_regions += 1;
+                            pinned_bytes += size;
+                        } else {
+                            pin_failures += 1;
+                            if pin_failures == 1 {
+                                log::warn!("First pin failure at moe_idx={}: {:?} (size={})",
+                                    moe_idx, err, size);
+                            }
                         }
                     }
                 }
@@ -12916,6 +13145,24 @@ impl GpuDecodeStore {
             pinned_regions, pinned_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             pin_elapsed, pin_failures,
         );
+
+        // Initialize APFL (speculative prefetch) if requested via env var.
+        // KRASIS_APFL_PREFETCH=N (default 0 = disabled). N = number of experts
+        // to speculatively prefetch per layer. Spec routing runs on dedicated
+        // spec_stream with its own cuBLAS handle, so it overlaps with the expert loop.
+        let apfl_prefetch = std::env::var("KRASIS_APFL_PREFETCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if apfl_prefetch > 0 {
+            // Slots = 2x prefetch_count * layers per decode pass. For prefetch_count=1
+            // with 48 MoE layers, 16 slots is plenty (we only need 1 per layer max,
+            // and slots are evicted after consumption).
+            let num_slots = (apfl_prefetch * 4).max(16);
+            self.init_apfl(num_slots, apfl_prefetch)?;
+        } else {
+            log::info!("APFL: disabled (set KRASIS_APFL_PREFETCH=1..4 to enable)");
+        }
 
         log::info!(
             "setup_from_engine complete: {} MoE layers, expert_buf={}KB, scaling_factor={}",
@@ -13117,8 +13364,7 @@ impl GpuDecodeStore {
         &mut self,
         model_dir: &str,
         num_tokens: usize,
-        initial_prefetch: usize,
-        max_prefetch: usize,
+        prefetch_count: usize,
         num_slots: usize,
     ) -> PyResult<String> {
         use crate::weights::marlin::bf16_to_f32;
@@ -13227,7 +13473,7 @@ impl GpuDecodeStore {
         ));
 
         // Init APFL
-        self.init_apfl(num_slots, initial_prefetch, max_prefetch)?;
+        self.init_apfl(num_slots, prefetch_count)?;
 
         // Run tokens
         let hs = hidden_size;
@@ -13267,22 +13513,6 @@ impl GpuDecodeStore {
         results.push(String::new());
         results.push(self.apfl_stats()?);
 
-        let graph = self.graph.as_ref().unwrap();
-        let apfl = graph.apfl.as_ref().unwrap();
-        let adapted: Vec<_> = apfl.layer_stats.iter().enumerate()
-            .filter(|(_, s)| s.hits + s.misses > 0)
-            .map(|(i, s)| (i, s.prefetch_count))
-            .collect();
-        if !adapted.is_empty() {
-            let min_pc = adapted.iter().map(|c| c.1).min().unwrap();
-            let max_pc = adapted.iter().map(|c| c.1).max().unwrap();
-            let avg_pc = adapted.iter().map(|c| c.1).sum::<usize>() as f64 / adapted.len() as f64;
-            results.push(format!(
-                "Adapted prefetch: min={}, max={}, avg={:.1} across {} layers",
-                min_pc, max_pc, avg_pc, adapted.len(),
-            ));
-        }
-
         std::mem::forget(store);
         Ok(results.join("\n"))
     }
@@ -13309,8 +13539,8 @@ impl GpuDecodeStore {
             let num_moe_layers = graph.moe_layers.iter().filter(|m| m.is_some()).count();
             let apfl = graph.apfl.as_ref().unwrap();
             results.push(format!(
-                "Testing: {} MoE layers, hidden={}, APFL slots={}, max_prefetch={}",
-                num_moe_layers, hs, apfl.slots.len(), apfl.max_prefetch,
+                "Testing: {} MoE layers, hidden={}, APFL slots={}, prefetch_count={}",
+                num_moe_layers, hs, apfl.slots.len(), apfl.prefetch_count,
             ));
         }
 
@@ -13356,26 +13586,6 @@ impl GpuDecodeStore {
         // Final APFL stats
         results.push(String::new());
         results.push(self.apfl_stats()?);
-
-        // Per-layer adaptation summary
-        let graph = self.graph.as_ref().unwrap();
-        let apfl = graph.apfl.as_ref().unwrap();
-        let mut adapted_counts: Vec<(usize, usize)> = Vec::new();
-        for (i, stats) in apfl.layer_stats.iter().enumerate() {
-            if stats.hits + stats.misses > 0 {
-                adapted_counts.push((i, stats.prefetch_count));
-            }
-        }
-        if !adapted_counts.is_empty() {
-            let min_pc = adapted_counts.iter().map(|c| c.1).min().unwrap();
-            let max_pc = adapted_counts.iter().map(|c| c.1).max().unwrap();
-            let avg_pc = adapted_counts.iter().map(|c| c.1).sum::<usize>() as f64
-                / adapted_counts.len() as f64;
-            results.push(format!(
-                "Adapted prefetch_count: min={}, max={}, avg={:.1} (across {} layers)",
-                min_pc, max_pc, avg_pc, adapted_counts.len(),
-            ));
-        }
 
         Ok(results.join("\n"))
     }
@@ -15197,6 +15407,12 @@ impl Drop for GpuDecodeStore {
             }
             if !self.prefetch_stream.0.is_null() {
                 let _ = cuda_sys::lib().cuStreamDestroy_v2(self.prefetch_stream.0);
+            }
+            if !self.spec_stream.0.is_null() {
+                let _ = cuda_sys::lib().cuStreamDestroy_v2(self.spec_stream.0);
+            }
+            if !self.spec_blas_handle.0.is_null() {
+                let _ = cublas_result::destroy_handle(self.spec_blas_handle.0);
             }
         }
     }

@@ -5831,6 +5831,7 @@ pub fn bench_decode_synthetic(
                 up_bias: None,
                 down_bias: None,
                 tiled: false,
+                contiguous_backing: None,
             });
         }
         moe_store.experts_cpu.push(layer_experts);

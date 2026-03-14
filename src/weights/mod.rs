@@ -337,6 +337,26 @@ pub struct UnifiedExpertWeights {
 
     /// Whether data is in tiled layout (TILE_N=256 wide tiles).
     pub tiled: bool,
+
+    /// Contiguous backing buffer for DMA optimization.
+    /// When Some, w13_packed/w13_scales/w2_packed/w2_scales point INTO this buffer
+    /// (via unsafe Vec::from_raw_parts). Layout matches GPU double-buffer:
+    /// [w13_packed | pad | w13_scales | pad | w2_packed | pad | w2_scales]
+    /// with 256-byte alignment between components. Enables single-call DMA per expert.
+    pub contiguous_backing: Option<Vec<u8>>,
+}
+
+impl Drop for UnifiedExpertWeights {
+    fn drop(&mut self) {
+        if self.contiguous_backing.is_some() {
+            // w13_packed/scales/w2_packed/scales point into contiguous_backing.
+            // Forget them to prevent double-free (backing owns the memory).
+            std::mem::forget(std::mem::take(&mut self.w13_packed));
+            std::mem::forget(std::mem::take(&mut self.w13_scales));
+            std::mem::forget(std::mem::take(&mut self.w2_packed));
+            std::mem::forget(std::mem::take(&mut self.w2_scales));
+        }
+    }
 }
 
 impl UnifiedExpertWeights {
@@ -411,6 +431,7 @@ impl UnifiedExpertWeights {
             up_bias: None,
             down_bias: None,
             tiled: false,
+            contiguous_backing: None,
         }
     }
 
@@ -506,6 +527,7 @@ impl UnifiedExpertWeights {
             up_bias: None,
             down_bias: None,
             tiled: false,
+            contiguous_backing: None,
         }
     }
 
@@ -587,6 +609,7 @@ impl UnifiedExpertWeights {
             up_bias: None,
             down_bias: None,
             tiled: false,
+            contiguous_backing: None,
         }
     }
 
@@ -655,6 +678,7 @@ impl UnifiedExpertWeights {
             up_bias: None,
             down_bias: None,
             tiled: false,
+            contiguous_backing: None,
         }
     }
 
@@ -706,6 +730,7 @@ impl UnifiedExpertWeights {
                 up_bias: None,
                 down_bias: None,
                 tiled: false,
+                contiguous_backing: None,
             }
         } else {
             // INT8 gate/up
@@ -759,6 +784,7 @@ impl UnifiedExpertWeights {
                 up_bias: None,
                 down_bias: None,
                 tiled: false,
+                contiguous_backing: None,
             }
         };
 
@@ -4272,56 +4298,75 @@ fn read_marlin_expert(
     let num_groups = h / group_size;
     let two_n = 2 * m;
 
-    // w13_packed: [K/div, 2*N] as u32
-    let w13_packed_count = packed_k * two_n;
-    let mut w13_packed = vec![0u32; w13_packed_count];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr().add(*offset),
-            w13_packed.as_mut_ptr() as *mut u8,
-            w13_packed_count * 4,
-        );
-    }
-    *offset += w13_packed_count * 4;
-
-    // w13_scales: [K/gs, 2*N] as u16
-    let w13_scales_count = num_groups * two_n;
-    let mut w13_scales = vec![0u16; w13_scales_count];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr().add(*offset),
-            w13_scales.as_mut_ptr() as *mut u8,
-            w13_scales_count * 2,
-        );
-    }
-    *offset += w13_scales_count * 2;
-
-    // w2_packed: [K_down/div, N_down] as u32 — N_down may be padded for Marlin kernel compat
+    // Compute byte sizes per component
+    let w13_packed_bytes = packed_k * two_n * 4;
+    let w13_scales_bytes = num_groups * two_n * 2;
     let h_w2 = marlin_w2_padded_n(h, m);
     let down_packed_k = m / div;
-    let w2_packed_count = down_packed_k * h_w2;
-    let mut w2_packed = vec![0u32; w2_packed_count];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr().add(*offset),
-            w2_packed.as_mut_ptr() as *mut u8,
-            w2_packed_count * 4,
-        );
-    }
-    *offset += w2_packed_count * 4;
-
-    // w2_scales: [K_down/gs, N_down] as u16
+    let w2_packed_bytes = down_packed_k * h_w2 * 4;
     let down_num_groups = m / group_size;
-    let w2_scales_count = down_num_groups * h_w2;
-    let mut w2_scales = vec![0u16; w2_scales_count];
+    let w2_scales_bytes = down_num_groups * h_w2 * 2;
+
+    // Total raw bytes in the mmap (no alignment padding in cache file)
+    let raw_total = w13_packed_bytes + w13_scales_bytes + w2_packed_bytes + w2_scales_bytes;
+
+    // Compute aligned offsets (256-byte alignment, matching GPU double-buffer layout)
+    let align = 256usize;
+    let w13p_aligned = (w13_packed_bytes + align - 1) & !(align - 1);
+    let w13s_aligned = (w13_scales_bytes + align - 1) & !(align - 1);
+    let w2p_aligned = (w2_packed_bytes + align - 1) & !(align - 1);
+    let w2s_aligned = (w2_scales_bytes + align - 1) & !(align - 1);
+
+    let contig_w13p_off = 0usize;
+    let contig_w13s_off = w13p_aligned;
+    let contig_w2p_off = w13p_aligned + w13s_aligned;
+    let contig_w2s_off = w13p_aligned + w13s_aligned + w2p_aligned;
+    let contig_total = w13p_aligned + w13s_aligned + w2p_aligned + w2s_aligned;
+
+    // Allocate single contiguous buffer and copy all 4 arrays into it
+    let mut backing = vec![0u8; contig_total];
+    let src = *offset;
     unsafe {
         std::ptr::copy_nonoverlapping(
-            data.as_ptr().add(*offset),
-            w2_scales.as_mut_ptr() as *mut u8,
-            w2_scales_count * 2,
+            data.as_ptr().add(src),
+            backing.as_mut_ptr().add(contig_w13p_off),
+            w13_packed_bytes,
+        );
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(src + w13_packed_bytes),
+            backing.as_mut_ptr().add(contig_w13s_off),
+            w13_scales_bytes,
+        );
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(src + w13_packed_bytes + w13_scales_bytes),
+            backing.as_mut_ptr().add(contig_w2p_off),
+            w2_packed_bytes,
+        );
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().add(src + w13_packed_bytes + w13_scales_bytes + w2_packed_bytes),
+            backing.as_mut_ptr().add(contig_w2s_off),
+            w2_scales_bytes,
         );
     }
-    *offset += w2_scales_count * 2;
+    *offset += raw_total;
+
+    // Create typed Vec views into the contiguous buffer via unsafe from_raw_parts.
+    // These Vecs do NOT own the memory — the backing Vec does.
+    // Drop impl on UnifiedExpertWeights prevents double-free.
+    let w13_packed_count = packed_k * two_n;
+    let w13_scales_count = num_groups * two_n;
+    let w2_packed_count = down_packed_k * h_w2;
+    let w2_scales_count = down_num_groups * h_w2;
+
+    let (w13_packed, w13_scales, w2_packed, w2_scales) = unsafe {
+        let bp = backing.as_ptr();
+        (
+            Vec::from_raw_parts(bp.add(contig_w13p_off) as *mut u32, w13_packed_count, w13_packed_count),
+            Vec::from_raw_parts(bp.add(contig_w13s_off) as *mut u16, w13_scales_count, w13_scales_count),
+            Vec::from_raw_parts(bp.add(contig_w2p_off) as *mut u32, w2_packed_count, w2_packed_count),
+            Vec::from_raw_parts(bp.add(contig_w2s_off) as *mut u16, w2_scales_count, w2_scales_count),
+        )
+    };
 
     UnifiedExpertWeights {
         w13_packed,
@@ -4337,6 +4382,7 @@ fn read_marlin_expert(
         up_bias: None,
         down_bias: None,
         tiled: false,
+        contiguous_backing: Some(backing),
     }
 }
 
@@ -4424,6 +4470,7 @@ fn read_unified_expert_cpu(
         up_bias: None,
         down_bias: None,
         tiled: false,
+        contiguous_backing: None,
     }
 }
 
@@ -4514,6 +4561,7 @@ fn read_unified_expert_cpu_mixed(
         up_bias: None,
         down_bias: None,
         tiled: false,
+        contiguous_backing: None,
     }
 }
 
