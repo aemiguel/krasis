@@ -39,6 +39,7 @@ DEFAULT_PORT = 8012
 DEFAULT_HOST = "127.0.0.1"
 BENCHMARK_TIMEOUT = 1200  # 20 min for model load + warmup + benchmark
 CACHE_BUILD_TIMEOUT = 1800  # 30 min for cache building (INT8 takes longer)
+AWQ_CALIBRATE_TIMEOUT = 1800  # 30 min for AWQ calibration
 HEALTH_POLL_INTERVAL = 2
 
 SUPPORTED_MODELS = [
@@ -296,9 +297,151 @@ def build_caches(model_name: str, gpu_idx: int, num_layers: int,
             if config_path and os.path.isfile(config_path):
                 os.unlink(config_path)
             # Wait for GPU to clear
-            wait_for_gpu_clear(gpu_idx, timeout=30)
+            wait_for_gpu_clear(gpu_idx, timeout=60)
 
     return results
+
+
+# ═══════════════════════════════════════════════════════════════════
+# AWQ Template Building (Pre-flight)
+# ═══════════════════════════════════════════════════════════════════
+
+def awq_template_exists(model_name: str) -> bool:
+    """Check if an AWQ calibration template exists for this model.
+
+    Checks both the bundled templates directory and user cache.
+    """
+    model_path = os.path.join(MODELS_DIR, model_name)
+    if not os.path.isdir(model_path):
+        return False
+
+    # Import compute_model_hash to get the model's hash
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.join(script_dir, "python"))
+    from krasis.awq_calibrate import compute_model_hash
+
+    model_hash = compute_model_hash(model_path)
+
+    # Check bundled templates
+    bundled = os.path.join(script_dir, "templates", "attention", model_hash, "template.json")
+    if os.path.isfile(bundled):
+        return True
+
+    # Check user cache
+    user_cache = os.path.expanduser(f"~/.krasis/templates/{model_hash}/template.json")
+    if os.path.isfile(user_cache):
+        return True
+
+    return False
+
+
+def build_awq_template(model_name: str, gpu_idx: int, num_layers: int,
+                       log_dir: str) -> bool:
+    """Build AWQ calibration template for a model if it doesn't exist.
+
+    Runs ./dev awq-calibrate with a temporary config. Returns True on success.
+    """
+    if awq_template_exists(model_name):
+        ok("AWQ template already exists — skipping calibration")
+        return True
+
+    info("Building AWQ template (this may take several minutes)...")
+    config_path = None
+    proc = None
+    log_path = os.path.join(log_dir, "awq_calibrate.log")
+
+    try:
+        # Generate a minimal config for AWQ calibration (always uses BF16 attention)
+        model_path = os.path.join(MODELS_DIR, model_name)
+        lines = [
+            f"# AWQ calibration config",
+            f'MODEL_PATH="{model_path}"',
+            f'CFG_SELECTED_GPUS="{gpu_idx}"',
+            f'CFG_PP_PARTITION="{num_layers}"',
+            f'CFG_LAYER_GROUP_SIZE="2"',
+            f'CFG_KV_DTYPE="fp8_e4m3"',
+            f'CFG_GPU_EXPERT_BITS="4"',
+            f'CFG_CPU_EXPERT_BITS="4"',
+            f'CFG_ATTENTION_QUANT="bf16"',
+            f'CFG_SHARED_EXPERT_QUANT="int8"',
+            f'CFG_DENSE_MLP_QUANT="int8"',
+            f'CFG_LM_HEAD_QUANT="int8"',
+            f'CFG_HOST="0.0.0.0"',
+            f'CFG_PORT="{DEFAULT_PORT}"',
+            f'CFG_NUM_GPUS="1"',
+        ]
+        fd, config_path = tempfile.mkstemp(prefix="krasis-awq-", suffix=".conf")
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        # Run AWQ calibration directly via Python module.
+        # We can't use ./dev awq-calibrate because its cleanup_gpu would kill
+        # THIS release test process (pgrep matches 'python.*krasis\.').
+        # We're already inside ./dev release-test which set up the conda env.
+        cmd = [sys.executable, "-m", "krasis.awq_calibrate", "--config", config_path]
+
+        log_file = open(log_path, "w")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+        )
+
+        # Wait for completion (AWQ calibrate exits when done, unlike server)
+        start = time.time()
+        while time.time() - start < AWQ_CALIBRATE_TIMEOUT:
+            if proc.poll() is not None:
+                break
+            time.sleep(HEALTH_POLL_INTERVAL)
+
+        if proc.poll() is None:
+            # Timed out
+            warn(f"AWQ calibration timed out after {AWQ_CALIBRATE_TIMEOUT}s")
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            return False
+
+        if proc.returncode != 0:
+            warn(f"AWQ calibration failed (exit code {proc.returncode})")
+            # Show last few lines of log
+            try:
+                with open(log_path) as f:
+                    content = f.read()
+                tail = content[-2000:] if len(content) > 2000 else content
+                warn(f"Log tail:\n{tail}")
+            except (OSError, IOError):
+                pass
+            return False
+
+        # Verify template was actually created
+        if awq_template_exists(model_name):
+            ok("AWQ template built successfully")
+            return True
+        else:
+            warn("AWQ calibration completed but template not found")
+            return False
+
+    except Exception as e:
+        warn(f"AWQ calibration error: {e}")
+        return False
+
+    finally:
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            log_file.close()
+        except Exception:
+            pass
+        if config_path and os.path.isfile(config_path):
+            os.unlink(config_path)
+        # Wait for GPU to clear after calibration
+        wait_for_gpu_clear(gpu_idx, timeout=60)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -404,14 +547,69 @@ def kill_server(proc: subprocess.Popen):
         pass
 
 
-def wait_for_gpu_clear(gpu_idx: int, timeout: int = 30) -> bool:
-    """Wait for GPU memory to drop below 500 MB used."""
-    for _ in range(timeout):
+def kill_stale_krasis_processes():
+    """Kill any lingering krasis Python processes (excluding ourselves)."""
+    our_pid = os.getpid()
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "python.*krasis\\."],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return  # No matches
+
+        pids = [int(p.strip()) for p in result.stdout.strip().split("\n")
+                if p.strip() and int(p.strip()) != our_pid]
+
+        if not pids:
+            return
+
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+
+        # Wait up to 5s for graceful exit
+        for _ in range(5):
+            alive = [p for p in pids if _pid_alive(p)]
+            if not alive:
+                return
+            time.sleep(1)
+
+        # SIGKILL survivors
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a process is still running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def wait_for_gpu_clear(gpu_idx: int, timeout: int = 60) -> bool:
+    """Wait for GPU memory to drop below 500 MB used.
+
+    If memory doesn't clear within half the timeout, kills any stale
+    krasis processes that may be holding GPU memory.
+    """
+    killed_stale = False
+    for i in range(timeout):
         try:
             result = subprocess.run(
                 ["nvidia-smi", f"--id={gpu_idx}", "--query-gpu=memory.used",
                  "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=10,
             )
             if result.returncode == 0:
                 used = int(result.stdout.strip())
@@ -419,6 +617,13 @@ def wait_for_gpu_clear(gpu_idx: int, timeout: int = 30) -> bool:
                     return True
         except (subprocess.TimeoutExpired, ValueError):
             pass
+
+        # If we're past half the timeout and still stuck, kill stale processes
+        if i == timeout // 2 and not killed_stale:
+            warn("GPU not clearing — killing stale krasis processes...")
+            kill_stale_krasis_processes()
+            killed_stale = True
+
         time.sleep(1)
     return False
 
@@ -843,6 +1048,21 @@ def main():
         die(f"Cache build failed for INT{', INT'.join(failed_bits)} — aborting release test")
     print()
 
+    # ── Pre-flight: build AWQ template ──────────────────────────
+
+    needs_awq = any(v["attention"] == "awq" for v in CONFIG_VARIANTS)
+    if needs_awq:
+        print(f"{'=' * 64}")
+        info("Phase 0b: Building AWQ template (if needed)")
+        print(f"{'=' * 64}\n")
+
+        awq_ok = build_awq_template(model_name, gpu_idx, num_layers, output_dir)
+        if awq_ok:
+            ok("AWQ template ready")
+        else:
+            warn("AWQ template build failed — AWQ configs will be skipped")
+        print()
+
     # ── Run each config variant ──────────────────────────────────
 
     config_results = []
@@ -856,6 +1076,13 @@ def main():
         config_path = None
         proc = None
         log_path = os.path.join(output_dir, f"server_config{i+1}_{timestamp}.log")
+
+        # Skip AWQ configs if template wasn't built
+        if variant["attention"] == "awq" and needs_awq and not awq_ok:
+            result["error"] = "AWQ template not available — skipped"
+            warn("Skipping (no AWQ template)")
+            config_results.append(result)
+            continue
 
         try:
             # 1. Generate temp config
@@ -943,7 +1170,7 @@ def main():
             # Wait for GPU to clear before next config
             info("Waiting for GPU memory to clear...")
             if not wait_for_gpu_clear(gpu_idx):
-                warn("GPU memory not fully cleared after 30s. Proceeding anyway.")
+                warn("GPU memory not fully cleared after 60s. Proceeding anyway.")
             else:
                 ok("GPU clear.")
 
