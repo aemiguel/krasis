@@ -3931,8 +3931,9 @@ class KrasisModel:
             else:
                 raise RuntimeError(
                     f"AWQ attention requested but no calibration template found for model "
-                    f"{self.cfg.model_path}. Run 'krasis-calibrate' first to generate an AWQ "
-                    f"template, or use --attention-quant bf16 for unquantized attention."
+                    f"{self.cfg.model_path}. No template available locally or from GitHub. "
+                    f"Run './dev awq-calibrate <config>' to generate one, or use "
+                    f"--attention-quant bf16 for unquantized attention."
                 )
 
         # Marlin quantization helpers (lazy import, only when quantizing)

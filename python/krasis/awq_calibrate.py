@@ -582,12 +582,67 @@ def save_template(template: Dict, output_dir: str) -> str:
     return out_path
 
 
+_TEMPLATE_BASE_URL = (
+    "https://raw.githubusercontent.com/brontoguana/krasis/main"
+    "/templates/attention"
+)
+
+
+def _download_template(model_hash: str) -> Optional[Dict]:
+    """Try to download an AWQ template from GitHub.
+
+    Downloads from the main branch raw content URL and caches locally
+    in ~/.krasis/templates/<model_hash>/template.json.
+
+    Returns the parsed template dict, or None if download fails.
+    """
+    import urllib.request
+    import urllib.error
+
+    url = f"{_TEMPLATE_BASE_URL}/{model_hash}/template.json"
+    cache_dir = os.path.expanduser(f"~/.krasis/templates/{model_hash}")
+    cache_path = os.path.join(cache_dir, "template.json")
+
+    logger.info("Downloading AWQ template for model hash %s ...", model_hash)
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "krasis"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        logger.warning("Failed to download AWQ template from %s: %s", url, e)
+        return None
+
+    try:
+        template = json.loads(data)
+    except json.JSONDecodeError:
+        logger.warning("Downloaded AWQ template is not valid JSON")
+        return None
+
+    if template.get("model_hash") != model_hash:
+        logger.warning("Downloaded template hash mismatch (expected %s, got %s)",
+                       model_hash, template.get("model_hash"))
+        return None
+
+    # Cache locally
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(template, f, indent=2)
+        logger.info("AWQ template cached at %s", cache_path)
+    except OSError as e:
+        logger.warning("Failed to cache AWQ template: %s", e)
+
+    return template
+
+
 def load_template(template_dir: str, model_path: str) -> Optional[Dict]:
     """Load a template for a model, if one exists.
 
     Searches:
     1. Bundled templates in template_dir/<model_hash>/template.json
     2. User cache in ~/.krasis/templates/<model_hash>/template.json
+    3. Downloads from GitHub if not found locally
     """
     model_hash = compute_model_hash(model_path)
 
@@ -606,7 +661,8 @@ def load_template(template_dir: str, model_path: str) -> Optional[Dict]:
                 logger.warning("Template hash mismatch at %s (expected %s, got %s)",
                                path, model_hash, template.get("model_hash"))
 
-    return None
+    # Not found locally — try downloading from GitHub
+    return _download_template(model_hash)
 
 
 def get_layer_scales(template: Dict, layer_idx: int) -> Optional[torch.Tensor]:
