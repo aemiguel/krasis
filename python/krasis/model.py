@@ -3753,7 +3753,7 @@ class KrasisModel:
                                 pass
 
         prompt_tokens = self.tokenizer.apply_chat_template(
-            parsed, **template_kwargs
+            parsed, add_generation_prompt=True, **template_kwargs
         )
 
         stop_ids = [self.cfg.eos_token_id] + list(self.cfg.extra_stop_token_ids)

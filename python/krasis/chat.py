@@ -212,7 +212,7 @@ class ChannelFilter:
     """
 
     _MARKERS = ['<|channel|>', '<|message|>', '<|end|>', '<|start|>',
-                '<|endofprompt|>']
+                '<|endofprompt|>', '<think>', '</think>']
 
     def __init__(self):
         self._buf = ""
@@ -268,7 +268,13 @@ class ChannelFilter:
             if matched:
                 self._has_channels = True
                 self._buf = self._buf[len(matched):]
-                if matched == '<|channel|>':
+                if matched == '<think>':
+                    self._display = False
+                    self._in_hidden = True
+                elif matched == '</think>':
+                    self._display = True
+                    self._in_hidden = False
+                elif matched == '<|channel|>':
                     self._reading_channel = True
                     self._channel = ""
                     self._display = False
@@ -440,7 +446,7 @@ def stream_chat(
     url: str,
     messages: List[Dict],
     temperature: float = 0.6,
-    max_tokens: int = 4096,
+    max_tokens: int = 16384,
     top_p: float = 0.95,
 ) -> tuple:
     """Send streaming chat request. Prints tokens as they arrive.
@@ -604,7 +610,7 @@ def _estimate_message_tokens(messages: List[Dict[str, str]]) -> int:
 def chat_loop(
     server: Dict[str, Any],
     temperature: float = 0.6,
-    max_tokens: int = 4096,
+    max_tokens: int = 16384,
     system_prompt: str = "",
 ):
     """Interactive chat loop with streaming responses."""
@@ -796,7 +802,7 @@ def _find_prompts_file() -> str:
 def run_sanity_test(
     server: Dict[str, Any],
     temperature: float = 0.6,
-    max_tokens: int = 4096,
+    max_tokens: int = 16384,
 ):
     """Submit each prompt from sanity_test_prompts.txt, print and save results."""
     from datetime import datetime
@@ -889,7 +895,7 @@ def main():
     parser.add_argument("--host", default="localhost",
                         help="Server hostname (default: localhost)")
     parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--max-tokens", type=int, default=16384)
     parser.add_argument("--system", default="",
                         help="Initial system prompt")
     parser.add_argument("--sanitytest", action="store_true",

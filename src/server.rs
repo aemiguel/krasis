@@ -86,6 +86,8 @@ struct ServerState {
     chat_template: crate::chat_template::ChatTemplateEngine,
     max_context_tokens: usize,
     default_enable_thinking: bool,
+    /// Token ID for `</think>` — when set, thinking tokens are exempt from max_tokens.
+    thinking_end_token: Option<usize>,
     /// Raw pointer to a GpuDecodeStore instance (set from Python during server init).
     /// Safety: single-request guarantee means no concurrent access.
     gpu_store_addr: usize,
@@ -496,7 +498,7 @@ fn handle_chat_completion(
     };
 
     let is_stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(2048) as usize;
+    let max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(8192) as usize;
     let temperature = req.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.6) as f32;
     let top_k = req.get("top_k").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     let top_p = req.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.95) as f32;
@@ -716,7 +718,7 @@ fn handle_chat_completion(
         first_token, prompt_len, max_tokens, temperature,
         top_k, top_p, presence_penalty, &stop_ids,
         &request_id, &state.model_name, created,
-        &overhead, has_tools,
+        &overhead, has_tools, enable_thinking,
     );
 
     // ── Cleanup (GIL required) ──
@@ -755,7 +757,11 @@ fn handle_gpu_decode(
     created: u64,
     overhead: &RequestOverhead,
     has_tools: bool,
+    enable_thinking: bool,
 ) {
+    // Resolve thinking end token early — used by both streaming and non-streaming paths
+    let think_end_id = if enable_thinking { state.thinking_end_token } else { None };
+
     if is_stream {
         if let Err(e) = begin_sse(stream) {
             log::error!("Failed to send SSE headers: {}", e);
@@ -763,6 +769,14 @@ fn handle_gpu_decode(
         }
 
         let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
+
+        // When thinking is enabled, inject <think> at start of stream.
+        // The prompt already includes <think>, but the client needs it in the
+        // output to know this is a thinking block (for display suppression).
+        if think_end_id.is_some() {
+            let think_chunk = format_sse_token(request_id, model_name, "<think>", None, created);
+            let _ = send_sse_chunk(stream, &think_chunk);
+        }
 
         // When tool use is active, buffer first token (might need tool call parsing).
         // Otherwise send immediately for lowest latency.
@@ -830,6 +844,19 @@ fn handle_gpu_decode(
         let decode_start = Instant::now();
         let mut decode_token_count = 0usize;
 
+        // ── Thinking budget tracking ──
+        // When thinking is enabled, tokens inside <think>...</think> are exempt
+        // from max_tokens. We track the state and only count answer tokens.
+        let mut in_thinking = think_end_id.is_some(); // start in thinking if enabled
+        let mut answer_token_count = 0usize;
+        let mut thinking_token_count = 0usize;
+        // Also check first_token — it could be </think> for trivial thinking
+        if in_thinking && Some(first_token) == think_end_id {
+            in_thinking = false;
+        } else if in_thinking {
+            thinking_token_count += 1;
+        }
+
         // ── Tool call detection state ──
         // When tools are present: stream content normally, detect <tool_call>,
         // buffer everything from that point, then send structured tool_calls
@@ -860,12 +887,35 @@ fn handle_gpu_decode(
         }
 
         // Shared callback for both single-GPU and multi-GPU decode
-        let mut on_token = |_token_id: usize, text: &str, finish_reason: Option<&str>| -> bool {
+        let mut on_token = |token_id: usize, text: &str, finish_reason: Option<&str>| -> bool {
             decode_token_count += 1;
+
+            // ── Track thinking state ──
+            // Tokens before </think> are "thinking" and don't count against max_tokens.
+            if think_end_id.is_some() {
+                if in_thinking {
+                    thinking_token_count += 1;
+                    if Some(token_id) == think_end_id {
+                        in_thinking = false;
+                        log::info!("Thinking complete: {} tokens", thinking_token_count);
+                    }
+                } else {
+                    answer_token_count += 1;
+                }
+            }
+
+            // Override finish_reason if answer token limit reached
+            let effective_finish = if finish_reason.is_some() {
+                finish_reason
+            } else if think_end_id.is_some() && !in_thinking && answer_token_count >= max_tokens {
+                Some("length")
+            } else {
+                None
+            };
 
             if has_tools {
                 tc_all_text.push_str(text);
-                if let Some(fr) = finish_reason {
+                if let Some(fr) = effective_finish {
                     tc_finish = fr.to_string();
                 }
 
@@ -898,11 +948,14 @@ fn handle_gpu_decode(
                 if writer_disconnected.load(Ordering::Acquire) {
                     return false;
                 }
+                if effective_finish.is_some() {
+                    return false;
+                }
                 true
             } else {
                 // Original non-tool path
                 let chunk = format_sse_token(
-                    request_id, model_name, text, finish_reason, created,
+                    request_id, model_name, text, effective_finish, created,
                 );
                 let formatted = format!("data: {}\n\n", chunk);
                 if tx.send(formatted).is_err()
@@ -910,8 +963,20 @@ fn handle_gpu_decode(
                 {
                     return false;
                 }
+                // Stop if answer limit reached
+                if effective_finish.is_some() {
+                    return false;
+                }
                 true
             }
+        };
+
+        // When thinking is enabled, give the decode loop extra budget for thinking tokens.
+        // The on_token callback enforces the real max_tokens on answer tokens only.
+        let decode_budget = if think_end_id.is_some() {
+            max_tokens.saturating_add(32768).saturating_sub(1)
+        } else {
+            max_tokens.saturating_sub(1)
         };
 
         if state.aux_gpu_store_addr != 0 {
@@ -922,7 +987,7 @@ fn handle_gpu_decode(
                 state.multi_gpu_gqa_offset,
                 first_token,
                 prompt_len,
-                max_tokens.saturating_sub(1),
+                decode_budget,
                 temperature,
                 top_k,
                 top_p,
@@ -936,7 +1001,7 @@ fn handle_gpu_decode(
             store.gpu_generate_stream(
                 first_token,
                 prompt_len,
-                max_tokens.saturating_sub(1),
+                decode_budget,
                 temperature,
                 top_k,
                 top_p,
@@ -1010,18 +1075,55 @@ fn handle_gpu_decode(
     } else {
         // ── Non-streaming path ──
         let mut all_text = String::new();
+        // Inject <think> prefix so clients can identify thinking blocks
+        if enable_thinking && state.thinking_end_token.is_some() {
+            all_text.push_str("<think>");
+        }
         let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
         all_text.push_str(&first_text);
         let mut total_tokens = 1usize;
         let mut finish = "length".to_string();
 
+        // Thinking budget for non-streaming
+        let ns_think_end_id = if enable_thinking { state.thinking_end_token } else { None };
+        let mut ns_in_thinking = ns_think_end_id.is_some();
+        let mut ns_answer_tokens = 0usize;
+        if ns_in_thinking && Some(first_token) == ns_think_end_id {
+            ns_in_thinking = false;
+        }
+
+        let ns_decode_budget = if ns_think_end_id.is_some() {
+            max_tokens.saturating_add(32768).saturating_sub(1)
+        } else {
+            max_tokens.saturating_sub(1)
+        };
+
         {
-            let mut on_token = |_token_id: usize, text: &str, finish_reason: Option<&str>| -> bool {
+            let mut on_token = |token_id: usize, text: &str, finish_reason: Option<&str>| -> bool {
                 all_text.push_str(text);
                 total_tokens += 1;
+
+                // Track thinking state
+                if ns_think_end_id.is_some() {
+                    if ns_in_thinking {
+                        if Some(token_id) == ns_think_end_id {
+                            ns_in_thinking = false;
+                        }
+                    } else {
+                        ns_answer_tokens += 1;
+                    }
+                }
+
                 if let Some(fr) = finish_reason {
                     finish = fr.to_string();
                 }
+
+                // Stop if answer limit reached
+                if ns_think_end_id.is_some() && !ns_in_thinking && ns_answer_tokens >= max_tokens {
+                    finish = "length".to_string();
+                    return false;
+                }
+
                 true
             };
             if state.aux_gpu_store_addr != 0 {
@@ -1031,7 +1133,7 @@ fn handle_gpu_decode(
                     state.multi_gpu_gqa_offset,
                     first_token,
                     prompt_len,
-                    max_tokens.saturating_sub(1),
+                    ns_decode_budget,
                     temperature,
                     top_k,
                     top_p,
@@ -1044,7 +1146,7 @@ fn handle_gpu_decode(
                 store.gpu_generate_stream(
                     first_token,
                     prompt_len,
-                    max_tokens.saturating_sub(1),
+                    ns_decode_budget,
                     temperature,
                     top_k,
                     top_p,
@@ -1094,6 +1196,8 @@ pub struct RustServer {
     tokenizer_path: String,
     max_context_tokens: usize,
     default_enable_thinking: bool,
+    /// Token ID for `</think>` passed from Python (0 = not available).
+    thinking_end_token_id: usize,
     gpu_store_addr: usize,
     py_model: Py<PyAny>,
     running: Arc<AtomicBool>,
@@ -1105,7 +1209,7 @@ pub struct RustServer {
 #[pymethods]
 impl RustServer {
     #[new]
-    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, gpu_store_addr=0, aux_gpu_store_addr=0, multi_gpu_split_layer=0, multi_gpu_gqa_offset=0))]
+    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, thinking_end_token_id=0, gpu_store_addr=0, aux_gpu_store_addr=0, multi_gpu_split_layer=0, multi_gpu_gqa_offset=0))]
     fn new(
         py_model: PyObject,
         host: String,
@@ -1114,6 +1218,7 @@ impl RustServer {
         tokenizer_path: String,
         max_context_tokens: usize,
         enable_thinking: bool,
+        thinking_end_token_id: usize,
         gpu_store_addr: usize,
         aux_gpu_store_addr: usize,
         multi_gpu_split_layer: usize,
@@ -1126,6 +1231,7 @@ impl RustServer {
             tokenizer_path,
             max_context_tokens,
             default_enable_thinking: enable_thinking,
+            thinking_end_token_id,
             gpu_store_addr,
             py_model: py_model.into(),
             running: Arc::new(AtomicBool::new(false)),
@@ -1146,6 +1252,7 @@ impl RustServer {
         let tokenizer_path = self.tokenizer_path.clone();
         let max_context_tokens = self.max_context_tokens;
         let default_enable_thinking = self.default_enable_thinking;
+        let thinking_end_token_id = self.thinking_end_token_id;
         let gpu_store_addr = self.gpu_store_addr;
         let aux_gpu_store_addr = self.aux_gpu_store_addr;
         let multi_gpu_split_layer = self.multi_gpu_split_layer;
@@ -1221,6 +1328,14 @@ impl RustServer {
                 log::info!("GIL timing enabled (KRASIS_GIL_TIMING=1)");
             }
 
+            // </think> token ID passed from Python (0 = not available)
+            let thinking_end_token = if thinking_end_token_id > 0 {
+                eprintln!("[krasis] Thinking end token: </think> = {}", thinking_end_token_id);
+                Some(thinking_end_token_id)
+            } else {
+                None
+            };
+
             let state = ServerState {
                 py_model,
                 model_name,
@@ -1228,6 +1343,7 @@ impl RustServer {
                 chat_template,
                 max_context_tokens,
                 default_enable_thinking,
+                thinking_end_token,
                 gpu_store_addr,
                 gil_timing,
                 aux_gpu_store_addr,

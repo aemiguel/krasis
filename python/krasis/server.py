@@ -1564,6 +1564,24 @@ def main():
     from krasis import RustServer
 
     tokenizer_path = os.path.join(args.model_path, "tokenizer.json")
+
+    # Look up </think> token ID for thinking budget tracking.
+    # Only activate if the model's chat template actually supports enable_thinking
+    # (i.e. the template contains <think> logic). Without this check, models
+    # without thinking support would never emit </think>, breaking the budget.
+    _hf_tok = _model.tokenizer.tokenizer  # unwrap Tokenizer → HF AutoTokenizer
+    _template = getattr(_hf_tok, "chat_template", "") or ""
+    think_end_id = 0
+    if "enable_thinking" in _template:
+        _raw_id = _hf_tok.convert_tokens_to_ids("</think>")
+        if isinstance(_raw_id, int) and _raw_id != _hf_tok.unk_token_id:
+            think_end_id = _raw_id
+            logger.info("Thinking end token: </think> = %d", think_end_id)
+        else:
+            logger.info("Template has enable_thinking but no </think> token")
+    else:
+        logger.info("Model template does not support enable_thinking — thinking budget disabled")
+
     rust_server = RustServer(
         _model,
         args.host,
@@ -1572,6 +1590,7 @@ def main():
         tokenizer_path,
         max_ctx,
         args.enable_thinking,
+        think_end_id,
         gpu_store_addr,
         aux_gpu_store_addr,
         multi_gpu_split_layer,
