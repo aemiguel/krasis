@@ -745,8 +745,9 @@ class KrasisModel:
                 for layer in self.layers:
                     if layer.device != device: continue
                     for key in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
-                         w = getattr(layer.attention, key, None) or \
-                             (layer.shared_expert.get(key) if layer.shared_expert else None)
+                         w = getattr(layer.attention, key, None)
+                         if w is None:
+                             w = layer.shared_expert.get(key) if layer.shared_expert else None
                          if w is not None:
                             wt = w[0] if isinstance(w, (tuple, list)) else w
                             k, n = wt.shape if len(wt.shape) == 2 else (wt.shape[1], wt.shape[0])

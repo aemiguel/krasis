@@ -3367,9 +3367,34 @@ impl GpuDecodeStore {
             return Ok(format!("{} | soft: 0 slots (budget too small)", result));
         }
 
+        // Count how many experts actually need soft tier (not already in hard pool)
+        let soft_experts_available: usize = ranking.iter()
+            .filter(|&&(l, e)| !hcs.cache.contains_key(&(l, e)))
+            .count();
+        if soft_experts_available == 0 {
+            log::info!("HCS soft tier: skipping allocation — all experts already in hard pool (100% coverage)");
+            hcs.soft_loaded = true;
+            hcs.soft_num_slots = 0;
+            hcs.soft_num_cached = 0;
+            let total_experts: usize = graph.moe_layers.iter()
+                .filter_map(|m| m.as_ref())
+                .map(|m| m.num_experts)
+                .sum();
+            let total_cached = hcs.num_cached;
+            let total_pct = if total_experts > 0 {
+                total_cached as f64 / total_experts as f64 * 100.0
+            } else { 0.0 };
+            return Ok(format!(
+                "{} | soft: 0 experts (all in hard tier, {:.1} MB saved) | total: {}/{} ({:.1}%) coverage",
+                result, soft_budget_mb as f64, total_cached, total_experts, total_pct,
+            ));
+        }
+
+        // Only allocate for the experts that actually need soft slots
+        let soft_num_slots = std::cmp::min(soft_num_slots, soft_experts_available);
         let soft_alloc_bytes = soft_num_slots * slot_size;
-        log::info!("HCS soft tier: allocating {:.1} MB ({} slots)",
-            soft_alloc_bytes as f64 / (1024.0 * 1024.0), soft_num_slots);
+        log::info!("HCS soft tier: allocating {:.1} MB ({} slots for {} available experts)",
+            soft_alloc_bytes as f64 / (1024.0 * 1024.0), soft_num_slots, soft_experts_available);
 
         let soft_buf = self.device.alloc_zeros::<u8>(soft_alloc_bytes)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
@@ -9536,7 +9561,20 @@ impl GpuDecodeStore {
             return (0, 0.0);
         }
 
-        if !hcs.soft_loaded || hcs.soft_buf.is_none() || hcs.soft_num_cached == 0 {
+        if !hcs.soft_loaded || hcs.soft_buf.is_none() {
+            return (0, 0.0);
+        }
+        // If soft buffer is allocated but empty (0 cached experts), still free it
+        if hcs.soft_num_cached == 0 {
+            let freed_bytes = hcs.soft_num_slots * hcs.soft_slot_size;
+            if freed_bytes > 0 {
+                hcs.soft_buf = None;
+                hcs.soft_loaded = false;
+                hcs.vram_bytes -= freed_bytes;
+                log::info!("HCS soft evict: freed empty soft buffer ({:.1} MB)",
+                    freed_bytes as f64 / (1024.0 * 1024.0));
+                return (0, freed_bytes as f64 / (1024.0 * 1024.0));
+            }
             return (0, 0.0);
         }
 
