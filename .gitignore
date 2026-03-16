@@ -16,5 +16,6 @@ krasis.log
 logs/**/*.log
 logs/**/*.txt
 logs/**/*.md
+logs/requests/
 perplexity/datasets/
 node_modules/

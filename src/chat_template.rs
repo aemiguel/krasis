@@ -93,16 +93,59 @@ impl ChatTemplateEngine {
     /// Apply the chat template to a list of messages.
     ///
     /// `messages_json` is a JSON array of {role, content} objects.
+    /// `tools_json` is an optional JSON array of tool definitions (OpenAI format).
     /// Returns the rendered text string ready for tokenization.
     pub fn apply(&self, messages_json: &str, add_generation_prompt: bool) -> Result<String, String> {
-        let messages: serde_json::Value = serde_json::from_str(messages_json)
+        self.apply_with_tools(messages_json, "", add_generation_prompt)
+    }
+
+    /// Apply with optional tools array for accurate token estimation.
+    pub fn apply_with_tools(&self, messages_json: &str, tools_json: &str, add_generation_prompt: bool) -> Result<String, String> {
+        let mut messages: serde_json::Value = serde_json::from_str(messages_json)
             .map_err(|e| format!("Failed to parse messages JSON: {}", e))?;
+        let tools: serde_json::Value = if tools_json.is_empty() {
+            serde_json::Value::Array(vec![])
+        } else {
+            serde_json::from_str(tools_json)
+                .unwrap_or(serde_json::Value::Array(vec![]))
+        };
+
+        // Pre-process: convert string tool_call arguments to objects.
+        // OpenAI format sends arguments as a JSON string, but Jinja templates
+        // use `arguments|items` which requires a dict/mapping.
+        if let Some(msgs) = messages.as_array_mut() {
+            for msg in msgs.iter_mut() {
+                if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+                    for tc in tool_calls.iter_mut() {
+                        // Determine which object holds arguments: tc.function or tc itself
+                        let has_function = tc.get("function").is_some();
+                        let fn_obj = if has_function {
+                            tc.get_mut("function").unwrap()
+                        } else {
+                            &mut *tc
+                        };
+                        if let Some(args_str) = fn_obj.get("arguments").and_then(|v| v.as_str()).map(String::from) {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                                fn_obj["arguments"] = parsed;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let mut env = minijinja::Environment::new();
 
         // Register the template
         env.add_template("chat", &self.template_source)
             .map_err(|e| format!("Failed to compile chat template: {}", e))?;
+
+        // Add tojson filter (used by Qwen templates to serialize tool parameters)
+        env.add_filter("tojson", |value: minijinja::Value| -> String {
+            // Convert minijinja Value to serde_json Value for proper JSON serialization
+            let json_val = minijinja_value_to_json(&value);
+            serde_json::to_string(&json_val).unwrap_or_else(|_| value.to_string())
+        });
 
         // Add raise_exception function (used by some templates)
         env.add_function("raise_exception", raise_exception);
@@ -184,6 +227,7 @@ impl ChatTemplateEngine {
 
         let ctx = minijinja::context! {
             messages => messages,
+            tools => tools,
             bos_token => &self.bos_token,
             eos_token => &self.eos_token,
             add_generation_prompt => add_generation_prompt,
@@ -232,6 +276,40 @@ fn strftime_now(fmt: String) -> String {
             .replace("%d", &format!("{:02}", day))
     } else {
         format!("{}", now)
+    }
+}
+
+/// Convert a minijinja Value to a serde_json Value for JSON serialization.
+fn minijinja_value_to_json(value: &minijinja::Value) -> serde_json::Value {
+    if value.is_none() || value.is_undefined() {
+        serde_json::Value::Null
+    } else if let Some(b) = value.as_str() {
+        serde_json::Value::String(b.to_string())
+    } else if let Ok(b) = bool::try_from(value.clone()) {
+        serde_json::Value::Bool(b)
+    } else if let Ok(n) = i64::try_from(value.clone()) {
+        serde_json::json!(n)
+    } else if let Ok(n) = f64::try_from(value.clone()) {
+        serde_json::json!(n)
+    } else if value.kind() == minijinja::value::ValueKind::Seq {
+        let items: Vec<serde_json::Value> = value.try_iter()
+            .map(|iter| iter.map(|v| minijinja_value_to_json(&v)).collect())
+            .unwrap_or_default();
+        serde_json::Value::Array(items)
+    } else if value.kind() == minijinja::value::ValueKind::Map {
+        let mut map = serde_json::Map::new();
+        if let Ok(keys) = value.try_iter() {
+            for key in keys {
+                let key_str = key.to_string();
+                if let Ok(val) = value.get_item(&key) {
+                    map.insert(key_str, minijinja_value_to_json(&val));
+                }
+            }
+        }
+        serde_json::Value::Object(map)
+    } else {
+        // Fallback: use the display representation
+        serde_json::Value::String(value.to_string())
     }
 }
 

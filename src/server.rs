@@ -94,6 +94,9 @@ struct ServerState {
     /// When true, log wall-clock time for each Python GIL acquisition.
     /// Enabled by KRASIS_GIL_TIMING=1. Zero cost when off (branch only).
     gil_timing: bool,
+    /// When set, write full request JSON to this directory for debugging IDE clients.
+    /// Enabled by KRASIS_LOG_REQUESTS=1 (writes to logs/requests/).
+    log_requests_dir: Option<String>,
     /// Multi-GPU: auxiliary store address (0 = single GPU mode).
     aux_gpu_store_addr: usize,
     /// Multi-GPU: layer index where GPU0 segment ends and GPU1 segment begins.
@@ -497,6 +500,19 @@ fn handle_chat_completion(
         }
     };
 
+    // Log full request body if request logging is enabled (for IDE debugging)
+    if let Some(ref dir) = state.log_requests_dir {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let filename = format!("{}/{}.json", dir, ts.as_millis());
+        if let Ok(pretty) = serde_json::to_string_pretty(&req) {
+            std::fs::write(&filename, &pretty).ok();
+        } else {
+            std::fs::write(&filename, body).ok();
+        }
+    }
+
     let is_stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(8192) as usize;
     let temperature = req.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.6) as f32;
@@ -537,12 +553,16 @@ fn handle_chat_completion(
     };
 
     // Tool use: extract tools array and tool_choice
+    // tool_choice can be a string ("auto", "none", "required") or an object
+    // {"type": "function", "function": {"name": "..."}} — we pass tools through
+    // unless tool_choice is explicitly "none".
     let tools_json = match req.get("tools") {
         Some(t) if t.is_array() => {
-            let tool_choice = req.get("tool_choice")
-                .and_then(|v| v.as_str())
-                .unwrap_or("auto");
-            if tool_choice == "none" {
+            let is_none = match req.get("tool_choice") {
+                Some(serde_json::Value::String(s)) => s == "none",
+                _ => false,  // object form or missing = allow tools
+            };
+            if is_none {
                 String::new()
             } else {
                 t.to_string()
@@ -554,8 +574,8 @@ fn handle_chat_completion(
 
     // ── Estimate prompt tokens for soft-tier HCS eviction ──
     let estimated_tokens = {
-        // Apply actual chat template to get full rendered text, then tokenize
-        let rendered = match state.chat_template.apply(&messages_json, true) {
+        // Apply actual chat template (with tools) to get full rendered text, then tokenize
+        let rendered = match state.chat_template.apply_with_tools(&messages_json, &tools_json, true) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("Chat template failed: {}", e);
@@ -1335,6 +1355,15 @@ impl RustServer {
                 log::info!("GIL timing enabled (KRASIS_GIL_TIMING=1)");
             }
 
+            let log_requests_dir = if std::env::var("KRASIS_LOG_REQUESTS").map(|v| v == "1").unwrap_or(false) {
+                let dir = "logs/requests".to_string();
+                std::fs::create_dir_all(&dir).ok();
+                log::info!("Request logging enabled → {}/", dir);
+                Some(dir)
+            } else {
+                None
+            };
+
             // </think> token ID passed from Python (0 = not available)
             let thinking_end_token = if thinking_end_token_id > 0 {
                 eprintln!("[krasis] Thinking end token: </think> = {}", thinking_end_token_id);
@@ -1353,6 +1382,7 @@ impl RustServer {
                 thinking_end_token,
                 gpu_store_addr,
                 gil_timing,
+                log_requests_dir,
                 aux_gpu_store_addr,
                 multi_gpu_split_layer,
                 multi_gpu_gqa_offset,
