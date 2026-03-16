@@ -782,8 +782,10 @@ def chat_loop(
                 )
                 elapsed = time.perf_counter() - t0
 
-                # Store clean display text in history (not raw channel markers)
-                messages.append({"role": "assistant", "content": display_text})
+                # Store full model output (including <think> content) in history.
+                # Models expect to see their own thinking in conversation history —
+                # stripping it causes 0 answer tokens on subsequent turns.
+                messages.append({"role": "assistant", "content": raw_text})
 
                 # Show stats from server timing data
                 if timing:
