@@ -1232,6 +1232,19 @@ struct GpuDecodeGraph {
     per_layer_graphs: Vec<CudaGraphExecPtr>,
     /// Whether per-layer graphs are valid for replay.
     per_layer_graphs_valid: bool,
+    /// Whether graphs have ever been successfully captured (for cross-request reuse).
+    /// After the first capture, KV cache and LA state buffer addresses are stable
+    /// (KV is allocated once at model load; LA Rust-side FP32 buffers use copy_()
+    /// in-place after first allocation). So graphs can be reused across requests
+    /// without recapture -- only the scalar params (token_id, pos, seq_len) and
+    /// LA state contents change, both handled via GPU-side indirection buffers.
+    graphs_ever_captured: bool,
+    /// Snapshot of LA state pointers at capture time, for verifying address stability.
+    /// Vec of (layer_idx, conv_state_ptr, recur_state_ptr).
+    captured_la_ptrs: Vec<(usize, u64, u64)>,
+    /// Snapshot of KV cache pointers at capture time, for verifying address stability.
+    /// Vec of (layer_idx, k_ptr, v_ptr).
+    captured_kv_ptrs: Vec<(usize, u64, u64)>,
     /// MoE layer indices (which layers have MoE data).
     per_layer_moe_indices: Vec<usize>,
     /// Persistent cuBLAS workspace for CUDA graph capture (prevents internal cudaMalloc).
@@ -1323,6 +1336,22 @@ pub struct GpuDecodeStore {
     last_min_free_vram_mb: usize,
     /// Four-point VRAM calibration data for runtime budget decisions.
     vram_calibration: Option<VramCalibration>,
+    /// Token IDs to suppress during sampling (logit set to -inf).
+    /// Used to prevent the model from generating turn-boundary tokens
+    /// (e.g. <|im_start|>) which cause phantom new turns in multi-turn chat.
+    suppress_tokens: Vec<usize>,
+    /// Minimum tokens before stop tokens are honored. When > 0, stop token IDs
+    /// are added to suppress_tokens for the first min_new_tokens decode steps.
+    /// Prevents models from bailing out with EOS on early multi-turn tokens.
+    min_new_tokens: usize,
+    /// Stop token IDs (for min_new_tokens suppression). Set per-request.
+    stop_token_ids_for_suppress: Vec<usize>,
+    /// When set, suppress stop tokens until this token ID has been generated.
+    /// Used to force models to close thinking blocks (</think>) before terminating.
+    /// Set per-request; None = disabled.
+    think_end_token_for_suppress: Option<usize>,
+    /// Whether the think_end_token has been seen in the current decode.
+    think_end_seen: bool,
     #[cfg(feature = "gpu-debug")]
     debug_stop_layer: usize,
     #[cfg(feature = "gpu-debug")]
@@ -1559,6 +1588,11 @@ impl GpuDecodeStore {
             spec_jaccard_threshold: 0.15,
             last_min_free_vram_mb: 0,
             vram_calibration: None,
+            suppress_tokens: Vec::new(),
+            min_new_tokens: 0,
+            stop_token_ids_for_suppress: Vec::new(),
+            think_end_token_for_suppress: None,
+            think_end_seen: false,
             #[cfg(feature = "gpu-debug")]
             debug_stop_layer: 0,
             #[cfg(feature = "gpu-debug")]
@@ -1874,6 +1908,9 @@ impl GpuDecodeStore {
             d_dummy_ptrs: None,
             per_layer_graphs: Vec::new(),
             per_layer_graphs_valid: false,
+            graphs_ever_captured: false,
+            captured_la_ptrs: Vec::new(),
+            captured_kv_ptrs: Vec::new(),
             per_layer_moe_indices: Vec::new(),
             d_cublas_workspace: None,
         }));
@@ -3915,6 +3952,26 @@ impl GpuDecodeStore {
         log::info!("Speculative Jaccard threshold set to {:.3}", self.spec_jaccard_threshold);
     }
 
+    /// Set token IDs to suppress during sampling (logit → -inf).
+    /// Prevents the model from generating turn-boundary tokens like <|im_start|>.
+    fn set_suppress_tokens(&mut self, token_ids: Vec<usize>) {
+        if !token_ids.is_empty() {
+            log::info!("Suppress tokens set: {:?}", token_ids);
+        }
+        self.suppress_tokens = token_ids;
+    }
+
+    /// Set min_new_tokens: stop tokens are suppressed for the first N decode steps.
+    /// Set stop_ids each request via set_min_new_tokens_stop_ids before decode.
+    fn set_min_new_tokens(&mut self, n: usize) {
+        self.min_new_tokens = n;
+    }
+
+    /// Set stop token IDs for min_new_tokens suppression (per-request).
+    fn set_min_new_tokens_stop_ids(&mut self, stop_ids: Vec<usize>) {
+        self.stop_token_ids_for_suppress = stop_ids;
+    }
+
     /// Get self pointer for Rust-side access (same pattern as CpuDecodeStore).
     fn gpu_store_addr(&self) -> usize {
         self as *const GpuDecodeStore as usize
@@ -3972,6 +4029,10 @@ impl GpuDecodeStore {
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("gpu_decode_step error: {}", e)))?;
 
+            let suppress = self.suppress_tokens.clone();
+            let min_nt = self.min_new_tokens;
+            let stop_suppress = self.stop_token_ids_for_suppress.clone();
+            let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
             let logits = &mut self.graph.as_mut().unwrap().h_logits;
             if presence_penalty != 0.0 {
                 for &tok in &seen_tokens {
@@ -3980,9 +4041,18 @@ impl GpuDecodeStore {
                     }
                 }
             }
+            for &tok in &suppress {
+                if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
+            }
+            if step < min_nt || think_end_active {
+                for &tok in &stop_suppress {
+                    if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
+                }
+            }
 
             next_token = crate::decode::sample_from_logits_pub(
                 logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+            self.notify_token_generated(next_token);
             seen_tokens.insert(next_token);
             tokens.push(next_token);
 
@@ -4099,9 +4169,11 @@ impl GpuDecodeStore {
                     if tok < vocab_size { logits[tok] -= presence_penalty; }
                 }
             }
+            self.apply_suppress_at_step(logits, vocab_size, step);
 
             next_token = crate::decode::sample_from_logits_pub(
                 logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+            self.notify_token_generated(next_token);
             seen_tokens.insert(next_token);
             tokens.push(next_token);
 
@@ -4333,6 +4405,57 @@ impl GpuDecodeStore {
 // ── Pure-Rust methods for GPU decode (no PyO3, used by Rust HTTP server) ──
 
 impl GpuDecodeStore {
+    /// Set min_new_tokens and stop_ids for suppression (called from Rust server code).
+    pub fn set_min_new_tokens_ext(&mut self, n: usize, stop_ids: Vec<usize>) {
+        self.min_new_tokens = n;
+        self.stop_token_ids_for_suppress = stop_ids;
+    }
+
+    /// Configure think-end suppression: suppress stop tokens until think_end_id is generated.
+    /// Call before each decode when thinking is enabled. Pass None to disable.
+    pub fn set_think_end_suppress(&mut self, think_end_id: Option<usize>) {
+        self.think_end_token_for_suppress = think_end_id;
+        self.think_end_seen = false;
+    }
+
+    /// Notify that a token was generated — checks for think_end_token.
+    #[inline]
+    pub fn notify_token_generated(&mut self, token_id: usize) {
+        if let Some(te) = self.think_end_token_for_suppress {
+            if token_id == te {
+                self.think_end_seen = true;
+            }
+        }
+    }
+
+    /// Apply token suppression to logits (set to -inf).
+    /// Called before sampling to prevent the model from generating turn-boundary tokens.
+    /// `step` is the decode step number (0-based) — used for min_new_tokens.
+    #[inline]
+    fn apply_suppress_at_step(&self, logits: &mut [f32], vocab_size: usize, step: usize) {
+        for &tok in &self.suppress_tokens {
+            if tok < vocab_size {
+                logits[tok] = f32::NEG_INFINITY;
+            }
+        }
+        // Suppress stop tokens for the first min_new_tokens steps
+        if step < self.min_new_tokens {
+            for &tok in &self.stop_token_ids_for_suppress {
+                if tok < vocab_size {
+                    logits[tok] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        // Suppress stop tokens until </think> has been generated
+        if self.think_end_token_for_suppress.is_some() && !self.think_end_seen {
+            for &tok in &self.stop_token_ids_for_suppress {
+                if tok < vocab_size {
+                    logits[tok] = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+
     /// Upload Marlin INT8 repacked weights to GPU and register.
     fn _finish_register_marlin_int8(
         &mut self, m: crate::weights::marlin::MarlinRepacked,
@@ -4905,7 +5028,60 @@ impl GpuDecodeStore {
                 unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
             }
             graph.per_layer_graphs_valid = false;
+            // NOTE: graphs_ever_captured stays true -- we keep the snapshot for diagnostics
         }
+    }
+
+    /// Verify that all LA and KV pointers baked into captured CUDA graphs are still valid.
+    /// Returns true if graphs can be safely reused, false if recapture is needed.
+    fn verify_graph_pointers(&self) -> bool {
+        let graph = match self.graph.as_ref() {
+            Some(g) => g,
+            None => return false,
+        };
+        if !graph.graphs_ever_captured || graph.per_layer_graphs.is_empty() {
+            return false;
+        }
+
+        // Check LA state pointers
+        for &(li, captured_conv, captured_recur) in &graph.captured_la_ptrs {
+            if li >= graph.layers.len() {
+                eprintln!("[krasis] graph-reuse: LA layer {} out of range", li);
+                return false;
+            }
+            match &graph.layers[li].attn {
+                GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
+                    if *conv_state_ptr != captured_conv || *recur_state_ptr != captured_recur {
+                        eprintln!("[krasis] graph-reuse: LA layer {} ptrs changed! \
+                            conv: 0x{:x}→0x{:x}, recur: 0x{:x}→0x{:x}",
+                            li, captured_conv, *conv_state_ptr,
+                            captured_recur, *recur_state_ptr);
+                        return false;
+                    }
+                }
+                _ => {
+                    eprintln!("[krasis] graph-reuse: layer {} no longer LA", li);
+                    return false;
+                }
+            }
+        }
+
+        // Check KV cache pointers
+        for &(li, captured_k, captured_v) in &graph.captured_kv_ptrs {
+            if li >= graph.kv_k_ptrs.len() {
+                eprintln!("[krasis] graph-reuse: KV layer {} out of range", li);
+                return false;
+            }
+            if graph.kv_k_ptrs[li] != captured_k || graph.kv_v_ptrs[li] != captured_v {
+                eprintln!("[krasis] graph-reuse: KV layer {} ptrs changed! \
+                    k: 0x{:x}→0x{:x}, v: 0x{:x}→0x{:x}",
+                    li, captured_k, graph.kv_k_ptrs[li],
+                    captured_v, graph.kv_v_ptrs[li]);
+                return false;
+            }
+        }
+
+        true
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -5147,6 +5323,29 @@ impl GpuDecodeStore {
 
         graph.per_layer_graphs = captured_graphs;
         graph.per_layer_graphs_valid = true;
+        graph.graphs_ever_captured = true;
+
+        // Snapshot LA and KV pointers at capture time for cross-request reuse verification.
+        // If these pointers are stable across requests (they should be: KV is allocated once,
+        // LA Rust-side FP32 buffers use copy_() in-place), we can skip recapture.
+        graph.captured_la_ptrs.clear();
+        graph.captured_kv_ptrs.clear();
+        for (li, layer) in graph.layers.iter().enumerate() {
+            match &layer.attn {
+                GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
+                    graph.captured_la_ptrs.push((li, *conv_state_ptr, *recur_state_ptr));
+                }
+                GpuAttnConfig::GQA { .. } => {
+                    if li < graph.kv_k_ptrs.len() && graph.kv_k_ptrs[li] != 0 {
+                        graph.captured_kv_ptrs.push((li, graph.kv_k_ptrs[li], graph.kv_v_ptrs[li]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        eprintln!("[krasis] Pointer snapshot: {} LA ptrs, {} KV ptrs",
+            graph.captured_la_ptrs.len(), graph.captured_kv_ptrs.len());
+
         self.graph = Some(graph);
         eprintln!("[krasis] Per-layer graphs captured: {} graphs", num_graphs);
         Ok(())
@@ -7779,6 +7978,24 @@ impl GpuDecodeStore {
             rng_state
         };
 
+        // CUDA graph reuse: verify pointer stability on both GPUs before reusing.
+        let gpu0_reuse = self.verify_graph_pointers();
+        let gpu1_reuse = aux_store.verify_graph_pointers();
+        if gpu0_reuse && gpu1_reuse {
+            eprintln!("[krasis] CUDA graphs reused on both GPUs (ptrs verified stable)");
+        } else {
+            if !gpu0_reuse {
+                let was = self.graph.as_ref().map(|g| g.graphs_ever_captured).unwrap_or(false);
+                if was { eprintln!("[krasis] GPU0 graph ptrs changed — invalidating"); }
+                self.invalidate_cuda_graph();
+            }
+            if !gpu1_reuse {
+                let was = aux_store.graph.as_ref().map(|g| g.graphs_ever_captured).unwrap_or(false);
+                if was { eprintln!("[krasis] GPU1 graph ptrs changed — invalidating"); }
+                aux_store.invalidate_cuda_graph();
+            }
+        }
+
         let mut detok = crate::server::StreamDetokenizer::new(tokenizer);
         let mut seen_tokens: std::collections::HashSet<usize> = std::collections::HashSet::new();
         seen_tokens.insert(first_token);
@@ -7997,9 +8214,11 @@ impl GpuDecodeStore {
                     if tok < vocab_size { logits[tok] -= presence_penalty; }
                 }
             }
+            self.apply_suppress_at_step(logits, vocab_size, generated);
 
             let target_pred = crate::decode::sample_from_logits_pub(
                 logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+            self.notify_token_generated(target_pred);
             seen_tokens.insert(target_pred);
             generated += 1;
             next_token = target_pred;
@@ -10038,6 +10257,22 @@ impl GpuDecodeStore {
             rng_state
         };
 
+        // CUDA graph reuse: after the first request, KV cache and LA state buffer
+        // addresses are stable (KV allocated once at model load; LA Rust-side FP32
+        // buffers use copy_() in-place). Verify pointers match capture-time snapshot.
+        // If stable, reuse graphs (skip ~30-40ms recapture overhead per request).
+        // If pointers moved (shouldn't happen), fall back to invalidate + recapture.
+        if self.verify_graph_pointers() {
+            eprintln!("[krasis] CUDA graphs reused from previous request (ptrs verified stable)");
+        } else {
+            let was_captured = self.graph.as_ref()
+                .map(|g| g.graphs_ever_captured).unwrap_or(false);
+            if was_captured {
+                eprintln!("[krasis] CUDA graph ptrs changed — invalidating, will recapture");
+            }
+            self.invalidate_cuda_graph();
+        }
+
         // Reset per-prompt timing accumulators
         {
             let g = self.graph.as_mut().unwrap();
@@ -10180,14 +10415,27 @@ impl GpuDecodeStore {
                         log::error!("gpu_generate_stream: decode_step error: {}", e);
                         break;
                     }
+                    let suppress = self.suppress_tokens.clone();
+                    let min_nt = self.min_new_tokens;
+                    let stop_suppress = self.stop_token_ids_for_suppress.clone();
+                    let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
                     let logits = &mut self.graph.as_mut().unwrap().h_logits;
                     if presence_penalty != 0.0 {
                         for &tok in &seen_tokens {
                             if tok < vocab_size { logits[tok] -= presence_penalty; }
                         }
                     }
+                    for &tok in &suppress {
+                        if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
+                    }
+                    if generated < min_nt || think_end_active {
+                        for &tok in &stop_suppress {
+                            if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
+                        }
+                    }
                     let target_pred = crate::decode::sample_from_logits_pub(
                         logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+                    self.notify_token_generated(target_pred);
                     seen_tokens.insert(target_pred);
                     generated += 1;
                     step += 1;
@@ -10250,6 +10498,12 @@ impl GpuDecodeStore {
                                 graph.h_batch_logits[tok] -= presence_penalty;
                             }
                         }
+                    }
+                }
+                {
+                    let batch_logits = &mut self.graph.as_mut().unwrap().h_batch_logits;
+                    for &tok in &self.suppress_tokens {
+                        if tok < vocab_size { batch_logits[tok] = f32::NEG_INFINITY; }
                     }
                 }
                 let target_pred = crate::decode::sample_from_logits_pub(
@@ -10467,6 +10721,10 @@ impl GpuDecodeStore {
                     }
                 }
 
+                let suppress = self.suppress_tokens.clone();
+                let min_nt = self.min_new_tokens;
+                let stop_suppress = self.stop_token_ids_for_suppress.clone();
+                let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
                 let logits = &mut self.graph.as_mut().unwrap().h_logits;
 
                 #[cfg(feature = "gpu-debug")]
@@ -10490,9 +10748,18 @@ impl GpuDecodeStore {
                         }
                     }
                 }
+                for &tok in &suppress {
+                    if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
+                }
+                if generated < min_nt || think_end_active {
+                    for &tok in &stop_suppress {
+                        if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
+                    }
+                }
 
                 let target_pred = crate::decode::sample_from_logits_pub(
                     logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+                self.notify_token_generated(target_pred);
 
                 seen_tokens.insert(target_pred);
                 generated += 1;

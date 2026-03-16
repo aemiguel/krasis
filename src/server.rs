@@ -732,6 +732,23 @@ fn handle_chat_completion(
         reload_ms,
     };
 
+    // ── Thinking suppression: prevent EOS before </think> ──
+    // When thinking is enabled, the model must generate </think> before it can
+    // terminate with <|im_end|>. Without this, the model puts its answer inside
+    // the thinking block and bails to EOS, resulting in 0 visible answer tokens.
+    if enable_thinking {
+        if let Some(te_id) = state.thinking_end_token {
+            store.set_think_end_suppress(Some(te_id));
+            store.set_min_new_tokens_ext(0, stop_ids.to_vec());
+        } else {
+            store.set_think_end_suppress(None);
+            store.set_min_new_tokens_ext(0, vec![]);
+        }
+    } else {
+        store.set_think_end_suppress(None);
+        store.set_min_new_tokens_ext(0, vec![]);
+    }
+
     // ── GPU decode: GIL-free Rust decode via GpuDecodeStore ──
     handle_gpu_decode(
         stream, is_stream, state, store, tokenizer,
@@ -1366,7 +1383,7 @@ impl RustServer {
 
             // </think> token ID passed from Python (0 = not available)
             let thinking_end_token = if thinking_end_token_id > 0 {
-                eprintln!("[krasis] Thinking end token: </think> = {}", thinking_end_token_id);
+                log::info!("Thinking end token: </think> = {}", thinking_end_token_id);
                 Some(thinking_end_token_id)
             } else {
                 None

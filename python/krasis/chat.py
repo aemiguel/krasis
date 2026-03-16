@@ -782,10 +782,21 @@ def chat_loop(
                 )
                 elapsed = time.perf_counter() - t0
 
-                # Store full model output (including <think> content) in history.
-                # Models expect to see their own thinking in conversation history —
-                # stripping it causes 0 answer tokens on subsequent turns.
-                messages.append({"role": "assistant", "content": raw_text})
+                # Check for degenerate response: model thought but produced no answer.
+                # This happens when the model generates <|im_end|> during thinking
+                # without closing </think>. Don't store the broken response in history
+                # (unclosed <think> tag would corrupt subsequent turns).
+                answer_tokens = timing.get("answer_tokens", -1) if timing else -1
+                think_tokens = timing.get("thinking_tokens", 0) if timing else 0
+                if answer_tokens == 0 and think_tokens > 0:
+                    print(f"\n  {RED}Model produced {think_tokens} thinking tokens but 0 answer tokens.{NC}")
+                    print(f"  {YELLOW}This turn will be retried — not added to history.{NC}")
+                    messages.pop()  # remove the user message, let them try again
+                else:
+                    # Store full model output (including <think> content) in history.
+                    # Models expect to see their own thinking in conversation history —
+                    # stripping it causes 0 answer tokens on subsequent turns.
+                    messages.append({"role": "assistant", "content": raw_text})
 
                 # Show stats from server timing data
                 if timing:
@@ -841,12 +852,59 @@ def _find_prompts_file() -> str:
     )
 
 
+def _parse_prompt_conversations(lines: List[str]) -> List[List[str]]:
+    """Parse prompt lines into conversations.
+
+    Lines starting with '- ' are continuations of the previous conversation
+    (history is maintained). All other non-empty lines start a new conversation.
+
+    Example input:
+        Hi
+        Who trained you?
+        Tell me about blue whales
+        - Tell me more about whales in general
+        - Where do whales live?
+
+    Returns:
+        [["Hi"], ["Who trained you?"],
+         ["Tell me about blue whales", "Tell me more about whales in general", "Where do whales live?"]]
+    """
+    conversations: List[List[str]] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("- "):
+            # Continuation of previous conversation
+            prompt_text = stripped[2:].strip()
+            if not prompt_text:
+                continue
+            if conversations:
+                conversations[-1].append(prompt_text)
+            else:
+                # No previous conversation — treat as new
+                conversations.append([prompt_text])
+        else:
+            # New independent conversation
+            conversations.append([stripped])
+    return conversations
+
+
+def _count_total_prompts(conversations: List[List[str]]) -> int:
+    """Count total number of prompts across all conversations."""
+    return sum(len(conv) for conv in conversations)
+
+
 def run_sanity_test(
     server: Dict[str, Any],
     temperature: float = 0.6,
     max_tokens: int = 16384,
 ):
-    """Submit each prompt from sanity_test_prompts.txt, print and save results."""
+    """Submit each prompt from sanity_test_prompts.txt, print and save results.
+
+    Supports multi-turn conversations: lines starting with '- ' continue the
+    previous conversation with history maintained.
+    """
     from datetime import datetime
     from pathlib import Path
 
@@ -857,10 +915,10 @@ def run_sanity_test(
     with open(prompts_path, "r") as f:
         all_lines = f.readlines()
 
-    # Filter to non-empty lines (skip blank separator lines)
-    prompts = [line.strip() for line in all_lines if line.strip()]
+    conversations = _parse_prompt_conversations(all_lines)
+    total_prompts = _count_total_prompts(conversations)
 
-    if not prompts:
+    if not conversations:
         print(f"  {RED}No prompts found in {prompts_path}{NC}")
         return
 
@@ -876,44 +934,75 @@ def run_sanity_test(
     header = f"Sanity Test: {model} @ {url}\nDate: {datetime.now().isoformat()}\n"
     results.append(header)
 
-    print(f"\n  {BOLD}Sanity Test{NC} — {len(prompts)} prompts")
+    # Count conversations with multiple turns for display
+    multi_turn = sum(1 for c in conversations if len(c) > 1)
+    conv_desc = f"{len(conversations)} conversations ({total_prompts} prompts)"
+    if multi_turn:
+        conv_desc += f", {multi_turn} multi-turn"
+
+    print(f"\n  {BOLD}Sanity Test{NC} — {conv_desc}")
     print(f"  {DIM}Server: {model} @ {url}{NC}")
     print(f"  {DIM}Output: {out_path}{NC}\n")
 
-    for i, prompt in enumerate(prompts, 1):
-        print(f"  {BOLD}━━━ Prompt {i}/{len(prompts)} ━━━{NC}")
-        print(f"  {GREEN}Prompt:{NC} {prompt}")
-        sys.stdout.write(f"  {CYAN}Response:{NC} ")
-        sys.stdout.flush()
+    prompt_num = 0
+    for conv_idx, conversation in enumerate(conversations, 1):
+        messages: List[Dict[str, str]] = []
+        is_multi = len(conversation) > 1
 
-        messages = [{"role": "user", "content": prompt}]
+        if is_multi:
+            print(f"  {BOLD}━━━ Conversation {conv_idx} ({len(conversation)} turns) ━━━{NC}")
 
-        try:
-            t0 = time.perf_counter()
-            display_text, raw_text, timing = stream_chat(
-                url, messages, temperature, max_tokens,
-            )
-            elapsed = time.perf_counter() - t0
-
-            if timing:
-                stats_line = _format_timing(timing)
+        for turn_idx, prompt in enumerate(conversation):
+            prompt_num += 1
+            turn_label = ""
+            if is_multi:
+                turn_label = f" [turn {turn_idx + 1}/{len(conversation)}]"
             else:
-                stats_line = f"WARNING: server did not send krasis_timing"
+                print(f"  {BOLD}━━━ Prompt {prompt_num}/{total_prompts} ━━━{NC}")
 
-            print(f"\n  {DIM}{stats_line}{NC}\n")
+            print(f"  {GREEN}Prompt:{NC} {prompt}{turn_label}")
+            sys.stdout.write(f"  {CYAN}Response:{NC} ")
+            sys.stdout.flush()
 
-            results.append(f"--- Prompt {i}/{len(prompts)} ---")
-            results.append(f"PROMPT: {prompt}")
-            results.append(f"RESPONSE: {display_text}")
-            results.append(f"TIME: {stats_line}")
-            results.append("")
+            messages.append({"role": "user", "content": prompt})
 
-        except Exception as e:
-            print(f"\n  {RED}ERROR: {e}{NC}\n")
-            results.append(f"--- Prompt {i}/{len(prompts)} ---")
-            results.append(f"PROMPT: {prompt}")
-            results.append(f"ERROR: {e}")
-            results.append("")
+            try:
+                t0 = time.perf_counter()
+                display_text, raw_text, timing = stream_chat(
+                    url, messages, temperature, max_tokens,
+                )
+                elapsed = time.perf_counter() - t0
+
+                # Check for degenerate response
+                answer_tokens = timing.get("answer_tokens", -1) if timing else -1
+                think_tokens = timing.get("thinking_tokens", 0) if timing else 0
+                if answer_tokens == 0 and think_tokens > 0:
+                    print(f"\n  {RED}Model produced {think_tokens} thinking tokens but 0 answer tokens.{NC}")
+                    messages.pop()  # remove user message
+                else:
+                    # Store full output (including thinking) in history
+                    messages.append({"role": "assistant", "content": raw_text})
+
+                if timing:
+                    stats_line = _format_timing(timing)
+                else:
+                    stats_line = f"WARNING: server did not send krasis_timing"
+
+                print(f"\n  {DIM}{stats_line}{NC}\n")
+
+                results.append(f"--- Prompt {prompt_num}/{total_prompts}{turn_label} ---")
+                results.append(f"PROMPT: {prompt}")
+                results.append(f"RESPONSE: {display_text}")
+                results.append(f"TIME: {stats_line}")
+                results.append("")
+
+            except Exception as e:
+                print(f"\n  {RED}ERROR: {e}{NC}\n")
+                results.append(f"--- Prompt {prompt_num}/{total_prompts}{turn_label} ---")
+                results.append(f"PROMPT: {prompt}")
+                results.append(f"ERROR: {e}")
+                results.append("")
+                messages.pop()  # remove failed user message
 
     # Write results file
     with open(out_path, "w") as f:
@@ -956,6 +1045,65 @@ def run_single_prompt(
         print(f"{RED}WARNING: server did not send krasis_timing — timing stats unavailable{NC}", file=sys.stderr)
 
 
+def run_file_prompts(
+    server: Dict[str, Any],
+    file_path: str,
+    temperature: float = 0.6,
+    max_tokens: int = 16384,
+    system_prompt: str = "",
+):
+    """Run prompts from a file with multi-turn conversation support.
+
+    Lines starting with '- ' continue the previous conversation with full
+    history. Other lines start fresh conversations.
+    """
+    import pathlib
+
+    fpath = pathlib.Path(file_path)
+    if not fpath.is_file():
+        print(f"Error: file not found: {file_path}", file=sys.stderr)
+        sys.exit(1)
+
+    conversations = _parse_prompt_conversations(fpath.read_text().splitlines())
+    if not conversations:
+        print(f"Error: no prompts found in {file_path}", file=sys.stderr)
+        sys.exit(1)
+
+    url = server["url"]
+    total_prompts = _count_total_prompts(conversations)
+    prompt_num = 0
+
+    for conversation in conversations:
+        messages: List[Dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        for prompt in conversation:
+            prompt_num += 1
+            messages.append({"role": "user", "content": prompt})
+
+            if total_prompts > 1:
+                is_continuation = len(messages) > (2 if system_prompt else 1)
+                prefix = "  >> " if is_continuation else ""
+                print(f"{prefix}{GREEN}[{prompt_num}/{total_prompts}]{NC} {prompt}", file=sys.stderr)
+
+            t0 = time.perf_counter()
+            display_text, raw_text, timing = stream_chat(
+                url, messages, temperature, max_tokens,
+            )
+            elapsed = time.perf_counter() - t0
+
+            sys.stdout.write("\n")
+
+            if timing:
+                print(f"{DIM}{_format_timing(timing)}{NC}", file=sys.stderr)
+            else:
+                print(f"{RED}WARNING: server did not send krasis_timing{NC}", file=sys.stderr)
+
+            # Store response in history for multi-turn
+            messages.append({"role": "assistant", "content": raw_text})
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # CLI entry point
 # ═══════════════════════════════════════════════════════════════════════
@@ -966,6 +1114,35 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Krasis Chat \u2014 interactive streaming chat client",
+        epilog=(
+            "modes:\n"
+            "  (no args)                Interactive chat session\n"
+            "  --prompt \"question\"       Send prompt(s), print response(s), exit\n"
+            "  --file prompts.txt       Run prompts from file (supports multi-turn)\n"
+            "  --sanitytest             Run built-in sanity test prompts\n"
+            "\n"
+            "multi-turn file format:\n"
+            "  Lines starting with '- ' continue the previous conversation\n"
+            "  (history is maintained). Other lines start fresh conversations.\n"
+            "\n"
+            "  Example file:\n"
+            "    Hi\n"
+            "    Tell me about blue whales\n"
+            "    - Tell me more about whales\n"
+            "    - Where do whales live?\n"
+            "    What is 2+2?\n"
+            "\n"
+            "  This runs 3 conversations: 'Hi' alone, 'blue whales' with 2 follow-ups,\n"
+            "  and '2+2' alone. The '- ' prompts see the full conversation history.\n"
+            "\n"
+            "examples:\n"
+            "  krasis chat                             # interactive\n"
+            "  krasis chat --prompt \"hello\"             # single prompt\n"
+            "  krasis chat --prompt \"q1\" \"q2\" \"q3\"      # multiple prompts\n"
+            "  krasis chat --file prompts.txt           # prompts from file\n"
+            "  krasis sanity                            # shortcut for --sanitytest\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--url", default=None,
                         help="Server URL (e.g. http://localhost:8012)")
@@ -982,29 +1159,15 @@ def main():
     parser.add_argument("--prompt", nargs="+", default=None,
                         help="Send one or more prompts, print responses to stdout, and exit (non-interactive)")
     parser.add_argument("--file", default=None,
-                        help="Read prompts from a text file (one per line), run each sequentially")
+                        help="Read prompts from file (lines with '- ' prefix continue previous conversation)")
     args = parser.parse_args()
 
-    # --file: read prompts from file, merge into --prompt list
-    if args.file:
-        import pathlib
-        fpath = pathlib.Path(args.file)
-        if not fpath.is_file():
-            print(f"Error: file not found: {args.file}", file=sys.stderr)
-            sys.exit(1)
-        file_prompts = [line.strip() for line in fpath.read_text().splitlines() if line.strip()]
-        if not file_prompts:
-            print(f"Error: no prompts found in {args.file}", file=sys.stderr)
-            sys.exit(1)
-        # Append to any --prompt args, or replace
-        if args.prompt:
-            args.prompt.extend(file_prompts)
-        else:
-            args.prompt = file_prompts
-
-    # Helper: run sanity test, single prompt, or chat loop based on args
+    # Helper: run sanity test, file prompts, single prompt, or chat loop based on args
     def _run(server):
-        if args.prompt:
+        if args.file:
+            run_file_prompts(server, args.file, args.temperature,
+                             args.max_tokens, args.system)
+        elif args.prompt:
             for prompt in args.prompt:
                 run_single_prompt(server, prompt, args.temperature,
                                   args.max_tokens, args.system)

@@ -1536,26 +1536,6 @@ def main():
             multi_gpu_gqa_offset = gqa_offset
             _status(f"Multi-GPU decode ready (split at layer {split_layer})")
 
-    _status(f"Server ready on {args.host}:{args.port}")
-    if aux_gpu_store_addr:
-        _detail(f"Decode: Multi-GPU  |  HCS: on  |  Max context: {max_ctx:,} tokens")
-        _detail(f"  GPU0 cuda:{device_indices[0]}: layers [0..{multi_gpu_split_layer})")
-        _detail(f"  GPU1 cuda:{device_indices[1]}: layers [{multi_gpu_split_layer}..{len(_model.layers)})")
-    else:
-        _detail(f"Decode: GPU  |  HCS: {'on' if args.hcs else 'off'}  |  Max context: {max_ctx:,} tokens")
-    _dim(f"KV cache: {args.kv_cache_mb:,} MB")
-
-    # ── Session messenger bridge ──
-    _session_proc = None
-    if getattr(args, 'session_enabled', False):
-        _session_proc = _start_session_bridge(args.host, args.port)
-
-    _dim("Press Q or Ctrl-C to stop")
-    logger.info(
-        "Model loaded, starting server on %s:%d (max context: %d, decode: GPU%s)",
-        args.host, args.port, max_ctx, "s (multi-GPU)" if aux_gpu_store_addr else "",
-    )
-
     # ── Server registry: write entry + register cleanup ──
     _write_registry(args.host, args.port, _model_name)
     atexit.register(_remove_registry)
@@ -1581,6 +1561,29 @@ def main():
             logger.info("Template has enable_thinking but no </think> token")
     else:
         logger.info("Model template does not support enable_thinking — thinking budget disabled")
+
+    # Look up turn-boundary tokens to suppress during generation.
+    # Models sometimes generate <|im_start|> during multi-turn thinking,
+    # creating phantom new turns. Suppressing these prevents the issue.
+    _suppress_tokens = []
+    for special_tok in ["<|im_start|>", "<|start_header_id|>", "<|begin_of_text|>"]:
+        _raw_id = _hf_tok.convert_tokens_to_ids(special_tok)
+        if isinstance(_raw_id, int) and _raw_id != _hf_tok.unk_token_id:
+            _suppress_tokens.append(_raw_id)
+    if _suppress_tokens:
+        _model._gpu_decode_store.set_suppress_tokens(_suppress_tokens)
+        _model._suppress_tokens = _suppress_tokens
+        logger.info("Suppress tokens: %s", {tok: _hf_tok.convert_ids_to_tokens(tok) for tok in _suppress_tokens})
+
+    logger.info(
+        "Model loaded, starting server on %s:%d (max context: %d, decode: GPU%s)",
+        args.host, args.port, max_ctx, "s (multi-GPU)" if aux_gpu_store_addr else "",
+    )
+
+    # ── Session messenger bridge ──
+    _session_proc = None
+    if getattr(args, 'session_enabled', False):
+        _session_proc = _start_session_bridge(args.host, args.port)
 
     rust_server = RustServer(
         _model,
@@ -1612,6 +1615,24 @@ def main():
     signal.signal(signal.SIGINT, _handle_exit)
     signal.signal(signal.SIGTERM, _handle_exit)
 
+    # ── Final ready banner (after all setup is done) ──
+    # Brief pause so any async log output settles before the banner
+    time.sleep(1.0)
+    _decode_mode = "Multi-GPU" if aux_gpu_store_addr else "GPU"
+    _hcs_str = "on" if args.hcs else "off"
+    _think_str = "on" if think_end_id else "off"
+    print(flush=True)
+    print(f"  {_BOLD}{_GREEN}{'━' * 54}{_NC}", flush=True)
+    print(f"  {_BOLD}{_GREEN}  KRASIS SERVER READY{_NC}", flush=True)
+    print(f"  {_BOLD}{_GREEN}{'━' * 54}{_NC}", flush=True)
+    print(f"  {_GREEN}Model:{_NC}    {_BOLD}{_model_name}{_NC}", flush=True)
+    print(f"  {_GREEN}Address:{_NC}  {_BOLD}{args.host}:{args.port}{_NC}", flush=True)
+    print(f"  {_GREEN}Context:{_NC}  {max_ctx:,} tokens  |  KV cache: {args.kv_cache_mb:,} MB", flush=True)
+    print(f"  {_GREEN}Decode:{_NC}   {_decode_mode}  |  HCS: {_hcs_str}  |  Think: {_think_str}", flush=True)
+    print(f"  {_BOLD}{_GREEN}{'━' * 54}{_NC}", flush=True)
+    print(f"  {_DIM}Press Q or Ctrl-C to stop{_NC}", flush=True)
+    print(flush=True)
+
     # Q to quit (background thread)
     def _stdin_listener():
         try:
@@ -1641,14 +1662,17 @@ def main():
             if _benchmark_only:
                 rust_server.stop()
             else:
-                _status(f"Server ready on {args.host}:{args.port}")
+                # Re-show ready banner after benchmark output
+                print(flush=True)
+                print(f"  {_BOLD}{_GREEN}{'═' * 50}{_NC}", flush=True)
+                print(f"  {_BOLD}{_GREEN}  SERVER READY — {args.host}:{args.port}{_NC}", flush=True)
+                print(f"  {_BOLD}{_GREEN}{'═' * 50}{_NC}", flush=True)
                 # Show Session ID again so it's visible after benchmark output
                 if getattr(args, 'session_enabled', False):
                     sid_path = Path.home() / ".krasis" / "session_id"
                     if sid_path.is_file():
                         sid = sid_path.read_text().strip()
                         if sid:
-                            _detail("Session messenger: ON")
                             print(f"  {_BOLD}Session ID: {sid}{_NC}", flush=True)
                 _dim("Press Q or Ctrl-C to stop")
 

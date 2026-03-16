@@ -1,10 +1,15 @@
 Hi
-Who trained you?
+- What's your name?
+- Who trained you?
 What is 2+2?
+- Now multiply that by 10
+- And divide the result by 5
 What is the largest animal in the world?
 What is the largest body of water in the world?
 Describe the binary chop algorithm in depth
 If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
 Tell me facts about the blue whale
+- Tell me more about whales in general
+- Where do whales live geographically?
 Write me a quicksort implementation in Rust
 

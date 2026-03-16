@@ -3788,6 +3788,30 @@ class KrasisModel:
         torch.cuda.synchronize()
         prefill_time = time.perf_counter() - t0
 
+        # Suppress turn-boundary tokens (e.g. <|im_start|>) before sampling first token.
+        # Prevents the model from generating phantom new turns in multi-turn chat.
+        suppress = getattr(self, '_suppress_tokens', None)
+        if suppress:
+            for tok_id in suppress:
+                if tok_id < next_logits.shape[-1]:
+                    next_logits[..., tok_id] = float('-inf')
+
+        # Multi-turn thinking fix: also suppress newline (198) and stop tokens
+        # for the first generated token. Without this, the model generates \n → EOS
+        # on multi-turn conversations, producing empty responses.
+        # Only apply when thinking is enabled AND there are multiple user turns.
+        if enable_thinking:
+            user_count = sum(1 for m in parsed if m.get("role") == "user")
+            if user_count > 1:
+                # Suppress newline — forces model to start with content word
+                newline_id = 198  # \n in Qwen tokenizer
+                if newline_id < next_logits.shape[-1]:
+                    next_logits[..., newline_id] = float('-inf')
+                # Suppress stop tokens — prevents immediate EOS bail-out
+                for tok_id in stop_ids:
+                    if tok_id < next_logits.shape[-1]:
+                        next_logits[..., tok_id] = float('-inf')
+
         # Sample first token
         first_token = sample(
             next_logits, temperature, top_k, top_p,
