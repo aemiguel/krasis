@@ -163,6 +163,8 @@ releases = json.loads(sys.stdin.read())
 if isinstance(releases, dict) and "message" in releases:
     print(json.dumps(releases))
     sys.exit(0)
+# Sort by published_at descending — GitHub API order is unreliable
+releases.sort(key=lambda r: r.get("published_at", ""), reverse=True)
 for r in releases:
     if r.get("prerelease", False):
         print(json.dumps(r))
