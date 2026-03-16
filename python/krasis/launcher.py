@@ -1528,6 +1528,7 @@ def parse_args() -> argparse.Namespace:
             "subcommands (use before any flags):\n"
             "  krasis                  Launch interactive TUI configurator\n"
             "  krasis chat [args]      Chat client (connect to running server)\n"
+            "  krasis sanity           Run sanity test prompts against running server\n"
             "  krasis kill             Terminate all running krasis instances\n"
             "\n"
             "examples:\n"
@@ -1535,6 +1536,7 @@ def parse_args() -> argparse.Namespace:
             "  krasis --config model.conf          # non-interactive with config file\n"
             "  krasis chat                         # chat with running server\n"
             "  krasis chat --port 8013             # chat on non-default port\n"
+            "  krasis sanity                       # run sanity test prompts\n"
             "  krasis kill                         # stop all krasis processes\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1804,11 +1806,12 @@ def _do_kill():
         # Skip dev script itself (bash ./dev ...)
         if cmdline.startswith("bash") and "/dev " in cmdline:
             continue
-        # Must be a Python/krasis process, not e.g. vim editing a krasis file
+        # Must be an actual krasis server/chat/launcher process
+        # NOT anything that just has "krasis" in a file path (e.g. HF downloads to ~/.krasis/)
         is_krasis = False
-        if "python" in cmdline and "krasis" in cmdline:
+        if "python" in cmdline and ("krasis.launcher" in cmdline or "krasis.server" in cmdline or "krasis.chat" in cmdline or "-m krasis" in cmdline):
             is_krasis = True
-        elif cmdline.strip().startswith("krasis"):
+        elif cmdline.strip().startswith("krasis ") or cmdline.strip() == "krasis":
             is_krasis = True
         if not is_krasis:
             continue
@@ -1843,6 +1846,12 @@ def main():
     # Handle subcommands early — before argparse, no GPU detection needed
     if len(sys.argv) > 1 and sys.argv[1] == "chat":
         sys.argv = [sys.argv[0]] + sys.argv[2:]  # strip "chat" from argv
+        from krasis.chat import main as chat_main
+        chat_main()
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "sanity":
+        sys.argv = [sys.argv[0], "--sanitytest"] + sys.argv[2:]
         from krasis.chat import main as chat_main
         chat_main()
         return

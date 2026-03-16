@@ -1054,11 +1054,18 @@ fn handle_gpu_decode(
             0.0
         };
         let decode_ms = elapsed * 1000.0;
+        let prefill_tok_s = if overhead.prefill_ms > 0.0 && prompt_len > 0 {
+            prompt_len as f64 / (overhead.prefill_ms / 1000.0)
+        } else {
+            0.0
+        };
         let overhead_total_ms = overhead.parse_ms + overhead.evict_ms + overhead.prefill_ms + overhead.reload_ms;
         let timing_chunk = format!(
-            r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[],"krasis_timing":{{"decode_tokens":{},"decode_time_ms":{:.1},"decode_tok_s":{:.2},"total_generated":{},"prompt_tokens":{},"overhead_ms":{:.1},"overhead":{{"parse_ms":{:.1},"evict_ms":{:.1},"prefill_ms":{:.1},"reload_ms":{:.1}}}}}}}"#,
+            r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[],"krasis_timing":{{"decode_tokens":{},"decode_time_ms":{:.1},"decode_tok_s":{:.2},"thinking_tokens":{},"answer_tokens":{},"total_generated":{},"prompt_tokens":{},"prefill_tok_s":{:.1},"overhead_ms":{:.1},"overhead":{{"parse_ms":{:.1},"evict_ms":{:.1},"prefill_ms":{:.1},"reload_ms":{:.1}}}}}}}"#,
             request_id, created, model_name,
-            decode_token_count, decode_ms, decode_tok_s, total_gen, prompt_len,
+            decode_token_count, decode_ms, decode_tok_s,
+            thinking_token_count, answer_token_count,
+            total_gen, prompt_len, prefill_tok_s,
             overhead_total_ms,
             overhead.parse_ms, overhead.evict_ms, overhead.prefill_ms, overhead.reload_ms
         );

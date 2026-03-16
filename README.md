@@ -6,36 +6,53 @@ You can [contact me here](https://forms.gle/ue4nvyvNNHtUZ7MQ7) but for bugs, dif
 
 If you want to easily monitor Krasis during runs, [check out ktop](https://github.com/brontoguana/ktop).
 
-![Krasis Server](krasis_server_2.png)
+![Krasis Server](krasis_server_3.png)
 
-## Krasis runs MoE LLMs fast on consumer level hardware
+## Krasis runs MoE LLMs fast on consumer grade hardware (single GPU)
 
-Krasis can run MoE language models that are much too large to fit in a consumer GPU (multi-hundred gigabyte modesl with 80- 500+ billion parameters) on consumer or accessible server hardware that doesn't require the huge cost to host the entire model in VRAM. 
+Krasis can run MoE language models that are much too large to fit in a consumer GPU (multi-hundred gigabyte model with 80- 500+ billion parameters) on consumer or accessible server hardware that doesn't require the huge cost to host the entire model in VRAM. 
 
-## Results vs Llama.cpp
+## Results vs Llama.cpp (1x RTX 5090 on PCIE 4.0)
 
+System specification:
 
+- 1x Epyc 7742
+- 8 channels system RAM (not heavily used by Krasis since Krasis now runs both prefill and decode on GPU)
+- 1x 5090 on PCIE 4.0 (bottlenecked to 32GB/sec since the 5090 support PCIE 5.0 at 64GB/sec)
+- **Most models (Qwen-3.5-35B at Q4 being the exception) are unable to entirely fit in GPU VRAM.**  
+  - In this case Llama **allocates some layers to the GPU and runs the rest on CPU**.
+  - Krasis instead **streams through VRAM** as necessary using algorithms optimised for the prefill stage and then the decode stage.
+- Model:
+  - Q4 model (BF16 attention in Krasis - AWQ is also supported for more limited VRAM cards)
+- Llama params:
+  - -ngl 99 -ncmoe -t 48 --mlock -fa on 
 
+### Krasis results (1x 5090 32GB, PCIE 4.0 only):
 
+| Model                 | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)   | Factor                  |
+| :-------------------- | :----: | :-------------------: | ------------ | ------------- | ----------------------- |
+| **Qwen3.5-35B-A3B**   |  35B   |     67 GB / 16GB      | 4475 tok/sec | 109.1 tok/sec | **4.59x pp / 3.6x tg**  |
+| **Qwen3-Coder-Next**  |  80B   |     159 GB / 38GB     | 3560 tok/sec | 70.3 tok/sec  | **6.92x pp / 3.78x tg** |
+| **Qwen3.5-122B-A10B** |  122B  |     234 GB / 56GB     | 2897 tok/sec | 27.7 tok/sec  |                         |
+| **Qwen3-235B-A22B**   |  235B  |    438 GB / 110GB     | 2124 tok/sec | 9.3 tok/sec   |                         |
 
-## Why LLM's run slow, and how Krasis runs them fast
+### Llama.cpp results (1x 5090 32GB, PCIE 4.0 only):
 
-LLM model operation consist of two key steps:
+| Model                 | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)  |
+| --------------------- | :----: | :-------------------: | ------------ | ------------ |
+| **Qwen3.5-35B-A3B**   |  35B   |     67 GB / 16GB      | 974 tok/sec  | 30.3 tok/sec |
+| **Qwen3-Coder-Next**  |  80B   |     159 GB / 38GB     | 514 tok/sec  | 18.6 tok/sec |
+| **Qwen3.5-122B-A10B** |  122B  |     234 GB / 56GB     | ? tok/sec    | ? tok/sec    |
+| **Qwen3-235B-A22B**   |  235B  |    438 GB / 110GB     | ? tok/sec    | ? tok/sec    |
 
-1) Prefill (handling potentially large amounts of input coming into the model)
-2) Decode (handling the generation of text after processing the input data)
+### Krasis results (1x **5080 16GB**, PCIE 4.0 only, compared to Llama.cpp on 32GB 5090)
 
-These are essentially the **LLM reading (prefill) and writing (decode)**.
-
-Prefill is best handled by the GPUs (large amounts of very parallel matrix multiplication), but on typical LLM runtimes its not possible to do more than offload a little of the large model onto the GPU.
-
-The GPU runs part of the model fast, then the CPU runs most of the model at a snail's pace.
-
-The result is if you enter a simple chat prompt it may respond in a reasonable time, but **if you hand it a file to read or try to work with it in an IDE, you wait minutes for it to even start generating text.**
-
-Krasis employs a different approach that utilises the GPU and system RAM more heavily which results in much faster prefill times.  In practice this means the model will generate text at a similar speed (faster in some cases due to other optimisations) **but you wait much less time for an answer, and the model can read files much more quickly.**
+| Model               | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)  | Factor              |
+| ------------------- | :----: | :-------------------: | ------------ | ------------ | ------------------- |
+| **Qwen3.5-35B-A3B** |  35B   |     67 GB / 16GB      | 2246 tok/sec | 38.8 tok/sec | **2.3x pp / 1.28x** |
 
 ## Krasis tradeoffs
+
 In order to achieve these speeds, Krasis has a few requirements.
 
 - Krasis currently only works with **NVidia GPUs**
@@ -44,24 +61,6 @@ In order to achieve these speeds, Krasis has a few requirements.
 - Krasis **will take some time to load on the first run** as it is doing a lot of pre-run work to optimise everything for runtime, much of this is cached for later runs though so subsequent runs will be quicker.
 - Krasis optimises models and caches them in <home folder>/.krasis, these can be large so you may need disk space for the original model BF16 model plus the quantised model size.
 - **Krasis is optimised to run models at Q4 and Q8**, which are generally very good trade-offs vs either running the full precision weights or heavily quantised models much lowered quality.
-
-## Supported Models
-
-| Model | Params | BF16 Size | Experts | Attention | Status |
-|-------|:------:|:---------:|---------|-----------|--------|
-| **Qwen3-Coder-Next** | 80B | 148 GB | 512 routed, top-10 | Hybrid (36 linear + 12 GQA) | Tested | 
-| **Qwen3.5-35B-A3B** | 35B | 67 GB | 256 routed, top-8 | Hybrid (30 linear + 10 GQA) | Partially Tested |
-| **Qwen3-235B-A22B** | 235B | 438 GB | 128 routed, top-8 | GQA | Partially Tested |
-| **DeepSeek V2-Lite** | 16B | 29 GB | 64 + 2 shared, top-6 | MLA | Partially Tested |
-
-## Models in progress
-
-| Model | Params | BF16 Size | Experts | Attention |
-|-------|:------:|:---------:|---------|-----------|
-| **GLM-4.7** | 355B | ? GB | ? | ? |
-| **GPT-OSS-120B** | 120B | ? GB | ? | ? |
-| **DeepSeek-VL2** | 27B | ? GB | ? | ? |
-| **DeepSeek-V3.2** | 685B | ? GB | ? | ? |
 
 ## Perplexity (Quantization Quality)
 
@@ -74,46 +73,6 @@ Measured with INT4 GPU + INT4 CPU experts (Q4), BF16 attention, INT8 shared/MLP/
 | **DeepSeek V2-Lite** | WikiText-2 | 307K | 6.03 | 2.59 |
 | **DeepSeek V2-Lite** | C4 validation | 500K | 9.22 | 3.20 |
 | **Qwen3.5-35B-A3B** | WikiText-2 | 297K | 6.41 | 2.68 |
-
-## Benchmark: AMD 5900X + 1x RTX 5080 16GB
-
-- **Hardware:** AMD 5900X (16 cores), DDR4-3200 2-channel, 1x NVIDIA RTX 5080 16 GB, PCIe 4.0 x16.
-- **Config:** BF16 attention, FP8 KV cache, INT8 shared/MLP/lm_head, LGS=2, 16 CPU threads.
-
-Benchmark uses 10K–50K token prompts (prefill) and 64-token generation runs (decode). Prefill speed is best of 20K/35K/50K. Decode is average of 3 runs with different prompts.
-
-| Model | Expert Quant | Prefill (tok/s) | Decode (tok/s) | ms/tok | Notes |
-|-------|:------------:|:---------------:|:--------------:|:------:|:-----:|
-| **Qwen3-Coder-Next** | INT4 GPU + INT4 CPU | 3,595 | 14.7 | 68 | - |
-| **Qwen3.5-35B-A3B**  | INT4 GPU + INT4 CPU | 2,295 | 7.11 | 140 | (Windows via WSL) |
-| **DeepSeek V2-Lite** | INT4 GPU + INT4 CPU | - | - | - | - |
-
-## Benchmark: EPYC 7742 + 1x RTX 5090 32 GB (GPU Decode)
-
-- **Hardware:** AMD EPYC 7742 (64 cores, 4 NUMA nodes), DDR4-2666 8-channel, 1x NVIDIA RTX 5090 32 GB, PCIe 4.0 x16.
-- **Config:** BF16 attention, FP8 KV cache, INT8 shared/MLP/lm_head, LGS=2, GPU decode (Rust, zero GIL), HCS expert pinning, pinned DMA.
-
-GPU decode streams MoE experts over PCIe while compute runs on VRAM-resident weights. The 5090's 32 GB VRAM holds attention, embeddings, norms, and ~40% of experts permanently.
-
-| Model | Expert Quant | Prefill (tok/s) | Decode (tok/s) | ms/tok | Notes |
-|-------|:------------:|:---------------:|:--------------:|:------:|:-----:|
-| **Qwen3-Coder-Next** | INT4 GPU + INT4 CPU | 2,022–3,636 | 30.4 | 33 | HCS 40%, ~5s layer streaming TTFT |
-
-## Benchmark: EPYC 7742 + 1x RTX 2000 Ada 16 GB
-
-- **Hardware:** AMD EPYC 7742 (64 cores, 4 NUMA nodes), DDR4-2666 8-channel, 1x NVIDIA RTX 2000 Ada 16 GB, PCIe 4.0 x8.
-- **Config:** BF16 attention, FP8 KV cache, INT8 shared/MLP/lm_head, LGS=2, 40 CPU threads, NUMA-aware thread pinning (required NPS4) + interleaved allocation.
-
-Benchmark uses 10K–50K token prompts (prefill) and 64-token generation runs (decode). Prefill speed is best of 20K/35K/50K. Decode is average of 3 runs with different prompts.
-
-| Model | Expert Quant | Prefill (tok/s) | TTFT | Decode (tok/s) | ms/tok |
-|-------|:------------:|:---------------:|:----------:|:--------------:|:------:|
-| **Qwen3-Coder-Next** | INT4 GPU + INT4 CPU | 1,060 | 18.9s | 15.81 | 63.6 |
-| **Qwen3-Coder-Next** | INT8 GPU + INT8 CPU | 873 | 40.1s | 12.41 | 80.6 |
-| **Qwen3.5-35B-A3B** | INT4 GPU + INT4 CPU | 1374 | 14.56s | 15.04 | 66.6 |
-| **Qwen3-235B-A22B** | INT4 GPU + INT4 CPU | 289 | 69.13s | 3.36 | 298.3 |
-| **DeepSeek V2-Lite** | INT4 GPU + INT4 CPU | 1,477 | 13.6s | 20.18 | 49.7 |
-| **DeepSeek V2-Lite** | INT8 GPU + INT8 CPU | 1,317 | 15.2s | 17.84 | 56.2 |
 
 ## Running Krasis - Quick Start
 

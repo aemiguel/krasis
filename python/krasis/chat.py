@@ -451,8 +451,9 @@ def stream_chat(
 ) -> tuple:
     """Send streaming chat request. Prints tokens as they arrive.
 
-    Returns (display_text, raw_text) — display_text has channel markers
+    Returns (display_text, raw_text, timing) — display_text has channel markers
     stripped (only 'final' channel shown). raw_text is the full model output.
+    timing is a dict with server-side stats (or None if not available).
     """
     host, port, ssl = _parse_host_port(url)
 
@@ -483,6 +484,7 @@ def stream_chat(
 
         raw_text = ""
         display_text = ""
+        timing = None
         cf = ChannelFilter()
         _THINKING = "(thinking...) "
         _thinking_shown = False
@@ -521,6 +523,11 @@ def stream_chat(
             except json.JSONDecodeError:
                 continue
 
+            # Capture server-side timing if present
+            if "krasis_timing" in obj:
+                timing = obj["krasis_timing"]
+                continue
+
             choices = obj.get("choices", [])
             if not choices:
                 continue
@@ -548,7 +555,9 @@ def stream_chat(
                     display_text += visible
 
             if choices[0].get("finish_reason"):
-                break
+                # Don't break yet — timing chunk comes after finish_reason.
+                # Continue reading until [DONE] or stream ends.
+                continue
 
         # Flush any remaining buffered text
         remaining = cf.flush()
@@ -560,7 +569,7 @@ def stream_chat(
             sys.stdout.flush()
             display_text += remaining
 
-        return display_text, raw_text
+        return display_text, raw_text, timing
     finally:
         conn.close()
 
@@ -601,6 +610,41 @@ def _estimate_message_tokens(messages: List[Dict[str, str]]) -> int:
         # ~4 tokens per message for role/formatting overhead
         total += 4 + _estimate_tokens(msg.get("content", ""))
     return total
+
+
+def _format_time(ms: float) -> str:
+    """Format milliseconds as ms or s depending on magnitude."""
+    if ms < 1000:
+        return f"{ms:.0f}ms"
+    return f"{ms / 1000:.1f}s"
+
+
+def _format_timing(timing: dict, elapsed: float = 0) -> str:
+    """Format server timing into compact single-line format.
+
+    Example: (pp: 21t 682ms 31t/s - tg 980t>12t 12s 89.2t/s)
+    """
+    prompt_tok = timing.get("prompt_tokens", 0)
+    prefill_ms = timing.get("overhead", {}).get("prefill_ms", 0)
+    prefill_tps = timing.get("prefill_tok_s", 0)
+
+    decode_ms = timing.get("decode_time_ms", 0)
+    decode_tps = timing.get("decode_tok_s", 0)
+    think_tok = timing.get("thinking_tokens", 0)
+    answer_tok = timing.get("answer_tokens", 0)
+
+    parts = []
+    if prefill_ms > 0:
+        parts.append(f"pp: {prompt_tok}t {_format_time(prefill_ms)} {prefill_tps:.0f}t/s")
+    if decode_ms > 0:
+        if think_tok > 0:
+            tok_desc = f"{think_tok}t>{answer_tok}t"
+        else:
+            tok_desc = f"{answer_tok}t"
+        parts.append(f"tg: {tok_desc} {_format_time(decode_ms)} {decode_tps:.1f}t/s")
+    return "(" + " - ".join(parts) + ")"
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -733,7 +777,7 @@ def chat_loop(
 
             try:
                 t0 = time.perf_counter()
-                display_text, raw_text = stream_chat(
+                display_text, raw_text, timing = stream_chat(
                     url, messages, temperature, max_tokens,
                 )
                 elapsed = time.perf_counter() - t0
@@ -741,16 +785,12 @@ def chat_loop(
                 # Store clean display text in history (not raw channel markers)
                 messages.append({"role": "assistant", "content": display_text})
 
-                # Rough token estimate for stats
-                approx_tokens = max(1, len(display_text) // 4)
-                if elapsed > 0:
-                    tps = approx_tokens / elapsed
-                    print(
-                        f"\n  {DIM}(~{approx_tokens} tokens, "
-                        f"{elapsed:.1f}s, ~{tps:.1f} tok/s){NC}\n"
-                    )
+                # Show stats from server timing data
+                if timing:
+                    print(f"\n  {DIM}{_format_timing(timing)}{NC}", end="")
                 else:
-                    print("\n")
+                    print(f"\n  {RED}WARNING: server did not send krasis_timing — timing stats unavailable{NC}", end="")
+                print("\n")
 
             except (ConnectionRefusedError, OSError) as e:
                 print(f"\n\n  {RED}Connection lost: {e}{NC}")
@@ -848,19 +888,22 @@ def run_sanity_test(
 
         try:
             t0 = time.perf_counter()
-            display_text, raw_text = stream_chat(
+            display_text, raw_text, timing = stream_chat(
                 url, messages, temperature, max_tokens,
             )
             elapsed = time.perf_counter() - t0
-            approx_tokens = max(1, len(display_text) // 4)
-            tps = approx_tokens / elapsed if elapsed > 0 else 0
 
-            print(f"\n  {DIM}({elapsed:.1f}s, ~{approx_tokens} tok, ~{tps:.1f} tok/s){NC}\n")
+            if timing:
+                stats_line = _format_timing(timing)
+            else:
+                stats_line = f"WARNING: server did not send krasis_timing"
+
+            print(f"\n  {DIM}{stats_line}{NC}\n")
 
             results.append(f"--- Prompt {i}/{len(prompts)} ---")
             results.append(f"PROMPT: {prompt}")
             results.append(f"RESPONSE: {display_text}")
-            results.append(f"TIME: {elapsed:.1f}s, ~{approx_tokens} tok, ~{tps:.1f} tok/s")
+            results.append(f"TIME: {stats_line}")
             results.append("")
 
         except Exception as e:
@@ -875,6 +918,40 @@ def run_sanity_test(
         f.write("\n".join(results) + "\n")
 
     print(f"  {BOLD}Results saved to:{NC} {out_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Single prompt (non-interactive)
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_single_prompt(
+    server: Dict[str, Any],
+    prompt: str,
+    temperature: float = 0.6,
+    max_tokens: int = 16384,
+    system_prompt: str = "",
+):
+    """Send a single prompt, print response to stdout, and exit."""
+    url = server["url"]
+    messages: List[Dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    t0 = time.perf_counter()
+    display_text, raw_text, timing = stream_chat(
+        url, messages, temperature, max_tokens,
+    )
+    elapsed = time.perf_counter() - t0
+
+    # End with newline after streamed content
+    sys.stdout.write("\n")
+
+    # Print timing stats to stderr so stdout stays clean for piping
+    if timing:
+        print(f"{DIM}{_format_timing(timing)}{NC}", file=sys.stderr)
+    else:
+        print(f"{RED}WARNING: server did not send krasis_timing — timing stats unavailable{NC}", file=sys.stderr)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -900,11 +977,36 @@ def main():
                         help="Initial system prompt")
     parser.add_argument("--sanitytest", action="store_true",
                         help="Run sanity test: submit prompts from benchmarks/sanity_test_prompts.txt")
+    parser.add_argument("--prompt", nargs="+", default=None,
+                        help="Send one or more prompts, print responses to stdout, and exit (non-interactive)")
+    parser.add_argument("--file", default=None,
+                        help="Read prompts from a text file (one per line), run each sequentially")
     args = parser.parse_args()
 
-    # Helper: run sanity test or chat loop based on args
+    # --file: read prompts from file, merge into --prompt list
+    if args.file:
+        import pathlib
+        fpath = pathlib.Path(args.file)
+        if not fpath.is_file():
+            print(f"Error: file not found: {args.file}", file=sys.stderr)
+            sys.exit(1)
+        file_prompts = [line.strip() for line in fpath.read_text().splitlines() if line.strip()]
+        if not file_prompts:
+            print(f"Error: no prompts found in {args.file}", file=sys.stderr)
+            sys.exit(1)
+        # Append to any --prompt args, or replace
+        if args.prompt:
+            args.prompt.extend(file_prompts)
+        else:
+            args.prompt = file_prompts
+
+    # Helper: run sanity test, single prompt, or chat loop based on args
     def _run(server):
-        if args.sanitytest:
+        if args.prompt:
+            for prompt in args.prompt:
+                run_single_prompt(server, prompt, args.temperature,
+                                  args.max_tokens, args.system)
+        elif args.sanitytest:
             run_sanity_test(server, args.temperature, args.max_tokens)
         else:
             chat_loop(server, args.temperature, args.max_tokens, args.system)

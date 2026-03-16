@@ -14,7 +14,10 @@
 #   ./dev perplexity <config>       Run perplexity eval (WikiText-2 by default) and exit
 #   ./dev release-test <model>      Run full release test (4 configs, produces report)
 #   ./dev awq-calibrate <config>    Run AWQ calibration, produce attention template
+#   ./dev chat [args]               Run krasis chat from source
+#   ./dev sanity                    Run sanity test prompts against running server
 #   ./dev kill                      Kill all krasis processes and free GPU memory
+#   ./dev install                   Sync krasis command to ~/.local/bin (uses source)
 #   ./dev shell                     Drop into a Python shell with the dev env
 #   ./dev python <args...>          Run arbitrary Python with the dev env
 #
@@ -510,7 +513,10 @@ case "$cmd" in
         echo "  test <config>             Short model test (benchmark + network tests)"
         echo "  test <config> --thorough  Thorough test (+ stress + large prompts)"
         echo "  network <port> [flags]    Run network tests against running server"
+        echo "  chat [args]               Run krasis chat from source"
+        echo "  sanity                    Run sanity test prompts against running server"
         echo "  kill                      Kill all krasis/GPU processes, reset if needed"
+        echo "  install                   Sync krasis command to ~/.local/bin (uses source)"
         echo "  shell                     Python shell with dev env"
         echo "  python <args>             Run Python with dev env"
         echo ""
@@ -536,6 +542,19 @@ case "$cmd" in
         echo "  ./dev python -m krasis.launcher"
         ;;
     kill)       do_kill ;;
+    chat)       exec "$PYTHON" -m krasis.chat "$@" ;;
+    sanity)     exec "$PYTHON" -m krasis.chat --sanitytest "$@" ;;
+    install)
+        info "Installing krasis command to ~/.local/bin/krasis..."
+        mkdir -p "$HOME/.local/bin"
+        # Symlink so installed command is always identical to repo script
+        rm -f "$HOME/.local/bin/krasis"
+        ln -s "$SCRIPT_DIR/krasis" "$HOME/.local/bin/krasis"
+        # Clean up any stale pip/venv artifacts
+        rm -f "$HOME/.local/bin/krasis-chat" "$HOME/.local/bin/krasis-setup"
+        rm -rf "$HOME/.krasis/venv"
+        ok "Installed. 'krasis' command symlinked to $SCRIPT_DIR/krasis"
+        ;;
     *)
         err "Unknown command: $cmd
   Run ./dev help for usage."
