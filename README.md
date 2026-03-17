@@ -1,6 +1,6 @@
 # Krasis
 
-Python-orchestrated Rust MoE runtime for large mixture-of-experts LLMs. Runs 200B+ parameter models on commodity hardware with full GPU prefill and efficient CPU decode.
+Python-orchestrated Rust LLM runtime. Runs 200B+ parameter models on commodity hardware with full GPU prefill and decode.
 
 You can [contact me here](https://forms.gle/ue4nvyvNNHtUZ7MQ7) but for bugs, difficulties, suggestions or requests for support for other models please report an issue instead.
 
