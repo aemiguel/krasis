@@ -10,7 +10,7 @@ If you want to easily monitor Krasis during runs, [check out ktop](https://githu
 
 ## Krasis runs LLMs fast on consumer grade hardware (single GPU)
 
-Krasis can run MoE language models that are much too large to fit in a consumer GPU (multi-hundred gigabyte model with 80- 500+ billion parameters) on consumer or accessible server hardware that doesn't require the huge cost to host the entire model in VRAM. 
+Krasis can run large language models that are much too large to fit in a consumer GPU (multi-hundred gigabyte model with 80- 500+ billion parameters) on consumer or accessible server hardware that doesn't require the huge cost to host the entire model in VRAM. 
 
 ## Results vs Llama.cpp (1x RTX 5090 on PCIE 4.0)
 
