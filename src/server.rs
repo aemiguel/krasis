@@ -738,14 +738,17 @@ fn handle_chat_completion(
     // the thinking block and bails to EOS, resulting in 0 visible answer tokens.
     if enable_thinking {
         if let Some(te_id) = state.thinking_end_token {
-            store.set_think_end_suppress(Some(te_id));
+            // Budget = max 4096 thinking tokens. If the model hasn't produced </think>
+            // by then, it's stuck in a loop. 4096 is generous for real reasoning.
+            let think_budget = 4096;
+            store.set_think_end_suppress(Some(te_id), think_budget);
             store.set_min_new_tokens_ext(0, stop_ids.to_vec());
         } else {
-            store.set_think_end_suppress(None);
+            store.set_think_end_suppress(None, 0);
             store.set_min_new_tokens_ext(0, vec![]);
         }
     } else {
-        store.set_think_end_suppress(None);
+        store.set_think_end_suppress(None, 0);
         store.set_min_new_tokens_ext(0, vec![]);
     }
 

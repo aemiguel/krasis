@@ -1,0 +1,35 @@
+What is the capital of France?
+- What is the population of that city?
+- Name three famous landmarks there
+- Which of those landmarks is the oldest?
+- Tell me more about its history
+Hi, who are you?
+- What languages can you speak?
+- Say hello in Japanese
+- Now say goodbye in Japanese
+- Translate "the weather is nice today" into Japanese
+What is 15 multiplied by 7?
+- Add 50 to that result
+- Now divide everything by 5
+- Is the result a prime number?
+- What are the prime numbers between 1 and 50?
+- How many of those primes are also Fibonacci numbers?
+Explain what a linked list is
+- How does it differ from an array?
+- Write a simple linked list implementation in Python
+- Now convert that to Rust
+- What are the performance tradeoffs between the two implementations?
+Tell me about the solar system
+- Which planet has the most moons?
+- Tell me about the largest moon of that planet
+- Is there any evidence of liquid water there?
+- What space missions have visited it?
+- What did those missions discover?
+- If you could design a new mission there, what would you prioritize?
+What are the three laws of thermodynamics?
+Name a famous painting
+- Who painted it?
+- What art movement does it belong to?
+Write a haiku about mountains
+- Now write one about the ocean
+- Now combine the themes of both into a single haiku

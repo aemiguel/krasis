@@ -1,0 +1,5 @@
+What is 2 + 2?
+What is 5 * 3?
+What is the capital of France?
+Say "hello world" and nothing else.
+What was the first question I asked you?

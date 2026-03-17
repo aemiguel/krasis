@@ -1,0 +1,25 @@
+What is photosynthesis?
+- Explain the light-dependent reactions in more detail
+- What role does chlorophyll play specifically?
+- How does this differ in C4 plants vs C3 plants?
+- Summarize everything you've told me about photosynthesis in 3 bullet points
+What is the capital of France?
+- What about Germany?
+- And Japan?
+- Which of those three cities has the largest population?
+- Tell me an interesting historical fact about that city
+Write a Python function that checks if a string is a palindrome
+- Now make it case-insensitive and ignore spaces
+- Add type hints and a docstring
+- Write 3 test cases for it
+Explain how a CPU executes an instruction
+- What is pipelining?
+- How does branch prediction work?
+- What happens on a branch misprediction?
+- How do modern CPUs handle speculative execution?
+- Summarize the full instruction execution pipeline
+Who was Alan Turing?
+- What was the Enigma machine?
+- How did Turing's work contribute to breaking it?
+- What is the Turing Test?
+- Is the Turing Test still relevant today?

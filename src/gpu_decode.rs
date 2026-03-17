@@ -1352,6 +1352,12 @@ pub struct GpuDecodeStore {
     think_end_token_for_suppress: Option<usize>,
     /// Whether the think_end_token has been seen in the current decode.
     think_end_seen: bool,
+    /// Max thinking tokens before stop-token suppression is lifted.
+    /// Prevents infinite generation when models fail to close </think>.
+    /// 0 = unlimited (no cap). Set per-request.
+    think_suppress_budget: usize,
+    /// Count of tokens generated while in thinking mode (before </think>).
+    think_suppress_count: usize,
     #[cfg(feature = "gpu-debug")]
     debug_stop_layer: usize,
     #[cfg(feature = "gpu-debug")]
@@ -1593,6 +1599,8 @@ impl GpuDecodeStore {
             stop_token_ids_for_suppress: Vec::new(),
             think_end_token_for_suppress: None,
             think_end_seen: false,
+            think_suppress_budget: 0,
+            think_suppress_count: 0,
             #[cfg(feature = "gpu-debug")]
             debug_stop_layer: 0,
             #[cfg(feature = "gpu-debug")]
@@ -4044,14 +4052,28 @@ impl GpuDecodeStore {
             for &tok in &suppress {
                 if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
             }
-            if step < min_nt || think_end_active {
+            let think_within_budget = self.think_suppress_budget == 0
+                || self.think_suppress_count < self.think_suppress_budget;
+            if step < min_nt || (think_end_active && think_within_budget) {
                 for &tok in &stop_suppress {
                     if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                 }
             }
 
-            next_token = crate::decode::sample_from_logits_pub(
-                logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+            // Force-inject </think> when thinking budget is exhausted
+            next_token = if think_end_active && !think_within_budget {
+                if let Some(te) = self.think_end_token_for_suppress {
+                    eprintln!("[krasis] Thinking budget exhausted ({} tokens) — force-injecting </think>",
+                        self.think_suppress_count);
+                    te
+                } else {
+                    crate::decode::sample_from_logits_pub(
+                        logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
+                }
+            } else {
+                crate::decode::sample_from_logits_pub(
+                    logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
+            };
             self.notify_token_generated(next_token);
             seen_tokens.insert(next_token);
             tokens.push(next_token);
@@ -4413,17 +4435,29 @@ impl GpuDecodeStore {
 
     /// Configure think-end suppression: suppress stop tokens until think_end_id is generated.
     /// Call before each decode when thinking is enabled. Pass None to disable.
-    pub fn set_think_end_suppress(&mut self, think_end_id: Option<usize>) {
+    /// `budget` = max thinking tokens before suppression is lifted (0 = unlimited).
+    pub fn set_think_end_suppress(&mut self, think_end_id: Option<usize>, budget: usize) {
         self.think_end_token_for_suppress = think_end_id;
         self.think_end_seen = false;
+        self.think_suppress_budget = budget;
+        self.think_suppress_count = 0;
     }
 
-    /// Notify that a token was generated — checks for think_end_token.
+    /// Notify that a token was generated — checks for think_end_token and counts thinking tokens.
     #[inline]
     pub fn notify_token_generated(&mut self, token_id: usize) {
         if let Some(te) = self.think_end_token_for_suppress {
             if token_id == te {
                 self.think_end_seen = true;
+                log::info!("Think end token seen after {} thinking tokens (budget: {})",
+                    self.think_suppress_count, self.think_suppress_budget);
+            } else if !self.think_end_seen {
+                // Still in thinking mode — count toward budget
+                self.think_suppress_count += 1;
+                if self.think_suppress_budget > 0 && self.think_suppress_count == self.think_suppress_budget {
+                    log::warn!("Thinking budget exhausted ({} tokens) without </think> — stop-token suppression lifted",
+                        self.think_suppress_budget);
+                }
             }
         }
     }
@@ -4446,11 +4480,18 @@ impl GpuDecodeStore {
                 }
             }
         }
-        // Suppress stop tokens until </think> has been generated
+        // Suppress stop tokens until </think> has been generated,
+        // but only up to the thinking budget (if set). After the budget is exhausted,
+        // stop suppression is lifted so the model can terminate — prevents infinite
+        // thinking loops from running for minutes.
         if self.think_end_token_for_suppress.is_some() && !self.think_end_seen {
-            for &tok in &self.stop_token_ids_for_suppress {
-                if tok < vocab_size {
-                    logits[tok] = f32::NEG_INFINITY;
+            let within_budget = self.think_suppress_budget == 0
+                || self.think_suppress_count < self.think_suppress_budget;
+            if within_budget {
+                for &tok in &self.stop_token_ids_for_suppress {
+                    if tok < vocab_size {
+                        logits[tok] = f32::NEG_INFINITY;
+                    }
                 }
             }
         }
@@ -8216,8 +8257,23 @@ impl GpuDecodeStore {
             }
             self.apply_suppress_at_step(logits, vocab_size, generated);
 
-            let target_pred = crate::decode::sample_from_logits_pub(
-                logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+            // Force-inject </think> when thinking budget is exhausted
+            let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
+            let think_within_budget = self.think_suppress_budget == 0
+                || self.think_suppress_count < self.think_suppress_budget;
+            let target_pred = if think_end_active && !think_within_budget {
+                if let Some(te) = self.think_end_token_for_suppress {
+                    eprintln!("[krasis] Thinking budget exhausted ({} tokens) — force-injecting </think>",
+                        self.think_suppress_count);
+                    te
+                } else {
+                    crate::decode::sample_from_logits_pub(
+                        logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
+                }
+            } else {
+                crate::decode::sample_from_logits_pub(
+                    logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
+            };
             self.notify_token_generated(target_pred);
             seen_tokens.insert(target_pred);
             generated += 1;
@@ -10428,13 +10484,27 @@ impl GpuDecodeStore {
                     for &tok in &suppress {
                         if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                     }
-                    if generated < min_nt || think_end_active {
+                    let think_within_budget = self.think_suppress_budget == 0
+                        || self.think_suppress_count < self.think_suppress_budget;
+                    if generated < min_nt || (think_end_active && think_within_budget) {
                         for &tok in &stop_suppress {
                             if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                         }
                     }
-                    let target_pred = crate::decode::sample_from_logits_pub(
-                        logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+                    // Force-inject </think> when thinking budget is exhausted
+                    let target_pred = if think_end_active && !think_within_budget {
+                        if let Some(te) = self.think_end_token_for_suppress {
+                            eprintln!("[krasis] Thinking budget exhausted ({} tokens) — force-injecting </think>",
+                                self.think_suppress_count);
+                            te
+                        } else {
+                            crate::decode::sample_from_logits_pub(
+                                logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
+                        }
+                    } else {
+                        crate::decode::sample_from_logits_pub(
+                            logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
+                    };
                     self.notify_token_generated(target_pred);
                     seen_tokens.insert(target_pred);
                     generated += 1;
@@ -10751,14 +10821,31 @@ impl GpuDecodeStore {
                 for &tok in &suppress {
                     if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                 }
-                if generated < min_nt || think_end_active {
+                let think_within_budget = self.think_suppress_budget == 0
+                    || self.think_suppress_count < self.think_suppress_budget;
+                let suppressing = generated < min_nt || (think_end_active && think_within_budget);
+                if suppressing {
                     for &tok in &stop_suppress {
                         if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                     }
                 }
 
-                let target_pred = crate::decode::sample_from_logits_pub(
-                    logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+                // Force-inject </think> when thinking budget is exhausted.
+                // Just lifting suppression isn't enough — degenerate models never
+                // produce EOS naturally once stuck in a thinking loop.
+                let target_pred = if think_end_active && !think_within_budget {
+                    if let Some(te) = self.think_end_token_for_suppress {
+                        eprintln!("[krasis] Thinking budget exhausted ({} tokens) — force-injecting </think>",
+                            self.think_suppress_count);
+                        te
+                    } else {
+                        crate::decode::sample_from_logits_pub(
+                            logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
+                    }
+                } else {
+                    crate::decode::sample_from_logits_pub(
+                        logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
+                };
                 self.notify_token_generated(target_pred);
 
                 seen_tokens.insert(target_pred);
