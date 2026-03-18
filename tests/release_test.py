@@ -54,6 +54,8 @@ CONFIG_VARIANTS = [
     {"name": "INT8/INT8 BF16",  "gpu_bits": 8, "cpu_bits": 8, "attention": "bf16"},
     {"name": "INT4/INT4 AWQ",   "gpu_bits": 4, "cpu_bits": 4, "attention": "awq"},
     {"name": "INT8/INT8 AWQ",   "gpu_bits": 8, "cpu_bits": 8, "attention": "awq"},
+    # Multi-GPU variant — skipped automatically if only 1 GPU available
+    {"name": "INT4/INT4 BF16 Multi-GPU", "gpu_bits": 4, "cpu_bits": 4, "attention": "bf16", "multi_gpu": True},
 ]
 
 # ANSI codes (for terminal output only — stripped from report)
@@ -121,6 +123,34 @@ def detect_best_gpu() -> Tuple[int, str, int]:
     return best
 
 
+def detect_all_gpus() -> List[Tuple[int, str, int]]:
+    """Detect all GPUs. Returns list of (index, name, vram_mb), sorted by VRAM descending."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        die("nvidia-smi failed. Are NVIDIA drivers installed?")
+
+    if result.returncode != 0:
+        die("nvidia-smi failed. Are NVIDIA drivers installed?")
+
+    gpus = []
+    for line in result.stdout.strip().split("\n"):
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3:
+            idx, name, vram = int(parts[0]), parts[1], int(parts[2])
+            gpus.append((idx, name, vram))
+
+    if not gpus:
+        die("No GPUs detected.")
+    # Sort by VRAM descending so the biggest GPU is first (primary)
+    gpus.sort(key=lambda g: g[2], reverse=True)
+    return gpus
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Config Generation
 # ═══════════════════════════════════════════════════════════════════
@@ -142,14 +172,22 @@ def get_num_layers(config: Dict) -> int:
 
 
 def generate_config(model_name: str, variant: Dict, gpu_idx: int,
-                    num_layers: int) -> str:
-    """Generate a temporary config file. Returns path to temp file."""
+                    num_layers: int, all_gpu_indices: Optional[List[int]] = None) -> str:
+    """Generate a temporary config file. Returns path to temp file.
+
+    For multi-GPU variants, all_gpu_indices is used for CFG_SELECTED_GPUS.
+    """
     model_path = os.path.join(MODELS_DIR, model_name)
+
+    if variant.get("multi_gpu") and all_gpu_indices and len(all_gpu_indices) > 1:
+        gpu_str = ",".join(str(i) for i in all_gpu_indices)
+    else:
+        gpu_str = str(gpu_idx)
 
     lines = [
         f"# Release test config — {variant['name']}",
         f'MODEL_PATH="{model_path}"',
-        f'CFG_SELECTED_GPUS="{gpu_idx}"',
+        f'CFG_SELECTED_GPUS="{gpu_str}"',
         f'CFG_PP_PARTITION="{num_layers}"',
         f'CFG_LAYER_GROUP_SIZE="2"',
         f'CFG_KV_DTYPE="fp8_e4m3"',
@@ -162,7 +200,6 @@ def generate_config(model_name: str, variant: Dict, gpu_idx: int,
         f'CFG_HOST="0.0.0.0"',
         f'CFG_PORT="{DEFAULT_PORT}"',
         f'CFG_GPU_PREFILL_THRESHOLD="300"',
-        f'CFG_NUM_GPUS="1"',
     ]
 
     fd, path = tempfile.mkstemp(prefix="krasis-release-", suffix=".conf")
@@ -788,31 +825,33 @@ def extract_server_error(log_path: str, max_chars: int = 3000) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 def run_sanity_prompts(port: int = DEFAULT_PORT) -> List[Dict]:
-    """Phase 2: Run sanity test prompts from benchmarks/sanity_test_prompts.txt."""
-    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    prompts_file = os.path.join(script_dir, "benchmarks", "sanity_test_prompts.txt")
+    """Phase 2: Run sanity test prompts via krasis chat sanity test.
 
-    if not os.path.isfile(prompts_file):
-        warn(f"Sanity prompts file not found: {prompts_file}")
-        return []
+    Uses the same multi-turn conversation engine as 'krasis sanity',
+    which properly maintains conversation history for continuation prompts.
+    """
+    from krasis.chat import run_sanity_test
 
-    with open(prompts_file) as f:
-        prompts = [line.strip() for line in f if line.strip()]
+    server = {
+        "host": DEFAULT_HOST,
+        "port": port,
+        "url": f"http://{DEFAULT_HOST}:{port}",
+        "model": "unknown",
+        "status": "ok",
+    }
+    # Try to fetch model name
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"http://{DEFAULT_HOST}:{port}/v1/models")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            models_data = data.get("data", [])
+            if models_data:
+                server["model"] = models_data[0].get("id", "unknown")
+    except Exception:
+        pass
 
-    results = []
-    for prompt in prompts:
-        info(f"  {prompt[:70]}")
-        r = send_chat_streaming(prompt, port=port, max_tokens=256, timeout=120)
-        r["prompt"] = prompt
-        results.append(r)
-        if r["error"]:
-            warn(f"    Error: {r['error']}")
-        else:
-            preview = r["text"][:120].replace("\n", " ")
-            decode_str = f"decode {r['decode_tok_s']:.1f} tok/s" if r['decode_tok_s'] > 0 else "decode Not Received"
-            ok(f"    TTFT {r['ttft_s']:.1f}s | {decode_str} | {r['total_s']:.1f}s — {preview}")
-
-    return results
+    return run_sanity_test(server, temperature=0.3, max_tokens=256)
 
 
 def run_large_prompt_tests(port: int = DEFAULT_PORT) -> List[Dict]:
@@ -900,6 +939,8 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
         lines.append("")
         lines.append(f"- Expert quant: INT{variant['gpu_bits']} GPU / INT{variant['cpu_bits']} CPU")
         lines.append(f"- Attention: {variant['attention'].upper()}")
+        if variant.get("multi_gpu"):
+            lines.append(f"- GPUs: {gpu_info[1]} + aux GPUs (multi-GPU decode pipeline)")
         lines.append("")
 
         if cr.get("error"):
@@ -924,8 +965,21 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
         if sanity:
             lines.append("### Sanity Test Results")
             lines.append("")
+            prev_conv = None
             for sr in sanity:
-                lines.append(f"**Prompt:** {sr['prompt']}")
+                conv = sr.get("conversation", 0)
+                turn = sr.get("turn", 1)
+                total_turns = sr.get("turns_in_conversation", 1)
+                is_multi = total_turns > 1
+
+                # Show conversation header for multi-turn
+                if is_multi and conv != prev_conv:
+                    lines.append(f"#### Conversation {conv} ({total_turns} turns)")
+                    lines.append("")
+                prev_conv = conv
+
+                turn_label = f" [turn {turn}/{total_turns}]" if is_multi else ""
+                lines.append(f"**Prompt:** {sr['prompt']}{turn_label}")
                 lines.append("")
                 if sr.get("error"):
                     lines.append(f"**Error:** {sr['error']}")
@@ -1007,16 +1061,25 @@ def main():
     if num_layers == 0:
         die("Could not determine num_hidden_layers from config.json")
 
-    # Detect best GPU
+    # Detect GPUs
     gpu_idx, gpu_name, gpu_vram = detect_best_gpu()
+    all_gpus = detect_all_gpus()
+    all_gpu_indices = [g[0] for g in all_gpus]
 
     # Find krasis command
     krasis_cmd = find_krasis_command()
 
     info(f"Model: {model_name} ({num_layers} layers)")
     info(f"GPU: {gpu_name} ({gpu_vram} MB, index {gpu_idx})")
+    if len(all_gpus) > 1:
+        gpu_summary = ", ".join(f"{g[1]} ({g[2]} MB)" for g in all_gpus)
+        info(f"All GPUs: {gpu_summary}")
     info(f"Krasis: {krasis_cmd}")
-    info(f"Configs: {len(CONFIG_VARIANTS)} variants")
+    # Count active variants (skip multi-GPU if only 1 GPU)
+    active_variants = [v for v in CONFIG_VARIANTS
+                       if not v.get("multi_gpu") or len(all_gpus) > 1]
+    info(f"Configs: {len(active_variants)} variants"
+         f"{' (multi-GPU skipped: only 1 GPU)' if len(active_variants) < len(CONFIG_VARIANTS) else ''}")
 
     # Prepare output directory
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1077,6 +1140,13 @@ def main():
         proc = None
         log_path = os.path.join(output_dir, f"server_config{i+1}_{timestamp}.log")
 
+        # Skip multi-GPU configs if only 1 GPU available
+        if variant.get("multi_gpu") and len(all_gpus) <= 1:
+            result["error"] = "Multi-GPU skipped — only 1 GPU available"
+            warn("Skipping (need 2+ GPUs for multi-GPU test)")
+            config_results.append(result)
+            continue
+
         # Skip AWQ configs if template wasn't built
         if variant["attention"] == "awq" and needs_awq and not awq_ok:
             result["error"] = "AWQ template not available — skipped"
@@ -1086,7 +1156,8 @@ def main():
 
         try:
             # 1. Generate temp config
-            config_path = generate_config(model_name, variant, gpu_idx, num_layers)
+            config_path = generate_config(model_name, variant, gpu_idx, num_layers,
+                                          all_gpu_indices=all_gpu_indices)
             info(f"Config: {config_path}")
 
             # 2. Launch krasis --config <file> --benchmark

@@ -923,6 +923,10 @@ struct GpuDecodeGraph {
     hidden_size: usize,
     #[allow(dead_code)]
     num_layers: usize,
+    /// Decode segment: the range of layers this store is responsible for during multi-GPU decode.
+    /// Default: [0..num_layers) for single-GPU or primary store, narrowed for aux stores.
+    decode_layer_start: usize,
+    decode_layer_end: usize,
     vocab_size: usize,
     eps: f32,
     intermediate_size: usize,
@@ -1751,6 +1755,8 @@ impl GpuDecodeStore {
         self.graph = Some(Box::new(GpuDecodeGraph {
             hidden_size,
             num_layers,
+            decode_layer_start: 0,
+            decode_layer_end: num_layers,
             vocab_size,
             eps,
             intermediate_size: intermediate,
@@ -3985,6 +3991,11 @@ impl GpuDecodeStore {
         self as *const GpuDecodeStore as usize
     }
 
+    /// Get the CUDA device ordinal this store was created on.
+    fn gpu_index(&self) -> usize {
+        self.device.ordinal()
+    }
+
     /// Run a single GPU decode step (for testing). Fills d_hidden and h_logits.
     fn py_gpu_decode_step(&mut self, token_id: usize, position: usize) -> PyResult<()> {
         self.gpu_decode_step(token_id, position)
@@ -4099,9 +4110,9 @@ impl GpuDecodeStore {
     /// Like gpu_generate_batch but uses gpu_generate_stream_multi under the hood.
     fn gpu_generate_batch_multi(
         &mut self,
-        aux_store_addr: usize,
-        split_layer: usize,
-        gqa_cache_offset: usize,
+        aux_store_addrs: Vec<usize>,
+        split_layers: Vec<usize>,
+        gqa_cache_offsets: Vec<usize>,
         first_token: usize,
         start_position: usize,
         max_tokens: usize,
@@ -4111,22 +4122,31 @@ impl GpuDecodeStore {
         stop_ids: Vec<usize>,
         presence_penalty: f32,
     ) -> PyResult<Vec<usize>> {
-        if aux_store_addr == 0 {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err("aux_store_addr is 0"));
+        let num_aux = aux_store_addrs.len();
+        if num_aux == 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("no aux stores provided"));
+        }
+        if split_layers.len() != num_aux || gqa_cache_offsets.len() != num_aux {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "aux_store_addrs, split_layers, and gqa_cache_offsets must have same length"));
         }
 
-        // We need a tokenizer for stream_multi — use a minimal one that just returns empty strings
-        // since we only care about token IDs for batch mode.
-        // Actually, stream_multi requires a real tokenizer. Let's inline the logic instead.
-        let aux_store = unsafe { &mut *(aux_store_addr as *mut GpuDecodeStore) };
-
-        let vocab_size = match aux_store.graph.as_ref() {
-            Some(g) => g.vocab_size,
-            None => return Err(pyo3::exceptions::PyRuntimeError::new_err("aux graph not configured")),
-        };
         let num_layers = match self.graph.as_ref() {
             Some(g) => g.layers.len(),
             None => return Err(pyo3::exceptions::PyRuntimeError::new_err("primary graph not configured")),
+        };
+
+        // Layer boundaries: [0, split_layers[0], split_layers[1], ..., num_layers]
+        let mut boundaries = Vec::with_capacity(num_aux + 2);
+        boundaries.push(0usize);
+        boundaries.extend_from_slice(&split_layers);
+        boundaries.push(num_layers);
+
+        // Vocab size from last aux store (has LM head)
+        let last_aux = unsafe { &mut *(aux_store_addrs[num_aux - 1] as *mut GpuDecodeStore) };
+        let vocab_size = match last_aux.graph.as_ref() {
+            Some(g) => g.vocab_size,
+            None => return Err(pyo3::exceptions::PyRuntimeError::new_err("last aux graph not configured")),
         };
 
         let stop_set: std::collections::HashSet<usize> = stop_ids.iter().copied().collect();
@@ -4153,39 +4173,54 @@ impl GpuDecodeStore {
         for step in 0..max_tokens {
             let pos = start_position + step;
 
-            // GPU0: embedding + layers [0..split_layer)
+            // GPU0: embedding + layers [0..boundaries[1])
             if let Err(e) = self.device.bind_to_thread() {
                 log::error!("batch_multi: bind GPU0 failed: {:?}", e);
                 break;
             }
+            let gpu0_is_last = num_aux == 0;
             if let Err(e) = self.gpu_decode_segment(
-                next_token, pos, true, 0, split_layer, false, 0,
+                next_token, pos, true, 0, boundaries[1], gpu0_is_last, 0,
             ) {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
                     format!("GPU0 segment error: {}", e)));
             }
 
-            // Transfer hidden state GPU0 -> GPU1 via host
-            let (h_hidden, h_residual) = self.download_hidden_state()
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("download_hidden error: {}", e)))?;
+            // Pipeline through aux GPUs
+            for i in 0..num_aux {
+                // Download hidden state from previous GPU
+                let (h_hidden, h_residual) = if i == 0 {
+                    self.download_hidden_state()
+                } else {
+                    let prev = unsafe { &mut *(aux_store_addrs[i - 1] as *mut GpuDecodeStore) };
+                    prev.download_hidden_state()
+                }.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("download_hidden from GPU{} error: {}", i, e)))?;
 
-            // GPU1: layers [split_layer..num_layers) + final
-            if let Err(e) = aux_store.device.bind_to_thread() {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("bind GPU1 failed: {:?}", e)));
-            }
-            aux_store.upload_hidden_state(&h_hidden, &h_residual)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("upload_hidden error: {}", e)))?;
-            if let Err(e) = aux_store.gpu_decode_segment(
-                next_token, pos, false, split_layer, num_layers, true, gqa_cache_offset,
-            ) {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("GPU1 segment error: {}", e)));
+                // Upload to current aux GPU
+                let aux = unsafe { &mut *(aux_store_addrs[i] as *mut GpuDecodeStore) };
+                if let Err(e) = aux.device.bind_to_thread() {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("bind GPU{} failed: {:?}", i + 1, e)));
+                }
+                aux.upload_hidden_state(&h_hidden, &h_residual)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("upload_hidden to GPU{} error: {}", i + 1, e)))?;
+
+                let is_last = i + 1 == num_aux;
+                if let Err(e) = aux.gpu_decode_segment(
+                    next_token, pos, false,
+                    boundaries[i + 1], boundaries[i + 2],
+                    is_last, gqa_cache_offsets[i],
+                ) {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("GPU{} segment error: {}", i + 1, e)));
+                }
             }
 
-            let logits = &mut aux_store.graph.as_mut().unwrap().h_logits;
+            // Logits from last aux store
+            let last_aux = unsafe { &mut *(aux_store_addrs[num_aux - 1] as *mut GpuDecodeStore) };
+            let logits = &mut last_aux.graph.as_mut().unwrap().h_logits;
             if presence_penalty != 0.0 {
                 for &tok in &seen_tokens {
                     if tok < vocab_size { logits[tok] -= presence_penalty; }
@@ -4225,6 +4260,11 @@ impl GpuDecodeStore {
         self.graph.as_ref().map_or(0, |g| g.kv_max_seq)
     }
 
+    /// Get total number of layers in the model.
+    pub fn num_layers(&self) -> usize {
+        self.graph.as_ref().map_or(0, |g| g.layers.len())
+    }
+
     /// Evict soft-tier HCS experts before prefill (PyO3 wrapper).
     /// Returns (evicted_count, freed_mb).
     #[pyo3(signature = (estimated_tokens))]
@@ -4239,10 +4279,10 @@ impl GpuDecodeStore {
     }
 
     /// Copy KV cache from this store to an aux store (PyO3 wrapper for validation).
-    #[pyo3(signature = (aux_store_addr, split_layer, gqa_offset, prompt_len))]
-    fn py_copy_kv_to_aux(&self, aux_store_addr: usize, split_layer: usize, gqa_offset: usize, prompt_len: usize) -> PyResult<()> {
+    #[pyo3(signature = (aux_store_addr, layer_start, layer_end, gqa_offset, prompt_len))]
+    fn py_copy_kv_to_aux(&self, aux_store_addr: usize, layer_start: usize, layer_end: usize, gqa_offset: usize, prompt_len: usize) -> PyResult<()> {
         let aux_store = unsafe { &mut *(aux_store_addr as *mut GpuDecodeStore) };
-        self.copy_kv_to_aux(aux_store, split_layer, gqa_offset, prompt_len)
+        self.copy_kv_to_aux(aux_store, layer_start, layer_end, gqa_offset, prompt_len)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 
@@ -4422,6 +4462,18 @@ impl GpuDecodeStore {
 
         hcs_hits
     }
+
+    /// Set the decode segment for this store (which layers it handles during multi-GPU decode).
+    /// This affects HCS% reporting — only experts in this segment are counted.
+    #[pyo3(signature = (layer_start, layer_end))]
+    fn set_decode_segment(&mut self, layer_start: usize, layer_end: usize) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        graph.decode_layer_start = layer_start;
+        graph.decode_layer_end = layer_end;
+        log::info!("GpuDecodeStore: decode segment set to [{}, {})", layer_start, layer_end);
+        Ok(())
+    }
 }
 
 // ── Pure-Rust methods for GPU decode (no PyO3, used by Rust HTTP server) ──
@@ -4564,12 +4616,17 @@ impl GpuDecodeStore {
     }
 
     /// Return benchmark stats: (min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct)
+    /// Only counts MoE experts within this store's decode segment [decode_layer_start..decode_layer_end).
     pub fn benchmark_stats(&self) -> (usize, usize, usize, f64) {
         let min_free = self.last_min_free_vram_mb;
         let (loaded, total, pct) = if let Some(graph) = self.graph.as_ref() {
             if let Some(hcs) = graph.hcs.as_ref() {
+                let seg_start = graph.decode_layer_start;
+                let seg_end = graph.decode_layer_end;
                 let total: usize = graph.moe_layers.iter()
-                    .filter_map(|m: &Option<MoeLayerData>| m.as_ref())
+                    .enumerate()
+                    .filter(|(i, _)| *i >= seg_start && *i < seg_end)
+                    .filter_map(|(_, m)| m.as_ref())
                     .map(|m| m.num_experts)
                     .sum();
                 let loaded = hcs.num_cached;
@@ -7800,27 +7857,27 @@ impl GpuDecodeStore {
         Ok(())
     }
 
-    /// Copy KV cache data from this store (GPU0) to an auxiliary store (GPU1)
-    /// for GQA layers that fall within GPU1's segment.
+    /// Copy KV cache data from this store (primary GPU) to an auxiliary store
+    /// for GQA layers within [layer_start..layer_end).
     ///
-    /// Called once per request after prefill, before decode begins.
+    /// Called once per request per aux GPU after prefill, before decode begins.
     /// Only copies positions [0..prompt_len) — decode will write new positions
     /// directly on each GPU.
     pub fn copy_kv_to_aux(
         &self,
         aux_store: &mut GpuDecodeStore,
-        split_layer: usize,
-        gqa_offset: usize,
+        layer_start: usize,
+        layer_end: usize,
+        _gqa_offset: usize,
         prompt_len: usize,
     ) -> Result<(), String> {
         let graph = self.graph.as_ref().ok_or("primary graph not configured")?;
         let aux_graph = aux_store.graph.as_ref().ok_or("aux graph not configured")?;
-        let num_layers = graph.layers.len();
 
-        // Iterate GQA layers in GPU1's segment [split_layer..num_layers)
+        // Iterate GQA layers in aux GPU's segment [layer_start..layer_end)
         let mut copied = 0usize;
         let mut total_bytes = 0usize;
-        for layer_idx in split_layer..num_layers {
+        for layer_idx in layer_start..layer_end {
             let k_src = graph.kv_k_ptrs[layer_idx];
             let v_src = graph.kv_v_ptrs[layer_idx];
             if k_src == 0 || v_src == 0 { continue; } // Not a GQA layer
@@ -7958,19 +8015,19 @@ impl GpuDecodeStore {
         result
     }
 
-    /// Multi-GPU streaming decode: coordinates two GpuDecodeStore instances.
+    /// Multi-GPU streaming decode: coordinates N GpuDecodeStore instances in a pipeline.
     ///
-    /// `self` owns layers [0..split_layer) (GPU0).
-    /// `aux_store` (via raw pointer) owns layers [split_layer..num_layers) (GPU1).
-    /// GPU0 does embedding. GPU1 does final norm + LM head.
-    /// Hidden state transfers via host memory (D2H + H2D, ~8KB, <1μs).
+    /// `self` owns layers [0..split_layers[0]) (GPU0).
+    /// Each aux store owns a segment of layers defined by consecutive split_layers entries.
+    /// The last aux store does final norm + LM head.
+    /// Hidden state transfers via host memory (D2H + H2D, ~8KB per transfer).
     ///
     /// The streaming callback `on_token` is the same as gpu_generate_stream.
     pub fn gpu_generate_stream_multi<F>(
         &mut self,
-        aux_store_addr: usize,
-        split_layer: usize,
-        gqa_cache_offset: usize,
+        aux_store_addrs: &[usize],
+        split_layers: &[usize],
+        gqa_cache_offsets: &[usize],
         first_token: usize,
         start_position: usize,
         max_tokens: usize,
@@ -7987,21 +8044,36 @@ impl GpuDecodeStore {
     {
         use std::time::Instant;
 
+        let num_aux = aux_store_addrs.len();
+        if num_aux == 0 || split_layers.len() != num_aux || gqa_cache_offsets.len() != num_aux {
+            log::error!("gpu_generate_stream_multi: invalid args (num_aux={}, splits={}, offsets={})",
+                num_aux, split_layers.len(), gqa_cache_offsets.len());
+            return 0;
+        }
+
         // Bind primary GPU context
         if let Err(e) = self.device.bind_to_thread() {
             log::error!("gpu_generate_stream_multi: failed to bind primary CUDA context: {:?}", e);
             return 0;
         }
 
-        let aux_store = unsafe { &mut *(aux_store_addr as *mut GpuDecodeStore) };
-
-        let vocab_size = match aux_store.graph.as_ref() {
-            Some(g) => g.vocab_size,
-            None => { log::error!("aux store graph not configured"); return 0; }
-        };
         let num_layers = match self.graph.as_ref() {
             Some(g) => g.layers.len(),
             None => { log::error!("primary store graph not configured"); return 0; }
+        };
+
+        // Layer boundaries: [0, split_layers[0], split_layers[1], ..., num_layers]
+        let num_gpus = num_aux + 1;
+        let mut boundaries = Vec::with_capacity(num_gpus + 1);
+        boundaries.push(0usize);
+        boundaries.extend_from_slice(split_layers);
+        boundaries.push(num_layers);
+
+        // Vocab size from last aux store (has LM head)
+        let last_aux = unsafe { &mut *(aux_store_addrs[num_aux - 1] as *mut GpuDecodeStore) };
+        let vocab_size = match last_aux.graph.as_ref() {
+            Some(g) => g.vocab_size,
+            None => { log::error!("last aux store graph not configured"); return 0; }
         };
 
         let stop_set: std::collections::HashSet<usize> = stop_ids.iter().copied().collect();
@@ -8019,21 +8091,29 @@ impl GpuDecodeStore {
             rng_state
         };
 
-        // CUDA graph reuse: verify pointer stability on both GPUs before reusing.
-        let gpu0_reuse = self.verify_graph_pointers();
-        let gpu1_reuse = aux_store.verify_graph_pointers();
-        if gpu0_reuse && gpu1_reuse {
-            eprintln!("[krasis] CUDA graphs reused on both GPUs (ptrs verified stable)");
+        // CUDA graph reuse: verify pointer stability on all GPUs before reusing.
+        let mut all_reuse = self.verify_graph_pointers();
+        for &addr in aux_store_addrs.iter() {
+            let s = unsafe { &mut *(addr as *mut GpuDecodeStore) };
+            if !s.verify_graph_pointers() {
+                all_reuse = false;
+            }
+        }
+        if all_reuse {
+            eprintln!("[krasis] CUDA graphs reused on all {} GPUs (ptrs verified stable)", num_gpus);
         } else {
-            if !gpu0_reuse {
+            if !self.verify_graph_pointers() {
                 let was = self.graph.as_ref().map(|g| g.graphs_ever_captured).unwrap_or(false);
                 if was { eprintln!("[krasis] GPU0 graph ptrs changed — invalidating"); }
                 self.invalidate_cuda_graph();
             }
-            if !gpu1_reuse {
-                let was = aux_store.graph.as_ref().map(|g| g.graphs_ever_captured).unwrap_or(false);
-                if was { eprintln!("[krasis] GPU1 graph ptrs changed — invalidating"); }
-                aux_store.invalidate_cuda_graph();
+            for (i, &addr) in aux_store_addrs.iter().enumerate() {
+                let s = unsafe { &mut *(addr as *mut GpuDecodeStore) };
+                if !s.verify_graph_pointers() {
+                    let was = s.graph.as_ref().map(|g| g.graphs_ever_captured).unwrap_or(false);
+                    if was { eprintln!("[krasis] GPU{} graph ptrs changed — invalidating", i + 1); }
+                    s.invalidate_cuda_graph();
+                }
             }
         }
 
@@ -8045,17 +8125,16 @@ impl GpuDecodeStore {
         let mut generated = 0usize;
         let decode_start = Instant::now();
 
-        log::info!("gpu_generate_stream_multi: split={}, gqa_offset={}, layers={}",
-            split_layer, gqa_cache_offset, num_layers);
+        log::info!("gpu_generate_stream_multi: {} GPUs, boundaries={:?}, gqa_offsets={:?}",
+            num_gpus, boundaries, gqa_cache_offsets);
 
         // Per-GPU timing accumulators
         let timing = self.graph.as_ref().map_or(false, |g| g.timing_enabled);
-        let mut t_gpu0_total = 0.0f64;
-        let mut t_gpu1_total = 0.0f64;
+        let mut t_gpu_totals: Vec<f64> = vec![0.0; num_gpus];
         let mut t_transfer_total = 0.0f64;
         let mut t_sample_total = 0.0f64;
 
-        // Initialize CUDA graph buffers on both stores
+        // Initialize CUDA graph buffers on all stores
         let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
         {
             // GPU0 graph buffers
@@ -8070,15 +8149,18 @@ impl GpuDecodeStore {
                     }
                 }
             }
-            // GPU1 graph buffers
-            if let Err(e) = aux_store.device.bind_to_thread() {
-                log::error!("multi-gpu: bind GPU1 for graph init: {:?}", e);
-            } else {
-                let needs_init = aux_store.graph.as_ref().map(|g| g.d_graph_token_id.is_none()).unwrap_or(false);
-                if needs_init {
-                    match aux_store.init_cuda_graph_buffers() {
-                        Ok(()) => eprintln!("[krasis] GPU1 CUDA graph buffers initialized"),
-                        Err(e) => eprintln!("[krasis] GPU1 graph init failed: {}", e),
+            // Aux GPU graph buffers
+            for (i, &addr) in aux_store_addrs.iter().enumerate() {
+                let s = unsafe { &mut *(addr as *mut GpuDecodeStore) };
+                if let Err(e) = s.device.bind_to_thread() {
+                    log::error!("multi-gpu: bind GPU{} for graph init: {:?}", i + 1, e);
+                } else {
+                    let needs_init = s.graph.as_ref().map(|g| g.d_graph_token_id.is_none()).unwrap_or(false);
+                    if needs_init {
+                        match s.init_cuda_graph_buffers() {
+                            Ok(()) => eprintln!("[krasis] GPU{} CUDA graph buffers initialized", i + 1),
+                            Err(e) => eprintln!("[krasis] GPU{} graph init failed: {}", i + 1, e),
+                        }
                     }
                 }
             }
@@ -8087,67 +8169,88 @@ impl GpuDecodeStore {
         for step in 0..max_tokens {
             let pos = start_position + step;
 
-            // Check if per-layer graphs are available on both GPUs
-            let gpu0_has_graphs = self.graph.as_ref()
-                .map(|g| g.per_layer_graphs_valid).unwrap_or(false);
-            let gpu1_has_graphs = aux_store.graph.as_ref()
-                .map(|g| g.per_layer_graphs_valid).unwrap_or(false);
-            let use_graphs = gpu0_has_graphs && gpu1_has_graphs && !no_graph;
+            // Check if per-layer graphs are available on ALL GPUs
+            let mut use_graphs = self.graph.as_ref()
+                .map(|g| g.per_layer_graphs_valid).unwrap_or(false) && !no_graph;
+            if use_graphs {
+                for &addr in aux_store_addrs.iter() {
+                    let s = unsafe { &*(addr as *const GpuDecodeStore) };
+                    if !s.graph.as_ref().map(|g| g.per_layer_graphs_valid).unwrap_or(false) {
+                        use_graphs = false;
+                        break;
+                    }
+                }
+            }
 
             if use_graphs {
                 // ── Per-layer graph replay path ──
+                let mut step_ok = true;
 
-                // GPU0: replay graphs for layers [0..split_layer)
+                // GPU0: replay graphs for its layer segment
                 if let Err(e) = self.device.bind_to_thread() {
                     log::error!("multi-gpu: bind GPU0 failed: {:?}", e);
                     break;
                 }
-                let t_gpu0_start = Instant::now();
+                let t_start = Instant::now();
                 if let Err(e) = self.replay_per_layer_graphs(next_token, pos, false) {
                     eprintln!("[krasis] GPU0 graph replay failed: {}, falling back", e);
                     self.invalidate_cuda_graph();
-                    aux_store.invalidate_cuda_graph();
-                    // Fall through to ungraphed path on next iteration
-                    continue;
-                }
-                let t_gpu0_end = Instant::now();
-                t_gpu0_total += t_gpu0_end.duration_since(t_gpu0_start).as_secs_f64();
-
-                // Transfer hidden state GPU0 → GPU1 via host
-                let t_xfer_start = Instant::now();
-                let (h_hidden, h_residual) = match self.download_hidden_state() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!("multi-gpu download_hidden error: {}", e);
-                        break;
+                    for &addr in aux_store_addrs.iter() {
+                        let s = unsafe { &mut *(addr as *mut GpuDecodeStore) };
+                        s.invalidate_cuda_graph();
                     }
-                };
-                if let Err(e) = aux_store.device.bind_to_thread() {
-                    log::error!("multi-gpu: bind GPU1 failed: {:?}", e);
-                    break;
-                }
-                if let Err(e) = aux_store.upload_hidden_state(&h_hidden, &h_residual) {
-                    log::error!("multi-gpu upload_hidden error: {}", e);
-                    break;
-                }
-                let t_xfer_end = Instant::now();
-                t_transfer_total += t_xfer_end.duration_since(t_xfer_start).as_secs_f64();
-
-                // GPU1: replay graphs for layers [split_layer..num_layers) + final
-                let t_gpu1_start = Instant::now();
-                if let Err(e) = aux_store.replay_per_layer_graphs(next_token, pos, true) {
-                    eprintln!("[krasis] GPU1 graph replay failed: {}, falling back", e);
-                    self.invalidate_cuda_graph();
-                    aux_store.invalidate_cuda_graph();
                     continue;
                 }
-                let t_gpu1_end = Instant::now();
-                t_gpu1_total += t_gpu1_end.duration_since(t_gpu1_start).as_secs_f64();
+                t_gpu_totals[0] += Instant::now().duration_since(t_start).as_secs_f64();
+
+                // Pipeline through aux GPUs: transfer + replay
+                for i in 0..num_aux {
+                    // Transfer hidden state from previous GPU
+                    let t_xfer_start = Instant::now();
+                    let (h_hidden, h_residual) = if i == 0 {
+                        match self.download_hidden_state() {
+                            Ok(v) => v,
+                            Err(e) => { log::error!("multi-gpu download_hidden from GPU0: {}", e); step_ok = false; break; }
+                        }
+                    } else {
+                        let prev = unsafe { &mut *(aux_store_addrs[i - 1] as *mut GpuDecodeStore) };
+                        match prev.download_hidden_state() {
+                            Ok(v) => v,
+                            Err(e) => { log::error!("multi-gpu download_hidden from GPU{}: {}", i, e); step_ok = false; break; }
+                        }
+                    };
+                    let aux = unsafe { &mut *(aux_store_addrs[i] as *mut GpuDecodeStore) };
+                    if let Err(e) = aux.device.bind_to_thread() {
+                        log::error!("multi-gpu: bind GPU{} failed: {:?}", i + 1, e);
+                        step_ok = false; break;
+                    }
+                    if let Err(e) = aux.upload_hidden_state(&h_hidden, &h_residual) {
+                        log::error!("multi-gpu upload_hidden to GPU{}: {}", i + 1, e);
+                        step_ok = false; break;
+                    }
+                    t_transfer_total += Instant::now().duration_since(t_xfer_start).as_secs_f64();
+
+                    // Replay graphs on this aux GPU
+                    let is_last = i + 1 == num_aux;
+                    let t_gpu_start = Instant::now();
+                    if let Err(e) = aux.replay_per_layer_graphs(next_token, pos, is_last) {
+                        eprintln!("[krasis] GPU{} graph replay failed: {}, falling back", i + 1, e);
+                        self.invalidate_cuda_graph();
+                        for &addr2 in aux_store_addrs.iter() {
+                            let s2 = unsafe { &mut *(addr2 as *mut GpuDecodeStore) };
+                            s2.invalidate_cuda_graph();
+                        }
+                        step_ok = false; break;
+                    }
+                    t_gpu_totals[i + 1] += Instant::now().duration_since(t_gpu_start).as_secs_f64();
+                }
+                if !step_ok { if step == 0 { continue; } else { break; } }
 
             } else {
                 // ── Ungraphed path (step 0, or after invalidation) ──
+                let mut step_ok = true;
 
-                // GPU0: embedding + layers [0..split_layer)
+                // GPU0: embedding + layers [0..boundaries[1])
                 if let Err(e) = self.device.bind_to_thread() {
                     log::error!("multi-gpu: bind GPU0 failed: {:?}", e);
                     break;
@@ -8159,87 +8262,101 @@ impl GpuDecodeStore {
 
                 if let Err(e) = self.gpu_decode_segment(
                     next_token, pos,
-                    true,           // do_embedding
-                    0,              // layer_start
-                    split_layer,    // layer_end
-                    false,          // do_final (not last segment)
-                    0,              // gqa_cache_offset (starts at 0)
+                    true,              // do_embedding
+                    0,                 // layer_start
+                    boundaries[1],     // layer_end
+                    false,             // do_final (not last segment)
+                    0,                 // gqa_cache_offset (starts at 0)
                 ) {
                     log::error!("multi-gpu GPU0 segment error: {}", e);
                     break;
                 }
 
                 if timing { self.device.synchronize().ok(); }
-                let t_gpu0_end = Instant::now();
-                t_gpu0_total += t_gpu0_end.duration_since(t_gpu0_start).as_secs_f64();
+                t_gpu_totals[0] += Instant::now().duration_since(t_gpu0_start).as_secs_f64();
 
-                // Transfer hidden state GPU0 → GPU1 via host
-                let t_xfer_start = Instant::now();
-                let (h_hidden, h_residual) = match self.download_hidden_state() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!("multi-gpu download_hidden error: {}", e);
-                        break;
+                // Pipeline through aux GPUs: transfer + decode segment
+                for i in 0..num_aux {
+                    // Transfer hidden state from previous GPU
+                    let t_xfer_start = Instant::now();
+                    let (h_hidden, h_residual) = if i == 0 {
+                        match self.download_hidden_state() {
+                            Ok(v) => v,
+                            Err(e) => { log::error!("multi-gpu download_hidden from GPU0: {}", e); step_ok = false; break; }
+                        }
+                    } else {
+                        let prev = unsafe { &mut *(aux_store_addrs[i - 1] as *mut GpuDecodeStore) };
+                        match prev.download_hidden_state() {
+                            Ok(v) => v,
+                            Err(e) => { log::error!("multi-gpu download_hidden from GPU{}: {}", i, e); step_ok = false; break; }
+                        }
+                    };
+
+                    let aux = unsafe { &mut *(aux_store_addrs[i] as *mut GpuDecodeStore) };
+                    if let Err(e) = aux.device.bind_to_thread() {
+                        log::error!("multi-gpu: bind GPU{} failed: {:?}", i + 1, e);
+                        step_ok = false; break;
                     }
-                };
+                    if let Err(e) = aux.upload_hidden_state(&h_hidden, &h_residual) {
+                        log::error!("multi-gpu upload_hidden to GPU{}: {}", i + 1, e);
+                        step_ok = false; break;
+                    }
+                    if timing { aux.device.synchronize().ok(); }
+                    t_transfer_total += Instant::now().duration_since(t_xfer_start).as_secs_f64();
 
-                if let Err(e) = aux_store.device.bind_to_thread() {
-                    log::error!("multi-gpu: bind GPU1 failed: {:?}", e);
-                    break;
+                    let is_last = i + 1 == num_aux;
+                    let t_gpu_start = Instant::now();
+                    if let Err(e) = aux.gpu_decode_segment(
+                        next_token, pos,
+                        false,                 // no embedding
+                        boundaries[i + 1],     // layer_start
+                        boundaries[i + 2],     // layer_end
+                        is_last,               // do_final only for last GPU
+                        gqa_cache_offsets[i],   // GQA layers before this segment
+                    ) {
+                        log::error!("multi-gpu GPU{} segment error: {}", i + 1, e);
+                        step_ok = false; break;
+                    }
+                    if timing { aux.device.synchronize().ok(); }
+                    t_gpu_totals[i + 1] += Instant::now().duration_since(t_gpu_start).as_secs_f64();
                 }
-                if let Err(e) = aux_store.upload_hidden_state(&h_hidden, &h_residual) {
-                    log::error!("multi-gpu upload_hidden error: {}", e);
-                    break;
-                }
-                if timing { aux_store.device.synchronize().ok(); }
-                let t_xfer_end = Instant::now();
-                t_transfer_total += t_xfer_end.duration_since(t_xfer_start).as_secs_f64();
-
-                let t_gpu1_start = Instant::now();
-                if let Err(e) = aux_store.gpu_decode_segment(
-                    next_token, pos,
-                    false,              // no embedding
-                    split_layer,        // layer_start
-                    num_layers,         // layer_end
-                    true,               // do_final (last segment)
-                    gqa_cache_offset,   // GQA layers before split
-                ) {
-                    log::error!("multi-gpu GPU1 segment error: {}", e);
-                    break;
-                }
-                if timing { aux_store.device.synchronize().ok(); }
-                let t_gpu1_end = Instant::now();
-                t_gpu1_total += t_gpu1_end.duration_since(t_gpu1_start).as_secs_f64();
+                if !step_ok { break; }
 
                 // Capture per-layer graphs after step 0
                 if step == 0 && !no_graph {
                     let gpu0_has_bufs = self.graph.as_ref()
                         .map(|g| g.d_graph_token_id.is_some()).unwrap_or(false);
-                    let gpu1_has_bufs = aux_store.graph.as_ref()
-                        .map(|g| g.d_graph_token_id.is_some()).unwrap_or(false);
+                    let all_have_bufs = gpu0_has_bufs && aux_store_addrs.iter().all(|&addr| {
+                        let s = unsafe { &*(addr as *const GpuDecodeStore) };
+                        s.graph.as_ref().map(|g| g.d_graph_token_id.is_some()).unwrap_or(false)
+                    });
 
-                    if gpu0_has_bufs && gpu1_has_bufs {
-                        // Capture GPU0 graphs: layers [0..split_layer), embedding, no final
+                    if all_have_bufs {
+                        // Capture GPU0 graphs: layers [0..boundaries[1]), embedding, no final
                         if let Err(e) = self.device.bind_to_thread() {
                             log::error!("multi-gpu: bind GPU0 for capture: {:?}", e);
                         } else {
                             match self.capture_per_layer_graphs(
-                                Some((0, split_layer)), true, false, 0,
+                                Some((0, boundaries[1])), true, false, 0,
                             ) {
                                 Ok(()) => eprintln!("[krasis] GPU0 per-layer graphs captured"),
                                 Err(e) => eprintln!("[krasis] GPU0 graph capture failed: {}", e),
                             }
                         }
 
-                        // Capture GPU1 graphs: layers [split_layer..num_layers), no embedding, final
-                        if let Err(e) = aux_store.device.bind_to_thread() {
-                            log::error!("multi-gpu: bind GPU1 for capture: {:?}", e);
-                        } else {
-                            match aux_store.capture_per_layer_graphs(
-                                Some((split_layer, num_layers)), false, true, gqa_cache_offset,
-                            ) {
-                                Ok(()) => eprintln!("[krasis] GPU1 per-layer graphs captured"),
-                                Err(e) => eprintln!("[krasis] GPU1 graph capture failed: {}", e),
+                        // Capture graphs for each aux GPU
+                        for (i, &addr) in aux_store_addrs.iter().enumerate() {
+                            let s = unsafe { &mut *(addr as *mut GpuDecodeStore) };
+                            let is_last = i + 1 == num_aux;
+                            if let Err(e) = s.device.bind_to_thread() {
+                                log::error!("multi-gpu: bind GPU{} for capture: {:?}", i + 1, e);
+                            } else {
+                                match s.capture_per_layer_graphs(
+                                    Some((boundaries[i + 1], boundaries[i + 2])), false, is_last, gqa_cache_offsets[i],
+                                ) {
+                                    Ok(()) => eprintln!("[krasis] GPU{} per-layer graphs captured", i + 1),
+                                    Err(e) => eprintln!("[krasis] GPU{} graph capture failed: {}", i + 1, e),
+                                }
                             }
                         }
                     }
@@ -8247,8 +8364,9 @@ impl GpuDecodeStore {
             }
 
             let t_sample_start = Instant::now();
-            // Logits are now in aux_store's h_logits
-            let logits = &mut aux_store.graph.as_mut().unwrap().h_logits;
+            // Logits are now in last aux store's h_logits
+            let last_aux = unsafe { &mut *(aux_store_addrs[num_aux - 1] as *mut GpuDecodeStore) };
+            let logits = &mut last_aux.graph.as_mut().unwrap().h_logits;
 
             if presence_penalty != 0.0 {
                 for &tok in &seen_tokens {
@@ -8302,24 +8420,29 @@ impl GpuDecodeStore {
         // Print multi-GPU timing summary
         if timing && generated > 0 {
             let n = generated as f64;
-            let avg_gpu0 = t_gpu0_total / n * 1000.0;
-            let avg_gpu1 = t_gpu1_total / n * 1000.0;
             let avg_xfer = t_transfer_total / n * 1000.0;
             let avg_sample = t_sample_total / n * 1000.0;
             let avg_total = elapsed / n * 1000.0;
-            let avg_other = avg_total - avg_gpu0 - avg_gpu1 - avg_xfer - avg_sample;
+            let avg_gpu_sum: f64 = t_gpu_totals.iter().map(|t| t / n * 1000.0).sum();
+            let avg_other = avg_total - avg_gpu_sum - avg_xfer - avg_sample;
 
             eprintln!();
             eprintln!("  \x1b[33m┌───────────────────────────────────────────────────────┐\x1b[0m");
-            eprintln!("  \x1b[33m│\x1b[0m  MULTI-GPU DECODE TIMING ({} tokens avg)              \x1b[33m│\x1b[0m", generated);
+            eprintln!("  \x1b[33m│\x1b[0m  MULTI-GPU DECODE TIMING ({} tokens, {} GPUs)          \x1b[33m│\x1b[0m", generated, num_gpus);
             eprintln!("  \x1b[33m├───────────────────────────────────────────────────────┤\x1b[0m");
             eprintln!("  \x1b[33m│\x1b[0m  Total:        {:7.2} ms/tok  ({:5.1} tok/s)         \x1b[33m│\x1b[0m", avg_total, 1000.0 / avg_total);
-            eprintln!("  \x1b[33m│\x1b[0m  GPU0 (L0-{}): {:7.2} ms  ({:4.1}%)  [{} layers]     \x1b[33m│\x1b[0m",
-                split_layer - 1, avg_gpu0, avg_gpu0 / avg_total * 100.0, split_layer);
-            eprintln!("  \x1b[33m│\x1b[0m  Transfer:     {:7.2} ms  ({:4.1}%)  [D2H+H2D]       \x1b[33m│\x1b[0m",
-                avg_xfer, avg_xfer / avg_total * 100.0);
-            eprintln!("  \x1b[33m│\x1b[0m  GPU1 (L{}-{}): {:7.2} ms  ({:4.1}%)  [{} layers]    \x1b[33m│\x1b[0m",
-                split_layer, num_layers - 1, avg_gpu1, avg_gpu1 / avg_total * 100.0, num_layers - split_layer);
+
+            // Per-GPU timing
+            for gpu_idx in 0..num_gpus {
+                let avg_gpu = t_gpu_totals[gpu_idx] / n * 1000.0;
+                let layer_start = boundaries[gpu_idx];
+                let layer_end = boundaries[gpu_idx + 1];
+                let n_layers = layer_end - layer_start;
+                eprintln!("  \x1b[33m│\x1b[0m  GPU{} (L{}-{}): {:7.2} ms  ({:4.1}%)  [{} layers]    \x1b[33m│\x1b[0m",
+                    gpu_idx, layer_start, layer_end - 1, avg_gpu, avg_gpu / avg_total * 100.0, n_layers);
+            }
+            eprintln!("  \x1b[33m│\x1b[0m  Transfer:     {:7.2} ms  ({:4.1}%)  [{} hops]        \x1b[33m│\x1b[0m",
+                avg_xfer, avg_xfer / avg_total * 100.0, num_aux);
             eprintln!("  \x1b[33m│\x1b[0m  Sample:       {:7.2} ms  ({:4.1}%)                   \x1b[33m│\x1b[0m",
                 avg_sample, avg_sample / avg_total * 100.0);
             if avg_other.abs() > 0.01 {
@@ -8329,17 +8452,14 @@ impl GpuDecodeStore {
             eprintln!("  \x1b[33m├───────────────────────────────────────────────────────┤\x1b[0m");
 
             // Per-layer rate comparison
-            let gpu0_ms_per_layer = if split_layer > 0 { avg_gpu0 / split_layer as f64 } else { 0.0 };
-            let gpu1_layers = num_layers - split_layer;
-            let gpu1_ms_per_layer = if gpu1_layers > 0 { avg_gpu1 / gpu1_layers as f64 } else { 0.0 };
-            eprintln!("  \x1b[33m│\x1b[0m  GPU0 per-layer: {:5.3} ms                            \x1b[33m│\x1b[0m", gpu0_ms_per_layer);
-            eprintln!("  \x1b[33m│\x1b[0m  GPU1 per-layer: {:5.3} ms                            \x1b[33m│\x1b[0m", gpu1_ms_per_layer);
-            if gpu0_ms_per_layer > 0.001 {
-                eprintln!("  \x1b[33m│\x1b[0m  GPU1/GPU0 ratio: {:5.2}x                             \x1b[33m│\x1b[0m",
-                    gpu1_ms_per_layer / gpu0_ms_per_layer);
+            for gpu_idx in 0..num_gpus {
+                let avg_gpu = t_gpu_totals[gpu_idx] / n * 1000.0;
+                let n_layers = boundaries[gpu_idx + 1] - boundaries[gpu_idx];
+                let ms_per_layer = if n_layers > 0 { avg_gpu / n_layers as f64 } else { 0.0 };
+                eprintln!("  \x1b[33m│\x1b[0m  GPU{} per-layer: {:5.3} ms                           \x1b[33m│\x1b[0m", gpu_idx, ms_per_layer);
             }
 
-            // HCS stats for both GPUs
+            // HCS stats for all GPUs
             eprintln!("  \x1b[33m├───────────────────────────────────────────────────────┤\x1b[0m");
             if let Some(ref graph0) = self.graph {
                 if let Some(ref hcs) = graph0.hcs {
@@ -8349,85 +8469,65 @@ impl GpuDecodeStore {
                         hcs.num_cached, hit_pct, hcs.total_hits, hcs.total_misses);
                 }
             }
-            if let Some(ref graph1) = aux_store.graph {
-                if let Some(ref hcs) = graph1.hcs {
-                    let total = (hcs.total_hits + hcs.total_misses).max(1) as f64;
-                    let hit_pct = hcs.total_hits as f64 / total * 100.0;
-                    eprintln!("  \x1b[33m│\x1b[0m  GPU1 HCS: {} cached, {:.1}% hit ({}/{})           \x1b[33m│\x1b[0m",
-                        hcs.num_cached, hit_pct, hcs.total_hits, hcs.total_misses);
+            for (i, &addr) in aux_store_addrs.iter().enumerate() {
+                let s = unsafe { &*(addr as *const GpuDecodeStore) };
+                if let Some(ref graph_i) = s.graph {
+                    if let Some(ref hcs) = graph_i.hcs {
+                        let total = (hcs.total_hits + hcs.total_misses).max(1) as f64;
+                        let hit_pct = hcs.total_hits as f64 / total * 100.0;
+                        eprintln!("  \x1b[33m│\x1b[0m  GPU{} HCS: {} cached, {:.1}% hit ({}/{})          \x1b[33m│\x1b[0m",
+                            i + 1, hcs.num_cached, hit_pct, hcs.total_hits, hcs.total_misses);
+                    }
                 }
             }
             eprintln!("  \x1b[33m└───────────────────────────────────────────────────────┘\x1b[0m");
 
-            // Also print per-GPU detailed timing from each graph
-            eprintln!();
-            eprintln!("  \x1b[36m=== GPU0 Detail (layers 0-{}) ===\x1b[0m", split_layer - 1);
-            if let Some(ref graph0) = self.graph {
-                if graph0.timing_step_count > 0 {
-                    let n0 = graph0.timing_step_count as f64;
-                    let avg_attn = graph0.t_attn / n0 * 1000.0;
-                    let avg_moe = graph0.t_route / n0 * 1000.0;
-                    let avg_norm = graph0.t_norm / n0 * 1000.0;
-                    let avg_attn_la = graph0.t_attn_la / n0 * 1000.0;
-                    let avg_attn_gqa = graph0.t_attn_gqa / n0 * 1000.0;
-                    let avg_route_sync = graph0.t_moe_route_sync / n0 * 1000.0;
-                    let avg_expert_loop = graph0.t_moe_expert_loop / n0 * 1000.0;
-                    let avg_shared = graph0.t_moe_shared / n0 * 1000.0;
-                    let avg_exp_w13 = graph0.t_expert_w13 / n0 * 1000.0;
-                    let avg_exp_silu = graph0.t_expert_silu_w2 / n0 * 1000.0;
-                    let avg_cold = graph0.dma_cold_experts as f64 / n0;
-                    let avg_hcs = graph0.dma_hcs_experts as f64 / n0;
-                    eprintln!("    Attention:    {:6.2} ms (LA {:5.2}, GQA {:5.2})", avg_attn, avg_attn_la, avg_attn_gqa);
-                    eprintln!("    MoE:          {:6.2} ms (route {:5.2}, experts {:5.2}, shared {:5.2})",
-                        avg_moe, avg_route_sync, avg_expert_loop, avg_shared);
-                    eprintln!("      w13: {:5.2} ms, silu+w2: {:5.2} ms", avg_exp_w13, avg_exp_silu);
-                    eprintln!("    Norms+Emb:    {:6.2} ms", avg_norm);
-                    eprintln!("    Cold/HCS:     {:.1}/{:.1} experts/tok", avg_cold, avg_hcs);
-                }
-            }
+            // Per-GPU detailed timing
+            let all_stores: Vec<(usize, &GpuDecodeStore)> = std::iter::once((0usize, &*self as &GpuDecodeStore))
+                .chain(aux_store_addrs.iter().enumerate().map(|(i, &addr)| {
+                    (i + 1, unsafe { &*(addr as *const GpuDecodeStore) })
+                }))
+                .collect();
 
-            eprintln!();
-            eprintln!("  \x1b[36m=== GPU1 Detail (layers {}-{}) ===\x1b[0m", split_layer, num_layers - 1);
-            if let Some(ref graph1) = aux_store.graph {
-                if graph1.timing_step_count > 0 {
-                    let n1 = graph1.timing_step_count as f64;
-                    let avg_attn = graph1.t_attn / n1 * 1000.0;
-                    let avg_moe = graph1.t_route / n1 * 1000.0;
-                    let avg_norm = graph1.t_norm / n1 * 1000.0;
-                    let avg_attn_la = graph1.t_attn_la / n1 * 1000.0;
-                    let avg_attn_gqa = graph1.t_attn_gqa / n1 * 1000.0;
-                    let avg_route_sync = graph1.t_moe_route_sync / n1 * 1000.0;
-                    let avg_expert_loop = graph1.t_moe_expert_loop / n1 * 1000.0;
-                    let avg_shared = graph1.t_moe_shared / n1 * 1000.0;
-                    let avg_exp_w13 = graph1.t_expert_w13 / n1 * 1000.0;
-                    let avg_exp_silu = graph1.t_expert_silu_w2 / n1 * 1000.0;
-                    let avg_cold = graph1.dma_cold_experts as f64 / n1;
-                    let avg_hcs = graph1.dma_hcs_experts as f64 / n1;
-                    let avg_lm = graph1.t_lm_head / n1 * 1000.0;
-                    eprintln!("    Attention:    {:6.2} ms (LA {:5.2}, GQA {:5.2})", avg_attn, avg_attn_la, avg_attn_gqa);
-                    eprintln!("    MoE:          {:6.2} ms (route {:5.2}, experts {:5.2}, shared {:5.2})",
-                        avg_moe, avg_route_sync, avg_expert_loop, avg_shared);
-                    eprintln!("      w13: {:5.2} ms, silu+w2: {:5.2} ms", avg_exp_w13, avg_exp_silu);
-                    eprintln!("    Norms+Emb:    {:6.2} ms", avg_norm);
-                    eprintln!("    LM Head:      {:6.2} ms", avg_lm);
-                    eprintln!("    Cold/HCS:     {:.1}/{:.1} experts/tok", avg_cold, avg_hcs);
+            for (gpu_idx, store_ref) in &all_stores {
+                let layer_start = boundaries[*gpu_idx];
+                let layer_end = boundaries[*gpu_idx + 1];
+                eprintln!();
+                eprintln!("  \x1b[36m=== GPU{} Detail (layers {}-{}) ===\x1b[0m", gpu_idx, layer_start, layer_end - 1);
+                if let Some(ref g) = store_ref.graph {
+                    if g.timing_step_count > 0 {
+                        let ns = g.timing_step_count as f64;
+                        eprintln!("    Attention:    {:6.2} ms (LA {:5.2}, GQA {:5.2})",
+                            g.t_attn / ns * 1000.0, g.t_attn_la / ns * 1000.0, g.t_attn_gqa / ns * 1000.0);
+                        eprintln!("    MoE:          {:6.2} ms (route {:5.2}, experts {:5.2}, shared {:5.2})",
+                            g.t_route / ns * 1000.0, g.t_moe_route_sync / ns * 1000.0,
+                            g.t_moe_expert_loop / ns * 1000.0, g.t_moe_shared / ns * 1000.0);
+                        eprintln!("      w13: {:5.2} ms, silu+w2: {:5.2} ms",
+                            g.t_expert_w13 / ns * 1000.0, g.t_expert_silu_w2 / ns * 1000.0);
+                        eprintln!("    Norms+Emb:    {:6.2} ms", g.t_norm / ns * 1000.0);
+                        if *gpu_idx == num_gpus - 1 {
+                            eprintln!("    LM Head:      {:6.2} ms", g.t_lm_head / ns * 1000.0);
+                        }
+                        eprintln!("    Cold/HCS:     {:.1}/{:.1} experts/tok",
+                            g.dma_cold_experts as f64 / ns, g.dma_hcs_experts as f64 / ns);
+                    }
                 }
             }
             eprintln!();
 
-            // Also emit to structured log
-            log::info!(
-                "MULTI-GPU DECODE TIMING ({} tokens avg): \
-                 Total: {:.2} ms/tok ({:.1} tok/s) | \
-                 GPU0 (L0-{}): {:.2} ms ({:.1}%) | Transfer: {:.2} ms ({:.1}%) | \
-                 GPU1 (L{}-{}): {:.2} ms ({:.1}%) | Sample: {:.2} ms ({:.1}%)",
-                generated,
-                avg_total, 1000.0 / avg_total,
-                split_layer - 1, avg_gpu0, avg_gpu0 / avg_total * 100.0,
-                avg_xfer, avg_xfer / avg_total * 100.0,
-                split_layer, num_layers - 1, avg_gpu1, avg_gpu1 / avg_total * 100.0,
-                avg_sample, avg_sample / avg_total * 100.0
-            );
+            // Structured log
+            let mut log_parts: Vec<String> = Vec::new();
+            log_parts.push(format!("MULTI-GPU DECODE TIMING ({} tokens, {} GPUs): Total: {:.2} ms/tok ({:.1} tok/s)",
+                generated, num_gpus, avg_total, 1000.0 / avg_total));
+            for gpu_idx in 0..num_gpus {
+                let avg_gpu = t_gpu_totals[gpu_idx] / n * 1000.0;
+                log_parts.push(format!("GPU{} (L{}-{}): {:.2} ms ({:.1}%)",
+                    gpu_idx, boundaries[gpu_idx], boundaries[gpu_idx + 1] - 1,
+                    avg_gpu, avg_gpu / avg_total * 100.0));
+            }
+            log_parts.push(format!("Transfer: {:.2} ms ({:.1}%)", avg_xfer, avg_xfer / avg_total * 100.0));
+            log_parts.push(format!("Sample: {:.2} ms ({:.1}%)", avg_sample, avg_sample / avg_total * 100.0));
+            log::info!("{}", log_parts.join(" | "));
         }
 
         generated

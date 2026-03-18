@@ -831,10 +831,16 @@ class KrasisModel:
             torch.cuda.synchronize(device)
 
         # ── 3. Linear attention torch.compile warmup ──
+        # Must set device back to primary BEFORE torch.compile — after the per-device
+        # loop above, the current CUDA device may be a secondary GPU with a different
+        # SM architecture. Inductor generates PTX for the current device's arch, so
+        # compiling while cuda:1 (e.g. Ada sm_89) is current would produce kernels
+        # that fail on cuda:0 (e.g. Blackwell sm_120).
         if self.cfg.linear_num_value_heads > 0:
             try:
                 from krasis.linear_attention import warmup_compiled_chunk_step
                 primary = devices[0]
+                torch.cuda.set_device(primary)
                 warmup_compiled_chunk_step(
                     primary,
                     nv=self.cfg.linear_num_value_heads,
@@ -4385,15 +4391,22 @@ class KrasisModel:
                      len(self.layers), store.gpu_store_addr())
         return store
 
-    def setup_gpu_decode_store_aux(self, gpu_idx: int, split_layer: int) -> "GpuDecodeStore":
+    def setup_gpu_decode_store_aux(self, gpu_idx: int, split_layer: int, layer_end: int = 0) -> "GpuDecodeStore":
         """Create an auxiliary GpuDecodeStore for multi-GPU decode.
 
-        Sets up a second store on gpu_idx for layers [split_layer..num_layers).
+        Sets up a store on gpu_idx for layers [split_layer..layer_end).
+        If layer_end=0, defaults to num_layers (last GPU in pipeline).
         Registers attention weights (copied to aux GPU), KV cache (allocated on
         aux GPU), MoE layers, final norm, LM head, and RoPE on the aux GPU.
+        Only the last segment (layer_end == num_layers) gets real final norm + LM head.
         """
         from krasis import GpuDecodeStore
         import torch
+
+        num_layers = len(self.layers)
+        if layer_end <= 0:
+            layer_end = num_layers
+        is_last_segment = (layer_end == num_layers)
 
         aux_device = torch.device(f"cuda:{gpu_idx}")
         primary_device = torch.device(self.ranks[0].device)
@@ -4429,26 +4442,42 @@ class KrasisModel:
         # a dummy so configure doesn't complain. Use primary embedding ptr (not accessed).
         store.set_embedding(self.embedding.data_ptr())
 
-        # Final norm — copy to aux GPU
-        fn_aux = self.final_norm.to(aux_device).contiguous()
-        self._aux_final_norm = fn_aux  # prevent GC
-        store.set_final_norm(fn_aux.data_ptr(), self.cfg.hidden_size)
+        if is_last_segment:
+            # Final norm — copy to aux GPU (only needed on last segment)
+            fn_aux = self.final_norm.to(aux_device).contiguous()
+            if not hasattr(self, '_aux_final_norms'):
+                self._aux_final_norms = []
+            self._aux_final_norms.append(fn_aux)
+            store.set_final_norm(fn_aux.data_ptr(), self.cfg.hidden_size)
 
-        # LM head — copy to aux GPU (needed for final segment)
-        # Dequantize on CPU to avoid OOM on GPU0 (LM head is ~1.2 GB in BF16)
-        lm_head_w = self.lm_head_data
-        if isinstance(lm_head_w, tuple):
-            w_int8, scale = lm_head_w
-            lm_head_bf16 = (w_int8.cpu().float() * scale.cpu().unsqueeze(1)).to(torch.bfloat16).contiguous().to(aux_device)
+            # LM head — copy to aux GPU (needed for final segment only)
+            # Dequantize on CPU to avoid OOM on GPU0 (LM head is ~1.2 GB in BF16)
+            lm_head_w = self.lm_head_data
+            if isinstance(lm_head_w, tuple):
+                w_int8, scale = lm_head_w
+                lm_head_bf16 = (w_int8.cpu().float() * scale.cpu().unsqueeze(1)).to(torch.bfloat16).contiguous().to(aux_device)
+            else:
+                lm_head_bf16 = lm_head_w.to(aux_device).contiguous()
+            if not hasattr(self, '_aux_lm_heads'):
+                self._aux_lm_heads = []
+            self._aux_lm_heads.append(lm_head_bf16)
+            lm_head_wid = store.register_weight(lm_head_bf16.data_ptr(), lm_head_bf16.shape[0], lm_head_bf16.shape[1], 0)
+            store.set_lm_head(lm_head_wid)
         else:
-            lm_head_bf16 = lm_head_w.to(aux_device).contiguous()
-        self._aux_lm_head = lm_head_bf16
-        lm_head_wid = store.register_weight(lm_head_bf16.data_ptr(), lm_head_bf16.shape[0], lm_head_bf16.shape[1], 0)
-        store.set_lm_head(lm_head_wid)
+            # Intermediate segment — register primary GPU's pointers as placeholders (never accessed)
+            store.set_final_norm(self.final_norm.data_ptr(), self.cfg.hidden_size)
+            lm_head_w = self.lm_head_data
+            if isinstance(lm_head_w, tuple):
+                lm_head_wid = store.register_weight(lm_head_w[0].data_ptr(), lm_head_w[0].shape[0], lm_head_w[0].shape[1], 0)
+            else:
+                lm_head_wid = store.register_weight(lm_head_w.data_ptr(), lm_head_w.shape[0], lm_head_w.shape[1], 0)
+            store.set_lm_head(lm_head_wid)
 
         store.set_norm_bias_one(getattr(self.cfg, 'norm_bias_one', False))
 
         # Keep references to aux GPU weight copies
+        if not hasattr(self, '_aux_decode_weights_all'):
+            self._aux_decode_weights_all = []
         self._aux_decode_weights = []
         aux_rope_set = False
         gqa_count_before_split = 0
@@ -4462,16 +4491,19 @@ class KrasisModel:
             if layer_idx < split_layer and layer.layer_type != "linear_attention":
                 gqa_count_before_split += 1
 
+            # Determine if this layer is in this aux GPU's segment
+            in_segment = split_layer <= layer_idx < layer_end
+
             if layer.layer_type == "linear_attention":
-                if layer_idx >= split_layer:
+                if in_segment:
                     # Copy LA weights to aux GPU
                     qkvz_w = attn.in_proj_qkvz.to(aux_device, non_blocking=True)
                     ba_w = attn.in_proj_ba.to(aux_device, non_blocking=True)
                     out_w = attn.out_proj.to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([qkvz_w, ba_w, out_w])
-                    qkvz_wid = _register_attn_weight(qkvz_w, layer_idx, "linear_attention", "in_proj_qkvz")
-                    ba_wid = _register_attn_weight(ba_w, layer_idx, "linear_attention", "in_proj_ba")
-                    out_wid = _register_attn_weight(out_w, layer_idx, "linear_attention", "out_proj")
+                    qkvz_wid = store.register_weight(qkvz_w.data_ptr(), qkvz_w.shape[0], qkvz_w.shape[1], _weight_dtype_code(qkvz_w))
+                    ba_wid = store.register_weight(ba_w.data_ptr(), ba_w.shape[0], ba_w.shape[1], _weight_dtype_code(ba_w))
+                    out_wid = store.register_weight(out_w.data_ptr(), out_w.shape[0], out_w.shape[1], _weight_dtype_code(out_w))
 
                     # Copy norm weights to aux GPU
                     inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
@@ -4510,9 +4542,9 @@ class KrasisModel:
                         layer_idx=layer_idx,
                         input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
                         post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
-                        in_proj_qkvz_wid=_register_attn_weight(attn.in_proj_qkvz, layer_idx, "linear_attention", "in_proj_qkvz"),
-                        in_proj_ba_wid=_register_attn_weight(attn.in_proj_ba, layer_idx, "linear_attention", "in_proj_ba"),
-                        out_proj_wid=_register_attn_weight(attn.out_proj, layer_idx, "linear_attention", "out_proj"),
+                        in_proj_qkvz_wid=store.register_weight(attn.in_proj_qkvz.data_ptr(), attn.in_proj_qkvz.shape[0], attn.in_proj_qkvz.shape[1], _weight_dtype_code(attn.in_proj_qkvz)),
+                        in_proj_ba_wid=store.register_weight(attn.in_proj_ba.data_ptr(), attn.in_proj_ba.shape[0], attn.in_proj_ba.shape[1], _weight_dtype_code(attn.in_proj_ba)),
+                        out_proj_wid=store.register_weight(attn.out_proj.data_ptr(), attn.out_proj.shape[0], attn.out_proj.shape[1], _weight_dtype_code(attn.out_proj)),
                         conv_weight_ptr=attn._rust_conv_weight.data_ptr() if hasattr(attn, '_rust_conv_weight') else 0,
                         a_log_ptr=attn._rust_a_log.data_ptr() if hasattr(attn, '_rust_a_log') else 0,
                         dt_bias_ptr=attn._rust_dt_bias.data_ptr() if hasattr(attn, '_rust_dt_bias') else 0,
@@ -4527,7 +4559,7 @@ class KrasisModel:
                     )
             else:
                 # GQA attention
-                if layer_idx >= split_layer:
+                if in_segment:
                     # Copy GQA weights to aux GPU
                     q_w = attn.q_proj.to(aux_device, non_blocking=True)
                     k_w = attn.k_proj.to(aux_device, non_blocking=True)
@@ -4587,11 +4619,11 @@ class KrasisModel:
                         )
                         aux_rope_set = True
                 else:
-                    # Layers before split — register placeholder
-                    q_wid = _register_attn_weight(attn.q_proj, layer_idx, "gqa", "q_proj")
-                    k_wid = _register_attn_weight(attn.k_proj, layer_idx, "gqa", "k_proj")
-                    v_wid = _register_attn_weight(attn.v_proj, layer_idx, "gqa", "v_proj")
-                    o_wid = _register_attn_weight(attn.o_proj, layer_idx, "gqa", "o_proj")
+                    # Layers before split — register placeholder (never executed on this GPU)
+                    q_wid = store.register_weight(attn.q_proj.data_ptr(), attn.q_proj.shape[0], attn.q_proj.shape[1], _weight_dtype_code(attn.q_proj))
+                    k_wid = store.register_weight(attn.k_proj.data_ptr(), attn.k_proj.shape[0], attn.k_proj.shape[1], _weight_dtype_code(attn.k_proj))
+                    v_wid = store.register_weight(attn.v_proj.data_ptr(), attn.v_proj.shape[0], attn.v_proj.shape[1], _weight_dtype_code(attn.v_proj))
+                    o_wid = store.register_weight(attn.o_proj.data_ptr(), attn.o_proj.shape[0], attn.o_proj.shape[1], _weight_dtype_code(attn.o_proj))
                     if attn.q_norm is not None:
                         q_norm_ptr = attn._rust_q_norm.data_ptr() if hasattr(attn, '_rust_q_norm') else 0
                     else:
@@ -4617,7 +4649,7 @@ class KrasisModel:
             if layer.is_moe:
                 store.register_mlp(layer_idx, "moe")
             elif layer.dense_mlp is not None:
-                if layer_idx >= split_layer:
+                if in_segment:
                     gp = layer.dense_mlp["gate_proj"].to(aux_device, non_blocking=True)
                     up = layer.dense_mlp["up_proj"].to(aux_device, non_blocking=True)
                     dp = layer.dense_mlp["down_proj"].to(aux_device, non_blocking=True)
@@ -4642,10 +4674,12 @@ class KrasisModel:
             store.setup_from_engine(self.krasis_engine)
 
         # Shared expert gates for aux layers
+        if not hasattr(self, '_aux_shared_gate_refs_all'):
+            self._aux_shared_gate_refs_all = []
         self._aux_shared_gate_refs = []
         for layer_idx, layer in enumerate(self.layers):
             if layer.is_moe and layer.shared_expert_gate is not None:
-                if layer_idx >= split_layer:
+                if split_layer <= layer_idx < layer_end:
                     sg = layer.shared_expert_gate.to(aux_device, non_blocking=True)
                     self._aux_shared_gate_refs.append(sg)
                     sg_wid = store.register_weight(sg.data_ptr(), sg.shape[0], sg.shape[1], 0)
@@ -4654,35 +4688,44 @@ class KrasisModel:
                     sg_wid = store.register_weight(sg.data_ptr(), sg.shape[0], sg.shape[1], 0)
                 store.set_moe_shared_gate_wid(layer_idx, sg_wid)
 
-        # Allocate KV cache on aux GPU for GQA layers in GPU1's segment
+        # Allocate KV cache on aux GPU for GQA layers in this segment [split_layer..layer_end)
         cache = self.kv_caches[0]
         if cache is not None and cache.k_cache is not None:
             kv_ptrs = []
             gqa_cache_idx = 0
             for layer_idx, layer in enumerate(self.layers):
                 if layer.layer_type != "linear_attention":
-                    if layer_idx >= split_layer:
+                    if split_layer <= layer_idx < layer_end:
                         # Allocate FP8 KV cache on aux GPU matching primary's shape
                         k_src = cache.k_cache[gqa_cache_idx]
                         v_src = cache.v_cache[gqa_cache_idx]
                         k_aux = torch.empty_like(k_src, device=aux_device)
                         v_aux = torch.empty_like(v_src, device=aux_device)
-                        if not hasattr(self, '_aux_kv_cache'):
-                            self._aux_kv_cache = []
-                        self._aux_kv_cache.extend([k_aux, v_aux])
+                        if not hasattr(self, '_aux_kv_caches'):
+                            self._aux_kv_caches = []
+                        self._aux_kv_caches.extend([k_aux, v_aux])
                         kv_ptrs.append((layer_idx, k_aux.data_ptr(), v_aux.data_ptr()))
                     else:
-                        # Layers before split — register primary GPU pointers (won't be accessed by aux decode)
+                        # Layers outside segment — register primary GPU pointers (won't be accessed)
                         k_layer = cache.k_cache[gqa_cache_idx]
                         v_layer = cache.v_cache[gqa_cache_idx]
                         kv_ptrs.append((layer_idx, k_layer.data_ptr(), v_layer.data_ptr()))
                     gqa_cache_idx += 1
             max_seq = cache.max_pages * cache.page_size
             store.set_kv_cache_ptrs(kv_ptrs, max_seq)
-            logger.info("Aux KV cache: %d GQA layers, max_seq=%d", len(kv_ptrs), max_seq)
+            logger.info("Aux KV cache on cuda:%d: %d GQA layers for [%d..%d), max_seq=%d",
+                        gpu_idx, len(kv_ptrs), split_layer, layer_end, max_seq)
 
         torch.cuda.synchronize(aux_device)
 
+        # Store references for GC protection and multi-GPU bookkeeping
+        if not hasattr(self, '_aux_gpu_decode_stores'):
+            self._aux_gpu_decode_stores = []
+        self._aux_gpu_decode_stores.append(store)
+        self._aux_decode_weights_all.extend(self._aux_decode_weights)
+        self._aux_shared_gate_refs_all.extend(self._aux_shared_gate_refs)
+
+        # Legacy single-aux-store attributes (still set for backward compat)
         self._aux_gpu_decode_store = store
         self._aux_gpu_idx = gpu_idx
         self._multi_gpu_split_layer = split_layer
@@ -4691,8 +4734,8 @@ class KrasisModel:
         if os.environ.get("KRASIS_DECODE_TIMING", "") == "1":
             store.set_timing(True)
 
-        logger.info("Aux GPU decode store configured: gpu=%d, split_layer=%d, gqa_offset=%d, store_addr=%d",
-                     gpu_idx, split_layer, gqa_count_before_split, store.gpu_store_addr())
+        logger.info("Aux GPU decode store configured: gpu=%d, layers=[%d..%d), gqa_offset=%d, store_addr=%d",
+                     gpu_idx, split_layer, layer_end, gqa_count_before_split, store.gpu_store_addr())
         return store
 
     def _export_kv_to_rust(self, seq_states, prompt_len: int):
@@ -4763,49 +4806,58 @@ class KrasisModel:
                 )
 
     def _update_la_state_ptrs_aux(self):
-        """Re-register LA state pointers on the aux store after prefill.
-        Copies post-prefill conv/recur states from GPU0 to GPU1."""
-        aux_store = getattr(self, '_aux_gpu_decode_store', None)
-        if aux_store is None:
-            return
-        split_layer = getattr(self, '_multi_gpu_split_layer', 0)
-        aux_gpu_idx = getattr(self, '_aux_gpu_idx', 1)
-        import torch
-        aux_dev = torch.device(f"cuda:{aux_gpu_idx}")
+        """Re-register LA state pointers on all aux stores after prefill.
+        Copies post-prefill conv/recur states from GPU0 to each aux GPU."""
+        aux_stores = getattr(self, '_aux_gpu_decode_stores', None)
+        if not aux_stores:
+            # Fallback to legacy single-store attribute
+            single = getattr(self, '_aux_gpu_decode_store', None)
+            if single is None:
+                return
+            aux_stores = [single]
 
-        for layer_idx, layer in enumerate(self.layers):
-            if layer_idx < split_layer:
-                continue
-            if layer.layer_type != "linear_attention":
-                continue
-            attn = layer.attention
-            if attn._conv_state is None or attn._recurrent_state is None:
-                continue
-            # Copy updated states to aux GPU -- preserve fixed addresses for CUDA graph replay.
-            new_conv_aux = attn._conv_state.squeeze(0).float().contiguous().to(aux_dev)
-            new_recur_aux = attn._recurrent_state.squeeze(0).float().contiguous().to(aux_dev)
-            if hasattr(attn, '_aux_conv_state') and attn._aux_conv_state is not None \
-                    and attn._aux_conv_state.shape == new_conv_aux.shape:
-                attn._aux_conv_state.copy_(new_conv_aux)
-                attn._aux_recur_state.copy_(new_recur_aux)
-            else:
-                attn._aux_conv_state = new_conv_aux
-                attn._aux_recur_state = new_recur_aux
-            # Re-register on aux store (reuse existing weight IDs from setup)
-            inp_norm = layer.input_norm_weight
-            post_norm = layer.post_attn_norm_weight
-            # Find the aux-device norm copies
-            inp_norm_aux = getattr(layer, '_aux_inp_norm', inp_norm)
-            post_norm_aux = getattr(layer, '_aux_post_norm', post_norm)
-            # We need weight IDs — LA layers store them; for aux we need to look them up
-            # For simplicity, re-register (register_la_layer overwrites the existing config)
-            # The weight IDs for projections were set during setup_gpu_decode_store_aux
-            # and are stored in the aux store's graph. We can just update state pointers.
-            aux_store.update_la_state_ptrs(
-                layer_idx,
-                attn._aux_conv_state.data_ptr(),
-                attn._aux_recur_state.data_ptr(),
-            )
+        import torch
+
+        # For each aux store, update LA state pointers for layers in its segment.
+        # We need to know each store's layer range. We can infer this from the store's
+        # graph config (segment_layer_start/end were set during setup). For simplicity,
+        # iterate all LA layers >= first split and update any aux store that has them.
+        split_layer = getattr(self, '_multi_gpu_split_layer', 0)
+
+        for aux_store in aux_stores:
+            aux_gpu_idx = aux_store.gpu_index() if hasattr(aux_store, 'gpu_index') else 0
+            aux_dev = torch.device(f"cuda:{aux_gpu_idx}")
+
+            for layer_idx, layer in enumerate(self.layers):
+                if layer_idx < split_layer:
+                    continue
+                if layer.layer_type != "linear_attention":
+                    continue
+                attn = layer.attention
+                if attn._conv_state is None or attn._recurrent_state is None:
+                    continue
+                # Copy updated states to aux GPU -- preserve fixed addresses for CUDA graph replay.
+                # Use per-store attribute names to avoid collisions between aux stores.
+                attr_conv = f'_aux_conv_state_{aux_gpu_idx}'
+                attr_recur = f'_aux_recur_state_{aux_gpu_idx}'
+                new_conv_aux = attn._conv_state.squeeze(0).float().contiguous().to(aux_dev)
+                new_recur_aux = attn._recurrent_state.squeeze(0).float().contiguous().to(aux_dev)
+                existing_conv = getattr(attn, attr_conv, None)
+                if existing_conv is not None and existing_conv.shape == new_conv_aux.shape:
+                    existing_conv.copy_(new_conv_aux)
+                    getattr(attn, attr_recur).copy_(new_recur_aux)
+                else:
+                    setattr(attn, attr_conv, new_conv_aux)
+                    setattr(attn, attr_recur, new_recur_aux)
+                # Also update the legacy attributes for backward compat
+                if not hasattr(attn, '_aux_conv_state') or attn._aux_conv_state is None:
+                    attn._aux_conv_state = getattr(attn, attr_conv)
+                    attn._aux_recur_state = getattr(attn, attr_recur)
+                aux_store.update_la_state_ptrs(
+                    layer_idx,
+                    getattr(attn, attr_conv).data_ptr(),
+                    getattr(attn, attr_recur).data_ptr(),
+                )
 
     def server_cleanup(self):
         """Free server request state (KV cache pages, etc.)."""

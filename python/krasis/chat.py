@@ -899,11 +899,15 @@ def run_sanity_test(
     server: Dict[str, Any],
     temperature: float = 0.6,
     max_tokens: int = 16384,
-):
+) -> List[Dict[str, Any]]:
     """Submit each prompt from sanity_test_prompts.txt, print and save results.
 
     Supports multi-turn conversations: lines starting with '- ' continue the
     previous conversation with history maintained.
+
+    Returns a list of per-prompt result dicts with keys:
+        prompt, text, conversation, turn, ttft_s, total_s, tokens,
+        decode_tok_s, prefill_tok_s, prompt_tokens, overhead, error
     """
     from datetime import datetime
     from pathlib import Path
@@ -920,7 +924,7 @@ def run_sanity_test(
 
     if not conversations:
         print(f"  {RED}No prompts found in {prompts_path}{NC}")
-        return
+        return []
 
     # Build output filename: YYYYMMDD-HHMMSS-<model>-sanity.txt
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -930,9 +934,11 @@ def run_sanity_test(
     out_dir = Path(prompts_path).parent
     out_path = out_dir / out_name
 
-    results = []
+    file_lines = []
     header = f"Sanity Test: {model} @ {url}\nDate: {datetime.now().isoformat()}\n"
-    results.append(header)
+    file_lines.append(header)
+
+    structured_results: List[Dict[str, Any]] = []
 
     # Count conversations with multiple turns for display
     multi_turn = sum(1 for c in conversations if len(c) > 1)
@@ -966,6 +972,22 @@ def run_sanity_test(
 
             messages.append({"role": "user", "content": prompt})
 
+            result_entry: Dict[str, Any] = {
+                "prompt": prompt,
+                "text": "",
+                "conversation": conv_idx,
+                "turn": turn_idx + 1,
+                "turns_in_conversation": len(conversation),
+                "ttft_s": 0,
+                "total_s": 0,
+                "tokens": 0,
+                "decode_tok_s": 0,
+                "prefill_tok_s": 0,
+                "prompt_tokens": 0,
+                "overhead": {},
+                "error": None,
+            }
+
             try:
                 t0 = time.perf_counter()
                 display_text, raw_text, timing = stream_chat(
@@ -985,30 +1007,47 @@ def run_sanity_test(
 
                 if timing:
                     stats_line = _format_timing(timing)
+                    result_entry["decode_tok_s"] = timing.get("decode_tok_s", 0)
+                    result_entry["prompt_tokens"] = timing.get("prompt_tokens", 0)
+                    result_entry["tokens"] = timing.get("answer_tokens", 0) + timing.get("thinking_tokens", 0)
+                    result_entry["overhead"] = timing.get("overhead", {})
+                    result_entry["prefill_tok_s"] = timing.get("prefill_tok_s", 0)
+                    prefill_ms = result_entry["overhead"].get("prefill_ms", 0)
+                    if prefill_ms > 0 and result_entry["prompt_tokens"] > 0 and result_entry["prefill_tok_s"] == 0:
+                        result_entry["prefill_tok_s"] = result_entry["prompt_tokens"] / (prefill_ms / 1000.0)
                 else:
                     stats_line = f"WARNING: server did not send krasis_timing"
 
+                result_entry["text"] = display_text
+                result_entry["ttft_s"] = round((timing or {}).get("overhead", {}).get("prefill_ms", elapsed * 1000) / 1000, 2)
+                result_entry["total_s"] = round(elapsed, 2)
+
                 print(f"\n  {DIM}{stats_line}{NC}\n")
 
-                results.append(f"--- Prompt {prompt_num}/{total_prompts}{turn_label} ---")
-                results.append(f"PROMPT: {prompt}")
-                results.append(f"RESPONSE: {display_text}")
-                results.append(f"TIME: {stats_line}")
-                results.append("")
+                file_lines.append(f"--- Prompt {prompt_num}/{total_prompts}{turn_label} ---")
+                file_lines.append(f"PROMPT: {prompt}")
+                file_lines.append(f"RESPONSE: {display_text}")
+                file_lines.append(f"TIME: {stats_line}")
+                file_lines.append("")
 
             except Exception as e:
                 print(f"\n  {RED}ERROR: {e}{NC}\n")
-                results.append(f"--- Prompt {prompt_num}/{total_prompts}{turn_label} ---")
-                results.append(f"PROMPT: {prompt}")
-                results.append(f"ERROR: {e}")
-                results.append("")
+                file_lines.append(f"--- Prompt {prompt_num}/{total_prompts}{turn_label} ---")
+                file_lines.append(f"PROMPT: {prompt}")
+                file_lines.append(f"ERROR: {e}")
+                file_lines.append("")
+                result_entry["error"] = str(e)
                 messages.pop()  # remove failed user message
+
+            structured_results.append(result_entry)
 
     # Write results file
     with open(out_path, "w") as f:
-        f.write("\n".join(results) + "\n")
+        f.write("\n".join(file_lines) + "\n")
 
     print(f"  {BOLD}Results saved to:{NC} {out_path}")
+
+    return structured_results
 
 
 # ═══════════════════════════════════════════════════════════════════════

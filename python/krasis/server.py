@@ -1072,44 +1072,42 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-    # ── Pre-compute multi-GPU layer split (before HCS, so we can filter rankings) ──
-    # Split is based on total HCS budget (hard+soft) on each GPU, so layers
+    # ── Pre-compute multi-GPU layer splits (before HCS, so we can filter rankings) ──
+    # Splits are based on total HCS budget (hard+soft) on each GPU, so layers
     # are proportional to where experts can actually live.
-    _multi_gpu_split = 0  # 0 = single GPU
+    # _multi_gpu_splits: list of split points (one per aux GPU). Empty = single GPU.
+    # _multi_gpu_gqa_offsets: GQA count before each split point.
+    _multi_gpu_splits = []
+    _multi_gpu_gqa_offsets = []
+    # Legacy compat
+    _multi_gpu_split = 0
     _multi_gpu_gqa_offset = 0
     if num_gpus_available > 1 and args.hcs:
-        _status("Computing multi-GPU layer split")
-        # GPU0: total HCS budget = hard + soft (from calibration)
-        gpu0_hcs_total = hard_budget + soft_budget
-
-        # GPU1: total VRAM minus overhead. Iterate to find self-consistent split.
-        gpu1_total = vram_monitor.total_mb(device_indices[1])
+        _status(f"Computing multi-GPU layer split ({num_gpus_available} GPUs)")
         num_layers = len(_model.layers)
 
         # Compute per-layer VRAM cost from actual loaded weights (not hardcoded estimates).
-        # Each layer's cost = attention weights + norms + gate + shared expert.
-        # For full attention (GQA) layers, also include KV cache contribution.
         _layer_vram_mb = []
         kv_cache = _model.kv_caches[0] if _model.kv_caches else None
         kv_total_mb = 0
         if kv_cache is not None:
-            # Total KV cache VRAM across all layers (will be split proportionally)
-            kv_total_bytes = sum(
-                t.nelement() * t.element_size()
-                for t in kv_cache.k_cache + kv_cache.v_cache
-            )
+            # k_cache and v_cache are single tensors (not lists); compute sizes individually
+            # to avoid FP8 tensor addition (ufunc_add not implemented for Float8_e4m3fn)
+            kv_total_bytes = 0
+            for cache_tensor in (kv_cache.k_cache, kv_cache.v_cache):
+                if cache_tensor is not None:
+                    kv_total_bytes += cache_tensor.nelement() * cache_tensor.element_size()
             kv_total_mb = kv_total_bytes / (1024 * 1024)
-            num_kv_layers = len(kv_cache.k_cache)
+            # num_layers is the first dim of the cache tensor
+            num_kv_layers = kv_cache.k_cache.shape[0] if kv_cache.k_cache is not None else 0
             kv_per_layer_mb = kv_total_mb / num_kv_layers if num_kv_layers > 0 else 0
         else:
             kv_per_layer_mb = 0
 
         for layer in _model.layers:
             layer_bytes = 0
-            # Norms
             layer_bytes += layer.input_norm_weight.nelement() * layer.input_norm_weight.element_size()
             layer_bytes += layer.post_attn_norm_weight.nelement() * layer.post_attn_norm_weight.element_size()
-            # Attention weights
             attn = layer.attention
             for attr_name in dir(attn):
                 val = getattr(attn, attr_name, None)
@@ -1119,7 +1117,6 @@ def main():
                     for t in val:
                         if isinstance(t, torch.Tensor) and t.device.type == 'cuda':
                             layer_bytes += t.nelement() * t.element_size()
-            # Gate + shared expert
             if layer.is_moe:
                 for w in [layer.gate_weight, layer.gate_bias, layer.e_score_correction_bias]:
                     if w is not None:
@@ -1133,55 +1130,106 @@ def main():
                                 if isinstance(t, torch.Tensor):
                                     layer_bytes += t.nelement() * t.element_size()
             layer_mb = layer_bytes / (1024 * 1024)
-            # Add KV cache cost for full attention layers
             if layer.layer_type != "linear_attention":
                 layer_mb += kv_per_layer_mb
             _layer_vram_mb.append(layer_mb)
 
-        # Compute GPU1 base overhead from actual model state:
-        # embedding + lm_head + final_norm (replicated on GPU1)
-        gpu1_base_overhead_bytes = 0
-        gpu1_base_overhead_bytes += _model.embedding.nelement() * _model.embedding.element_size()
-        gpu1_base_overhead_bytes += _model.final_norm.nelement() * _model.final_norm.element_size()
+        # Compute base overhead for the last aux GPU (embedding + lm_head + final_norm)
+        # Only the last GPU needs the LM head; intermediate GPUs only need attention/norms.
+        last_gpu_base_overhead_bytes = 0
+        last_gpu_base_overhead_bytes += _model.embedding.nelement() * _model.embedding.element_size()
+        last_gpu_base_overhead_bytes += _model.final_norm.nelement() * _model.final_norm.element_size()
         if isinstance(_model.lm_head_data, tuple):
             for t in _model.lm_head_data:
                 if isinstance(t, torch.Tensor):
-                    gpu1_base_overhead_bytes += t.nelement() * t.element_size()
+                    last_gpu_base_overhead_bytes += t.nelement() * t.element_size()
         elif isinstance(_model.lm_head_data, torch.Tensor):
-            gpu1_base_overhead_bytes += _model.lm_head_data.nelement() * _model.lm_head_data.element_size()
-        gpu1_base_overhead = gpu1_base_overhead_bytes / (1024 * 1024)
+            last_gpu_base_overhead_bytes += _model.lm_head_data.nelement() * _model.lm_head_data.element_size()
+        last_gpu_base_overhead = last_gpu_base_overhead_bytes / (1024 * 1024)
 
-        # Iterate: estimate split -> compute GPU1 attention cost -> recompute split
-        # Converges in 2-3 iterations since attention cost changes discretely.
-        _multi_gpu_split = num_layers // 2  # initial guess
+        # Compute HCS budget for each GPU.
+        # GPU0: from calibration (hard + soft).
+        # Aux GPUs: total VRAM - attention cost - overhead - safety margin.
+        # We iterate to find self-consistent splits where each GPU's layer assignment
+        # matches its available HCS budget proportionally.
+        gpu0_hcs_total = hard_budget + soft_budget
+        num_aux = num_gpus_available - 1
+        aux_totals = [vram_monitor.total_mb(device_indices[i + 1]) for i in range(num_aux)]
+
+        # Initial guess: equal distribution
+        initial_splits = [int(round(num_layers * (i + 1) / num_gpus_available))
+                          for i in range(num_aux)]
+        # Clamp each split to [2, num_layers - 2] and ensure monotonic
+        for i in range(len(initial_splits)):
+            initial_splits[i] = max(2, min(initial_splits[i], num_layers - 2))
+        for i in range(1, len(initial_splits)):
+            initial_splits[i] = max(initial_splits[i], initial_splits[i - 1] + 1)
+
+        _multi_gpu_splits = list(initial_splits)
+        gpu_hcs_budgets = [0.0] * num_gpus_available
+
         for _iter in range(5):
-            prev_split = _multi_gpu_split
+            prev_splits = list(_multi_gpu_splits)
 
-            # Sum per-layer VRAM costs for GPU1's layers at this split
-            gpu1_attn_cost = sum(_layer_vram_mb[i] for i in range(_multi_gpu_split, num_layers))
+            # Compute boundaries: [0, splits[0], splits[1], ..., num_layers]
+            boundaries = [0] + _multi_gpu_splits + [num_layers]
 
-            gpu1_hcs_total = max(0, gpu1_total - gpu1_base_overhead - gpu1_attn_cost - SAFETY_MARGIN_MB)
-            total_hcs = gpu0_hcs_total + gpu1_hcs_total
+            # Compute HCS budget for each GPU
+            gpu_hcs_budgets[0] = gpu0_hcs_total
+            for i in range(num_aux):
+                gpu_idx_in_list = i + 1
+                layer_start = boundaries[gpu_idx_in_list]
+                layer_end_b = boundaries[gpu_idx_in_list + 1]
+                attn_cost = sum(_layer_vram_mb[j] for j in range(layer_start, layer_end_b))
+                # Last aux GPU has LM head overhead
+                base_overhead = last_gpu_base_overhead if (i + 1 == num_aux) else 0
+                gpu_hcs_budgets[gpu_idx_in_list] = max(0,
+                    aux_totals[i] - base_overhead - attn_cost - SAFETY_MARGIN_MB)
 
-            if total_hcs > 0:
-                gpu0_ratio = gpu0_hcs_total / total_hcs
-                _multi_gpu_split = int(round(num_layers * gpu0_ratio))
-                _multi_gpu_split = max(2, min(_multi_gpu_split, num_layers - 2))
+            total_hcs = sum(gpu_hcs_budgets)
+            if total_hcs <= 0:
+                break
 
-            if _multi_gpu_split == prev_split:
+            # Redistribute layers proportionally to HCS budgets
+            cumulative = 0.0
+            new_splits = []
+            for i in range(num_aux):
+                cumulative += gpu_hcs_budgets[i]
+                split_pos = int(round(num_layers * cumulative / total_hcs))
+                split_pos = max(2, min(split_pos, num_layers - 2))
+                new_splits.append(split_pos)
+
+            # Ensure monotonic increasing
+            for i in range(1, len(new_splits)):
+                new_splits[i] = max(new_splits[i], new_splits[i - 1] + 1)
+
+            _multi_gpu_splits = new_splits
+            if _multi_gpu_splits == prev_splits:
                 break  # converged
 
-        # Count GQA layers in GPU0 segment (needed for KV cache offset)
-        _multi_gpu_gqa_offset = 0
-        for i in range(min(_multi_gpu_split, num_layers)):
-            if _model.layers[i].layer_type != "linear_attention":
-                _multi_gpu_gqa_offset += 1
+        # Compute GQA offsets for each split point
+        _multi_gpu_gqa_offsets = []
+        for split in _multi_gpu_splits:
+            gqa_count = 0
+            for i in range(min(split, num_layers)):
+                if _model.layers[i].layer_type != "linear_attention":
+                    gqa_count += 1
+            _multi_gpu_gqa_offsets.append(gqa_count)
 
-        _detail(f"HCS budgets: GPU0 {gpu0_hcs_total:,} MB / GPU1 {gpu1_hcs_total:,} MB = {total_hcs:,} MB total")
-        _detail(f"Layer split: GPU0 [0..{_multi_gpu_split}) = {_multi_gpu_split} layers ({gpu0_ratio:.1%}), "
-                f"GPU1 [{_multi_gpu_split}..{num_layers}) = {num_layers - _multi_gpu_split} layers ({1-gpu0_ratio:.1%})")
-        logger.info("Multi-GPU split: layer %d, GPU0 ratio=%.1f%%, gqa_offset=%d",
-                    _multi_gpu_split, gpu0_ratio * 100, _multi_gpu_gqa_offset)
+        # Recompute final boundaries for display
+        boundaries = [0] + _multi_gpu_splits + [num_layers]
+        _detail(f"HCS budgets: " + ", ".join(
+            f"GPU{i} {gpu_hcs_budgets[i]:,.0f} MB" for i in range(num_gpus_available)
+        ) + f" = {total_hcs:,.0f} MB total")
+        for i in range(num_gpus_available):
+            n_layers = boundaries[i + 1] - boundaries[i]
+            ratio = gpu_hcs_budgets[i] / total_hcs if total_hcs > 0 else 0
+            _detail(f"  GPU{i}: layers [{boundaries[i]}..{boundaries[i+1]}) = {n_layers} layers ({ratio:.1%})")
+        logger.info("Multi-GPU splits: %s, gqa_offsets=%s", _multi_gpu_splits, _multi_gpu_gqa_offsets)
+
+        # Legacy compat (used by HCS ranking filter below)
+        _multi_gpu_split = _multi_gpu_splits[0] if _multi_gpu_splits else 0
+        _multi_gpu_gqa_offset = _multi_gpu_gqa_offsets[0] if _multi_gpu_gqa_offsets else 0
 
     if not args.hcs:
         _status("GPU decode (no HCS)")
@@ -1236,6 +1284,10 @@ def main():
                 SAFETY_MARGIN_MB,
             )
             _dim(cal_msg)
+
+            # ── Set decode segment on primary store (for accurate HCS% reporting) ──
+            gpu0_layer_end = _multi_gpu_split if _multi_gpu_split > 0 else len(_model.layers)
+            store.set_decode_segment(0, gpu0_layer_end)
 
             # ── Initialize tiered HCS: hard pool + soft pool ──
             # In multi-GPU mode, filter ranking to GPU0's layer segment only
@@ -1382,76 +1434,77 @@ def main():
     max_ctx = _model.get_max_context_tokens()
 
     # ── Multi-GPU decode setup ──
-    aux_gpu_store_addr = 0
-    multi_gpu_split_layer = 0
-    multi_gpu_gqa_offset = 0
-    if _multi_gpu_split > 0 and args.hcs:
-        _status("Multi-GPU decode setup")
+    # Lists passed to RustServer for N-GPU pipeline decode
+    all_aux_gpu_store_addrs = []
+    all_multi_gpu_split_layers = list(_multi_gpu_splits)
+    all_multi_gpu_gqa_offsets = list(_multi_gpu_gqa_offsets)
+    if _multi_gpu_splits and args.hcs:
+        num_aux = len(_multi_gpu_splits)
+        num_layers = len(_model.layers)
+        boundaries = [0] + list(_multi_gpu_splits) + [num_layers]
+        _status(f"Multi-GPU decode setup ({num_aux + 1} GPUs)")
         gc.collect()
         torch.cuda.empty_cache()
 
-        split_layer = _multi_gpu_split
-        gqa_offset = _multi_gpu_gqa_offset
-        num_layers = len(_model.layers)
+        # Count layer types per GPU segment
+        for gpu_i in range(num_aux + 1):
+            seg_start, seg_end = boundaries[gpu_i], boundaries[gpu_i + 1]
+            la, gqa, moe, dense = 0, 0, 0, 0
+            for i in range(seg_start, seg_end):
+                layer = _model.layers[i]
+                if layer.layer_type == "linear_attention": la += 1
+                else: gqa += 1
+                if layer.is_moe: moe += 1
+                elif layer.dense_mlp is not None: dense += 1
+            _detail(f"  GPU{gpu_i}: layers [{seg_start}..{seg_end}) = {seg_end - seg_start} layers "
+                    f"({la} LA + {gqa} GQA, {moe} MoE + {dense} dense)")
+        _dim(f"  GQA cache offsets: {_multi_gpu_gqa_offsets}")
+        _dim(f"  Attention layers are PERMANENT on each GPU (copied at setup, never evicted)")
 
-        if True:
-            # Count layer types per GPU segment
-            gpu0_la, gpu0_gqa, gpu0_moe, gpu0_dense = 0, 0, 0, 0
-            gpu1_la, gpu1_gqa, gpu1_moe, gpu1_dense = 0, 0, 0, 0
-            for i, layer in enumerate(_model.layers):
-                is_la = layer.layer_type == "linear_attention"
-                is_moe = layer.is_moe
-                is_dense = layer.dense_mlp is not None
-                if i < split_layer:
-                    if is_la: gpu0_la += 1
-                    else: gpu0_gqa += 1
-                    if is_moe: gpu0_moe += 1
-                    elif is_dense: gpu0_dense += 1
-                else:
-                    if is_la: gpu1_la += 1
-                    else: gpu1_gqa += 1
-                    if is_moe: gpu1_moe += 1
-                    elif is_dense: gpu1_dense += 1
-
-            _detail(f"Layer split: GPU0 [0..{split_layer}) = {split_layer} layers, "
-                    f"GPU1 [{split_layer}..{num_layers}) = {num_layers - split_layer} layers")
-            _detail(f"  GPU0: {gpu0_la} LA + {gpu0_gqa} GQA attention, {gpu0_moe} MoE + {gpu0_dense} dense MLP")
-            _detail(f"  GPU1: {gpu1_la} LA + {gpu1_gqa} GQA attention, {gpu1_moe} MoE + {gpu1_dense} dense MLP")
-            _detail(f"  GQA cache offset for GPU1: {gqa_offset}")
-            _dim(f"  Attention layers are PERMANENT on each GPU (copied at setup, never evicted)")
-
-            # Create aux store on GPU1
-            _dim(f"Creating aux decode store on cuda:{device_indices[1]}...")
+        # Create aux stores for each aux GPU
+        aux_stores = []
+        for i in range(num_aux):
+            seg_start = _multi_gpu_splits[i]
+            seg_end = boundaries[i + 2]  # boundaries[i+1+1]
+            gpu_idx = device_indices[i + 1]
+            _dim(f"Creating aux decode store {i+1} on cuda:{gpu_idx} for layers [{seg_start}..{seg_end})...")
             aux_store = _model.setup_gpu_decode_store_aux(
-                gpu_idx=device_indices[1],
-                split_layer=split_layer,
+                gpu_idx=gpu_idx,
+                split_layer=seg_start,
+                layer_end=seg_end,
             )
-            aux_gpu_store_addr = aux_store.gpu_store_addr()
+            aux_store.set_decode_segment(seg_start, seg_end)
+            aux_stores.append(aux_store)
+            all_aux_gpu_store_addrs.append(aux_store.gpu_store_addr())
 
-            # Log post-setup VRAM
-            torch.cuda.synchronize(devices[1])
-            gc.collect()
-            torch.cuda.empty_cache()
-            for idx in device_indices:
-                post_free = vram_monitor.current_free_mb(idx)
-                total_mb = vram_monitor.total_mb(idx)
-                _dim(f"  cuda:{idx} after aux store setup: {post_free:,.0f} MB free / {total_mb:,} MB total")
+        # Log post-setup VRAM
+        for dev in devices:
+            torch.cuda.synchronize(dev)
+        gc.collect()
+        torch.cuda.empty_cache()
+        for idx in device_indices:
+            post_free = vram_monitor.current_free_mb(idx)
+            total_mb = vram_monitor.total_mb(idx)
+            _dim(f"  cuda:{idx} after aux store setup: {post_free:,.0f} MB free / {total_mb:,} MB total")
 
-            # Initialize HCS on aux store if we have the heatmap
-            if args.hcs and 'ranking' in locals():
-                # Build full ranking for GPU1's layer segment (ranked + unranked)
-                aux_ranking = _full_ranking_for_layers(ranking, split_layer, num_layers)
+        # Initialize HCS on each aux store if we have the heatmap
+        if args.hcs and 'ranking' in locals():
+            for i, aux_store in enumerate(aux_stores):
+                seg_start = boundaries[i + 1]
+                seg_end = boundaries[i + 2]
+                gpu_idx = device_indices[i + 1]
+
+                aux_ranking = _full_ranking_for_layers(ranking, seg_start, seg_end)
                 num_aux_ranked = sum(1 for l, e in aux_ranking if (l, e) in set(ranking))
-                _dim(f"  GPU1 HCS: {len(aux_ranking)} experts for layers [{split_layer}..{num_layers}) "
+                _dim(f"  GPU{i+1} HCS: {len(aux_ranking)} experts for layers [{seg_start}..{seg_end}) "
                      f"({num_aux_ranked} ranked + {len(aux_ranking) - num_aux_ranked} unranked)")
                 # Measure aux GPU free VRAM for HCS budget
-                aux_free_mb = vram_monitor.current_free_mb(device_indices[1])
+                aux_free_mb = vram_monitor.current_free_mb(gpu_idx)
                 aux_hcs_budget = max(0, int(aux_free_mb) - SAFETY_MARGIN_MB)
-                # 100% hard tier — GPU1 never does prefill so never needs to evict
+                # 100% hard tier — aux GPUs never do prefill so never need to evict
                 aux_hard = aux_hcs_budget
                 aux_soft = 0
-                _detail(f"Aux HCS budget: {aux_hard:,} MB hard + {aux_soft:,} MB soft = {aux_hcs_budget:,} MB")
-                _dim(f"  (aux_free={aux_free_mb:,.0f} MB - safety={SAFETY_MARGIN_MB} MB)")
+                _detail(f"  GPU{i+1} HCS budget: {aux_hard:,} MB hard (aux_free={aux_free_mb:,.0f} MB)")
 
                 if aux_ranking:
                     result = aux_store.hcs_pool_init_tiered(
@@ -1460,81 +1513,96 @@ def main():
                         soft_budget_mb=aux_soft,
                         safety_margin_mb=SAFETY_MARGIN_MB,
                     )
-                    _detail(f"Aux HCS: {result}")
+                    _detail(f"  GPU{i+1} HCS: {result}")
 
-            # ── Multi-GPU decode validation ──
-            _status("Validating multi-GPU decode")
-            # Reset VRAM monitor to capture multi-GPU decode stats
-            vram_monitor.reset_min_free()
-            try:
-                import json as _json
-                # Evict soft HCS on both stores for prefill
-                gpu_store = _model._gpu_decode_store
-                evicted0, freed0 = gpu_store.py_hcs_evict_for_prefill(500)
-                if evicted0 > 0:
-                    _dim(f"  Evicted {evicted0} soft experts for validation prefill")
+        # ── Multi-GPU decode validation ──
+        _status("Validating multi-GPU decode")
+        vram_monitor.reset_min_free()
+        try:
+            import json as _json
+            gpu_store = _model._gpu_decode_store
+            evicted0, freed0 = gpu_store.py_hcs_evict_for_prefill(500)
+            if evicted0 > 0:
+                _dim(f"  Evicted {evicted0} soft experts for validation prefill")
 
-                messages_json = _json.dumps([{"role": "user", "content": "Hi"}])
-                result = _model.server_prefill(
-                    messages_json, max_new_tokens=5, temperature=0.6, top_k=50,
-                    top_p=0.95, presence_penalty=0.0,
-                    enable_thinking=False, extra_stop_tokens=[],
-                    decode_mode="gpu",
+            messages_json = _json.dumps([{"role": "user", "content": "Hi"}])
+            result = _model.server_prefill(
+                messages_json, max_new_tokens=5, temperature=0.6, top_k=50,
+                top_p=0.95, presence_penalty=0.0,
+                enable_thinking=False, extra_stop_tokens=[],
+                decode_mode="gpu",
+            )
+
+            # Copy KV cache to each aux store
+            for i in range(num_aux):
+                seg_start = boundaries[i + 1]
+                seg_end = boundaries[i + 2]
+                gpu_store.py_copy_kv_to_aux(
+                    all_aux_gpu_store_addrs[i], seg_start, seg_end,
+                    _multi_gpu_gqa_offsets[i], result.prompt_len)
+
+            # Reload soft HCS on GPU0 only (aux GPUs have no soft tier)
+            r0, _ = gpu_store.py_hcs_reload_after_prefill()
+            if r0 > 0:
+                _dim(f"  Reloaded {r0} soft experts after validation prefill")
+
+            # Run multi-GPU decode
+            if result.first_token not in result.stop_ids:
+                tokens = gpu_store.gpu_generate_batch_multi(
+                    aux_store_addrs=all_aux_gpu_store_addrs,
+                    split_layers=all_multi_gpu_split_layers,
+                    gqa_cache_offsets=all_multi_gpu_gqa_offsets,
+                    first_token=result.first_token,
+                    start_position=result.prompt_len,
+                    max_tokens=4,
+                    temperature=0.6,
+                    top_k=50,
+                    top_p=0.95,
+                    stop_ids=result.stop_ids,
+                    presence_penalty=0.0,
                 )
+                _detail(f"Multi-GPU decode validation: {len(tokens)} tokens generated OK")
+            else:
+                _detail("Multi-GPU decode validation: prefill hit stop token (OK)")
 
-                # Copy KV cache to aux store
-                gpu_store.py_copy_kv_to_aux(aux_gpu_store_addr, split_layer, gqa_offset, result.prompt_len)
+            _model.server_cleanup()
 
-                # Reload soft HCS on GPU0 only (GPU1 has no soft tier)
-                r0, _ = gpu_store.py_hcs_reload_after_prefill()
-                if r0 > 0:
-                    _dim(f"  Reloaded {r0} soft experts after validation prefill")
+            # Log VRAM stats from all GPUs during multi-GPU decode
+            torch.cuda.synchronize()
+            time.sleep(0.1)  # let monitor poll
+            for idx in device_indices:
+                min_free = vram_monitor.min_free_mb(idx)
+                current_free = vram_monitor.current_free_mb(idx)
+                total_mb = vram_monitor.total_mb(idx)
+                _dim(f"  cuda:{idx} during multi-GPU decode: min_free={min_free:,} MB, "
+                     f"current_free={current_free:,.0f} MB / {total_mb:,} MB total")
 
-                # Run multi-GPU decode
-                if result.first_token not in result.stop_ids:
-                    tokens = gpu_store.gpu_generate_batch_multi(
-                        aux_store_addr=aux_gpu_store_addr,
-                        split_layer=split_layer,
-                        gqa_cache_offset=gqa_offset,
-                        first_token=result.first_token,
-                        start_position=result.prompt_len,
-                        max_tokens=4,
-                        temperature=0.6,
-                        top_k=50,
-                        top_p=0.95,
-                        stop_ids=result.stop_ids,
-                        presence_penalty=0.0,
-                    )
-                    _detail(f"Multi-GPU decode validation: {len(tokens)} tokens generated OK")
+            # ── Validate aux GPU VRAM safety during decode ──
+            # Aux GPUs never run prefill, so decode transients are the only VRAM pressure.
+            # Check that min_free stayed above 0 (budget was safe).
+            for i in range(num_aux):
+                gpu_idx = device_indices[i + 1]
+                aux_min_free = vram_monitor.min_free_mb(gpu_idx)
+                aux_current = vram_monitor.current_free_mb(gpu_idx)
+                if aux_min_free < 50:
+                    _warn(f"  GPU{i+1} (cuda:{gpu_idx}): min_free={aux_min_free} MB during decode — "
+                          f"dangerously close to OOM, HCS budget may be too aggressive")
                 else:
-                    _detail("Multi-GPU decode validation: prefill hit stop token (OK)")
+                    _dim(f"  GPU{i+1} (cuda:{gpu_idx}): min_free={aux_min_free} MB during decode, "
+                         f"current_free={aux_current:.0f} MB (budget safe)")
 
+        except Exception as e:
+            try:
                 _model.server_cleanup()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Multi-GPU decode validation failed: {e}\n"
+                "Cannot start server with broken multi-GPU decode. "
+                "Fix the underlying issue or disable multi-GPU."
+            ) from e
 
-                # Log VRAM stats from both GPUs during multi-GPU decode
-                torch.cuda.synchronize()
-                time.sleep(0.1)  # let monitor poll
-                for idx in device_indices:
-                    min_free = vram_monitor.min_free_mb(idx)
-                    current_free = vram_monitor.current_free_mb(idx)
-                    total_mb = vram_monitor.total_mb(idx)
-                    _dim(f"  cuda:{idx} during multi-GPU decode: min_free={min_free:,} MB, "
-                         f"current_free={current_free:,.0f} MB / {total_mb:,} MB total")
-
-            except Exception as e:
-                try:
-                    _model.server_cleanup()
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"Multi-GPU decode validation failed: {e}\n"
-                    "Cannot start server with broken multi-GPU decode. "
-                    "Fix the underlying issue or disable multi-GPU."
-                ) from e
-
-            multi_gpu_split_layer = split_layer
-            multi_gpu_gqa_offset = gqa_offset
-            _status(f"Multi-GPU decode ready (split at layer {split_layer})")
+        _status(f"Multi-GPU decode ready ({num_aux + 1} GPUs, splits={_multi_gpu_splits})")
 
     # ── Server registry: write entry + register cleanup ──
     _write_registry(args.host, args.port, _model_name)
@@ -1577,7 +1645,8 @@ def main():
 
     logger.info(
         "Model loaded, starting server on %s:%d (max context: %d, decode: GPU%s)",
-        args.host, args.port, max_ctx, "s (multi-GPU)" if aux_gpu_store_addr else "",
+        args.host, args.port, max_ctx,
+        f"s ({len(all_aux_gpu_store_addrs)+1}-GPU)" if all_aux_gpu_store_addrs else "",
     )
 
     # ── Session messenger bridge ──
@@ -1595,9 +1664,9 @@ def main():
         args.enable_thinking,
         think_end_id,
         gpu_store_addr,
-        aux_gpu_store_addr,
-        multi_gpu_split_layer,
-        multi_gpu_gqa_offset,
+        all_aux_gpu_store_addrs,
+        all_multi_gpu_split_layers,
+        all_multi_gpu_gqa_offsets,
     )
 
     def _handle_exit(sig, frame):
@@ -1618,7 +1687,7 @@ def main():
     # ── Final ready banner (after all setup is done) ──
     # Brief pause so any async log output settles before the banner
     time.sleep(1.0)
-    _decode_mode = "Multi-GPU" if aux_gpu_store_addr else "GPU"
+    _decode_mode = f"{len(all_aux_gpu_store_addrs)+1}-GPU" if all_aux_gpu_store_addrs else "GPU"
     _hcs_str = "on" if args.hcs else "off"
     _think_str = "on" if think_end_id else "off"
     print(flush=True)

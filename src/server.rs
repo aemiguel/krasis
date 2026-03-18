@@ -97,12 +97,12 @@ struct ServerState {
     /// When set, write full request JSON to this directory for debugging IDE clients.
     /// Enabled by KRASIS_LOG_REQUESTS=1 (writes to logs/requests/).
     log_requests_dir: Option<String>,
-    /// Multi-GPU: auxiliary store address (0 = single GPU mode).
-    aux_gpu_store_addr: usize,
-    /// Multi-GPU: layer index where GPU0 segment ends and GPU1 segment begins.
-    multi_gpu_split_layer: usize,
-    /// Multi-GPU: number of GQA layers before the split point (for KV cache indexing on GPU1).
-    multi_gpu_gqa_offset: usize,
+    /// Multi-GPU: auxiliary store addresses (empty = single GPU mode).
+    aux_gpu_store_addrs: Vec<usize>,
+    /// Multi-GPU: layer indices where each segment boundary falls.
+    multi_gpu_split_layers: Vec<usize>,
+    /// Multi-GPU: number of GQA layers before each split point (for KV cache indexing).
+    multi_gpu_gqa_offsets: Vec<usize>,
 }
 
 /// Parsed HTTP request.
@@ -711,17 +711,22 @@ fn handle_chat_completion(
                 request_id, queued);
         }
     }
-    // NOTE: aux GPU has no soft tier (100% hard), no eviction/reload needed
-    // ── Multi-GPU: copy KV cache from GPU0 to GPU1 after prefill ──
-    if state.aux_gpu_store_addr != 0 {
+    // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
+    // ── Multi-GPU: copy KV cache from primary to all aux GPUs after prefill ──
+    if !state.aux_gpu_store_addrs.is_empty() {
         let t_kvcopy = Instant::now();
-        let aux_store = unsafe { &mut *(state.aux_gpu_store_addr as *mut GpuDecodeStore) };
-        if let Err(e) = store.copy_kv_to_aux(aux_store, state.multi_gpu_split_layer, state.multi_gpu_gqa_offset, prompt_len) {
-            log::error!("Request {}: KV cache copy to aux GPU failed: {}", request_id, e);
-        } else {
-            let kvcopy_ms = t_kvcopy.elapsed().as_secs_f64() * 1000.0;
-            log::info!("Request {}: KV cache copied to aux GPU in {:.1}ms", request_id, kvcopy_ms);
+        let num_aux = state.aux_gpu_store_addrs.len();
+        let num_layers = store.num_layers();
+        for i in 0..num_aux {
+            let aux_store = unsafe { &mut *(state.aux_gpu_store_addrs[i] as *mut GpuDecodeStore) };
+            let layer_start = state.multi_gpu_split_layers[i];
+            let layer_end = if i + 1 < num_aux { state.multi_gpu_split_layers[i + 1] } else { num_layers };
+            if let Err(e) = store.copy_kv_to_aux(aux_store, layer_start, layer_end, state.multi_gpu_gqa_offsets[i], prompt_len) {
+                log::error!("Request {}: KV cache copy to aux GPU{} failed: {}", request_id, i + 1, e);
+            }
         }
+        let kvcopy_ms = t_kvcopy.elapsed().as_secs_f64() * 1000.0;
+        log::info!("Request {}: KV cache copied to {} aux GPUs in {:.1}ms", request_id, num_aux, kvcopy_ms);
     }
     let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
 
@@ -1019,12 +1024,12 @@ fn handle_gpu_decode(
             max_tokens.saturating_sub(1)
         };
 
-        if state.aux_gpu_store_addr != 0 {
-            // Multi-GPU decode: GPU0 layers [0..split), GPU1 layers [split..N)
+        if !state.aux_gpu_store_addrs.is_empty() {
+            // Multi-GPU decode: pipeline across N GPUs
             store.gpu_generate_stream_multi(
-                state.aux_gpu_store_addr,
-                state.multi_gpu_split_layer,
-                state.multi_gpu_gqa_offset,
+                &state.aux_gpu_store_addrs,
+                &state.multi_gpu_split_layers,
+                &state.multi_gpu_gqa_offsets,
                 first_token,
                 prompt_len,
                 decode_budget,
@@ -1173,11 +1178,11 @@ fn handle_gpu_decode(
 
                 true
             };
-            if state.aux_gpu_store_addr != 0 {
+            if !state.aux_gpu_store_addrs.is_empty() {
                 store.gpu_generate_stream_multi(
-                    state.aux_gpu_store_addr,
-                    state.multi_gpu_split_layer,
-                    state.multi_gpu_gqa_offset,
+                    &state.aux_gpu_store_addrs,
+                    &state.multi_gpu_split_layers,
+                    &state.multi_gpu_gqa_offsets,
                     first_token,
                     prompt_len,
                     ns_decode_budget,
@@ -1248,15 +1253,15 @@ pub struct RustServer {
     gpu_store_addr: usize,
     py_model: Py<PyAny>,
     running: Arc<AtomicBool>,
-    aux_gpu_store_addr: usize,
-    multi_gpu_split_layer: usize,
-    multi_gpu_gqa_offset: usize,
+    aux_gpu_store_addrs: Vec<usize>,
+    multi_gpu_split_layers: Vec<usize>,
+    multi_gpu_gqa_offsets: Vec<usize>,
 }
 
 #[pymethods]
 impl RustServer {
     #[new]
-    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, thinking_end_token_id=0, gpu_store_addr=0, aux_gpu_store_addr=0, multi_gpu_split_layer=0, multi_gpu_gqa_offset=0))]
+    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, thinking_end_token_id=0, gpu_store_addr=0, aux_gpu_store_addrs=Vec::new(), multi_gpu_split_layers=Vec::new(), multi_gpu_gqa_offsets=Vec::new()))]
     fn new(
         py_model: PyObject,
         host: String,
@@ -1267,9 +1272,9 @@ impl RustServer {
         enable_thinking: bool,
         thinking_end_token_id: usize,
         gpu_store_addr: usize,
-        aux_gpu_store_addr: usize,
-        multi_gpu_split_layer: usize,
-        multi_gpu_gqa_offset: usize,
+        aux_gpu_store_addrs: Vec<usize>,
+        multi_gpu_split_layers: Vec<usize>,
+        multi_gpu_gqa_offsets: Vec<usize>,
     ) -> Self {
         Self {
             host,
@@ -1282,9 +1287,9 @@ impl RustServer {
             gpu_store_addr,
             py_model: py_model.into(),
             running: Arc::new(AtomicBool::new(false)),
-            aux_gpu_store_addr,
-            multi_gpu_split_layer,
-            multi_gpu_gqa_offset,
+            aux_gpu_store_addrs,
+            multi_gpu_split_layers,
+            multi_gpu_gqa_offsets,
         }
     }
 
@@ -1301,9 +1306,9 @@ impl RustServer {
         let default_enable_thinking = self.default_enable_thinking;
         let thinking_end_token_id = self.thinking_end_token_id;
         let gpu_store_addr = self.gpu_store_addr;
-        let aux_gpu_store_addr = self.aux_gpu_store_addr;
-        let multi_gpu_split_layer = self.multi_gpu_split_layer;
-        let multi_gpu_gqa_offset = self.multi_gpu_gqa_offset;
+        let aux_gpu_store_addrs = self.aux_gpu_store_addrs.clone();
+        let multi_gpu_split_layers = self.multi_gpu_split_layers.clone();
+        let multi_gpu_gqa_offsets = self.multi_gpu_gqa_offsets.clone();
         let running = self.running.clone();
 
         // Install raw SIGINT handler BEFORE releasing the GIL.
@@ -1403,9 +1408,9 @@ impl RustServer {
                 gpu_store_addr,
                 gil_timing,
                 log_requests_dir,
-                aux_gpu_store_addr,
-                multi_gpu_split_layer,
-                multi_gpu_gqa_offset,
+                aux_gpu_store_addrs,
+                multi_gpu_split_layers,
+                multi_gpu_gqa_offsets,
             };
 
             while running.load(Ordering::Acquire) {
@@ -1516,19 +1521,25 @@ impl RustServer {
             .unwrap_or(false);
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
 
-        // Copy KV cache to aux store (multi-GPU)
-        if self.aux_gpu_store_addr != 0 {
-            let aux_store = unsafe { &mut *(self.aux_gpu_store_addr as *mut GpuDecodeStore) };
-            if let Err(e) = store.copy_kv_to_aux(aux_store, self.multi_gpu_split_layer, self.multi_gpu_gqa_offset, prompt_len) {
-                log::error!("benchmark_request: KV copy to aux failed: {}", e);
+        // Copy KV cache to aux stores (multi-GPU)
+        if !self.aux_gpu_store_addrs.is_empty() {
+            let num_aux = self.aux_gpu_store_addrs.len();
+            let num_layers = store.num_layers();
+            for i in 0..num_aux {
+                let aux_store = unsafe { &mut *(self.aux_gpu_store_addrs[i] as *mut GpuDecodeStore) };
+                let layer_start = self.multi_gpu_split_layers[i];
+                let layer_end = if i + 1 < num_aux { self.multi_gpu_split_layers[i + 1] } else { num_layers };
+                if let Err(e) = store.copy_kv_to_aux(aux_store, layer_start, layer_end, self.multi_gpu_gqa_offsets[i], prompt_len) {
+                    log::error!("benchmark_request: KV copy to aux GPU{} failed: {}", i + 1, e);
+                }
             }
         }
 
-        // Reload soft HCS after prefill (both stores)
+        // Reload soft HCS after prefill
         // Always attempt reload — soft pool may have been cancelled/freed by a prior operation
         let t_reload = Instant::now();
         store.hcs_reload_after_prefill_async();
-        // NOTE: aux GPU has no soft tier (100% hard), no eviction/reload needed
+        // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
         let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
 
         // Decode (pure Rust, GIL held but unused by decode loop)
@@ -1537,11 +1548,11 @@ impl RustServer {
         } else {
             let decode_start = Instant::now();
             let mut count = 0usize;
-            if self.aux_gpu_store_addr != 0 {
+            if !self.aux_gpu_store_addrs.is_empty() {
                 store.gpu_generate_stream_multi(
-                    self.aux_gpu_store_addr,
-                    self.multi_gpu_split_layer,
-                    self.multi_gpu_gqa_offset,
+                    &self.aux_gpu_store_addrs,
+                    &self.multi_gpu_split_layers,
+                    &self.multi_gpu_gqa_offsets,
                     first_token,
                     prompt_len,
                     max_new_tokens.saturating_sub(1),
@@ -1592,8 +1603,17 @@ impl RustServer {
             0.0
         };
 
-        // Collect HCS stats and min free VRAM
-        let (min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct) = store.benchmark_stats();
+        // Collect HCS stats from primary store
+        let (min_free_vram_mb, mut hcs_loaded, mut hcs_total, _) = store.benchmark_stats();
+
+        // Aggregate HCS stats from all aux stores (multi-GPU)
+        for &aux_addr in &self.aux_gpu_store_addrs {
+            let aux_store = unsafe { &*(aux_addr as *const GpuDecodeStore) };
+            let (_, aux_loaded, aux_total, _) = aux_store.benchmark_stats();
+            hcs_loaded += aux_loaded;
+            hcs_total += aux_total;
+        }
+        let hcs_pct = if hcs_total > 0 { hcs_loaded as f64 / hcs_total as f64 * 100.0 } else { 0.0 };
 
         Ok(format!(
             r#"{{"prefill_ms":{:.1},"prefill_tok_s":{:.1},"prompt_tokens":{},"decode_ms":{:.1},"decode_tok_s":{:.2},"decode_tokens":{},"evict_ms":{:.1},"reload_ms":{:.1},"min_free_vram_mb":{},"hcs_loaded":{},"hcs_total":{},"hcs_pct":{:.1}}}"#,

@@ -102,6 +102,10 @@ def warmup_compiled_chunk_step(device, nv, dk, dv, chunk_size=64):
         logger.info("Linear attention torch.compile warmup complete on %s", device)
     except Exception as e:
         logger.warning("Linear attention torch.compile warmup on %s failed: %s", device, e)
+        # Reset to eager fallback so prefill doesn't crash with the broken compiled function
+        global _compiled_chunk_step
+        _compiled_chunk_step = _chunk_step
+        logger.warning("Falling back to eager linear attention (no torch.compile)")
 
 
 def _linear(x: torch.Tensor, weight_data) -> torch.Tensor:
