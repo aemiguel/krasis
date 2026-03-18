@@ -224,6 +224,9 @@ def detect_hardware() -> Dict[str, Any]:
 def scan_models(search_dir: str, native_only: bool = False) -> List[Dict[str, Any]]:
     """Scan directory for HF model directories with config.json.
 
+    Recurses into subdirectories to find models in org/repo folder structures
+    (e.g. models/Qwen/Qwen3.5-122B-A10B/).
+
     Args:
         native_only: If True, only return models that have safetensors files.
     """
@@ -231,22 +234,22 @@ def scan_models(search_dir: str, native_only: bool = False) -> List[Dict[str, An
     if not os.path.isdir(search_dir):
         return models
 
-    for name in sorted(os.listdir(search_dir), key=str.lower):
-        model_dir = os.path.join(search_dir, name)
-        config_path = os.path.join(model_dir, "config.json")
-        if not os.path.isfile(config_path):
+    # Walk the tree looking for directories containing config.json
+    for dirpath, dirnames, filenames in os.walk(search_dir):
+        if "config.json" not in filenames:
             continue
+
+        model_dir = dirpath
+        config_path = os.path.join(model_dir, "config.json")
 
         # Native-only filter: require at least one .safetensors file
         if native_only:
-            try:
-                has_safetensors = any(
-                    f.endswith(".safetensors") for f in os.listdir(model_dir)
-                )
-            except OSError:
+            if not any(f.endswith(".safetensors") for f in filenames):
                 continue
-            if not has_safetensors:
-                continue
+
+        # Use relative path from search_dir as display name (e.g. "Qwen/Qwen3.5-122B-A10B")
+        rel = os.path.relpath(model_dir, search_dir)
+        name = rel if rel != "." else os.path.basename(model_dir)
 
         try:
             with open(config_path) as f:
@@ -288,6 +291,8 @@ def scan_models(search_dir: str, native_only: bool = False) -> List[Dict[str, An
         except (json.JSONDecodeError, KeyError, TypeError):
             continue
 
+    # Sort by name for consistent display
+    models.sort(key=lambda m: m["name"].lower())
     return models
 
 
@@ -1225,23 +1230,28 @@ class Launcher:
         print(f"(Set KRASIS_HOME to change, caches can grow large)\n")
 
         # Step 1: Native model selection (safetensors only)
-        models = scan_models(self.models_dir, native_only=True)
-        if not models:
-            print(f"No native models found in {self.models_dir}", file=sys.stderr)
-            print(f"Download a model with: huggingface-cli download <model> --local-dir {self.models_dir}/<name>",
-                  file=sys.stderr)
-            return False
+        # Skip if --model-path was explicitly provided via CLI
+        if self.cfg.model_path and os.path.isdir(self.cfg.model_path):
+            self._read_model_info()
+            print(f"Model: {self.cfg.model_path} (from --model-path)")
+        else:
+            models = scan_models(self.models_dir, native_only=True)
+            if not models:
+                print(f"No native models found in {self.models_dir}", file=sys.stderr)
+                print(f"Download a model with: huggingface-cli download <model> --local-dir {self.models_dir}/<name>",
+                      file=sys.stderr)
+                return False
 
-        _hide_cursor()
-        try:
-            selected = _model_selection_screen(models, self.cfg.model_path)
-        finally:
-            _show_cursor()
+            _hide_cursor()
+            try:
+                selected = _model_selection_screen(models, self.cfg.model_path)
+            finally:
+                _show_cursor()
 
-        if selected is None:
-            return False
-        self.cfg.model_path = selected["path"]
-        self.model_info = selected
+            if selected is None:
+                return False
+            self.cfg.model_path = selected["path"]
+            self.model_info = selected
 
         # Step 2: GPU selection (always shown, pre-selects saved GPUs)
         if self.hw["gpus"]:
