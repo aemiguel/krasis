@@ -728,7 +728,8 @@ class KrasisBenchmark:
         if getattr(self.model, '_stream_attn_enabled', False):
             lgs = getattr(self.model, 'layer_group_size', 0)
             suffix = f"_stream_lgs{lgs}"
-        filename = f"{model_name}_{gguf_name}_{num_gpus}gpu_{gpu_quant}_{cpu_quant}{suffix}.log"
+        attn_quant = model_info.get("attention_quant", "bf16")
+        filename = f"{model_name}_{gguf_name}_{num_gpus}gpu_{gpu_quant}_{cpu_quant}_a{attn_quant}{suffix}.log"
         rel_path = f"benchmarks/{filename}"
 
         try:

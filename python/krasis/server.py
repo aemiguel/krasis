@@ -188,8 +188,105 @@ def _build_heatmap(model: KrasisModel, save_path: str) -> str:
         "Discuss compiler optimization passes such as dead code elimination and loop unrolling. ",
         "Explain the CAP theorem and its practical implications for system design. ",
         "Describe memory management strategies in operating systems including paging and segmentation. ",
+        # Python code section — exercises code-related expert routing
+        """Review this Python async server implementation and suggest improvements:
+```python
+import asyncio
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Optional
+
+@dataclass
+class ConnectionPool:
+    max_connections: int = 100
+    _semaphore: asyncio.Semaphore = field(init=False)
+    _active: dict[int, asyncio.Task] = field(default_factory=dict)
+
+    def __post_init__(self):
+        self._semaphore = asyncio.Semaphore(self.max_connections)
+
+    async def acquire(self, timeout: Optional[float] = None) -> int:
+        try:
+            await asyncio.wait_for(self._semaphore.acquire(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise ConnectionError(f"Pool exhausted ({self.max_connections} active)")
+        conn_id = id(asyncio.current_task())
+        self._active[conn_id] = asyncio.current_task()
+        return conn_id
+
+    async def release(self, conn_id: int) -> None:
+        self._active.pop(conn_id, None)
+        self._semaphore.release()
+
+    async def stream_response(self, data: bytes) -> AsyncIterator[bytes]:
+        chunk_size = 4096
+        for i in range(0, len(data), chunk_size):
+            yield data[i:i + chunk_size]
+            await asyncio.sleep(0)
+
+async def handle_request(pool: ConnectionPool, payload: bytes) -> bytes:
+    conn_id = await pool.acquire(timeout=5.0)
+    try:
+        result = bytearray()
+        async for chunk in pool.stream_response(payload):
+            result.extend(chunk)
+        return bytes(result)
+    finally:
+        await pool.release(conn_id)
+``` """,
         "Discuss the principles of functional programming and category theory. ",
         "Explain how neural network backpropagation works with gradient descent. ",
+        # Rust code section — exercises code-related expert routing
+        """Analyze this Rust GPU memory manager for correctness and performance:
+```rust
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+pub struct GpuBufferPool {
+    device_id: usize,
+    free_buffers: Mutex<HashMap<usize, Vec<*mut u8>>>,
+    total_allocated: Mutex<usize>,
+    capacity: usize,
+}
+
+unsafe impl Send for GpuBufferPool {}
+unsafe impl Sync for GpuBufferPool {}
+
+impl GpuBufferPool {
+    pub fn new(device_id: usize, capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            device_id,
+            free_buffers: Mutex::new(HashMap::new()),
+            total_allocated: Mutex::new(0),
+            capacity,
+        })
+    }
+
+    pub fn allocate(&self, size: usize) -> Result<*mut u8, GpuError> {
+        let aligned = (size + 255) & !255;
+        if let Some(buf) = self.free_buffers.lock().unwrap()
+            .get_mut(&aligned).and_then(|v| v.pop())
+        {
+            return Ok(buf);
+        }
+        let mut total = self.total_allocated.lock().unwrap();
+        if *total + aligned > self.capacity {
+            return Err(GpuError::OutOfMemory {
+                requested: aligned,
+                available: self.capacity - *total,
+            });
+        }
+        let ptr = unsafe { cuda_malloc(self.device_id, aligned)? };
+        *total += aligned;
+        Ok(ptr)
+    }
+
+    pub fn deallocate(&self, ptr: *mut u8, size: usize) {
+        let aligned = (size + 255) & !255;
+        self.free_buffers.lock().unwrap()
+            .entry(aligned).or_default().push(ptr);
+    }
+}
+``` """,
         "Describe the architecture of modern CPUs including pipelining and branch prediction. ",
         "Discuss cryptographic primitives including AES, RSA, and elliptic curve cryptography. ",
         "Explain container orchestration with Kubernetes including pods, services, and deployments. ",
