@@ -611,6 +611,9 @@ fn handle_chat_completion(
     // NOTE: aux GPU never does prefill, so no eviction needed there
     let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
 
+    // ── Snapshot VRAM before prefill ──
+    log::info!("VRAM before prefill: {} MB free", store_for_evict.query_vram_free_mb());
+
     // ── Call Python for prefill (GIL required) ──
     let t_prefill_gil = Instant::now();
     let prefill_result = Python::with_gil(|py| -> PyResult<(usize, usize, Vec<usize>, bool)> {
@@ -1057,6 +1060,9 @@ fn handle_gpu_decode(
             );
         }
 
+        // Capture decode timing BEFORE post-generation processing (tool call parsing etc.)
+        let decode_elapsed = decode_start.elapsed().as_secs_f64();
+
         // ── Post-generation: emit tool calls or finish ──
         if has_tools {
             let (_content, tool_calls) = parse_tool_calls(&tc_all_text);
@@ -1091,7 +1097,7 @@ fn handle_gpu_decode(
             }
         }
 
-        let elapsed = decode_start.elapsed().as_secs_f64();
+        let elapsed = decode_elapsed;
         let total_gen = decode_token_count + 1;
         let decode_tok_s = if elapsed > 0.0 && decode_token_count > 0 {
             decode_token_count as f64 / elapsed

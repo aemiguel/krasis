@@ -4048,10 +4048,6 @@ impl GpuDecodeStore {
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("gpu_decode_step error: {}", e)))?;
 
-            let suppress = self.suppress_tokens.clone();
-            let min_nt = self.min_new_tokens;
-            let stop_suppress = self.stop_token_ids_for_suppress.clone();
-            let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
             let logits = &mut self.graph.as_mut().unwrap().h_logits;
             if presence_penalty != 0.0 {
                 for &tok in &seen_tokens {
@@ -4060,13 +4056,14 @@ impl GpuDecodeStore {
                     }
                 }
             }
-            for &tok in &suppress {
+            for &tok in &self.suppress_tokens {
                 if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
             }
+            let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
             let think_within_budget = self.think_suppress_budget == 0
                 || self.think_suppress_count < self.think_suppress_budget;
-            if step < min_nt || (think_end_active && think_within_budget) {
-                for &tok in &stop_suppress {
+            if step < self.min_new_tokens || (think_end_active && think_within_budget) {
+                for &tok in &self.stop_token_ids_for_suppress {
                     if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                 }
             }
@@ -4613,6 +4610,14 @@ impl GpuDecodeStore {
         );
 
         Ok(id)
+    }
+
+    /// Query current VRAM free in MB via cuMemGetInfo_v2.
+    pub fn query_vram_free_mb(&self) -> usize {
+        let mut free: usize = 0;
+        let mut _total: usize = 0;
+        unsafe { let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
+        free / (1024 * 1024)
     }
 
     /// Return benchmark stats: (min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct)
@@ -10488,7 +10493,7 @@ impl GpuDecodeStore {
             }
         }
 
-        // Track min VRAM free during decode
+        // Track min VRAM free during decode (3 snapshots: before loop, after loop, and post-decode query)
         let mut min_vram_free_bytes: usize = usize::MAX;
 
         // Lightweight decode profiling (KRASIS_DECODE_PROFILE=1)
@@ -10508,6 +10513,16 @@ impl GpuDecodeStore {
                     Ok(()) => eprintln!("[krasis] CUDA graph buffers initialized"),
                     Err(e) => eprintln!("[krasis] CUDA graph init failed: {}", e),
                 }
+            }
+        }
+
+        // Snapshot VRAM before decode loop
+        {
+            let mut free: usize = 0;
+            let mut _total: usize = 0;
+            unsafe { let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
+            if free < min_vram_free_bytes {
+                min_vram_free_bytes = free;
             }
         }
 
@@ -10571,23 +10586,20 @@ impl GpuDecodeStore {
                         log::error!("gpu_generate_stream: decode_step error: {}", e);
                         break;
                     }
-                    let suppress = self.suppress_tokens.clone();
-                    let min_nt = self.min_new_tokens;
-                    let stop_suppress = self.stop_token_ids_for_suppress.clone();
-                    let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
                     let logits = &mut self.graph.as_mut().unwrap().h_logits;
                     if presence_penalty != 0.0 {
                         for &tok in &seen_tokens {
                             if tok < vocab_size { logits[tok] -= presence_penalty; }
                         }
                     }
-                    for &tok in &suppress {
+                    for &tok in &self.suppress_tokens {
                         if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                     }
+                    let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
                     let think_within_budget = self.think_suppress_budget == 0
                         || self.think_suppress_count < self.think_suppress_budget;
-                    if generated < min_nt || (think_end_active && think_within_budget) {
-                        for &tok in &stop_suppress {
+                    if generated < self.min_new_tokens || (think_end_active && think_within_budget) {
+                        for &tok in &self.stop_token_ids_for_suppress {
                             if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                         }
                     }
@@ -10881,20 +10893,6 @@ impl GpuDecodeStore {
                     }
                 }
 
-                // Track min VRAM free (after decode step, when expert buffers are at peak)
-                {
-                    let mut free: usize = 0;
-                    let mut _total: usize = 0;
-                    unsafe { let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
-                    if free < min_vram_free_bytes {
-                        min_vram_free_bytes = free;
-                    }
-                }
-
-                let suppress = self.suppress_tokens.clone();
-                let min_nt = self.min_new_tokens;
-                let stop_suppress = self.stop_token_ids_for_suppress.clone();
-                let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
                 let logits = &mut self.graph.as_mut().unwrap().h_logits;
 
                 #[cfg(feature = "gpu-debug")]
@@ -10918,14 +10916,15 @@ impl GpuDecodeStore {
                         }
                     }
                 }
-                for &tok in &suppress {
+                for &tok in &self.suppress_tokens {
                     if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                 }
+                let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
                 let think_within_budget = self.think_suppress_budget == 0
                     || self.think_suppress_count < self.think_suppress_budget;
-                let suppressing = generated < min_nt || (think_end_active && think_within_budget);
+                let suppressing = generated < self.min_new_tokens || (think_end_active && think_within_budget);
                 if suppressing {
-                    for &tok in &stop_suppress {
+                    for &tok in &self.stop_token_ids_for_suppress {
                         if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                     }
                 }
@@ -10998,6 +10997,10 @@ impl GpuDecodeStore {
             let mut vram_total: usize = 0;
             unsafe {
                 let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut vram_free, &mut vram_total);
+            }
+            // Post-decode snapshot also contributes to min tracking
+            if vram_free < min_vram_free_bytes {
+                min_vram_free_bytes = vram_free;
             }
             let free_mb = vram_free / (1024 * 1024);
             let total_mb = vram_total / (1024 * 1024);
