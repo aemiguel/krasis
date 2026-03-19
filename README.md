@@ -14,6 +14,7 @@ Krasis can run large language models that are much too large to fit in a consume
 
 ## Latest News
 
+* [Krasis subreddit is now available](https://www.reddit.com/r/krasis/) for anyone that wants to follow Krasis news and updates more closely.
 * Multi-GPU pre-release now available via the latest release.  This won't improve prefill speed but could improve decode speed on multi GPU systems with similar GPUs.
 * Fix for higher system RAM usage than expected.
 
