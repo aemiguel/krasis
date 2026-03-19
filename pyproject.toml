@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "krasis"
-version = "0.1.64"
+version = "0.1.65"
 description = "Hybrid LLM runtime — minimal VRAM, always-on GPU prefill, optimised CPU inference"
 license = {text = "SSPL-1.0"}
 requires-python = ">=3.10"

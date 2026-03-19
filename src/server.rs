@@ -455,8 +455,8 @@ fn handle_request(
 
         ("GET", "/v1/models") => {
             let body = format!(
-                r#"{{"object":"list","data":[{{"id":"{}","object":"model","owned_by":"krasis"}}]}}"#,
-                state.model_name
+                r#"{{"object":"list","data":[{{"id":"{}","object":"model","owned_by":"krasis","max_context_tokens":{}}}]}}"#,
+                state.model_name, state.max_context_tokens
             );
             let _ = send_json(&mut tcp_stream, 200, &body);
         }
@@ -647,12 +647,18 @@ fn handle_chat_completion(
     let (first_token, prompt_len, stop_ids, kv_overflow) = match prefill_result {
         Ok(v) => v,
         Err(e) => {
-            log::error!("Prefill failed: {}", e);
-            let _ = send_json(
-                stream,
-                500,
-                &format!(r#"{{"error":"Prefill failed: {}"}}"#, e),
-            );
+            let err_str = e.to_string();
+            log::error!("Prefill failed: {}", err_str);
+            // Return 413 with structured error for KV cache exhaustion
+            let (status, body) = if err_str.contains("KV cache exhausted") {
+                (413, format!(
+                    r#"{{"error":{{"message":"Context length exceeds KV cache capacity ({} tokens max). Reduce context or start a new conversation.","type":"invalid_request_error","code":"context_length_exceeded","max_context_tokens":{}}}}}"#,
+                    state.max_context_tokens, state.max_context_tokens
+                ))
+            } else {
+                (500, format!(r#"{{"error":{{"message":"Prefill failed: {}","type":"server_error"}}}}"#, err_str))
+            };
+            let _ = send_json(stream, status, &body);
             // Cleanup on error
             Python::with_gil(|py| {
                 let _ = state.py_model.call_method0(py, "server_cleanup");
