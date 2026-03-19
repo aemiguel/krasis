@@ -850,9 +850,15 @@ class KrasisBenchmark:
         archive_path = self._archive_benchmark(model_info, report)
 
         # 9. Final summary
+        attn_label = model_info['attention_quant'].upper()
+        gpu_label = f"{model_info['num_gpus']} GPU" if model_info['num_gpus'] > 1 else "1 GPU"
+        config_label = f"INT{model_info['gpu_expert_bits']}/{model_info['cpu_expert_bits']} {attn_label} {gpu_label}"
+
         print(f"\n{BOLD}{'─' * 48}")
         print(f"  BENCHMARK COMPLETE")
         print(f"{'─' * 48}{NC}")
+        print(f"  Model:                 {BOLD}{model_info['model_name']}{NC}")
+        print(f"  Config:                {config_label}")
         print(f"  Prefill (internal):    {GREEN}{BOLD}{prefill_result['best_tok_s']:,.1f} tok/s{NC}  (best of {lengths_str})")
         if decode_result["best_tok_s"] > 0:
             print(f"  Decode (internal):     {GREEN}{BOLD}{decode_result['best_tok_s']:.2f} tok/s{NC}  (best of {decode_len_str})")

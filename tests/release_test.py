@@ -785,7 +785,11 @@ def send_chat_streaming(prompt: str, port: int = DEFAULT_PORT,
 # ═══════════════════════════════════════════════════════════════════
 
 def extract_benchmark_section(log_path: str) -> str:
-    """Extract the benchmark output block from the server log, ANSI-stripped."""
+    """Extract the BENCHMARK COMPLETE summary block from the server log, ANSI-stripped.
+
+    Only captures the final summary (model, config, speeds, HCS) — not the full
+    benchmark run output with warmup, CUDA graph captures, etc.
+    """
     with open(log_path) as f:
         content = f.read()
 
@@ -794,11 +798,17 @@ def extract_benchmark_section(log_path: str) -> str:
     end_idx = None
 
     for i, line in enumerate(lines):
-        if "KRASIS BENCHMARK" in line:
-            start_idx = max(0, i - 1)
+        # Look for the "─" separator line immediately before BENCHMARK COMPLETE
         if "BENCHMARK COMPLETE" in line:
-            # Capture through the summary block after BENCHMARK COMPLETE
-            for j in range(i, min(len(lines), i + 15)):
+            # Walk backward to find the separator line (─────)
+            for j in range(i - 1, max(0, i - 3), -1):
+                if "─" in lines[j] or "────" in lines[j]:
+                    start_idx = j
+                    break
+            if start_idx is None:
+                start_idx = i
+            # Walk forward to capture through the summary (ends at blank line or Log: line)
+            for j in range(i + 1, min(len(lines), i + 15)):
                 end_idx = j + 1
                 if lines[j].strip() == "" and j > i + 3:
                     break
@@ -920,32 +930,57 @@ def run_large_prompt_tests(port: int = DEFAULT_PORT) -> List[Dict]:
 
 def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
                     config_results: List[Dict]) -> str:
-    """Generate the markdown release test report."""
+    """Generate the markdown release test report.
+
+    Structure:
+    1. Header with metadata and links
+    2. All benchmark result summaries grouped together
+    3. All sanity test results in full (prompt + response) for manual verification
+    """
     lines = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     lines.append(f"# Krasis Release Test — {model_name}")
     lines.append("")
     lines.append(f"**Date:** {now}")
-    lines.append(f"**GPU:** {gpu_info[1]} ({gpu_info[2]} MB, index {gpu_info[0]})")
+    lines.append(f"**GPU:** {gpu_info[1]} ({gpu_info[2]} MB)")
     lines.append(f"**Model:** {model_name}")
     lines.append(f"**Configs tested:** {len(config_results)}")
     lines.append("")
 
+    # Links
+    lines.append("## Contents")
+    lines.append("")
+    lines.append("- [Benchmark Results](#benchmark-results)")
     for i, cr in enumerate(config_results):
         variant = cr["variant"]
-        lines.append("---")
-        lines.append("")
-        lines.append(f"## Config {i+1}: {variant['name']}")
-        lines.append("")
-        lines.append(f"- Expert quant: INT{variant['gpu_bits']} GPU / INT{variant['cpu_bits']} CPU")
-        lines.append(f"- Attention: {variant['attention'].upper()}")
-        if variant.get("multi_gpu"):
-            lines.append(f"- GPUs: {gpu_info[1]} + aux GPUs (multi-GPU decode pipeline)")
+        status = "FAILED" if cr.get("error") else "PASS"
+        anchor = f"config-{i+1}-{variant['name'].lower().replace(' ', '-').replace('/', '')}"
+        lines.append(f"  - [{variant['name']} — {status}](#{anchor})")
+    lines.append("- [Sanity Tests](#sanity-tests)")
+    for i, cr in enumerate(config_results):
+        if cr.get("error"):
+            continue
+        variant = cr["variant"]
+        sanity = cr.get("sanity_results", [])
+        passed = sum(1 for s in sanity if not s.get("error"))
+        anchor = f"sanity-config-{i+1}-{variant['name'].lower().replace(' ', '-').replace('/', '')}"
+        lines.append(f"  - [{variant['name']} ({passed}/{len(sanity)})](#{anchor})")
+    lines.append("")
+
+    # ── Benchmark Results ──────────────────────────────────────────
+    lines.append("---")
+    lines.append("")
+    lines.append("## Benchmark Results")
+    lines.append("")
+
+    for i, cr in enumerate(config_results):
+        variant = cr["variant"]
+        lines.append(f"### Config {i+1}: {variant['name']}")
         lines.append("")
 
         if cr.get("error"):
-            lines.append("### ERROR")
+            lines.append("**FAILED**")
             lines.append("")
             lines.append("```")
             lines.append(cr["error"])
@@ -953,83 +988,70 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
             lines.append("")
             continue
 
-        # Benchmark results
-        lines.append("### Benchmark Results")
-        lines.append("")
         lines.append("```")
         lines.append(cr.get("benchmark_output", "(no benchmark output)"))
         lines.append("```")
         lines.append("")
 
-        # Sanity prompts
-        sanity = cr.get("sanity_results", [])
-        if sanity:
-            lines.append("### Sanity Test Results")
-            lines.append("")
-            prev_conv = None
-            for sr in sanity:
-                conv = sr.get("conversation", 0)
-                turn = sr.get("turn", 1)
-                total_turns = sr.get("turns_in_conversation", 1)
-                is_multi = total_turns > 1
-
-                # Show conversation header for multi-turn
-                if is_multi and conv != prev_conv:
-                    lines.append(f"#### Conversation {conv} ({total_turns} turns)")
-                    lines.append("")
-                prev_conv = conv
-
-                turn_label = f" [turn {turn}/{total_turns}]" if is_multi else ""
-                lines.append(f"**Prompt:** {sr['prompt']}{turn_label}")
-                lines.append("")
-                if sr.get("error"):
-                    lines.append(f"**Error:** {sr['error']}")
-                else:
-                    decode_str = f"{sr['decode_tok_s']:.1f} tok/s" if sr.get('decode_tok_s', 0) > 0 else "Not Received"
-                    prefill_str = f"{sr['prefill_tok_s']:.0f} tok/s" if sr.get('prefill_tok_s', 0) > 0 else "Not Received"
-                    lines.append(f"TTFT: {sr['ttft_s']:.2f}s | "
-                                 f"Prefill: {prefill_str} | "
-                                 f"Decode: {decode_str} | "
-                                 f"Tokens: {sr['tokens']} (prompt: {sr.get('prompt_tokens', '?')})")
-                    overhead = sr.get('overhead', {})
-                    if overhead:
-                        lines.append(f"Overhead: parse={overhead.get('parse_ms', 0):.1f}ms "
-                                     f"evict={overhead.get('evict_ms', 0):.1f}ms "
-                                     f"prefill={overhead.get('prefill_ms', 0):.0f}ms "
-                                     f"reload={overhead.get('reload_ms', 0):.0f}ms")
-                    lines.append("")
-                    lines.append(f"> {sr['text']}")
-                lines.append("")
-
-        # Large prompt results
+        # Large prompt results — compact table under benchmark
         large = cr.get("large_results", [])
         if large:
-            lines.append("### Large Prompt Results")
+            lines.append("**Large Prompts:**")
             lines.append("")
+            lines.append("| Size | Book | Decode | Prefill | TTFT |")
+            lines.append("|------|------|--------|---------|------|")
             for lr in large:
                 book = lr.get('book', 'unknown')
-                lines.append(f"**{lr['prompt_name']}** ({lr['prompt_chars']:,} chars, {book})")
-                lines.append("")
                 if lr.get("error"):
-                    lines.append(f"**Error:** {lr['error']}")
+                    lines.append(f"| {lr['prompt_name']} | {book} | FAILED | — | — |")
                 else:
-                    decode_str = f"{lr['decode_tok_s']:.1f} tok/s" if lr.get('decode_tok_s', 0) > 0 else "Not Received"
-                    prefill_str = f"{lr['prefill_tok_s']:.0f} tok/s" if lr.get('prefill_tok_s', 0) > 0 else "Not Received"
-                    lines.append(f"TTFT: {lr['ttft_s']:.2f}s | "
-                                 f"Prefill: {prefill_str} | "
-                                 f"Decode: {decode_str} | "
-                                 f"Tokens: {lr['tokens']} (prompt: {lr.get('prompt_tokens', '?')})")
-                    overhead = lr.get('overhead', {})
-                    if overhead:
-                        lines.append(f"Overhead: parse={overhead.get('parse_ms', 0):.1f}ms "
-                                     f"evict={overhead.get('evict_ms', 0):.1f}ms "
-                                     f"prefill={overhead.get('prefill_ms', 0):.0f}ms "
-                                     f"reload={overhead.get('reload_ms', 0):.0f}ms")
-                    lines.append("")
-                    # Prompt preview
-                    lines.append(f"Prompt (first 200 chars): `{lr['prompt_preview'][:200]}`")
-                    lines.append("")
-                    lines.append(f"> {lr['text']}")
+                    decode_str = f"{lr['decode_tok_s']:.1f} tok/s" if lr.get('decode_tok_s', 0) > 0 else "N/A"
+                    prefill_str = f"{lr['prefill_tok_s']:.0f} tok/s" if lr.get('prefill_tok_s', 0) > 0 else "N/A"
+                    lines.append(f"| {lr['prompt_name']} | {book} | {decode_str} | {prefill_str} | {lr['ttft_s']:.2f}s |")
+            lines.append("")
+
+    # ── Sanity Tests ───────────────────────────────────────────────
+    lines.append("---")
+    lines.append("")
+    lines.append("## Sanity Tests")
+    lines.append("")
+
+    for i, cr in enumerate(config_results):
+        if cr.get("error"):
+            continue
+
+        variant = cr["variant"]
+        sanity = cr.get("sanity_results", [])
+        if not sanity:
+            continue
+
+        passed = sum(1 for s in sanity if not s.get("error"))
+        failed = len(sanity) - passed
+        status = f"{passed}/{len(sanity)} passed" if failed == 0 else f"{passed}/{len(sanity)} passed, {failed} FAILED"
+
+        lines.append(f"### Sanity Config {i+1}: {variant['name']}")
+        lines.append("")
+        lines.append(f"**{status}**")
+        lines.append("")
+
+        for sr in sanity:
+            prompt = sr['prompt']
+            turn_label = ""
+            if sr.get("turns_in_conversation", 1) > 1:
+                turn_label = f" [turn {sr.get('turn', 1)}/{sr['turns_in_conversation']}]"
+
+            if sr.get("error"):
+                lines.append(f"**Prompt:** {prompt}{turn_label}")
+                lines.append(f"**FAILED:** {sr['error']}")
+                lines.append("")
+            else:
+                decode_str = f"{sr['decode_tok_s']:.1f} tok/s" if sr.get('decode_tok_s', 0) > 0 else "N/A"
+                prefill_str = f"{sr['prefill_tok_s']:.0f} tok/s" if sr.get('prefill_tok_s', 0) > 0 else "N/A"
+                lines.append(f"**Prompt:** {prompt}{turn_label}  ")
+                lines.append(f"*Decode: {decode_str} | Prefill: {prefill_str} | TTFT: {sr['ttft_s']:.2f}s*")
+                lines.append("")
+                response = sr.get('text', '(no response)')
+                lines.append(f"> {response.replace(chr(10), chr(10) + '> ')}")
                 lines.append("")
 
     return "\n".join(lines)
