@@ -573,6 +573,539 @@ extern "C" __global__ void scale_bf16(
     }
 }
 
+// ── MLA (Multi-head Latent Attention) Decode Kernels ──────────────────
+
+// Write compressed KV + rope PE to FP8 caches at the current position.
+// ckv_cache: [max_seq, kv_lora_rank], kpe_cache: [max_seq, qk_rope_dim]
+// Input ckv [kv_lora_rank] and kpe [qk_rope_dim] are FP32.
+extern "C" __global__ void mla_kv_cache_write_g(
+    __nv_fp8_e4m3* __restrict__ ckv_cache,
+    __nv_fp8_e4m3* __restrict__ kpe_cache,
+    const float* __restrict__ ckv,       // [kv_lora_rank] FP32
+    const float* __restrict__ kpe,       // [qk_rope_dim] FP32
+    const int* __restrict__ d_position,
+    int kv_lora_rank,
+    int ckv_cache_dim,
+    int qk_rope_dim
+) {
+    int position = *d_position;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < ckv_cache_dim) {
+        float val = (i < kv_lora_rank) ? ckv[i] : 0.0f;
+        ckv_cache[position * ckv_cache_dim + i] = f32_to_fp8e4m3(val);
+    }
+    if (i < qk_rope_dim) {
+        kpe_cache[position * qk_rope_dim + i] = f32_to_fp8e4m3(kpe[i]);
+    }
+}
+
+// MLA KV cache write (non-graphed: position as immediate)
+// ckv_cache_dim >= kv_lora_rank: elements [kv_lora_rank, ckv_cache_dim) are zero-padded.
+extern "C" __global__ void mla_kv_cache_write(
+    __nv_fp8_e4m3* __restrict__ ckv_cache,
+    __nv_fp8_e4m3* __restrict__ kpe_cache,
+    const float* __restrict__ ckv,
+    const float* __restrict__ kpe,
+    int position,
+    int kv_lora_rank,
+    int ckv_cache_dim,
+    int qk_rope_dim
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < ckv_cache_dim) {
+        float val = (i < kv_lora_rank) ? ckv[i] : 0.0f;
+        ckv_cache[position * ckv_cache_dim + i] = f32_to_fp8e4m3(val);
+    }
+    if (i < qk_rope_dim) {
+        kpe_cache[position * qk_rope_dim + i] = f32_to_fp8e4m3(kpe[i]);
+    }
+}
+
+// MLA attention decode kernel (graphable variant, reads seq_len from GPU pointer).
+//
+// Computes single-token MLA attention for all query heads simultaneously.
+// Score = dot(q_absorbed[h], ckv_cache[pos]) + dot(q_pe[h], kpe_cache[pos])
+// Output = softmax-weighted sum of ckv_cache values (kv_lora_rank dims per head).
+//
+// Grid: (num_heads, 1, 1)   Block: (256, 1, 1)
+// Shared memory: (kv_lora_rank + qk_rope_dim + num_warps + MLA_TILE_SIZE) * sizeof(float)
+#define MLA_TILE_SIZE 4096
+
+extern "C" __global__ void mla_attention_g(
+    float* __restrict__ output,              // [num_heads * kv_lora_rank] FP32
+    const float* __restrict__ q_absorbed,    // [num_heads * kv_lora_rank] FP32
+    const float* __restrict__ q_pe,          // [num_heads * qk_rope_dim] FP32
+    const __nv_fp8_e4m3* __restrict__ ckv_cache,  // [max_seq * kv_lora_rank] FP8
+    const __nv_fp8_e4m3* __restrict__ kpe_cache,  // [max_seq * qk_rope_dim] FP8
+    float sm_scale,
+    int num_heads,
+    int kv_lora_rank,
+    int qk_rope_dim,
+    const int* __restrict__ d_seq_len,
+    int max_seq
+) {
+    int seq_len = *d_seq_len;
+    int h = blockIdx.x;
+    if (h >= num_heads) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    // Shared memory: [kv_lora_rank] q_abs + [qk_rope_dim] q_pe + [num_warps] reduce + [MLA_TILE_SIZE] weights
+    extern __shared__ float smem[];
+    float* s_q_abs = smem;
+    float* s_q_pe = smem + kv_lora_rank;
+    float* smem_reduce = s_q_pe + qk_rope_dim;
+    float* smem_weights = smem_reduce + num_warps;
+
+    // Preload absorbed query and rope PE query into shared memory
+    const float* qa_head = q_absorbed + h * kv_lora_rank;
+    const float* qp_head = q_pe + h * qk_rope_dim;
+    for (int i = tid; i < kv_lora_rank; i += num_threads) {
+        s_q_abs[i] = qa_head[i];
+    }
+    for (int i = tid; i < qk_rope_dim; i += num_threads) {
+        s_q_pe[i] = qp_head[i];
+    }
+    __syncthreads();
+
+    // Pass 1: find max score
+    float local_max = -1e30f;
+    for (int pos = tid; pos < seq_len; pos += num_threads) {
+        float score = 0.0f;
+        // Compressed KV dot product (kv_lora_rank dims)
+        const __nv_fp8_e4m3* ckv_vec = ckv_cache + pos * kv_lora_rank;
+        for (int d = 0; d < kv_lora_rank; d += 16) {
+            int remaining = kv_lora_rank - d;
+            int count = remaining < 16 ? remaining : 16;
+            if (count == 16) {
+                uint4 packed = *reinterpret_cast<const uint4*>(ckv_vec + d);
+                const unsigned char* pb = reinterpret_cast<const unsigned char*>(&packed);
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    score += s_q_abs[d + j] * fp8e4m3_to_f32(
+                        *reinterpret_cast<const __nv_fp8_e4m3*>(&pb[j]));
+                }
+            } else {
+                for (int j = 0; j < count; j++) {
+                    score += s_q_abs[d + j] * fp8e4m3_to_f32(ckv_vec[d + j]);
+                }
+            }
+        }
+        // Rope PE dot product (qk_rope_dim dims)
+        const __nv_fp8_e4m3* kpe_vec = kpe_cache + pos * qk_rope_dim;
+        for (int d = 0; d < qk_rope_dim; d += 16) {
+            int remaining = qk_rope_dim - d;
+            int count = remaining < 16 ? remaining : 16;
+            if (count == 16) {
+                uint4 packed = *reinterpret_cast<const uint4*>(kpe_vec + d);
+                const unsigned char* pb = reinterpret_cast<const unsigned char*>(&packed);
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    score += s_q_pe[d + j] * fp8e4m3_to_f32(
+                        *reinterpret_cast<const __nv_fp8_e4m3*>(&pb[j]));
+                }
+            } else {
+                for (int j = 0; j < count; j++) {
+                    score += s_q_pe[d + j] * fp8e4m3_to_f32(kpe_vec[d + j]);
+                }
+            }
+        }
+        score *= sm_scale;
+        local_max = fmaxf(local_max, score);
+    }
+    // Warp reduce max
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) m = fmaxf(m, smem_reduce[w]);
+        smem_reduce[0] = m;
+    }
+    __syncthreads();
+    float global_max = smem_reduce[0];
+
+    // Pass 2 (tiled): compute weights, accumulate weighted ckv
+    float local_sum = 0.0f;
+    // Per-thread V accumulators (kv_lora_rank dims, 4 per thread stride)
+    float v_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int tile_start = 0; tile_start < seq_len; tile_start += MLA_TILE_SIZE) {
+        int tile_end = tile_start + MLA_TILE_SIZE;
+        if (tile_end > seq_len) tile_end = seq_len;
+        int tile_len = tile_end - tile_start;
+
+        // Phase A: compute exp(score - max) for each position
+        for (int ti = tid; ti < tile_len; ti += num_threads) {
+            int pos = tile_start + ti;
+            float score = 0.0f;
+            const __nv_fp8_e4m3* ckv_vec = ckv_cache + pos * kv_lora_rank;
+            for (int d = 0; d < kv_lora_rank; d += 16) {
+                int remaining = kv_lora_rank - d;
+                int count = remaining < 16 ? remaining : 16;
+                if (count == 16) {
+                    uint4 packed = *reinterpret_cast<const uint4*>(ckv_vec + d);
+                    const unsigned char* pb = reinterpret_cast<const unsigned char*>(&packed);
+                    #pragma unroll
+                    for (int j = 0; j < 16; j++) {
+                        score += s_q_abs[d + j] * fp8e4m3_to_f32(
+                            *reinterpret_cast<const __nv_fp8_e4m3*>(&pb[j]));
+                    }
+                } else {
+                    for (int j = 0; j < count; j++) {
+                        score += s_q_abs[d + j] * fp8e4m3_to_f32(ckv_vec[d + j]);
+                    }
+                }
+            }
+            const __nv_fp8_e4m3* kpe_vec = kpe_cache + pos * qk_rope_dim;
+            for (int d = 0; d < qk_rope_dim; d += 16) {
+                int remaining = qk_rope_dim - d;
+                int count = remaining < 16 ? remaining : 16;
+                if (count == 16) {
+                    uint4 packed = *reinterpret_cast<const uint4*>(kpe_vec + d);
+                    const unsigned char* pb = reinterpret_cast<const unsigned char*>(&packed);
+                    #pragma unroll
+                    for (int j = 0; j < 16; j++) {
+                        score += s_q_pe[d + j] * fp8e4m3_to_f32(
+                            *reinterpret_cast<const __nv_fp8_e4m3*>(&pb[j]));
+                    }
+                } else {
+                    for (int j = 0; j < count; j++) {
+                        score += s_q_pe[d + j] * fp8e4m3_to_f32(kpe_vec[d + j]);
+                    }
+                }
+            }
+            float w = expf(score * sm_scale - global_max);
+            smem_weights[ti] = w;
+            local_sum += w;
+        }
+        __syncthreads();
+
+        // Phase B: accumulate weighted ckv using stored weights
+        // Output dim is kv_lora_rank (not head_dim)
+        const __nv_fp8_e4m3* v_base = ckv_cache + tile_start * kv_lora_rank;
+        int di = 0;
+        for (int d = tid; d < kv_lora_rank; d += num_threads) {
+            float acc = 0.0f;
+            for (int ti = 0; ti < tile_len; ti++) {
+                acc += smem_weights[ti] * fp8e4m3_to_f32(v_base[ti * kv_lora_rank + d]);
+            }
+            v_acc[di++] += acc;
+        }
+        __syncthreads();
+    }
+
+    // Warp reduce sum_exp
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < num_warps; w++) s += smem_reduce[w];
+        smem_reduce[0] = s;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / smem_reduce[0];
+
+    // Write normalized output
+    float* out_head = output + h * kv_lora_rank;
+    int di = 0;
+    for (int d = tid; d < kv_lora_rank; d += num_threads) {
+        out_head[d] = v_acc[di++] * inv_sum;
+    }
+}
+
+// MLA attention decode kernel (non-graphed: seq_len as immediate)
+extern "C" __global__ void mla_attention(
+    float* __restrict__ output,
+    const float* __restrict__ q_absorbed,
+    const float* __restrict__ q_pe,
+    const __nv_fp8_e4m3* __restrict__ ckv_cache,
+    const __nv_fp8_e4m3* __restrict__ kpe_cache,
+    float sm_scale,
+    int num_heads,
+    int kv_lora_rank,
+    int qk_rope_dim,
+    int seq_len,
+    int max_seq
+) {
+    int h = blockIdx.x;
+    if (h >= num_heads) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    extern __shared__ float smem[];
+    float* s_q_abs = smem;
+    float* s_q_pe = smem + kv_lora_rank;
+    float* smem_reduce = s_q_pe + qk_rope_dim;
+    float* smem_weights = smem_reduce + num_warps;
+
+    const float* qa_head = q_absorbed + h * kv_lora_rank;
+    const float* qp_head = q_pe + h * qk_rope_dim;
+    for (int i = tid; i < kv_lora_rank; i += num_threads) {
+        s_q_abs[i] = qa_head[i];
+    }
+    for (int i = tid; i < qk_rope_dim; i += num_threads) {
+        s_q_pe[i] = qp_head[i];
+    }
+    __syncthreads();
+
+    // Pass 1: find max score
+    float local_max = -1e30f;
+    for (int pos = tid; pos < seq_len; pos += num_threads) {
+        float score = 0.0f;
+        const __nv_fp8_e4m3* ckv_vec = ckv_cache + pos * kv_lora_rank;
+        for (int d = 0; d < kv_lora_rank; d += 16) {
+            int remaining = kv_lora_rank - d;
+            int count = remaining < 16 ? remaining : 16;
+            if (count == 16) {
+                uint4 packed = *reinterpret_cast<const uint4*>(ckv_vec + d);
+                const unsigned char* pb = reinterpret_cast<const unsigned char*>(&packed);
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    score += s_q_abs[d + j] * fp8e4m3_to_f32(
+                        *reinterpret_cast<const __nv_fp8_e4m3*>(&pb[j]));
+                }
+            } else {
+                for (int j = 0; j < count; j++) {
+                    score += s_q_abs[d + j] * fp8e4m3_to_f32(ckv_vec[d + j]);
+                }
+            }
+        }
+        const __nv_fp8_e4m3* kpe_vec = kpe_cache + pos * qk_rope_dim;
+        for (int d = 0; d < qk_rope_dim; d += 16) {
+            int remaining = qk_rope_dim - d;
+            int count = remaining < 16 ? remaining : 16;
+            if (count == 16) {
+                uint4 packed = *reinterpret_cast<const uint4*>(kpe_vec + d);
+                const unsigned char* pb = reinterpret_cast<const unsigned char*>(&packed);
+                #pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    score += s_q_pe[d + j] * fp8e4m3_to_f32(
+                        *reinterpret_cast<const __nv_fp8_e4m3*>(&pb[j]));
+                }
+            } else {
+                for (int j = 0; j < count; j++) {
+                    score += s_q_pe[d + j] * fp8e4m3_to_f32(kpe_vec[d + j]);
+                }
+            }
+        }
+        score *= sm_scale;
+        local_max = fmaxf(local_max, score);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) m = fmaxf(m, smem_reduce[w]);
+        smem_reduce[0] = m;
+    }
+    __syncthreads();
+    float global_max = smem_reduce[0];
+
+    // Pass 2 (tiled): compute weights, accumulate weighted ckv
+    float local_sum = 0.0f;
+    float v_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int tile_start = 0; tile_start < seq_len; tile_start += MLA_TILE_SIZE) {
+        int tile_end = tile_start + MLA_TILE_SIZE;
+        if (tile_end > seq_len) tile_end = seq_len;
+        int tile_len = tile_end - tile_start;
+
+        for (int ti = tid; ti < tile_len; ti += num_threads) {
+            int pos = tile_start + ti;
+            float score = 0.0f;
+            const __nv_fp8_e4m3* ckv_vec = ckv_cache + pos * kv_lora_rank;
+            for (int d = 0; d < kv_lora_rank; d += 16) {
+                int remaining = kv_lora_rank - d;
+                int count = remaining < 16 ? remaining : 16;
+                if (count == 16) {
+                    uint4 packed = *reinterpret_cast<const uint4*>(ckv_vec + d);
+                    const unsigned char* pb = reinterpret_cast<const unsigned char*>(&packed);
+                    #pragma unroll
+                    for (int j = 0; j < 16; j++) {
+                        score += s_q_abs[d + j] * fp8e4m3_to_f32(
+                            *reinterpret_cast<const __nv_fp8_e4m3*>(&pb[j]));
+                    }
+                } else {
+                    for (int j = 0; j < count; j++) {
+                        score += s_q_abs[d + j] * fp8e4m3_to_f32(ckv_vec[d + j]);
+                    }
+                }
+            }
+            const __nv_fp8_e4m3* kpe_vec = kpe_cache + pos * qk_rope_dim;
+            for (int d = 0; d < qk_rope_dim; d += 16) {
+                int remaining = qk_rope_dim - d;
+                int count = remaining < 16 ? remaining : 16;
+                if (count == 16) {
+                    uint4 packed = *reinterpret_cast<const uint4*>(kpe_vec + d);
+                    const unsigned char* pb = reinterpret_cast<const unsigned char*>(&packed);
+                    #pragma unroll
+                    for (int j = 0; j < 16; j++) {
+                        score += s_q_pe[d + j] * fp8e4m3_to_f32(
+                            *reinterpret_cast<const __nv_fp8_e4m3*>(&pb[j]));
+                    }
+                } else {
+                    for (int j = 0; j < count; j++) {
+                        score += s_q_pe[d + j] * fp8e4m3_to_f32(kpe_vec[d + j]);
+                    }
+                }
+            }
+            float w = expf(score * sm_scale - global_max);
+            smem_weights[ti] = w;
+            local_sum += w;
+        }
+        __syncthreads();
+
+        const __nv_fp8_e4m3* v_base = ckv_cache + tile_start * kv_lora_rank;
+        int di = 0;
+        for (int d = tid; d < kv_lora_rank; d += num_threads) {
+            float acc = 0.0f;
+            for (int ti = 0; ti < tile_len; ti++) {
+                acc += smem_weights[ti] * fp8e4m3_to_f32(v_base[ti * kv_lora_rank + d]);
+            }
+            v_acc[di++] += acc;
+        }
+        __syncthreads();
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < num_warps; w++) s += smem_reduce[w];
+        smem_reduce[0] = s;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / smem_reduce[0];
+
+    float* out_head = output + h * kv_lora_rank;
+    int di = 0;
+    for (int d = tid; d < kv_lora_rank; d += num_threads) {
+        out_head[d] = v_acc[di++] * inv_sum;
+    }
+}
+
+// MLA de-interleave kernel: [re0, im0, re1, im1, ...] → [re0, re1, ..., im0, im1, ...]
+// Applied to q_pe and k_pe before RoPE when rope_interleave=true.
+extern "C" __global__ void mla_deinterleave(
+    float* __restrict__ data,    // [num_heads * dim] or [dim] in-place
+    int total_elements,          // num_heads * dim
+    int dim                      // rope dimension per head (must be even)
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total_elements) return;
+    int head_offset = (i / dim) * dim;
+    int local_i = i % dim;
+    int half = dim / 2;
+    // Only process the first half to avoid double-swap
+    if (local_i >= half) return;
+    // Swap: re at even indices, im at odd indices → re block then im block
+    float re = data[head_offset + local_i * 2];
+    float im = data[head_offset + local_i * 2 + 1];
+    data[head_offset + local_i] = re;
+    data[head_offset + half + local_i] = im;
+}
+
+// MLA split Q: [h0_nope|h0_rope|h1_nope|h1_rope|...] → contiguous q_nope [nh*nope] and q_pe [nh*rope]
+extern "C" __global__ void mla_split_q(
+    float* __restrict__ q_nope_out,  // [num_heads * nope_dim]
+    float* __restrict__ q_pe_out,    // [num_heads * rope_dim]
+    const float* __restrict__ q_in,  // [num_heads * (nope_dim + rope_dim)]
+    int num_heads,
+    int nope_dim,
+    int rope_dim
+) {
+    int stride = nope_dim + rope_dim;
+    int total = num_heads * stride;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int h = i / stride;
+    int local = i % stride;
+    float val = q_in[i];
+    if (local < nope_dim) {
+        q_nope_out[h * nope_dim + local] = val;
+    } else {
+        q_pe_out[h * rope_dim + (local - nope_dim)] = val;
+    }
+}
+
+// MLA w_kc absorption: q_nope[h, nope_dim] @ w_kc[h, nope_dim, kv_lora_rank] → q_absorbed[h, kv_lora_rank]
+// One block per head. Each thread computes a subset of the kv_lora_rank output dims.
+extern "C" __global__ void mla_absorb_wkc(
+    float* __restrict__ q_absorbed,    // [num_heads * kv_lora_rank] FP32 output
+    const float* __restrict__ q_nope,  // [num_heads * nope_dim] FP32 input
+    const __nv_bfloat16* __restrict__ w_kc,  // [num_heads, nope_dim, kv_lora_rank] BF16
+    int num_heads,
+    int nope_dim,
+    int kv_lora_rank
+) {
+    int h = blockIdx.x;
+    if (h >= num_heads) return;
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    const float* q_h = q_nope + h * nope_dim;
+    const __nv_bfloat16* w_h = w_kc + h * nope_dim * kv_lora_rank;
+    float* out_h = q_absorbed + h * kv_lora_rank;
+
+    // Each thread computes one or more output dimensions
+    for (int d = tid; d < kv_lora_rank; d += num_threads) {
+        float acc = 0.0f;
+        for (int k = 0; k < nope_dim; k++) {
+            acc += q_h[k] * bf16_to_f32(w_h[k * kv_lora_rank + d]);
+        }
+        out_h[d] = acc;
+    }
+}
+
+// MLA w_vc post-attention: attn_out[h, kv_lora_rank] @ w_vc[h, v_head_dim, kv_lora_rank]^T → out[h, v_head_dim]
+// Then converts to BF16 for o_proj input.
+// One block per head.
+extern "C" __global__ void mla_apply_wvc(
+    __nv_bfloat16* __restrict__ output,       // [num_heads * v_head_dim] BF16
+    const float* __restrict__ attn_out,       // [num_heads * kv_lora_rank] FP32
+    const __nv_bfloat16* __restrict__ w_vc,   // [num_heads, v_head_dim, kv_lora_rank] BF16
+    int num_heads,
+    int v_head_dim,
+    int kv_lora_rank
+) {
+    int h = blockIdx.x;
+    if (h >= num_heads) return;
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    const float* a_h = attn_out + h * kv_lora_rank;
+    const __nv_bfloat16* w_h = w_vc + h * v_head_dim * kv_lora_rank;
+    __nv_bfloat16* out_h = output + h * v_head_dim;
+
+    for (int d = tid; d < v_head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int k = 0; k < kv_lora_rank; k++) {
+            acc += a_h[k] * bf16_to_f32(w_h[d * kv_lora_rank + k]);
+        }
+        out_h[d] = f32_to_bf16(acc);
+    }
+}
+
 // ── Linear Attention Convolution ───────────────────────────────────────
 
 // 1D causal convolution for linear attention (Mamba-style).

@@ -132,6 +132,28 @@ class WeightLoader:
         handle = self._get_handle(shard_name)
         return handle.get_tensor(name)
 
+    def _read_and_dequant(self, name: str) -> torch.Tensor:
+        """Read a tensor, dequanting FP8 to BF16 if needed.
+
+        FP8 models (e.g. Mistral 4) store weights as float8_e4m3fn with a
+        companion weight_scale_inv tensor.  Dequant: bf16 = fp8.to(bf16) * scale_inv.
+        Non-FP8 tensors are returned as-is converted to BF16.
+        """
+        w = self._read_tensor(name)
+        if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz,
+                        torch.float8_e5m2, torch.float8_e5m2fnuz):
+            # Look for companion scale_inv tensor
+            scale_name = f"{name}_scale_inv"
+            if scale_name not in self._weight_map:
+                # Try without .weight suffix: "foo.weight" → "foo.weight_scale_inv"
+                # already handled above since name includes ".weight"
+                logger.warning("FP8 tensor %s has no scale_inv — raw conversion only", name)
+                return w.to(torch.bfloat16)
+            scale_inv = self._read_tensor(scale_name).float()
+            w = w.to(torch.float32) * scale_inv
+            return w.to(torch.bfloat16)
+        return w.to(torch.bfloat16)
+
     def _load_and_quantize(
         self, name: str, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -139,14 +161,14 @@ class WeightLoader:
 
         Returns (weight_int8, scale) both on device.
         """
-        w = self._read_tensor(name).to(torch.bfloat16)
+        w = self._read_and_dequant(name)
         w_int8, scale = quantize_to_int8(w)
         del w
         return w_int8.to(device), scale.to(device)
 
     def _load_bf16(self, name: str, device: torch.device) -> torch.Tensor:
         """Read a weight tensor and place on GPU as BF16."""
-        w = self._read_tensor(name).to(torch.bfloat16)
+        w = self._read_and_dequant(name)
         return w.to(device)
 
 

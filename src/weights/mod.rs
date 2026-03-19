@@ -10,7 +10,7 @@ pub mod marlin;
 pub mod safetensors_io;
 
 use crate::weights::marlin::{quantize_int4, quantize_int8, QuantizedInt4, QuantizedInt8, DEFAULT_GROUP_SIZE};
-use crate::weights::safetensors_io::MmapSafetensors;
+use crate::weights::safetensors_io::{MmapSafetensors, Dtype};
 use memmap2::Mmap;
 use pyo3::prelude::*;
 use serde::Deserialize;
@@ -5013,7 +5013,57 @@ fn is_prequantized(weight_map: &HashMap<String, String>) -> bool {
     weight_map.keys().any(|k| k.ends_with(".weight_packed"))
 }
 
-/// Detect stacked expert format (Qwen3.5).
+/// Convert FP8 E4M3 byte to f32.
+/// Format: 1 sign, 4 exponent (bias=7), 3 mantissa. Range: [-448, 448].
+#[inline]
+fn fp8e4m3_to_f32(v: u8) -> f32 {
+    // Use static lookup table for speed (only 256 entries)
+    FP8E4M3_LUT[v as usize]
+}
+
+/// FP8 E4M3 to f32 lookup table (256 entries, computed at compile time).
+static FP8E4M3_LUT: [f32; 256] = {
+    let mut lut = [0.0f32; 256];
+    let mut i: usize = 0;
+    while i < 256 {
+        let sign = if i & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
+        let exp = ((i >> 3) & 0xF) as i32;
+        let mant = (i & 0x7) as u32;
+
+        lut[i] = if exp == 0 && mant == 0 {
+            // Zero (both +0 and -0)
+            0.0
+        } else if exp == 0 {
+            // Subnormal: (-1)^sign * 2^(-6) * (mant / 8)
+            sign * (mant as f32) * (1.0 / 8.0) * (1.0 / 64.0)  // 2^-6 = 1/64
+        } else if exp == 15 && mant == 7 {
+            // NaN
+            f32::NAN
+        } else {
+            // Normal: (-1)^sign * 2^(exp-7) * (1 + mant/8)
+            // Build the float from bits for const-eval compatibility
+            let mantissa_f = 1.0 + (mant as f32) / 8.0;
+            let pow2 = if exp >= 7 {
+                (1u32 << (exp as u32 - 7)) as f32
+            } else {
+                1.0 / ((1u32 << (7 - exp as u32)) as f32)
+            };
+            sign * pow2 * mantissa_f
+        };
+        i += 1;
+    }
+    lut
+};
+
+/// Dequantize a slice of FP8 E4M3 bytes to BF16 u16 values, applying a per-tensor scale.
+fn dequant_fp8_to_bf16(fp8_data: &[u8], scale: f32) -> Vec<u16> {
+    fp8_data.iter().map(|&b| {
+        let val = fp8e4m3_to_f32(b) * scale;
+        marlin::f32_to_bf16(val)
+    }).collect()
+}
+
+/// Detect stacked expert format (Qwen3.5, Mistral 4).
 /// These models store all experts in stacked 3D tensors per layer:
 ///   experts.gate_up_proj [E, 2*inter, hidden]
 ///   experts.down_proj [E, hidden, inter]
@@ -5365,7 +5415,8 @@ fn load_prequantized_weight(
     })
 }
 
-/// Load a BF16 weight tensor and quantize it to INT4.
+/// Load a BF16 or FP8 weight tensor and quantize it to INT4.
+/// For FP8 tensors, loads the per-tensor `weight_scale_inv` and dequantizes to BF16 first.
 fn load_and_quantize_weight(
     prefix: &str,
     proj_name: &str,
@@ -5385,10 +5436,21 @@ fn load_and_quantize_weight(
     let rows = info.shape[0];
     let cols = info.shape[1];
 
-    let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
-        .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+    if info.dtype.is_fp8() {
+        // FP8 path: read as bytes, load per-tensor scale_inv, dequant to BF16
+        let fp8_data: &[u8] = shard.tensor_as_slice(&tensor_name)
+            .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
 
-    Ok(quantize_int4(bf16_data, rows, cols, group_size))
+        let scale_name = format!("{tensor_name}_scale_inv");
+        let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
+
+        let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
+        Ok(quantize_int4(&bf16_data, rows, cols, group_size))
+    } else {
+        let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
+            .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+        Ok(quantize_int4(bf16_data, rows, cols, group_size))
+    }
 }
 
 /// Load a BF16 expert's gate/up/down projections and quantize to INT4 or INT8.
@@ -5411,7 +5473,7 @@ fn load_and_quantize_expert(
         )?);
         Ok((g, u, d))
     } else {
-        // INT8 path: load BF16 and quantize to INT8
+        // INT8 path: load BF16/FP8 and quantize to INT8
         let load_int8 = |proj_name: &str| -> Result<QuantWeight, String> {
             let tensor_name = format!("{prefix}.{proj_name}.weight");
             let shard_name = weight_map.get(&tensor_name)
@@ -5422,9 +5484,18 @@ fn load_and_quantize_expert(
                 .ok_or_else(|| format!("Tensor not in shard: {tensor_name}"))?;
             let rows = info.shape[0];
             let cols = info.shape[1];
-            let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
-                .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
-            Ok(QuantWeight::Int8(quantize_int8(bf16_data, rows, cols, group_size)))
+            if info.dtype.is_fp8() {
+                let fp8_data: &[u8] = shard.tensor_as_slice(&tensor_name)
+                    .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+                let scale_name = format!("{tensor_name}_scale_inv");
+                let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
+                let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
+                Ok(QuantWeight::Int8(quantize_int8(&bf16_data, rows, cols, group_size)))
+            } else {
+                let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
+                    .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+                Ok(QuantWeight::Int8(quantize_int8(bf16_data, rows, cols, group_size)))
+            }
         };
 
         let g = load_int8("gate_proj")?;
@@ -5434,10 +5505,37 @@ fn load_and_quantize_expert(
     }
 }
 
-/// Load all experts from stacked 3D tensors (Qwen3.5 format) and quantize.
+/// Load a per-tensor FP8 scale_inv value. Handles both BF16 scalar and FP32 scalar formats.
+fn load_fp8_scale(
+    scale_name: &str,
+    weight_map: &HashMap<String, String>,
+    shards: &HashMap<String, MmapSafetensors>,
+) -> Result<f32, String> {
+    let shard_name = weight_map.get(scale_name)
+        .ok_or_else(|| format!("FP8 scale_inv not found: {scale_name}"))?;
+    let shard = shards.get(shard_name)
+        .ok_or_else(|| format!("Shard not loaded: {shard_name}"))?;
+    let info = shard.tensor_info(scale_name)
+        .ok_or_else(|| format!("Tensor not in shard: {scale_name}"))?;
+
+    if info.dtype == Dtype::F32 {
+        let data: &[f32] = shard.tensor_as_slice(scale_name)
+            .map_err(|e| format!("Failed to read {scale_name}: {e}"))?;
+        Ok(data[0])
+    } else {
+        // BF16 scalar
+        let data: &[u16] = shard.tensor_as_slice(scale_name)
+            .map_err(|e| format!("Failed to read {scale_name}: {e}"))?;
+        Ok(marlin::bf16_to_f32(data[0]))
+    }
+}
+
+/// Load all experts from stacked 3D tensors (Qwen3.5/Mistral 4 format) and quantize.
 ///
 /// Stacked format: experts.gate_up_proj [E, 2*inter, hidden], experts.down_proj [E, hidden, inter]
 /// Splits gate_up into separate gate [inter, hidden] and up [inter, hidden] per expert.
+///
+/// Supports both BF16 source weights (Qwen3.5) and FP8 E4M3 with per-expert scale_inv (Mistral 4).
 fn load_stacked_layer_experts(
     layer_idx: usize,
     layers_prefix: &str,
@@ -5463,8 +5561,7 @@ fn load_stacked_layer_experts(
         return Err(format!("gate_up_proj shape mismatch: expected [{n_experts}, {}, {hidden}], got {:?}",
             2 * inter, gu_info.shape));
     }
-    let gu_data: &[u16] = gu_shard.tensor_as_slice(&gu_name)
-        .map_err(|e| format!("Failed to read {gu_name}: {e}"))?;
+    let is_fp8 = gu_info.dtype.is_fp8();
 
     // Load stacked down_proj [E, hidden, inter]
     let dp_name = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.down_proj");
@@ -5478,39 +5575,105 @@ fn load_stacked_layer_experts(
         return Err(format!("down_proj shape mismatch: expected [{n_experts}, {hidden}, {inter}], got {:?}",
             dp_info.shape));
     }
-    let dp_data: &[u16] = dp_shard.tensor_as_slice(&dp_name)
-        .map_err(|e| format!("Failed to read {dp_name}: {e}"))?;
 
-    // Slice per-expert and quantize
     let gu_stride = 2 * inter * hidden;  // elements per expert in gate_up
     let dp_stride = hidden * inter;      // elements per expert in down
 
-    let experts: Vec<ExpertWeights> = (0..n_experts).into_par_iter().map(|eidx| {
-        let gu_start = eidx * gu_stride;
-        let gu_expert = &gu_data[gu_start..gu_start + gu_stride];
-        // Split gate_up [2*inter, hidden] into gate [inter, hidden] and up [inter, hidden]
-        let gate_slice = &gu_expert[..inter * hidden];
-        let up_slice = &gu_expert[inter * hidden..];
-
-        let dp_start = eidx * dp_stride;
-        let down_slice = &dp_data[dp_start..dp_start + dp_stride];
-
-        if num_bits == 4 {
-            ExpertWeights {
-                gate: QuantWeight::Int4(quantize_int4(gate_slice, inter, hidden, group_size)),
-                up: QuantWeight::Int4(quantize_int4(up_slice, inter, hidden, group_size)),
-                down: QuantWeight::Int4(quantize_int4(down_slice, hidden, inter, group_size)),
-            }
-        } else {
-            ExpertWeights {
-                gate: QuantWeight::Int8(quantize_int8(gate_slice, inter, hidden, group_size)),
-                up: QuantWeight::Int8(quantize_int8(up_slice, inter, hidden, group_size)),
-                down: QuantWeight::Int8(quantize_int8(down_slice, hidden, inter, group_size)),
-            }
+    if is_fp8 {
+        // FP8 path: read as bytes, load per-expert scale_inv, dequant to BF16
+        if layer_idx == 0 {
+            log::info!("Detected FP8 E4M3 stacked experts — will dequant with scale_inv");
         }
-    }).collect();
+        let gu_bytes: &[u8] = gu_shard.tensor_as_slice(&gu_name)
+            .map_err(|e| format!("Failed to read {gu_name}: {e}"))?;
+        let dp_bytes: &[u8] = dp_shard.tensor_as_slice(&dp_name)
+            .map_err(|e| format!("Failed to read {dp_name}: {e}"))?;
 
-    Ok(experts)
+        // Load per-expert scale_inv: [E, 1, 1] BF16 → one f32 scale per expert
+        let gu_scale_name = format!("{gu_name}_scale_inv");
+        let dp_scale_name = format!("{dp_name}_scale_inv");
+
+        let load_scales = |name: &str| -> Result<Vec<f32>, String> {
+            let shard_name = weight_map.get(name)
+                .ok_or_else(|| format!("FP8 scale_inv not found: {name}"))?;
+            let shard = shards.get(shard_name)
+                .ok_or_else(|| format!("Shard not loaded: {shard_name}"))?;
+            let scale_data: &[u16] = shard.tensor_as_slice(name)
+                .map_err(|e| format!("Failed to read {name}: {e}"))?;
+            // Each scale is BF16, shape [E, 1, 1] → E values
+            Ok(scale_data.iter().map(|&v| marlin::bf16_to_f32(v)).collect())
+        };
+
+        let gu_scales = load_scales(&gu_scale_name)?;
+        let dp_scales = load_scales(&dp_scale_name)?;
+        if gu_scales.len() != n_experts || dp_scales.len() != n_experts {
+            return Err(format!("scale_inv length mismatch: gu={}, dp={}, expected {}",
+                gu_scales.len(), dp_scales.len(), n_experts));
+        }
+
+        let experts: Vec<ExpertWeights> = (0..n_experts).into_par_iter().map(|eidx| {
+            let gu_start = eidx * gu_stride;
+            let gu_expert = &gu_bytes[gu_start..gu_start + gu_stride];
+            let gu_bf16 = dequant_fp8_to_bf16(gu_expert, gu_scales[eidx]);
+
+            // Split gate_up [2*inter, hidden] into gate [inter, hidden] and up [inter, hidden]
+            let gate_slice = &gu_bf16[..inter * hidden];
+            let up_slice = &gu_bf16[inter * hidden..];
+
+            let dp_start = eidx * dp_stride;
+            let dp_expert = &dp_bytes[dp_start..dp_start + dp_stride];
+            let down_bf16 = dequant_fp8_to_bf16(dp_expert, dp_scales[eidx]);
+
+            if num_bits == 4 {
+                ExpertWeights {
+                    gate: QuantWeight::Int4(quantize_int4(gate_slice, inter, hidden, group_size)),
+                    up: QuantWeight::Int4(quantize_int4(up_slice, inter, hidden, group_size)),
+                    down: QuantWeight::Int4(quantize_int4(&down_bf16, hidden, inter, group_size)),
+                }
+            } else {
+                ExpertWeights {
+                    gate: QuantWeight::Int8(quantize_int8(gate_slice, inter, hidden, group_size)),
+                    up: QuantWeight::Int8(quantize_int8(up_slice, inter, hidden, group_size)),
+                    down: QuantWeight::Int8(quantize_int8(&down_bf16, hidden, inter, group_size)),
+                }
+            }
+        }).collect();
+
+        Ok(experts)
+    } else {
+        // BF16 path (existing behavior)
+        let gu_data: &[u16] = gu_shard.tensor_as_slice(&gu_name)
+            .map_err(|e| format!("Failed to read {gu_name}: {e}"))?;
+        let dp_data: &[u16] = dp_shard.tensor_as_slice(&dp_name)
+            .map_err(|e| format!("Failed to read {dp_name}: {e}"))?;
+
+        let experts: Vec<ExpertWeights> = (0..n_experts).into_par_iter().map(|eidx| {
+            let gu_start = eidx * gu_stride;
+            let gu_expert = &gu_data[gu_start..gu_start + gu_stride];
+            // Split gate_up [2*inter, hidden] into gate [inter, hidden] and up [inter, hidden]
+            let gate_slice = &gu_expert[..inter * hidden];
+            let up_slice = &gu_expert[inter * hidden..];
+
+            let dp_start = eidx * dp_stride;
+            let down_slice = &dp_data[dp_start..dp_start + dp_stride];
+
+            if num_bits == 4 {
+                ExpertWeights {
+                    gate: QuantWeight::Int4(quantize_int4(gate_slice, inter, hidden, group_size)),
+                    up: QuantWeight::Int4(quantize_int4(up_slice, inter, hidden, group_size)),
+                    down: QuantWeight::Int4(quantize_int4(down_slice, hidden, inter, group_size)),
+                }
+            } else {
+                ExpertWeights {
+                    gate: QuantWeight::Int8(quantize_int8(gate_slice, inter, hidden, group_size)),
+                    up: QuantWeight::Int8(quantize_int8(up_slice, inter, hidden, group_size)),
+                    down: QuantWeight::Int8(quantize_int8(down_slice, hidden, inter, group_size)),
+                }
+            }
+        }).collect();
+
+        Ok(experts)
+    }
 }
 
 #[cfg(test)]

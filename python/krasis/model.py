@@ -3875,6 +3875,13 @@ class KrasisModel:
                 # in_proj_qkvz output dim = nk*(dk + dk + hr*dv + hr*dv)
                 qkvz_out = attn.num_k_heads * (2 * attn.k_head_dim + 2 * attn.head_ratio * attn.v_head_dim)
                 max_qkv = max(max_qkv, qkvz_out)
+            elif hasattr(layer.attention, 'kv_a_proj'):
+                # MLA: q_absorbed [num_heads * ckv_dim] is the largest buffer
+                ma = layer.attention
+                q_out = ma.num_heads * (ma.qk_nope_dim + ma.qk_rope_dim)
+                q_absorbed = ma.num_heads * ma.ckv_dim  # padded to 512 for FlashInfer
+                kv_out = ma.ckv_dim + ma.qk_rope_dim
+                max_qkv = max(max_qkv, q_out, q_absorbed, kv_out)
             elif hasattr(layer.attention, 'num_heads'):
                 ga = layer.attention
                 q_sz = ga.num_heads * ga.head_dim * (2 if ga.gated_attention else 1)
@@ -4213,6 +4220,94 @@ class KrasisModel:
                     kernel_dim=attn.kernel_dim, conv_dim=attn.conv_dim,
                     scale=attn.scale,
                 )
+            elif hasattr(attn, 'kv_a_proj'):
+                # MLA attention — register projections and absorbed weights
+                # Q projection weights
+                if attn.has_q_lora:
+                    qa_w = attn.q_a_proj
+                    qb_w = attn.q_b_proj
+                    qa_wid = _register_attn_weight(qa_w, layer_idx, "mla", "q_a_proj")
+                    qb_wid = _register_attn_weight(qb_w, layer_idx, "mla", "q_b_proj")
+                    # q_a layernorm: BF16 → FP32 for Rust per_head_rmsnorm
+                    attn._rust_q_a_norm = attn.q_a_norm_weight.float().contiguous().to(device)
+                    q_a_norm_ptr = attn._rust_q_a_norm.data_ptr()
+                    self._rust_decode_weights.append(attn._rust_q_a_norm)
+                    q_proj_wid = None
+                else:
+                    q_w = attn.q_proj
+                    q_proj_wid = _register_attn_weight(q_w, layer_idx, "mla", "q_proj")
+                    qa_wid = None
+                    qb_wid = None
+                    q_a_norm_ptr = 0
+
+                # KV projection
+                kva_w = attn.kv_a_proj
+                kva_wid = _register_attn_weight(kva_w, layer_idx, "mla", "kv_a_proj")
+
+                # O projection
+                o_w = attn.o_proj
+                o_wid = _register_attn_weight(o_w, layer_idx, "mla", "o_proj")
+
+                # kv_a layernorm: BF16 → FP32
+                attn._rust_kv_a_norm = attn.kv_a_norm_weight.float().contiguous().to(device)
+                self._rust_decode_weights.append(attn._rust_kv_a_norm)
+
+                # w_kc and w_vc: keep as BF16 on GPU (read by CUDA kernels directly)
+                # Shape: [num_heads, dim_a, dim_b] — ensure contiguous
+                attn._rust_w_kc = attn.w_kc.contiguous().to(device)
+                attn._rust_w_vc = attn.w_vc.contiguous().to(device)
+                self._rust_decode_weights.extend([attn._rust_w_kc, attn._rust_w_vc])
+
+                # MLA FP8 KV caches: share FlashInfer's paged cache directly
+                # For single-sequence decode, paged layout [pages, page_size, dim]
+                # is identical to flat layout [position, dim] in memory.
+                cache = self.kv_caches[0]
+                if not hasattr(self, '_mla_cache_offset'):
+                    self._mla_cache_offset = 0
+                mla_offset = self._mla_cache_offset
+                self._mla_cache_offset += 1
+                ckv_layer = cache.ckv_cache[mla_offset]  # [pages, page_size, kv_lora_rank]
+                kpe_layer = cache.kpe_cache[mla_offset]  # [pages, page_size, qk_rope_dim]
+                max_seq = cache.max_pages * cache.page_size
+
+                store.register_mla_layer(
+                    layer_idx=layer_idx,
+                    input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
+                    post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
+                    kv_a_proj_wid=kva_wid, o_proj_wid=o_wid,
+                    kv_a_norm_ptr=attn._rust_kv_a_norm.data_ptr(),
+                    w_kc_ptr=attn._rust_w_kc.data_ptr(),
+                    w_vc_ptr=attn._rust_w_vc.data_ptr(),
+                    num_heads=attn.num_heads,
+                    kv_lora_rank=attn.kv_lora_rank,  # real kv_lora_rank (256 for Mistral)
+                    qk_nope_dim=attn.qk_nope_dim,
+                    qk_rope_dim=attn.qk_rope_dim,
+                    v_head_dim=attn.v_head_dim,
+                    sm_scale=attn.sm_scale,
+                    rope_interleave=getattr(self.cfg, 'rope_interleave', True),
+                    ckv_cache_ptr=ckv_layer.data_ptr(),
+                    kpe_cache_ptr=kpe_layer.data_ptr(),
+                    q_a_proj_wid=qa_wid,
+                    q_b_proj_wid=qb_wid,
+                    q_a_norm_ptr=q_a_norm_ptr,
+                    q_proj_wid=q_proj_wid,
+                    q_lora_rank=attn.q_lora_rank if attn.has_q_lora else 0,
+                    ckv_cache_dim=attn.ckv_dim,  # padded to ≥512 for FlashInfer MLA
+                )
+
+                # Set up RoPE tables from first MLA layer
+                if not rope_set:
+                    cos, sin = attn._get_rope_cos_sin(max_seq)
+                    cos_f32 = cos.float().contiguous()
+                    sin_f32 = sin.float().contiguous()
+                    self._rust_rope_cos = cos_f32
+                    self._rust_rope_sin = sin_f32
+                    store.set_rope_tables(
+                        cos_f32.data_ptr(), sin_f32.data_ptr(),
+                        cos_f32.shape[1], max_seq,
+                    )
+                    rope_set = True
+
             else:
                 # GQA attention — when quantizing, keep on CPU to avoid putting
                 # full BF16 in VRAM. Only upload to GPU for BF16 mode.
@@ -4369,7 +4464,7 @@ class KrasisModel:
             kv_ptrs = []
             gqa_cache_idx = 0
             for layer_idx, layer in enumerate(self.layers):
-                if layer.layer_type != "linear_attention":
+                if layer.layer_type != "linear_attention" and not hasattr(layer.attention, 'kv_a_proj'):
                     k_layer = cache.k_cache[gqa_cache_idx]  # [max_pages, page_size, nkv, hd]
                     v_layer = cache.v_cache[gqa_cache_idx]
                     gqa_cache_idx += 1
@@ -4378,6 +4473,12 @@ class KrasisModel:
             store.set_kv_cache_ptrs(kv_ptrs, max_seq)
             logger.info("Shared FP8 KV cache: %d GQA layers, max_seq=%d (%d pages × %d)",
                         len(kv_ptrs), max_seq, cache.max_pages, cache.page_size)
+        elif cache is not None and cache.ckv_cache is not None:
+            # MLA-only model (no GQA layers): still need to set max_seq for Rust decode
+            max_seq = cache.max_pages * cache.page_size
+            store.set_kv_cache_ptrs([], max_seq)
+            logger.info("MLA-only KV cache: max_seq=%d (%d pages × %d)",
+                        max_seq, cache.max_pages, cache.page_size)
 
         self._gpu_decode_store = store
 

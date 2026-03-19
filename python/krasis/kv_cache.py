@@ -56,7 +56,8 @@ class PagedKVCache:
 
         # Compute cache dimensions based on attention type
         if cfg.is_mla:
-            self.ckv_dim = cfg.kv_lora_rank        # 512
+            # FlashInfer MLA requires ckv_dim=512. Pad if kv_lora_rank < 512.
+            self.ckv_dim = max(cfg.kv_lora_rank, 512)  # ≥ 512
             self.kpe_dim = cfg.qk_rope_head_dim    # 64
             self.kv_cache_dim = self.ckv_dim + self.kpe_dim  # 576
             self.num_kv_heads = None

@@ -113,6 +113,15 @@ const KERNEL_NAMES: &[&str] = &[
     "gqa_attention_reduce_g",
     "la_fused_post_proj",
     "expert_classify_prepare",
+    // MLA (Multi-head Latent Attention) kernels
+    "mla_kv_cache_write_g",
+    "mla_kv_cache_write",
+    "mla_attention_g",
+    "mla_attention",
+    "mla_deinterleave",
+    "mla_split_q",
+    "mla_absorb_wkc",
+    "mla_apply_wvc",
 ];
 
 const MODULE_NAME: &str = "decode_kernels";
@@ -772,10 +781,33 @@ enum GpuAttnConfig {
         k_norm_ptr: u64,
         gated: bool,
     },
-    #[allow(dead_code)]
     MLA {
+        // Q projection: q_lora path (q_a_proj → layernorm → q_b_proj) or direct q_proj
+        q_a_proj: Option<usize>,   // None for direct q_proj
+        q_b_proj: Option<usize>,
+        q_a_norm_ptr: u64,         // FP32 layernorm weight for q_a (0 if direct)
+        q_proj: Option<usize>,     // Some for direct, None for q_lora
+        // KV projection
         kv_a_proj: usize,
+        kv_a_norm_ptr: u64,        // FP32 layernorm weight for kv_a
+        // Absorbed weights (BF16, kept on GPU permanently)
+        w_kc_ptr: u64,             // [num_heads, qk_nope_dim, ckv_cache_dim] BF16
+        w_vc_ptr: u64,             // [num_heads, v_head_dim, ckv_cache_dim] BF16
+        // Output
         o_proj: usize,
+        // Dimensions
+        num_heads: usize,
+        kv_lora_rank: usize,       // real kv_lora_rank from model (e.g. 256 for Mistral)
+        ckv_cache_dim: usize,      // effective ckv dim in cache (≥512 for FlashInfer MLA)
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        q_lora_rank: usize,        // 0 if direct q_proj
+        sm_scale: f32,
+        rope_interleave: bool,
+        // MLA KV cache (separate ckv and kpe, FP8)
+        ckv_cache_ptr: u64,        // [max_seq, ckv_cache_dim] FP8
+        kpe_cache_ptr: u64,        // [max_seq, qk_rope_dim] FP8
     },
 }
 
@@ -915,6 +947,15 @@ struct CachedKernels {
     la_fused_post_proj: cudarc::driver::CudaFunction,
     // GPU-side expert classification (eliminates cuStreamSynchronize in route sync)
     expert_classify_prepare: cudarc::driver::CudaFunction,
+    // MLA (Multi-head Latent Attention) kernels
+    mla_kv_cache_write_g: cudarc::driver::CudaFunction,
+    mla_kv_cache_write: cudarc::driver::CudaFunction,
+    mla_attention_g: cudarc::driver::CudaFunction,
+    mla_attention: cudarc::driver::CudaFunction,
+    mla_deinterleave: cudarc::driver::CudaFunction,
+    mla_split_q: cudarc::driver::CudaFunction,
+    mla_absorb_wkc: cudarc::driver::CudaFunction,
+    mla_apply_wvc: cudarc::driver::CudaFunction,
 }
 
 // ── Main GPU decode graph ──────────────────────────────────────────────
@@ -1045,6 +1086,11 @@ struct GpuDecodeGraph {
     d_gqa_k: cudarc::driver::CudaSlice<f32>,
     d_gqa_v: cudarc::driver::CudaSlice<f32>,
     d_gqa_out: cudarc::driver::CudaSlice<f32>,
+
+    // MLA scratch (FP32, allocated on demand)
+    d_mla_q_absorbed: cudarc::driver::CudaSlice<f32>,   // [num_heads * kv_lora_rank] for absorbed query
+    d_mla_kv: cudarc::driver::CudaSlice<f32>,           // [kv_lora_rank + qk_rope_dim] for KV projection
+    d_mla_attn_out: cudarc::driver::CudaSlice<f32>,     // [num_heads * kv_lora_rank] attention output
 
     // FlashDecoding tiled attention partial buffers (allocated lazily after kv_max_seq is known)
     d_gqa_tiled_o: Option<cudarc::driver::CudaSlice<f32>>,   // [num_q_heads, max_tiles, head_dim]
@@ -1250,6 +1296,9 @@ struct GpuDecodeGraph {
     /// Snapshot of KV cache pointers at capture time, for verifying address stability.
     /// Vec of (layer_idx, k_ptr, v_ptr).
     captured_kv_ptrs: Vec<(usize, u64, u64)>,
+    /// Snapshot of MLA KV cache pointers at capture time (ckv_cache + kpe_cache).
+    /// Vec of (layer_idx, ckv_cache_ptr, kpe_cache_ptr).
+    captured_mla_ptrs: Vec<(usize, u64, u64)>,
     /// MoE layer indices (which layers have MoE data).
     per_layer_moe_indices: Vec<usize>,
     /// Persistent cuBLAS workspace for CUDA graph capture (prevents internal cudaMalloc).
@@ -1743,6 +1792,16 @@ impl GpuDecodeStore {
         let d_gqa_out = self.device.alloc_zeros::<f32>(qkv_size)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
 
+        // MLA buffers: sized to hold max possible MLA dimensions
+        // These are reused across all MLA layers (allocated once)
+        let mla_buf_size = qkv_size; // qkv_size already accounts for MLA dimension needs
+        let d_mla_q_absorbed = self.device.alloc_zeros::<f32>(mla_buf_size)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let d_mla_kv = self.device.alloc_zeros::<f32>(mla_buf_size)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let d_mla_attn_out = self.device.alloc_zeros::<f32>(mla_buf_size)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+
         let la_buf_size = qkv_size.max(intermediate);
         let d_la_qkvz = self.device.alloc_zeros::<f32>(la_buf_size)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
@@ -1825,6 +1884,9 @@ impl GpuDecodeStore {
             d_gqa_k,
             d_gqa_v,
             d_gqa_out,
+            d_mla_q_absorbed,
+            d_mla_kv,
+            d_mla_attn_out,
             d_gqa_tiled_o: None,
             d_gqa_tiled_lse: None,
             gqa_tile_size: 0,
@@ -1929,6 +1991,7 @@ impl GpuDecodeStore {
             graphs_ever_captured: false,
             captured_la_ptrs: Vec::new(),
             captured_kv_ptrs: Vec::new(),
+            captured_mla_ptrs: Vec::new(),
             per_layer_moe_indices: Vec::new(),
             d_cublas_workspace: None,
         }));
@@ -2000,6 +2063,15 @@ impl GpuDecodeStore {
                 gqa_attention_reduce_g: get("gqa_attention_reduce_g")?,
                 la_fused_post_proj: get("la_fused_post_proj")?,
                 expert_classify_prepare: get("expert_classify_prepare")?,
+                // MLA kernels
+                mla_kv_cache_write_g: get("mla_kv_cache_write_g")?,
+                mla_kv_cache_write: get("mla_kv_cache_write")?,
+                mla_attention_g: get("mla_attention_g")?,
+                mla_attention: get("mla_attention")?,
+                mla_deinterleave: get("mla_deinterleave")?,
+                mla_split_q: get("mla_split_q")?,
+                mla_absorb_wkc: get("mla_absorb_wkc")?,
+                mla_apply_wvc: get("mla_apply_wvc")?,
             };
             // Extract raw CUfunction handles for spec routing on spec_stream.
             self.raw_sigmoid_topk = CudaFunc(extract_cu_function(&kernels.sigmoid_topk));
@@ -3776,6 +3848,88 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    /// Register an MLA (Multi-head Latent Attention) layer for GPU decode.
+    #[pyo3(signature = (
+        layer_idx, input_norm_ptr, input_norm_size,
+        post_attn_norm_ptr, post_attn_norm_size,
+        kv_a_proj_wid, o_proj_wid,
+        kv_a_norm_ptr, w_kc_ptr, w_vc_ptr,
+        num_heads, kv_lora_rank, qk_nope_dim, qk_rope_dim, v_head_dim,
+        sm_scale, rope_interleave,
+        ckv_cache_ptr, kpe_cache_ptr,
+        q_a_proj_wid=None, q_b_proj_wid=None, q_a_norm_ptr=0,
+        q_proj_wid=None, q_lora_rank=0, ckv_cache_dim=0
+    ))]
+    fn register_mla_layer(
+        &mut self,
+        layer_idx: usize,
+        input_norm_ptr: usize, input_norm_size: usize,
+        post_attn_norm_ptr: usize, post_attn_norm_size: usize,
+        kv_a_proj_wid: usize, o_proj_wid: usize,
+        kv_a_norm_ptr: usize, w_kc_ptr: usize, w_vc_ptr: usize,
+        num_heads: usize, kv_lora_rank: usize,
+        qk_nope_dim: usize, qk_rope_dim: usize, v_head_dim: usize,
+        sm_scale: f32, rope_interleave: bool,
+        ckv_cache_ptr: usize, kpe_cache_ptr: usize,
+        q_a_proj_wid: Option<usize>, q_b_proj_wid: Option<usize>, q_a_norm_ptr: usize,
+        q_proj_wid: Option<usize>, q_lora_rank: usize,
+        ckv_cache_dim: usize,
+    ) -> PyResult<()> {
+        // ckv_cache_dim: effective dimension in cache (≥512 for FlashInfer MLA).
+        // If 0 (default), use kv_lora_rank directly.
+        let ckv_cache_dim = if ckv_cache_dim == 0 { kv_lora_rank } else { ckv_cache_dim };
+
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        while graph.layers.len() <= layer_idx {
+            graph.layers.push(GpuDecodeLayer {
+                input_norm_ptr: 0,
+                input_norm_size: 0,
+                post_attn_norm_ptr: 0,
+                post_attn_norm_size: 0,
+                attn: GpuAttnConfig::MLA {
+                    q_a_proj: None, q_b_proj: None, q_a_norm_ptr: 0,
+                    q_proj: None, kv_a_proj: 0, kv_a_norm_ptr: 0,
+                    w_kc_ptr: 0, w_vc_ptr: 0, o_proj: 0,
+                    num_heads: 0, kv_lora_rank: 0, ckv_cache_dim: 0,
+                    qk_nope_dim: 0, qk_rope_dim: 0, v_head_dim: 0,
+                    q_lora_rank: 0, sm_scale: 0.0, rope_interleave: true,
+                    ckv_cache_ptr: 0, kpe_cache_ptr: 0,
+                },
+                mlp: GpuMlpConfig::None,
+            });
+        }
+        graph.layers[layer_idx].input_norm_ptr = input_norm_ptr as u64;
+        graph.layers[layer_idx].input_norm_size = input_norm_size;
+        graph.layers[layer_idx].post_attn_norm_ptr = post_attn_norm_ptr as u64;
+        graph.layers[layer_idx].post_attn_norm_size = post_attn_norm_size;
+        graph.layers[layer_idx].attn = GpuAttnConfig::MLA {
+            q_a_proj: q_a_proj_wid,
+            q_b_proj: q_b_proj_wid,
+            q_a_norm_ptr: q_a_norm_ptr as u64,
+            q_proj: q_proj_wid,
+            kv_a_proj: kv_a_proj_wid,
+            kv_a_norm_ptr: kv_a_norm_ptr as u64,
+            w_kc_ptr: w_kc_ptr as u64,
+            w_vc_ptr: w_vc_ptr as u64,
+            o_proj: o_proj_wid,
+            num_heads,
+            kv_lora_rank,
+            ckv_cache_dim,
+            qk_nope_dim,
+            qk_rope_dim,
+            v_head_dim,
+            q_lora_rank,
+            sm_scale,
+            rope_interleave,
+            ckv_cache_ptr: ckv_cache_ptr as u64,
+            kpe_cache_ptr: kpe_cache_ptr as u64,
+        };
+        log::info!("GpuDecodeStore: registered MLA layer {} (heads={}, kv_lora_rank={}, ckv_cache_dim={}, nope={}, rope={}, v_hd={})",
+            layer_idx, num_heads, kv_lora_rank, ckv_cache_dim, qk_nope_dim, qk_rope_dim, v_head_dim);
+        Ok(())
+    }
+
     /// Register MLP config for a layer (MoE, Dense, or None).
     /// For MoE layers, the expert data should already be registered via register_moe_layer.
     #[pyo3(signature = (layer_idx, mlp_type, gate_proj_wid=None, up_proj_wid=None, down_proj_wid=None))]
@@ -5204,6 +5358,29 @@ impl GpuDecodeStore {
             }
         }
 
+        // Check MLA cache pointers
+        for &(li, captured_ckv, captured_kpe) in &graph.captured_mla_ptrs {
+            if li >= graph.layers.len() {
+                eprintln!("[krasis] graph-reuse: MLA layer {} out of range", li);
+                return false;
+            }
+            match &graph.layers[li].attn {
+                GpuAttnConfig::MLA { ckv_cache_ptr, kpe_cache_ptr, .. } => {
+                    if *ckv_cache_ptr != captured_ckv || *kpe_cache_ptr != captured_kpe {
+                        eprintln!("[krasis] graph-reuse: MLA layer {} ptrs changed! \
+                            ckv: 0x{:x}→0x{:x}, kpe: 0x{:x}→0x{:x}",
+                            li, captured_ckv, *ckv_cache_ptr,
+                            captured_kpe, *kpe_cache_ptr);
+                        return false;
+                    }
+                }
+                _ => {
+                    eprintln!("[krasis] graph-reuse: layer {} no longer MLA", li);
+                    return false;
+                }
+            }
+        }
+
         true
     }
 
@@ -5453,6 +5630,7 @@ impl GpuDecodeStore {
         // LA Rust-side FP32 buffers use copy_() in-place), we can skip recapture.
         graph.captured_la_ptrs.clear();
         graph.captured_kv_ptrs.clear();
+        graph.captured_mla_ptrs.clear();
         for (li, layer) in graph.layers.iter().enumerate() {
             match &layer.attn {
                 GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
@@ -5463,11 +5641,15 @@ impl GpuDecodeStore {
                         graph.captured_kv_ptrs.push((li, graph.kv_k_ptrs[li], graph.kv_v_ptrs[li]));
                     }
                 }
-                _ => {}
+                GpuAttnConfig::MLA { ckv_cache_ptr, kpe_cache_ptr, .. } => {
+                    if *ckv_cache_ptr != 0 {
+                        graph.captured_mla_ptrs.push((li, *ckv_cache_ptr, *kpe_cache_ptr));
+                    }
+                }
             }
         }
-        eprintln!("[krasis] Pointer snapshot: {} LA ptrs, {} KV ptrs",
-            graph.captured_la_ptrs.len(), graph.captured_kv_ptrs.len());
+        eprintln!("[krasis] Pointer snapshot: {} LA ptrs, {} KV ptrs, {} MLA ptrs",
+            graph.captured_la_ptrs.len(), graph.captured_kv_ptrs.len(), graph.captured_mla_ptrs.len());
 
         self.graph = Some(graph);
         eprintln!("[krasis] Per-layer graphs captured: {} graphs", num_graphs);
@@ -6197,8 +6379,237 @@ impl GpuDecodeStore {
                         gqa_cache_idx += 1;
                     }
 
-                    GpuAttnConfig::MLA { .. } => {
-                        return Err("MLA not supported in per-layer graph path".to_string());
+                    GpuAttnConfig::MLA {
+                        q_a_proj, q_b_proj, q_a_norm_ptr, q_proj,
+                        kv_a_proj, kv_a_norm_ptr,
+                        w_kc_ptr, w_vc_ptr, o_proj,
+                        num_heads, kv_lora_rank, ckv_cache_dim, qk_nope_dim, qk_rope_dim, v_head_dim,
+                        q_lora_rank, sm_scale, rope_interleave,
+                        ckv_cache_ptr, kpe_cache_ptr,
+                    } => {
+                        let nh = *num_heads;
+                        let klr = *kv_lora_rank;
+                        let ccd = *ckv_cache_dim;
+                        let nope = *qk_nope_dim;
+                        let rope = *qk_rope_dim;
+                        let vhd = *v_head_dim;
+                        let q_head_dim = nope + rope;
+
+                        // ── MLA Step 1: Q projection ──
+                        if let (Some(qa_id), Some(qb_id)) = (q_a_proj, q_b_proj) {
+                            let qa_w = &graph.weights[*qa_id];
+                            self.gemv_bf16_to_f32(qa_w, *graph.d_hidden.device_ptr(),
+                                *graph.d_gqa_q.device_ptr())?;
+                            {
+                                let threads = 256u32;
+                                let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                                unsafe {
+                                    k.per_head_rmsnorm.clone().launch(cfg, (
+                                        *graph.d_gqa_q.device_ptr(), *q_a_norm_ptr, eps,
+                                        1i32, *q_lora_rank as i32, 0i32,
+                                    )).map_err(|e| format!("mla q_a_norm[{}]: {:?}", layer_idx, e))?;
+                                }
+                            }
+                            unsafe {
+                                k.fp32_to_bf16.clone().launch(
+                                    LaunchConfig::for_num_elems(*q_lora_rank as u32),
+                                    (
+                                        *graph.d_scratch.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        *q_lora_rank as i32,
+                                    ),
+                                ).map_err(|e| format!("mla q_a_to_bf16[{}]: {:?}", layer_idx, e))?;
+                            }
+                            let qb_w = &graph.weights[*qb_id];
+                            self.gemv_bf16_to_f32(qb_w, *graph.d_scratch.device_ptr(),
+                                *graph.d_gqa_q.device_ptr())?;
+                        } else if let Some(qid) = q_proj {
+                            let qw = &graph.weights[*qid];
+                            self.gemv_bf16_to_f32(qw, *graph.d_hidden.device_ptr(),
+                                *graph.d_gqa_q.device_ptr())?;
+                        } else {
+                            return Err(format!("MLA layer {} has no Q projection", layer_idx));
+                        }
+
+                        // ── MLA Step 2: KV projection + norm ──
+                        let kva_w = &graph.weights[*kv_a_proj];
+                        self.gemv_bf16_to_f32(kva_w, *graph.d_hidden.device_ptr(),
+                            *graph.d_mla_kv.device_ptr())?;
+                        {
+                            let threads = 256u32;
+                            let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                            unsafe {
+                                k.per_head_rmsnorm.clone().launch(cfg, (
+                                    *graph.d_mla_kv.device_ptr(), *kv_a_norm_ptr, eps,
+                                    1i32, klr as i32, 0i32,
+                                )).map_err(|e| format!("mla kv_a_norm[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+                        let ckv_ptr = *graph.d_mla_kv.device_ptr();
+                        let k_pe_ptr = unsafe { (*graph.d_mla_kv.device_ptr() as *const f32).add(klr) as u64 };
+
+                        // ── MLA Step 3: Split Q → q_nope + q_pe ──
+                        {
+                            let total = (nh * q_head_dim) as u32;
+                            let threads = 256u32;
+                            let blocks = (total + threads - 1) / threads;
+                            unsafe {
+                                k.mla_split_q.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_gqa_k.device_ptr(),
+                                        *graph.d_gqa_v.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        nh as i32, nope as i32, rope as i32,
+                                    ),
+                                ).map_err(|e| format!("mla_split_q[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // ── MLA Step 4: De-interleave (conditional) ──
+                        if *rope_interleave {
+                            {
+                                let total_q = (nh * rope) as u32;
+                                let threads = 256u32;
+                                let blocks = (total_q + threads - 1) / threads;
+                                unsafe {
+                                    k.mla_deinterleave.clone().launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (
+                                            *graph.d_gqa_v.device_ptr(),
+                                            total_q as i32,
+                                            rope as i32,
+                                        ),
+                                    ).map_err(|e| format!("mla deinterleave q_pe[{}]: {:?}", layer_idx, e))?;
+                                }
+                            }
+                            {
+                                let threads = 256u32;
+                                let blocks = ((rope as u32) + threads - 1) / threads;
+                                unsafe {
+                                    k.mla_deinterleave.clone().launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (
+                                            k_pe_ptr,
+                                            rope as i32,
+                                            rope as i32,
+                                        ),
+                                    ).map_err(|e| format!("mla deinterleave k_pe[{}]: {:?}", layer_idx, e))?;
+                                }
+                            }
+                        }
+
+                        // ── MLA Step 5: RoPE (graphable: reads position from GPU buffer) ──
+                        if let Some(ref d_cos) = graph.d_rope_cos {
+                            if let Some(ref d_sin) = graph.d_rope_sin {
+                                let half_dim = rope / 2;
+                                let total_work = (nh + 1) * half_dim;
+                                let threads = 256u32;
+                                let blocks = ((total_work as u32) + threads - 1) / threads;
+                                unsafe {
+                                    k.apply_rope_g.clone().launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (
+                                            *graph.d_gqa_v.device_ptr(),
+                                            k_pe_ptr,
+                                            *d_cos.device_ptr(),
+                                            *d_sin.device_ptr(),
+                                            d_pos_ptr,
+                                            nh as i32, 1i32, rope as i32, half_dim as i32,
+                                        ),
+                                    ).map_err(|e| format!("mla apply_rope_g[{}]: {:?}", layer_idx, e))?;
+                                }
+                            }
+                        }
+
+                        // ── MLA Step 6: Absorb w_kc ──
+                        {
+                            let threads = 256u32;
+                            unsafe {
+                                k.mla_absorb_wkc.clone().launch(
+                                    LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_mla_q_absorbed.device_ptr(),
+                                        *graph.d_gqa_k.device_ptr(),
+                                        *w_kc_ptr,
+                                        nh as i32, nope as i32, ccd as i32,
+                                    ),
+                                ).map_err(|e| format!("mla_absorb_wkc[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // ── MLA Step 7: Write to FP8 cache (graphable) ──
+                        {
+                            let total = (ccd + rope) as u32;
+                            let threads = 256u32;
+                            let blocks = (total + threads - 1) / threads;
+                            unsafe {
+                                k.mla_kv_cache_write_g.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *ckv_cache_ptr,
+                                        *kpe_cache_ptr,
+                                        ckv_ptr,
+                                        k_pe_ptr,
+                                        d_pos_ptr,
+                                        klr as i32,
+                                        ccd as i32,
+                                        rope as i32,
+                                    ),
+                                ).map_err(|e| format!("mla_kv_cache_write_g[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // ── MLA Step 8: Attention (graphable: reads seq_len from GPU buffer) ──
+                        {
+                            let threads = 256u32;
+                            let num_warps = (threads + 31) / 32;
+                            let tile_size = 4096u32;
+                            let shared_mem = (ccd as u32 + rope as u32 + num_warps + tile_size) * 4;
+                            unsafe {
+                                k.mla_attention_g.clone().launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, 1, 1),
+                                        block_dim: (threads, 1, 1),
+                                        shared_mem_bytes: shared_mem,
+                                    },
+                                    (
+                                        *graph.d_mla_attn_out.device_ptr(),
+                                        *graph.d_mla_q_absorbed.device_ptr(),
+                                        *graph.d_gqa_v.device_ptr(),
+                                        *ckv_cache_ptr,
+                                        *kpe_cache_ptr,
+                                        *sm_scale,
+                                        nh as i32,
+                                        ccd as i32,
+                                        rope as i32,
+                                        d_seq_len_ptr,
+                                        graph.kv_max_seq as i32,
+                                    ),
+                                ).map_err(|e| format!("mla_attention_g[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // ── MLA Step 9: Apply w_vc ──
+                        {
+                            let threads = 256u32;
+                            unsafe {
+                                k.mla_apply_wvc.clone().launch(
+                                    LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_scratch.device_ptr(),
+                                        *graph.d_mla_attn_out.device_ptr(),
+                                        *w_vc_ptr,
+                                        nh as i32, vhd as i32, ccd as i32,
+                                    ),
+                                ).map_err(|e| format!("mla_apply_wvc[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // ── MLA Step 10: O projection ──
+                        let ow = &graph.weights[*o_proj];
+                        self.gemv_bf16_internal(ow, *graph.d_scratch.device_ptr(),
+                            *graph.d_hidden.device_ptr())?;
                     }
                 }
 
@@ -7542,8 +7953,264 @@ impl GpuDecodeStore {
                     gqa_cache_idx += 1;
                 }
 
-                GpuAttnConfig::MLA { .. } => {
-                    return Err("MLA attention not implemented for GPU decode".to_string());
+                GpuAttnConfig::MLA {
+                    q_a_proj, q_b_proj, q_a_norm_ptr, q_proj,
+                    kv_a_proj, kv_a_norm_ptr,
+                    w_kc_ptr, w_vc_ptr, o_proj,
+                    num_heads, kv_lora_rank, ckv_cache_dim, qk_nope_dim, qk_rope_dim, v_head_dim,
+                    q_lora_rank, sm_scale, rope_interleave,
+                    ckv_cache_ptr, kpe_cache_ptr,
+                } => {
+                    let nh = *num_heads;
+                    let klr = *kv_lora_rank;     // real kv_lora_rank (e.g. 256 for Mistral)
+                    let ccd = *ckv_cache_dim;    // padded ckv dim in cache (≥512)
+                    let nope = *qk_nope_dim;
+                    let rope = *qk_rope_dim;
+                    let vhd = *v_head_dim;
+                    let q_head_dim = nope + rope;
+
+                    // ── MLA Step 1: Q projection ──
+                    if let (Some(qa_id), Some(qb_id)) = (q_a_proj, q_b_proj) {
+                        // q_lora path: q_a_proj → RMSNorm → q_b_proj
+                        let qa_w = &graph.weights[*qa_id];
+                        self.gemv_bf16_to_f32(qa_w, *graph.d_hidden.device_ptr(),
+                            *graph.d_gqa_q.device_ptr())?;
+
+                        // RMSNorm on q_a output (1 head of size q_lora_rank)
+                        {
+                            let threads = 256u32;
+                            let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                            unsafe {
+                                k.per_head_rmsnorm.clone().launch(cfg, (
+                                    *graph.d_gqa_q.device_ptr(), *q_a_norm_ptr, eps,
+                                    1i32, *q_lora_rank as i32, 0i32,
+                                )).map_err(|e| format!("mla q_a_norm[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Convert FP32 → BF16 for q_b input
+                        unsafe {
+                            k.fp32_to_bf16.clone().launch(
+                                LaunchConfig::for_num_elems(*q_lora_rank as u32),
+                                (
+                                    *graph.d_scratch.device_ptr(),
+                                    *graph.d_gqa_q.device_ptr(),
+                                    *q_lora_rank as i32,
+                                ),
+                            ).map_err(|e| format!("mla q_a_to_bf16[{}]: {:?}", layer_idx, e))?;
+                        }
+
+                        // q_b_proj: BF16 q_lora_rank → FP32 num_heads*(nope+rope)
+                        let qb_w = &graph.weights[*qb_id];
+                        self.gemv_bf16_to_f32(qb_w, *graph.d_scratch.device_ptr(),
+                            *graph.d_gqa_q.device_ptr())?;
+                    } else if let Some(qid) = q_proj {
+                        let qw = &graph.weights[*qid];
+                        self.gemv_bf16_to_f32(qw, *graph.d_hidden.device_ptr(),
+                            *graph.d_gqa_q.device_ptr())?;
+                    } else {
+                        return Err(format!("MLA layer {} has no Q projection", layer_idx));
+                    }
+                    // d_gqa_q = [num_heads * (nope + rope)] FP32
+
+                    // ── MLA Step 2: KV projection ──
+                    let kva_w = &graph.weights[*kv_a_proj];
+                    self.gemv_bf16_to_f32(kva_w, *graph.d_hidden.device_ptr(),
+                        *graph.d_mla_kv.device_ptr())?;
+
+                    // RMSNorm on ckv portion only (first kv_lora_rank elements)
+                    {
+                        let threads = 256u32;
+                        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                        unsafe {
+                            k.per_head_rmsnorm.clone().launch(cfg, (
+                                *graph.d_mla_kv.device_ptr(), *kv_a_norm_ptr, eps,
+                                1i32, klr as i32, 0i32,
+                            )).map_err(|e| format!("mla kv_a_norm[{}]: {:?}", layer_idx, e))?;
+                        }
+                    }
+
+                    let ckv_ptr = *graph.d_mla_kv.device_ptr();
+                    let k_pe_ptr = unsafe { (*graph.d_mla_kv.device_ptr() as *const f32).add(klr) as u64 };
+
+                    // ── MLA Step 3: Split Q → q_nope + q_pe ──
+                    // d_gqa_q: [h0_nope|h0_rope|h1_nope|h1_rope|...]
+                    // → d_gqa_k: q_nope [nh*nope], d_gqa_v: q_pe [nh*rope]
+                    {
+                        let total = (nh * q_head_dim) as u32;
+                        let threads = 256u32;
+                        let blocks = (total + threads - 1) / threads;
+                        unsafe {
+                            k.mla_split_q.clone().launch(
+                                LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                (
+                                    *graph.d_gqa_k.device_ptr(),
+                                    *graph.d_gqa_v.device_ptr(),
+                                    *graph.d_gqa_q.device_ptr(),
+                                    nh as i32,
+                                    nope as i32,
+                                    rope as i32,
+                                ),
+                            ).map_err(|e| format!("mla_split_q[{}]: {:?}", layer_idx, e))?;
+                        }
+                    }
+
+                    // ── MLA Step 4: De-interleave q_pe and k_pe (conditional) ──
+                    if *rope_interleave {
+                        // q_pe: [nh * rope] in d_gqa_v
+                        {
+                            let total_q = (nh * rope) as u32;
+                            let threads = 256u32;
+                            let blocks = (total_q + threads - 1) / threads;
+                            unsafe {
+                                k.mla_deinterleave.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_gqa_v.device_ptr(),
+                                        total_q as i32,
+                                        rope as i32,
+                                    ),
+                                ).map_err(|e| format!("mla deinterleave q_pe[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+                        // k_pe: [rope] at k_pe_ptr
+                        {
+                            let threads = 256u32;
+                            let blocks = ((rope as u32) + threads - 1) / threads;
+                            unsafe {
+                                k.mla_deinterleave.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        k_pe_ptr,
+                                        rope as i32,
+                                        rope as i32,
+                                    ),
+                                ).map_err(|e| format!("mla deinterleave k_pe[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+                    }
+
+                    // ── MLA Step 5: RoPE on q_pe and k_pe ──
+                    if let Some(ref d_cos) = graph.d_rope_cos {
+                        if let Some(ref d_sin) = graph.d_rope_sin {
+                            let half_dim = rope / 2;
+                            let total_work = (nh + 1) * half_dim; // nh q heads + 1 k "head"
+                            let threads = 256u32;
+                            let blocks = ((total_work as u32) + threads - 1) / threads;
+                            unsafe {
+                                k.apply_rope.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_gqa_v.device_ptr(),  // q_pe [nh * rope]
+                                        k_pe_ptr,                     // k_pe [rope]
+                                        *d_cos.device_ptr(),
+                                        *d_sin.device_ptr(),
+                                        position as i32,
+                                        nh as i32, 1i32, rope as i32, half_dim as i32,
+                                    ),
+                                ).map_err(|e| format!("mla apply_rope[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+                    }
+
+                    // ── MLA Step 6: Absorb w_kc (q_nope @ w_kc → q_absorbed) ──
+                    // w_kc is [H, nope, ccd] (padded to ≥512 for FlashInfer MLA)
+                    {
+                        let threads = 256u32;
+                        unsafe {
+                            k.mla_absorb_wkc.clone().launch(
+                                LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                (
+                                    *graph.d_mla_q_absorbed.device_ptr(),
+                                    *graph.d_gqa_k.device_ptr(),
+                                    *w_kc_ptr,
+                                    nh as i32,
+                                    nope as i32,
+                                    ccd as i32,  // padded ckv dim
+                                ),
+                            ).map_err(|e| format!("mla_absorb_wkc[{}]: {:?}", layer_idx, e))?;
+                        }
+                    }
+                    // ── MLA Step 7: Write to FP8 cache ──
+                    // Cache has ccd-dim entries; real data is klr, rest zero-padded by kernel
+                    {
+                        let total = (ccd + rope) as u32;  // ccd for ckv, rope for kpe
+                        let threads = 256u32;
+                        let blocks = (total + threads - 1) / threads;
+                        unsafe {
+                            k.mla_kv_cache_write.clone().launch(
+                                LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                (
+                                    *ckv_cache_ptr,
+                                    *kpe_cache_ptr,
+                                    ckv_ptr,
+                                    k_pe_ptr,
+                                    position as i32,
+                                    klr as i32,   // real data size
+                                    ccd as i32,   // cache stride (padded)
+                                    rope as i32,
+                                ),
+                            ).map_err(|e| format!("mla_kv_cache_write[{}]: {:?}", layer_idx, e))?;
+                        }
+                    }
+
+                    // ── MLA Step 8: MLA attention ──
+                    // Uses ccd (padded) for cache reads and q_absorbed dimensions
+                    {
+                        let threads = 256u32;
+                        let num_warps = (threads + 31) / 32;
+                        let tile_size = 4096u32; // MLA_TILE_SIZE in CUDA
+                        let shared_mem = (ccd as u32 + rope as u32 + num_warps + tile_size) * 4;
+                        let attn_seq_len = (position + 1) as i32;
+                        unsafe {
+                            k.mla_attention.clone().launch(
+                                LaunchConfig {
+                                    grid_dim: (nh as u32, 1, 1),
+                                    block_dim: (threads, 1, 1),
+                                    shared_mem_bytes: shared_mem,
+                                },
+                                (
+                                    *graph.d_mla_attn_out.device_ptr(),
+                                    *graph.d_mla_q_absorbed.device_ptr(),
+                                    *graph.d_gqa_v.device_ptr(),
+                                    *ckv_cache_ptr,
+                                    *kpe_cache_ptr,
+                                    *sm_scale,
+                                    nh as i32,
+                                    ccd as i32,   // padded ckv dim
+                                    rope as i32,
+                                    attn_seq_len,
+                                    graph.kv_max_seq as i32,
+                                ),
+                            ).map_err(|e| format!("mla_attention[{}]: {:?}", layer_idx, e))?;
+                        }
+                    }
+                    // ── MLA Step 9: Apply w_vc (attn_out @ w_vc → BF16) ──
+                    // w_vc is [H, v_head, ccd] (padded)
+                    {
+                        let threads = 256u32;
+                        unsafe {
+                            k.mla_apply_wvc.clone().launch(
+                                LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                (
+                                    *graph.d_scratch.device_ptr(),
+                                    *graph.d_mla_attn_out.device_ptr(),
+                                    *w_vc_ptr,
+                                    nh as i32,
+                                    vhd as i32,
+                                    ccd as i32,   // padded ckv dim
+                                ),
+                            ).map_err(|e| format!("mla_apply_wvc[{}]: {:?}", layer_idx, e))?;
+                        }
+                    }
+
+                    // ── MLA Step 10: O projection ──
+                    let ow = &graph.weights[*o_proj];
+                    self.gemv_bf16_internal(
+                        ow,
+                        *graph.d_scratch.device_ptr(),
+                        *graph.d_hidden.device_ptr(),
+                    )?;
                 }
             }
 

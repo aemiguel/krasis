@@ -290,6 +290,7 @@ class ModelConfig:
     rope_scaling: Dict[str, Any] = field(default_factory=dict)
     max_position_embeddings: int = 262144
     partial_rotary_factor: float = 1.0  # GLM-4.7 uses 0.5 (only half of head_dim gets RoPE)
+    rope_interleave: bool = True  # MLA models: True means q_pe/k_pe need de-interleaving before RoPE
 
     # Attention
     attention_bias: bool = False       # GLM-4.7, GPT OSS have bias on Q/K/V projections
@@ -450,9 +451,10 @@ class ModelConfig:
             rms_norm_eps=cfg.get("rms_norm_eps", 1e-6),
             hidden_act=cfg.get("hidden_act", "silu"),
             rope_theta=rope_theta,
-            rope_scaling=cfg.get("rope_scaling") or {},
+            rope_scaling=cfg.get("rope_scaling") or rope_params or {},
             max_position_embeddings=cfg.get("max_position_embeddings", 131072),
             partial_rotary_factor=partial_rotary,
+            rope_interleave=cfg.get("rope_interleave", True),
             attention_bias=cfg.get("attention_bias", False),
             sliding_window=sliding_window,
             expert_quant_method=expert_quant_method,

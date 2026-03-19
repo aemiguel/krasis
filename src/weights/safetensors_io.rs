@@ -47,17 +47,26 @@ pub enum Dtype {
     Bf16,
     F32,
     F64,
+    #[serde(alias = "F8_E4M3")]
+    F8E4M3,
+    #[serde(alias = "F8_E5M2")]
+    F8E5M2,
 }
 
 impl Dtype {
     /// Bytes per element.
     pub fn element_size(&self) -> usize {
         match self {
-            Dtype::Bool | Dtype::U8 | Dtype::I8 => 1,
+            Dtype::Bool | Dtype::U8 | Dtype::I8 | Dtype::F8E4M3 | Dtype::F8E5M2 => 1,
             Dtype::I16 | Dtype::F16 | Dtype::Bf16 => 2,
             Dtype::I32 | Dtype::F32 => 4,
             Dtype::I64 | Dtype::F64 => 8,
         }
+    }
+
+    /// True if this is an FP8 type that needs dequantization.
+    pub fn is_fp8(&self) -> bool {
+        matches!(self, Dtype::F8E4M3 | Dtype::F8E5M2)
     }
 }
 

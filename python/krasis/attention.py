@@ -138,9 +138,29 @@ class MLAAttention:
         # BF16 layernorms
         self.kv_a_norm_weight = weights["kv_a_layernorm"] # [kv_lora_rank]
 
+        # FlashInfer MLA requires head_dim_ckv=512. For models with smaller
+        # kv_lora_rank (e.g. Mistral 4: kv_lora_rank=256), pad to 512.
+        # The padded dims are always 0 so the math is unchanged.
+        self.ckv_dim = max(cfg.kv_lora_rank, 512)  # effective ckv dimension for cache/attention
+        self._ckv_needs_pad = (cfg.kv_lora_rank < self.ckv_dim)
+
         # BF16 kv_b_proj split weights (kept full precision for quality)
-        self.w_kc = weights["w_kc"]  # [heads, qk_nope, kv_lora_rank]
-        self.w_vc = weights["w_vc"]  # [heads, v_head, kv_lora_rank]
+        w_kc = weights["w_kc"]  # [heads, qk_nope, kv_lora_rank]
+        w_vc = weights["w_vc"]  # [heads, v_head, kv_lora_rank]
+
+        if self._ckv_needs_pad:
+            pad_size = self.ckv_dim - cfg.kv_lora_rank
+            # Pad last dimension with zeros: [H, d, klr] → [H, d, ckv_dim]
+            self.w_kc = torch.nn.functional.pad(w_kc, (0, pad_size))
+            self.w_vc = torch.nn.functional.pad(w_vc, (0, pad_size))
+            if layer_idx == 0:
+                logger.info(
+                    "MLA: kv_lora_rank=%d < 512, padding ckv to %d for FlashInfer MLA",
+                    cfg.kv_lora_rank, self.ckv_dim,
+                )
+        else:
+            self.w_kc = w_kc
+            self.w_vc = w_vc
 
         # RoPE parameters
         self.rope_theta = cfg.rope_theta
@@ -222,8 +242,10 @@ class MLAAttention:
         """
         # De-interleave: HF weights store rope dims as [re0, im0, re1, im1, ...]
         # RoPE rotation requires half-split: [re0, re1, ..., im0, im1, ...]
-        q_pe = self._deinterleave(q_pe)
-        k_pe = self._deinterleave(k_pe)
+        # Only needed when rope_interleave=True (DeepSeek V2, Kimi K2.5, Mistral 4)
+        if self.cfg.rope_interleave:
+            q_pe = self._deinterleave(q_pe)
+            k_pe = self._deinterleave(k_pe)
 
         max_pos = positions.max().item() + 1
         cos, sin = self._get_rope_cos_sin(max_pos)
@@ -307,7 +329,7 @@ class MLAAttention:
         k_pe = k_pe_heads.squeeze(1)    # [M, 64]
 
         # ── Step 5: Absorb w_kc into query ──
-        # q_nope: [M, H, 128] @ w_kc: [H, 128, 512] → [M, H, 512]
+        # q_nope @ w_kc → [M, H, ckv_dim] (512 always, padded w_kc if kv_lora_rank < 512)
         q_nope_absorbed = torch.einsum("mhi,hid->mhd", q_nope.float(), self.w_kc.float()).to(torch.bfloat16)
         del q_nope
 
@@ -319,21 +341,21 @@ class MLAAttention:
         kv_indices = seq_state.kv_indices(self.device)
         kv_indptr = seq_state.kv_indptr(self.device)
 
-        # append positions: [M] batch_indices all 0 (single sequence)
-        batch_indices = torch.zeros(M, dtype=torch.int32, device=self.device)
-        # positions within the page/sequence
-        append_positions = positions.to(torch.int32)
+        # Pad ckv to ckv_dim (512) if needed, then cast to cache dtype
+        ckv_for_cache = kv_compressed
+        if self._ckv_needs_pad:
+            ckv_for_cache = torch.nn.functional.pad(
+                kv_compressed, (0, self.ckv_dim - self.kv_lora_rank)
+            )
+        ckv_append = ckv_for_cache.to(kv_cache.kv_dtype)  # [M, ckv_dim]
+        kpe_append = k_pe.to(kv_cache.kv_dtype)           # [M, qk_rope_dim]
 
-        # last_page_len BEFORE append (seq_len not yet advanced)
+        batch_indices = torch.zeros(M, dtype=torch.int32, device=self.device)
+        append_positions = positions.to(torch.int32)
         last_page_len_tensor = torch.tensor(
             [seq_state.last_page_len() if seq_state.seq_len > 0 else 0],
             dtype=torch.int32, device=self.device,
         )
-
-        # Cast to cache dtype for append
-        ckv_append = kv_compressed.to(kv_cache.kv_dtype)  # [M, 512]
-        kpe_append = k_pe.to(kv_cache.kv_dtype)           # [M, 64]
-
         flashinfer.page.append_paged_mla_kv_cache(
             ckv_append, kpe_append,
             batch_indices, append_positions,
@@ -342,28 +364,20 @@ class MLAAttention:
         )
 
         # ── Step 7: FlashInfer MLA attention ──
+        effective_kv_len = seq_state.seq_len + num_new_tokens
         kv_indices = seq_state.kv_indices(self.device)
         kv_indptr = seq_state.kv_indptr(self.device)
-        # kv_len must include the newly appended tokens (seq_len not yet advanced)
-        effective_kv_len = seq_state.seq_len + num_new_tokens
         kv_len_arr = torch.tensor([effective_kv_len], dtype=torch.int32, device=self.device)
-
-        # qo_indptr: [0, M] for single sequence
         qo_indptr = torch.tensor([0, M], dtype=torch.int32, device=self.device)
 
         # FP8 KV cache: MLA kernel requires 16-bit floats. Upcast only the
         # pages actually in use (via kv_indices) instead of the entire cache.
         if ckv_layer.dtype != torch.bfloat16:
-            used_pages = kv_indices  # [num_used_pages]
+            used_pages = kv_indices
             attn_ckv = ckv_layer[used_pages].to(torch.bfloat16)
             attn_kpe = kpe_layer[used_pages].to(torch.bfloat16)
-            # Keep references alive until next call — FlashInfer's MLA kernel
-            # may still be reading these tensors asynchronously when forward()
-            # returns. Without this, PyTorch's caching allocator can recycle the
-            # GPU memory before the kernel finishes, causing illegal memory access.
             self._fp8_ckv_ref = attn_ckv
             self._fp8_kpe_ref = attn_kpe
-            # Remap page indices to compact range [0, N)
             compact_kv_indices = torch.arange(
                 len(used_pages), dtype=torch.int32, device=self.device
             )
@@ -378,7 +392,7 @@ class MLAAttention:
             kv_indices=compact_kv_indices,
             kv_len_arr=kv_len_arr,
             num_heads=self.num_heads,
-            head_dim_ckv=self.kv_lora_rank,
+            head_dim_ckv=self.ckv_dim,
             head_dim_kpe=self.qk_rope_dim,
             page_size=kv_cache.page_size,
             causal=True,
@@ -387,7 +401,7 @@ class MLAAttention:
             kv_data_type=torch.bfloat16,
         )
 
-        # attn_out: [M, H, kv_lora_rank=512]
+        # attn_out: [M, H, ckv_dim]
         attn_out = self._attn_wrapper.run(
             q_nope=q_nope_absorbed,
             q_pe=q_pe,
@@ -396,7 +410,7 @@ class MLAAttention:
         )
 
         # ── Step 8: Post-attention projection ──
-        # attn_out [M, H, 512] @ w_vc^T [H, 512, 128] → [M, H, 128]
+        # attn_out [M, H, ckv_dim] @ w_vc^T [H, ckv_dim, v_head] → [M, H, v_head]
         attn_projected = torch.einsum(
             "mhd,hod->mho", attn_out.float(), self.w_vc.float()
         ).to(torch.bfloat16)
