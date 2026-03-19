@@ -34,13 +34,13 @@
 #
 # Configs are short names that map to testconfigs/*.conf:
 #   qcn         -> testconfigs/qcn-4-4-a16.conf
-#   qcn-a4      -> testconfigs/qcn-4-4-a4.conf
+#   qcn-a4      -> testconfigs/qcn-4-4-awq.conf
 #   q235        -> testconfigs/q235-4-4-a16.conf
-#   q235-a4     -> testconfigs/q235-4-4-a4.conf
+#   q235-a4     -> testconfigs/q235-4-4-awq.conf
 #   v2lite      -> testconfigs/v2lite-4-4-a16.conf
 #   deepseek-vl -> testconfigs/deepseek-vl2-4-4-a16.conf
 #   qwen35      -> testconfigs/qwen35-4-4-a16.conf
-#   qwen35-a4   -> testconfigs/qwen35-4-4-a4.conf
+#   qwen35-a4   -> testconfigs/qwen35-4-4-awq.conf
 #
 set -euo pipefail
 
@@ -78,13 +78,13 @@ resolve_config() {
     local name="$1"
     case "$name" in
         qcn|QCN)            echo "$SCRIPT_DIR/testconfigs/qcn-4-4-a16.conf" ;;
-        qcn-a4)             echo "$SCRIPT_DIR/testconfigs/qcn-4-4-a4.conf" ;;
+        qcn-a4)             echo "$SCRIPT_DIR/testconfigs/qcn-4-4-awq.conf" ;;
         q235)               echo "$SCRIPT_DIR/testconfigs/q235-4-4-a16.conf" ;;
-        q235-a4)            echo "$SCRIPT_DIR/testconfigs/q235-4-4-a4.conf" ;;
+        q235-a4)            echo "$SCRIPT_DIR/testconfigs/q235-4-4-awq.conf" ;;
         v2lite|V2-Lite)     echo "$SCRIPT_DIR/testconfigs/v2lite-4-4-a16.conf" ;;
         deepseek-vl|vl2)    echo "$SCRIPT_DIR/testconfigs/deepseek-vl2-4-4-a16.conf" ;;
         qwen35|Qwen3.5)     echo "$SCRIPT_DIR/testconfigs/qwen35-4-4-a16.conf" ;;
-        qwen35-a4)          echo "$SCRIPT_DIR/testconfigs/qwen35-4-4-a4.conf" ;;
+        qwen35-a4)          echo "$SCRIPT_DIR/testconfigs/qwen35-4-4-awq.conf" ;;
         *)
             # Try as a direct path
             if [[ -f "$name" ]]; then

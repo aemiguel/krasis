@@ -689,22 +689,35 @@ struct GpuWeight {
     scales_ptr: u64,
     /// Quantization group size for Marlin INT8/INT4 (typically 128).
     group_size: usize,
+    /// Simple INT4 decode format: [rows, cols/2] packed u8 on GPU.
+    /// When non-zero, decode GEMV uses this instead of Marlin (faster at M=1).
+    simple_packed_ptr: u64,
+    /// Simple INT4 decode format: [rows, cols/group_size] FP32 scales on GPU.
+    simple_scales_f32_ptr: u64,
 }
 
 impl GpuWeight {
     /// Create a standard weight (BF16/FP32/FP16/FP8).
     fn new(ptr: u64, rows: usize, cols: usize, dtype: u8) -> Self {
-        Self { ptr, rows, cols, dtype, scales_ptr: 0, group_size: 0 }
+        Self { ptr, rows, cols, dtype, scales_ptr: 0, group_size: 0,
+               simple_packed_ptr: 0, simple_scales_f32_ptr: 0 }
     }
 
     /// Create a Marlin INT8 weight with packed data and scales.
     fn new_marlin_int8(packed_ptr: u64, scales_ptr: u64, rows: usize, cols: usize, group_size: usize) -> Self {
-        Self { ptr: packed_ptr, rows, cols, dtype: 4, scales_ptr, group_size }
+        Self { ptr: packed_ptr, rows, cols, dtype: 4, scales_ptr, group_size,
+               simple_packed_ptr: 0, simple_scales_f32_ptr: 0 }
     }
 
     /// Create a Marlin INT4 weight with packed data and scales.
     fn new_marlin_int4(packed_ptr: u64, scales_ptr: u64, rows: usize, cols: usize, group_size: usize) -> Self {
-        Self { ptr: packed_ptr, rows, cols, dtype: 5, scales_ptr, group_size }
+        Self { ptr: packed_ptr, rows, cols, dtype: 5, scales_ptr, group_size,
+               simple_packed_ptr: 0, simple_scales_f32_ptr: 0 }
+    }
+
+    /// Whether this weight has a simple INT4 decode format available.
+    fn has_simple_int4(&self) -> bool {
+        self.simple_packed_ptr != 0
     }
 
     fn cublas_data_type(&self) -> cublas_sys::cudaDataType {
@@ -1412,6 +1425,9 @@ pub struct GpuDecodeStore {
     think_suppress_budget: usize,
     /// Count of tokens generated while in thinking mode (before </think>).
     think_suppress_count: usize,
+    /// Pending simple INT4 data from repack_marlin_int4_cpu, consumed by register_marlin_int4_weight.
+    /// FIFO queue: repack pushes, register pops. Ensures each weight gets its matching simple format.
+    pending_simple_int4: Vec<crate::weights::marlin::SimpleInt4>,
     #[cfg(feature = "gpu-debug")]
     debug_stop_layer: usize,
     #[cfg(feature = "gpu-debug")]
@@ -1655,6 +1671,7 @@ impl GpuDecodeStore {
             think_end_seen: false,
             think_suppress_budget: 0,
             think_suppress_count: 0,
+            pending_simple_int4: Vec::new(),
             #[cfg(feature = "gpu-debug")]
             debug_stop_layer: 0,
             #[cfg(feature = "gpu-debug")]
@@ -2140,14 +2157,51 @@ impl GpuDecodeStore {
     /// Register a Marlin INT4 weight (packed + scales already on GPU).
     /// Returns the weight ID. Used when Python does the quantization/repacking
     /// so both prefill (gptq_marlin_gemm) and decode (Rust GEMV) share the same data.
+    ///
+    /// If a pending simple INT4 was stashed by repack_marlin_int4_cpu, it is consumed
+    /// here: uploaded to GPU alongside the Marlin data, giving decode a faster GEMV path.
     fn register_marlin_int4_weight(
         &mut self, packed_ptr: usize, scales_ptr: usize,
         rows: usize, cols: usize, group_size: usize,
     ) -> PyResult<usize> {
+        // Pop pending simple INT4 (if available from repack_marlin_int4_cpu)
+        let simple = if !self.pending_simple_int4.is_empty() {
+            Some(self.pending_simple_int4.remove(0))
+        } else {
+            None
+        };
+
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         let id = graph.weights.len();
-        graph.weights.push(GpuWeight::new_marlin_int4(packed_ptr as u64, scales_ptr as u64, rows, cols, group_size));
+        let mut w = GpuWeight::new_marlin_int4(packed_ptr as u64, scales_ptr as u64, rows, cols, group_size);
+
+        // Upload simple INT4 to Rust-owned GPU memory for fast decode GEMV
+        if let Some(s) = simple {
+            let d_packed = self.device.htod_copy(s.packed)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Failed to upload simple INT4 packed: {:?}", e)))?;
+            w.simple_packed_ptr = *d_packed.device_ptr();
+
+            // Convert FP32 scales to byte vec for htod_copy
+            let scales_u32: Vec<u32> = s.scales.iter().map(|f| f.to_bits()).collect();
+            let d_scales = self.device.htod_copy(scales_u32)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Failed to upload simple INT4 scales: {:?}", e)))?;
+            w.simple_scales_f32_ptr = *d_scales.device_ptr();
+
+            let packed_mb = (rows * cols / 2) as f64 / 1024.0 / 1024.0;
+            let scales_kb = (rows * cols / group_size * 4) as f64 / 1024.0;
+            log::info!(
+                "  + simple INT4 decode format: packed={:.1} MB, scales={:.1} KB",
+                packed_mb, scales_kb,
+            );
+
+            std::mem::forget(d_packed);
+            std::mem::forget(d_scales);
+        }
+
+        graph.weights.push(w);
         Ok(id)
     }
 
@@ -2273,10 +2327,13 @@ impl GpuDecodeStore {
     /// Quantize a CPU BF16 weight to Marlin INT4 format using Rust repack.
     /// Returns (packed_bytes, scales_bytes, n, k) — caller uploads to GPU and registers.
     /// This ensures decode GEMV and prefill GEMM use the same Marlin repack format.
+    ///
+    /// Also produces and stashes the simple INT4 format (for fast decode GEMV).
+    /// The stashed data is consumed by the next register_marlin_int4_weight call.
     fn repack_marlin_int4_cpu(
-        &self, cpu_bf16_ptr: usize, rows: usize, cols: usize, group_size: usize,
+        &mut self, cpu_bf16_ptr: usize, rows: usize, cols: usize, group_size: usize,
     ) -> PyResult<(pyo3::Py<pyo3::types::PyBytes>, pyo3::Py<pyo3::types::PyBytes>, usize, usize)> {
-        use crate::weights::marlin::{quantize_int4, marlin_repack};
+        use crate::weights::marlin::{quantize_int4, marlin_repack, simple_int4_from_quantized};
 
         let n = rows;
         let k = cols;
@@ -2288,6 +2345,10 @@ impl GpuDecodeStore {
 
         let q = quantize_int4(&bf16_data, n, k, group_size);
         let m = marlin_repack(&q);
+
+        // Also create simple INT4 format for decode GEMV and stash it
+        let simple = simple_int4_from_quantized(&q);
+        self.pending_simple_int4.push(simple);
 
         // Convert packed u32 vec to bytes
         let packed_bytes: Vec<u8> = m.packed.iter()
@@ -10497,7 +10558,7 @@ impl GpuDecodeStore {
     }
 
     /// BF16 GEMV: output_bf16[N] = weight[N,K] @ input_bf16[K]
-    /// Supports BF16, Marlin INT8, and Marlin INT4 weights.
+    /// Supports BF16, Marlin INT8, Marlin INT4, and simple INT4 weights.
     fn gemv_bf16_internal(&self, w: &GpuWeight, input_ptr: u64, output_ptr: u64) -> Result<(), String> {
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
@@ -10505,6 +10566,10 @@ impl GpuDecodeStore {
             return self.launch_marlin_gemv_int8_bf16(w, input_ptr, output_ptr);
         }
         if w.is_marlin_int4() {
+            // Prefer simple INT4 for decode (single kernel, no tile permutation overhead)
+            if w.has_simple_int4() {
+                return self.launch_simple_int4_gemv_bf16(w, input_ptr, output_ptr);
+            }
             return self.launch_marlin_gemv_int4_bf16(w, input_ptr, output_ptr);
         }
         unsafe {
@@ -10526,7 +10591,7 @@ impl GpuDecodeStore {
     }
 
     /// GEMV with FP32 output: output_f32[N] = weight[N,K] @ input_bf16[K]
-    /// Supports BF16, Marlin INT8, and Marlin INT4 weights.
+    /// Supports BF16, Marlin INT8, Marlin INT4, and simple INT4 weights.
     fn gemv_bf16_to_f32(&self, w: &GpuWeight, input_ptr: u64, output_ptr: u64) -> Result<(), String> {
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
@@ -10534,6 +10599,10 @@ impl GpuDecodeStore {
             return self.launch_marlin_gemv_int8_f32(w, input_ptr, output_ptr);
         }
         if w.is_marlin_int4() {
+            // Prefer simple INT4 for decode (single kernel, no tile permutation overhead)
+            if w.has_simple_int4() {
+                return self.launch_simple_int4_gemv_f32(w, input_ptr, output_ptr);
+            }
             return self.launch_marlin_gemv_int4_f32(w, input_ptr, output_ptr);
         }
         unsafe {
@@ -12560,6 +12629,59 @@ impl GpuDecodeStore {
                  self.perm_inv_weight_int4, self.perm_inv_scale,
                  k as i32, n as i32, w.group_size as i32, k_splits as i32),
             ).map_err(|e| format!("marlin_gemv_int4_v2_fused_f32 launch: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Launch simple INT4 GEMV with BF16 output (for fast decode attention projections).
+    /// Single kernel, no tile permutation overhead. Uses [rows, cols/2] u8 packed + FP32 scales.
+    fn launch_simple_int4_gemv_bf16(
+        &self, w: &GpuWeight, input_ptr: u64, output_ptr: u64,
+    ) -> Result<(), String> {
+        let rows = w.rows;
+        let cols = w.cols;
+        let gs = w.group_size;
+        let blocks = ((rows + 7) / 8) as u32; // 8 warps per block, 1 row per warp
+        let smem = (cols as u32) * 2; // BF16 input in shared memory
+
+        let f = self.device.get_func(MODULE_NAME, "simple_int4_gemv_bf16")
+            .ok_or("simple_int4_gemv_bf16 kernel not found")?;
+        unsafe {
+            f.launch(
+                cudarc::driver::LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem,
+                },
+                (w.simple_packed_ptr, w.simple_scales_f32_ptr, input_ptr, output_ptr,
+                 rows as i32, cols as i32, gs as i32),
+            ).map_err(|e| format!("simple_int4_gemv_bf16: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Launch simple INT4 GEMV with FP32 output (for attention score paths).
+    fn launch_simple_int4_gemv_f32(
+        &self, w: &GpuWeight, input_ptr: u64, output_ptr: u64,
+    ) -> Result<(), String> {
+        let rows = w.rows;
+        let cols = w.cols;
+        let gs = w.group_size;
+        let blocks = ((rows + 7) / 8) as u32;
+        let smem = (cols as u32) * 2;
+
+        let f = self.device.get_func(MODULE_NAME, "simple_int4_gemv_f32")
+            .ok_or("simple_int4_gemv_f32 kernel not found")?;
+        unsafe {
+            f.launch(
+                cudarc::driver::LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem,
+                },
+                (w.simple_packed_ptr, w.simple_scales_f32_ptr, input_ptr, output_ptr,
+                 rows as i32, cols as i32, gs as i32),
+            ).map_err(|e| format!("simple_int4_gemv_f32: {:?}", e))?;
         }
         Ok(())
     }

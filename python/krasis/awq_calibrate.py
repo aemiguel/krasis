@@ -330,6 +330,8 @@ INPUT_PROJECTIONS = {
     "linear_attention": ["in_proj_qkvz", "in_proj_ba"],
     "full_attention": ["q_proj", "k_proj", "v_proj"],
     "sliding_attention": ["q_proj", "k_proj", "v_proj"],
+    "mla": ["q_a_proj", "kv_a_proj"],
+    "mla_direct_q": ["q_proj", "kv_a_proj"],
 }
 
 # Which projections take attention output as input (no norm folding possible)
@@ -337,6 +339,8 @@ OUTPUT_PROJECTIONS = {
     "linear_attention": ["out_proj"],
     "full_attention": ["o_proj"],
     "sliding_attention": ["o_proj"],
+    "mla": ["o_proj"],
+    "mla_direct_q": ["o_proj"],
 }
 
 
@@ -429,6 +433,9 @@ def _search_all_layers(
 
         s_x = per_layer_activations[layer_idx]
         lt = layer.layer_type
+        # MLA layers report as "full_attention" but have different projections
+        if lt != "linear_attention" and hasattr(layer.attention, 'kv_a_proj'):
+            lt = "mla" if hasattr(layer.attention, 'q_a_proj') else "mla_direct_q"
         input_proj_names = INPUT_PROJECTIONS.get(lt, [])
         output_proj_names = OUTPUT_PROJECTIONS.get(lt, [])
 
@@ -942,6 +949,8 @@ def main():
         lr = layer_results[layer_idx]
         layer = model.layers[layer_idx]
         lt = layer.layer_type
+        if lt != "linear_attention" and hasattr(layer.attention, 'kv_a_proj'):
+            lt = "mla"
         print(f"  {layer_idx:>6} {lt:>15} {lr['alpha']:>6.2f} "
               f"{lr['improvement'] * 100:>15.1f}% "
               f"{len(lr['input_projs']):>7} {len(lr['output_projs']):>7} "

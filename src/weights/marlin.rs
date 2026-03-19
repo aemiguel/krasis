@@ -233,6 +233,47 @@ pub fn dequantize_int4(q: &QuantizedInt4) -> Vec<f32> {
     output
 }
 
+/// Simple INT4 format for fast decode GEMV (M=1).
+///
+/// Same quantization as QuantizedInt4 but repacked for the simple_int4_gemv kernel:
+/// - packed: [rows, cols/2] u8, two 4-bit values per byte (lo=elem[k], hi=elem[k+1])
+/// - scales: [rows, cols/group_size] FP32
+///
+/// This format avoids Marlin's tile permutation overhead, giving faster single-token
+/// GEMV at the cost of slower batched GEMM (which prefill uses Marlin for).
+pub struct SimpleInt4 {
+    pub packed: Vec<u8>,   // [rows, cols/2] packed u8
+    pub scales: Vec<f32>,  // [rows, cols/group_size] FP32
+    pub rows: usize,
+    pub cols: usize,
+    pub group_size: usize,
+}
+
+/// Convert QuantizedInt4 (u32-packed, BF16 scales) to SimpleInt4 (u8-packed, FP32 scales).
+///
+/// The u32→u8 conversion is a direct reinterpret (little-endian byte extraction):
+/// each u32 holds 8 nibbles = 4 bytes, and each byte holds 2 consecutive weights
+/// in the same format the simple_int4_gemv kernel expects.
+pub fn simple_int4_from_quantized(q: &QuantizedInt4) -> SimpleInt4 {
+    // Reinterpret packed u32 as u8 (little-endian)
+    let packed: Vec<u8> = q.packed.iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+
+    // Convert BF16 scales to FP32
+    let scales: Vec<f32> = q.scales.iter()
+        .map(|&s| bf16_to_f32(s))
+        .collect();
+
+    SimpleInt4 {
+        packed,
+        scales,
+        rows: q.rows,
+        cols: q.cols,
+        group_size: q.group_size,
+    }
+}
+
 /// Marlin tile size (K dimension).
 const MARLIN_TILE: usize = 16;
 

@@ -4222,11 +4222,26 @@ class KrasisModel:
                 )
             elif hasattr(attn, 'kv_a_proj'):
                 # MLA attention — register projections and absorbed weights
+                # AWQ v2: per-channel scales for MLA input projections
+                _qa_scales = _layer_awq_scales if (
+                    _layer_awq_scales is not None and _awq_template is not None
+                    and is_awq_scaled_tensor(_awq_template, layer_idx, "q_a_proj")
+                ) else None
+                _qproj_scales = _layer_awq_scales if (
+                    _layer_awq_scales is not None and _awq_template is not None
+                    and is_awq_scaled_tensor(_awq_template, layer_idx, "q_proj")
+                ) else None
+                _kva_scales = _layer_awq_scales if (
+                    _layer_awq_scales is not None and _awq_template is not None
+                    and is_awq_scaled_tensor(_awq_template, layer_idx, "kv_a_proj")
+                ) else None
+
                 # Q projection weights
                 if attn.has_q_lora:
                     qa_w = attn.q_a_proj
                     qb_w = attn.q_b_proj
-                    qa_wid = _register_attn_weight(qa_w, layer_idx, "mla", "q_a_proj")
+                    qa_wid = _register_attn_weight(qa_w, layer_idx, "mla", "q_a_proj",
+                                                    awq_scales=_qa_scales)
                     qb_wid = _register_attn_weight(qb_w, layer_idx, "mla", "q_b_proj")
                     # q_a layernorm: BF16 → FP32 for Rust per_head_rmsnorm
                     attn._rust_q_a_norm = attn.q_a_norm_weight.float().contiguous().to(device)
@@ -4235,18 +4250,46 @@ class KrasisModel:
                     q_proj_wid = None
                 else:
                     q_w = attn.q_proj
-                    q_proj_wid = _register_attn_weight(q_w, layer_idx, "mla", "q_proj")
+                    q_proj_wid = _register_attn_weight(q_w, layer_idx, "mla", "q_proj",
+                                                        awq_scales=_qproj_scales)
                     qa_wid = None
                     qb_wid = None
                     q_a_norm_ptr = 0
 
                 # KV projection
                 kva_w = attn.kv_a_proj
-                kva_wid = _register_attn_weight(kva_w, layer_idx, "mla", "kv_a_proj")
+                kva_wid = _register_attn_weight(kva_w, layer_idx, "mla", "kv_a_proj",
+                                                 awq_scales=_kva_scales)
 
                 # O projection
                 o_w = attn.o_proj
                 o_wid = _register_attn_weight(o_w, layer_idx, "mla", "o_proj")
+
+                # Replace MLA attention weight attributes with MarlinWeight for prefill
+                from krasis.attention import MarlinWeight
+                if attn.has_q_lora:
+                    if qa_wid in self._marlin_attn_weights:
+                        attn.q_a_proj = MarlinWeight(*self._marlin_attn_weights[qa_wid])
+                    if qb_wid in self._marlin_attn_weights:
+                        attn.q_b_proj = MarlinWeight(*self._marlin_attn_weights[qb_wid])
+                else:
+                    if q_proj_wid is not None and q_proj_wid in self._marlin_attn_weights:
+                        attn.q_proj = MarlinWeight(*self._marlin_attn_weights[q_proj_wid])
+                if kva_wid in self._marlin_attn_weights:
+                    attn.kv_a_proj = MarlinWeight(*self._marlin_attn_weights[kva_wid])
+                if o_wid in self._marlin_attn_weights:
+                    attn.o_proj = MarlinWeight(*self._marlin_attn_weights[o_wid])
+
+                # AWQ v2: fold 1/s into input_norm_weight for MLA layers
+                if _layer_awq_scales is not None and (
+                    _qa_scales is not None or _qproj_scales is not None
+                    or _kva_scales is not None
+                ):
+                    s = _layer_awq_scales.to(inp_norm.device)
+                    inp_norm.data.copy_(
+                        (inp_norm.float() / s.float()).to(inp_norm.dtype))
+                    logger.debug("AWQ: folded scales into input_norm for MLA layer %d "
+                                 "(mean_scale=%.4f)", layer_idx, s.mean().item())
 
                 # kv_a layernorm: BF16 → FP32
                 attn._rust_kv_a_norm = attn.kv_a_norm_weight.float().contiguous().to(device)

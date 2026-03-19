@@ -390,6 +390,7 @@ class LauncherConfig:
         self.gpu_expert_bits: int = 4
         self.cpu_expert_bits: int = 4
         self.attention_quant: str = "bf16"
+        self._attention_quant_explicit: bool = False  # set when user/config explicitly chose
         self.shared_expert_quant: str = "int8"
         self.dense_mlp_quant: str = "int8"
         self.lm_head_quant: str = "int8"
@@ -459,6 +460,7 @@ class LauncherConfig:
             if val in ("int4", "int8"):
                 val = "awq"
             self.attention_quant = val
+            self._attention_quant_explicit = True
         if "CFG_SHARED_EXPERT_QUANT" in saved:
             self.shared_expert_quant = saved["CFG_SHARED_EXPERT_QUANT"]
         if "CFG_DENSE_MLP_QUANT" in saved:
@@ -1253,6 +1255,9 @@ class Launcher:
             self.cfg.model_path = selected["path"]
             self.model_info = selected
 
+        # Default to AWQ if a calibration template exists (user can still toggle in TUI)
+        self._default_awq_if_template()
+
         # Step 2: GPU selection (always shown, pre-selects saved GPUs)
         if self.hw["gpus"]:
             if self.args.selected_gpus is not None and self.selected_gpus:
@@ -1413,6 +1418,22 @@ class Launcher:
                 "max_context": max_context,
             }
         except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+    def _default_awq_if_template(self) -> None:
+        """Default attention_quant to AWQ if a calibration template exists for this model."""
+        if not self.cfg.model_path or self.cfg.attention_quant == "awq":
+            return
+        if self.cfg._attention_quant_explicit:
+            return
+        try:
+            from krasis.awq_calibrate import load_template
+            template_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), "templates", "attention")
+            tmpl = load_template(template_dir, self.cfg.model_path)
+            if tmpl is not None:
+                self.cfg.attention_quant = "awq"
+        except Exception:
             pass
 
     def print_summary(self) -> None:
@@ -1651,6 +1672,7 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         if val in ("int4", "int8"):
             val = "awq"
         cfg.attention_quant = val
+        cfg._attention_quant_explicit = True
     if args.shared_expert_quant is not None:
         cfg.shared_expert_quant = args.shared_expert_quant
     if args.dense_mlp_quant is not None:
@@ -1949,6 +1971,7 @@ def main():
                 sys.exit(1)
 
         launcher._read_model_info()
+        launcher._default_awq_if_template()
         launcher._resolve_selected_gpus()
 
         # Set/recompute PP if not specified, GPU count mismatch, or layer sum mismatch
