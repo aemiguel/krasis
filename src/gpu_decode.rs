@@ -1353,6 +1353,24 @@ struct CudaGraphExecPtr(CUgraphExec);
 unsafe impl Send for CudaGraphExecPtr {}
 unsafe impl Sync for CudaGraphExecPtr {}
 
+/// Single-slot AWQ: one GPU allocation per weight, shared between Marlin (prefill) and
+/// simple INT4 (decode). Host copies of both formats are kept for DMA swaps.
+struct SingleSlotSwapEntry {
+    weight_id: usize,
+    /// Fixed GPU address for packed weights (never changes — both formats share this slot).
+    packed_slot_ptr: u64,
+    /// Fixed GPU address for scales (never changes — sized to max of BF16 and FP32).
+    scales_slot_ptr: u64,
+    /// Marlin packed data (tile-permuted INT4) saved from GPU during registration.
+    marlin_packed_host: Vec<u8>,
+    /// Marlin BF16 scales saved from GPU during registration.
+    marlin_scales_host: Vec<u8>,
+    /// Simple INT4 packed data (sequential layout) from repack.
+    simple_packed_host: Vec<u8>,
+    /// Simple INT4 FP32 scales from repack (as raw bytes).
+    simple_scales_host: Vec<u8>,
+}
+
 // ── PyO3 wrapper ───────────────────────────────────────────────────────
 
 #[pyclass]
@@ -1428,6 +1446,9 @@ pub struct GpuDecodeStore {
     /// Pending simple INT4 data from repack_marlin_int4_cpu, consumed by register_marlin_int4_weight.
     /// FIFO queue: repack pushes, register pops. Ensures each weight gets its matching simple format.
     pending_simple_int4: Vec<crate::weights::marlin::SimpleInt4>,
+    /// Single-slot AWQ: swap entries for each attention weight. Host copies of both
+    /// Marlin and simple INT4 formats, plus the fixed GPU slot addresses.
+    single_slot_swaps: Vec<SingleSlotSwapEntry>,
     #[cfg(feature = "gpu-debug")]
     debug_stop_layer: usize,
     #[cfg(feature = "gpu-debug")]
@@ -1672,6 +1693,7 @@ impl GpuDecodeStore {
             think_suppress_budget: 0,
             think_suppress_count: 0,
             pending_simple_int4: Vec::new(),
+            single_slot_swaps: Vec::new(),
             #[cfg(feature = "gpu-debug")]
             debug_stop_layer: 0,
             #[cfg(feature = "gpu-debug")]
@@ -2158,8 +2180,12 @@ impl GpuDecodeStore {
     /// Returns the weight ID. Used when Python does the quantization/repacking
     /// so both prefill (gptq_marlin_gemm) and decode (Rust GEMV) share the same data.
     ///
-    /// If a pending simple INT4 was stashed by repack_marlin_int4_cpu, it is consumed
-    /// here: uploaded to GPU alongside the Marlin data, giving decode a faster GEMV path.
+    /// Single-slot AWQ: the GPU addresses from PyTorch become the permanent "slot".
+    /// Both Marlin and simple INT4 data are DMA'd into the same addresses on swap.
+    /// Marlin data is copied from GPU to host during registration (for later restore).
+    /// Simple INT4 host data is stashed from repack_marlin_int4_cpu.
+    /// simple_packed_ptr and simple_scales_f32_ptr are set to the SAME addresses as
+    /// the Marlin pointers — CUDA graphs see stable pointers across all requests.
     fn register_marlin_int4_weight(
         &mut self, packed_ptr: usize, scales_ptr: usize,
         rows: usize, cols: usize, group_size: usize,
@@ -2174,35 +2200,131 @@ impl GpuDecodeStore {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         let id = graph.weights.len();
-        let mut w = GpuWeight::new_marlin_int4(packed_ptr as u64, scales_ptr as u64, rows, cols, group_size);
 
-        // Upload simple INT4 to Rust-owned GPU memory for fast decode GEMV
+        let packed_gpu = packed_ptr as u64;
+        let scales_gpu = scales_ptr as u64;
+
+        // Create weight with BOTH Marlin and simple ptrs pointing to the same slot
+        let mut w = GpuWeight::new_marlin_int4(packed_gpu, scales_gpu, rows, cols, group_size);
+        // Single-slot: simple INT4 decode reads from the same GPU addresses
+        w.simple_packed_ptr = packed_gpu;
+        w.simple_scales_f32_ptr = scales_gpu;
+
         if let Some(s) = simple {
-            let d_packed = self.device.htod_copy(s.packed)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("Failed to upload simple INT4 packed: {:?}", e)))?;
-            w.simple_packed_ptr = *d_packed.device_ptr();
+            let packed_bytes = s.packed.len();
+            let marlin_scales_bytes = rows * (cols / group_size) * 2; // BF16
 
-            // Convert FP32 scales to byte vec for htod_copy
-            let scales_u32: Vec<u32> = s.scales.iter().map(|f| f.to_bits()).collect();
-            let d_scales = self.device.htod_copy(scales_u32)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("Failed to upload simple INT4 scales: {:?}", e)))?;
-            w.simple_scales_f32_ptr = *d_scales.device_ptr();
+            // Copy Marlin data from GPU to host (for later restore after decode)
+            let mut marlin_packed_host = vec![0u8; packed_bytes];
+            let mut marlin_scales_host = vec![0u8; marlin_scales_bytes];
+            unsafe {
+                let r = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    marlin_packed_host.as_mut_ptr() as *mut std::ffi::c_void,
+                    packed_gpu, packed_bytes);
+                if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("cuMemcpyDtoH Marlin packed: {:?}", r)));
+                }
+                let r = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    marlin_scales_host.as_mut_ptr() as *mut std::ffi::c_void,
+                    scales_gpu, marlin_scales_bytes);
+                if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("cuMemcpyDtoH Marlin scales: {:?}", r)));
+                }
+            }
 
-            let packed_mb = (rows * cols / 2) as f64 / 1024.0 / 1024.0;
-            let scales_kb = (rows * cols / group_size * 4) as f64 / 1024.0;
+            // Convert simple INT4 FP32 scales to raw bytes
+            let simple_scales_host: Vec<u8> = s.scales.iter()
+                .flat_map(|f| f.to_bits().to_ne_bytes())
+                .collect();
+
+            let packed_mb = packed_bytes as f64 / 1024.0 / 1024.0;
             log::info!(
-                "  + simple INT4 decode format: packed={:.1} MB, scales={:.1} KB",
-                packed_mb, scales_kb,
+                "  + single-slot AWQ: packed={:.1} MB, Marlin scales={} B, simple scales={} B",
+                packed_mb, marlin_scales_bytes, simple_scales_host.len(),
             );
 
-            std::mem::forget(d_packed);
-            std::mem::forget(d_scales);
+            self.single_slot_swaps.push(SingleSlotSwapEntry {
+                weight_id: id,
+                packed_slot_ptr: packed_gpu,
+                scales_slot_ptr: scales_gpu,
+                marlin_packed_host,
+                marlin_scales_host,
+                simple_packed_host: s.packed,
+                simple_scales_host,
+            });
         }
 
         graph.weights.push(w);
         Ok(id)
+    }
+
+    /// Single-slot AWQ: DMA simple INT4 data into the GPU slots for decode.
+    /// Overwrites Marlin data at the same addresses. Pointers never change,
+    /// so CUDA graphs remain valid without recapture.
+    fn swap_to_simple_int4(&mut self) -> PyResult<()> {
+        if self.single_slot_swaps.is_empty() {
+            return Ok(());
+        }
+        let mut total_bytes: usize = 0;
+        for entry in &self.single_slot_swaps {
+            unsafe {
+                let r = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    entry.packed_slot_ptr,
+                    entry.simple_packed_host.as_ptr() as *const std::ffi::c_void,
+                    entry.simple_packed_host.len());
+                if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("swap_to_simple_int4 packed: {:?}", r)));
+                }
+                let r = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    entry.scales_slot_ptr,
+                    entry.simple_scales_host.as_ptr() as *const std::ffi::c_void,
+                    entry.simple_scales_host.len());
+                if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("swap_to_simple_int4 scales: {:?}", r)));
+                }
+            }
+            total_bytes += entry.simple_packed_host.len() + entry.simple_scales_host.len();
+        }
+        log::info!("Single-slot AWQ: swapped to simple INT4 ({:.1} MB DMA)",
+                   total_bytes as f64 / 1024.0 / 1024.0);
+        Ok(())
+    }
+
+    /// Single-slot AWQ: DMA Marlin data back into the GPU slots for prefill.
+    /// Restores original Marlin-permuted data at the same addresses.
+    fn swap_to_marlin(&mut self) -> PyResult<()> {
+        if self.single_slot_swaps.is_empty() {
+            return Ok(());
+        }
+        let mut total_bytes: usize = 0;
+        for entry in &self.single_slot_swaps {
+            unsafe {
+                let r = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    entry.packed_slot_ptr,
+                    entry.marlin_packed_host.as_ptr() as *const std::ffi::c_void,
+                    entry.marlin_packed_host.len());
+                if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("swap_to_marlin packed: {:?}", r)));
+                }
+                let r = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    entry.scales_slot_ptr,
+                    entry.marlin_scales_host.as_ptr() as *const std::ffi::c_void,
+                    entry.marlin_scales_host.len());
+                if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("swap_to_marlin scales: {:?}", r)));
+                }
+            }
+            total_bytes += entry.marlin_packed_host.len() + entry.marlin_scales_host.len();
+        }
+        log::info!("Single-slot AWQ: swapped to Marlin ({:.1} MB DMA)",
+                   total_bytes as f64 / 1024.0 / 1024.0);
+        Ok(())
     }
 
     /// Quantize a BF16 weight tensor to Marlin INT8 format and register it.

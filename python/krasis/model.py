@@ -3626,7 +3626,7 @@ class KrasisModel:
         _t_gen_start = time.perf_counter()
 
         try:
-            # ── Prefill ──
+            # ── Prefill ── (Single-slot AWQ: Marlin already in GPU slots)
             prompt_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
             positions = torch.arange(len(prompt_tokens), dtype=torch.int32, device=device)
 
@@ -3657,6 +3657,8 @@ class KrasisModel:
             self._export_kv_to_rust(seq_states_per_rank, len(prompt_tokens))
             self._update_la_state_ptrs()
             self._update_la_state_ptrs_aux()
+            # Single-slot AWQ: swap simple INT4 into GPU slots for decode
+            gpu_store.swap_to_simple_int4()
             decode_tokens = gpu_store.gpu_generate_batch(
                 first_token=next_token,
                 start_position=len(prompt_tokens),
@@ -3677,6 +3679,9 @@ class KrasisModel:
             else:
                 self._last_decode_time = 0.0
                 self._last_decode_tok_s = 0.0
+            # Single-slot AWQ: restore Marlin into GPU slots for next prefill
+            if gpu_store is not None:
+                gpu_store.swap_to_marlin()
             # Free KV cache pages
             for s in seq_states_per_rank:
                 if s is not None:
@@ -3768,7 +3773,7 @@ class KrasisModel:
 
         device = torch.device(self.ranks[0].device)
 
-        # Prefill
+        # Prefill — Single-slot AWQ: Marlin already in GPU slots
         prompt_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
         positions = torch.arange(len(prompt_tokens), dtype=torch.int32, device=device)
 
@@ -3824,6 +3829,10 @@ class KrasisModel:
         self._export_kv_to_rust(seq_states, len(prompt_tokens))
         self._update_la_state_ptrs()
         self._update_la_state_ptrs_aux()
+
+        # Single-slot AWQ: swap simple INT4 into GPU slots for decode
+        gpu_store.swap_to_simple_int4()
+
         store_addr = gpu_store.gpu_store_addr()
 
         class _Result:
@@ -4062,30 +4071,57 @@ class KrasisModel:
                     repacked = torch.from_numpy(packed_np.copy()).to(
                         dtype=torch.int32, device=device)
                     scale_raw = torch.from_numpy(scales_np.copy()).to(torch.int16)
-                    scale_perm = scale_raw.view(torch.bfloat16).to(device)
+
+                    # Single-slot AWQ: allocate scales at FP32 size (2x BF16) so the
+                    # same GPU buffer holds either BF16 Marlin scales or FP32 simple scales.
+                    # BF16 scales occupy the first half; gptq_marlin_gemm gets a BF16 view.
+                    n_scale_elements = (k // marlin_gs) * n
+                    if use_int4:
+                        # Allocate slot: 2x BF16 elements as int16 = FP32 byte capacity
+                        scales_slot = torch.empty(n_scale_elements * 2, dtype=torch.int16, device=device)
+                        # Fill first half with BF16 data
+                        bf16_on_gpu = scale_raw.view(torch.bfloat16).to(device)
+                        scales_slot[:n_scale_elements].copy_(bf16_on_gpu.view(torch.int16).reshape(-1))
+                        # BF16 view for gptq_marlin_gemm (same underlying memory, first half)
+                        scale_perm = scales_slot[:n_scale_elements].view(torch.bfloat16).reshape(k // marlin_gs, n)
+                        del bf16_on_gpu
+                    else:
+                        # INT8: no single-slot swap, standard BF16 scales
+                        scale_perm = scale_raw.view(torch.bfloat16).to(device)
+
                     # Reshape for gptq_marlin_gemm: packed [K/16, pack_factor*N], scales [K/gs, N]
                     if use_int4:
                         repacked = repacked.reshape(k // 16, 2 * n)
                     else:
                         repacked = repacked.reshape(k // 16, 4 * n)
-                    scale_perm = scale_perm.reshape(k // marlin_gs, n)
+                    if not use_int4:
+                        scale_perm = scale_perm.reshape(k // marlin_gs, n)
 
                     # Step 4: Register GPU pointer with Rust store
+                    # For INT4 single-slot: scales_ptr points to the full FP32-sized slot
                     scalar_type = _marlin_scalar_type_int4 if use_int4 else _marlin_scalar_type_int8
                     if use_int4:
+                        scales_data_ptr = scales_slot.data_ptr() if use_int4 else scale_perm.data_ptr()
                         wid = store.register_marlin_int4_weight(
-                            repacked.data_ptr(), scale_perm.data_ptr(),
+                            repacked.data_ptr(), scales_data_ptr,
                             n, k, marlin_gs)
                     else:
                         wid = store.register_marlin_int8_weight(
                             repacked.data_ptr(), scale_perm.data_ptr(),
                             n, k, marlin_gs)
 
-                    # Step 5: Keep PyTorch tensors alive and accessible for prefill
+                    # Step 5: Keep PyTorch tensors alive and accessible for prefill.
+                    # Single-slot: tensors stay on GPU permanently (they ARE the slots).
+                    # For INT4, also keep scales_slot alive to prevent GC.
                     self._marlin_attn_weights[wid] = (
                         repacked, scale_perm, _marlin_workspace,
                         scalar_type, n, k,
                     )
+                    if use_int4:
+                        # Keep the full slot tensor alive (scale_perm is a view into it)
+                        if not hasattr(self, '_single_slot_scales'):
+                            self._single_slot_scales = []
+                        self._single_slot_scales.append(scales_slot)
                     return wid
                 else:
                     logger.warning("Attention weight [%d×%d] not Marlin-compatible "
@@ -4540,6 +4576,11 @@ class KrasisModel:
 
         logger.info("GPU decode store configured: %d layers, store_addr=%d",
                      len(self.layers), store.gpu_store_addr())
+
+        # Single-slot AWQ: Marlin data is in the GPU slots from registration.
+        # PyTorch tensors stay on GPU permanently (they ARE the slots).
+        # Rust handles swapping slot contents between Marlin and simple INT4.
+
         return store
 
     def setup_gpu_decode_store_aux(self, gpu_idx: int, split_layer: int, layer_end: int = 0) -> "GpuDecodeStore":
@@ -5018,7 +5059,16 @@ class KrasisModel:
                 )
 
     def server_cleanup(self):
-        """Free server request state (KV cache pages, etc.)."""
+        """Free server request state (KV cache pages, etc.).
+
+        Also handles single-slot AWQ: restore Marlin data into GPU slots
+        for instant prefill on the next request.
+        """
+        # Single-slot AWQ: restore Marlin into slots
+        gpu_store = getattr(self, '_gpu_decode_store', None)
+        if gpu_store is not None:
+            gpu_store.swap_to_marlin()
+
         states = getattr(self, '_server_seq_states', None)
         if states:
             for s in states:
