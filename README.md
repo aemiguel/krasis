@@ -14,7 +14,8 @@ Krasis can run large language models that are much too large to fit in a consume
 
 ## Latest News
 
-* Multi-GPU pre-release now available via the install link in the [ADVANCED.md](https://github.com/brontoguana/krasis/blob/main/ADVANCED.md) doc.  This won't improve prefill speed but could improve decode speed on multi GPU systems with similar GPUs.
+* Multi-GPU pre-release now available via the latest release.  This won't improve prefill speed but could improve decode speed on multi GPU systems with similar GPUs.
+* Fix for higher system RAM usage than expected.
 
 ## Benchmarks
 
