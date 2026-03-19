@@ -3854,6 +3854,19 @@ class KrasisModel:
         r.kv_overflow = (rust_max_seq > 0 and len(prompt_tokens) > rust_max_seq)
         return r
 
+    @staticmethod
+    def _dense_mlp_tensor(w) -> torch.Tensor:
+        """Extract a BF16 tensor from a dense MLP weight value.
+
+        Dense MLP weights are either plain BF16 tensors or (weight_int8, scale)
+        tuples from per-channel INT8 quantization.  The Rust decode store needs
+        plain BF16, so dequantize on the fly when necessary.
+        """
+        if isinstance(w, tuple):
+            w_int8, scale = w
+            return (w_int8.float() * scale.float().unsqueeze(1)).to(torch.bfloat16)
+        return w
+
     def setup_gpu_decode_store(self) -> "GpuDecodeStore":
         """Create and configure a GpuDecodeStore for Rust-native GPU decode.
 
@@ -3882,16 +3895,23 @@ class KrasisModel:
                 kv_sz = ga.num_kv_heads * ga.head_dim
                 max_qkv = max(max_qkv, q_sz + kv_sz * 2)
 
+        # Compute max intermediate from actual layer types (not unused config fields)
+        has_dense_mlp = any(l.dense_mlp is not None for l in self.layers)
+        max_inter = self.cfg.moe_intermediate_size
+        if has_dense_mlp:
+            max_inter = max(max_inter, self.cfg.intermediate_size)
+
         store.configure(
             hidden_size=self.cfg.hidden_size,
             num_layers=len(self.layers),
             vocab_size=self.cfg.vocab_size,
             eps=self.cfg.rms_norm_eps,
             max_experts_per_tok=self.cfg.num_experts_per_tok,
-            max_intermediate_size=self.cfg.moe_intermediate_size,
+            max_intermediate_size=max_inter,
             max_qkv_size=max_qkv,
             group_size=128,
             expert_bits=self.quant_cfg.gpu_expert_bits,
+            moe_intermediate_size=self.cfg.moe_intermediate_size,
         )
 
         # Register embedding
@@ -4327,9 +4347,10 @@ class KrasisModel:
             if layer.is_moe:
                 store.register_mlp(layer_idx, "moe")
             elif layer.dense_mlp is not None:
-                gp = layer.dense_mlp["gate_proj"]
-                up = layer.dense_mlp["up_proj"]
-                dp = layer.dense_mlp["down_proj"]
+                gp = self._dense_mlp_tensor(layer.dense_mlp["gate_proj"])
+                up = self._dense_mlp_tensor(layer.dense_mlp["up_proj"])
+                dp = self._dense_mlp_tensor(layer.dense_mlp["down_proj"])
+                self._rust_decode_weights.extend([gp, up, dp])
                 gp_wid = store.register_weight(gp.data_ptr(), gp.shape[0], gp.shape[1], 0)
                 up_wid = store.register_weight(up.data_ptr(), up.shape[0], up.shape[1], 0)
                 dp_wid = store.register_weight(dp.data_ptr(), dp.shape[0], dp.shape[1], 0)
@@ -4426,16 +4447,22 @@ class KrasisModel:
                 kv_sz = ga.num_kv_heads * ga.head_dim
                 max_qkv = max(max_qkv, q_sz + kv_sz * 2)
 
+        has_dense_mlp = any(l.dense_mlp is not None for l in self.layers)
+        max_inter = self.cfg.moe_intermediate_size
+        if has_dense_mlp:
+            max_inter = max(max_inter, self.cfg.intermediate_size)
+
         store.configure(
             hidden_size=self.cfg.hidden_size,
             num_layers=len(self.layers),
             vocab_size=self.cfg.vocab_size,
             eps=self.cfg.rms_norm_eps,
             max_experts_per_tok=self.cfg.num_experts_per_tok,
-            max_intermediate_size=self.cfg.moe_intermediate_size,
+            max_intermediate_size=max_inter,
             max_qkv_size=max_qkv,
             group_size=128,
             expert_bits=self.quant_cfg.gpu_expert_bits,
+            moe_intermediate_size=self.cfg.moe_intermediate_size,
         )
 
         # Embedding — not needed on aux (segment_skip_embedding=true), but register
@@ -4650,17 +4677,18 @@ class KrasisModel:
                 store.register_mlp(layer_idx, "moe")
             elif layer.dense_mlp is not None:
                 if in_segment:
-                    gp = layer.dense_mlp["gate_proj"].to(aux_device, non_blocking=True)
-                    up = layer.dense_mlp["up_proj"].to(aux_device, non_blocking=True)
-                    dp = layer.dense_mlp["down_proj"].to(aux_device, non_blocking=True)
+                    gp = self._dense_mlp_tensor(layer.dense_mlp["gate_proj"]).to(aux_device, non_blocking=True)
+                    up = self._dense_mlp_tensor(layer.dense_mlp["up_proj"]).to(aux_device, non_blocking=True)
+                    dp = self._dense_mlp_tensor(layer.dense_mlp["down_proj"]).to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([gp, up, dp])
                     gp_wid = store.register_weight(gp.data_ptr(), gp.shape[0], gp.shape[1], 0)
                     up_wid = store.register_weight(up.data_ptr(), up.shape[0], up.shape[1], 0)
                     dp_wid = store.register_weight(dp.data_ptr(), dp.shape[0], dp.shape[1], 0)
                 else:
-                    gp = layer.dense_mlp["gate_proj"]
-                    up = layer.dense_mlp["up_proj"]
-                    dp = layer.dense_mlp["down_proj"]
+                    gp = self._dense_mlp_tensor(layer.dense_mlp["gate_proj"])
+                    up = self._dense_mlp_tensor(layer.dense_mlp["up_proj"])
+                    dp = self._dense_mlp_tensor(layer.dense_mlp["down_proj"])
+                    self._rust_decode_weights.extend([gp, up, dp])
                     gp_wid = store.register_weight(gp.data_ptr(), gp.shape[0], gp.shape[1], 0)
                     up_wid = store.register_weight(up.data_ptr(), up.shape[0], up.shape[1], 0)
                     dp_wid = store.register_weight(dp.data_ptr(), dp.shape[0], dp.shape[1], 0)

@@ -75,6 +75,40 @@ class PagedKVCache:
                 max_mb = 2000  # default 2 GB
             budget_bytes = max_mb * 1024 * 1024
             bytes_per_page = self._bytes_per_page()
+
+            # Cap to actual free VRAM minus computed safety margin.
+            # Safety = FlashInfer workspace (256 MB) + max prefill intermediate
+            # (MoE or dense MLP, whichever is larger at 5K token chunk) + 200 MB base.
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            chunk_est = 5000
+            # MoE intermediates: [M*topk, 2*moe_inter] + [M*topk, hidden], bf16
+            moe_inter = cfg.moe_intermediate_size
+            top_k = cfg.num_experts_per_tok
+            hidden = cfg.hidden_size
+            moe_ws = (chunk_est * top_k * 2 * moe_inter * 2 +
+                       chunk_est * top_k * hidden * 2) if moe_inter > 0 and top_k > 0 else 0
+            # Dense MLP intermediates: gate + up + cat, peak = M * inter * 8
+            dense_inter = cfg.intermediate_size
+            dense_ws = chunk_est * dense_inter * 8 if dense_inter > 0 else 0
+            prefill_ws = max(moe_ws, dense_ws)
+            flashinfer_ws = 256 * 1024 * 1024  # matches attention.py _get_workspace
+            base_headroom = 200 * 1024 * 1024
+            safety_bytes = flashinfer_ws + prefill_ws + base_headroom
+            safety_mb = safety_bytes / (1024 * 1024)
+            available_bytes = max(0, free_bytes - safety_bytes)
+            if budget_bytes > available_bytes:
+                old_mb = budget_bytes / (1024 * 1024)
+                budget_bytes = available_bytes
+                new_mb = budget_bytes / (1024 * 1024)
+                logger.warning(
+                    "KV cache: requested %d MB but only %.0f MB available "
+                    "(%.0f MB free - %.0f MB safety [%.0f prefill + 256 FlashInfer + 200 base]), "
+                    "capping to %.0f MB",
+                    int(old_mb), available_bytes / (1024 * 1024),
+                    free_bytes / (1024 * 1024), safety_mb,
+                    prefill_ws / (1024 * 1024), new_mb,
+                )
+
             max_pages = max(64, budget_bytes // bytes_per_page)
             logger.info(
                 "KV cache: %d MB → %d pages (%.1fK tokens)",

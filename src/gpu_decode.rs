@@ -929,7 +929,8 @@ struct GpuDecodeGraph {
     decode_layer_end: usize,
     vocab_size: usize,
     eps: f32,
-    intermediate_size: usize,
+    intermediate_size: usize,         // max intermediate (for buffer allocation)
+    moe_intermediate_size: usize,     // MoE expert intermediate (for expert kernels)
     group_size: usize,
     /// Expert quantization bits: 4 (INT4 Marlin) or 8 (INT8 Marlin).
     expert_bits: u8,
@@ -1615,7 +1616,7 @@ impl GpuDecodeStore {
     }
 
     /// Initialize the decode graph with model dimensions.
-    #[pyo3(signature = (hidden_size, num_layers, vocab_size, eps, max_experts_per_tok=10, max_intermediate_size=0, max_qkv_size=0, group_size=128, expert_bits=4))]
+    #[pyo3(signature = (hidden_size, num_layers, vocab_size, eps, max_experts_per_tok=10, max_intermediate_size=0, max_qkv_size=0, group_size=128, expert_bits=4, moe_intermediate_size=0))]
     fn configure(
         &mut self,
         hidden_size: usize,
@@ -1627,8 +1628,10 @@ impl GpuDecodeStore {
         max_qkv_size: usize,
         group_size: usize,
         expert_bits: u8,
+        moe_intermediate_size: usize,
     ) -> PyResult<()> {
         let intermediate = if max_intermediate_size > 0 { max_intermediate_size } else { hidden_size * 4 };
+        let moe_inter = if moe_intermediate_size > 0 { moe_intermediate_size } else { intermediate };
         let qkv_size = if max_qkv_size > 0 { max_qkv_size } else { hidden_size * 3 };
 
         let d_hidden = self.device.alloc_zeros::<u16>(hidden_size)
@@ -1760,6 +1763,7 @@ impl GpuDecodeStore {
             vocab_size,
             eps,
             intermediate_size: intermediate,
+            moe_intermediate_size: moe_inter,
             group_size,
             expert_bits,
             weights: Vec::with_capacity(num_layers * 8),
@@ -2674,7 +2678,7 @@ impl GpuDecodeStore {
         self.run_expert_on_gpu(
             &moe.experts[expert_idx],
             graph.hidden_size,
-            graph.intermediate_size,
+            graph.moe_intermediate_size,
             graph.group_size,
         )
     }
@@ -3078,7 +3082,7 @@ impl GpuDecodeStore {
 
         let expert = &moe.experts[expert_id];
         let hs = graph.hidden_size;
-        let intermediate = graph.intermediate_size;
+        let intermediate = graph.moe_intermediate_size;
         let gs = graph.group_size;
         let n = 2 * intermediate;  // w13 output dim
         let k = hs;                // w13 input dim
@@ -3175,7 +3179,7 @@ impl GpuDecodeStore {
     fn download_gate_up_bf16(&self) -> PyResult<Vec<u16>> {
         let graph = self.graph.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
-        let size = graph.intermediate_size * 2;
+        let size = graph.moe_intermediate_size * 2;
         let mut out = vec![0u16; size];
         unsafe {
             let err = cuda_sys::lib().cuMemcpyDtoH_v2(
@@ -3335,7 +3339,23 @@ impl GpuDecodeStore {
         budget_mb: usize,
         headroom_mb: usize,
     ) -> PyResult<String> {
-        self.hcs_pool_init_internal(ranking, budget_mb, headroom_mb)
+        // budget_mb=0 means auto-detect from free VRAM (legacy non-tiered API)
+        let actual_budget_mb = if budget_mb == 0 {
+            let (free, _total) = cudarc::driver::result::mem_get_info()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("mem_get_info: {:?}", e)))?;
+            let headroom_bytes = headroom_mb * 1024 * 1024;
+            if free > headroom_bytes {
+                (free - headroom_bytes) / (1024 * 1024)
+            } else {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Not enough VRAM: {} MB free, {} MB headroom",
+                        free / (1024 * 1024), headroom_mb)));
+            }
+        } else {
+            budget_mb
+        };
+        self.hcs_pool_init_internal(ranking, actual_budget_mb)
     }
 
     /// Store four-point VRAM calibration data from startup measurement.
@@ -3406,7 +3426,7 @@ impl GpuDecodeStore {
     ) -> PyResult<String> {
         // First, init the hard pool using existing logic
         let result = self.hcs_pool_init_internal(
-            ranking.clone(), hard_budget_mb, 0,
+            ranking.clone(), hard_budget_mb,
         )?;
 
         {
@@ -5084,7 +5104,7 @@ impl GpuDecodeStore {
                 // Build dummy pointer array [w13p, w13s, w2p, w2s] on GPU
                 let dummy_base = *graph.d_dummy_expert.as_ref().unwrap().device_ptr();
                 let hs = graph.hidden_size;
-                let intermediate = graph.intermediate_size;
+                let intermediate = graph.moe_intermediate_size;
                 let gs = graph.group_size;
                 let w13_packed_bytes = (2 * intermediate * hs / 8) as u64;
                 let w13_scales_bytes = (2 * intermediate * hs / gs * 2 / 8) as u64;
@@ -5537,7 +5557,7 @@ impl GpuDecodeStore {
         let k = graph.kernels.as_ref()
             .ok_or_else(|| "Kernels not cached".to_string())?.clone();
 
-        let intermediate = graph.intermediate_size;
+        let intermediate = graph.moe_intermediate_size;
         let gs = graph.group_size;
         // Select inverse weight permutation based on expert quantization bits
         let inv_wp = if graph.expert_bits == 8 {
@@ -5748,7 +5768,7 @@ impl GpuDecodeStore {
                     unsafe {
                         k.scale_bf16.clone().launch(
                             LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                            (*graph.d_moe_out.device_ptr(), rsf, hs as i32),
+                            (*graph.d_moe_out.device_ptr(), *graph.d_moe_out.device_ptr(), rsf, hs as i32),
                         ).map_err(|e| format!("scale_bf16[{}]: {:?}", layer_idx, e))?;
                     }
                 }
@@ -9398,7 +9418,7 @@ impl GpuDecodeStore {
             .ok_or_else(|| format!("MoE layer {} not registered", layer_idx))?;
 
         let hs = graph.hidden_size;
-        let intermediate = graph.intermediate_size;
+        let intermediate = graph.moe_intermediate_size;
         let gs = graph.group_size;
         let topk = moe.topk;
         let ne = moe.num_experts;
@@ -12095,7 +12115,7 @@ impl GpuDecodeStore {
 
         let expert = &moe.experts[expert_id];
         let hs = graph.hidden_size;
-        let intermediate = graph.intermediate_size;
+        let intermediate = graph.moe_intermediate_size;
         let gs = graph.group_size;
         let w13_n = 2 * intermediate;
         let is_int8 = graph.expert_bits == 8;
@@ -12209,7 +12229,7 @@ impl GpuDecodeStore {
                 format!("MoE layer {} not registered", layer_idx)))?;
 
         let hs = graph.hidden_size;
-        let intermediate = graph.intermediate_size;
+        let intermediate = graph.moe_intermediate_size;
         let gs = graph.group_size;
         let topk = moe.topk;
         let ne = moe.num_experts;
@@ -13572,7 +13592,7 @@ impl GpuDecodeStore {
             self.configure(
                 hidden_size, num_layers, vocab_size, 1e-6,
                 topk, intermediate_size, hidden_size * 3, group_size,
-                store.gpu_num_bits,
+                store.gpu_num_bits, intermediate_size,
             )?;
         }
 
@@ -13919,7 +13939,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
-            store.gpu_num_bits,
+            store.gpu_num_bits, intermediate_size,
         )?;
 
         // Step 3: Upload gate weight for the target layer as FP32
@@ -14108,7 +14128,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
-            store.gpu_num_bits,
+            store.gpu_num_bits, intermediate_size,
         )?;
 
         // Register ALL MoE layers with synthetic gate weights
@@ -14371,7 +14391,6 @@ impl GpuDecodeStore {
         &mut self,
         ranking: Vec<(usize, usize)>,
         budget_mb: usize,
-        headroom_mb: usize,
     ) -> PyResult<String> {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
@@ -14391,30 +14410,9 @@ impl GpuDecodeStore {
         let align = 512usize;
         let slot_size = (expert_bytes + align - 1) & !(align - 1);
 
-        // Determine budget
-        let budget_bytes = if budget_mb > 0 {
-            budget_mb * 1024 * 1024
-        } else {
-            let (free, _total) = cudarc::driver::result::mem_get_info()
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("mem_get_info: {:?}", e)))?;
-            let headroom_bytes = headroom_mb * 1024 * 1024;
-            if free > headroom_bytes {
-                free - headroom_bytes
-            } else {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("Not enough VRAM: {} MB free, {} MB headroom",
-                        free / (1024 * 1024), headroom_mb)));
-            }
-        };
-
+        // Determine budget (0 = empty pool, used by tiered init for no-hard-pool case)
+        let budget_bytes = budget_mb * 1024 * 1024;
         let num_slots = budget_bytes / slot_size;
-        if num_slots == 0 {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                format!("Budget too small for even one expert ({} bytes need {} bytes)",
-                    budget_bytes, slot_size)));
-        }
-
         let pool_alloc_bytes = num_slots * slot_size;
 
         // Determine max experts per layer for bitset indexing
@@ -14430,15 +14428,20 @@ impl GpuDecodeStore {
             .map(|m| m.num_experts)
             .sum();
 
-        log::info!("HCS pool: allocating {:.1} MB ({} slots x {:.1} KB/slot)",
-            pool_alloc_bytes as f64 / (1024.0 * 1024.0),
-            num_slots, slot_size as f64 / 1024.0);
-
-        // Allocate the pool
-        let pool_buf = self.device.alloc_zeros::<u8>(pool_alloc_bytes)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("HCS pool alloc ({} MB): {:?}", pool_alloc_bytes / (1024 * 1024), e)))?;
-        let pool_base = *pool_buf.device_ptr();
+        // Allocate the pool (skip if 0 budget — empty hard pool for tiered init)
+        let (pool_buf_opt, pool_base) = if num_slots > 0 {
+            log::info!("HCS pool: allocating {:.1} MB ({} slots x {:.1} KB/slot)",
+                pool_alloc_bytes as f64 / (1024.0 * 1024.0),
+                num_slots, slot_size as f64 / 1024.0);
+            let buf = self.device.alloc_zeros::<u8>(pool_alloc_bytes)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("HCS pool alloc ({} MB): {:?}", pool_alloc_bytes / (1024 * 1024), e)))?;
+            let base = *buf.device_ptr();
+            (Some(buf), base)
+        } else {
+            log::info!("HCS pool: empty hard pool (0 budget), soft tier only");
+            (None, 0u64)
+        };
 
         let mut slot_to_expert: Vec<Option<(usize, usize)>> = vec![None; num_slots];
 
@@ -14541,7 +14544,7 @@ impl GpuDecodeStore {
         hcs.expert_vram_bytes = slot_size;
         hcs.vram_bytes = pool_alloc_bytes;
         hcs.num_cached = loaded;
-        hcs.pool_buf = Some(pool_buf);
+        hcs.pool_buf = pool_buf_opt;
         hcs.pool_slot_size = slot_size;
         hcs.pool_num_slots = num_slots;
         // Build free slot stack from unassigned slots (above next_slot + any failed slots)
@@ -14894,7 +14897,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
-            store.gpu_num_bits,
+            store.gpu_num_bits, intermediate_size,
         )?;
 
         // Step 3: Register ALL MoE layers with synthetic gate weights
@@ -15116,7 +15119,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
-            store.gpu_num_bits,
+            store.gpu_num_bits, intermediate_size,
         )?;
 
         let mut max_expert_bytes = 0usize;
@@ -15476,7 +15479,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
-            store.gpu_num_bits,
+            store.gpu_num_bits, intermediate_size,
         )?;
 
         let mut max_expert_bytes = 0usize;
@@ -15678,7 +15681,7 @@ impl GpuDecodeStore {
             };
             let inv_sp = *graph.d_inv_scale_perm.device_ptr();
             let hs = graph.hidden_size;
-            let intermediate = graph.intermediate_size;
+            let intermediate = graph.moe_intermediate_size;
             let gs = graph.group_size;
             let k = graph.kernels.as_ref().unwrap();
 
@@ -15905,7 +15908,7 @@ impl GpuDecodeStore {
             };
             let inv_sp = *graph.d_inv_scale_perm.device_ptr();
             let hs = graph.hidden_size;
-            let intermediate = graph.intermediate_size;
+            let intermediate = graph.moe_intermediate_size;
             let gs = graph.group_size;
             let k = graph.kernels.as_ref().unwrap();
             let hcs = graph.hcs.as_ref().unwrap();

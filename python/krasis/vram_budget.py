@@ -421,6 +421,11 @@ def compute_launcher_budget(
             prefill_chunk * top_k * 2 * moe_inter * 2 +  # cache13
             prefill_chunk * top_k * hidden * 2             # cache2
         )
+    # Dense MLP workspace: gate [M, inter] + up [M, inter] + cat [M, 2*inter], all bf16
+    # Peak when all 3 coexist before silu_and_mul: M * intermediate_size * 8 bytes
+    if dense_inter > 0:
+        dense_mlp_workspace_bytes = prefill_chunk * dense_inter * 8
+        prefill_workspace_bytes = max(prefill_workspace_bytes, dense_mlp_workspace_bytes)
 
     for rank_idx in range(num_ranks):
         rank_start = sum(pp_partition[:rank_idx])
