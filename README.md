@@ -27,18 +27,18 @@ Krasis can run large language models that are much too large to fit in a consume
 - **Most models (Qwen-3.5-35B at Q4 being the exception) are unable to entirely fit in GPU VRAM.** Krasis **streams through VRAM** as necessary using algorithms optimised for the prefill stage and then the decode stage.
 - Q4 model (BF16 attention, AWQ also supported for more limited VRAM cards)
 
-| Model                 | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)   |
-| :-------------------- | :----: | :-------------------: | ------------ | ------------- |
-| **Qwen3.5-35B-A3B**   |  35B   |     67 GB / 16GB      | 4475 tok/sec | 109.1 tok/sec |
-| **Qwen3-Coder-Next**  |  80B   |     159 GB / 38GB     | 3560 tok/sec | 70.3 tok/sec  |
-| **Qwen3.5-122B-A10B** |  122B  |     234 GB / 56GB     | 2897 tok/sec | 27.7 tok/sec  |
-| **Qwen3-235B-A22B**   |  235B  |    438 GB / 110GB     | 2124 tok/sec | 9.3 tok/sec   |
+| Model                 | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)   | Release |
+| :-------------------- | :----: | :-------------------: | ------------ | ------------- | ------- |
+| **Qwen3.5-35B-A3B**   |  35B   |     67 GB / 16GB      | 4475 tok/sec | 109.1 tok/sec | v0.1.63 |
+| **Qwen3-Coder-Next**  |  80B   |     159 GB / 38GB     | 3560 tok/sec | 70.3 tok/sec  | v0.1.63 |
+| **Qwen3.5-122B-A10B** |  122B  |     234 GB / 56GB     | 2897 tok/sec | 27.7 tok/sec  | v0.1.63 |
+| **Qwen3-235B-A22B**   |  235B  |    438 GB / 110GB     | 2124 tok/sec | 9.3 tok/sec   | v0.1.63 |
 
 ### 1x RTX 5080 16GB (PCIE 4.0)
 
-| Model                | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)  |
-| -------------------- | :----: | :-------------------: | ------------ | ------------ |
-| **Qwen3-Coder-Next** |  80B   |     159 GB / 38GB     | 1801 tok/sec | 26.8 tok/sec |
+| Model                | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)  | Release |
+| -------------------- | :----: | :-------------------: | ------------ | ------------ | ------- |
+| **Qwen3-Coder-Next** |  80B   |     159 GB / 38GB     | 1801 tok/sec | 26.8 tok/sec | v0.1.63 |
 
 ## Krasis tradeoffs
 
