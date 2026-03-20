@@ -9156,6 +9156,16 @@ impl GpuDecodeStore {
         let mut t_transfer_total = 0.0f64;
         let mut t_sample_total = 0.0f64;
 
+        // Per-GPU VRAM tracking: snapshot min free on each GPU during decode
+        let mut min_vram_free: Vec<usize> = vec![usize::MAX; num_gpus];
+        // Initial snapshot on GPU0
+        {
+            let mut free: usize = 0;
+            let mut _total: usize = 0;
+            unsafe { let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
+            min_vram_free[0] = free;
+        }
+
         // Initialize CUDA graph buffers on all stores
         let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
         {
@@ -9434,8 +9444,50 @@ impl GpuDecodeStore {
         let elapsed = decode_start.elapsed().as_secs_f64();
         if generated > 0 {
             let tps = generated as f64 / elapsed;
+
+            // Post-decode VRAM snapshot on all GPUs
+            // GPU0 (already bound from last step)
+            if let Err(_) = self.device.bind_to_thread() {} else {
+                let mut free: usize = 0;
+                let mut total: usize = 0;
+                unsafe { let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut total); }
+                if free < min_vram_free[0] { min_vram_free[0] = free; }
+            }
+            // Aux GPUs
+            for i in 0..num_aux {
+                let aux = unsafe { &mut *(aux_store_addrs[i] as *mut GpuDecodeStore) };
+                if let Err(_) = aux.device.bind_to_thread() {} else {
+                    let mut free: usize = 0;
+                    let mut total: usize = 0;
+                    unsafe { let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut total); }
+                    if free < min_vram_free[i + 1] { min_vram_free[i + 1] = free; }
+                }
+            }
+            // Re-bind GPU0 as the primary context
+            let _ = self.device.bind_to_thread();
+
+            // Update last_min_free on each store
+            let gpu0_min_mb = min_vram_free[0] / (1024 * 1024);
+            self.last_min_free_vram_mb = gpu0_min_mb;
+            for i in 0..num_aux {
+                let aux = unsafe { &mut *(aux_store_addrs[i] as *mut GpuDecodeStore) };
+                aux.last_min_free_vram_mb = min_vram_free[i + 1] / (1024 * 1024);
+            }
+
+            // Print per-GPU VRAM summary
+            let mut vram_parts: Vec<String> = Vec::with_capacity(num_gpus);
+            for g in 0..num_gpus {
+                let min_mb = min_vram_free[g] / (1024 * 1024);
+                vram_parts.push(format!("GPU{} {}MB min", g, min_mb));
+            }
+            eprintln!("  \x1b[32mdecode: {} tokens in {:.2}s ({:.1} tok/s)  VRAM: {}\x1b[0m",
+                generated, elapsed, tps, vram_parts.join(", "));
+
             log::info!("gpu_generate_stream_multi: {} tokens in {:.2}s ({:.1} tok/s)",
                 generated, elapsed, tps);
+            for g in 0..num_gpus {
+                log::info!("  GPU{} VRAM: min_free={} MB during decode", g, min_vram_free[g] / (1024 * 1024));
+            }
         }
         self.last_decode_elapsed = elapsed;
 

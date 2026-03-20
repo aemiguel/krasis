@@ -1619,11 +1619,19 @@ impl RustServer {
         let (min_free_vram_mb, mut hcs_loaded, mut hcs_total, _) = store.benchmark_stats();
 
         // Aggregate HCS stats from all aux stores (multi-GPU)
-        for &aux_addr in &self.aux_gpu_store_addrs {
+        // Also log per-GPU VRAM stats
+        if !self.aux_gpu_store_addrs.is_empty() {
+            log::info!("  GPU0: min_free={} MB, HCS {} loaded", min_free_vram_mb, hcs_loaded);
+        }
+        for (i, &aux_addr) in self.aux_gpu_store_addrs.iter().enumerate() {
             let aux_store = unsafe { &*(aux_addr as *const GpuDecodeStore) };
-            let (_, aux_loaded, aux_total, _) = aux_store.benchmark_stats();
+            let (aux_min_free, aux_loaded, aux_total, aux_pct) = aux_store.benchmark_stats();
             hcs_loaded += aux_loaded;
             hcs_total += aux_total;
+            if !self.aux_gpu_store_addrs.is_empty() {
+                log::info!("  GPU{}: min_free={} MB, HCS {}/{} ({:.1}%)",
+                    i + 1, aux_min_free, aux_loaded, aux_total, aux_pct);
+            }
         }
         let hcs_pct = if hcs_total > 0 { hcs_loaded as f64 / hcs_total as f64 * 100.0 } else { 0.0 };
 

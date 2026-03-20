@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-20 01:38:45
+Krasis Benchmark — 2026-03-20 07:30:29
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -26,25 +26,25 @@ Strategy:
   Mode:           gpu_decode (layer_grouped(2))
 
 Prefill (internal) — 6 runs at different lengths:
-  Run 1:  612.4 tok/s (1,000 tokens in 1633.0ms)
-  Run 2:  2,303.6 tok/s (5,000 tokens in 2170.5ms)
-  Run 3:  2,884.0 tok/s (10,000 tokens in 3467.4ms)
-  Run 4:  3,330.6 tok/s (20,000 tokens in 6004.8ms)
-  Run 5:  3,537.0 tok/s (35,000 tokens in 9895.4ms)
-  Run 6:  3,432.4 tok/s (50,000 tokens in 14567.2ms)
-  Best:   3,537.0 tok/s (35,000 tokens)
+  Run 1:  609.9 tok/s (1,000 tokens in 1639.7ms)
+  Run 2:  2,266.8 tok/s (5,000 tokens in 2205.8ms)
+  Run 3:  2,877.7 tok/s (10,000 tokens in 3475.0ms)
+  Run 4:  3,299.6 tok/s (20,000 tokens in 6061.4ms)
+  Run 5:  3,527.1 tok/s (35,000 tokens in 9923.2ms)
+  Run 6:  3,427.6 tok/s (50,000 tokens in 14587.5ms)
+  Best:   3,527.1 tok/s (35,000 tokens)
 
 Decode (internal) — 50/100/250 tokens, 3 separate prompts:
-   50 tokens: 39.73 tok/s (25.2ms/tok)
-  100 tokens: 40.25 tok/s (24.8ms/tok)
-  250 tokens: 39.68 tok/s (25.2ms/tok)
-  Best:    40.25 tok/s
-  HCS:     20154/24576 experts (82.0%)
-  Min free VRAM: 0 MB
+   50 tokens: 39.24 tok/s (25.5ms/tok)
+  100 tokens: 40.40 tok/s (24.8ms/tok)
+  250 tokens: 39.40 tok/s (25.4ms/tok)
+  Best:    40.40 tok/s
+  HCS:     19824/24576 experts (80.7%)
+  Min free VRAM: 676 MB
 
 Round trip (network) — 50/100/250 tokens via HTTP:
-   50 tokens: 72.17 tok/s (3.05s total)
-  100 tokens: 51.07 tok/s (4.28s total)
-  250 tokens: 43.04 tok/s (8.15s total)
-  Best:    72.17 tok/s
+   50 tokens: 71.48 tok/s (3.08s total)
+  100 tokens: 51.79 tok/s (4.31s total)
+  250 tokens: 42.99 tok/s (8.18s total)
+  Best:    71.48 tok/s
 ================================================================

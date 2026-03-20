@@ -1209,6 +1209,7 @@ def main():
         else:
             kv_per_layer_mb = 0
 
+        from krasis.attention import MarlinWeight as _MW
         for layer in _model.layers:
             layer_bytes = 0
             layer_bytes += layer.input_norm_weight.nelement() * layer.input_norm_weight.element_size()
@@ -1216,7 +1217,13 @@ def main():
             attn = layer.attention
             for attr_name in dir(attn):
                 val = getattr(attn, attr_name, None)
-                if isinstance(val, torch.Tensor) and val.device.type == 'cuda':
+                if isinstance(val, _MW):
+                    # MarlinWeight: count packed + scales GPU tensors
+                    if val.packed.is_cuda:
+                        layer_bytes += val.packed.nelement() * val.packed.element_size()
+                    if val.scales.is_cuda:
+                        layer_bytes += val.scales.nelement() * val.scales.element_size()
+                elif isinstance(val, torch.Tensor) and val.device.type == 'cuda':
                     layer_bytes += val.nelement() * val.element_size()
                 elif isinstance(val, tuple) and len(val) == 2:
                     for t in val:
@@ -1712,6 +1719,58 @@ def main():
             ) from e
 
         _status(f"Multi-GPU decode ready ({num_aux + 1} GPUs, splits={_multi_gpu_splits})")
+
+    # ── Final VRAM summary (all GPUs) ──
+    if num_gpus_available > 1 and args.hcs and _multi_gpu_splits:
+        gc.collect()
+        torch.cuda.empty_cache()
+        _status("VRAM allocation summary")
+        boundaries_final = [0] + list(_multi_gpu_splits) + [len(_model.layers)]
+        for gpu_i in range(num_gpus_available):
+            idx = device_indices[gpu_i]
+            total_vram = vram_monitor.total_mb(idx)
+            current_free = vram_monitor.current_free_mb(idx)
+            used = total_vram - current_free
+            seg_start = boundaries_final[gpu_i]
+            seg_end = boundaries_final[gpu_i + 1]
+            n_layers = seg_end - seg_start
+            # Count layer types
+            la_count = sum(1 for i in range(seg_start, seg_end) if _model.layers[i].layer_type == "linear_attention")
+            gqa_count = n_layers - la_count
+            moe_count = sum(1 for i in range(seg_start, seg_end) if _model.layers[i].is_moe)
+            # Estimate attention VRAM for this segment
+            seg_attn_mb = sum(_layer_vram_mb[j] for j in range(seg_start, seg_end))
+            # HCS info
+            if gpu_i == 0:
+                hcs_hard = gpu0_hard
+                hcs_soft = gpu0_soft
+                hcs_total = hcs_hard + hcs_soft
+                hcs_type = f"hard={hcs_hard:,}MB + soft={hcs_soft:,}MB"
+                # Prefill-only info
+                prefill_only_entries = getattr(_model, '_prefill_only_attn', [])
+                if prefill_only_entries:
+                    po_bytes = 0
+                    for _, _, _, mw in prefill_only_entries:
+                        po_bytes += mw.packed.nelement() * mw.packed.element_size()
+                        po_bytes += mw.scales.nelement() * mw.scales.element_size()
+                    po_mb = po_bytes / (1024 * 1024)
+                    _detail(f"  GPU{gpu_i} (cuda:{idx}): layers [{seg_start}..{seg_end}) = {n_layers} ({la_count}LA+{gqa_count}GQA, {moe_count}MoE)")
+                    _detail(f"    Attention (decode segment): {seg_attn_mb:.0f} MB (permanent, AWQ simple INT4)")
+                    _detail(f"    Attention (prefill-only):   {po_mb:.0f} MB (freed after prefill, reclaimed for HCS)")
+                    _detail(f"    HCS:   {hcs_type} = {hcs_total:,} MB total")
+                    _detail(f"    VRAM:  {used:,.0f} MB used / {total_vram:,} MB total ({current_free:,.0f} MB free)")
+                else:
+                    _detail(f"  GPU{gpu_i} (cuda:{idx}): layers [{seg_start}..{seg_end}) = {n_layers} ({la_count}LA+{gqa_count}GQA, {moe_count}MoE)")
+                    _detail(f"    Attention: {seg_attn_mb:.0f} MB")
+                    _detail(f"    HCS:   {hcs_type} = {hcs_total:,} MB total")
+                    _detail(f"    VRAM:  {used:,.0f} MB used / {total_vram:,} MB total ({current_free:,.0f} MB free)")
+            else:
+                aux_hcs_budget = gpu_hcs_budgets[gpu_i]
+                attn_type = "AWQ simple INT4" if args.attention_quant == "awq" else "BF16"
+                _detail(f"  GPU{gpu_i} (cuda:{idx}): layers [{seg_start}..{seg_end}) = {n_layers} ({la_count}LA+{gqa_count}GQA, {moe_count}MoE)")
+                _detail(f"    Attention: {seg_attn_mb:.0f} MB ({attn_type}, permanent)")
+                _detail(f"    HCS:   {aux_hcs_budget:,.0f} MB (100% hard, no prefill)")
+                _detail(f"    VRAM:  {used:,.0f} MB used / {total_vram:,} MB total ({current_free:,.0f} MB free)")
 
     # ── Server registry: write entry + register cleanup ──
     _write_registry(args.host, args.port, _model_name)

@@ -5374,6 +5374,7 @@ class KrasisModel:
 
         # Track which MarlinWeight attributes are "prefill-only" (outside decode segment)
         # These can be freed after prefill and re-uploaded before next prefill.
+        from krasis.attention import MarlinWeight
         self._prefill_only_attn = []  # [(layer_idx, attn, attr_name, MarlinWeight)]
         self._prefill_only_freed = False
 
@@ -5384,17 +5385,17 @@ class KrasisModel:
             if layer.layer_type == "linear_attention":
                 for attr_name in ("in_proj_qkvz", "in_proj_ba", "out_proj"):
                     mw = getattr(attn, attr_name, None)
-                    if mw is not None and hasattr(mw, '_fields'):  # MarlinWeight namedtuple
+                    if isinstance(mw, MarlinWeight):
                         self._prefill_only_attn.append((layer_idx, attn, attr_name, mw))
             elif hasattr(attn, 'kv_a_proj'):
                 for attr_name in ("q_a_proj", "q_b_proj", "q_proj", "kv_a_proj", "o_proj"):
                     mw = getattr(attn, attr_name, None)
-                    if mw is not None and hasattr(mw, '_fields'):
+                    if isinstance(mw, MarlinWeight):
                         self._prefill_only_attn.append((layer_idx, attn, attr_name, mw))
             else:
                 for attr_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
                     mw = getattr(attn, attr_name, None)
-                    if mw is not None and hasattr(mw, '_fields'):
+                    if isinstance(mw, MarlinWeight):
                         self._prefill_only_attn.append((layer_idx, attn, attr_name, mw))
 
         n_tensors = len(self._prefill_only_attn)
@@ -5402,9 +5403,8 @@ class KrasisModel:
             # Estimate VRAM that will be freed after prefill
             total_bytes = 0
             for _, _, _, mw in self._prefill_only_attn:
-                packed, scales, _, _, n, k = mw
-                total_bytes += packed.nelement() * packed.element_size()
-                total_bytes += scales.nelement() * scales.element_size()
+                total_bytes += mw.packed.nelement() * mw.packed.element_size()
+                total_bytes += mw.scales.nelement() * mw.scales.element_size()
             logger.info("Prefill-only attention: %d tensors for layers outside [%d, %d), "
                         "~%.0f MB freeable after prefill",
                         n_tensors, decode_start, decode_end, total_bytes / 1024 / 1024)
@@ -5425,13 +5425,14 @@ class KrasisModel:
         new_entries = []
 
         for layer_idx, attn, attr_name, mw in entries:
-            packed, scales, workspace, scalar_type, n, k = mw
+            packed = mw.packed
+            scales = mw.scales
             freed_bytes += packed.nelement() * packed.element_size()
             freed_bytes += scales.nelement() * scales.element_size()
             # Move to CPU (creates CPU copy, releases GPU tensor on next GC)
             packed_cpu = packed.cpu()
             scales_cpu = scales.cpu()
-            cpu_mw = MarlinWeight(packed_cpu, scales_cpu, workspace, scalar_type, n, k)
+            cpu_mw = MarlinWeight(packed_cpu, scales_cpu, mw.workspace, mw.scalar_type, mw.n, mw.k)
             # Clear GPU reference on attention module
             setattr(attn, attr_name, None)
             # Also remove from _marlin_attn_weights if tracked there
@@ -5470,20 +5471,19 @@ class KrasisModel:
         uploaded_bytes = 0
         new_entries = []
 
+        from krasis.attention import MarlinWeight
         for layer_idx, attn, attr_name, mw in entries:
-            packed_cpu, scales_cpu, workspace, scalar_type, n, k = mw
             # Re-upload to GPU
-            if packed_cpu.is_cuda:
+            if mw.packed.is_cuda:
                 # Already on GPU (shouldn't happen if freed, but be safe)
                 new_entries.append((layer_idx, attn, attr_name, mw))
                 continue
-            packed_gpu = packed_cpu.to(device, non_blocking=True)
-            scales_gpu = scales_cpu.to(device, non_blocking=True)
+            packed_gpu = mw.packed.to(device, non_blocking=True)
+            scales_gpu = mw.scales.to(device, non_blocking=True)
             uploaded_bytes += packed_gpu.nelement() * packed_gpu.element_size()
             uploaded_bytes += scales_gpu.nelement() * scales_gpu.element_size()
 
-            from krasis.attention import MarlinWeight
-            new_mw = MarlinWeight(packed_gpu, scales_gpu, workspace, scalar_type, n, k)
+            new_mw = MarlinWeight(packed_gpu, scales_gpu, mw.workspace, mw.scalar_type, mw.n, mw.k)
             setattr(attn, attr_name, new_mw)
             new_entries.append((layer_idx, attn, attr_name, new_mw))
 
