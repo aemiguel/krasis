@@ -1,0 +1,183 @@
+Sanity Test: Mistral-Small-4-119B-2603 @ http://127.0.0.1:8012
+Date: 2026-03-20T18:19:02.509293
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: Hello! How can I assist you today? 😊
+TIME: (pp: 16t 2.4s 7t/s - tg: 0t 533ms 22.5t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: I don't have a name.
+TIME: (pp: 36t 2.4s 15t/s - tg: 0t 315ms 22.2t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: I was trained by Mistral AI, a leading AI lab based in Paris.
+TIME: (pp: 50t 2.4s 21t/s - tg: 0t 724ms 22.1t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 2 + 2 equals 4.
+TIME: (pp: 22t 2.4s 9t/s - tg: 0t 357ms 22.4t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 4 * 10 = 40
+TIME: (pp: 40t 2.4s 17t/s - tg: 0t 405ms 22.2t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 40 / 5 = 8
+TIME: (pp: 59t 2.4s 25t/s - tg: 0t 384ms 20.9t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+- **Size**: It can reach lengths of up to **30 meters (98 feet)** and weigh as much as **200 tons (180 metric tonnes)**.
+- **Characteristics**: Blue whales are baleen whales, filter-feeding marine mammals that consume krill. They are found in oceans around the world and are known for their massive hearts, which can weigh as much as an small car, and their unique vocalizations that can travel long distances underwater.
+- **Comparison**: Even the largest dinosaur, the **Argentinosaurus**, was only about **30 meters long** and weighed around **70 tons**, making the blue whale not only the largest animal alive today but also one of the largest animals to have ever existed.
+
+### Additional Facts:
+- **Heart**: A blue whale's heart can weigh up to **600 kg (1,300 lbs)**.
+- **Vocalizations**: Their low-frequency sounds can be as loud as **188 decibels** and can be heard across oceans.
+- **Conservation**: Blue whales are an endangered species due to historical whaling and current threats like ship
+TIME: (pp: 24t 2.4s 10t/s - tg: 0t 12.2s 21.0t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: The largest body of water in the world is the **Pacific Ocean**.
+
+- **Surface Area**: Approximately **165.2 million square kilometers** (63.8 million square miles).
+- **Volume**: Roughly **710 million cubic kilometers** (170 million cubic miles).
+- **Location**: It extends from the Arctic Ocean in the north to the Southern Ocean in the south, bounded by Asia and Australia in the west and the Americas in the east.
+
+The Pacific Ocean is significantly larger than the **Atlantic Ocean** (the second-largest, with about **106.5 million square kilometers**) and the **Indian Ocean** (the third-largest, with about **70.6 million square kilometers**).
+TIME: (pp: 26t 2.4s 11t/s - tg: 0t 7.0s 21.6t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: The **Binary Chop Algorithm** (also known as **Binary Search**) is a highly efficient **divide-and-conquer** search technique used to locate a specific element in a **sorted array** or list. It works by repeatedly dividing the search interval in half, eliminating half of the elements from consideration based on comparisons with the target value, until the desired element is found or the interval is empty.
+
+---
+
+### 🔍 **Core Idea**
+- **Input**: A sorted array `arr` of `n` elements and a target value `x`.
+- **Output**: The index of `x` if found, otherwise `-1` (or `false` if using a boolean return).
+- **Time Complexity**: **O(log n)** — significantly faster than linear search **O(n)** for large arrays.
+- **Space Complexity**: **O(1)** — only a few variables are used, making it space-efficient.
+
+---
+
+### 📌 **Key Characteristics**
+1. **Sorted Data**: The array must be sorted in ascending (or descending) order for binary search to work.
+2. **Comparison-Based**: Uses comparisons to determine whether the target is in the left or right half of the current interval.
+3. **In-Place**: Operates
+TIME: (pp: 23t 2.4s 10t/s - tg: 0t 12.1s 21.0t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: Alright, let's tackle this problem step by step. The question is: "If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it takes for 20 towels to dry under the exact same conditions?"
+
+At first glance, this seems like a straightforward question about how long it takes for more towels to dry under the same conditions. But let's think carefully to understand what's being asked and how to approach it.
+
+### Understanding the Problem
+
+The key phrase here is "under the exact same conditions." This implies that the environment in which the towels are drying is identical in both scenarios. So, what does "drying on a clothesline in the sun" entail?
+
+1. **Space on the Clothesline**: The clothesline has a certain length or capacity. If it can hold 4 towels at a time, then drying 20 towels would require using the clothesline multiple times unless there's enough space to hang all 20 simultaneously.
+
+2. **Drying Time**: Each towel takes 4 hours to dry when hung on the clothesline in the sun. This suggests that the drying process is independent for each towel; that is, one towel doesn
+TIME: (pp: 55t 2.4s 23t/s - tg: 0t 12.4s 20.5t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: The **blue whale** (*Balaenoptera musculus*) is the **largest animal ever known to have existed** on Earth—even bigger than the biggest dinosaurs! Here are some fascinating facts about these magnificent creatures:
+
+### **Size & Physical Characteristics**
+- **Length:** Up to **100 feet (30 meters)**—as long as a **30-meter (100 ft) school bus** or **three buses stacked end-to-end**!
+- **Weight:** Around **200 tons (180 metric tonnes)**—heavier than **50 elephants** or **30 Tyrannosaurus rex**!
+- **Heart Size:** Their heart is the **largest of any animal**, weighing as much as a **car (400–600 lbs / 180–270 kg)**.
+- **Aorta Diameter:** The main artery from their heart is **wide enough for a human to swim through** (up to **9 inches / 23 cm** in diameter).
+- **Tongue Weight:** Their tongue alone can weigh **as much as an elephant** (around **2.7 tons / 2.4 metric tonnes**).
+- **Baby Size:**
+TIME: (pp: 22t 2.4s 9t/s - tg: 0t 12.2s 20.9t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: Whales are among the most fascinating and complex creatures on Earth, belonging to the order **Cetacea** (which includes both whales and dolphins). They are **mammals** (not fish!) and have evolved incredible adaptations for life in the ocean. Here’s a deep dive into **whales in general**:
+
+---
+
+### **🐋 General Whale Facts**
+1. **Mammalian Nature**
+   - Whales are **warm-blooded**, breathe air, nurse their young with milk, and have **hair** (though only a few species have visible hair as adults).
+   - They give **live birth** (unlike most fish, which lay eggs) and have **lungs** instead of gills.
+   - Whales nurse their calves underwater—**a baby whale can drink 50–100 gallons (190–380 liters) of milk per day**!
+
+2. **Evolution**
+   - Whales evolved from **land-dwelling mammals** (like hippos or even-toed ungulates) around **50 million years ago**.
+   - Their ancestors, such as *Pakicetus*, had **four legs** and looked more like a small deer than a whale.
+
+TIME: (pp: 288t 2.4s 118t/s - tg: 0t 13.9s 18.3t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: Whales inhabit **every ocean** on Earth, from the icy polar regions to the warm tropical waters, and can be found in both **deep offshore** and **coastal** zones. Their distribution depends on the species, feeding habits, and migration patterns. Here’s a breakdown of where different whale species live geographically:
+
+---
+
+### **🌍 Geographic Distribution of Whales**
+
+#### **🔹 Arctic Ocean (Cold, Ice-covered Waters)**
+- **Beluga Whale** (*Delphinapterus leucas*) – Found in **Arctic and sub-Arctic waters**, often in shallow coastal areas.
+- **Narwhal** (*Monodon monoceros*) – Lives in the **Arctic waters** of Canada, Greenland, and Russia.
+- **Bowhead Whale** (*Balaena mysticetus*) – **Arctic specialist**, found in the **Arctic Basin** (especially around Alaska, Canada, and Greenland).
+- **Polar Bear** (technically not a whale, but they hunt beluga and bowhead whales in Arctic waters).
+
+#### **🔹 Antarctic Ocean (Southern Ocean)**
+- **Blue Whale** (*Balaenoptera musculus*) – Mostly in the **Southern Ocean
+TIME: (pp: 553t 2.5s 225t/s - tg: 0t 15.7s 16.2t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: # QuickSort Implementation in Rust
+
+Here's a standard implementation of the quicksort algorithm in Rust:
+
+```rust
+fn quicksort<T: Ord>(arr: &mut [T]) {
+    if arr.len() <= 1 {
+        return;
+    }
+
+    let pivot = partition(arr);
+    quicksort(&mut arr[..pivot]);
+    quicksort(&mut arr[pivot + 1..]);
+}
+
+fn partition<T: Ord>(arr: &mut [T]) -> usize {
+    let len = arr.len();
+    let pivot_index = len / 2;
+    arr.swap(pivot_index, len - 1);
+    let pivot = &arr[len - 1];
+
+    let mut i = 0;
+    for j in 0..len - 1 {
+        if arr[j] <= pivot {
+            arr.swap(i, j);
+            i += 1;
+        }
+    }
+    arr.swap(i, len - 1);
+    i
+}
+
+fn main() {
+    let mut numbers = [9, 3, 7, 6, 2, 8, 5, 1, 4];
+    println!("Before: {:?}", numbers);
+    quicksort(&mut numbers);
+   
+TIME: (pp: 23t 2.4s 9t/s - tg: 0t 12.2s 20.9t/s)
+

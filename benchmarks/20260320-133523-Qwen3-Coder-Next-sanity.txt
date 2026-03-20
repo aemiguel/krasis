@@ -1,0 +1,207 @@
+Sanity Test: Qwen3-Coder-Next @ http://127.0.0.1:8012
+Date: 2026-03-20T13:35:23.277568
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: Hello! How can I help you today? 😊
+TIME: (pp: 9t 3.1s 3t/s - tg: 0t 321ms 34.3t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: I'm Qwen! 😊  
+I'm a large language model developed by Alibaba Cloud.  
+Nice to meet you—what would you like to chat about or explore together? 🌟
+TIME: (pp: 35t 3.2s 11t/s - tg: 0t 1.0s 37.3t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: I was trained by the **Tongyi Lab** team at **Alibaba Group**—a dedicated group of researchers, engineers, and AI experts who work on advancing large language models and natural language processing.
+
+My training involved vast amounts of text data (with strict privacy and ethical safeguards), along with cutting-edge techniques in machine learning and deep learning. I also underwent extensive fine-tuning to improve my reasoning, multilingual support, coding abilities, and helpfulness.
+
+If you're curious about how I learn, my capabilities, or even how I differ from other models—I’d be happy to share more! 🚀
+TIME: (pp: 88t 3.1s 28t/s - tg: 0t 3.3s 38.0t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 2 + 2 = **4**
+TIME: (pp: 15t 3.1s 5t/s - tg: 0t 245ms 32.6t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 4 × 10 = **40**
+TIME: (pp: 40t 3.1s 13t/s - tg: 0t 296ms 33.8t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 40 ÷ 5 = **8**
+TIME: (pp: 67t 3.1s 21t/s - tg: 0t 298ms 33.5t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: The **blue whale** (*Balaenoptera musculus*) is the largest animal ever known to have existed—both in terms of length and mass.
+
+- **Length**: Up to **30 meters (98 feet)**  
+- **Weight**: Up to **170 metric tons** (though some historical reports suggest even higher, up to ~180 tons)
+
+To put this in perspective:
+- Its tongue alone can weigh as much as an elephant.
+- Its heart is about the size of a small car and weighs around **180 kg (400 lbs)**.
+- A blue whale calf gains about **70 kg (150 lbs)** per day during its first year.
+
+Despite their immense size, blue whales feed almost exclusively on tiny shrimp-like animals called **krill**—consuming up to **4 tons of krill per day** during feeding season.
+
+They are currently listed as **Endangered** by the IUCN, primarily due to historical commercial whaling and ongoing threats like ship strikes and ocean noise.
+TIME: (pp: 17t 3.1s 5t/s - tg: 0t 5.7s 38.0t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: The **Pacific Ocean** is the largest body of water in the world.
+
+- **Surface area**: approximately **165,200,000 km²** (65,200,000 sq mi)  
+- **Volume**: about **700,000,000 km³**  
+- It covers more than half of the Earth’s surface and is larger than all of Earth’s landmasses combined.
+
+For comparison, the next largest is the **Atlantic Ocean**, with a surface area of about 76,700,000 km².
+TIME: (pp: 19t 3.1s 6t/s - tg: 0t 3.4s 37.9t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: The **binary chop algorithm**, more commonly known as **binary search**, is an efficient divide-and-conquer algorithm for finding a target value within a sorted array (or more generally, any sorted data structure). It works by repeatedly dividing the search interval in half, significantly reducing the number of comparisons needed compared to linear search.
+
+ Below is a comprehensive, in-depth explanation:
+
+---
+
+### **1. Core Principle**
+
+Binary search leverages the **sorted nature** of the input data. At each step, it compares the target value to the middle element of the current search interval:
+
+- If they are equal, the search is complete.
+- If the target is less than the middle element, the search continues in the **left half**.
+- If the target is greater, the search continues in the **right half**.
+
+This halving process continues until the target is found or the search interval becomes empty (indicating the target is not present).
+
+---
+
+### **2. Algorithm Steps (Iterative Version)**
+
+```text
+Input: 
+  - A sorted array A[0..n-1] (ascending order assumed)
+  - Target value T
+
+Procedure:
+  1. Set low = 0 (start index)
+  2. Set high = n - 
+TIME: (pp: 15t 3.2s 5t/s - tg: 0t 6.7s 37.8t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: This is a classic trick question!
+
+**Answer: 4 hours**
+
+Explanation:  
+The drying time depends on the **weather conditions and the drying surface**, not the number of towels — *as long as there’s enough space on the clothesline for all towels to be spread out and receive sunlight and airflow*.
+
+If 4 towels take 4 hours to dry under those conditions, and you have enough space to hang 20 towels (without overcrowding), then each towel still dries in **4 hours**, because drying is parallel — not dependent on quantity in series.
+
+So, **20 towels also take 4 hours** to dry under the same conditions — assuming the clothesline can accommodate them all simultaneously.
+
+⚠️ If the clothesline is too short and you have to dry them in batches, then it would take longer — but the question says “under the exact same conditions,” implying the setup (including line capacity) is unchanged.
+
+✅ So the answer is: **4 hours**.
+TIME: (pp: 46t 3.2s 15t/s - tg: 0t 5.4s 37.7t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: Here are some fascinating facts about the blue whale (*Balaenoptera musculus*—the largest animal to have ever lived):
+
+### 🐋 Size & Scale
+- **Largest animal ever**: Adults reach up to **30 meters (98 feet)** in length and weigh **180 metric tons (200 short tons)**—equivalent to about 25 African elephants.
+- A newborn calf is already **7 meters (23 feet)** long and weighs **2–3 tons**—roughly the size of a small elephant.
+- The tongue alone weighs **~2 tons**, and a blue whale’s heart is about the size of a small car (~1.5 tons, 1.8 meters long), beating at ~10–100 BPM depending on activity.
+
+### 🐋 Feeding & Diet
+- Despite their massive size, blue whales feed almost exclusively on **krill** (tiny shrimp-like crustaceans, 1–2 cm long).
+- An adult can consume up to **4 tons of krill per day** during feeding season.
+- They use **lunge feeding**: accelerate toward dense krill patches, open their mouths wide (gular pleats expand to accommodate huge volumes
+TIME: (pp: 15t 3.1s 5t/s - tg: 0t 6.8s 37.7t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: Absolutely! Whales are among the most awe-inspiring and intelligent creatures on Earth. Here's a comprehensive overview of whales in general—covering their biology, diversity, behavior, and conservation:
+
+---
+
+### 🐋 **What Are Whales?**
+Whales are **marine mammals** belonging to the infraorder **Cetacea**, which includes:
+- **Toothed whales** (Odontoceti): e.g., sperm whales, orcas, dolphins, porpoises  
+- **Baleen whales** (Mysticeti): e.g., blue whales, humpbacks, gray whales  
+
+Key traits:
+- Warm-blooded (endothermic)
+- Breath air through lungs (must surface to breathe)
+- Give live birth and nurse young with milk
+- Have hair (at some life stage—often just a few sensory bristles)
+- Evolved from land mammals ~50 million years ago (e.g., *Pakicetus*, a wolf-sized ancestor)
+
+---
+
+### 🐬 **Types of Whales: A Quick Breakdown**
+
+| Group | Key Features | Examples |
+|-------|--------------|----------|
+| **Toothed Whales** | Have teeth (or baleen in rare exceptions), use echolocation,
+TIME: (pp: 288t 3.1s 92t/s - tg: 0t 6.9s 37.0t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: Whales are found in **every ocean on Earth**—from the tropics to the polar regions—and even in some seas and estuaries—but their distribution varies significantly by species, season, and life stage. Here’s a detailed look at where whales live geographically:
+
+---
+
+### 🌍 **Global Distribution Overview**
+
+#### ✅ **Cosmopolitan Species (Found Worldwide)**
+- **Humpback whales** (*Megaptera novaeangliae*):  
+  - Migrate globally—breeding in tropical/subtropical waters (e.g., Hawaii, Caribbean, Polynesia), feeding in cold polar/subpolar seas (e.g., Antarctic, North Pacific, Arctic).
+  - One of the most widespread whales, occurring in all major oceans.
+
+- **Minke whales** (*Balaenoptera acutorostrata* & *B. borealis*):  
+  - Found in both polar and temperate waters—e.g., Antarctic minke in the Southern Ocean, common minke in North Atlantic/Pacific.
+
+- **Sperm whales** (*Physeter macrocephalus*):  
+  - Deep-ocean dwellers—avoid continental shelves. Found from equator to ~50° latitude in both hem
+TIME: (pp: 561t 3.2s 178t/s - tg: 0t 6.9s 37.1t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: Here's a clean, idiomatic in-place quicksort implementation in Rust. It uses the Lomuto partition scheme and includes a small optimization for insertion sort on tiny subarrays.
+
+```rust
+pub fn quicksort<T: Ord + Clone + Copy + ?Sized>(arr: &mut [T]) {
+    // Use insertion sort for small arrays (optimization)
+    const INSERTION_SORT_THRESHOLD: usize = 16;
+
+    fn insertion_sort<T: Ord + Copy + ?Sized>(arr: &mut [T]) {
+        for i in 1..arr.len() {
+            let mut j = i as i32;
+            while j > 0 && arr[j as usize] < arr[(j - 1) as usize] {
+                arr.swap(j as usize, (j - 1) as usize);
+                j -= 1;
+            }
+        }
+    }
+
+    fn partition<T: Ord + Copy + ?Sized>(arr: &mut [T], lo: usize, hi: usize) -> usize {
+        // Pivot: last element
+        let pivot = arr[hi];
+        let mut i = lo;
+        for j in lo..hi {
+            if arr[j] <= pivot {
+                arr.swap
+TIME: (pp: 16t 3.1s 5t/s - tg: 0t 6.8s 37.7t/s)
+

@@ -34,6 +34,15 @@ def _run(cmd, check=True, **kwargs):
     return subprocess.run(cmd, check=check, **kwargs)
 
 
+# Package approval mode — set during main(), used by _install_system_deps
+_auto_approve = False
+
+
+def _pkg_flag():
+    """Return ['-y'] if auto-approve, else [] so the package manager prompts."""
+    return ["-y"] if _auto_approve else []
+
+
 def _has_nvidia_gpu():
     """Check if an NVIDIA GPU is present."""
     if not shutil.which("nvidia-smi"):
@@ -197,6 +206,52 @@ def _need_python_dev():
     return True
 
 
+def _show_required_packages():
+    """Show what packages are needed without installing anything."""
+    print(f"\n{BOLD}Required packages:{NC}\n")
+
+    nvcc_ver = _get_nvcc_version()
+    required_ver = _get_required_cuda_version()
+    need_nvcc = nvcc_ver is None or nvcc_ver < required_ver
+    need_ninja = not shutil.which("ninja") and not shutil.which("ninja-build")
+    need_pydev = _need_python_dev()
+
+    distro, _ = _detect_distro()
+
+    if not need_nvcc and not need_ninja and not need_pydev:
+        print(f"  {GREEN}All system packages already installed.{NC}")
+    else:
+        if need_nvcc:
+            cuda_pkg = f"cuda-toolkit-{required_ver[0]}-{required_ver[1]}"
+            if nvcc_ver:
+                print(f"  • {cuda_pkg}  (have nvcc {nvcc_ver[0]}.{nvcc_ver[1]}, need {required_ver[0]}.{required_ver[1]}+)")
+            else:
+                print(f"  • {cuda_pkg}")
+        if need_ninja:
+            print(f"  • ninja-build")
+        if need_pydev:
+            py_ver_dot = f"{sys.version_info.major}.{sys.version_info.minor}"
+            print(f"  • python{py_ver_dot}-dev")
+
+    # Check Python packages
+    try:
+        import torch
+        has_torch = torch.cuda.is_available()
+    except ImportError:
+        has_torch = False
+    if not has_torch:
+        _, cu_ver = _get_cuda_version_from_driver()
+        print(f"  • torch (CUDA {cu_ver}) — pip install torch --index-url https://download.pytorch.org/whl/cu{''.join(cu_ver.split('.'))}")
+
+    for pip_name, import_name in [("flashinfer-python", "flashinfer"), ("sgl-kernel", "sgl_kernel"), ("sglang", "sglang")]:
+        try:
+            __import__(import_name)
+        except ImportError:
+            print(f"  • {pip_name} — pip install {pip_name}")
+
+    print(f"\n  Install these manually, then re-run {BOLD}krasis-setup{NC}.\n")
+
+
 def _install_system_deps():
     """Install system packages: CUDA toolkit (nvcc), ninja, and python-dev headers."""
     print(f"\n{BOLD}Step 1: System Packages (nvcc, ninja, python-dev){NC}")
@@ -248,9 +303,9 @@ def _install_system_deps():
     if apt_pkgs or dnf_pkgs:
         if distro == "debian":
             _run(sudo + ["apt-get", "update", "-qq"], check=False)
-            ret = _run(sudo + ["apt-get", "install", "-y"] + apt_pkgs, check=False)
+            ret = _run(sudo + ["apt-get", "install"] + _pkg_flag() + apt_pkgs, check=False)
         elif distro == "rhel":
-            ret = _run(sudo + ["dnf", "install", "-y"] + dnf_pkgs, check=False)
+            ret = _run(sudo + ["dnf", "install"] + _pkg_flag() + dnf_pkgs, check=False)
         else:
             ret = type("R", (), {"returncode": 1})()
         if ret.returncode != 0:
@@ -271,9 +326,10 @@ def _install_system_deps():
         )
         print(f"  Adding NVIDIA CUDA {required_ver[0]}.{required_ver[1]} repository...")
 
-        # Remove old distro nvcc if present
+        # Remove old distro nvcc if present — always prompt for removals
         if nvcc_too_old:
-            _run(sudo + ["apt-get", "remove", "-y", "nvidia-cuda-toolkit"], check=False)
+            print(f"  {YELLOW}Will remove old nvidia-cuda-toolkit before installing new version.{NC}")
+            _run(sudo + ["apt-get", "remove"] + _pkg_flag() + ["nvidia-cuda-toolkit"], check=False)
 
         # Download and install keyring
         import tempfile
@@ -300,11 +356,11 @@ def _install_system_deps():
 
             if repo_ok:
                 # Try exact version first, fall back to major meta-package
-                ret = _run(sudo + ["apt-get", "install", "-y", cuda_pkg], check=False)
+                ret = _run(sudo + ["apt-get", "install"] + _pkg_flag() + [cuda_pkg], check=False)
                 if ret.returncode != 0:
                     fallback_pkg = f"cuda-toolkit-{required_ver[0]}"
                     print(f"  {YELLOW}{cuda_pkg} not found, trying {fallback_pkg}...{NC}")
-                    ret = _run(sudo + ["apt-get", "install", "-y", fallback_pkg], check=False)
+                    ret = _run(sudo + ["apt-get", "install"] + _pkg_flag() + [fallback_pkg], check=False)
                 if ret.returncode == 0:
                     cuda_installed = True
             else:
@@ -352,11 +408,11 @@ def _install_system_deps():
 
     elif need_nvcc and distro == "rhel":
         cuda_pkg = f"cuda-toolkit-{required_ver[0]}-{required_ver[1]}"
-        ret = _run(sudo + ["dnf", "install", "-y", cuda_pkg], check=False)
+        ret = _run(sudo + ["dnf", "install"] + _pkg_flag() + [cuda_pkg], check=False)
         if ret.returncode != 0:
             fallback_pkg = f"cuda-toolkit-{required_ver[0]}"
             print(f"  {YELLOW}{cuda_pkg} not found, trying {fallback_pkg}...{NC}")
-            ret = _run(sudo + ["dnf", "install", "-y", fallback_pkg], check=False)
+            ret = _run(sudo + ["dnf", "install"] + _pkg_flag() + [fallback_pkg], check=False)
             if ret.returncode != 0:
                 print(f"  {YELLOW}Could not install {cuda_pkg} via dnf, checking if nvcc is already available...{NC}")
 
@@ -516,9 +572,9 @@ def _install_session_deps():
         print(f"  {YELLOW}Node.js not found. Installing...{NC}")
         if distro == "debian":
             _run(sudo + ["apt-get", "update", "-qq"], check=False)
-            ret = _run(sudo + ["apt-get", "install", "-y", "nodejs", "npm"], check=False)
+            ret = _run(sudo + ["apt-get", "install"] + _pkg_flag() + ["nodejs", "npm"], check=False)
         elif distro == "rhel":
-            ret = _run(sudo + ["dnf", "install", "-y", "nodejs", "npm"], check=False)
+            ret = _run(sudo + ["dnf", "install"] + _pkg_flag() + ["nodejs", "npm"], check=False)
         else:
             ret = type("R", (), {"returncode": 1})()
         if ret.returncode != 0:
@@ -538,9 +594,9 @@ def _install_session_deps():
         # Bun's installer requires unzip — install it if missing (common on fresh WSL2)
         if not shutil.which("unzip"):
             if distro == "debian":
-                _run(sudo + ["apt-get", "install", "-y", "unzip"], check=False)
+                _run(sudo + ["apt-get", "install"] + _pkg_flag() + ["unzip"], check=False)
             elif distro == "rhel":
-                _run(sudo + ["dnf", "install", "-y", "unzip"], check=False)
+                _run(sudo + ["dnf", "install"] + _pkg_flag() + ["unzip"], check=False)
         # Bun's official installer doesn't need sudo — installs to ~/.bun
         ret = _run(["bash", "-c", "curl -fsSL https://bun.sh/install | bash"], check=False)
         if ret.returncode != 0:
@@ -567,6 +623,8 @@ def _install_session_deps():
 
 
 def main():
+    global _auto_approve
+
     print(f"\n{BOLD}{CYAN}Krasis Setup{NC}")
     print(f"{DIM}{'─' * 50}{NC}\n")
 
@@ -582,7 +640,32 @@ def main():
         print(f"    sudo apt install nvidia-driver-560  # or newer")
         sys.exit(1)
 
-    print(f"NVIDIA GPU detected.")
+    print(f"NVIDIA GPU detected.\n")
+
+    # Ask about package approval mode
+    print(f"  Krasis may need to install or upgrade system packages")
+    print(f"  (CUDA toolkit, ninja, python-dev, etc).\n")
+    print(f"  Options:")
+    print(f"    {BOLD}[A]{NC} Auto-approve all package installations")
+    print(f"    {BOLD}[R]{NC} Review each installation before it proceeds")
+    print(f"    {BOLD}[M]{NC} Manual — show what's needed, install nothing\n")
+    try:
+        answer = input(f"  Package install mode? [A/r/m] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "a"
+
+    if answer.startswith("m"):
+        print(f"\n  {YELLOW}Manual mode — will show required packages but not install them.{NC}")
+        print(f"  You can re-run krasis-setup after installing them yourself.\n")
+        _auto_approve = False
+        _show_required_packages()
+        return
+    elif answer.startswith("r"):
+        print(f"\n  {CYAN}Review mode — each package install will show its plan for your approval.{NC}\n")
+        _auto_approve = False
+    else:
+        print(f"\n  {CYAN}Auto-approve mode — packages will be installed without prompting.{NC}\n")
+        _auto_approve = True
 
     results = {}
 

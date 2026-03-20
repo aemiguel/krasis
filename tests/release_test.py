@@ -52,7 +52,6 @@ SUPPORTED_MODELS = [
 
 CONFIG_VARIANTS = [
     {"name": "INT4/INT4 BF16",  "gpu_bits": 4, "cpu_bits": 4, "attention": "bf16"},
-    {"name": "INT8/INT8 BF16",  "gpu_bits": 8, "cpu_bits": 8, "attention": "bf16"},
     {"name": "INT4/INT4 AWQ",   "gpu_bits": 4, "cpu_bits": 4, "attention": "awq"},
     {"name": "INT8/INT8 AWQ",   "gpu_bits": 8, "cpu_bits": 8, "attention": "awq"},
     # Multi-GPU variant — skipped automatically if only 1 GPU available
@@ -172,6 +171,39 @@ def get_num_layers(config: Dict) -> int:
     return text_config.get("num_hidden_layers", 0)
 
 
+def estimate_total_params_b(config: Dict) -> float:
+    """Estimate total model parameters in billions from config.json dimensions.
+
+    Computes from: attention params + MoE expert params + shared/dense MLP params.
+    This is an approximation but accurate enough for the >200B threshold.
+    """
+    tc = config.get("text_config", config)
+    layers = tc.get("num_hidden_layers", 0)
+    hidden = tc.get("hidden_size", 0)
+    num_experts = tc.get("num_experts", 0)
+    moe_inter = tc.get("moe_intermediate_size", tc.get("intermediate_size", 0))
+    num_heads = tc.get("num_attention_heads", 0)
+    num_kv_heads = tc.get("num_key_value_heads", num_heads)
+    head_dim = hidden // num_heads if num_heads > 0 else 0
+
+    if layers == 0 or hidden == 0:
+        return 0.0
+
+    # Per-layer attention: Q + K + V + O projections
+    attn_params = hidden * (num_heads * head_dim) + hidden * (num_kv_heads * head_dim) * 2 + (num_heads * head_dim) * hidden
+
+    # Per-layer MoE experts: gate + up + down per expert
+    expert_params = num_experts * 3 * hidden * moe_inter if num_experts > 0 else 0
+
+    # Shared expert (if present, typically same size as one MoE expert)
+    shared_inter = tc.get("shared_expert_intermediate_size", 0)
+    shared_params = 3 * hidden * shared_inter if shared_inter > 0 else 0
+
+    total_per_layer = attn_params + expert_params + shared_params
+    total = total_per_layer * layers
+    return total / 1e9
+
+
 def generate_config(model_name: str, variant: Dict, gpu_idx: int,
                     num_layers: int, all_gpu_indices: Optional[List[int]] = None) -> str:
     """Generate a temporary config file. Returns path to temp file.
@@ -227,17 +259,21 @@ def cache_exists(model_name: str, gpu_bits: int, cpu_bits: int) -> bool:
 
 
 def build_caches(model_name: str, gpu_idx: int, num_layers: int,
-                 log_dir: str, force: bool = False) -> Dict[int, bool]:
+                 log_dir: str, force: bool = False,
+                 skip_int8: bool = False) -> Dict[int, bool]:
     """Build expert caches for all required bit-widths before running tests.
 
     Launches krasis with --build-cache for each unique bit-width (INT4 and INT8).
     If cache already exists and force=False, skips building.
+    If skip_int8=True, INT8 caches are not built.
 
     Returns dict mapping bits -> success.
     """
     # Collect unique bit-widths needed across all config variants
     needed_bits = set()
     for variant in CONFIG_VARIANTS:
+        if skip_int8 and variant["gpu_bits"] == 8:
+            continue
         needed_bits.add(variant["gpu_bits"])  # gpu_bits == cpu_bits in our configs
 
     results = {}
@@ -1168,6 +1204,9 @@ def main():
     if num_layers == 0:
         die("Could not determine num_hidden_layers from config.json")
 
+    total_params_b = estimate_total_params_b(model_config)
+    skip_int8 = total_params_b > 200.0
+
     # Detect GPUs
     gpu_idx, gpu_name, gpu_vram = detect_best_gpu()
     all_gpus = detect_all_gpus()
@@ -1176,17 +1215,25 @@ def main():
     # Find krasis command
     krasis_cmd = find_krasis_command()
 
-    info(f"Model: {model_name} ({num_layers} layers)")
+    info(f"Model: {model_name} ({num_layers} layers, ~{total_params_b:.0f}B params)")
+    if skip_int8:
+        info("INT8 configs skipped (model >200B params — INT8 cache too large)")
     info(f"GPU: {gpu_name} ({gpu_vram} MB, index {gpu_idx})")
     if len(all_gpus) > 1:
         gpu_summary = ", ".join(f"{g[1]} ({g[2]} MB)" for g in all_gpus)
         info(f"All GPUs: {gpu_summary}")
     info(f"Krasis: {krasis_cmd}")
-    # Count active variants (skip multi-GPU if only 1 GPU)
+    # Count active variants (skip multi-GPU if only 1 GPU, skip INT8 if >200B)
     active_variants = [v for v in CONFIG_VARIANTS
-                       if not v.get("multi_gpu") or len(all_gpus) > 1]
+                       if (not v.get("multi_gpu") or len(all_gpus) > 1)
+                       and (not skip_int8 or v["gpu_bits"] != 8)]
+    skip_reasons = []
+    if len(all_gpus) <= 1 and any(v.get("multi_gpu") for v in CONFIG_VARIANTS):
+        skip_reasons.append("multi-GPU skipped: only 1 GPU")
+    if skip_int8:
+        skip_reasons.append("INT8 skipped: >200B params")
     info(f"Configs: {len(active_variants)} variants"
-         f"{' (multi-GPU skipped: only 1 GPU)' if len(active_variants) < len(CONFIG_VARIANTS) else ''}")
+         f"{' (' + ', '.join(skip_reasons) + ')' if skip_reasons else ''}")
 
     # Prepare output directory
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1208,7 +1255,8 @@ def main():
     print(f"{'=' * 64}\n")
 
     cache_results = build_caches(model_name, gpu_idx, num_layers, output_dir,
-                                 force=args.force_rebuild_cache)
+                                 force=args.force_rebuild_cache,
+                                 skip_int8=skip_int8)
 
     cache_ok = all(cache_results.values())
     if cache_ok:
@@ -1220,7 +1268,8 @@ def main():
 
     # ── Pre-flight: build AWQ template ──────────────────────────
 
-    needs_awq = any(v["attention"] == "awq" for v in CONFIG_VARIANTS)
+    needs_awq = any(v["attention"] == "awq" and (not skip_int8 or v["gpu_bits"] != 8)
+                    for v in CONFIG_VARIANTS)
     if needs_awq:
         print(f"{'=' * 64}")
         info("Phase 0b: Building AWQ template (if needed)")
@@ -1251,6 +1300,13 @@ def main():
         if variant.get("multi_gpu") and len(all_gpus) <= 1:
             result["error"] = "Multi-GPU skipped — only 1 GPU available"
             warn("Skipping (need 2+ GPUs for multi-GPU test)")
+            config_results.append(result)
+            continue
+
+        # Skip INT8 configs for models >200B params
+        if skip_int8 and variant["gpu_bits"] == 8:
+            result["error"] = f"INT8 skipped — model is ~{total_params_b:.0f}B params (>200B)"
+            warn("Skipping (INT8 too large for >200B model)")
             config_results.append(result)
             continue
 

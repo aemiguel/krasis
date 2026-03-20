@@ -3934,11 +3934,12 @@ class KrasisModel:
         store.set_final_norm(self.final_norm.data_ptr(), self.cfg.hidden_size)
 
         # Register LM head (always as BF16 for cuBLAS GEMV compatibility)
+        # Dequantize on CPU to avoid OOM on GPU0 (float32 intermediate can be ~3 GB for large vocabs)
         lm_head_w = self.lm_head_data
         if isinstance(lm_head_w, tuple):
-            # INT8 (weight, scale) — dequantize to BF16 for Rust decode
+            # INT8 (weight, scale) — dequantize to BF16 on CPU, then copy to GPU
             w_int8, scale = lm_head_w
-            lm_head_bf16 = (w_int8.float() * scale.unsqueeze(1)).to(torch.bfloat16).contiguous()
+            lm_head_bf16 = (w_int8.cpu().float() * scale.cpu().unsqueeze(1)).to(torch.bfloat16).contiguous().to(device)
             self._rust_lm_head = lm_head_bf16  # prevent GC
             lm_head_ptr = lm_head_bf16.data_ptr()
             lm_head_rows = lm_head_bf16.shape[0]

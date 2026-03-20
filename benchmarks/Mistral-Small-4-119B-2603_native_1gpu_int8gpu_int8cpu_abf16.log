@@ -1,0 +1,50 @@
+================================================================
+Krasis Benchmark — 2026-03-20 18:34:44
+================================================================
+Model:            Mistral-Small-4-119B-2603
+Architecture:     mistral4, 36 layers, 128 experts, top-4
+PP Partition:     [36] (1 GPUs)
+
+Hardware:
+  CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
+  RAM:            1007 GB total, 120.9 GB used by process
+  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 7331 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
+
+Quantization:
+  GPU experts:    INT8 (Marlin)
+  CPU experts:    INT8
+  Attention:      BF16
+  Shared expert:  INT8
+  Dense MLP:      INT8
+  LM head:        INT8
+  KV cache:       FP8 E4M3
+
+Strategy:
+  Layer group size: 2 (layer_grouped(2))
+  Prefill threshold: 1
+  Mode:           gpu_decode (layer_grouped(2))
+
+Prefill (internal) — 6 runs at different lengths:
+  Run 1:  208.3 tok/s (1,000 tokens in 4801.3ms)
+  Run 2:  926.6 tok/s (5,000 tokens in 5396.1ms)
+  Run 3:  1,484.1 tok/s (10,000 tokens in 6738.3ms)
+  Run 4:  1,853.3 tok/s (20,000 tokens in 10791.8ms)
+  Run 5:  1,699.0 tok/s (35,000 tokens in 20600.2ms)
+  Run 6:  1,431.7 tok/s (50,000 tokens in 34923.9ms)
+  Best:   1,853.3 tok/s (20,000 tokens)
+
+Decode (internal) — 50/100/250 tokens, 3 separate prompts:
+   50 tokens: 11.32 tok/s (88.3ms/tok)
+  100 tokens: 11.40 tok/s (87.7ms/tok)
+  250 tokens: 11.42 tok/s (87.6ms/tok)
+  Best:    11.42 tok/s
+  HCS:     768/4608 experts (16.7%)
+  Min free VRAM: 798 MB
+
+Round trip (network) — 50/100/250 tokens via HTTP:
+   50 tokens: 19.27 tok/s (9.53s total)
+  100 tokens: 14.44 tok/s (13.81s total)
+  250 tokens: 12.54 tok/s (26.91s total)
+  Best:    19.27 tok/s
+================================================================

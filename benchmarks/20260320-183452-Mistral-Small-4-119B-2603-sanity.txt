@@ -1,0 +1,154 @@
+Sanity Test: Mistral-Small-4-119B-2603 @ http://127.0.0.1:8012
+Date: 2026-03-20T18:34:52.400252
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: Hello! How can I assist you today? 😊
+TIME: (pp: 16t 4.7s 3t/s - tg: 0t 1.2s 9.7t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: I don't have a name, but you can call me **Assistant** or **AI Helper**! How can I assist you today? 😊
+TIME: (pp: 36t 4.7s 8t/s - tg: 0t 2.8s 11.0t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: I was trained by Mistral AI, a leading AI lab based in Paris.
+TIME: (pp: 74t 4.7s 16t/s - tg: 0t 1.6s 10.1t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 2 + 2 = 4
+TIME: (pp: 22t 4.7s 5t/s - tg: 0t 831ms 8.4t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 4 × 10 = 40
+TIME: (pp: 39t 4.7s 8t/s - tg: 0t 994ms 9.1t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 40 ÷ 5 = 8
+TIME: (pp: 58t 4.7s 12t/s - tg: 0t 999ms 9.0t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: The largest animal in the world is the **blue whale** (*Balaenoptera musculus*). It can reach lengths of up to **30 meters (98 feet)** and weigh as much as **200 tons (180 metric tonnes)**.
+
+Adult blue whales can grow longer than a basketball court and weigh more than most large dinosaurs. Their hearts alone can weigh as much as an elephant, and their tongues can weigh as much as a car. Blue whales are found in oceans around the world and are baleen whales, feeding mainly on tiny krill.
+TIME: (pp: 24t 4.7s 5t/s - tg: 0t 10.1s 11.6t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: The largest body of water in the world is the **Pacific Ocean**, covering approximately **63 million square miles (165 million square kilometers)**. It spans from the Arctic Ocean in the north to the Southern Ocean in the south, and is bordered by Asia and Australia on the west and the Americas on the east.
+
+The Pacific Ocean is also the **deepest** ocean, with an average depth of about **14,000 feet (4,280 meters)** and its deepest point, the **Mariana Trench**, reaching **36,070 feet (10,994 meters)** below sea level.
+
+The **Atlantic Ocean** is the second-largest, followed by the **Indian Ocean**, **Southern Ocean**, and **Arctic Ocean**.
+
+Would you like details on any specific ocean or its features?
+TIME: (pp: 26t 4.7s 6t/s - tg: 0t 15.1s 11.5t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: The **Binary Chop Algorithm** (also known as **Binary Search**) is a highly efficient **divide-and-conquer** searching algorithm used to locate a target value within a **sorted array** or list. It works by repeatedly dividing the search interval in half, eliminating half of the remaining elements each time, until the target is found or the interval is narrowed to a single element.
+
+### **Key Characteristics of Binary Search:**
+1. **Requires a sorted dataset** – The array must be sorted in ascending or descending order for binary search to work.
+2. **Time Complexity** – \(O(\log n)\), where \(n\) is the number of elements in the array. This is much faster than linear search (\(O(n)\)).
+3. **Space Complexity** – \(O(1)\) (iterative) or \(O(\log n)\) (recursive, due to call stack).
+4. **Works on any sorted sequence** – Can be applied to arrays, lists, or even more complex data structures (e.g., binary search trees).
+
+---
+
+### **How Binary Search Works (Step-by-Step):**
+1. **Initialize Pointers** – Start with two pointers, `low` and `high`, representing the current search range.
+  
+TIME: (pp: 23t 4.7s 5t/s - tg: 0t 22.0s 11.6t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: The drying time for clothes on a clothesline is primarily determined by environmental conditions such as sunlight, humidity, wind speed, and temperature, rather than the number of towels being dried. Since all 20 towels are under the exact same conditions as the 4 towels, they will also take 4 hours to dry.
+
+**Final Answer:** It takes 4 hours for 20 towels to dry under the same conditions.
+TIME: (pp: 55t 4.7s 12t/s - tg: 0t 7.8s 11.4t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: The **blue whale** (*Balaenoptera musculus*) is the **largest animal ever known to have existed on Earth**—bigger than the biggest dinosaurs and even larger than the largest extinct whale species, the **perucetus colossus** (a newly discovered fossil whale that may have rivaled the blue whale in size). Here are some fascinating facts about this magnificent creature:
+
+### **Size & Physical Characteristics**
+1. **Record-Breaking Size** – Blue whales can reach lengths of **up to 100 feet (30 meters)** and weigh **as much as 200 tons (180 metric tons)**, making them longer than three school buses and heavier than 50 elephants.
+2. **Heart Size** – Their heart alone can weigh **as much as an car (about 1,300 lbs or 600 kg)** and is roughly the size of a small car.
+3. **Aorta Width** – The aorta (main artery) of a blue whale is wide enough for a **human to swim through it** (about 1 foot or 30 cm in diameter).
+4. **Tongue Weight** – A blue whale’s tongue can weigh **as much
+TIME: (pp: 22t 4.7s 5t/s - tg: 0t 22.0s 11.6t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: Whales are some of the most **fascinating, intelligent, and diverse** mammals on Earth, belonging to the order **Cetacea**. They live entirely in water, yet they breathe air, nurse their young, and have complex social behaviors. Here’s a **deep dive** into general whale facts, covering their **evolution, biology, behavior, and conservation**:
+
+---
+
+### **🌊 Whale Basics: What Makes Them Unique**
+1. **Mammals, Not Fish** – Whales are **warm-blooded mammals** (like humans, dogs, and dolphins) that evolved from **land-dwelling ancestors** (hippo-like creatures) around **50 million years ago**.
+2. **Blowhole** – Unlike fish, whales breathe through **blowholes** (nostrils) on top of their heads. They can hold their breath for **up to 90 minutes** (sperm whales hold the record).
+3. **Blubber** – They have a thick layer of **blubber** (up to **12 inches or 30 cm**) for insulation, energy storage, and buoyancy.
+4. **Tail (Fluke) & Fins** – Their
+TIME: (pp: 288t 4.8s 60t/s - tg: 0t 24.0s 10.6t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: Whales are found in **all oceans** and some rivers, from the **Arctic to the Antarctic**, and in both shallow and deep waters. Their distribution depends on the species, feeding habits, migration patterns, and environmental conditions. Here’s a breakdown of where different whale species live geographically:
+
+---
+
+### **🌍 Global Whale Distribution by Ocean & Region**
+
+#### **🐋 Arctic Ocean (North Pole)**
+- **Beluga Whale** (*Delphinapterus leucas*) – Found in **Arctic and sub-Arctic waters**, including the **Arctic Ocean, Hudson Bay, Gulf of St. Lawrence, and the waters around Greenland, Alaska, and Russia**.
+- **Narwhal** (*Monodon monoceros*) – Lives in the **Arctic waters of Canada, Greenland, Norway (Svalbard), and Russia**.
+- **Bowhead Whale** (*Balaena mysticetus*) – Exclusively in the **Arctic Ocean**, particularly around **Alaska, Canada, Greenland, and the Barents Sea**.
+- **Polar Bear** (not a whale, but related to Arctic marine mammals) – Found in the **Arctic Ocean** (around **Canada, Greenland, Norway, Russia
+TIME: (pp: 553t 4.8s 116t/s - tg: 0t 25.5s 10.0t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: # QuickSort Implementation in Rust
+
+Here's a clean and idiomatic implementation of the quicksort algorithm in Rust:
+
+```rust
+fn quicksort<T: Ord>(arr: &mut [T]) {
+    if arr.len() <= 1 {
+        return;
+    }
+
+    let pivot = partition(arr);
+    quicksort(&mut arr[0..pivot]);
+    quicksort(&mut arr[pivot + 1..]);
+}
+
+fn partition<T: Ord>(arr: &mut [T]) -> usize {
+    let len = arr.len();
+    let pivot_index = len / 2;
+    arr.swap(pivot_index, len - 1);
+    let pivot = &arr[len - 1];
+
+    let mut i = 0;
+    for j in 0..len - 1 {
+        if &arr[j] <= pivot {
+            arr.swap(i, j);
+            i += 1;
+        }
+    }
+    arr.swap(i, len - 1);
+    i
+}
+
+fn main() {
+    let mut numbers = [9, 8, 7, 6, 5, 4, 3, 2, 1];
+    println!("Before: {:?}", numbers);
+    quicksort
+TIME: (pp: 23t 4.7s 5t/s - tg: 0t 22.3s 11.4t/s)
+
