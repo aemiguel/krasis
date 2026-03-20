@@ -5150,6 +5150,14 @@ impl GpuDecodeStore {
         (min_free, loaded, total, pct)
     }
 
+    /// Return HCS safety margin in MB (0 if HCS not configured).
+    pub fn hcs_safety_margin_mb(&self) -> usize {
+        self.graph.as_ref()
+            .and_then(|g| g.hcs.as_ref())
+            .map(|hcs| hcs.safety_margin_mb)
+            .unwrap_or(0)
+    }
+
     /// Allocate batch buffers for speculative decode batched verification.
     /// Called when draft model is loaded. batch_max = draft_k + 1.
     fn allocate_batch_buffers(&mut self, batch_max: usize) -> pyo3::PyResult<()> {

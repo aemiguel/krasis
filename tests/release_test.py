@@ -898,6 +898,25 @@ def extract_vram_report(script_dir: str) -> Optional[List[Dict]]:
         return None
 
 
+def extract_safety_margin(log_path: str) -> Optional[int]:
+    """Extract HCS safety margin from benchmark log output.
+
+    Looks for: 'safety margin: NNN MB' in the log.
+    Returns margin in MB, or None if not found.
+    """
+    try:
+        with open(log_path) as f:
+            for line in f:
+                if "safety margin:" in line:
+                    import re
+                    m = re.search(r'safety margin:\s*(\d+)\s*MB', line)
+                    if m:
+                        return int(m.group(1))
+        return None
+    except (OSError, IOError):
+        return None
+
+
 def extract_server_error(log_path: str, max_chars: int = 3000) -> str:
     """Extract the tail of the server log for error reporting."""
     try:
@@ -1094,13 +1113,19 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
             lines.append("")
 
     # ── VRAM Report ───────────────────────────────────────────────
+    # Show only key lifecycle events: prefill, HCS soft load, decode
+    VRAM_KEY_EVENTS = {
+        "prefill_start", "prefill_end",
+        "hcs_soft_load_start", "hcs_soft_load_end",
+        "decode_start", "decode_end",
+    }
     has_vram = any(cr.get("vram_report") for cr in config_results)
     if has_vram:
         lines.append("---")
         lines.append("")
         lines.append("## VRAM Report")
         lines.append("")
-        lines.append("Free VRAM (MB) at each lifecycle event, per GPU.")
+        lines.append("Free VRAM (MB) at key lifecycle points, per GPU.")
         lines.append("")
 
         for i, cr in enumerate(config_results):
@@ -1108,12 +1133,17 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
             if not vram:
                 continue
 
+            # Filter to key events only
+            key_events = [ev for ev in vram if ev["event"] in VRAM_KEY_EVENTS]
+            if not key_events:
+                continue
+
             variant = cr["variant"]
             lines.append(f"### Config {i+1}: {variant['name']}")
             lines.append("")
 
             # Build header from GPU count
-            num_gpus = len(vram[0]["gpus"]) if vram else 0
+            num_gpus = len(key_events[0]["gpus"]) if key_events else 0
             hdr = "| Event | Time |"
             sep = "|-------|-----:|"
             for g in range(num_gpus):
@@ -1122,13 +1152,27 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
             lines.append(hdr)
             lines.append(sep)
 
-            for ev in vram:
+            for ev in key_events:
                 row = f"| {ev['event']} | {ev['time_s']:.1f}s |"
                 for mb in ev["gpus"]:
                     row += f" {mb:,} MB |"
                 lines.append(row)
 
             lines.append("")
+
+            # Check VRAM utilization after HCS soft load
+            safety_margin = cr.get("safety_margin_mb")
+            soft_load_end = next(
+                (ev for ev in key_events if ev["event"] == "hcs_soft_load_end"), None)
+            if soft_load_end and safety_margin:
+                gpu0_free = soft_load_end["gpus"][0] if soft_load_end["gpus"] else 0
+                headroom = gpu0_free - safety_margin
+                if headroom > 200:
+                    lines.append(
+                        f"> **WARNING:** After HCS soft load, GPU0 has {gpu0_free} MB free "
+                        f"({headroom} MB above safety margin of {safety_margin} MB). "
+                        f"VRAM is underutilised — soft tier should load more experts.")
+                    lines.append("")
 
     # ── Sanity Tests ───────────────────────────────────────────────
     lines.append("---")
@@ -1401,6 +1445,12 @@ def main():
             vram_events = extract_vram_report(script_dir)
             if vram_events:
                 result["vram_report"] = vram_events
+
+            # Extract safety margin from benchmark log
+            if log_path:
+                margin = extract_safety_margin(log_path)
+                if margin is not None:
+                    result["safety_margin_mb"] = margin
 
             # Clean up temp config
             if config_path and os.path.isfile(config_path):

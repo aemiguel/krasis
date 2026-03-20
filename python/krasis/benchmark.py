@@ -519,6 +519,7 @@ class KrasisBenchmark:
         hcs_loaded = 0
         hcs_total = 0
         hcs_pct = 0.0
+        safety_margin_mb = 0
 
         for text, target_tokens in zip(prompt_texts, decode_lengths):
             r = self._engine_request(text, max_new_tokens=target_tokens)
@@ -536,6 +537,7 @@ class KrasisBenchmark:
             hcs_loaded = r.get("hcs_loaded", 0)
             hcs_total = r.get("hcs_total", 0)
             hcs_pct = r.get("hcs_pct", 0.0)
+            safety_margin_mb = r.get("safety_margin_mb", 0)
 
             # EOS hit early — not enough output, discard this run
             if generated < target_tokens:
@@ -574,6 +576,7 @@ class KrasisBenchmark:
             "hcs_loaded": hcs_loaded,
             "hcs_total": hcs_total,
             "hcs_pct": round(hcs_pct, 1),
+            "safety_margin_mb": safety_margin_mb,
         }
 
     def _benchmark_round_trip(self, decode_texts: List[str],
@@ -818,7 +821,9 @@ class KrasisBenchmark:
         else:
             print(f"  {YELLOW}{BOLD}All decode runs failed (EOS too early){NC}")
         print(f"  HCS:  {decode_result['hcs_loaded']}/{decode_result['hcs_total']} experts loaded ({decode_result['hcs_pct']:.1f}%)")
-        print(f"  VRAM: {decode_result['min_free_vram_mb']} MB min free during benchmark")
+        safety = decode_result.get('safety_margin_mb', 0)
+        min_free = decode_result['min_free_vram_mb']
+        print(f"  VRAM: {min_free} MB min free during decode (safety margin: {safety} MB)")
 
         # 6. Round trip (network) — full HTTP prefill + decode
         round_trip_result = None

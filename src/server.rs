@@ -1521,13 +1521,11 @@ impl RustServer {
         };
 
         // Evict soft HCS before prefill (both stores in multi-GPU)
-        crate::vram_monitor::report_event("evict_start");
         let store = unsafe { &mut *(self.gpu_store_addr as *mut GpuDecodeStore) };
         let t_evict = Instant::now();
         let (evicted, _) = store.hcs_evict_for_prefill(estimated_tokens);
         // NOTE: aux GPU never does prefill, so no eviction needed there
         let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
-        crate::vram_monitor::report_event("evict_end");
 
         // Prefill (Python, GIL held)
         crate::vram_monitor::report_event("prefill_start");
@@ -1558,7 +1556,21 @@ impl RustServer {
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         crate::vram_monitor::report_event("prefill_end");
 
-        // Copy KV cache to aux stores (multi-GPU)
+        // Reload soft HCS after prefill — ASYNC, matching production behavior.
+        // Production starts async reload BEFORE KV copy so DMA overlaps with
+        // KV copy time, giving soft experts a head start. We match that order.
+        crate::vram_monitor::report_event("hcs_soft_load_start");
+        let t_reload = Instant::now();
+        let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async(prompt_len);
+        if queued > 0 {
+            log::info!("Benchmark: HCS soft async reload queued {} experts ({} tokens)",
+                queued, prompt_len);
+        }
+        // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
+        let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
+        crate::vram_monitor::report_event("hcs_soft_load_end");
+
+        // Copy KV cache to aux stores (multi-GPU) — after async reload starts
         if !self.aux_gpu_store_addrs.is_empty() {
             let num_aux = self.aux_gpu_store_addrs.len();
             let num_layers = store.num_layers();
@@ -1571,14 +1583,6 @@ impl RustServer {
                 }
             }
         }
-
-        // Reload soft HCS after prefill — adaptive size based on actual prompt length
-        // Always attempt reload — soft pool may have been cancelled/freed by a prior operation
-        crate::vram_monitor::report_event("reload_start");
-        let t_reload = Instant::now();
-        store.hcs_reload_after_prefill_async(prompt_len);
-        // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
-        let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
 
         // Decode (pure Rust, GIL held but unused by decode loop)
         crate::vram_monitor::report_event("decode_start");
@@ -1637,7 +1641,6 @@ impl RustServer {
 
         // Cleanup
         self.py_model.call_method0(py, "server_cleanup")?;
-        crate::vram_monitor::report_event("cleanup_end");
 
         let prefill_tok_s = if prefill_ms > 0.0 {
             prompt_len as f64 / (prefill_ms / 1000.0)
@@ -1647,6 +1650,7 @@ impl RustServer {
 
         // Collect HCS stats from primary store
         let (min_free_vram_mb, mut hcs_loaded, mut hcs_total, _) = store.benchmark_stats();
+        let safety_margin_mb = store.hcs_safety_margin_mb();
 
         // Aggregate HCS stats from all aux stores (multi-GPU)
         // Also log per-GPU VRAM stats
@@ -1666,11 +1670,12 @@ impl RustServer {
         let hcs_pct = if hcs_total > 0 { hcs_loaded as f64 / hcs_total as f64 * 100.0 } else { 0.0 };
 
         Ok(format!(
-            r#"{{"prefill_ms":{:.1},"prefill_tok_s":{:.1},"prompt_tokens":{},"decode_ms":{:.1},"decode_tok_s":{:.2},"decode_tokens":{},"evict_ms":{:.1},"reload_ms":{:.1},"min_free_vram_mb":{},"hcs_loaded":{},"hcs_total":{},"hcs_pct":{:.1}}}"#,
+            r#"{{"prefill_ms":{:.1},"prefill_tok_s":{:.1},"prompt_tokens":{},"decode_ms":{:.1},"decode_tok_s":{:.2},"decode_tokens":{},"evict_ms":{:.1},"reload_ms":{:.1},"min_free_vram_mb":{},"hcs_loaded":{},"hcs_total":{},"hcs_pct":{:.1},"safety_margin_mb":{}}}"#,
             prefill_ms, prefill_tok_s, prompt_len,
             decode_ms, decode_tok_s, decode_tokens,
             evict_ms, reload_ms,
-            min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct
+            min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct,
+            safety_margin_mb
         ))
     }
 
