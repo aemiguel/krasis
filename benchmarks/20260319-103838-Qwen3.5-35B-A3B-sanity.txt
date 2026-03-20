@@ -1,0 +1,195 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://127.0.0.1:8012
+Date: 2026-03-19T10:38:38.891679
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! How can I help you today?
+TIME: (pp: 11t 1.3s 8t/s - tg: 444t>11t 8.1s 56.1t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+
+Hello! You can call me **Qwen3.5**—that's my official name. But feel free to give me a nickname if you'd like! 😊
+
+How can I assist you today? Whether it's answering questions, helping with tasks, or just chatting, I'm here to help! 🌟
+TIME: (pp: 35t 1.3s 26t/s - tg: 4098t>67t 61.5s 67.7t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+Hello! You can call me **Qwen3.5**—that's my official name. But feel free to give me a nickname if you'd like! 😊
+
+I was trained by the **Qwen Team** at **Alibaba Cloud**. We've worked hard to make me smarter, faster, and more helpful for you! 🌟
+
+How can I assist you today? Whether it's answering questions, helping with tasks, or just chatting, I'm here to help! 🌟
+TIME: (pp: 114t 1.3s 85t/s - tg: 104t>104t 3.4s 60.7t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+2 + 2 = 4.
+TIME: (pp: 17t 1.3s 13t/s - tg: 358t>10t 6.5s 56.8t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+40
+TIME: (pp: 42t 1.3s 31t/s - tg: 39t>4t 748ms 56.1t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+8
+TIME: (pp: 61t 1.3s 46t/s - tg: 18t>3t 382ms 52.4t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are a few key facts about its size:
+*   **Weight:** They can weigh up to **200 metric tons** (approximately 440,000 pounds).
+*   **Length:** They can grow up to **30 meters** (98 feet) long.
+*   **Heart:** Their heart is the size of a small car and weighs about 180 kilograms (400 pounds).
+
+The blue whale is not only the largest living animal on Earth but is also considered the largest animal to have ever lived, surpassing even the biggest dinosaurs in terms of mass.
+TIME: (pp: 19t 1.3s 14t/s - tg: 1059t>152t 21.9s 55.2t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water in the world is the **Pacific Ocean**.
+
+It covers approximately **63 million square miles** (163 million square kilometers), which is about 30% of the Earth's surface.
+
+If you are specifically asking about the largest **lake**, that distinction belongs to the **Caspian Sea**, which is technically a lake despite its name.
+TIME: (pp: 21t 1.3s 16t/s - tg: 943t>80t 18.6s 55.0t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+# The Binary Chop Algorithm (Binary Search)
+
+The **Binary Chop**, more commonly known in computer science as **Binary Search**, is one of the most fundamental and efficient algorithms for searching within a collection of data. It is a classic example of the **Divide and Conquer** strategy.
+
+Below is a comprehensive, in-depth analysis of the algorithm, covering its logic, mathematical foundations, implementation, complexity, and advanced variations.
+
+---
+
+## 1. Core Concept and Prerequisites
+
+### What is it?
+Binary Search is an algorithm that finds the position of a target value within a **sorted** array. It works by repeatedly dividing the search interval in half.
+
+### The "Guessing Game" Analogy
+Imagine I am thinking of a number between 1 and 100. You have to guess it.
+*   **Linear Search:** You guess 1, then 2, then 3... This is slow.
+*   **Binary Search:** You guess 50.
+    *   If I say "Too low," you know the number is between 51 and 100.
+    *   If I say "Too high," you know the number is between 1 and 4
+TIME: (pp: 17t 1.3s 13t/s - tg: 1015t>256t 22.0s 57.7t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+**Reasoning:**
+This is a classic riddle. Drying happens simultaneously, not sequentially. As long as there is enough space on the clothesline for all the towels to hang without overlapping significantly, the sun and wind will dry all of them at the same rate. Therefore, whether you hang 4 towels or 20 towels, they will all finish drying at the same time.
+TIME: (pp: 48t 1.3s 36t/s - tg: 1007t>88t 20.6s 53.0t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the blue whale (*Balaenoptera musculus*):
+
+*   **Largest Animal Ever:** The blue whale is the largest animal known to have ever lived on Earth, surpassing even the largest dinosaurs.
+*   **Size:** They can grow up to **30 meters (98 feet)** in length.
+*   **Weight:** A fully grown blue whale can weigh as much as **200 tons** (approximately 400,000 pounds).
+*   **Heart:** Their heart is the size of a small car and weighs about **400 pounds (180 kg)**.
+*   **Tongue:** Their tongue alone weighs as much as an adult elephant (roughly **6,000 pounds** or **2,700 kg**).
+*   **Diet:** Despite their massive size, they feed almost exclusively on **krill**, tiny shrimp-like crustaceans. A single blue whale can eat up to 4 tons of krill per day during feeding season.
+*   **Feeding Method:** They are baleen whales, meaning they filter feed. They take in large mouthfuls of water and push it out
+TIME: (pp: 17t 1.3s 13t/s - tg: 1366t>256t 29.8s 54.5t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+Here is a broader overview of whales, covering their biology, types, and behaviors:
+
+### 1. They Are Mammals, Not Fish
+Despite living in the ocean, whales are warm-blooded mammals. This means they:
+*   **Breathe Air:** They have lungs and must surface to breathe through a blowhole on top of their head.
+*   **Give Live Birth:** They do not lay eggs; they bear live young and nurse them with milk.
+*   **Have Hair:** While they look smooth, they usually have a few hairs around their snout, especially when born.
+*   **Evolved from Land:** Their ancestors were four-legged land animals that returned to the water millions of years ago.
+
+### 2. Two Main Groups
+Whales are divided into two suborders based on how they eat:
+*   **Baleen Whales (Mysticeti):**
+    *   **Diet:** They have plates of keratin (like fingernails) called baleen inside their mouths to filter small prey like krill and plankton from the water.
+    *   **Examples:** Blue Whale, Humpback Whale, Right Whale, Gray Whale.
+    *  
+TIME: (pp: 289t 1.3s 216t/s - tg: 1727t>256t 36.2s 54.8t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Whales are found in every ocean on Earth, from the icy poles to the warm tropics. Here is a breakdown of their geographical distribution:
+
+### 1. **Global Presence**
+   - **Arctic & Antarctic:** Many species, such as the Blue Whale, Humpback Whale, and Right Whale, inhabit the cold waters of the North and South Poles.
+   - **Tropical & Equatorial:** Some species, like the Gray Whale and certain Humpback populations, migrate through warm equatorial waters.
+   - **Coastal:** Species like the Orca (Killer Whale) and S
+
+
+TIME: (pp: 560t 1.3s 417t/s - tg: 1128t>131t 22.7s 55.3t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+# Quicksort Implementation in Rust
+
+Here's a clean, idiomatic Rust implementation of the quicksort algorithm, including both in-place and functional versions, along with documentation and tests.
+
+## In-Place Quicksort
+
+```rust
+/// Sorts a slice in-place using the quicksort algorithm.
+///
+/// # Examples
+///
+/// ```
+/// let mut data = vec![3, 1, 4, 1, 5, 9, 2, 6];
+/// quicksort_inplace(&mut data);
+/// assert_eq!(data, vec![1, 1, 2, 3, 4, 5, 6, 9]);
+/// ```
+pub fn quicksort_inplace<T: Ord>(slice: &mut [T]) {
+    let len = slice.len();
+    if len <= 1 {
+        return;
+    }
+    quicksort_helper(slice, 0, len - 1);
+}
+
+fn quicksort_helper<T: Ord>(slice: &mut [T], low: usize, high: usize) {
+    if low < high {
+        let pivot_index = partition(slice, low, high);
+       
+TIME: (pp: 18t 1.4s 13t/s - tg: 151t>256t 7.1s 57.3t/s)
+

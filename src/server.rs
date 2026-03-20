@@ -59,16 +59,19 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::sync::mpsc;
 
-/// Global pointer to the server's `running` flag so the raw SIGINT handler
+/// Global pointer to the server's `running` flag so the raw signal handler
 /// can set it to `false` without going through Python's signal mechanism.
 /// This is only written once (before the accept loop) and read from the
 /// signal handler, so the raw pointer is safe in practice.
 static SIGINT_RUNNING: AtomicBool = AtomicBool::new(false);
-static SIGINT_FLAG_PTR: std::sync::atomic::AtomicPtr<AtomicBool> =
+static SIGNAL_FLAG_PTR: std::sync::atomic::AtomicPtr<AtomicBool> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-extern "C" fn sigint_handler(_sig: libc::c_int) {
-    let ptr = SIGINT_FLAG_PTR.load(Ordering::Acquire);
+/// Raw signal handler for SIGINT and SIGTERM.  Sets the server's `running`
+/// flag to false so the accept loop exits cleanly, even when the GIL is
+/// released (Python signal handlers can't run during allow_threads).
+extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
+    let ptr = SIGNAL_FLAG_PTR.load(Ordering::Acquire);
     if !ptr.is_null() {
         // Safety: ptr points to the Arc<AtomicBool>'s inner value,
         // which outlives this handler (server.run() is still on the stack).
@@ -605,16 +608,19 @@ fn handle_chat_completion(
     let parse_ms = t_request.elapsed().as_secs_f64() * 1000.0;
 
     // ── Evict soft HCS before prefill to free VRAM ──
+    crate::vram_monitor::report_event("evict_start");
     let t_evict = Instant::now();
     let store_for_evict = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
     let (evicted, _freed_mb) = store_for_evict.hcs_evict_for_prefill(estimated_tokens);
     // NOTE: aux GPU never does prefill, so no eviction needed there
     let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
+    crate::vram_monitor::report_event("evict_end");
 
     // ── Snapshot VRAM before prefill ──
     log::info!("VRAM before prefill: {} MB free", store_for_evict.query_vram_free_mb());
 
     // ── Call Python for prefill (GIL required) ──
+    crate::vram_monitor::report_event("prefill_start");
     let t_prefill_gil = Instant::now();
     let prefill_result = Python::with_gil(|py| -> PyResult<(usize, usize, Vec<usize>, bool)> {
         let result = state.py_model.call_method(
@@ -643,6 +649,7 @@ fn handle_chat_completion(
         Ok((first_token, prompt_len, stop_ids, kv_overflow))
     });
     let prefill_gil_ms = t_prefill_gil.elapsed().as_secs_f64() * 1000.0;
+    crate::vram_monitor::report_event("prefill_end");
 
     let (first_token, prompt_len, stop_ids, kv_overflow) = match prefill_result {
         Ok(v) => v,
@@ -711,6 +718,7 @@ fn handle_chat_completion(
     // ── Reload soft HCS after prefill (async — DMA overlaps with decode) ──
     // Always attempt reload — soft pool may have been cancelled by a prior operation
     // even if we didn't evict anything this time.
+    crate::vram_monitor::report_event("reload_start");
     let t_reload = Instant::now();
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
     {
@@ -767,6 +775,7 @@ fn handle_chat_completion(
     }
 
     // ── GPU decode: GIL-free Rust decode via GpuDecodeStore ──
+    crate::vram_monitor::report_event("decode_start");
     handle_gpu_decode(
         stream, is_stream, state, store, tokenizer,
         first_token, prompt_len, max_tokens, temperature,
@@ -774,6 +783,7 @@ fn handle_chat_completion(
         &request_id, &state.model_name, created,
         &overhead, has_tools, enable_thinking,
     );
+    crate::vram_monitor::report_event("decode_end");
 
     // ── Cleanup (GIL required) ──
     let t_cleanup_gil = Instant::now();
@@ -781,6 +791,7 @@ fn handle_chat_completion(
         let _ = state.py_model.call_method0(py, "server_cleanup");
     });
     let cleanup_gil_ms = t_cleanup_gil.elapsed().as_secs_f64() * 1000.0;
+    crate::vram_monitor::report_event("cleanup_end");
 
     let total_ms = t_request.elapsed().as_secs_f64() * 1000.0;
     log::info!(
@@ -1323,24 +1334,33 @@ impl RustServer {
         let multi_gpu_gqa_offsets = self.multi_gpu_gqa_offsets.clone();
         let running = self.running.clone();
 
-        // Install raw SIGINT handler BEFORE releasing the GIL.
+        // Install raw SIGINT + SIGTERM handlers BEFORE releasing the GIL.
         // Python's signal.signal handlers only dispatch between bytecodes,
         // but run() enters allow_threads (native Rust) so Python never gets
         // a chance to run the handler.  The raw handler sets `running` to
         // false directly, and the accept loop exits on the next 10ms poll.
+        // SIGTERM is needed because the release test (and systemd) send
+        // SIGTERM for clean shutdown; without a raw handler, the server
+        // never stops and gets SIGKILL'd, skipping VRAM report CSV write.
         let running_ptr = Arc::as_ptr(&self.running) as *mut AtomicBool;
-        SIGINT_FLAG_PTR.store(running_ptr, Ordering::Release);
+        SIGNAL_FLAG_PTR.store(running_ptr, Ordering::Release);
 
-        // Save previous handler so we can restore it
-        let prev_handler;
+        // Save previous handlers so we can restore them
+        let prev_sigint;
+        let prev_sigterm;
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = sigint_handler as *const () as usize;
+            sa.sa_sigaction = shutdown_signal_handler as *const () as usize;
             libc::sigemptyset(&mut sa.sa_mask);
             sa.sa_flags = libc::SA_RESTART;
-            let mut old_sa: libc::sigaction = std::mem::zeroed();
-            libc::sigaction(libc::SIGINT, &sa, &mut old_sa);
-            prev_handler = old_sa;
+
+            let mut old_int: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGINT, &sa, &mut old_int);
+            prev_sigint = old_int;
+
+            let mut old_term: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGTERM, &sa, &mut old_term);
+            prev_sigterm = old_term;
         }
 
         // Release GIL — server loop runs without it.
@@ -1452,10 +1472,11 @@ impl RustServer {
             log::info!("Rust HTTP server stopped");
         });
 
-        // Restore previous SIGINT handler and clear global pointer
-        SIGINT_FLAG_PTR.store(std::ptr::null_mut(), Ordering::Release);
+        // Restore previous signal handlers and clear global pointer
+        SIGNAL_FLAG_PTR.store(std::ptr::null_mut(), Ordering::Release);
         unsafe {
-            libc::sigaction(libc::SIGINT, &prev_handler, std::ptr::null_mut());
+            libc::sigaction(libc::SIGINT, &prev_sigint, std::ptr::null_mut());
+            libc::sigaction(libc::SIGTERM, &prev_sigterm, std::ptr::null_mut());
         }
 
         Ok(())
@@ -1500,13 +1521,16 @@ impl RustServer {
         };
 
         // Evict soft HCS before prefill (both stores in multi-GPU)
+        crate::vram_monitor::report_event("evict_start");
         let store = unsafe { &mut *(self.gpu_store_addr as *mut GpuDecodeStore) };
         let t_evict = Instant::now();
         let (evicted, _) = store.hcs_evict_for_prefill(estimated_tokens);
         // NOTE: aux GPU never does prefill, so no eviction needed there
         let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
+        crate::vram_monitor::report_event("evict_end");
 
         // Prefill (Python, GIL held)
+        crate::vram_monitor::report_event("prefill_start");
         let t_prefill = Instant::now();
         let stop_tokens: Vec<String> = Vec::new();
         let result = self.py_model.call_method(
@@ -1532,6 +1556,7 @@ impl RustServer {
             .and_then(|v| v.extract(py))
             .unwrap_or(false);
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        crate::vram_monitor::report_event("prefill_end");
 
         // Copy KV cache to aux stores (multi-GPU)
         if !self.aux_gpu_store_addrs.is_empty() {
@@ -1549,12 +1574,14 @@ impl RustServer {
 
         // Reload soft HCS after prefill — adaptive size based on actual prompt length
         // Always attempt reload — soft pool may have been cancelled/freed by a prior operation
+        crate::vram_monitor::report_event("reload_start");
         let t_reload = Instant::now();
         store.hcs_reload_after_prefill_async(prompt_len);
         // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
         let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
 
         // Decode (pure Rust, GIL held but unused by decode loop)
+        crate::vram_monitor::report_event("decode_start");
         let (decode_ms, decode_tokens, decode_tok_s) = if kv_overflow || max_new_tokens <= 1 {
             (0.0f64, 1usize, 0.0f64)
         } else {
@@ -1606,8 +1633,11 @@ impl RustServer {
             (elapsed * 1000.0, total, tok_s)
         };
 
+        crate::vram_monitor::report_event("decode_end");
+
         // Cleanup
         self.py_model.call_method0(py, "server_cleanup")?;
+        crate::vram_monitor::report_event("cleanup_end");
 
         let prefill_tok_s = if prefill_ms > 0.0 {
             prompt_len as f64 / (prefill_ms / 1000.0)

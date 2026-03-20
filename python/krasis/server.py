@@ -744,6 +744,8 @@ def main():
                         help="Run benchmark via HTTP and exit (don't keep server running)")
     parser.add_argument("--timing", action="store_true",
                         help="Enable decode timing instrumentation (per-layer breakdown)")
+    parser.add_argument("--vram-report", action="store_true",
+                        help="Generate VRAM report CSV (periodic readings + events) to logs/vram_report.csv")
     parser.add_argument("--stress-test", action="store_true",
                         help="Run stress test (diverse prompts) and exit")
     parser.add_argument("--perplexity", action="store_true",
@@ -989,6 +991,13 @@ def main():
         total = vram_monitor.total_mb(idx)
         _dim(f"cuda:{idx}: {total:,} MB total")
 
+    # ── Enable VRAM report if requested ──
+    if getattr(args, 'vram_report', False):
+        vram_monitor.enable_report()
+        _dim("VRAM report enabled (periodic samples + events)")
+
+    vram_monitor.report_event("model_loaded")
+
     # ── Phase 1: Warmup (trigger all lazy CUDA allocations) ──
     # torch.compile, KV cache, FlashInfer workspace, cuBLAS handles, decode buffers.
     # These cause a transient VRAM spike that is freed afterwards. The monitor
@@ -997,6 +1006,7 @@ def main():
     _model._multi_gpu_hcs = False
     _status("Warmup (prefill + decode, no HCS)")
     _dim("Triggering lazy CUDA allocations (torch.compile, FlashInfer, cuBLAS)")
+    vram_monitor.report_event("warmup_start")
     t_warmup = time.time()
     # Use layer_group_size=1 for warmup to avoid DMA pipeline issues with grouped prefill
     _saved_layer_group_size = _model.layer_group_size
@@ -1009,6 +1019,7 @@ def main():
     _model._init_gpu_prefill()
     warmup_elapsed = time.time() - t_warmup
     _detail(f"Warmup complete in {warmup_elapsed:.1f}s")
+    vram_monitor.report_event("warmup_end")
 
     # Log warmup VRAM impact before resetting
     for idx in device_indices:
@@ -1029,6 +1040,7 @@ def main():
     import torch
 
     _status("VRAM calibration (4-point measurement)")
+    vram_monitor.report_event("calibration_start")
     _detail(f"Safety margin: {SAFETY_MARGIN_MB:,} MB")
     _detail(f"Using layer_group_size={_model.layer_group_size} (same as runtime)")
 
@@ -1062,6 +1074,7 @@ def main():
         logger.info("VRAM calibration baseline: free=%d MB, total=%d MB", _baseline_free, _baseline_total)
 
         # ── 2a: Short prompt prefill ──
+        vram_monitor.report_event("cal_short_prefill")
         vram_monitor.reset(dev_idx)
         _dim("Capture: short prompt prefill (~500 tokens)")
         short_prompt_len, short_result = _capture_prefill(_model, SHORT_REPEATS)
@@ -1073,6 +1086,7 @@ def main():
         logger.info("VRAM cal short prefill: %d tokens, min_free=%d MB", short_tokens, prefill_short_free)
 
         # ── 2b: Short prompt decode ──
+        vram_monitor.report_event("cal_short_decode")
         if short_result is not None:
             vram_monitor.reset(dev_idx)
             _dim("Capture: short prompt decode")
@@ -1086,6 +1100,7 @@ def main():
             _model.server_cleanup()
 
         # ── 2c: Long prompt prefill ──
+        vram_monitor.report_event("cal_long_prefill")
         vram_monitor.reset(dev_idx)
         _long_est = LONG_REPEATS * TOKENS_PER_REPEAT
         _dim(f"Capture: long prompt prefill (~{_long_est // 1000}K tokens)")
@@ -1098,6 +1113,7 @@ def main():
         logger.info("VRAM cal long prefill: %d tokens, min_free=%d MB", long_tokens, prefill_long_free)
 
         # ── 2d: Long prompt decode ──
+        vram_monitor.report_event("cal_long_decode")
         if long_result is not None:
             vram_monitor.reset(dev_idx)
             _dim("Capture: long prompt decode")
@@ -1162,6 +1178,7 @@ def main():
     decode_available = max(0, _free_mb - decode_transient - SAFETY_MARGIN_MB)
     soft_budget = max(0, decode_available - hard_budget)
 
+    vram_monitor.report_event("calibration_end")
     _status("VRAM calibration complete")
     _detail(f"Prefill: {prefill_kb_per_tok:.1f} KB/token ({prefill_short_free:,} MB @ {short_tokens} tok -> {prefill_long_free:,} MB @ {long_tokens} tok)")
     _detail(f"Decode:  {decode_kb_per_tok:.1f} KB/token ({decode_short_free:,} MB @ short -> {decode_long_free:,} MB @ long)")
@@ -1426,6 +1443,7 @@ def main():
                      f"hard: {gpu0_hard:,} MB, soft: {gpu0_soft:,} MB")
 
             t_hcs = time.time()
+            vram_monitor.report_event("hcs_init_start")
             _status("Loading HCS pool (hard + soft tier)")
 
             result = store.hcs_pool_init_tiered(
@@ -1436,6 +1454,7 @@ def main():
             )
             hcs_elapsed = time.time() - t_hcs
 
+            vram_monitor.report_event("hcs_init_end")
             _status("HCS pool loaded")
             _detail(result)
             _dim(f"Loaded in {hcs_elapsed:.1f}s")
@@ -1446,6 +1465,7 @@ def main():
     # The Rust server does this at server.rs:590; here we mirror that for the
     # Python-side warmup path. Without this, prefill OOMs when hard+soft fill
     # VRAM to within the safety margin.
+    vram_monitor.report_event("validation_start")
     _status("Decode validation")
     gpu_store = getattr(_model, '_gpu_decode_store', None)
     if gpu_store is not None:
@@ -1459,6 +1479,7 @@ def main():
         if reloaded > 0:
             _dim(f"Reloaded {reloaded} soft experts after validation ({reloaded_mb:.0f} MB)")
     _detail("Decode validation passed")
+    vram_monitor.report_event("validation_end")
 
     # ── Enable VRAM monitor runtime warnings ──
     # enable_warnings() resets min-free tracking so the first poll captures
@@ -1558,6 +1579,7 @@ def main():
         num_aux = len(_multi_gpu_splits)
         num_layers = len(_model.layers)
         boundaries = [0] + list(_multi_gpu_splits) + [num_layers]
+        vram_monitor.report_event("multi_gpu_setup_start")
         _status(f"Multi-GPU decode setup ({num_aux + 1} GPUs)")
         gc.collect()
         torch.cuda.empty_cache()
@@ -1718,6 +1740,7 @@ def main():
                 "Fix the underlying issue or disable multi-GPU."
             ) from e
 
+        vram_monitor.report_event("multi_gpu_setup_end")
         _status(f"Multi-GPU decode ready ({num_aux + 1} GPUs, splits={_multi_gpu_splits})")
 
     # ── Final VRAM summary (all GPUs) ──
@@ -1860,6 +1883,7 @@ def main():
     _think_str = "on" if think_end_id else "off"
     print(flush=True)
     print(f"  {_BOLD}{_GREEN}{'━' * 54}{_NC}", flush=True)
+    vram_monitor.report_event("server_ready")
     print(f"  {_BOLD}{_GREEN}  KRASIS SERVER READY{_NC}", flush=True)
     print(f"  {_BOLD}{_GREEN}{'━' * 54}{_NC}", flush=True)
     print(f"  {_GREEN}Model:{_NC}    {_BOLD}{_model_name}{_NC}", flush=True)
@@ -1918,6 +1942,34 @@ def main():
 
     # run() releases the GIL and blocks until stop() is called
     rust_server.run()
+
+    # ── Write VRAM report if enabled ──
+    vram_monitor.report_event("server_shutdown")
+    if getattr(args, 'vram_report', False):
+        _report_path = os.path.join(os.getcwd(), "logs", "vram_report.csv")
+        os.makedirs(os.path.dirname(_report_path), exist_ok=True)
+        try:
+            vram_monitor.write_report(_report_path)
+            # Print summary of key events
+            summary = vram_monitor.report_summary()
+            if summary:
+                print(flush=True)
+                print(f"  {_BOLD}VRAM Report Summary{_NC}", flush=True)
+                print(f"  {'─' * 60}", flush=True)
+                _hdr = f"  {'Event':<30s} {'Time':>8s}"
+                for i in device_indices:
+                    _hdr += f"  {'GPU' + str(i):>8s}"
+                print(_hdr, flush=True)
+                print(f"  {'─' * 60}", flush=True)
+                for event, ts_ms, gpu_free in summary:
+                    _line = f"  {event:<30s} {ts_ms/1000:>7.1f}s"
+                    for mb in gpu_free:
+                        _line += f"  {mb:>6d}MB"
+                    print(_line, flush=True)
+                print(f"  {'─' * 60}", flush=True)
+                print(f"  {_DIM}Full report: {_report_path}{_NC}", flush=True)
+        except Exception as e:
+            logger.warning("Failed to write VRAM report: %s", e)
 
     # ── Clean exit before Python teardown triggers cascading errors ──
     vram_monitor.stop()

@@ -1,0 +1,202 @@
+Sanity Test: Qwen3-Coder-Next @ http://127.0.0.1:8012
+Date: 2026-03-19T12:05:56.531167
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: Hello! How can I help you today? 😊
+TIME: (pp: 9t 3.1s 3t/s - tg: 0t 320ms 34.4t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: I'm Qwen! 🌟  
+I'm a large-scale language model developed by Alibaba Cloud.  
+Nice to meet you—let me know if you have any questions or need help with anything! 😊
+TIME: (pp: 35t 3.1s 11t/s - tg: 0t 1.1s 37.5t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: I was trained by the Tongyi Lab team at Alibaba Group. 🤖  
+Specifically, my development involved many researchers and engineers who worked on large-scale language models, including the Qwen series (like Qwen1, Qwen2, Qwen3, and the latest Qwen3).  
+
+They used vast amounts of text data (with strict privacy and safety filters) and advanced training techniques to help me understand and generate human-like language across many topics.
+
+If you're curious about how I work, my capabilities, or even how to use me effectively—I'm happy to share more! 😊
+TIME: (pp: 92t 3.1s 29t/s - tg: 0t 3.2s 37.9t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 2 + 2 = **4**.
+TIME: (pp: 15t 3.1s 5t/s - tg: 0t 268ms 33.6t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 4 × 10 = **40**.
+TIME: (pp: 41t 3.1s 13t/s - tg: 0t 322ms 34.1t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 40 ÷ 5 = **8**.
+TIME: (pp: 69t 3.1s 22t/s - tg: 0t 324ms 33.9t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: The largest animal in the world—and the largest animal to have ever existed—is the **blue whale** (*Balaenoptera musculus*).  
+
+- **Adults** typically reach lengths of **24–27 meters (80–90 feet)** and weigh **100–150 metric tons** (some individuals have been recorded up to ~150 tons).  
+- The **heaviest reliably recorded** blue whale was a female caught in Antarctica in 1909, measuring **29.9 meters (90 feet 1 inch)** and weighing an estimated **190 metric tons**.  
+- Their heart alone can weigh around **180 kg (400 lbs)** and be the size of a small car, while their tongue weighs as much as an elephant.
+
+Despite their massive size, blue whales feed almost exclusively on tiny shrimp-like animals called **krill**, consuming up to **4 tons of krill per day** during feeding season.
+TIME: (pp: 17t 3.1s 5t/s - tg: 0t 5.4s 38.0t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: The **Pacific Ocean** is the largest body of water in the world.
+
+- **Area**: approximately **165,250,000 km²** (65,250,000 sq mi)  
+- **Volume**: holds more than **50%** of the world’s total seawater  
+- **Maximum depth**: the **Mariana Trench**, reaching **10,984 meters** (35,797 ft) at the Challenger Deep  
+
+It covers more than half of Earth’s surface and is larger than all the world’s landmasses combined.
+TIME: (pp: 19t 3.2s 6t/s - tg: 0t 3.3s 38.2t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: The **binary chop algorithm**, more commonly known as **binary search**, is a highly efficient divide-and-conquer algorithm for finding a target value within a **sorted** array (or list). Its name “binary chop” emphasizes the repeated halving of the search space—each step “chops” the remaining portion of the array in half.
+
+ Below is an in-depth explanation covering its principles, mechanics, variants, complexity, applications, and nuances.
+
+---
+
+### **1. Core Principle**
+
+Binary search exploits the **sorted nature** of the input data to eliminate half of the remaining elements at each step. Instead of checking every element (as in linear search), it compares the target value to the **middle element** of the current search interval:
+
+- If equal → found.
+- If target < middle → search the **left half**.
+- If target > middle → search the **right half**.
+
+This process repeats recursively or iteratively until the target is found or the search space becomes empty.
+
+---
+
+### **2. Algorithm Steps (Iterative Version)**
+
+Let `arr` be a sorted array (ascending order), `low` and `high` be indices defining the current search interval, and `target` be the value to find.
+
+```text
+1. Initialize
+TIME: (pp: 15t 3.1s 5t/s - tg: 0t 6.7s 38.1t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: This is a classic riddle-type question that tests whether you assume a relationship where there isn’t one.
+
+**Answer: 4 hours**
+
+**Explanation:**
+
+The drying time depends on **weather conditions and airflow**, not on how many towels are drying — *as long as they’re all exposed to the same conditions and not blocking each other’s drying space*.
+
+If 4 towels take 4 hours to dry, that implies each towel takes 4 hours to dry individually under those conditions.
+
+Adding more towels (e.g., 20) doesn’t change the *time per towel* — unless overcrowding reduces airflow or sun exposure (which the question says is “exact same conditions,” implying no crowding issues). So, assuming proper spacing and identical conditions, **20 towels also take 4 hours to dry**.
+
+✅ **Key insight**: Drying time is per item, not a function of total count (unless limited by space or airflow — which isn’t the case here).
+TIME: (pp: 46t 3.1s 15t/s - tg: 0t 5.3s 37.9t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: Here are some fascinating facts about the blue whale (*Balaenoptera musculus*), the largest animal known to have ever lived:
+
+1. **Size Record Holder**:  
+   - Adult blue whales reach lengths of up to **30 meters (98 feet)** and can weigh over **180 metric tons (200 short tons)**.  
+   - Their heart alone weighs about **180 kg (400 lbs)**—roughly the size of a small car—and can be heard beating from over 2 miles away underwater.
+
+2. **Diet & Feeding**:  
+   - Despite their massive size, blue whales feed almost exclusively on tiny shrimp-like crustaceans called **krill** (typically *Euphausia superba*).  
+   - A single blue whale can consume up to **4–6 tons of krill per day** during feeding season.  
+   - They use **lunge feeding**: accelerate toward a dense krill patch, open their mouths wide (expandable throat grooves allow them to take in more than their own body weight in water), then filter out the water using baleen plates.
+
+3. **Baleen Plates**:  
+   - Instead of teeth, blue whales have
+TIME: (pp: 15t 3.1s 5t/s - tg: 0t 6.7s 38.0t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: Certainly! Whales are a captivating group of marine mammals with a rich evolutionary history and diverse adaptations. Here's a comprehensive overview of whales in general—covering their classification, biology, behavior, and conservation:
+
+---
+
+### 🐋 **What Are Whales?**
+Whales are **cetaceans**, a group of fully aquatic mammals that also includes dolphins and porpoises. They evolved from land-dwelling ancestors over 50 million years ago and now live in oceans worldwide—from polar seas to tropical waters.
+
+Cetaceans are divided into two suborders:
+
+1. **Mysticeti (Baleen Whales)**  
+   - Filter-feeders with baleen plates (keratin-based fringes) instead of teeth.  
+   - Examples: Blue whale, humpback whale, gray whale, right whale.  
+   - They have **two blowholes** and often migrate long distances.
+
+2. **Odontoceti (Toothed Whales)**  
+   - Predators with teeth (or specialized structures like the sperm whale’s teeth).  
+   - Use **echolocation** to navigate and hunt.  
+   - Examples: Sperm whale, orca (killer whale), dolphins, porpoises, beaked whales
+TIME: (pp: 288t 3.1s 92t/s - tg: 0t 6.8s 37.3t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: Whales are found in **every ocean on Earth**, from the Arctic and Antarctic to tropical and temperate waters—but their distribution varies significantly by species, season, and life stage (e.g., breeding vs. feeding). Here's a breakdown of their geographic ranges:
+
+---
+
+### 🌍 **Global Whale Distribution by Region & Species**
+
+#### **1. Polar Regions (Arctic & Antarctic)**
+- **Antarctic**:  
+  - **Minke whales**, **humpbacks**, **fins**, and especially ** Antarctic blue whales** feed here in summer (Oct–Feb).  
+  - The Southern Ocean supports massive krill swarms—key food for baleen whales.  
+  - **Southern right whales** historically breed in sub-Antarctic waters (e.g., South Georgia, Falklands).  
+- **Arctic & Subarctic**:  
+  - **Bowhead whales** live year-round in the Arctic (under sea ice).  
+  - **Narwhals** and **belugas** inhabit Arctic and subarctic seas (e.g., Canadian Arctic, Greenland, Svalbard).  
+  - **Humpbacks** and **minkes** migrate through polar edges seasonally.
+
+#### **2. Temper
+TIME: (pp: 561t 3.1s 178t/s - tg: 0t 6.8s 37.4t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: Here's a clean, idiomatic in-place quicksort implementation in Rust, using the Lomuto partition scheme:
+
+```rust
+pub fn quicksort<T: Ord + Copy>(arr: &mut [T]) {
+    // Handle empty slice or single element
+    if arr.len() <= 1 {
+        return;
+    }
+
+    quicksort_recursive(arr, 0, arr.len() - 1);
+}
+
+fn quicksort_recursive<T: Ord + Copy>(arr: &mut [T], low: usize, high: usize) {
+    if low < high {
+        // Partition the array and get the pivot index
+        let pi = partition(arr, low, high);
+        
+        // Recursively sort elements before and after partition
+        quicksort_recursive(arr, low, pi.wrapping_sub(1);
+        quicksort_recursive(arr, pi + 1, high);
+    }
+}
+
+fn partition<T: Ord + Copy>(arr: &mut [T], low: usize, high: usize) -> usize {
+    // Choose the last element as pivot
+    let pivot = arr[high];
+
+    // Index of smaller element (indicates right position of pivot)
+    let mut i = low.wrapping_sub(1);
+
+    for j in low..
+TIME: (pp: 16t 3.1s 5t/s - tg: 0t 6.7s 38.0t/s)
+

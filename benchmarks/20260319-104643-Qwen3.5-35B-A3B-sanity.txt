@@ -1,0 +1,205 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://127.0.0.1:8012
+Date: 2026-03-19T10:46:43.616113
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! How can I help you today? 😊 Whether you have a question, need assistance with a task, or just want to chat, feel free to let me know! 🌟
+
+**What would you like to explore?**
+- 📚 Learning something new?
+- 💡 Solving a problem?
+- 🎨 Creative ideas?
+- 🌍 General curiosity?
+
+Just say the word! 😊
+
+
+*(Note: If "Hi" was a typo or part of a specific context, feel free to clarify!)*
+TIME: (pp: 11t 687ms 16t/s - tg: 118t 1.2s 96.5t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+
+Hello! I am **Qwen3.5**. I am the latest large language model developed by Tongyi Lab. How can I assist you today?
+TIME: (pp: 49t 694ms 71t/s - tg: 25t>33t 593ms 96.2t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+I was trained by **Tongyi Lab**. I am the latest large language model developed by Tongyi Lab. How can I assist you today?
+TIME: (pp: 94t 685ms 137t/s - tg: 315t>32t 3.8s 91.5t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+4
+TIME: (pp: 17t 689ms 25t/s - tg: 82t>3t 862ms 97.5t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+2 + 2 = 4.
+
+4 × 10 = 40.
+TIME: (pp: 35t 689ms 51t/s - tg: 4098t>21t 45.8s 89.9t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+The final result is 8.
+TIME: (pp: 71t 692ms 103t/s - tg: 73t>9t 851ms 95.2t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are a few key facts about them:
+*   **Size:** They can grow up to **30 meters (98 feet)** in length.
+*   **Weight:** They can weigh as much as **200 tons** (approximately 400,000 pounds).
+*   **Record:** They are not only the largest living animals but also the **largest animals known to have ever lived**, surpassing even the largest dinosaurs in terms of mass.
+TIME: (pp: 19t 688ms 28t/s - tg: 1075t>124t 13.1s 91.1t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water in the world is the **Pacific Ocean**.
+
+It covers approximately **63 million square miles** (163 million square kilometers), which is more than all of Earth's landmass combined.
+
+**Note on Lakes:**
+If you are asking specifically about the largest **lake** (an enclosed body of water), that is the **Caspian Sea**. Despite its name, it is technically a lake because it has no outlet to the ocean. However, it is much smaller than the Pacific Ocean.
+TIME: (pp: 21t 713ms 30t/s - tg: 1983t>110t 23.2s 90.2t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+# The Binary Chop (Binary Search) Algorithm: A Deep Dive
+
+The **Binary Chop**, more formally known as **Binary Search**, is one of the most fundamental and efficient algorithms in computer science. It is a "divide and conquer" algorithm used to find the position of a target value within a **sorted** array or list.
+
+While a linear search checks every element one by one ($O(n)$), the binary chop reduces the search space by half with every step, resulting in logarithmic time complexity ($O(\log n)$).
+
+Below is a comprehensive analysis of the algorithm, covering its logic, mathematical foundation, implementation details, edge cases, and advanced variations.
+
+---
+
+## 1. Core Logic and Prerequisites
+
+### The Prerequisite: Sorted Data
+The most critical constraint of the binary chop is that the data **must be sorted** (either ascending or descending). If the data is unsorted, the algorithm cannot determine which half of the array to discard based on the comparison with the middle element.
+
+### The Mechanism
+The algorithm works by maintaining a "search window" defined by two pointers: `low` (start index) and `high` (end index).
+1.  **Calculate Midpoint:** Find the middle
+TIME: (pp: 17t 691ms 25t/s - tg: 975t>256t 13.5s 91.3t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+Here is the reasoning:
+The towels dry simultaneously. The time it takes for a towel to dry depends on the environmental conditions (sun, air, temperature), not on the number of towels hanging on the line. As long as the towels are hung out at the same time and have enough space to dry without blocking each other, they will all finish drying at the same time.
+TIME: (pp: 48t 691ms 70t/s - tg: 919t>85t 11.0s 91.2t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the **blue whale** (*Balaenoptera musculus*), the largest animal known to have ever lived on Earth.
+
+### 1. Record-Breaking Size
+*   **Largest Animal Ever:** Blue whales are larger than any known dinosaur.
+*   **Dimensions:** They can grow up to **100 feet (30 meters)** long.
+*   **Weight:** They can weigh up to **200 tons** (roughly 400,000 pounds). To put that in perspective, a blue whale's tongue alone can weigh as much as a full-grown elephant.
+
+### 2. Incredible Anatomy
+*   **The Heart:** Their heart is the size of a small car (about the size of a bumper car) and weighs around **400 pounds (180 kg)**.
+*   **Blood Pressure:** Their blood pressure is so high that it would be fatal to humans. It is roughly double that of a human's.
+*   **Breathing:** As mammals, they breathe air. They have a blowhole on top of their head and can hold their breath for up to **90 minutes** while diving.
+
+### 
+TIME: (pp: 17t 691ms 25t/s - tg: 946t>256t 13.2s 91.3t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+Here are some more general facts about **whales** (the order *Cetacea*):
+
+### 1. Diverse Family
+*   **Two Main Groups:** Whales are divided into two main groups:
+    *   **Baleen Whales:** Filter feeders that use baleen plates to strain food from the water (e.g., Blue, Humpback, Gray, and Right whales).
+    *   **Toothed Whales:** Predators that hunt fish, squid, and other marine life (e.g., Sperm, Orca, and Dolphin species).
+
+### 2. Incredible Adaptations
+*   **Deep Diving:** Some species, like the Sperm Whale, can dive over **3,000 meters (10,000 feet)** deep.
+*   **Breath-Holding:** They can hold their breath for up to **90 minutes** while diving.
+*   **Communication:** They communicate using complex songs and clicks.
+*   **Size:** They range from the tiny **Dwarf Sperm Whale** (about 1.5 meters) to the massive **Blue Whale** (up to 30 meters).
+
+### 3. Social
+TIME: (pp: 288t 689ms 418t/s - tg: 470t>256t 8.0s 90.2t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Here are the facts about **where whales live geographically**.
+
+### 1. Global Distribution
+*   **Everywhere:** Whales are found in **all of the world's oceans**.
+*   **Polar Regions:** Many species, like the **Blue Whale** and **Humpback Whale**, migrate to the **Arctic** and **Antarctic** waters to feed during the summer.
+*   **Tropical Waters:** Many species migrate to **tropical and subtropical waters** (like the Caribbean, Hawaii, or the Pacific) to breed and give birth during the winter.
+
+### 2. Specific Habitats
+*   **Open Ocean (Pelagic):** The **Blue Whale** and **Fin Whale** spend most of their time in the open ocean, far from land.
+*   **Coastal Waters:** Some species, like the **Humpback Whale** and **Gray Whale**, spend significant time near the coast.
+*   **River Systems:** The **Amazon River Dolphin** (Boto) and **Yangtze River Dolphin** (Baiji, likely extinct) live in freshwater rivers.
+*   **Ice Edges:** The **Bowhead Whale** lives in the Arctic and can
+TIME: (pp: 560t 690ms 812t/s - tg: 1669t>256t 21.3s 90.3t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+Here is a safe, in-place Quicksort implementation in Rust.
+
+This implementation uses generics to work with any type `T` that implements the `Ord` trait (like integers, strings, etc.). It sorts the slice **in-place** (modifying the original data) to avoid unnecessary allocations.
+
+```rust
+// Define the generic function.
+// T must implement Ord to allow comparison.
+fn quicksort<T: Ord>(arr: &mut [T]) {
+    // Base case: arrays with 0 or 1 element are already sorted
+    if arr.len() <= 1 {
+        return;
+    }
+
+    // Select the last element as the pivot
+    let pivot_index = arr.len() - 1;
+    
+    // We borrow the pivot value as a reference to avoid requiring T: Copy
+    // This allows the function to work with non-Copy types (e.g., String)
+    let pivot = &arr[pivot_index];
+
+    // Partition logic: move elements smaller than pivot to the left
+    // 'i' tracks the boundary of elements smaller than the pivot
+    let mut i = 0;
+    
+    // Iterate through the slice excluding the pivot itself
+
+TIME: (pp: 18t 690ms 26t/s - tg: 4098t>256t 48.0s 90.7t/s)
+

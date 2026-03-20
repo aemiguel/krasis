@@ -1,0 +1,202 @@
+Sanity Test: Qwen3-Coder-Next @ http://127.0.0.1:8012
+Date: 2026-03-20T08:42:08.238575
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: Hello! How can I help you today? 😊
+TIME: (pp: 9t 3.3s 3t/s - tg: 0t 313ms 35.2t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: I'm Qwen! 😊  
+I'm a large-scale language model developed by Alibaba Cloud.  
+Nice to meet you—what would you like to explore or discuss? 🌟
+TIME: (pp: 35t 3.4s 10t/s - tg: 0t 995ms 38.2t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: I was developed and trained by the Tongyi Lab team at Alibaba Group.  
+Specifically, my training involved large-scale data processing, advanced machine learning techniques, and extensive fine-tuning to ensure strong performance across tasks like answering questions, writing, coding, and more.
+
+While I don’t have a single “trainer” in the human sense, my development involved contributions from many researchers, engineers, and linguists who worked on data curation, model architecture, alignment, and safety.
+
+If you’re curious about how I learn, my capabilities, or how I differ from other models—I’d love to share more! 🧠✨
+TIME: (pp: 87t 3.2s 27t/s - tg: 0t 3.2s 39.1t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 2 + 2 = 4
+TIME: (pp: 15t 3.2s 5t/s - tg: 0t 214ms 32.8t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 4 × 10 = 40
+TIME: (pp: 39t 3.4s 11t/s - tg: 0t 377ms 23.9t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 40 ÷ 5 = 8
+TIME: (pp: 65t 6.2s 10t/s - tg: 0t 376ms 23.9t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: The **blue whale** (*Balaenoptera musculus*) is the largest animal known to have ever lived on Earth.  
+
+- **Length**: Up to **29.9 meters** (about 94 feet), with some historical reports suggesting individuals over 30 meters.  
+- **Weight**: Up to **173 metric tons** (about 386,000 pounds), though typical large adults weigh around 150–150 tons.  
+
+Blue whales are marine mammals and feed almost exclusively on tiny shrimp-like animals called **krill**, consuming up to 4 tons of krill per day during feeding season.  
+
+Their heart alone can weigh around **180 kg** (400 lbs) and is roughly the size of a small car; their tongue weighs as much as an elephant.  
+
+While the *Argentinosaurus* (a sauropod dinosaur) may have been longer (estimates ~30–37 m), blue whales are heavier and more massive overall—and they are the largest *living* animal.
+TIME: (pp: 17t 6.2s 3t/s - tg: 0t 8.2s 27.2t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: The **Pacific Ocean** is the largest body of water in the world.  
+
+- **Area**: Approximately **165 million square kilometers** (63 million square miles)  
+- **Volume**: About **717 million cubic kilometers**  
+
+It covers more than half of the Earth’s total ocean surface and is larger than all of Earth’s landmasses combined.
+TIME: (pp: 19t 6.3s 3t/s - tg: 0t 2.8s 27.3t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: The **binary chop algorithm**—more commonly known as **binary search**—is an efficient, divide-and-conquer algorithm for finding a target value within a **sorted** array (or list). Its name "binary chop" emphasizes the repeated halving (or "chopping") of the search space. Below is a comprehensive, in-depth explanation covering its principles, mechanics, variants, complexity, implementation, and nuances.
+
+---
+
+## 🧠 Core Concept
+
+Binary search works by **repeatedly dividing the search interval in half**. It starts with the entire sorted array, compares the target value to the middle element, and:
+
+- If they match, the search ends successfully.
+- If the target is *less than* the middle element, the search continues in the **left half**.
+- If the target is *greater than* the middle element, the search continues in the **right half**.
+
+This process repeats until the target is found or the search interval becomes empty (indicating absence).
+
+> ⚠️ **Crucial Requirement**: The input array **must be sorted** (e.g., ascending order). Unsorted data renders binary search invalid or requires preprocessing (e.g., sorting first), which often negates its efficiency advantage.
+
+---
+
+##
+TIME: (pp: 15t 6.2s 2t/s - tg: 0t 9.3s 27.4t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: This is a classic trick question!
+
+The key insight is: **drying time does not depend on the number of towels**, assuming they’re all exposed to the same conditions (sunlight, wind, humidity, etc.) and are spread out properly on the line.
+
+If 4 towels take 4 hours to dry, that means **each towel individually takes 4 hours to dry** under those conditions — it's not a batch process where more items slow each other down (assuming they're not blocking each other's airflow or sun exposure).
+
+So, if you put **20 towels** on the line (and they’re all getting equal sun/air), each one still takes **4 hours** to dry.
+
+✅ **Answer: 4 hours**  
+*(Assuming the towels are all drying simultaneously and independently — no overcrowding that blocks airflow or sunlight.)*
+TIME: (pp: 46t 6.3s 7t/s - tg: 0t 6.4s 27.2t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: Here are some fascinating and scientifically verified facts about the **blue whale** (*Balaenoptera musculus*):
+
+### 🐋 **Size & Scale**
+- **Largest animal ever known**—living or extinct:  
+  - Adults reach **up to 30 meters (98 feet)** in length.  
+  - Weight: **170–200+ tons** (370,000–400,000 lbs), with some historical reports suggesting up to 150 tons (though confirmed max is ~100–170 tons).  
+  - Heart alone weighs **~180 kg (440 lbs)**—about the size of a small car—and can be heard from over 2 miles away.  
+  - Tongue weighs **~2 tons**—enough to carry 50 people.  
+  - A newborn calf is **7 meters (23 ft)** long and weighs **2.5–3 tons** at birth.
+
+### 🌊 **Feeding & Diet**
+- **Filter feeders** using baleen plates (not teeth):  
+  - Each side of the upper jaw has **70–90 b
+TIME: (pp: 15t 6.3s 2t/s - tg: 0t 9.3s 27.3t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: Absolutely! Whales are among the most awe-inspiring and ecologically important mammals on Earth. Here's a comprehensive overview of **whales in general**, covering their biology, diversity, behavior, and conservation:
+
+---
+
+### 🐋 **What Are Whales?**
+Whales are **marine mammals** belonging to the order **Cetacea**, which also includes **dolphins and porpoises**. They evolved from land-dwelling ancestors around 50 million years ago and fully transitioned to aquatic life by ~34 million years ago.
+
+Cetaceans are divided into two suborders:
+1. **Mysticeti** – **Baleen whales** (filter feeders with baleen plates)
+2. **Odontoceti** – **Toothed whales** (have teeth, use echolocation)
+
+---
+
+### 🌊 **Key Adaptations for Marine Life**
+- **Streamlined bodies** and **flippers** for efficient swimming  
+- **Blubber** (up to 10 cm thick) for insulation, energy storage, and buoyancy  
+- **Modified respiratory system**: blowholes (modified nostrils) on top of the head; can hold breath for 60+ minutes (sperm whales
+TIME: (pp: 288t 6.3s 45t/s - tg: 0t 9.4s 27.1t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: Whales are found in **every ocean on Earth**, from the **tropics to the polar regions**, and even in some **semi-enclosed seas and large rivers** (for a few species). Their distribution depends on species-specific habitat preferences, food availability, migration patterns, and seasonal conditions.
+
+Here’s a breakdown of where different whale groups live:
+
+---
+
+### 🌍 **Geographic Range by Habitat Type**
+
+### 1. **Open Ocean (Pelagic Zones)**
+- **Most baleen and toothed whales** spend significant time in **deep offshore waters**.
+- Examples:
+  - **Blue whales**: Cosmopolitan—found in all major oceans (Atlantic, Pacific, Indian, Southern), though populations are often separated (e.g., Antarctic, Eastern North Pacific, Eastern North Atlantic).
+  - **Sperm whales**: One of the most widespread mammals on Earth—found in **all oceans**, especially in deep waters >1,000 meters deep (e.g., equatorial and subtropical zones).
+  - **Humpback whales**: migrate globally between **polar feeding grounds** and **tropical breeding lagoons**.
+
+### 2. **Coastal & Shelf Waters**
+- Many species use **shallow
+TIME: (pp: 561t 6.4s 88t/s - tg: 0t 9.4s 27.1t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: Here's a clean, idiomatic quicksort implementation in Rust that works on `Vec<T>` where `T: Ord + Copy` (to keep it simple and avoid borrowing issues):
+
+```rust
+pub fn quicksort<T: Ord + Copy>(arr: &mut [T]) {
+    if arr.len() <= 1 {
+        return;
+    }
+
+    // Partition the array
+    let pivot = arr[arr.len() / 2]; // middle element as pivot
+    let mut i = 0;
+    let mut j = arr.len() - 1;
+
+    loop {
+        // Find element >= pivot from left
+        while i < j && arr[i] < pivot {
+            i += 1;
+        }
+
+        // Find element <= pivot from right
+        while j > i && arr[j] > pivot {
+            j -= 1;
+        }
+
+        if i >= j {
+            break;
+        }
+
+        arr.swap(i, j);
+        i += 1;
+        j -= 1;
+    }
+
+    // Recursively sort the partitions
+    // Note: j is the last index of the left partition
+    let left_size = j + 1;
+    quicksort(&mut arr[0..left_size]);
+    quicksort
+TIME: (pp: 16t 6.3s 2t/s - tg: 0t 9.4s 27.2t/s)
+

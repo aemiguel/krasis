@@ -510,7 +510,7 @@ def launch_server(config_path: str, log_file) -> subprocess.Popen:
     Returns the Popen handle. stdout/stderr go to log_file.
     """
     krasis = find_krasis_command()
-    cmd = [krasis, "--config", config_path, "--benchmark"]
+    cmd = [krasis, "--config", config_path, "--benchmark", "--vram-report"]
 
     proc = subprocess.Popen(
         cmd,
@@ -820,6 +820,48 @@ def extract_benchmark_section(log_path: str) -> str:
     return "(benchmark output not found in log)"
 
 
+def extract_vram_report(script_dir: str) -> Optional[List[Dict]]:
+    """Extract VRAM report events from logs/vram_report.csv.
+
+    Returns list of dicts: [{"event": str, "time_s": float, "gpus": [free_mb, ...]}, ...]
+    Only includes event rows (not periodic samples). Returns None if CSV not found.
+    """
+    csv_path = os.path.join(script_dir, "logs", "vram_report.csv")
+    if not os.path.isfile(csv_path):
+        return None
+
+    try:
+        with open(csv_path) as f:
+            lines = f.read().strip().split("\n")
+
+        if len(lines) < 2:
+            return None
+
+        # Parse header to find GPU columns
+        header = lines[0].split(",")
+        gpu_cols = [i for i, h in enumerate(header) if h.startswith("gpu") and h.endswith("_free_mb")]
+
+        events = []
+        for line in lines[1:]:
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            event = parts[1].strip()
+            if not event:
+                continue  # Skip periodic samples
+            ts_ms = int(parts[0])
+            gpu_free = [int(parts[i]) if i < len(parts) else 0 for i in gpu_cols]
+            events.append({
+                "event": event,
+                "time_s": ts_ms / 1000.0,
+                "gpus": gpu_free,
+            })
+
+        return events if events else None
+    except (OSError, IOError, ValueError):
+        return None
+
+
 def extract_server_error(log_path: str, max_chars: int = 3000) -> str:
     """Extract the tail of the server log for error reporting."""
     try:
@@ -935,7 +977,8 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
     Structure:
     1. Header with metadata and links
     2. All benchmark result summaries grouped together
-    3. All sanity test results in full (prompt + response) for manual verification
+    3. VRAM report — free VRAM at lifecycle events per GPU
+    4. All sanity test results in full (prompt + response) for manual verification
     """
     lines = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -957,6 +1000,10 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
         status = "FAILED" if cr.get("error") else "PASS"
         anchor = f"config-{i+1}-{variant['name'].lower().replace(' ', '-').replace('/', '')}"
         lines.append(f"  - [{variant['name']} — {status}](#{anchor})")
+    # Only show VRAM Report link if any config has vram data
+    has_vram = any(cr.get("vram_report") for cr in config_results)
+    if has_vram:
+        lines.append("- [VRAM Report](#vram-report)")
     lines.append("- [Sanity Tests](#sanity-tests)")
     for i, cr in enumerate(config_results):
         if cr.get("error"):
@@ -1008,6 +1055,43 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
                     decode_str = f"{lr['decode_tok_s']:.1f} tok/s" if lr.get('decode_tok_s', 0) > 0 else "N/A"
                     prefill_str = f"{lr['prefill_tok_s']:.0f} tok/s" if lr.get('prefill_tok_s', 0) > 0 else "N/A"
                     lines.append(f"| {lr['prompt_name']} | {book} | {decode_str} | {prefill_str} | {lr['ttft_s']:.2f}s |")
+            lines.append("")
+
+    # ── VRAM Report ───────────────────────────────────────────────
+    has_vram = any(cr.get("vram_report") for cr in config_results)
+    if has_vram:
+        lines.append("---")
+        lines.append("")
+        lines.append("## VRAM Report")
+        lines.append("")
+        lines.append("Free VRAM (MB) at each lifecycle event, per GPU.")
+        lines.append("")
+
+        for i, cr in enumerate(config_results):
+            vram = cr.get("vram_report")
+            if not vram:
+                continue
+
+            variant = cr["variant"]
+            lines.append(f"### Config {i+1}: {variant['name']}")
+            lines.append("")
+
+            # Build header from GPU count
+            num_gpus = len(vram[0]["gpus"]) if vram else 0
+            hdr = "| Event | Time |"
+            sep = "|-------|-----:|"
+            for g in range(num_gpus):
+                hdr += f" GPU{g} Free |"
+                sep += " ---------:|"
+            lines.append(hdr)
+            lines.append(sep)
+
+            for ev in vram:
+                row = f"| {ev['event']} | {ev['time_s']:.1f}s |"
+                for mb in ev["gpus"]:
+                    row += f" {mb:,} MB |"
+                lines.append(row)
+
             lines.append("")
 
     # ── Sanity Tests ───────────────────────────────────────────────
@@ -1256,6 +1340,11 @@ def main():
                 log_file.close()
             except Exception:
                 pass
+
+            # Extract VRAM report (CSV written by server at shutdown)
+            vram_events = extract_vram_report(script_dir)
+            if vram_events:
+                result["vram_report"] = vram_events
 
             # Clean up temp config
             if config_path and os.path.isfile(config_path):

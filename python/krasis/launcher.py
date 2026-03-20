@@ -1495,7 +1495,7 @@ class Launcher:
         print()
 
     def launch_server(self, benchmark: bool = False, benchmark_only: bool = False,
-                      stress_test: bool = False) -> None:
+                      stress_test: bool = False, vram_report: bool = False) -> None:
         """Write a temp config file and exec the Krasis server with --config."""
         import tempfile
 
@@ -1524,6 +1524,8 @@ class Launcher:
             cmd_args.append("--benchmark-only")
         if stress_test:
             cmd_args.append("--stress-test")
+        if vram_report:
+            cmd_args.append("--vram-report")
 
         # Set CUDA_VISIBLE_DEVICES to selected GPUs
         if self.selected_gpus:
@@ -1637,6 +1639,8 @@ def parse_args() -> argparse.Namespace:
                         help="Run standardized benchmark before starting server")
     parser.add_argument("--benchmark-suite", nargs="?", const="", default=None,
                         help="Run benchmark suite (optional: path to TOML config)")
+    parser.add_argument("--vram-report", action="store_true",
+                        help="Generate VRAM report CSV to logs/vram_report.csv")
     parser.add_argument("--skip-setup", action="store_true",
                         help="(ignored — handled by bash wrapper)")
     parser.add_argument("--venv", default=None,
@@ -1991,7 +1995,8 @@ def main():
             )
 
         launcher.print_summary()
-        launcher.launch_server(benchmark=args.benchmark)
+        launcher.launch_server(benchmark=args.benchmark,
+                               vram_report=getattr(args, 'vram_report', False))
     else:
         # Interactive TUI
         if launcher.run_interactive():
@@ -2029,6 +2034,7 @@ def main():
                 benchmark=(launch_mode in ("benchmark", "benchmark_only")),
                 benchmark_only=(launch_mode == "benchmark_only"),
                 stress_test=(launch_mode == "stress_test"),
+                vram_report=getattr(args, 'vram_report', False),
             )
         else:
             print("Aborted.")

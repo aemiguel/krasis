@@ -1,0 +1,205 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://127.0.0.1:8012
+Date: 2026-03-19T10:54:11.649400
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! How can I assist you today? 😊 Whether you have questions, need help with a task, or just want to chat, feel free to let me know! 🌟📚💻🎨🎵🎮🎬🎤🎭🎨🎶🎹🎺🎻🎼🎧🎤🎹🎺🎻🎼🎧🎤🎹🎺🎻🎼🎧🎤🎹🎺🎻🎼🎧🎤🎹🎺🎻🎼🎧🎤🎹🎺🎻🎼🎧🎤🎹🎺🎻🎼🎧🎤🎹🎺🎻🎼🎧🎤🎹🎺🎻🎼🎧🎤🎹🎺🎻🎼🎧🎤🎹🎺
+TIME: (pp: 11t 1.3s 8t/s - tg: 256t 4.4s 58.3t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+TIME: (pp: 279t 1.3s 209t/s - tg: 4098t>1t 65.5s 62.5t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+Hello! My name is Qwen3.5. I was trained by the Tongyi Lab team at Alibaba Cloud. How can I assist you today? 😊
+TIME: (pp: 293t 1.3s 220t/s - tg: 35t>35t 1.3s 53.3t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+4
+TIME: (pp: 17t 1.3s 13t/s - tg: 78t>3t 1.5s 54.7t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+40
+TIME: (pp: 35t 1.3s 26t/s - tg: 9t>4t 265ms 45.2t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+8
+TIME: (pp: 54t 1.3s 40t/s - tg: 10t>3t 263ms 45.7t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are a few key facts about them:
+*   **Size:** They can grow up to **100 feet (30 meters)** long.
+*   **Weight:** They can weigh as much as **200 tons**.
+*   **History:** They are not only the largest living animal but also the largest animal known to have ever lived on Earth, surpassing even the biggest dinosaurs.
+TIME: (pp: 19t 1.3s 14t/s - tg: 539t>108t 12.4s 52.2t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water on Earth is the **Pacific Ocean**.
+
+It covers approximately **63 million square miles** (165 million square kilometers), which is about 30% of the Earth's surface and more than the total land area of all continents combined.
+
+**Note on Lakes:**
+If you are asking specifically for the largest **lake** (an enclosed body of water), the answer is the **Caspian Sea**. Despite its name, it is technically a lake because it is landlocked. It covers about 143,000 square miles (371,000 square kilometers).
+
+*   **Largest lake by surface area:** Caspian Sea
+*   **Largest lake by volume:** Lake Baikal (in Russia)
+TIME: (pp: 21t 1.3s 16t/s - tg: 2022t>164t 42.8s 51.1t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+# The Binary Search Algorithm (Binary Chop)
+
+The **Binary Search** algorithm, often colloquially referred to as the **Binary Chop**, is one of the most fundamental and efficient algorithms in computer science. It is a classic example of the **Divide and Conquer** paradigm.
+
+Below is a comprehensive, in-depth description of the algorithm, covering its mechanics, mathematical foundations, implementation nuances, complexity analysis, and advanced variations.
+
+---
+
+## 1. Core Concept and Definition
+
+Binary Search is a search algorithm that finds the position of a target value within a **sorted array**. It works by repeatedly dividing the search interval in half.
+
+*   **Input:** A sorted collection of elements (array, list, etc.) and a target value.
+*   **Output:** The index of the target value if found; otherwise, a signal indicating the value is not present.
+*   **Key Constraint:** The data **must be sorted** (ascending or descending). Without this precondition, the algorithm cannot guarantee correctness.
+
+---
+
+## 2. The Mechanics of the Algorithm
+
+The logic relies on the fact that if the array is sorted, comparing the target to the middle element allows us to eliminate half of the remaining search space immediately.
+
+
+TIME: (pp: 17t 1.3s 13t/s - tg: 986t>256t 22.9s 54.2t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+Here is the reasoning:
+The towels dry simultaneously. Since the environmental conditions (sun, wind, heat) remain the same, each individual towel takes 4 hours to dry regardless of how many other towels are hanging alongside it (assuming there is enough space on the clothesline).
+TIME: (pp: 48t 1.4s 35t/s - tg: 909t>65t 19.7s 49.5t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the **Blue Whale** (*Balaenoptera musculus*), the largest animal known to have ever lived on Earth.
+
+### 1. They are the largest animals ever
+*   **Size:** They can grow up to **100 feet (30 meters)** long.
+*   **Weight:** They can weigh up to **200 tons** (400,000 pounds).
+*   **Comparison:** Their tongue alone can weigh as much as an **elephant**, and their heart is the size of a **small car**.
+
+### 2. Massive Heart and Blood Pressure
+*   The blue whale's heart weighs about **400 pounds (180 kg)**.
+*   It pumps blood so powerfully that the pressure can be felt from **2 miles away**.
+*   When the whale dives, its heart rate slows down significantly to conserve oxygen.
+
+### 3. They eat tons of tiny food
+*   Despite their massive size, they feed almost exclusively on **krill** (tiny shrimp-like crustaceans).
+*   A single blue whale can eat up to **4 tons of krill per day** during feeding season.
+*
+TIME: (pp: 17t 1.4s 13t/s - tg: 991t>256t 24.6s 50.7t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+Here are some more general facts about **whales** (the order *Cetacea*), which includes the Blue Whale as well as other species like the Humpback, Orca, and Sperm Whale.
+
+### 1. They are Mammals, not Fish
+*   **Breathing:** Whales breathe air through a blowhole on top of their head. They cannot breathe underwater like fish.
+*   **Warm-blooded:** They are warm-blooded mammals, meaning they regulate their own body temperature.
+*   **Birth:** They give birth to live young (calves) and nurse them with milk.
+
+### 2. They are Highly Social
+*   **Communication:** Whales are known for their complex songs and calls, which can travel for **hundreds of miles** underwater.
+*   **Hunting:** Many species, like Orcas (Killer Whales), hunt in coordinated packs.
+*   **Bonding:** Mothers and calves form very strong bonds, and some species are known to care for injured or dying members of their group.
+
+### 3. They are Deep Divers
+*   **Sperm Whales:** Can dive over **2,000 meters** (6,5
+TIME: (pp: 289t 1.3s 217t/s - tg: 963t>256t 23.6s 51.6t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Here is a comprehensive summary of where **whales** live geographically, covering their global range, migration patterns, and specific habitats.
+
+### 1. Global Distribution
+*   **All Oceans:** Whales are found in **all five oceans** of the world, from the freezing Arctic to the Antarctic.
+*   **Pelagic Zone:** Most species spend the majority of their lives in the **open ocean** (pelagic zone), far from land.
+*   **Coastal Areas:** Some species, like Orcas (Killer Whales) and Gray Whales, are frequently found near **coastal** waters and continental shelves.
+
+### 2. Migration Patterns
+*   **Seasonal Travel:** Many whales, particularly **Humpbacks**, migrate **thousands of miles** annually.
+*   **Feeding vs. Breeding:** They typically feed in **cold, nutrient-rich** polar waters during the summer and migrate to **warm, tropical** waters for breeding and calving in the winter.
+*   **Distance:** Some species can travel over **5,000 miles** (8,000 km) in a single migration season.
+
+### 3. Specific Habitat Preferences
+*
+TIME: (pp: 561t 1.3s 420t/s - tg: 4098t>256t 74.7s 58.3t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+Here is a standard, in-place implementation of Quicksort in Rust. It uses mutable slices (`&mut [T]`) and the `Ord` trait bound, which is the idiomatic way to handle sorting in Rust without external dependencies.
+
+```rust
+fn quicksort<T: Ord>(slice: &mut [T]) {
+    if slice.len() <= 1 {
+        return;
+    }
+
+    let pivot_index = partition(slice);
+    
+    // Recursively sort the left and right partitions
+    quicksort(&mut slice[..pivot_index]);
+    quicksort(&mut slice[pivot_index + 1..]);
+}
+
+fn partition<T: Ord>(slice: &mut [T]) -> usize {
+    let len = slice.len();
+    // Pick the middle element as pivot to avoid worst-case on sorted data
+    let pivot_idx = len / 2;
+    
+    // Move pivot to the end for easier partitioning
+    slice.swap(pivot_idx, len - 1);
+    
+    let pivot = &slice[len - 1]; // Reference to the pivot value
+    
+    let mut store_idx = 0;
+    
+    // Iterate through the slice (excluding the pivot at the
+TIME: (pp: 18t 1.3s 13t/s - tg: 3739t>256t 77.1s 51.8t/s)
+
