@@ -1,0 +1,197 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://127.0.0.1:8012
+Date: 2026-03-20T21:01:15.857341
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! How can I help you today?
+TIME: (pp: 11t 694ms 16t/s - tg: 693t>11t 14.4s 48.7t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+
+I'm an AI assistant, so I don't have a personal name. But you can call me whatever you like! How can I help you today? 😊
+TIME: (pp: 35t 696ms 50t/s - tg: 33t>35t 1.3s 50.0t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+I was trained by the Tongyi Lab under Alibaba Cloud. My development leverages the extensive historical data and technical expertise accumulated by Alibaba Group. I underwent rigorous training and optimization to ensure high-quality performance. How can I assist you today? 😊
+TIME: (pp: 82t 687ms 119t/s - tg: 61t>51t 2.3s 49.2t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+2 + 2 = 4.
+TIME: (pp: 17t 694ms 24t/s - tg: 350t>10t 7.3s 49.1t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+40
+TIME: (pp: 42t 702ms 60t/s - tg: 21t>4t 477ms 50.3t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+8
+TIME: (pp: 61t 692ms 88t/s - tg: 11t>3t 263ms 49.4t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are a few key facts about its size:
+*   **Length:** They can grow up to **30 meters (98 feet)** long.
+*   **Weight:** They can weigh as much as **190 tonnes (209 short tons)**.
+*   **History:** The blue whale is also the largest animal known to have ever lived, surpassing even the largest dinosaurs.
+
+For comparison, the blue whale's tongue alone can weigh as much as an elephant, and its heart is about the size of a small car.
+TIME: (pp: 19t 693ms 27t/s - tg: 1004t>137t 23.5s 48.5t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water in the world is the **Pacific Ocean**.
+
+However, if you are asking specifically about the largest **lake** (a landlocked body of water), that title belongs to the **Caspian Sea**. Despite its name, it is technically a lake because it is not connected to the world's oceans.
+TIME: (pp: 21t 698ms 30t/s - tg: 931t>69t 20.6s 48.6t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+The **Binary Chop** algorithm, more commonly known in computer science as **Binary Search**, is a fundamental algorithm used to find the position of a target value within a sorted collection. It is a classic example of the **Divide and Conquer** strategy.
+
+While the term "chop" implies cutting the search space in half, the logic is identical to the standard Binary Search. Below is an in-depth technical analysis of the algorithm, covering its mechanics, complexity, implementation details, edge cases, and variations.
+
+---
+
+### 1. Core Concept and Prerequisites
+
+The fundamental premise of the Binary Chop is that if a list is sorted, you can determine which half of the list the target value *cannot* be in by comparing the target to the middle element.
+
+**Prerequisites:**
+1.  **Sorted Data:** The array or list must be sorted in ascending (or descending) order. If the data is unsorted, the algorithm fails.
+2.  **Random Access:** The data structure should allow $O(1)$ access to the middle element (e.g., an array or vector). It does not work efficiently on Linked Lists because finding the middle requires traversal.
+
+### 2. The Algorithm Logic
+
+The algorithm maintains
+TIME: (pp: 17t 697ms 24t/s - tg: 1181t>256t 29.6s 48.5t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+Here is the reasoning:
+Drying clothes is a **parallel process**, not a sequential one. Since all the towels are hanging on the line at the same time, they are all exposed to the sun and wind simultaneously. Adding more towels does not increase the time required for evaporation, provided they all fit on the line without blocking each other's airflow.
+
+*   1 towel = 4 hours
+*   4 towels = 4 hours
+*   20 towels = 4 hours
+TIME: (pp: 48t 696ms 69t/s - tg: 1842t>112t 40.4s 48.4t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the blue whale (*Balaenoptera musculus*):
+
+**1. They are the largest animals ever known**
+The blue whale is not only the largest animal alive today, but it is also the largest animal known to have ever lived on Earth. They are even bigger than the largest dinosaurs.
+
+**2. Incredible Size and Weight**
+*   **Length:** They can grow up to **100 feet (30 meters)** long.
+*   **Weight:** They can weigh up to **200 tons (400,000 pounds)**.
+*   **Comparison:** Their tongue alone can weigh as much as a full-grown elephant, and their heart is the size of a small car and weighs about 400 pounds (180 kg).
+
+**3. They are Mammals, not Fish**
+Like humans, blue whales breathe air. They have a blowhole on top of their head and must come to the surface to breathe. They can hold their breath for up to 90 minutes while diving deep.
+
+**4. The Loudest Animal**
+The blue whale is the loudest animal on the planet. Their low-frequency calls can reach
+TIME: (pp: 17t 697ms 24t/s - tg: 784t>256t 21.4s 48.5t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+It is great that you are interested in whales! While the Blue Whale is the most famous, there is a whole world of diversity among whales. Here are some key facts about whales in general:
+
+### 1. They Are Mammals, Not Fish
+This is the most common misconception. Whales are warm-blooded mammals, just like humans.
+*   **Breathing:** They breathe air through lungs, not gills. They must come to the surface to breathe.
+*   **Birth:** They give birth to live young (calves) and nurse them with milk.
+*   **Hair:** While they look smooth, they actually have a few hairs around their snout when they are born.
+
+### 2. Two Main Groups
+Whales are divided into two suborders based on how they eat and their teeth:
+*   **Toothed Whales (Odontoceti):** These have teeth and hunt for food. This group includes **Sperm Whales**, **Orca (Killer Whales)**, and **Dolphins**. They use **echolocation** (sonar) to find prey in the dark ocean.
+*   **Baleen Whales (Mysticeti):** These have no
+TIME: (pp: 289t 695ms 416t/s - tg: 1393t>256t 34.2s 48.2t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Whales are found in oceans all around the world, but their specific locations depend on the species, the time of year, and what they are doing (feeding vs. breeding). Here is a breakdown of where whales live geographically:
+
+### 1. Global Distribution
+Whales are **cosmopolitan**, meaning most species can be found in almost all of the world's oceans.
+*   **The Pacific, Atlantic, Indian, Arctic, and Southern Oceans:** Almost all whale species inhabit these waters.
+*   **No Landlocked Lakes:** True whales live in saltwater. While there are freshwater dolphins (like the Amazon River Dolphin), they are not classified as true whales.
+
+### 2. Climate Zones (Polar vs. Tropical)
+Most whales migrate between two main geographic zones based on the season:
+*   **Polar Regions (High Latitudes):**
+    *   **Where:** Arctic (North Pole) and Antarctic (South Pole).
+    *   **Why:** These waters are cold and nutrient-rich. This is where whales go to **feed**. The abundance of krill and small fish allows them to build up fat reserves.
+    *   **Species:** Blue Whales, Humpbacks, Minke
+TIME: (pp: 561t 692ms 811t/s - tg: 1343t>256t 33.2s 48.2t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+Here is a clean, **in-place** implementation of Quicksort in Rust. It is generic (works with any type `T` that implements `Ord`), memory-safe, and uses slices (`&mut [T]`) to avoid unnecessary allocations.
+
+```rust
+fn quicksort<T: Ord>(arr: &mut [T]) {
+    if arr.len() <= 1 {
+        return;
+    }
+
+    // 1. Pick a pivot (middle element is a simple heuristic)
+    let pivot_idx = arr.len() / 2;
+    let pivot = arr[pivot_idx];
+
+    // 2. Partition the array
+    // We use a mutable index to track the position of the next element < pivot
+    let mut store_index = 0;
+    
+    // Swap pivot to the end temporarily to simplify the loop
+    arr.swap(pivot_idx, arr.len() - 1);
+
+    for i in 0..arr.len() - 1 {
+        if arr[i] < pivot {
+            arr.swap(i, store_index);
+            store_index += 1;
+        }
+    }
+
+    // 3. Place pivot in its correct sorted position
+
+TIME: (pp: 18t 696ms 26t/s - tg: 2937t>256t 66.5s 48.0t/s)
+

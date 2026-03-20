@@ -1,0 +1,304 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://127.0.0.1:8012
+Date: 2026-03-20T21:45:53.597090
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! How can I help you today? 😊
+
+Whether you have a question, need help with a task, or just want to chat, feel free to let me know!
+
+*(Note: If you meant to type "Hi" and accidentally hit "assistant" instead, no worries! I'm still here and ready to help.)*
+
+What would you like to do? 🚀
+
+1. **Ask a question**
+2. **Get help with a task**
+3. **Learn something new**
+4. **Just say hi!**
+
+Let me know! 😊
+
+---
+
+*P.S. If you meant to type something else (like "Hi" + a specific topic), feel free to clarify!* 😊
+
+---
+
+**Ready when you are!** 🌟
+
+*(Just type your request or question below!)*
+
+---
+
+**Example:**
+- "What's the weather like today?"
+- "Help me write a story."
+- "Explain quantum physics simply."
+- "Hi, how are you?"
+
+**Your turn!** 😊
+
+---
+
+*P.S. I'm an AI assistant, so I'm always happy to help! Just let me know what you need.*
+TIME: (pp: 11t 1.5s 7t/s - tg: 256t 4.1s 62.2t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+
+Hello! My name is **Qwen3.5**, an AI assistant developed by Tongyi Lab (Alibaba Cloud). How can I help you today? 😊
+
+---
+
+**Key details:**
+- **Name**: Qwen3.5
+- **Developer**: Tongyi Lab (Alibaba Cloud)
+- **Purpose**: To assist with tasks like answering questions, creating content, coding, analyzing data, and more!
+
+Let me know what you'd like to explore or work on! 🚀
+
+---
+
+**Example tasks I can help with:**
+- Writing stories or emails
+- Solving math problems
+- Coding assistance
+- Data analysis
+- Learning new topics
+- Just chatting!
+
+What would you like to do? 🌟
+
+---
+
+**P.S.** I'm an AI assistant, so I'm always happy to help! Just let me know what you need. 😊
+
+---
+
+**Ready when you are!** 🌟
+
+*(Just type your request or question below!)*
+
+---
+
+**Example:**
+- "What's the weather like today?"
+- "Help me write a story."
+- "Explain quantum physics simply."
+- "Hi, how are you?"
+
+
+TIME: (pp: 281t 1.5s 190t/s - tg: 583t>256t 12.2s 68.7t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+Hello! I was trained by **Tongyi Lab** (part of Alibaba Cloud). How can I help you today? 😊
+
+---
+
+**Key details:**
+- **Trainer**: Tongyi Lab (Alibaba Cloud)
+- **Purpose**: To assist with tasks like answering questions, creating content, coding, analyzing data, and more!
+
+Let me know what you'd like to explore or work on! 🚀
+
+---
+
+**Example tasks I can help with:**
+- Writing stories or emails
+- Solving math problems
+- Coding assistance
+- Data analysis
+- Learning new topics
+- Just chatting!
+
+What would you like to do? 🌟
+
+---
+
+**P.S.** I'm an AI assistant, so I'm always happy to help! Just let me know what you need. 😊
+
+---
+
+**Ready when you are!** 🌟
+
+*(Just type your request or question below!)*
+
+---
+
+**Example:**
+- "What's the weather like today?"
+- "Help me write a story."
+- "Explain quantum physics simply."
+- "Hi, how are you?"
+
+---
+
+**Your turn!** 😊
+TIME: (pp: 549t 1.6s 341t/s - tg: 418t>249t 9.4s 70.8t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+2 + 2 = 4.
+TIME: (pp: 17t 1.6s 10t/s - tg: 210t>10t 3.4s 64.2t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+40
+TIME: (pp: 42t 1.5s 27t/s - tg: 21t>4t 405ms 59.3t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+The result is **8**.
+TIME: (pp: 61t 1.5s 41t/s - tg: 18t>8t 426ms 58.7t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are a few key facts about them:
+*   **Size:** They can grow up to **100 feet (30 meters)** long.
+*   **Weight:** They can weigh as much as **200 tons** (roughly 400,000 pounds).
+*   **History:** They are not only the largest living animals but also the **largest known animals to have ever lived on Earth**, surpassing even the largest dinosaurs.
+TIME: (pp: 19t 1.4s 14t/s - tg: 677t>123t 12.9s 62.0t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The answer depends on how you define "body of water," but generally:
+
+*   **The Largest Ocean:** The **Pacific Ocean** is the largest body of water on Earth. It covers more than 63 million square miles (165 million square kilometers), which is larger than all of the Earth's landmass combined.
+*   **The Largest Lake:** If you are referring to lakes, the **Caspian Sea** is the largest. Despite its name, it is technically a lake because it is landlocked and has no outlet to the ocean.
+*   **The Largest Freshwater Lake:** By surface area, that is **Lake Superior** (in North America). By volume, that is **Lake Baikal** (in Russia).
+
+So, in the broadest sense, the **Pacific Ocean** is the largest.
+TIME: (pp: 21t 1.6s 13t/s - tg: 1093t>175t 20.5s 61.8t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+# The Binary Chop (Binary Search) Algorithm: A Deep Dive
+
+The **Binary Chop**, more formally known as **Binary Search**, is one of the most fundamental and efficient algorithms in computer science. It is a classic example of the **Divide and Conquer** paradigm.
+
+While often taught as a simple "find the middle" routine, a deep understanding of the algorithm requires exploring its mathematical underpinnings, implementation nuances, edge cases, and advanced variations.
+
+---
+
+## 1. Core Concept and Prerequisites
+
+### The Fundamental Principle
+Binary search works by repeatedly dividing the search interval in half. If the value of the search key is less than the item in the middle of the interval, the search continues in the lower half; otherwise, it continues in the upper half.
+
+### The Golden Rule: Sorted Data
+The absolute prerequisite for binary search is that the input data **must be sorted** (ascending or descending).
+*   **Why?** The algorithm relies on the assumption that if `target < middle`, then `target` cannot exist in the right half. Without sorting, this assumption fails, and the algorithm yields incorrect results.
+*   **Cost:** If the data is not sorted, you must sort it first (usually
+TIME: (pp: 17t 1.4s 12t/s - tg: 964t>256t 18.6s 65.6t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+Here is the reasoning:
+Drying on a clothesline is a **parallel process**, not a sequential one. If you hang 4 towels, they all dry at the same time. If you hang 20 towels (assuming there is enough space on the line), they all dry at the same time under the same environmental conditions. The number of towels does not change the time it takes for an individual towel to dry.
+TIME: (pp: 48t 1.6s 30t/s - tg: 1907t>95t 34.6s 57.8t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the **Blue Whale** (*Balaenoptera musculus*), the largest animal known to have ever lived on Earth.
+
+### **Size and Scale**
+*   **Largest Animal Ever:** Blue whales are larger than any known dinosaur. Their length can reach up to **30 meters (98 feet)**.
+*   **Weight:** They can weigh as much as **200 tons** (approximately 400,000 pounds).
+*   **Heart:** A blue whale's heart is the size of a small car and weighs about **400 pounds (180 kg)**.
+*   **Tongue:** Their tongue alone weighs as much as an **elephant** (about 2,700 lbs or 1,200 kg).
+*   **Blood:** Their arteries are so large that a human could swim through them.
+
+### **Diet and Feeding**
+*   **Krill Specialists:** Despite their massive size, they feed almost exclusively on tiny crustaceans called **krill**.
+*   **Huge Appetite:** During the feeding season, a single blue whale can consume up to **4 tons (8,0
+TIME: (pp: 17t 1.6s 10t/s - tg: 799t>256t 17.4s 60.5t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+Here are some more fascinating facts about **whales** in general, the largest and most complex animals on Earth.
+
+### **1. Diversity and Size**
+*   **The Largest:** The **Blue Whale** (*Balaenoptera musculus*) is the largest animal known to have ever lived on Earth. It can reach lengths of up to **30 meters (98 feet)** and weigh as much as **200 tons** (approximately 400,000 pounds).
+*   **The Smallest:** The **Vaquita** (*Phocoena sinus*) is the smallest whale, measuring only about **1.5 meters (5 feet)** and weighing around **50 kg (110 lbs)**.
+*   **The Heaviest:** The **Blue Whale** is also the heaviest, with a heart the size of a small car and weighing about **400 pounds (180 kg)**.
+*   **The Longest:** The **Blue Whale** is also the longest, with a tongue alone weighing as much as an **elephant** (about 2,700 lbs or 1,200 kg).
+
+### **2. Diet and Feeding**
+
+TIME: (pp: 289t 1.6s 180t/s - tg: 1374t>256t 26.8s 60.8t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Here are some fascinating facts about **where whales live geographically** and how they navigate the globe.
+
+### **1. Global Distribution**
+*   **All Oceans:** Whales are found in **all five oceans** of the world: the Pacific, Atlantic, Indian, Southern (Antarctic), and Arctic Oceans.
+*   **No Landlocked:** Unlike some fish, there are no landlocked whale populations. They are strictly marine animals.
+*   **Polar to Tropical:** While some species prefer cold waters (like the **Blue Whale** and **Humpback**), others thrive in warm tropical waters (like the **Bottlenose Dolphin**, which is technically a whale).
+
+### **2. Seasonal Migration**
+*   **The Great Journey:** Many whales migrate thousands of miles between feeding grounds in the **polar regions** (where food is abundant in summer) and breeding grounds in the **tropical or subtropical waters** (where it is warmer for calves).
+*   **The Longest Migrants:** The **Gray Whale** holds the record for the longest migration of any mammal, traveling up to **25,000 kilometers (15,500 miles)** round trip
+TIME: (pp: 560t 1.6s 348t/s - tg: 2693t>256t 44.3s 66.6t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+Here is an idiomatic, in-place Quicksort implementation in Rust.
+
+This implementation uses:
+1.  **Generics**: Works with any type `T` that implements the `Ord` trait.
+2.  **Mutable Slices**: `&mut [T]` to sort in-place without allocating new vectors.
+3.  **`split_at_mut`**: A safe way to handle recursive calls without overlapping mutable borrows.
+
+```rust
+fn quicksort<T: Ord>(slice: &mut [T]) {
+    if slice.len() <= 1 {
+        return;
+    }
+
+    // 1. Choose a pivot (using the first element for simplicity)
+    let pivot_index = partition(slice);
+
+    // 2. Split the slice into left and right parts around the pivot
+    //    split_at_mut returns (&mut [T], &mut [T])
+    let (left, right) = slice.split_at_mut(pivot_index);
+
+    // 3. Recursively sort the left part
+    quicksort(left);
+
+    // 4. Recursively sort the right part (excluding the pivot element at right[0])
+    //    We use a range slice
+TIME: (pp: 18t 1.6s 11t/s - tg: 2640t>256t 46.8s 61.8t/s)
+

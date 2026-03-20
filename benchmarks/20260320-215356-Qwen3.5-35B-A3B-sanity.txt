@@ -1,0 +1,208 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://127.0.0.1:8012
+Date: 2026-03-20T21:53:56.614339
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! How can I help you today?
+TIME: (pp: 11t 692ms 16t/s - tg: 808t>11t 16.7s 48.9t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+
+Hello! I'm Qwen3.5, the latest large language model developed by Tongyi Lab. How can I assist you today?
+TIME: (pp: 35t 698ms 50t/s - tg: 27t>30t 1.1s 50.2t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+Hello! I'm Qwen3.5, the latest large language model developed by Tongyi Lab. I was trained by the Tongyi Lab team at Alibaba Cloud. How can I assist you today?
+TIME: (pp: 77t 690ms 112t/s - tg: 43t>43t 1.7s 49.9t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+2 + 2 = 4
+TIME: (pp: 17t 692ms 25t/s - tg: 182t>9t 3.8s 49.9t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+40
+TIME: (pp: 41t 696ms 59t/s - tg: 27t>4t 596ms 50.3t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+8
+TIME: (pp: 60t 696ms 86t/s - tg: 10t>3t 241ms 49.9t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal currently living on Earth is the **blue whale** (*Balaenoptera musculus*).
+
+Here are some key facts about its size:
+*   **Length:** They can grow up to **30 meters (98 feet)** long.
+*   **Weight:** They can weigh up to **200 tons** (approximately 180 metric tonnes).
+*   **Comparison:** They are larger than any known dinosaur that has ever lived.
+*   **Diet:** Despite their massive size, they feed almost exclusively on tiny shrimp-like animals called krill.
+
+To put their size in perspective, a blue whale's heart is about the size of a small car, and its tongue can weigh as much as an elephant.
+TIME: (pp: 19t 695ms 27t/s - tg: 596t>158t 15.4s 48.9t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water in the world is the **Pacific Ocean**.
+
+Here are a few key details:
+*   **Size:** It covers approximately **165 million square kilometers** (63 million square miles), which is more than all of Earth's landmass combined.
+*   **Coverage:** It accounts for about **46% of the water on Earth's surface** and roughly **30% of the planet's total surface area**.
+
+If you are asking specifically about the largest **lake** (a landlocked body of water), that is the **Caspian Sea**, which covers about 371,000 square kilometers. Despite its name, it is technically a lake because it has no outlet to the ocean.
+TIME: (pp: 21t 698ms 30t/s - tg: 1735t>157t 38.9s 48.7t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+# The Binary Chop Algorithm (Binary Search)
+
+The **Binary Chop** algorithm, more commonly known in computer science as **Binary Search**, is a fundamental algorithm used to find the position of a target value within a sorted array or list. It is a classic example of the **Divide and Conquer** paradigm.
+
+While the name "Binary Chop" is less common in modern academic literature, it vividly describes the mechanism: the search space is "chopped" in half at every step until the target is found or the space is exhausted.
+
+---
+
+## 1. Core Concept and Prerequisites
+
+### The Fundamental Requirement
+The most critical prerequisite for the Binary Chop algorithm is that the data structure **must be sorted** (either in ascending or descending order). If the data is unsorted, the algorithm cannot determine which half of the array to discard, rendering it ineffective.
+
+### The Intuition
+Imagine looking up a name in a physical phone book. You do not start at page 1 and read every name. Instead, you open the book roughly in the middle.
+*   If the name you want comes alphabetically *before* the middle name, you know the target is in the first half.
+*   If it comes *
+TIME: (pp: 17t 695ms 24t/s - tg: 1179t>256t 29.4s 48.8t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+This is a classic logic puzzle. The towels dry simultaneously, not sequentially. As long as all the towels fit on the line and receive the same exposure to the sun and air, the drying time remains the same regardless of the number of towels.
+TIME: (pp: 48t 695ms 69t/s - tg: 1104t>58t 23.8s 48.8t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the **blue whale** (*Balaenoptera musculus*):
+
+**1. They are the largest animals ever known to have lived.**
+Even larger than the biggest dinosaurs, blue whales can grow up to **98 feet (30 meters)** long and weigh as much as **200 tons**. To put that in perspective, their tongue alone can weigh as much as an elephant.
+
+**2. Their heart is massive.**
+A blue whale's heart is about the size of a small car and weighs around **400 pounds (180 kilograms)**. You can actually see their heartbeat from a distance because the pulse is so strong.
+
+**3. They are incredibly loud.**
+Blue whales produce the loudest sounds of any animal on Earth. Their calls can reach **188 decibels**, which is louder than a jet engine. These low-frequency sounds can travel for hundreds of miles underwater.
+
+**4. They eat tiny creatures.**
+Despite their size, blue whales are not predators of large fish. They are baleen whales that feed almost exclusively on **krill** (tiny shrimp-like crustaceans). A single whale can consume up to **4 tons of krill per
+TIME: (pp: 17t 692ms 25t/s - tg: 1622t>256t 38.6s 48.6t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+It is great to dive deeper into the world of whales! While the Blue Whale is the most famous, the group known as **cetaceans** (which includes whales, dolphins, and porpoises) is incredibly diverse.
+
+Here are the key facts about whales in general:
+
+### 1. They Are Mammals, Not Fish
+This is the most common misconception. Whales share more traits with humans than with fish:
+*   **Warm-blooded:** They maintain a constant body temperature.
+*   **Live Birth:** They give birth to live young (calves) rather than laying eggs.
+*   **Nursing:** Mothers produce milk to feed their calves.
+*   **Breathing:** They breathe air using lungs, not gills.
+
+### 2. Two Main Groups
+Whales are divided into two suborders based on how they eat and their teeth:
+*   **Mysticetes (Baleen Whales):** They have no teeth. Instead, they have plates of baleen (made of keratin, like fingernails) hanging from their upper jaw to filter food (like krill and small fish) from the water. Examples: Blue Whale, Humpback, Gray Whale
+TIME: (pp: 289t 692ms 418t/s - tg: 2640t>256t 60.2s 48.1t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Whales are found in **all of the world's oceans**, from the **Arctic** to the **Antarctic**, and from the **surface** to the **deep sea**.
+
+Here are the key geographical facts about where whales live:
+
+### 1. They Are Global
+Whales are not restricted to one region. You can find them in:
+*   **The Arctic Ocean:** Home to the **Beluga**, **Narwhal**, and **Bowhead** whale.
+*   **The Antarctic Ocean:** Home to the **Blue**, **Humpback**, and **Minke** whale.
+*   **The Pacific, Atlantic, and Indian Oceans:** Home to almost all species, including the **Sperm Whale**, **Orca** (Killer Whale), and **Gray Whale**.
+
+### 2. They Migrate Long Distances
+Many whale species are famous for their **long migrations**.
+*   **Gray Whales:** Travel up to **14,000 miles** (22,000 km) in a year, which is the longest migration of any mammal. They travel from the cold feeding grounds in the Arctic to the warm breeding grounds in Mexico.
+*
+TIME: (pp: 561t 700ms 802t/s - tg: 4098t>256t 91.7s 47.5t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+# Quicksort Implementation in Rust
+
+Here's a clean, idiomatic Rust implementation of Quicksort, including both in-place and functional variants, along with test cases and usage examples.
+
+## 1. In-Place Quicksort (Mutable Reference)
+
+```rust
+fn quicksort_inplace(arr: &mut [i32]) {
+    if arr.len() <= 1 {
+        return;
+    }
+
+    let mut left = 0;
+    let mut right = arr.len() - 1;
+    let pivot = arr[left];
+
+    while left < right {
+        while left < right && arr[right] >= pivot {
+            right -= 1;
+        }
+        while left < right && arr[left] <= pivot {
+            left += 1;
+        }
+        if left < right {
+            arr.swap(left, right);
+        }
+    }
+
+    arr.swap(0, left);
+    quicksort_inplace(&mut arr[..left]);
+    quicksort_inplace(&mut arr[left + 1..]);
+}
+```
+
+## 2. Functional Quicksort (Returns New Vector)
+
+```rust
+fn quicksort_function
+TIME: (pp: 18t 703ms 26t/s - tg: 74t>256t 6.7s 49.4t/s)
+

@@ -3071,6 +3071,12 @@ class GpuPrefillManager:
         for (layer, expert), count in sorted(self._heatmap.items()):
             data[f"{layer},{expert}"] = count
 
+        # Embed metadata so we can detect stale heatmaps on reload
+        data["_metadata"] = {
+            "num_moe_layers": self._num_moe_layers,
+            "n_routed_experts": self.num_experts,
+        }
+
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
         logger.info("Heatmap saved: %d entries to %s", len(data), path)
@@ -3159,6 +3165,8 @@ class GpuPrefillManager:
             with open(heatmap_path) as f:
                 raw = json.load(f)
             for key_str, count in raw.items():
+                if key_str.startswith("_"):
+                    continue  # skip metadata keys
                 parts = key_str.split(",")
                 heatmap[(int(parts[0]), int(parts[1]))] = count
             logger.info("Loaded heatmap from %s: %d entries", heatmap_path, len(heatmap))

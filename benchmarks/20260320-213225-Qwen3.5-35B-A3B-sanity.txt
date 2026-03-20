@@ -1,0 +1,206 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://127.0.0.1:8012
+Date: 2026-03-20T21:32:25.320636
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! 👋 How can I help you today?
+TIME: (pp: 11t 692ms 16t/s - tg: 936t>13t 9.0s 104.8t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+
+Hello! 👋 I'm Qwen3.5, the latest large language model developed by Tongyi Lab. How can I assist you today?
+TIME: (pp: 37t 696ms 53t/s - tg: 47t>32t 702ms 111.1t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+Hello! 👋 I'm Qwen3.5, the latest large language model developed by Tongyi Lab. I was trained on high-quality, comprehensive corpora, which have significantly enhanced my language understanding and expression capabilities. How can I assist you today? 😊
+TIME: (pp: 81t 692ms 117t/s - tg: 112t>56t 1.6s 107.3t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+2 + 2 = 4
+TIME: (pp: 17t 691ms 25t/s - tg: 322t>9t 3.1s 107.1t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+40
+TIME: (pp: 41t 698ms 59t/s - tg: 19t>4t 196ms 112.4t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+40 / 5 = 8
+TIME: (pp: 60t 695ms 86t/s - tg: 12t>10t 188ms 111.6t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are a few key facts about them:
+*   **Size:** They can grow up to **30 meters (98 feet)** long.
+*   **Weight:** They can weigh as much as **200 tons** (approximately 400,000 pounds).
+*   **Comparison:** Their heart alone can weigh as much as a small car, and their tongue can weigh as much as an elephant.
+
+While the blue whale is the largest animal overall, the **African bush elephant** is the largest land animal.
+TIME: (pp: 19t 693ms 27t/s - tg: 1320t>138t 13.9s 104.5t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water in the world is the **Pacific Ocean**.
+
+It covers approximately 63 million square miles (163 million square kilometers), which is about 30% of the Earth's surface and more than twice the size of all the other oceans combined.
+
+However, if you are asking specifically about **lakes**, the answer is the **Caspian Sea**. Despite its name, it is technically a lake (it is landlocked and not connected to the ocean). It is the world's largest inland body of water by surface area.
+
+Here is a quick breakdown:
+*   **Largest Ocean:** Pacific Ocean
+*   **Largest Lake (by surface area):** Caspian Sea
+*   **Largest Freshwater Lake (by volume):** Lake Baikal (Russia)
+*   **Largest Freshwater Lake (by surface area):** Lake Superior (North America)
+TIME: (pp: 21t 697ms 30t/s - tg: 923t>189t 10.6s 104.9t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+# The Binary Chop Algorithm (Binary Search)
+
+The **Binary Chop**, more commonly known in computer science as **Binary Search**, is one of the most fundamental and efficient algorithms for finding a specific value within a collection. It is a classic example of the **Divide and Conquer** strategy.
+
+Below is an in-depth analysis of the algorithm, covering its logic, implementation, mathematical complexity, edge cases, and variations.
+
+---
+
+## 1. Core Concept
+The fundamental intuition behind the Binary Chop is to eliminate half of the remaining search space with every comparison.
+
+Imagine looking up a word in a physical dictionary. You do not start at page 1 and read every word. Instead, you open the book roughly in the middle.
+*   If the word you want comes **alphabetically before** the current page, you ignore the second half of the book.
+*   If it comes **after**, you ignore the first half.
+*   You repeat this process on the remaining half until you find the word.
+
+In computer science, this "book" is a **sorted array**, and the "pages" are the indices of that array.
+
+## 2. Prerequisites
+For the Binary Chop to function correctly, the data
+TIME: (pp: 17t 696ms 24t/s - tg: 1366t>256t 15.6s 104.1t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It would still take **4 hours**.
+
+Here is the reasoning:
+Drying is a **parallel process**, not a sequential one. Each towel dries independently based on the environmental conditions (sun, wind, temperature). As long as there is enough space on the clothesline for all 20 towels to hang without blocking each other's airflow or sunlight, they will all finish drying at the same time.
+
+Therefore, the time required is determined by the drying rate of a single towel, which is 4 hours.
+TIME: (pp: 48t 699ms 69t/s - tg: 1391t>108t 14.4s 104.2t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the **Blue Whale** (*Balaenoptera musculus*), the largest animal known to have ever lived on Earth:
+
+### 🐋 Size and Weight
+*   **Largest Animal Ever:** They are larger than any dinosaur. The largest recorded blue whale was about **98 feet (30 meters)** long.
+*   **Weight:** They can weigh up to **200 tons** (400,000 pounds).
+*   **Comparison:** Their tongue alone can weigh as much as a full-grown **elephant** (about 6,000 pounds).
+
+### ❤️ Anatomy
+*   **Heart:** Their heart is the size of a small car (like a Volkswagen Beetle) and weighs about **400 pounds**.
+*   **Blood Vessels:** Their arteries are so large that a human could swim through them.
+*   **Skin:** They have blue-grey skin with lighter mottling, which is why they are named "blue" whales, though they often appear dark underwater.
+
+### 🍽️ Diet and Eating Habits
+*   **Food:** They eat almost exclusively **krill** (tiny shrimp-like crustace
+TIME: (pp: 17t 701ms 24t/s - tg: 1851t>256t 20.3s 104.0t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+Here is a comprehensive guide to **Whales** in general. While the Blue Whale is the most famous, the group of animals known as **Cetaceans** is incredibly diverse.
+
+### 🐋 Whales are Mammals, Not Fish
+This is the most important fact to remember.
+*   **Warm-Blooded:** They maintain a constant body temperature.
+*   **Breathe Air:** They have lungs and must come to the surface to breathe through a **blowhole** on top of their head.
+*   **Give Live Birth:** They do not lay eggs.
+*   **Nurse Young:** Mothers produce milk to feed their calves (called "calves," not babies).
+
+### 🧬 Two Main Groups
+Whales are divided into two suborders based on how they eat:
+
+**1. Toothed Whales (Odontocetes)**
+*   **Examples:** Sperm Whales, Orcas (Killer Whales), Dolphins, Porpoises.
+*   **Diet:** They hunt prey like fish, squid, and seals.
+*   **Senses:** They use **echolocation** (sonar) to navigate and find food in dark waters.
+TIME: (pp: 289t 696ms 416t/s - tg: 1233t>256t 14.4s 103.3t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Here is the geographical breakdown of where **Whales** live on Earth. While they are primarily ocean animals, their range is incredibly vast.
+
+### 🌍 Global Distribution
+*   **All Oceans:** Whales are found in all five major oceans: the **Pacific**, **Atlantic**, **Indian**, **Arctic**, and **Southern** (Antarctic) Oceans.
+*   **No Landlocked Seas:** Generally, they do not live in landlocked seas (like the Caspian Sea) unless they are river dolphins that have adapted to freshwater.
+*   **Coastal vs. Open:** Some species stay close to the **continental shelf** (coastal), while others live in the **deep open ocean** (pelagic zone).
+
+### ❄️ Polar Regions (The Feeding Grounds)
+*   **Arctic & Antarctic:** These cold waters are rich in nutrients (krill and small fish).
+*   **Species:** **Blue Whales**, **Humpback Whales**, **Bowhead Whales**, and **Beluga Whales** spend their summers here to eat heavily.
+*   **Ice:** Some, like the **Narwhal**, live specifically under the ice
+TIME: (pp: 561t 698ms 804t/s - tg: 1578t>256t 17.7s 103.4t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+Here is a clean, idiomatic, and in-place Quicksort implementation in Rust. It uses generics so it works with any type that implements the `Ord` trait (like `i32`, `String`, etc.).
+
+```rust
+fn quicksort<T: Ord>(arr: &mut [T]) {
+    if arr.len() <= 1 {
+        return;
+    }
+
+    // Pick the last element as the pivot
+    let pivot_index = arr.len() - 1;
+    let pivot = arr[pivot_index];
+
+    // Partition: move elements smaller than pivot to the left
+    let mut i = 0;
+    for j in 0..pivot_index {
+        if arr[j] <= pivot {
+            arr.swap(i, j);
+            i += 1;
+        }
+    }
+    // Place pivot in the correct sorted position
+    arr.swap(i, pivot_index);
+
+    // Recursively sort the sub-slices
+    // Note: Rust's borrow checker ensures [0..i] and [i+1..] are disjoint
+    quicksort(&mut arr[0..i]);
+    quicksort(&mut arr[i + 1..
+TIME: (pp: 18t 696ms 26t/s - tg: 2614t>256t 27.7s 103.7t/s)
+

@@ -1,0 +1,211 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://127.0.0.1:8012
+Date: 2026-03-20T20:53:35.733798
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! How can I assist you today? 😊 Whether you have a question, need help with a task, or just want to chat, feel free to let me know! 🌟
+
+
+Hello! How can I assist you today? 😊 Whether you have a question, need help with a task, or just want to chat, feel free to let me know! 🌟
+TIME: (pp: 11t 1.4s 8t/s - tg: 83t 1.2s 67.3t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+
+Hello! I'm Qwen3.5, a large language model developed by Tongyi Lab. How can I assist you today? 😊 Whether you have a question, need help with a task, or just want to chat, feel free to let me know! 🌟
+TIME: (pp: 65t 1.5s 44t/s - tg: 57t>59t 1.6s 69.7t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+Hello! I'm Qwen3.5, a large language model developed by Tongyi Lab. How can I assist you today? 😊 Whether you have a question, need help with a task, or just want to chat, feel free to let me know! 🌟
+TIME: (pp: 136t 1.4s 96t/s - tg: 59t>59t 1.6s 71.0t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+2 + 2 = 4.
+TIME: (pp: 17t 1.5s 11t/s - tg: 156t>10t 2.5s 65.4t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+40
+TIME: (pp: 42t 1.5s 28t/s - tg: 21t>4t 401ms 59.9t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+The result is 8.
+TIME: (pp: 61t 1.4s 43t/s - tg: 18t>8t 421ms 59.4t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are some key facts about them:
+
+*   **Size:** They can grow up to **100 feet (30 meters)** long and weigh as much as **200 tons** (approximately 180 metric tonnes).
+*   **Comparison:** They are larger than any known dinosaur or other animal that has ever lived on Earth.
+*   **Diet:** Despite their massive size, they feed almost exclusively on tiny shrimp-like animals called **krill**.
+*   **Weight:** Their heart alone can weigh as much as a small car (about 400 lbs or 180 kg), and their tongue can weigh as much as an elephant.
+
+Blue whales are found in oceans all over the world.
+TIME: (pp: 19t 1.4s 14t/s - tg: 523t>177t 11.3s 61.9t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water on Earth is the **Pacific Ocean**.
+
+Here are a few key details:
+*   **Size:** It covers approximately **63 million square miles** (163 million square kilometers), which is larger than all of the Earth's landmass combined.
+*   **Location:** It lies between Asia and Australia to the west and the Americas to the east.
+
+**Note on Lakes:**
+If you are asking about the largest **lake** (an enclosed body of water surrounded by land), that is the **Caspian Sea**. Despite its name, it is technically a lake because it is landlocked and has no outlet to the ocean. It covers about 143,000 square miles.
+TIME: (pp: 21t 1.5s 14t/s - tg: 1248t>154t 23.1s 60.6t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+# The Binary Search Algorithm (Binary Chop)
+
+**Binary Search**, often colloquially referred to as **Binary Chop** (particularly in British English), is one of the most fundamental and efficient algorithms in computer science. It is a "divide and conquer" algorithm used to find the position of a target value within a **sorted** array or list.
+
+Unlike Linear Search, which checks every element sequentially ($O(n)$), Binary Search eliminates half of the remaining search space with every comparison, achieving logarithmic time complexity ($O(\log n)$).
+
+Below is a deep dive into the mechanics, mathematics, implementation nuances, and variations of the algorithm.
+
+---
+
+## 1. Core Concept and Prerequisites
+
+### The Logic
+Imagine you are looking for a specific word in a physical dictionary. You do not start at page 1. Instead, you open the book roughly in the middle.
+1.  If the word you want comes alphabetically **before** the middle word, you ignore the entire second half.
+2.  If it comes **after**, you ignore the entire first half.
+3.  You repeat this process on the remaining half until you find the word or the section becomes empty.
+
+### Prerequisites
+*  
+TIME: (pp: 17t 1.5s 11t/s - tg: 1087t>256t 20.8s 64.5t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It would still take **4 hours**.
+
+Here is the reasoning:
+Drying is a process that happens in **parallel**, not sequentially. If the environmental conditions (sun, air, heat) remain the same, each individual towel will dry at the same rate regardless of how many other towels are hanging next to it.
+
+Since the 4 towels take 4 hours to dry, it means the drying time for the environment is 4 hours. Hanging 20 towels at the same time (assuming they fit on the line) means they will all finish drying at the same time as the first batch.
+
+**Answer:** 4 hours.
+TIME: (pp: 48t 1.5s 32t/s - tg: 1840t>133t 33.9s 58.1t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the **blue whale** (*Balaenoptera musculus*):
+
+### 🐋 Size and Scale
+*   **Largest Animal Ever:** The blue whale is the largest animal known to have ever lived on Earth, even larger than any known dinosaur.
+*   **Massive Weight:** They can weigh up to **200 tons** (400,000 pounds).
+*   **Giant Length:** They can grow up to **100 feet** (30 meters) in length.
+*   **Heart Size:** Their heart is the size of a small car and weighs about **400 pounds** (180 kg).
+*   **Tongue Weight:** Their tongue alone can weigh as much as an **elephant**.
+
+### 🍽️ Diet and Feeding
+*   **Krill Eaters:** Despite their massive size, they feed almost exclusively on tiny shrimp-like crustaceans called **krill**.
+*   **Huge Appetite:** A single blue whale can eat up to **4 tons** of krill per day during feeding season.
+*   **Filter Feeders:** They are baleen whales, meaning they
+TIME: (pp: 17t 1.5s 11t/s - tg: 675t>256t 15.2s 61.1t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+Here are some fascinating facts about the **blue whale** (*Balaenoptera musculus*):
+
+### 🐋 **Size and Scale**
+*   **Largest Animal Ever:** The blue whale is the largest animal known to have ever lived on Earth, even larger than any known dinosaur.
+*   **Massive Weight:** They can weigh up to **200 tons** (400,000 pounds).
+*   **Giant Length:** They can grow up to **100 feet** (30 meters) in length.
+*   **Heart Size:** Their heart is the size of a small car and weighs about **400 pounds** (180 kg).
+*   **Tongue Weight:** Their tongue alone can weigh as much as an **elephant**.
+
+### 🍽️ **Diet and Feeding**
+*   **Krill Eaters:** Despite their massive size, they feed almost exclusively on tiny shrimp-like crustaceans called **krill**.
+*   **Huge Appetite:** A single blue whale can eat up to **4 tons** of krill per day during feeding season.
+*   **Filter Feeders:** They are bale
+TIME: (pp: 289t 1.5s 193t/s - tg: 560t>256t 13.4s 60.7t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Here is a comprehensive overview of where whales live geographically, covering their global distribution, migration patterns, and habitat preferences.
+
+### 🌍 **Global Distribution**
+Whales are found in **all of the world's oceans**, from the freezing waters of the poles to the warm waters of the tropics. However, different species have different preferences.
+
+*   **Blue Whales:** Found in oceans all over the world, from the Arctic to the Antarctic. They are present in the Pacific, Atlantic, Indian, and Southern Oceans.
+*   **Humpback Whales:** Found in almost all oceans, but they are most common in the Pacific and Atlantic.
+*   **Narwhals & Belugas:** Restricted to the Arctic Ocean and surrounding seas.
+*   **Sperm Whales:** Found in deep waters of all oceans, from the equator to the poles.
+
+### 🧭 **Migration Patterns (The Great Journey)**
+Most large whales are **migratory**. They travel thousands of miles between two distinct types of habitats:
+
+1.  **Polar Feeding Grounds (Summer):**
+    *   **Location:** High latitudes (near the North and South Poles).
+    *  
+TIME: (pp: 561t 1.5s 375t/s - tg: 2105t>256t 38.0s 62.1t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+Here is a complete, idiomatic implementation of Quicksort in Rust.
+
+This implementation sorts a slice **in-place** (modifying the original data) and is generic over any type `T` that implements the `Ord` trait.
+
+```rust
+/// Sorts a mutable slice in-place using the Quicksort algorithm.
+///
+/// # Type Parameters
+/// * `T`: The type of elements in the slice. Must implement `Ord`.
+///
+/// # Examples
+/// ```
+/// let mut data = vec![5, 2, 9, 1, 5, 6];
+/// quicksort(&mut data);
+/// assert_eq!(data, vec![1, 2, 5, 5, 6, 9]);
+/// ```
+fn quicksort<T: Ord>(slice: &mut [T]) {
+    // Base case: slices of length 0 or 1 are already sorted
+    if slice.len() <= 1 {
+        return;
+    }
+
+    // Choose the middle element as the pivot to avoid worst-case scenarios on sorted data
+    let mid = slice.len() / 2;
+    let pivot = slice[mid];
+
+   
+TIME: (pp: 18t 1.5s 12t/s - tg: 4098t>256t 66.2s 65.7t/s)
+

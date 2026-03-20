@@ -173,6 +173,72 @@ def _start_session_bridge(host: str, port: int) -> Optional[subprocess.Popen]:
         return None
 
 
+def _validate_heatmap(heatmap_path: str, cfg) -> bool:
+    """Check if a cached heatmap matches the current model config.
+
+    Returns True if valid, False if it should be rebuilt.
+    Only triggers rebuild on structural mismatches (wrong layer count or
+    expert count), NOT on missing metadata or sparse coverage.
+    """
+    try:
+        with open(heatmap_path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        logger.warning("Heatmap file corrupt or unreadable, will rebuild")
+        return False
+
+    meta = data.get("_metadata")
+    if meta:
+        # New format with embedded metadata -- exact check
+        expected_moe = cfg.num_moe_layers
+        expected_experts = cfg.n_routed_experts
+        if meta.get("num_moe_layers") != expected_moe:
+            logger.warning(
+                "Heatmap stale: num_moe_layers=%s but model has %d, will rebuild",
+                meta.get("num_moe_layers"), expected_moe,
+            )
+            return False
+        if meta.get("n_routed_experts") != expected_experts:
+            logger.warning(
+                "Heatmap stale: n_routed_experts=%s but model has %d, will rebuild",
+                meta.get("n_routed_experts"), expected_experts,
+            )
+            return False
+        return True
+
+    # Old format (no metadata) -- infer from data keys
+    layers_seen = set()
+    max_expert = -1
+    for key in data:
+        if key.startswith("_"):
+            continue
+        parts = key.split(",")
+        if len(parts) == 2:
+            layers_seen.add(int(parts[0]))
+            max_expert = max(max_expert, int(parts[1]))
+
+    expected_moe = cfg.num_moe_layers
+    if len(layers_seen) < expected_moe:
+        # Some layers have zero activations in a 10K sample -- only flag if
+        # a significant number are missing (>20% of layers absent is suspicious)
+        missing_pct = (expected_moe - len(layers_seen)) / expected_moe
+        if missing_pct > 0.2:
+            logger.warning(
+                "Heatmap covers %d/%d MoE layers (%.0f%% missing), will rebuild",
+                len(layers_seen), expected_moe, missing_pct * 100,
+            )
+            return False
+
+    if max_expert >= cfg.n_routed_experts:
+        logger.warning(
+            "Heatmap references expert %d but model only has %d experts, will rebuild",
+            max_expert, cfg.n_routed_experts,
+        )
+        return False
+
+    return True
+
+
 def _build_heatmap(model: KrasisModel, save_path: str) -> str:
     """Build expert activation heatmap by running active_only inference.
 
@@ -1370,8 +1436,12 @@ def main():
         primary_dev = devices[0]
         total_experts = cfg.n_routed_experts * cfg.num_moe_layers
 
-        # ── Load heatmap ──
-        if not os.path.exists(heatmap_path):
+        # ── Load heatmap (validate against model config) ──
+        need_rebuild = not os.path.exists(heatmap_path)
+        if not need_rebuild and not _validate_heatmap(heatmap_path, cfg):
+            _warn("Cached heatmap doesn't match model config, rebuilding")
+            need_rebuild = True
+        if need_rebuild:
             _status("Building expert heatmap (calibration)")
             heatmap_path = _build_heatmap(_model, heatmap_path)
         else:
@@ -1380,6 +1450,8 @@ def main():
         # ── Load heatmap and build sorted ranking ──
         with open(heatmap_path) as f:
             raw_heatmap = json.load(f)
+        # Strip metadata before building ranking
+        raw_heatmap.pop("_metadata", None)
         sorted_ranking = sorted(raw_heatmap.items(), key=lambda x: x[1], reverse=True)
         ranking = [(int(k.split(",")[0]), int(k.split(",")[1])) for k, _ in sorted_ranking]
         _detail(f"Heatmap: {len(ranking):,} experts ranked from {len(raw_heatmap):,} entries")

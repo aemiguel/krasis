@@ -1,0 +1,201 @@
+Sanity Test: Qwen3-Coder-Next @ http://127.0.0.1:8012
+Date: 2026-03-20T20:07:06.866675
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: Hello! How can I help you today? 😊
+TIME: (pp: 9t 1.6s 6t/s - tg: 0t 199ms 55.3t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: I'm Qwen! 😊  
+I'm a large-scale language model developed by Alibaba Cloud. Nice to meet you—how can I assist you today? 🌟
+TIME: (pp: 35t 1.6s 21t/s - tg: 0t 587ms 59.6t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: I was trained by the Tongyi Lab team at Alibaba Group. 🌟  
+Specifically, I’m part of the Qwen series—large language models developed through extensive research and development efforts by Alibaba’s Tongyi Lab. My training involved vast amounts of text data (from Alibaba’s internal historical accumulation, subject to strict compliance and privacy safeguards) and cutting-edge techniques in machine learning and natural language processing.
+
+If you're curious about my capabilities, training process, or how I differ from other models—I’d be happy to share more! 😊
+TIME: (pp: 84t 1.6s 52t/s - tg: 0t 1.8s 62.8t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 2 + 2 = **4**.
+TIME: (pp: 15t 1.6s 9t/s - tg: 0t 178ms 50.4t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 4 × 10 = **40**.
+TIME: (pp: 41t 1.6s 25t/s - tg: 0t 220ms 50.0t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 40 ÷ 5 = **8**.
+TIME: (pp: 69t 1.6s 42t/s - tg: 0t 215ms 51.1t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: The **blue whale** (*Balaenoptera musculus*) is the largest animal known to have ever lived on Earth.
+
+- **Length**: Up to about **29.9 meters** (96 feet), with historical reports of individuals approaching 30 meters.
+- **Weight**: Up to approximately **181 metric tons** (175 long tons or 197 short tons), though most adults range between 100–150 tons.
+
+To put it in perspective:
+- A blue whale’s heart alone can weigh around **180 kg** (400 lbs) and is roughly the size of a small car.
+- Its tongue can weigh as much as an elephant.
+- A human child could realistically swim through its largest arteries.
+
+Despite its massive size, the blue whale feeds almost exclusively on tiny shrimp-like animals called **krill**, consuming up to 4 tons per day during feeding season.
+
+Due to commercial whaling in the 20th century, blue whale populations were severely depleted. They are currently listed as **Endangered** by the IUCN, though conservation efforts have led to some recovery in certain regions.
+TIME: (pp: 17t 1.6s 10t/s - tg: 0t 4.2s 56.6t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: The largest body of water in the world is the **Pacific Ocean**.
+
+- **Area**: Approximately **165.25 million square kilometers** (62.5 million square miles)  
+- **Volume**: About **714 million cubic kilometers**  
+- It covers more than 30% of Earth’s surface and is larger than all of Earth’s landmasses combined.
+
+The Pacific Ocean is also the deepest ocean, with the Mariana Trench—home to the Challenger Deep, the deepest known point on Earth—at about **10,984 meters** (35,007 feet) deep.
+
+Let me know if you’d like more details! 😊
+TIME: (pp: 19t 1.6s 12t/s - tg: 0t 2.5s 56.7t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: The **binary chop algorithm**, more commonly known as **binary search**, is a highly efficient algorithm for finding a target value within a *sorted* array (or other sorted, random-access data structures). Its name “chop” reflects its strategy of repeatedly *cutting the search space in half* until the target is found or determined to be absent.
+
+Below is a comprehensive, in-depth explanation covering its principles, mechanics, variants, analysis, and practical considerations.
+
+---
+
+## 🔍 Core Idea
+
+Binary search exploits the **sorted order** of the data to eliminate half of the remaining candidates with each comparison. Instead of scanning linearly (O(n)), it reduces the problem size logarithmically.
+
+> **Key Requirement**: The input must be *sorted* (e.g., ascending or descending). If unsorted, sorting first (O(n log n)) may outweigh benefits unless multiple searches are performed.
+
+---
+
+## 🧠 Algorithm Logic (Iterative & Recursive)
+
+### Problem Setup
+- Input: Sorted array `A` of length `n`, target value `x`.
+- Output: Index of `x` in `A`, or `−1` (or `null`) if not found.
+
+### High-Level Steps
+1. Maintain a *search interval* defined
+TIME: (pp: 15t 1.6s 9t/s - tg: 0t 4.3s 58.9t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: This is a classic riddle that tests whether you assume drying time depends on the *number* of towels.
+
+**Answer: 4 hours.**
+
+**Explanation:**  
+The drying time depends on the *conditions* (sunlight, wind, humidity, etc.) and how long it takes for *each towel* to dry individually — not on how many towels are drying simultaneously.
+
+If 4 towels take 4 hours to dry, that means each towel needs 4 hours under those conditions. Adding more towels (as long as they’re spread out and not blocking each other’s exposure to sun/air) doesn’t reduce or increase the time per towel — it just means more towels are drying at the same time.
+
+So, 20 towels, under the **exact same conditions**, will each still take **4 hours** to dry.
+
+✅ **Answer: 4 hours.**
+TIME: (pp: 46t 1.6s 28t/s - tg: 0t 3.1s 57.3t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: Here are some fascinating and scientifically verified facts about the **blue whale** (*Balaenoptera musculus*):
+
+### 🐋 Size & Scale
+- **Largest animal ever known** to have lived on Earth—larger than any dinosaur.
+- Adults average **2.1–30 meters (78–98 ft)** in length, with the largest reliably measured at **29.9 meters (99 ft)**.
+- Weight: Up to **180 metric tons** (200 short tons), with some historical reports suggesting up to ~200 tons—though modern measurements are typically lower.
+- A blue whale’s **heart** weighs about **180 kg (400 lbs)**—roughly the size of a small car—and can be heard beating over 2 miles away underwater.
+- Its **aorta** (main artery) is about **23 cm (9 inches)** in diameter—large enough for a human child to crawl through.
+
+### 🐋 Feeding & Diet
+- Despite their massive size, blue whales feed almost exclusively on **krill** (tiny shrimp-like crustaceans, 1–2 cm long).
+- They consume **3–4 tons of kr
+TIME: (pp: 15t 1.6s 9t/s - tg: 0t 4.5s 56.7t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: Absolutely! Whales are among the most fascinating and intelligent mammals on Earth—here’s a comprehensive overview of whales in general, covering their biology, behavior, diversity, and conservation:
+
+---
+
+### 🐋 **What Are Whales?**
+- Whales are **marine mammals** belonging to the order **Cetacea**, which also includes dolphins and porpoises.
+- They evolved from land-dwelling ancestors around **50 million years ago**, with fossil evidence (e.g., *Pakicetus*, *Ambulocetus*) showing a gradual transition to fully aquatic life.
+- Key adaptations: streamlined bodies, flippers (modified limbs), blowholes (modified nostrils), thick blubber for insulation, and echolocation (in toothed whales).
+
+---
+
+### 🐋 **Two Main Suborders**
+
+#### 1. **Mysticeti — Baleen Whales**
+- **Filter feeders** with **baleen plates** (keratin-based screens) instead of teeth.
+- Use techniques like **lunge feeding**, **skim feeding**, or **bubble-net feeding** to capture prey.
+- Include:
+  - Blue whale (largest animal ever)
+  - Humpback whale (famous for complex songs)
+  - Gray
+TIME: (pp: 288t 1.6s 177t/s - tg: 0t 4.4s 58.0t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: Whales are found in **every ocean on Earth**, from the Arctic to the Antarctic—and even in some rivers (though most species are strictly marine). Their distribution depends on species, season, food availability, and breeding needs. Here’s a detailed breakdown:
+
+---
+
+### 🌍 **Global Distribution Overview**
+
+#### 🌐 **Oceanic Range**
+- **All major oceans**: Atlantic, Pacific, Indian, Southern (Antarctic), and Arctic.
+- **Coastal vs. open ocean**: Some species (e.g., humpbacks, grays) frequent **coastal waters, shelves, and estuaries** during migration or breeding; others (e.g., blue, fin, sperm whales) are **pelagic**, preferring deep offshore waters.
+
+#### 🌡️ **Latitudinal Zones**
+- **Polar & Subpolar Regions** (Summer feeding grounds):
+  - **Arctic**: Bowhead and beluga whales live year-round in Arctic waters (e.g., Beaufort Sea, Svalbard).
+  - **Antarctic**: Blue, humpback, minke, and sei whales migrate here in summer to feed on abundant krill.
+- **Temperate Zones** (Migration corridors & seasonal feeding):
+ 
+TIME: (pp: 561t 1.6s 343t/s - tg: 0t 4.5s 56.6t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: Here's a clean, idiomatic in-place quicksort implementation in Rust that uses the **median-of-three** pivot selection strategy and handles edge cases safely:
+
+```rust
+fn quicksort<T: Ord + Clone>(arr: &mut [T]) {
+    quicksort_recursive(arr, 0, arr.len().saturating_sub(1));
+}
+
+fn quicksort_recursive<T: Ord + Clone>(arr: &mut [T], low: usize, high: usize) {
+    if low >= high {
+        return;
+    }
+
+    // Partition the array and get the pivot index
+    let pi = partition(arr, low, high);
+
+    // Recursively sort elements before and after partition
+    if pi > 0 {
+        quicksort_recursive(arr, low, pi.saturating_sub(1));
+    }
+    quicksort_recursive(arr, pi.saturating_add(1), high);
+}
+
+fn partition<T: Ord + Clone>(arr: &mut [T], low: usize, high: usize) -> usize {
+    // Median-of-three pivot selection: first, middle, last
+    let mid = low + (high - low) / 2;
+    let mut pivot = arr[mid].clone();
+
+    // Move pivot to end for easier
+TIME: (pp: 16t 1.6s 10t/s - tg: 0t 4.6s 55.0t/s)
+

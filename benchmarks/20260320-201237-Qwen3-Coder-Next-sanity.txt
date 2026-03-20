@@ -1,0 +1,204 @@
+Sanity Test: Qwen3-Coder-Next @ http://127.0.0.1:8012
+Date: 2026-03-20T20:12:37.425099
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: Hello! How can I help you today? 😊
+TIME: (pp: 9t 1.8s 5t/s - tg: 0t 175ms 62.7t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: I'm Qwen! 😊  
+I'm a large-scale language model developed by Alibaba Cloud. I'm here to help with all kinds of tasks—like answering questions, writing stories, coding, logical reasoning, and more. What would you like to do? 🌟
+TIME: (pp: 35t 1.7s 20t/s - tg: 0t 784ms 71.4t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: I was developed by the Tongyi Lab team at Alibaba Group. Specifically, I was trained by Alibaba Cloud’s research and engineering teams, who worked on building, training, and optimizing me using vast amounts of text data and advanced machine learning techniques.
+
+While I don’t have a single "trainer" in the human sense (like a person sitting next to me), my development involved many researchers, engineers, and linguists who curated data, designed training methods, and fine-tuned my capabilities to be helpful, honest, and harmless.
+
+If you're curious about how I was trained, my architecture, or my limitations—I'm happy to explain! 😊
+TIME: (pp: 105t 1.8s 59t/s - tg: 0t 1.8s 73.4t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 2 + 2 = **4**
+TIME: (pp: 15t 1.8s 8t/s - tg: 0t 149ms 53.5t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 4 × 10 = **40**
+TIME: (pp: 40t 1.7s 23t/s - tg: 0t 187ms 53.5t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 40 ÷ 5 = **8**
+TIME: (pp: 67t 1.7s 38t/s - tg: 0t 182ms 55.0t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: The **blue whale** (*Balaenoptera musculus*) is the largest animal known to have ever lived on Earth.
+
+- **Length**: Up to **~30 meters (98 feet)**, with the longest reliably measured specimen at **29.9 meters (98 feet)**.
+- **Weight**: Up to **~200 metric tons** (440,000 pounds), with some estimates for exceptionally large individuals reaching **~30 metric tons more**.
+- **Heart**: About the size of a small car (~180 kg / 400 lbs).
+- **Tongue**: Weighs as much as an elephant (~2.5 tons).
+- **Diet**: Primarily krill—consuming up to **4 tons per day** during feeding season.
+
+Despite its immense size, the blue whale feeds by filter-feeding: it takes in huge mouthfuls of water and krill, then pushes the water out through baleen plates, trapping the food.
+
+Fossil evidence suggests no dinosaur or other prehistoric animal exceeded the blue whale in size. 🐋
+TIME: (pp: 17t 1.7s 10t/s - tg: 0t 3.6s 64.6t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: The largest body of water in the world is the **Pacific Ocean**.
+
+- **Area**: Approximately 165.25 million square kilometers (45.4 million square miles)  
+- **Volume**: About 714 million cubic kilometers (133.8% of the world’s total ocean water volume)  
+- **Size comparison**: It’s larger than all of Earth’s landmasses combined.
+
+The Pacific Ocean spans from the Arctic in the north to the Southern Ocean in the south, and from Asia and Australia in the west to the Americas in the east.
+TIME: (pp: 19t 1.8s 11t/s - tg: 0t 1.9s 63.6t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: The **binary chop algorithm**, more commonly known today as **binary search**, is a highly efficient algorithm for finding a target value within a **sorted** array (or other ordered data structures). Its name “chop” comes from the idea of repeatedly *chopping* the search space in half.
+
+Below is a comprehensive, in-depth explanation covering its principles, mechanics, variants, correctness, complexity, implementation nuances, and applications.
+
+---
+
+## 🔍 Core Idea
+
+Given a **sorted** sequence (e.g., ascending order), binary search exploits the ordering to eliminate half of the remaining candidates at each step. Instead of scanning linearly (O(n)), it reduces the problem size by a factor of 2 each iteration.
+
+> 📌 **Key requirement**: The data must be *sorted* and *random-access* (e.g., array, not linked list).
+
+---
+
+## 🧠 Algorithmic Principle
+
+Binary search is a **divide-and-conquer** algorithm. At each step:
+
+1. Compare the target value `x` to the **middle element** of the current search interval.
+2. If equal → found!
+3. If `x` < middle → discard the right half (search left).
+4. If `x` > middle → discard the
+TIME: (pp: 15t 1.8s 8t/s - tg: 0t 3.8s 67.1t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: This is a classic riddle or trick question!
+
+The key is understanding **how drying works on a clothesline**.
+
+If it takes **4 hours for 4 towels to dry**, that implies the drying time depends on **time in the sun**, not on the number of towels — *assuming they’re all drying simultaneously and independently* (i.e., each towel gets full sun exposure, not shaded by others).
+
+So, if the 4 towels all dry **in parallel** (side by side, each getting full sun), then each towel takes **4 hours** to dry.
+
+Therefore, **20 towels**, under the *exact same conditions* (same sun, same clothesline length, each towel spaced out so none shade another), would *also* take **4 hours** to dry — because they’re all drying at the same time.
+
+✅ **Answer: 4 hours**
+
+> 💡 Note: This assumes ideal conditions — towels don’t block sun from each other, humidity doesn’t build up, etc. In real life, overcrowding *could* increase drying time, but the question says “exact same conditions,” implying proper spacing and environment.
+TIME: (pp: 46t 1.8s 26t/s - tg: 0t 3.6s 64.2t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: Here are some fascinating and scientifically verified facts about the **blue whale** (*Balaenoptera musculus*):
+
+### 🐋 **Size & Scale**
+- **Largest animal ever known to have lived on Earth**: Blue whales can reach lengths of up to **29.9 meters (99 feet)** and weigh as much as **173 tonnes** (though most adults average 22–25 meters and 100–150 tonnes).
+- A blue whale’s **heart** weighs about **400 pounds (180 kg)**—roughly the size of a small car—and beats only **8–10 times per minute** at rest.
+- Their **tongue** can weigh as much as an elephant (~6,000 lbs / 2,700 kg).
+- A human baby could **crawl through the arteries** of a blue whale’s aorta (main artery).
+
+### 🌊 **Feeding & Diet**
+- Blue whales are **filter feeders**, using baleen plates (made of keratin) to strain food from seawater.
+- Their primary prey is **krill**—tiny shrimp-like crustaceans (1–2 cm long).
+TIME: (pp: 15t 1.8s 8t/s - tg: 0t 3.9s 65.1t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: Absolutely! Whales are among the most awe-inspiring mammals on Earth—majestic, intelligent, and deeply connected to ocean health. Here’s a comprehensive overview of whales in general, covering their biology, behavior, diversity, and conservation:
+
+---
+
+### 🐋 **What Are Whales?**
+- Whales are **marine mammals** belonging to the order **Cetacea**, which also includes **dolphins and porpoises**.
+- They evolved from land-dwelling ancestors around **50 million years ago**, gradually adapting to aquatic life (e.g., limbs became flippers, nostrils migrated to the top of the head to form blowholes).
+- Like all mammals, whales:
+  - Are warm-blooded
+  - Breathe air via lungs
+  - Give birth to live young
+  - Nurse their calves with milk
+  - Have hair (though minimal—usually just a few sensory bristles on the snout)
+
+---
+
+### 🐋 **Two Main Suborders**
+
+#### 1. **Mysticeti — Baleen Whales**
+- **Filter feeders** with baleen plates instead of teeth.
+- Have **two blowholes** (V-shaped).
+- Known for complex vocalizations (e.g.,
+TIME: (pp: 288t 1.8s 163t/s - tg: 0t 3.8s 66.4t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: Whales are found in **every ocean on Earth**, from the Arctic to the Antarctic—and even in some rivers (though most species are strictly marine). Their distribution depends on species, season, food availability, and breeding needs. Here's a breakdown:
+
+---
+
+### 🌍 **Global Whale Habitats**
+
+#### 🧊 **Polar Regions (Arctic & Antarctic)**
+- **Summer feeding grounds**: Rich in krill and small fish due to seasonal phytoplankton blooms.
+  - **Antarctic**: Blue, humpback, minke, and southern right whales migrate here to feed during the austral summer (Nov–Mar).
+  - **Arctic**: Bowhead, beluga, and narwhal whales inhabit cold, icy waters year-round—or seasonally (e.g., some humpbacks enter the Bering and Chukchi Seas).
+- *Note*: Sea ice limits access, so many whales migrate *out* of the deepest polar zones in winter.
+
+#### 🌡️ **Temperate Zones (e.g., North Atlantic, North Pacific, Southern Ocean)**
+- Serve as **migration corridors** and sometimes feeding or breeding areas.
+  - Example: The **California Current** (Pacific coast of North America) supports gray
+TIME: (pp: 561t 1.8s 316t/s - tg: 0t 4.0s 64.2t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: Here's a clean, idiomatic implementation of quicksort in Rust that works on slices of `Ord` types:
+
+```rust
+fn quicksort<T: Ord + Copy>(arr: &mut [T]) {
+    if arr.len() <= 1 {
+        return;
+    }
+
+    // Partition the array around a pivot (middle element)
+    let pivot_index = partition(arr);
+    
+    // Recursively sort the two partitions
+    quicksort(&mut arr[..pivot_index]);
+    quicksort(&mut arr[pivot_index + 1..]);
+}
+
+// Helper function to partition the array
+fn partition<T: Ord + Copy>(arr: &mut [T]) -> usize {
+    // Choose middle element as pivot to avoid worst-case on sorted arrays
+    let pivot_index = arr.len() / 2;
+    let pivot = arr[pivot_index];
+    
+    // Move pivot to end temporarily
+    arr.swap(pivot_index, arr.len() - 1);
+    
+    let mut i = 0;
+    let mut j = arr.len() - 1;
+    
+    // Partition around pivot
+    while i < j {
+        // Find element >= pivot from left
+        while i < j && arr[i] < pivot {
+            i += 
+TIME: (pp: 16t 1.8s 9t/s - tg: 0t 4.2s 60.9t/s)
+

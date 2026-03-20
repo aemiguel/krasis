@@ -1,0 +1,269 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://127.0.0.1:8012
+Date: 2026-03-20T21:38:12.012335
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! How can I help you today? 😊
+
+Whether you have a question, need help with a task, or just want to chat, feel free to let me know!
+
+*(Note: If you meant to say "Hi" to someone else, feel free to share the context, and I can help you draft a message or response!)*
+
+**What would you like to do?**
+- 📝 Write something (email, story, code, etc.)
+- 🧠 Solve a problem or explain a concept
+- 💡 Get creative ideas
+- 🌍 Learn something new
+- 🎮 Play a game or have a fun conversation
+
+Just let me know! 😊
+
+---
+*P.S. If you meant "Hi" as a greeting, I'm here to help with anything you need!* 🌟
+
+**How can I assist you today?** 😊
+
+---
+*Let me know your needs, and I'll tailor my response!* 🚀
+
+**What's on your mind?** 😊
+
+---
+*Feel free to ask anything!* 🌟
+
+**How can I help?** 😊
+
+---
+*Let's get started!* 🚀
+
+**What would you
+TIME: (pp: 11t 755ms 15t/s - tg: 256t 2.1s 123.0t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+
+Hello! I'm Qwen3.5. How can I help you today? 😊
+
+Whether you have a question, need help with a task, or just want to chat, feel free to let me know!
+
+*(Note: If you meant to say "Hi" to someone else, feel free to share the context, and I can help you draft a message or response!)*
+
+**What would you like to do?**
+- 📝 Write something (email, story, code, etc.)
+- 🧠 Solve a problem or explain a concept
+- 💡 Get creative ideas
+- 🌍 Learn something new
+- 🎮 Play a game or have a fun conversation
+
+Just let me know! 😊
+
+---
+*P.S. If you meant "Hi" as a greeting, I'm here to help with anything you need!* 🌟
+
+**How can I assist you today?** 😊
+
+---
+*Let me know your needs, and I'll tailor my response!* 🚀
+
+**What's on your mind?** 😊
+
+---
+*Feel free to ask anything!* 🌟
+
+**How can I help?** 😊
+
+---
+*Let's get started!*
+TIME: (pp: 281t 755ms 372t/s - tg: 4098t>256t 37.3s 116.8t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+I was developed by the **Tongyi Lab**, which is part of **Alibaba Cloud**. I am the latest version in the **Qwen series** (Qwen3.5), designed to assist with a wide range of tasks, from answering questions to creating content and solving complex problems.
+
+Let me know how I can help you today! 😊
+TIME: (pp: 550t 855ms 643t/s - tg: 4098t>75t 35.8s 116.5t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+4
+TIME: (pp: 17t 856ms 20t/s - tg: 81t>3t 644ms 128.8t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+The result of multiplying 4 by 10 is 40.
+TIME: (pp: 35t 759ms 46t/s - tg: 4t>17t 156ms 128.6t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+8
+TIME: (pp: 67t 750ms 89t/s - tg: 101t>3t 831ms 124.0t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **Blue Whale** (*Balaenoptera musculus*).
+
+Here are some key facts about them:
+
+*   **Size:** They can grow up to **30 meters (98 feet)** in length.
+*   **Weight:** They can weigh as much as **200 tons** (approximately 173,000 kilograms).
+*   **Record:** They are not only the largest living animals but are also considered the largest animals to have ever lived on Earth, surpassing even the largest dinosaurs in terms of mass.
+
+For comparison, the **African Bush Elephant** is the largest land animal, but it is much smaller than the Blue Whale.
+TIME: (pp: 19t 801ms 24t/s - tg: 1163t>151t 11.1s 118.1t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water in the world is the **Pacific Ocean**.
+
+It covers more than **63 million square miles** (163 million square kilometers), which is roughly **30% of the Earth's surface** and more than twice the size of all land on Earth combined.
+
+If you are specifically asking about the largest **lake** (a landlocked body of water), that title belongs to the **Caspian Sea**, which is technically a lake despite its name.
+TIME: (pp: 21t 855ms 25t/s - tg: 4098t>102t 35.8s 117.4t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+# The Binary Chop (Binary Search) Algorithm: A Deep Dive
+
+The **Binary Chop**, more formally known as **Binary Search**, is one of the most fundamental and efficient algorithms in computer science. It is a "Divide and Conquer" algorithm used to find the position of a target value within a sorted array.
+
+While often introduced in introductory programming courses, a deep understanding of its mechanics, edge cases, complexity, and variations is crucial for building robust systems.
+
+---
+
+## 1. Core Concept and Logic
+
+The fundamental intuition behind the Binary Chop is **elimination**.
+If you are looking for a specific word in a dictionary, you don't start at page 1 and read every word. You open the book in the middle. If the word you want comes *before* the current page, you discard the second half. If it comes *after*, you discard the first half. You repeat this until you find the word or determine it doesn't exist.
+
+### Prerequisites
+*   **Sorted Data:** The array or list **must** be sorted in ascending (or descending) order. If the data is unsorted, the algorithm fails.
+*   **Random Access:** The data structure must allow access to the middle element
+TIME: (pp: 17t 857ms 20t/s - tg: 1111t>256t 11.6s 117.8t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+Here is the reasoning:
+1.  **Parallel Drying:** When you hang towels on a clothesline, they dry simultaneously, not sequentially. The sun and air dry all the towels at the same time.
+2.  **Constant Conditions:** Since the conditions (sun, wind, temperature) are the "exact same," the rate of evaporation for each towel remains constant.
+3.  **The Logic:** If 4 towels take 4 hours to dry, it means the drying process takes 4 hours. Adding more towels (assuming they fit on the line without blocking each other's sunlight or airflow) does not change the time required for the sun to dry them.
+
+**Common Mistake:** Many people try to calculate a rate (e.g., 1 hour per towel) and multiply it by 20, resulting in 20 hours. However, on a clothesline, the time is determined by the environment, not the quantity of items, provided they are all exposed to the sun at the same time.
+
+*(Note: In a real-world scenario, if the clothesline is too short to hold 20 towels without them overlapping and blocking the sun, the drying time might increase.
+TIME: (pp: 48t 861ms 56t/s - tg: 3581t>256t 32.7s 117.4t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the blue whale (*Balaenoptera musculus*):
+
+### **Size and Scale**
+*   **Largest Animal Ever:** The blue whale is the largest animal known to have ever lived on Earth, even larger than any dinosaur.
+*   **Massive Weight:** They can weigh up to **200 tons** (400,000 pounds).
+*   **Length:** They can grow up to **100 feet** (30 meters) long.
+*   **Heart Size:** Their heart is the size of a small car and weighs about **400 pounds** (180 kg).
+*   **Tongue Weight:** Their tongue alone can weigh as much as a full-grown elephant (about 4,000 to 6,000 pounds).
+*   **Blood Volume:** Their blood volume is so large that their arteries are wide enough for a human to swim through.
+
+### **Biology and Behavior**
+*   **Mammals, Not Fish:** Despite living in the ocean, they are mammals. They breathe air through a blowhole on top of their head.
+*   **Diet:** They
+TIME: (pp: 17t 856ms 20t/s - tg: 920t>256t 9.9s 118.2t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+Here are some more fascinating facts about whales in general:
+
+### **Diversity and Size**
+*   **Diverse Species:** There are over **80 species** of whales, ranging from the tiny **dwarf sperm whale** (about 1.5 meters long) to the massive **blue whale** (up to 30 meters long).
+*   **Size Range:** They vary greatly in size, from the smallest **dwarf sperm whale** (about 1.5 meters long) to the largest **blue whale** (up to 30 meters long).
+*   **Weight:** They can weigh from a few hundred kilograms to over **150 tons**.
+
+### **Biology and Behavior**
+*   **Mammals, Not Fish:** Despite living in the ocean, they are mammals. They breathe air through a blowhole on top of their head.
+*   **Diet:** They eat a variety of foods, from tiny krill to large fish and squid.
+*   **Communication:** They use complex sounds to communicate, including songs and clicks.
+*   **Migration:** Many species migrate thousands of miles each year to find food and breeding grounds.
+
+### **Conservation**
+*
+TIME: (pp: 289t 857ms 337t/s - tg: 651t>256t 7.8s 116.3t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Here are some fascinating facts about where whales live geographically:
+
+### **Global Distribution**
+*   **All Oceans:** Whales live in oceans all over the world, from the Arctic to the Antarctic.
+*   **Polar Regions:** They thrive in cold waters, especially in the Arctic and Antarctic.
+*   **Tropical Waters:** Some species, like the **blue whale**, live in warm tropical waters.
+*   **Coastal Areas:** Many species, like the **humpback whale**, live near coastal areas.
+*   **Deep Ocean:** Some species, like the **sperm whale**, live in the deep ocean.
+*   **Surface Water:** Some species, like the **blue whale**, live near the surface.
+*   **Migration:** Many species migrate thousands of miles each year to find food and breeding grounds.
+
+### **Specific Locations**
+*   **Arctic:** The **blue whale** lives in the Arctic.
+*   **Antarctic:** The **blue whale** lives in the Antarctic.
+*   **Tropical:** The **blue whale** lives in tropical waters.
+*   **Coastal:** The **blue whale** lives near coastal areas.
+*
+TIME: (pp: 561t 856ms 656t/s - tg: 464t>256t 6.2s 116.2t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+Here is a clean, idiomatic implementation of Quicksort in Rust.
+
+This implementation uses the **Lomuto partition scheme** and sorts the slice **in-place**. It uses `std::mem::swap` to handle element movement safely and requires the type `T` to implement `Ord` (total ordering).
+
+```rust
+use std::mem;
+
+/// Public function to sort a mutable slice in-place.
+fn quicksort<T: Ord>(arr: &mut [T]) {
+    if arr.len() <= 1 {
+        return;
+    }
+    // Call the recursive helper with the full range of the slice
+    sort_helper(arr, 0, arr.len() - 1);
+}
+
+/// Recursive helper function that sorts the slice between `low` and `high` indices.
+fn sort_helper<T: Ord>(arr: &mut [T], low: usize, high: usize) {
+    if low < high {
+        // Partition the array and get the pivot index
+        let pi = partition(arr, low, high);
+
+        // Recursively sort elements before and after partition
+        sort_helper(arr, low, pi - 1);
+        sort_helper(arr, pi
+TIME: (pp: 18t 856ms 21t/s - tg: 2759t>256t 25.6s 117.8t/s)
+

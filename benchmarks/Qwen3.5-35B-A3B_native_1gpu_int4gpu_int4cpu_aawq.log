@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-20 20:46:58
+Krasis Benchmark — 2026-03-20 21:38:10
 ================================================================
 Model:            Qwen3.5-35B-A3B
 Architecture:     qwen3_5_moe_text, 40 layers, 256 experts, top-8, 10 GQA + 30 linear
@@ -27,24 +27,24 @@ Strategy:
 
 Prefill (internal) — 6 runs at different lengths:
   Run 1:  1,305.0 tok/s (1,000 tokens in 766.3ms)
-  Run 2:  2,748.7 tok/s (5,000 tokens in 1819.1ms)
-  Run 3:  3,472.6 tok/s (10,000 tokens in 2879.7ms)
-  Run 4:  3,957.3 tok/s (20,000 tokens in 5054.0ms)
-  Run 5:  4,181.2 tok/s (35,000 tokens in 8370.7ms)
-  Run 6:  4,139.8 tok/s (50,000 tokens in 12077.9ms)
-  Best:   4,181.2 tok/s (35,000 tokens)
+  Run 2:  2,748.5 tok/s (5,000 tokens in 1819.2ms)
+  Run 3:  3,472.2 tok/s (10,000 tokens in 2880.0ms)
+  Run 4:  4,027.8 tok/s (20,000 tokens in 4965.4ms)
+  Run 5:  4,339.3 tok/s (35,000 tokens in 8065.9ms)
+  Run 6:  4,209.9 tok/s (50,000 tokens in 11876.7ms)
+  Best:   4,339.3 tok/s (35,000 tokens)
 
 Decode (internal) — 50/100/250 tokens, 3 separate prompts:
-   50 tokens: 126.54 tok/s (7.9ms/tok)
-  100 tokens: 124.46 tok/s (8.0ms/tok)
-  250 tokens: 121.09 tok/s (8.3ms/tok)
-  Best:    126.54 tok/s
+   50 tokens: 126.21 tok/s (7.9ms/tok)
+  100 tokens: 124.60 tok/s (8.0ms/tok)
+  250 tokens: 121.17 tok/s (8.3ms/tok)
+  Best:    126.21 tok/s
   HCS:     10240/10240 experts (100.0%)
   Min free VRAM: 5382 MB
 
 Round trip (network) — 50/100/250 tokens via HTTP:
    50 tokens: 206.85 tok/s (1.22s total)
-  100 tokens: 152.45 tok/s (1.63s total)
-  250 tokens: 130.29 tok/s (2.90s total)
+  100 tokens: 153.68 tok/s (1.62s total)
+  250 tokens: 127.43 tok/s (2.94s total)
   Best:    206.85 tok/s
 ================================================================
