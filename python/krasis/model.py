@@ -3626,6 +3626,9 @@ class KrasisModel:
         _t_gen_start = time.perf_counter()
 
         try:
+            # Multi-GPU: re-upload prefill-only attention if previously freed
+            self._upload_prefill_only_attention()
+
             # ── Prefill ── (Single-slot AWQ: Marlin already in GPU slots)
             prompt_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
             positions = torch.arange(len(prompt_tokens), dtype=torch.int32, device=device)
@@ -3657,6 +3660,8 @@ class KrasisModel:
             self._export_kv_to_rust(seq_states_per_rank, len(prompt_tokens))
             self._update_la_state_ptrs()
             self._update_la_state_ptrs_aux()
+            # Multi-GPU: free prefill-only attention before decode
+            self._free_prefill_only_attention()
             # Single-slot AWQ: swap simple INT4 into GPU slots for decode
             gpu_store.swap_to_simple_int4()
             decode_tokens = gpu_store.gpu_generate_batch(
@@ -3773,6 +3778,9 @@ class KrasisModel:
 
         device = torch.device(self.ranks[0].device)
 
+        # Multi-GPU: re-upload prefill-only attention (freed after last decode)
+        self._upload_prefill_only_attention()
+
         # Prefill — Single-slot AWQ: Marlin already in GPU slots
         prompt_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
         positions = torch.arange(len(prompt_tokens), dtype=torch.int32, device=device)
@@ -3829,6 +3837,9 @@ class KrasisModel:
         self._export_kv_to_rust(seq_states, len(prompt_tokens))
         self._update_la_state_ptrs()
         self._update_la_state_ptrs_aux()
+
+        # Multi-GPU: free prefill-only attention (layers outside decode segment)
+        self._free_prefill_only_attention()
 
         # Single-slot AWQ: swap simple INT4 into GPU slots for decode
         gpu_store.swap_to_simple_int4()
@@ -4020,6 +4031,11 @@ class KrasisModel:
             Returns weight ID in the Rust store. For quantized weights, also
             stores (packed, scales, workspace, scalar_type, N, K) on
             self._marlin_attn_weights[wid] for prefill GEMM."""
+            # Stash BF16 on CPU for aux store quantization (only when streaming is off)
+            if self._aux_bf16_stash is not None and layer_idx >= 0:
+                w_stash = w.cpu().contiguous() if w.is_cuda else w.contiguous()
+                self._aux_bf16_stash[(layer_idx, tensor_name)] = w_stash
+
             # Determine effective quantization for this tensor
             effective_quant = attn_quant
             if attn_quant == "awq":
@@ -4134,6 +4150,13 @@ class KrasisModel:
                 w.data_ptr(), w.shape[0], w.shape[1], _weight_dtype_code(w))
 
         self._marlin_attn_weights = {}  # wid -> (packed, scales, workspace, scalar_type, N, K)
+
+        # Stash BF16 CPU copies of attention weights for aux store AWQ quantization.
+        # Needed when streaming attention is not enabled and attrs get replaced by MarlinWeight.
+        if not getattr(self, '_stream_attn_enabled', False):
+            self._aux_bf16_stash = {}  # {(layer_idx, attr_name): cpu_tensor}
+        else:
+            self._aux_bf16_stash = None  # streaming has its own CPU copies
 
         for layer_idx, layer in enumerate(self.layers):
             attn = layer.attention
@@ -4673,6 +4696,78 @@ class KrasisModel:
 
         store.set_norm_bias_one(getattr(self.cfg, 'norm_bias_one', False))
 
+        # ── AWQ support for aux stores ──
+        # Aux GPUs never do prefill, so they only need simple INT4 (no Marlin, no swap).
+        attn_quant = self.quant_cfg.attention  # "bf16" or "awq"
+        marlin_gs = 128
+        _awq_template = None
+        if attn_quant == "awq":
+            from krasis.awq_calibrate import load_template
+            template_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), "templates", "attention")
+            _awq_template = load_template(template_dir, self.cfg.model_path)
+            if _awq_template is None:
+                raise RuntimeError(
+                    "AWQ attention: template loaded on primary store but missing for aux")
+            logger.info("Aux store cuda:%d: AWQ simple INT4 attention (no Marlin swap needed)",
+                        gpu_idx)
+
+        def _get_bf16_source(attn, attr_name, layer_idx):
+            """Get BF16 source tensor, even if primary store replaced attr with MarlinWeight."""
+            # Check streaming attention CPU copies first
+            if self._stream_attn_enabled and layer_idx in self._stream_attn_cpu:
+                cpu_w = self._stream_attn_cpu[layer_idx]
+                if attr_name in cpu_w:
+                    return cpu_w[attr_name]
+            # Check BF16 stash (populated during primary store setup)
+            stash = getattr(self, '_aux_bf16_stash', None)
+            if stash is not None and (layer_idx, attr_name) in stash:
+                return stash[(layer_idx, attr_name)]
+            # Direct attribute (if still a tensor)
+            w = getattr(attn, attr_name, None)
+            if w is not None and isinstance(w, torch.Tensor):
+                return w
+            raise RuntimeError(
+                f"Cannot get BF16 source for {attr_name} on layer {layer_idx} "
+                f"(type={type(w).__name__}). No streaming attention or BF16 stash available.")
+
+        def _register_aux_attn(w_bf16, layer_idx, layer_type, tensor_name,
+                               awq_scales=None):
+            """Register attention weight on aux store.
+            AWQ → quantize to simple INT4 on aux GPU (Rust alloc + upload).
+            BF16 → copy tensor to aux GPU.
+            """
+            if attn_quant == "awq" and _awq_template is not None:
+                from krasis.awq_calibrate import get_tensor_decision
+                effective_quant = get_tensor_decision(
+                    _awq_template, layer_idx, layer_type, tensor_name)
+            else:
+                effective_quant = "bf16"
+
+            if effective_quant in ("int4", "int8") and w_bf16.dtype == torch.bfloat16:
+                use_int4 = (effective_quant == "int4")
+                if use_int4:
+                    n, k = w_bf16.shape
+                    if n % 64 == 0 and k % 16 == 0 and k % marlin_gs == 0:
+                        w_cpu = w_bf16.cpu().contiguous() if w_bf16.is_cuda else w_bf16.contiguous()
+                        if awq_scales is not None:
+                            w_cpu = (w_cpu.float() * awq_scales.float().unsqueeze(0)).to(
+                                torch.bfloat16).contiguous()
+                        store.repack_marlin_int4_cpu(w_cpu.data_ptr(), n, k, marlin_gs)
+                        del w_cpu
+                        return store.register_simple_int4_only(n, k, marlin_gs)
+                    else:
+                        logger.warning("Aux attn [%d×%d] not Marlin-compatible, using BF16",
+                                       n, k)
+                # INT8 or non-compatible: fall through to BF16
+
+            # BF16 path
+            w_gpu = w_bf16.to(aux_device, non_blocking=True)
+            self._aux_decode_weights.append(w_gpu)
+            return store.register_weight(
+                w_gpu.data_ptr(), w_gpu.shape[0], w_gpu.shape[1],
+                _weight_dtype_code(w_gpu))
+
         # Keep references to aux GPU weight copies
         if not hasattr(self, '_aux_decode_weights_all'):
             self._aux_decode_weights_all = []
@@ -4686,7 +4781,8 @@ class KrasisModel:
             post_norm = layer.post_attn_norm_weight
 
             # Count GQA layers before split for gqa_cache_offset
-            if layer_idx < split_layer and layer.layer_type != "linear_attention":
+            if layer_idx < split_layer and layer.layer_type != "linear_attention" \
+                    and not hasattr(attn, 'kv_a_proj'):
                 gqa_count_before_split += 1
 
             # Determine if this layer is in this aux GPU's segment
@@ -4694,17 +4790,45 @@ class KrasisModel:
 
             if layer.layer_type == "linear_attention":
                 if in_segment:
-                    # Copy LA weights to aux GPU
-                    qkvz_w = attn.in_proj_qkvz.to(aux_device, non_blocking=True)
-                    ba_w = attn.in_proj_ba.to(aux_device, non_blocking=True)
-                    out_w = attn.out_proj.to(aux_device, non_blocking=True)
-                    self._aux_decode_weights.extend([qkvz_w, ba_w, out_w])
-                    qkvz_wid = store.register_weight(qkvz_w.data_ptr(), qkvz_w.shape[0], qkvz_w.shape[1], _weight_dtype_code(qkvz_w))
-                    ba_wid = store.register_weight(ba_w.data_ptr(), ba_w.shape[0], ba_w.shape[1], _weight_dtype_code(ba_w))
-                    out_wid = store.register_weight(out_w.data_ptr(), out_w.shape[0], out_w.shape[1], _weight_dtype_code(out_w))
+                    # Get BF16 source weights (may have been replaced by MarlinWeight on primary)
+                    qkvz_src = _get_bf16_source(attn, "in_proj_qkvz", layer_idx)
+                    ba_src = _get_bf16_source(attn, "in_proj_ba", layer_idx)
+                    out_src = _get_bf16_source(attn, "out_proj", layer_idx)
 
-                    # Copy norm weights to aux GPU
-                    inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
+                    # AWQ scales for input projections
+                    _layer_awq_scales = None
+                    _qkvz_scales = None
+                    _ba_scales = None
+                    if attn_quant == "awq" and _awq_template is not None:
+                        from krasis.awq_calibrate import (
+                            get_layer_scales, is_awq_scaled_tensor)
+                        _layer_awq_scales = get_layer_scales(_awq_template, layer_idx)
+                        _qkvz_scales = _layer_awq_scales if (
+                            _layer_awq_scales is not None
+                            and is_awq_scaled_tensor(_awq_template, layer_idx, "in_proj_qkvz")
+                        ) else None
+                        _ba_scales = _layer_awq_scales if (
+                            _layer_awq_scales is not None
+                            and is_awq_scaled_tensor(_awq_template, layer_idx, "in_proj_ba")
+                        ) else None
+
+                    qkvz_wid = _register_aux_attn(qkvz_src, layer_idx,
+                                                   "linear_attention", "in_proj_qkvz",
+                                                   awq_scales=_qkvz_scales)
+                    ba_wid = _register_aux_attn(ba_src, layer_idx,
+                                                 "linear_attention", "in_proj_ba",
+                                                 awq_scales=_ba_scales)
+                    out_wid = _register_aux_attn(out_src, layer_idx,
+                                                  "linear_attention", "out_proj")
+
+                    # AWQ: fold 1/s into input_norm_weight for aux copy
+                    if _layer_awq_scales is not None and (
+                            _qkvz_scales is not None or _ba_scales is not None):
+                        s = _layer_awq_scales.to(inp_norm.device)
+                        inp_norm_folded = (inp_norm.float() / s.float()).to(inp_norm.dtype)
+                        inp_norm_aux = inp_norm_folded.to(aux_device, non_blocking=True)
+                    else:
+                        inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
                     post_norm_aux = post_norm.to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([inp_norm_aux, post_norm_aux])
 
@@ -4735,42 +4859,229 @@ class KrasisModel:
                         scale=attn.scale,
                     )
                 else:
-                    # Layers before split — register placeholder (won't be executed)
+                    # Placeholder for non-segment LA layers (never executed on this GPU).
+                    # Use dummy weights — ptr=0 is safe since decode segment skips these.
+                    dummy_wid = store.register_weight(0, 1, 1, 0)
                     store.register_la_layer(
                         layer_idx=layer_idx,
                         input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
                         post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
-                        in_proj_qkvz_wid=store.register_weight(attn.in_proj_qkvz.data_ptr(), attn.in_proj_qkvz.shape[0], attn.in_proj_qkvz.shape[1], _weight_dtype_code(attn.in_proj_qkvz)),
-                        in_proj_ba_wid=store.register_weight(attn.in_proj_ba.data_ptr(), attn.in_proj_ba.shape[0], attn.in_proj_ba.shape[1], _weight_dtype_code(attn.in_proj_ba)),
-                        out_proj_wid=store.register_weight(attn.out_proj.data_ptr(), attn.out_proj.shape[0], attn.out_proj.shape[1], _weight_dtype_code(attn.out_proj)),
-                        conv_weight_ptr=attn._rust_conv_weight.data_ptr() if hasattr(attn, '_rust_conv_weight') else 0,
-                        a_log_ptr=attn._rust_a_log.data_ptr() if hasattr(attn, '_rust_a_log') else 0,
-                        dt_bias_ptr=attn._rust_dt_bias.data_ptr() if hasattr(attn, '_rust_dt_bias') else 0,
-                        norm_weight_ptr=attn._rust_norm_weight.data_ptr() if hasattr(attn, '_rust_norm_weight') else 0,
-                        conv_state_ptr=attn._rust_conv_state.data_ptr() if hasattr(attn, '_rust_conv_state') else 0,
-                        recur_state_ptr=attn._rust_recur_state.data_ptr() if hasattr(attn, '_rust_recur_state') else 0,
+                        in_proj_qkvz_wid=dummy_wid, in_proj_ba_wid=dummy_wid,
+                        out_proj_wid=dummy_wid,
+                        conv_weight_ptr=0, a_log_ptr=0, dt_bias_ptr=0,
+                        norm_weight_ptr=0, conv_state_ptr=0, recur_state_ptr=0,
                         nk=attn.num_k_heads, nv=attn.num_v_heads,
                         dk=attn.k_head_dim, dv=attn.v_head_dim,
                         hr=attn.head_ratio,
                         kernel_dim=attn.kernel_dim, conv_dim=attn.conv_dim,
                         scale=attn.scale,
                     )
+            elif hasattr(attn, 'kv_a_proj'):
+                # MLA attention
+                if in_segment:
+                    # Get BF16 sources for MLA projections
+                    _layer_awq_scales = None
+                    _qa_scales = None
+                    _qproj_scales = None
+                    _kva_scales = None
+                    if attn_quant == "awq" and _awq_template is not None:
+                        from krasis.awq_calibrate import (
+                            get_layer_scales, is_awq_scaled_tensor)
+                        _layer_awq_scales = get_layer_scales(_awq_template, layer_idx)
+                        _qa_scales = _layer_awq_scales if (
+                            _layer_awq_scales is not None
+                            and is_awq_scaled_tensor(_awq_template, layer_idx, "q_a_proj")
+                        ) else None
+                        _qproj_scales = _layer_awq_scales if (
+                            _layer_awq_scales is not None
+                            and is_awq_scaled_tensor(_awq_template, layer_idx, "q_proj")
+                        ) else None
+                        _kva_scales = _layer_awq_scales if (
+                            _layer_awq_scales is not None
+                            and is_awq_scaled_tensor(_awq_template, layer_idx, "kv_a_proj")
+                        ) else None
+
+                    # Q projection
+                    if attn.has_q_lora:
+                        qa_src = _get_bf16_source(attn, "q_a_proj", layer_idx)
+                        qb_src = _get_bf16_source(attn, "q_b_proj", layer_idx)
+                        qa_wid = _register_aux_attn(qa_src, layer_idx, "mla", "q_a_proj",
+                                                     awq_scales=_qa_scales)
+                        qb_wid = _register_aux_attn(qb_src, layer_idx, "mla", "q_b_proj")
+                        attn._aux_q_a_norm = attn.q_a_norm_weight.float().contiguous().to(aux_device)
+                        self._aux_decode_weights.append(attn._aux_q_a_norm)
+                        q_a_norm_ptr = attn._aux_q_a_norm.data_ptr()
+                        q_proj_wid = None
+                    else:
+                        q_src = _get_bf16_source(attn, "q_proj", layer_idx)
+                        q_proj_wid = _register_aux_attn(q_src, layer_idx, "mla", "q_proj",
+                                                         awq_scales=_qproj_scales)
+                        qa_wid = None
+                        qb_wid = None
+                        q_a_norm_ptr = 0
+
+                    # KV projection
+                    kva_src = _get_bf16_source(attn, "kv_a_proj", layer_idx)
+                    kva_wid = _register_aux_attn(kva_src, layer_idx, "mla", "kv_a_proj",
+                                                  awq_scales=_kva_scales)
+
+                    # O projection
+                    o_src = _get_bf16_source(attn, "o_proj", layer_idx)
+                    o_wid = _register_aux_attn(o_src, layer_idx, "mla", "o_proj")
+
+                    # AWQ: fold 1/s into input_norm_weight for aux copy
+                    if _layer_awq_scales is not None and (
+                        _qa_scales is not None or _qproj_scales is not None
+                        or _kva_scales is not None
+                    ):
+                        s = _layer_awq_scales.to(inp_norm.device)
+                        inp_norm_folded = (inp_norm.float() / s.float()).to(inp_norm.dtype)
+                        inp_norm_aux = inp_norm_folded.to(aux_device, non_blocking=True)
+                    else:
+                        inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
+                    post_norm_aux = post_norm.to(aux_device, non_blocking=True)
+                    self._aux_decode_weights.extend([inp_norm_aux, post_norm_aux])
+
+                    # kv_a layernorm, w_kc, w_vc on aux GPU
+                    attn._aux_kv_a_norm = attn.kv_a_norm_weight.float().contiguous().to(aux_device)
+                    attn._aux_w_kc = attn.w_kc.contiguous().to(aux_device)
+                    attn._aux_w_vc = attn.w_vc.contiguous().to(aux_device)
+                    self._aux_decode_weights.extend([
+                        attn._aux_kv_a_norm, attn._aux_w_kc, attn._aux_w_vc])
+
+                    # MLA KV cache on aux GPU
+                    cache = self.kv_caches[0]
+                    if not hasattr(self, '_aux_mla_cache_offset'):
+                        self._aux_mla_cache_offset = 0
+                    mla_offset = self._aux_mla_cache_offset
+                    self._aux_mla_cache_offset += 1
+                    ckv_src = cache.ckv_cache[mla_offset]
+                    kpe_src = cache.kpe_cache[mla_offset]
+                    ckv_aux = torch.empty_like(ckv_src, device=aux_device)
+                    kpe_aux = torch.empty_like(kpe_src, device=aux_device)
+                    if not hasattr(self, '_aux_mla_caches'):
+                        self._aux_mla_caches = []
+                    self._aux_mla_caches.extend([ckv_aux, kpe_aux])
+                    max_seq = cache.max_pages * cache.page_size
+
+                    store.register_mla_layer(
+                        layer_idx=layer_idx,
+                        input_norm_ptr=inp_norm_aux.data_ptr(),
+                        input_norm_size=inp_norm_aux.numel(),
+                        post_attn_norm_ptr=post_norm_aux.data_ptr(),
+                        post_attn_norm_size=post_norm_aux.numel(),
+                        kv_a_proj_wid=kva_wid, o_proj_wid=o_wid,
+                        kv_a_norm_ptr=attn._aux_kv_a_norm.data_ptr(),
+                        w_kc_ptr=attn._aux_w_kc.data_ptr(),
+                        w_vc_ptr=attn._aux_w_vc.data_ptr(),
+                        num_heads=attn.num_heads,
+                        kv_lora_rank=attn.kv_lora_rank,
+                        qk_nope_dim=attn.qk_nope_dim,
+                        qk_rope_dim=attn.qk_rope_dim,
+                        v_head_dim=attn.v_head_dim,
+                        sm_scale=attn.sm_scale,
+                        rope_interleave=getattr(self.cfg, 'rope_interleave', True),
+                        ckv_cache_ptr=ckv_aux.data_ptr(),
+                        kpe_cache_ptr=kpe_aux.data_ptr(),
+                        q_a_proj_wid=qa_wid,
+                        q_b_proj_wid=qb_wid,
+                        q_a_norm_ptr=q_a_norm_ptr,
+                        q_proj_wid=q_proj_wid,
+                        q_lora_rank=attn.q_lora_rank if attn.has_q_lora else 0,
+                        ckv_cache_dim=attn.ckv_dim,
+                    )
+
+                    # RoPE from first MLA layer in segment
+                    if not aux_rope_set:
+                        cos, sin = attn._get_rope_cos_sin(max_seq)
+                        cos_f32 = cos.float().contiguous().to(aux_device)
+                        sin_f32 = sin.float().contiguous().to(aux_device)
+                        self._aux_rope_cos = cos_f32
+                        self._aux_rope_sin = sin_f32
+                        store.set_rope_tables(
+                            cos_f32.data_ptr(), sin_f32.data_ptr(),
+                            cos_f32.shape[1], max_seq,
+                        )
+                        aux_rope_set = True
+                else:
+                    # Placeholder MLA (never executed on this GPU)
+                    dummy_wid = store.register_weight(0, 1, 1, 0)
+                    cache = self.kv_caches[0]
+                    if not hasattr(self, '_aux_mla_cache_offset'):
+                        self._aux_mla_cache_offset = 0
+                    mla_offset = self._aux_mla_cache_offset
+                    self._aux_mla_cache_offset += 1
+                    max_seq = cache.max_pages * cache.page_size
+                    store.register_mla_layer(
+                        layer_idx=layer_idx,
+                        input_norm_ptr=inp_norm.data_ptr(),
+                        input_norm_size=inp_norm.numel(),
+                        post_attn_norm_ptr=post_norm.data_ptr(),
+                        post_attn_norm_size=post_norm.numel(),
+                        kv_a_proj_wid=dummy_wid, o_proj_wid=dummy_wid,
+                        kv_a_norm_ptr=0, w_kc_ptr=0, w_vc_ptr=0,
+                        num_heads=attn.num_heads,
+                        kv_lora_rank=attn.kv_lora_rank,
+                        qk_nope_dim=attn.qk_nope_dim,
+                        qk_rope_dim=attn.qk_rope_dim,
+                        v_head_dim=attn.v_head_dim,
+                        sm_scale=attn.sm_scale,
+                        rope_interleave=getattr(self.cfg, 'rope_interleave', True),
+                        ckv_cache_ptr=cache.ckv_cache[mla_offset].data_ptr(),
+                        kpe_cache_ptr=cache.kpe_cache[mla_offset].data_ptr(),
+                        q_a_proj_wid=None, q_b_proj_wid=None, q_a_norm_ptr=0,
+                        q_proj_wid=None, q_lora_rank=0,
+                        ckv_cache_dim=attn.ckv_dim,
+                    )
             else:
                 # GQA attention
                 if in_segment:
-                    # Copy GQA weights to aux GPU
-                    q_w = attn.q_proj.to(aux_device, non_blocking=True)
-                    k_w = attn.k_proj.to(aux_device, non_blocking=True)
-                    v_w = attn.v_proj.to(aux_device, non_blocking=True)
-                    o_w = attn.o_proj.to(aux_device, non_blocking=True)
-                    self._aux_decode_weights.extend([q_w, k_w, v_w, o_w])
-                    q_wid = store.register_weight(q_w.data_ptr(), q_w.shape[0], q_w.shape[1], _weight_dtype_code(q_w))
-                    k_wid = store.register_weight(k_w.data_ptr(), k_w.shape[0], k_w.shape[1], _weight_dtype_code(k_w))
-                    v_wid = store.register_weight(v_w.data_ptr(), v_w.shape[0], v_w.shape[1], _weight_dtype_code(v_w))
-                    o_wid = store.register_weight(o_w.data_ptr(), o_w.shape[0], o_w.shape[1], _weight_dtype_code(o_w))
+                    # Get BF16 source weights
+                    q_src = _get_bf16_source(attn, "q_proj", layer_idx)
+                    k_src = _get_bf16_source(attn, "k_proj", layer_idx)
+                    v_src = _get_bf16_source(attn, "v_proj", layer_idx)
+                    o_src = _get_bf16_source(attn, "o_proj", layer_idx)
 
-                    # Copy norm weights to aux GPU
-                    inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
+                    # AWQ scales
+                    _layer_awq_scales = None
+                    _q_scales = None
+                    _k_scales = None
+                    _v_scales = None
+                    if attn_quant == "awq" and _awq_template is not None:
+                        from krasis.awq_calibrate import (
+                            get_layer_scales, is_awq_scaled_tensor)
+                        _layer_awq_scales = get_layer_scales(_awq_template, layer_idx)
+                        _q_scales = _layer_awq_scales if (
+                            _layer_awq_scales is not None
+                            and is_awq_scaled_tensor(_awq_template, layer_idx, "q_proj")
+                        ) else None
+                        _k_scales = _layer_awq_scales if (
+                            _layer_awq_scales is not None
+                            and is_awq_scaled_tensor(_awq_template, layer_idx, "k_proj")
+                        ) else None
+                        _v_scales = _layer_awq_scales if (
+                            _layer_awq_scales is not None
+                            and is_awq_scaled_tensor(_awq_template, layer_idx, "v_proj")
+                        ) else None
+
+                    q_wid = _register_aux_attn(q_src, layer_idx, "gqa", "q_proj",
+                                               awq_scales=_q_scales)
+                    k_wid = _register_aux_attn(k_src, layer_idx, "gqa", "k_proj",
+                                               awq_scales=_k_scales)
+                    v_wid = _register_aux_attn(v_src, layer_idx, "gqa", "v_proj",
+                                               awq_scales=_v_scales)
+                    o_wid = _register_aux_attn(o_src, layer_idx, "gqa", "o_proj")
+
+                    # AWQ: fold 1/s into input_norm_weight for aux copy
+                    if _layer_awq_scales is not None and (
+                        _q_scales is not None or _k_scales is not None
+                        or _v_scales is not None
+                    ):
+                        s = _layer_awq_scales.to(inp_norm.device)
+                        inp_norm_folded = (inp_norm.float() / s.float()).to(inp_norm.dtype)
+                        inp_norm_aux = inp_norm_folded.to(aux_device, non_blocking=True)
+                    else:
+                        inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
                     post_norm_aux = post_norm.to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([inp_norm_aux, post_norm_aux])
 
@@ -4817,29 +5128,18 @@ class KrasisModel:
                         )
                         aux_rope_set = True
                 else:
-                    # Layers before split — register placeholder (never executed on this GPU)
-                    q_wid = store.register_weight(attn.q_proj.data_ptr(), attn.q_proj.shape[0], attn.q_proj.shape[1], _weight_dtype_code(attn.q_proj))
-                    k_wid = store.register_weight(attn.k_proj.data_ptr(), attn.k_proj.shape[0], attn.k_proj.shape[1], _weight_dtype_code(attn.k_proj))
-                    v_wid = store.register_weight(attn.v_proj.data_ptr(), attn.v_proj.shape[0], attn.v_proj.shape[1], _weight_dtype_code(attn.v_proj))
-                    o_wid = store.register_weight(attn.o_proj.data_ptr(), attn.o_proj.shape[0], attn.o_proj.shape[1], _weight_dtype_code(attn.o_proj))
-                    if attn.q_norm is not None:
-                        q_norm_ptr = attn._rust_q_norm.data_ptr() if hasattr(attn, '_rust_q_norm') else 0
-                    else:
-                        q_norm_ptr = 0
-                    if attn.k_norm is not None:
-                        k_norm_ptr = attn._rust_k_norm.data_ptr() if hasattr(attn, '_rust_k_norm') else 0
-                    else:
-                        k_norm_ptr = 0
+                    # Placeholder GQA (never executed on this GPU)
+                    dummy_wid = store.register_weight(0, 1, 1, 0)
                     store.register_gqa_layer(
                         layer_idx=layer_idx,
                         input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
                         post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
-                        q_proj_wid=q_wid, k_proj_wid=k_wid,
-                        v_proj_wid=v_wid, o_proj_wid=o_wid,
+                        q_proj_wid=dummy_wid, k_proj_wid=dummy_wid,
+                        v_proj_wid=dummy_wid, o_proj_wid=dummy_wid,
                         fused_qkv_wid=None,
                         num_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
                         head_dim=attn.head_dim, sm_scale=attn.sm_scale,
-                        q_norm_ptr=q_norm_ptr, k_norm_ptr=k_norm_ptr,
+                        q_norm_ptr=0, k_norm_ptr=0,
                         gated=attn.gated_attention,
                     )
 
@@ -4893,7 +5193,7 @@ class KrasisModel:
             kv_ptrs = []
             gqa_cache_idx = 0
             for layer_idx, layer in enumerate(self.layers):
-                if layer.layer_type != "linear_attention":
+                if layer.layer_type != "linear_attention" and not hasattr(layer.attention, 'kv_a_proj'):
                     if split_layer <= layer_idx < layer_end:
                         # Allocate FP8 KV cache on aux GPU matching primary's shape
                         k_src = cache.k_cache[gqa_cache_idx]
@@ -5057,6 +5357,140 @@ class KrasisModel:
                     getattr(attn, attr_conv).data_ptr(),
                     getattr(attn, attr_recur).data_ptr(),
                 )
+
+    def restrict_to_decode_segment(self, decode_start: int, decode_end: int):
+        """Multi-GPU: restrict GPU 0's single-slot AWQ swaps to its decode segment only.
+
+        Called after set_decode_segment(). Removes swap entries for layers outside
+        [decode_start, decode_end) so swap_to_simple_int4/swap_to_marlin only touch
+        decode-segment weights. Stashes prefill-only layer info for free/upload cycle.
+        """
+        gpu_store = getattr(self, '_gpu_decode_store', None)
+        if gpu_store is None:
+            return
+
+        # Tell Rust to remove swap entries for non-decode layers
+        removed = gpu_store.restrict_swaps_to_decode_segment()
+
+        # Track which MarlinWeight attributes are "prefill-only" (outside decode segment)
+        # These can be freed after prefill and re-uploaded before next prefill.
+        self._prefill_only_attn = []  # [(layer_idx, attn, attr_name, MarlinWeight)]
+        self._prefill_only_freed = False
+
+        for layer_idx, layer in enumerate(self.layers):
+            if decode_start <= layer_idx < decode_end:
+                continue  # In decode segment — managed by single-slot swap
+            attn = layer.attention
+            if layer.layer_type == "linear_attention":
+                for attr_name in ("in_proj_qkvz", "in_proj_ba", "out_proj"):
+                    mw = getattr(attn, attr_name, None)
+                    if mw is not None and hasattr(mw, '_fields'):  # MarlinWeight namedtuple
+                        self._prefill_only_attn.append((layer_idx, attn, attr_name, mw))
+            elif hasattr(attn, 'kv_a_proj'):
+                for attr_name in ("q_a_proj", "q_b_proj", "q_proj", "kv_a_proj", "o_proj"):
+                    mw = getattr(attn, attr_name, None)
+                    if mw is not None and hasattr(mw, '_fields'):
+                        self._prefill_only_attn.append((layer_idx, attn, attr_name, mw))
+            else:
+                for attr_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                    mw = getattr(attn, attr_name, None)
+                    if mw is not None and hasattr(mw, '_fields'):
+                        self._prefill_only_attn.append((layer_idx, attn, attr_name, mw))
+
+        n_tensors = len(self._prefill_only_attn)
+        if n_tensors > 0:
+            # Estimate VRAM that will be freed after prefill
+            total_bytes = 0
+            for _, _, _, mw in self._prefill_only_attn:
+                packed, scales, _, _, n, k = mw
+                total_bytes += packed.nelement() * packed.element_size()
+                total_bytes += scales.nelement() * scales.element_size()
+            logger.info("Prefill-only attention: %d tensors for layers outside [%d, %d), "
+                        "~%.0f MB freeable after prefill",
+                        n_tensors, decode_start, decode_end, total_bytes / 1024 / 1024)
+
+    def _free_prefill_only_attention(self):
+        """Free prefill-only attention tensors from GPU after prefill.
+
+        Moves packed/scales to CPU and clears GPU references so PyTorch can
+        reclaim VRAM. The CPU copies are kept for re-upload before next prefill.
+        """
+        entries = getattr(self, '_prefill_only_attn', None)
+        if not entries or getattr(self, '_prefill_only_freed', False):
+            return
+
+        import gc
+        from krasis.attention import MarlinWeight
+        freed_bytes = 0
+        new_entries = []
+
+        for layer_idx, attn, attr_name, mw in entries:
+            packed, scales, workspace, scalar_type, n, k = mw
+            freed_bytes += packed.nelement() * packed.element_size()
+            freed_bytes += scales.nelement() * scales.element_size()
+            # Move to CPU (creates CPU copy, releases GPU tensor on next GC)
+            packed_cpu = packed.cpu()
+            scales_cpu = scales.cpu()
+            cpu_mw = MarlinWeight(packed_cpu, scales_cpu, workspace, scalar_type, n, k)
+            # Clear GPU reference on attention module
+            setattr(attn, attr_name, None)
+            # Also remove from _marlin_attn_weights if tracked there
+            marlin_weights = getattr(self, '_marlin_attn_weights', {})
+            to_remove = [wid for wid, info in marlin_weights.items()
+                         if info[0] is packed]
+            for wid in to_remove:
+                del marlin_weights[wid]
+            # Release scales_slot from _single_slot_scales if it backs this scales view
+            slot_scales = getattr(self, '_single_slot_scales', [])
+            scales_base = scales.storage().data_ptr() if scales.is_cuda else 0
+            self._single_slot_scales = [
+                s for s in slot_scales
+                if s.data_ptr() != scales_base
+            ]
+            # Keep CPU copy for re-upload
+            new_entries.append((layer_idx, attn, attr_name, cpu_mw))
+
+        self._prefill_only_attn = new_entries
+        gc.collect()
+        torch.cuda.empty_cache()
+        self._prefill_only_freed = True
+        logger.info("Freed prefill-only attention: ~%.0f MB", freed_bytes / 1024 / 1024)
+
+    def _upload_prefill_only_attention(self):
+        """Re-upload prefill-only attention tensors to GPU before prefill.
+
+        Restores MarlinWeight references on attention modules. Called before prefill
+        in multi-GPU mode when the tensors were previously freed.
+        """
+        entries = getattr(self, '_prefill_only_attn', None)
+        if not entries or not getattr(self, '_prefill_only_freed', False):
+            return  # Nothing freed, nothing to upload
+
+        device = torch.device(self.ranks[0].device)
+        uploaded_bytes = 0
+        new_entries = []
+
+        for layer_idx, attn, attr_name, mw in entries:
+            packed_cpu, scales_cpu, workspace, scalar_type, n, k = mw
+            # Re-upload to GPU
+            if packed_cpu.is_cuda:
+                # Already on GPU (shouldn't happen if freed, but be safe)
+                new_entries.append((layer_idx, attn, attr_name, mw))
+                continue
+            packed_gpu = packed_cpu.to(device, non_blocking=True)
+            scales_gpu = scales_cpu.to(device, non_blocking=True)
+            uploaded_bytes += packed_gpu.nelement() * packed_gpu.element_size()
+            uploaded_bytes += scales_gpu.nelement() * scales_gpu.element_size()
+
+            from krasis.attention import MarlinWeight
+            new_mw = MarlinWeight(packed_gpu, scales_gpu, workspace, scalar_type, n, k)
+            setattr(attn, attr_name, new_mw)
+            new_entries.append((layer_idx, attn, attr_name, new_mw))
+
+        self._prefill_only_attn = new_entries
+        self._prefill_only_freed = False
+        torch.cuda.synchronize(device)
+        logger.info("Uploaded prefill-only attention: ~%.0f MB", uploaded_bytes / 1024 / 1024)
 
     def server_cleanup(self):
         """Free server request state (KV cache pages, etc.).

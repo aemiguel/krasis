@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-19 23:46:11
+Krasis Benchmark — 2026-03-20 01:16:21
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -8,7 +8,7 @@ PP Partition:     [48] (1 GPUs)
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
   RAM:            1007 GB total, 43.6 GB used by process
-  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 4333 MB allocated
+  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 4336 MB allocated
   GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
 
 Quantization:
@@ -26,25 +26,25 @@ Strategy:
   Mode:           gpu_decode (layer_grouped(2))
 
 Prefill (internal) — 6 runs at different lengths:
-  Run 1:  575.3 tok/s (1,000 tokens in 1738.1ms)
-  Run 2:  2,303.5 tok/s (5,000 tokens in 2170.6ms)
-  Run 3:  2,691.1 tok/s (10,000 tokens in 3716.0ms)
-  Run 4:  3,275.0 tok/s (20,000 tokens in 6106.8ms)
-  Run 5:  3,411.4 tok/s (35,000 tokens in 10259.6ms)
-  Run 6:  3,346.2 tok/s (50,000 tokens in 14942.5ms)
-  Best:   3,411.4 tok/s (35,000 tokens)
+  Run 1:  588.6 tok/s (1,000 tokens in 1699.0ms)
+  Run 2:  2,246.5 tok/s (5,000 tokens in 2225.7ms)
+  Run 3:  2,867.4 tok/s (10,000 tokens in 3487.4ms)
+  Run 4:  3,324.7 tok/s (20,000 tokens in 6015.6ms)
+  Run 5:  3,565.1 tok/s (35,000 tokens in 9817.4ms)
+  Run 6:  3,427.7 tok/s (50,000 tokens in 14587.1ms)
+  Best:   3,565.1 tok/s (35,000 tokens)
 
 Decode (internal) — 50/100/250 tokens, 3 separate prompts:
-   50 tokens: 72.21 tok/s (13.8ms/tok)
-  100 tokens: 79.69 tok/s (12.5ms/tok)
-  250 tokens: 73.88 tok/s (13.5ms/tok)
-  Best:    79.69 tok/s
+   50 tokens: 75.85 tok/s (13.2ms/tok)
+  100 tokens: 78.28 tok/s (12.8ms/tok)
+  250 tokens: 72.99 tok/s (13.7ms/tok)
+  Best:    78.28 tok/s
   HCS:     16339/24576 experts (66.5%)
   Min free VRAM: 618 MB
 
 Round trip (network) — 50/100/250 tokens via HTTP:
-   50 tokens: 139.04 tok/s (2.62s total)
-  100 tokens: 98.83 tok/s (3.27s total)
-  250 tokens: 78.69 tok/s (5.43s total)
-  Best:    139.04 tok/s
+   50 tokens: 136.56 tok/s (2.69s total)
+  100 tokens: 99.92 tok/s (3.26s total)
+  250 tokens: 77.98 tok/s (5.53s total)
+  Best:    136.56 tok/s
 ================================================================

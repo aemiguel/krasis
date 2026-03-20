@@ -714,10 +714,10 @@ fn handle_chat_completion(
     let t_reload = Instant::now();
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
     {
-        let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async();
+        let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async(prompt_len);
         if queued > 0 {
-            log::info!("Request {}: HCS soft async reload queued {} experts",
-                request_id, queued);
+            log::info!("Request {}: HCS soft async reload queued {} experts ({} tokens)",
+                request_id, queued, prompt_len);
         }
     }
     // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
@@ -1547,10 +1547,10 @@ impl RustServer {
             }
         }
 
-        // Reload soft HCS after prefill
+        // Reload soft HCS after prefill — adaptive size based on actual prompt length
         // Always attempt reload — soft pool may have been cancelled/freed by a prior operation
         let t_reload = Instant::now();
-        store.hcs_reload_after_prefill_async();
+        store.hcs_reload_after_prefill_async(prompt_len);
         // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
         let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
 

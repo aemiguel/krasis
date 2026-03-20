@@ -237,6 +237,16 @@ impl VramCalibration {
     fn decode_hcs_budget_mb(&self, tokens: usize) -> u64 {
         self.decode_free_mb(tokens).saturating_sub(self.safety_margin_mb)
     }
+
+    /// Decode VRAM consumption per token in KB (linear rate).
+    fn decode_kb_per_tok(&self) -> f64 {
+        if self.long_tokens > self.short_tokens {
+            ((self.decode_short_free_mb as f64 - self.decode_long_free_mb as f64)
+                / (self.long_tokens - self.short_tokens) as f64) * 1024.0
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Per-layer APFL statistics.
@@ -420,6 +430,10 @@ struct HcsState {
     soft_reload_entries: Vec<(usize, usize, HcsCacheEntry)>,
     /// Safety margin in MB — minimum free VRAM to maintain.
     safety_margin_mb: usize,
+    /// Hard tier budget in MB (set at init, survives worst-case prefill).
+    hard_budget_mb: usize,
+    /// Maximum soft tier budget in MB (set at init, sized for decode after short prompt).
+    soft_max_mb: usize,
 
     /// Max experts per layer (stride for flat indexing in cache_fast, heatmap, etc.).
     num_experts_per_layer: usize,
@@ -475,6 +489,8 @@ impl HcsState {
             soft_reload_stream: None, // CudaStream
             soft_reload_entries: Vec::new(),
             safety_margin_mb: 600,
+            hard_budget_mb: 0,
+            soft_max_mb: 0,
             num_experts_per_layer: 0,
             d_expert_ptrs: None,
             d_expert_ptrs_ne: 0,
@@ -2327,6 +2343,133 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    /// Register a simple INT4 weight directly (no Marlin, no single-slot swap).
+    /// Used for aux GPU stores that never do prefill — they only need decode format.
+    /// Pops pending simple INT4 from repack_marlin_int4_cpu, allocates GPU memory,
+    /// uploads packed data and FP32 scales. CUDA graphs see stable pointers.
+    fn register_simple_int4_only(
+        &mut self, rows: usize, cols: usize, group_size: usize,
+    ) -> PyResult<usize> {
+        let simple = if !self.pending_simple_int4.is_empty() {
+            self.pending_simple_int4.remove(0)
+        } else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "register_simple_int4_only: no pending simple INT4 data (call repack_marlin_int4_cpu first)"));
+        };
+
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let id = graph.weights.len();
+
+        // Allocate GPU memory for packed data and FP32 scales
+        let packed_bytes = simple.packed.len();
+        let scales_bytes = simple.scales.len() * 4; // f32 = 4 bytes each
+        let packed_gpu: u64;
+        let scales_gpu: u64;
+        unsafe {
+            let mut p: u64 = 0;
+            let r = cuda_sys::lib().cuMemAlloc_v2(&mut p, packed_bytes);
+            if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("cuMemAlloc packed: {:?}", r)));
+            }
+            packed_gpu = p;
+            let r = cuda_sys::lib().cuMemAlloc_v2(&mut p, scales_bytes);
+            if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("cuMemAlloc scales: {:?}", r)));
+            }
+            scales_gpu = p;
+
+            // Upload simple INT4 packed data
+            let r = cuda_sys::lib().cuMemcpyHtoD_v2(
+                packed_gpu,
+                simple.packed.as_ptr() as *const std::ffi::c_void,
+                packed_bytes);
+            if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("cuMemcpyHtoD packed: {:?}", r)));
+            }
+
+            // Upload FP32 scales
+            let scales_host: Vec<u8> = simple.scales.iter()
+                .flat_map(|f| f.to_bits().to_ne_bytes())
+                .collect();
+            let r = cuda_sys::lib().cuMemcpyHtoD_v2(
+                scales_gpu,
+                scales_host.as_ptr() as *const std::ffi::c_void,
+                scales_bytes);
+            if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("cuMemcpyHtoD scales: {:?}", r)));
+            }
+        }
+
+        // Create weight with simple INT4 ptrs only — dtype=5 (Marlin INT4) so
+        // GEMV dispatch enters the is_marlin_int4 branch, then has_simple_int4
+        // returns true and uses the fast simple kernel.
+        let mut w = GpuWeight::new_marlin_int4(packed_gpu, scales_gpu, rows, cols, group_size);
+        w.simple_packed_ptr = packed_gpu;
+        w.simple_scales_f32_ptr = scales_gpu;
+
+        let packed_mb = packed_bytes as f64 / 1024.0 / 1024.0;
+        log::info!("  + simple INT4 only: wid={}, {:.1} MB packed + {:.1} MB scales",
+                   id, packed_mb, scales_bytes as f64 / 1024.0 / 1024.0);
+
+        graph.weights.push(w);
+        Ok(id)
+    }
+
+    /// Remove single-slot swap entries for weights NOT used by the decode segment.
+    /// Called after set_decode_segment() in multi-GPU mode. Returns count of entries removed.
+    /// After this, swap_to_simple_int4/swap_to_marlin only touch decode-segment weights.
+    fn restrict_swaps_to_decode_segment(&mut self) -> PyResult<usize> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+
+        let start = graph.decode_layer_start;
+        let end = graph.decode_layer_end;
+
+        // Collect weight IDs referenced by layers in the decode segment
+        let mut decode_wids = std::collections::HashSet::new();
+        for i in start..end.min(graph.layers.len()) {
+            match &graph.layers[i].attn {
+                GpuAttnConfig::GQA { q_proj, k_proj, v_proj, o_proj, fused_qkv, .. } => {
+                    decode_wids.insert(*q_proj);
+                    decode_wids.insert(*k_proj);
+                    decode_wids.insert(*v_proj);
+                    decode_wids.insert(*o_proj);
+                    if let Some(fused) = fused_qkv {
+                        decode_wids.insert(*fused);
+                    }
+                }
+                GpuAttnConfig::LinearAttention { in_proj_qkvz, in_proj_ba, out_proj, .. } => {
+                    decode_wids.insert(*in_proj_qkvz);
+                    decode_wids.insert(*in_proj_ba);
+                    decode_wids.insert(*out_proj);
+                }
+                GpuAttnConfig::MLA { kv_a_proj, o_proj, q_a_proj, q_b_proj, q_proj, .. } => {
+                    decode_wids.insert(*kv_a_proj);
+                    decode_wids.insert(*o_proj);
+                    if let Some(w) = q_a_proj { decode_wids.insert(*w); }
+                    if let Some(w) = q_b_proj { decode_wids.insert(*w); }
+                    if let Some(w) = q_proj { decode_wids.insert(*w); }
+                }
+            }
+        }
+
+        let before = self.single_slot_swaps.len();
+        self.single_slot_swaps.retain(|entry| decode_wids.contains(&entry.weight_id));
+        let removed = before - self.single_slot_swaps.len();
+
+        if removed > 0 {
+            log::info!("restrict_swaps_to_decode_segment: removed {} swap entries for layers outside [{}, {}), {} remain",
+                       removed, start, end, self.single_slot_swaps.len());
+        }
+
+        Ok(removed)
+    }
+
     /// Quantize a BF16 weight tensor to Marlin INT8 format and register it.
     /// Takes a GPU BF16 tensor, copies to CPU, quantizes to INT8, repacks to
     /// Marlin format, uploads packed + scales back to GPU, and registers.
@@ -3690,6 +3833,8 @@ impl GpuDecodeStore {
             let hcs = graph.hcs.as_mut()
                 .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("HCS not initialized"))?;
             hcs.safety_margin_mb = safety_margin_mb;
+            hcs.hard_budget_mb = hard_budget_mb;
+            hcs.soft_max_mb = soft_budget_mb;
         }
 
         // Now allocate and fill the soft tier
@@ -4627,9 +4772,11 @@ impl GpuDecodeStore {
     }
 
     /// Reload soft-tier HCS experts after prefill (PyO3 wrapper).
+    /// actual_tokens: prompt length for adaptive sizing (0 = use full soft budget).
     /// Returns (loaded_count, reload_ms).
-    fn py_hcs_reload_after_prefill(&mut self) -> (usize, f64) {
-        self.hcs_reload_after_prefill()
+    #[pyo3(signature = (actual_tokens=0))]
+    fn py_hcs_reload_after_prefill(&mut self, actual_tokens: usize) -> (usize, f64) {
+        self.hcs_reload_after_prefill(actual_tokens)
     }
 
     /// Copy KV cache from this store to an aux store (PyO3 wrapper for validation).
@@ -10916,8 +11063,9 @@ impl GpuDecodeStore {
 
     /// Reload soft-tier HCS experts after prefill completes.
     /// Allocates VRAM and DMA copies experts from host mmap.
+    /// actual_tokens: prompt length for adaptive sizing (0 = use full soft budget).
     /// Returns (loaded_count, reload_ms).
-    pub fn hcs_reload_after_prefill(&mut self) -> (usize, f64) {
+    pub fn hcs_reload_after_prefill(&mut self, actual_tokens: usize) -> (usize, f64) {
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
@@ -10932,8 +11080,27 @@ impl GpuDecodeStore {
         }
 
         let slot_size = hcs.soft_slot_size;
-        let num_slots = hcs.soft_num_slots;
-        if slot_size == 0 || num_slots == 0 {
+        if slot_size == 0 || hcs.soft_max_mb == 0 {
+            return (0, 0.0);
+        }
+
+        // Adaptive soft budget based on actual prompt length
+        let adaptive_soft_mb = if actual_tokens > 0 {
+            if let Some(ref cal) = self.vram_calibration {
+                let extra_tokens = actual_tokens.saturating_sub(cal.short_tokens);
+                let extra_mb = (extra_tokens as f64 * cal.decode_kb_per_tok() / 1024.0) as usize;
+                hcs.soft_max_mb.saturating_sub(extra_mb)
+            } else {
+                hcs.soft_max_mb
+            }
+        } else {
+            hcs.soft_max_mb
+        };
+        let num_slots = std::cmp::min(
+            adaptive_soft_mb * 1024 * 1024 / slot_size,
+            hcs.soft_ranking.len(),
+        );
+        if num_slots == 0 {
             return (0, 0.0);
         }
 
@@ -11021,16 +11188,18 @@ impl GpuDecodeStore {
 
         hcs.soft_buf = Some(soft_buf);
         hcs.soft_slot_to_expert = slot_to_expert;
+        hcs.soft_num_slots = num_slots;
         hcs.soft_num_cached = loaded;
         hcs.soft_loaded = true;
         hcs.num_cached += loaded;
         hcs.vram_bytes += alloc_bytes;
 
+        let alloc_mb = alloc_bytes as f64 / (1024.0 * 1024.0);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("  \x1b[32mHCS soft: reloaded {} experts ({:.1} MB) in {:.1}ms\x1b[0m",
-            loaded, alloc_bytes as f64 / (1024.0 * 1024.0), elapsed_ms);
-        log::info!("HCS soft: reloaded {} experts ({:.1} MB) in {:.1}ms",
-            loaded, alloc_bytes as f64 / (1024.0 * 1024.0), elapsed_ms);
+        eprintln!("  \x1b[32mHCS soft: reloaded {} experts ({:.1}/{} MB) in {:.1}ms\x1b[0m",
+            loaded, alloc_mb, hcs.soft_max_mb, elapsed_ms);
+        log::info!("HCS soft: reloaded {} experts ({:.1}/{} MB) in {:.1}ms",
+            loaded, alloc_mb, hcs.soft_max_mb, elapsed_ms);
 
         (loaded, elapsed_ms)
     }
@@ -11040,7 +11209,7 @@ impl GpuDecodeStore {
     /// Call hcs_check_soft_reload_complete() each decode step to activate
     /// the soft tier once all DMA finishes.
     /// Returns (num_experts_queued, alloc_mb).
-    pub fn hcs_reload_after_prefill_async(&mut self) -> (usize, f64) {
+    pub fn hcs_reload_after_prefill_async(&mut self, actual_tokens: usize) -> (usize, f64) {
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
@@ -11055,10 +11224,32 @@ impl GpuDecodeStore {
         }
 
         let slot_size = hcs.soft_slot_size;
-        let num_slots = hcs.soft_num_slots;
-        if slot_size == 0 || num_slots == 0 {
+        if slot_size == 0 || hcs.soft_max_mb == 0 {
             return (0, 0.0);
         }
+
+        // Compute adaptive soft budget based on actual prompt length.
+        // Short prompts → full soft tier. Long prompts → reduced soft tier.
+        // Uses relative delta from calibration: the additional VRAM consumed by
+        // extra tokens cancels out any absolute offset between calibration and runtime.
+        let adaptive_soft_mb = if let Some(ref cal) = self.vram_calibration {
+            let extra_tokens = actual_tokens.saturating_sub(cal.short_tokens);
+            let extra_mb = (extra_tokens as f64 * cal.decode_kb_per_tok() / 1024.0) as usize;
+            hcs.soft_max_mb.saturating_sub(extra_mb)
+        } else {
+            hcs.soft_max_mb
+        };
+
+        let adaptive_slots = std::cmp::min(
+            adaptive_soft_mb * 1024 * 1024 / slot_size,
+            hcs.soft_ranking.len(),
+        );
+        if adaptive_slots == 0 {
+            log::info!("HCS soft: no reload — {} tokens uses all decode VRAM (adaptive_soft=0 MB, max={})",
+                actual_tokens, hcs.soft_max_mb);
+            return (0, 0.0);
+        }
+        let num_slots = adaptive_slots;
 
         let t0 = std::time::Instant::now();
         let alloc_bytes = num_slots * slot_size;
@@ -11186,6 +11377,7 @@ impl GpuDecodeStore {
         // Store the buffer and pending state (but don't activate cache entries yet)
         hcs.soft_buf = Some(soft_buf);
         hcs.soft_slot_to_expert = slot_to_expert;
+        hcs.soft_num_slots = num_slots;
         hcs.soft_num_cached = queued;
         hcs.soft_loaded = false; // Not yet — DMA still in flight
         hcs.soft_reload_pending = true;
@@ -11193,12 +11385,14 @@ impl GpuDecodeStore {
         hcs.vram_bytes += alloc_bytes;
 
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("  \x1b[36mHCS soft: async reload queued {} experts ({:.1} MB) in {:.1}ms\x1b[0m",
-            queued, alloc_bytes as f64 / (1024.0 * 1024.0), elapsed_ms);
-        log::info!("HCS soft: async reload queued {} experts ({:.1} MB) in {:.1}ms",
-            queued, alloc_bytes as f64 / (1024.0 * 1024.0), elapsed_ms);
+        let alloc_mb = alloc_bytes as f64 / (1024.0 * 1024.0);
+        let max_mb = hcs.soft_max_mb;
+        eprintln!("  \x1b[36mHCS soft: async reload queued {} experts ({:.1}/{} MB, {} tokens) in {:.1}ms\x1b[0m",
+            queued, alloc_mb, max_mb, actual_tokens, elapsed_ms);
+        log::info!("HCS soft: async reload queued {} experts ({:.1}/{} MB, {} tokens) in {:.1}ms",
+            queued, alloc_mb, max_mb, actual_tokens, elapsed_ms);
 
-        (queued, alloc_bytes as f64 / (1024.0 * 1024.0))
+        (queued, alloc_mb)
     }
 
     /// Check if async soft-tier reload DMA has completed.

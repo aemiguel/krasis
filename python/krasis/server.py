@@ -1042,6 +1042,7 @@ def main():
         long_target_tokens = int(kv_max_tokens * 0.8)
         LONG_REPEATS = max(SHORT_REPEATS * 2, long_target_tokens // TOKENS_PER_REPEAT)
     else:
+        kv_max_tokens = 0
         LONG_REPEATS = SHORT_REPEATS * 4  # minimal fallback, no KV cache info
 
     prefill_short_free = None
@@ -1136,7 +1137,17 @@ def main():
     # after calibration the actual free VRAM may differ (PyTorch caching allocator
     # retains some blocks). Using deltas and applying them to actual post-cleanup
     # free VRAM gives correct budgets regardless of allocator state.
-    prefill_transient = max(0, _baseline_free - prefill_long_free)   # worst-case prefill VRAM consumed
+    prefill_transient_measured = max(0, _baseline_free - prefill_long_free)   # at calibration (80% KV)
+    # Extrapolate prefill transient to 100% KV fill.
+    # Hard budget must survive worst-case prefill, which is a completely full KV cache,
+    # not just the 80% used during calibration. The linear model makes this exact.
+    if kv_max_tokens > long_tokens and prefill_kb_per_tok > 0:
+        extra_tokens = kv_max_tokens - long_tokens
+        extra_mb = int(extra_tokens * prefill_kb_per_tok / 1024)
+        prefill_transient = prefill_transient_measured + extra_mb
+        _detail(f"Prefill transient extrapolated: {prefill_transient_measured:,} MB (80% KV) -> {prefill_transient:,} MB (100% KV, +{extra_mb:,} MB for {extra_tokens:,} extra tokens)")
+    else:
+        prefill_transient = prefill_transient_measured
     decode_transient = max(0, _baseline_free - decode_short_free)    # best-case decode VRAM consumed
 
     torch.cuda.synchronize()
@@ -1154,8 +1165,8 @@ def main():
     _status("VRAM calibration complete")
     _detail(f"Prefill: {prefill_kb_per_tok:.1f} KB/token ({prefill_short_free:,} MB @ {short_tokens} tok -> {prefill_long_free:,} MB @ {long_tokens} tok)")
     _detail(f"Decode:  {decode_kb_per_tok:.1f} KB/token ({decode_short_free:,} MB @ short -> {decode_long_free:,} MB @ long)")
-    _detail(f"Transient: prefill={prefill_transient:,} MB, decode={decode_transient:,} MB  |  Actual free: {_free_mb:,} MB / {_total_mb:,} MB")
-    _detail(f"Hard HCS budget: {hard_budget:,} MB  |  Soft HCS budget: {soft_budget:,} MB  |  Total: {hard_budget + soft_budget:,} MB")
+    _detail(f"Transient: prefill={prefill_transient:,} MB (100% KV), decode={decode_transient:,} MB  |  Actual free: {_free_mb:,} MB / {_total_mb:,} MB")
+    _detail(f"Hard HCS budget: {hard_budget:,} MB (survives 100% KV prefill)  |  Soft HCS budget: {soft_budget:,} MB (max, adaptive per-request)  |  Total: {hard_budget + soft_budget:,} MB")
     logger.info("VRAM budget (4-point): hard=%d MB, soft=%d MB, actual_free=%d MB, prefill_transient=%d MB, decode_transient=%d MB, prefill=%.1f KB/tok, decode=%.1f KB/tok",
                 hard_budget, soft_budget, _free_mb, prefill_transient, decode_transient, prefill_kb_per_tok, decode_kb_per_tok)
 
@@ -1382,6 +1393,10 @@ def main():
             # ── Set decode segment on primary store (for accurate HCS% reporting) ──
             gpu0_layer_end = _multi_gpu_split if _multi_gpu_split > 0 else len(_model.layers)
             store.set_decode_segment(0, gpu0_layer_end)
+
+            # Multi-GPU: restrict AWQ swaps to decode segment, track prefill-only layers
+            if _multi_gpu_split > 0:
+                _model.restrict_to_decode_segment(0, gpu0_layer_end)
 
             # ── Initialize tiered HCS: hard pool + soft pool ──
             # In multi-GPU mode, filter ranking to GPU0's layer segment only
