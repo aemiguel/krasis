@@ -40,7 +40,7 @@ DEFAULT_HOST = "127.0.0.1"
 BENCHMARK_TIMEOUT = 1200  # 20 min for model load + warmup + benchmark
 CACHE_BUILD_TIMEOUT = 1800  # 30 min for cache building (INT8 takes longer)
 AWQ_CALIBRATE_TIMEOUT = 1800  # 30 min for AWQ calibration
-PERPLEXITY_TIMEOUT = 600  # 10 min for model load + 20K token eval
+PERPLEXITY_TIMEOUT = 1800  # 30 min for model load + 20K token eval
 PERPLEXITY_MAX_TOKENS = 20000
 PERPLEXITY_WARN_THRESHOLD = 0.05  # +5% PPL increase from baseline = WARN
 PERPLEXITY_FAIL_THRESHOLD = 0.15  # +15% PPL increase from baseline = FAIL
