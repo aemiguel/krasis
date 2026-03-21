@@ -475,12 +475,98 @@ Models: $(printf '%s, ' "${MODELS[@]}" | sed 's/, $//')" 2>/dev/null || warn "Co
         fi
     done
 
+    local configs_elapsed=$(( $(date +%s) - start_time ))
+    local configs_mins=$((configs_elapsed / 60))
+    local configs_secs=$((configs_elapsed % 60))
+    local target_suffix=""
+    [[ -n "$release_target" ]] && target_suffix=" ($release_target)"
+    local configs_msg="All configs passed: $completed/$total models in ${configs_mins}m ${configs_secs}s. Starting perplexity phase.${target_suffix}"
+    ok "$configs_msg"
+    session-send "$SESSION_WS" "$configs_msg" 2>/dev/null || true
+
+    # ── Perplexity phase: one INT4/AWQ pass per model ──────────────
+    info "=== Perplexity Phase: INT4/AWQ for all models ==="
+    session-send "$SESSION_WS" "Starting perplexity phase: INT4/AWQ for $total models" 2>/dev/null || true
+
+    local ppl_passed=0
+    local ppl_failed=0
+    local best_gpu_idx
+    best_gpu_idx=$(nvidia-smi --query-gpu=index,memory.total --format=csv,noheader,nounits | sort -t',' -k2 -nr | head -1 | cut -d',' -f1 | tr -d ' ')
+
+    for model in "${MODELS[@]}"; do
+        local model_dir="$HOME/.krasis/models/$model"
+        local config_json="$model_dir/config.json"
+
+        if [[ ! -f "$config_json" ]]; then
+            warn "No config.json for $model — skipping perplexity"
+            ppl_failed=$((ppl_failed + 1))
+            session-send "$SESSION_WS" "[PPL] SKIP: $model (no config.json)" 2>/dev/null || true
+            continue
+        fi
+
+        # Get num_layers from model config
+        local num_layers
+        num_layers=$("$PYTHON" -c "
+import json, sys
+c = json.load(open('$config_json'))
+tc = c.get('text_config', c)
+print(tc.get('num_hidden_layers', 0))
+") || num_layers=0
+
+        if [[ "$num_layers" -eq 0 ]]; then
+            warn "Could not detect num_layers for $model — skipping perplexity"
+            ppl_failed=$((ppl_failed + 1))
+            session-send "$SESSION_WS" "[PPL] SKIP: $model (unknown layers)" 2>/dev/null || true
+            continue
+        fi
+
+        # Generate temp INT4/AWQ config
+        local ppl_conf
+        ppl_conf=$(mktemp /tmp/krasis-ppl-XXXXXX.conf)
+        cat > "$ppl_conf" <<PPLCONF
+# Perplexity config — INT4/INT4 AWQ — $model
+MODEL_PATH="$model_dir"
+CFG_SELECTED_GPUS="$best_gpu_idx"
+CFG_PP_PARTITION="$num_layers"
+CFG_LAYER_GROUP_SIZE="2"
+CFG_KV_DTYPE="fp8_e4m3"
+CFG_GPU_EXPERT_BITS="4"
+CFG_CPU_EXPERT_BITS="4"
+CFG_ATTENTION_QUANT="awq"
+CFG_SHARED_EXPERT_QUANT="int8"
+CFG_DENSE_MLP_QUANT="int8"
+CFG_LM_HEAD_QUANT="int8"
+PPLCONF
+
+        info "=== [PPL] $model (INT4/AWQ) ==="
+        session-send "$SESSION_WS" "[PPL] Starting: $model" 2>/dev/null || true
+        local ppl_start
+        ppl_start=$(date +%s)
+
+        if do_perplexity "$ppl_conf" --max-tokens 20000; then
+            local ppl_elapsed=$(( $(date +%s) - ppl_start ))
+            local ppl_mins=$((ppl_elapsed / 60))
+            local ppl_secs=$((ppl_elapsed % 60))
+            ppl_passed=$((ppl_passed + 1))
+            ok "[PPL] PASSED: $model (${ppl_mins}m ${ppl_secs}s)"
+            session-send "$SESSION_WS" "[PPL] PASSED: $model (${ppl_mins}m ${ppl_secs}s)" 2>/dev/null || true
+        else
+            local ppl_elapsed=$(( $(date +%s) - ppl_start ))
+            local ppl_mins=$((ppl_elapsed / 60))
+            local ppl_secs=$((ppl_elapsed % 60))
+            ppl_failed=$((ppl_failed + 1))
+            warn "[PPL] FAILED: $model (${ppl_mins}m ${ppl_secs}s)"
+            session-send "$SESSION_WS" "[PPL] FAILED: $model (${ppl_mins}m ${ppl_secs}s)" 2>/dev/null || true
+        fi
+
+        rm -f "$ppl_conf"
+    done
+
+    # ── Final summary ──────────────────────────────────────────────
     local total_elapsed=$(( $(date +%s) - start_time ))
     local total_mins=$((total_elapsed / 60))
     local total_secs=$((total_elapsed % 60))
-    local target_suffix=""
-    [[ -n "$release_target" ]] && target_suffix=" ($release_target)"
-    local final_msg="ALL PASSED: $completed/$total models tested in ${total_mins}m ${total_secs}s.${target_suffix}"
+    local final_msg="COMPLETE: $completed/$total models passed, perplexity $ppl_passed/$total passed, total ${total_mins}m ${total_secs}s.${target_suffix}"
     ok "$final_msg"
     session-send "$SESSION_WS" "$final_msg" 2>/dev/null || true
 

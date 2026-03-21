@@ -2228,9 +2228,6 @@ def main():
             warn("AWQ template build failed — AWQ configs will be skipped")
         print()
 
-    # ── Load perplexity baselines ──────────────────────────────
-    baselines = load_perplexity_baselines(output_dir)
-
     # ── Run each config variant ──────────────────────────────────
 
     config_results = []
@@ -2370,50 +2367,12 @@ def main():
                 if margin is not None:
                     result["safety_margin_mb"] = margin
 
-            # Wait for GPU to clear before perplexity
+            # Wait for GPU to clear before next config
             info("Waiting for GPU memory to clear...")
             if not wait_for_gpu_clear(gpu_idx):
                 warn("GPU memory not fully cleared after 60s. Proceeding anyway.")
             else:
                 ok("GPU clear.")
-
-            # Phase 4: Perplexity evaluation (after server killed, GPU clear)
-            # Skip for thinking variant — same weights/config as its non-thinking twin,
-            # perplexity would be identical (thinking is a request-level parameter)
-            skip_ppl = variant.get("thinking", False)
-            if skip_ppl:
-                info("Phase 4: Perplexity skipped (thinking variant — same weights as AWQ)")
-            elif config_path and os.path.isfile(config_path) and not result.get("error"):
-                info(f"Phase 4: Perplexity evaluation "
-                     f"({PERPLEXITY_MAX_TOKENS:,} tokens, wikitext-2)")
-                ppl_result = run_perplexity_test(
-                    config_path, output_dir, timestamp, i)
-                if ppl_result:
-                    result["perplexity"] = ppl_result
-                    # Check against baseline
-                    ppl_status, ppl_baseline, ppl_delta = check_perplexity_baseline(
-                        baselines, model_name, variant["name"],
-                        ppl_result["perplexity"])
-                    ppl_result["baseline_status"] = ppl_status
-                    ppl_result["baseline_ppl"] = ppl_baseline
-                    ppl_result["baseline_delta_pct"] = ppl_delta
-                    # Update baseline (always store latest)
-                    if model_name not in baselines:
-                        baselines[model_name] = {}
-                    baselines[model_name][variant["name"]] = {
-                        "perplexity": ppl_result["perplexity"],
-                        "bpc": ppl_result.get("bpc"),
-                        "date": datetime.now().strftime("%Y-%m-%d"),
-                    }
-                else:
-                    warn("Perplexity evaluation failed — skipping")
-
-                # Wait for GPU to clear after perplexity
-                info("Waiting for GPU memory to clear...")
-                if not wait_for_gpu_clear(gpu_idx):
-                    warn("GPU memory not fully cleared after 60s. Proceeding anyway.")
-                else:
-                    ok("GPU clear.")
 
             # Clean up temp config
             if config_path and os.path.isfile(config_path):
@@ -2433,11 +2392,6 @@ def main():
                     parts.append(f"{nums['decode']} tok/s decode")
                 if nums.get("hcs"):
                     parts.append(f"{nums['hcs']}% HCS")
-            if result.get("perplexity"):
-                ppl = result["perplexity"]
-                parts.append(f"ppl={ppl['perplexity']:.2f}")
-                if ppl.get("baseline_status"):
-                    parts.append(ppl["baseline_status"])
             detail = f" ({', '.join(parts)})" if parts else ""
             session_notify(
                 f"[{model_name}] Config {i+1}/{len(CONFIG_VARIANTS)} "
@@ -2454,9 +2408,6 @@ def main():
 
     with open(report_path, "w") as f:
         f.write(report)
-
-    # Save updated perplexity baselines
-    save_perplexity_baselines(output_dir, baselines)
 
     ok(f"Report: {report_path}")
 
