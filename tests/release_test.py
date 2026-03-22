@@ -2333,6 +2333,30 @@ def main():
             result["sanity_results"] = run_sanity_prompts(port=DEFAULT_PORT,
                                                           enable_thinking=thinking)
 
+            # Run validation on sanity results immediately
+            sanity_fail_count = 0
+            sanity_warn_count = 0
+            sanity_pass_count = 0
+            for sr in result["sanity_results"]:
+                if sr.get("error"):
+                    sanity_fail_count += 1
+                    sr["_validation"] = [("FAIL", sr["error"])]
+                    sr["_validation_status"] = "FAIL"
+                else:
+                    issues = validate_sanity_result(sr.get("prompt", ""), sr.get("text", ""))
+                    sr["_validation"] = issues
+                    status = validation_status(issues)
+                    sr["_validation_status"] = status
+                    if status == "FAIL":
+                        sanity_fail_count += 1
+                    elif status == "WARN":
+                        sanity_warn_count += 1
+                    else:
+                        sanity_pass_count += 1
+            result["sanity_fail_count"] = sanity_fail_count
+            result["sanity_warn_count"] = sanity_warn_count
+            result["sanity_pass_count"] = sanity_pass_count
+
             # 7. Phase 3: Large prompts
             info("Phase 3: Large prompt validation")
             result["large_results"] = run_large_prompt_tests(port=DEFAULT_PORT,
@@ -2392,10 +2416,19 @@ def main():
                     parts.append(f"{nums['decode']} tok/s decode")
                 if nums.get("hcs"):
                     parts.append(f"{nums['hcs']}% HCS")
+            # Include sanity validation summary
+            sf = result.get("sanity_fail_count", 0)
+            sw = result.get("sanity_warn_count", 0)
+            sp = result.get("sanity_pass_count", 0)
+            if sf:
+                parts.append(f"sanity {sp}P/{sw}W/{sf}F")
+            elif sw:
+                parts.append(f"sanity {sp}P/{sw}W")
+            config_status = "FAIL" if sf else "PASS"
             detail = f" ({', '.join(parts)})" if parts else ""
             session_notify(
                 f"[{model_name}] Config {i+1}/{len(CONFIG_VARIANTS)} "
-                f"PASS: {variant['name']}{detail}")
+                f"{config_status}: {variant['name']}{detail}")
 
         config_results.append(result)
 
@@ -2414,15 +2447,24 @@ def main():
     # Summary
     print(f"\n{BOLD}Release Test Summary — {model_name}{NC}")
     print(f"{'─' * 48}")
+    any_failed = False
     for i, cr in enumerate(config_results):
-        status = f"{RED}FAILED{NC}" if cr.get("error") else f"{GREEN}OK{NC}"
+        if cr.get("error"):
+            status = f"{RED}FAILED{NC}"
+            any_failed = True
+        elif cr.get("sanity_fail_count", 0) > 0:
+            sf = cr["sanity_fail_count"]
+            status = f"{RED}FAILED{NC} ({sf} sanity failures)"
+            any_failed = True
+        else:
+            status = f"{GREEN}OK{NC}"
         print(f"  Config {i+1} ({cr['variant']['name']}): {status}")
     print(f"{'─' * 48}")
     print(f"Report: {report_path}")
     print()
 
-    # Exit with failure if any config errored
-    if any(cr.get("error") for cr in config_results):
+    # Exit with failure if any config errored or had sanity failures
+    if any_failed:
         sys.exit(1)
 
 
