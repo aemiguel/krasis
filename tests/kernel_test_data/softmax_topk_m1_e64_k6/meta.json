@@ -1,0 +1,33 @@
+{
+  "atol": 1e-05,
+  "rtol": 1e-05,
+  "note": "Softmax top-K M=1 E=64 topk=6",
+  "inputs": {
+    "gate": {
+      "file": "input_gate.bin",
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "f32"
+    }
+  },
+  "outputs": {
+    "topk_weights": {
+      "file": "expected_topk_weights.bin",
+      "shape": [
+        1,
+        6
+      ],
+      "dtype": "f32"
+    },
+    "topk_ids": {
+      "file": "expected_topk_ids.bin",
+      "shape": [
+        1,
+        6
+      ],
+      "dtype": "i32"
+    }
+  }
+}

@@ -1,9 +1,9 @@
 """Krasis Setup — one-command environment setup for CUDA + GPU dependencies.
 
 Handles:
-  1. CUDA toolkit installation (nvcc needed for FlashInfer JIT)
+  1. CUDA toolkit installation (nvcc needed for kernel compilation)
   2. CUDA-enabled PyTorch
-  3. FlashInfer + sgl-kernel
+  3. GPU kernel compilation (Marlin GEMM vendored, no sgl-kernel needed)
 
 Usage:
     krasis-setup          # auto-detect and install everything
@@ -109,7 +109,7 @@ def _get_nvcc_version():
 
 
 def _has_nvcc():
-    """Check if nvcc is available (needed for FlashInfer JIT)."""
+    """Check if nvcc is available (needed for CUDA kernel compilation)."""
     return _get_nvcc_version() is not None
 
 
@@ -198,7 +198,7 @@ def _get_required_cuda_version():
 
 
 def _need_python_dev():
-    """Check if Python development headers are installed (needed for FlashInfer JIT)."""
+    """Check if Python development headers are installed (needed for pyo3)."""
     import sysconfig
     inc = sysconfig.get_path("include")
     if inc and os.path.isfile(os.path.join(inc, "Python.h")):
@@ -243,11 +243,7 @@ def _show_required_packages():
         _, cu_ver = _get_cuda_version_from_driver()
         print(f"  • torch (CUDA {cu_ver}) — pip install torch --index-url https://download.pytorch.org/whl/cu{''.join(cu_ver.split('.'))}")
 
-    for pip_name, import_name in [("flashinfer-python", "flashinfer"), ("sgl-kernel", "sgl_kernel"), ("sglang", "sglang")]:
-        try:
-            __import__(import_name)
-        except ImportError:
-            print(f"  • {pip_name} — pip install {pip_name}")
+    # sgl-kernel is no longer needed — Marlin GEMM kernels are vendored in libkrasis_marlin.so
 
     print(f"\n  Install these manually, then re-run {BOLD}krasis-setup{NC}.\n")
 
@@ -379,7 +375,7 @@ def _install_system_deps():
         if os.path.isdir(cuda_bin) and cuda_bin not in os.environ.get("PATH", ""):
             os.environ["PATH"] = cuda_bin + ":" + os.environ.get("PATH", "")
             print(f"  Added {cuda_bin} to PATH for this session.")
-        # Set CUDA_HOME so FlashInfer/PyTorch JIT find the right toolkit
+        # Set CUDA_HOME so PyTorch JIT finds the right toolkit
         cuda_home = os.path.dirname(cuda_bin)
         if os.path.isdir(cuda_home):
             os.environ["CUDA_HOME"] = cuda_home
@@ -512,36 +508,10 @@ def _install_cuda_torch():
 
 
 def _install_gpu_packages():
-    """Install FlashInfer, sgl-kernel, and sglang."""
-    print(f"\n{BOLD}Step 3: GPU Packages (FlashInfer, sgl-kernel, sglang){NC}")
-
-    packages = [
-        ("flashinfer-python", "flashinfer"),
-        ("sgl-kernel", "sgl_kernel"),
-        ("sglang", "sglang"),
-    ]
-
-    missing = []
-    for pip_name, import_name in packages:
-        try:
-            __import__(import_name)
-            print(f"  {GREEN}{pip_name} already installed.{NC}")
-        except ImportError:
-            missing.append(pip_name)
-
-    if not missing:
-        return True
-
-    print(f"  Installing: {', '.join(missing)}...")
-    ret = _run(
-        [sys.executable, "-m", "pip", "install"] + missing + ["--quiet"],
-        check=False,
-    )
-
-    if ret.returncode != 0:
-        print(f"  {RED}Failed. Install manually:{NC}")
-        print(f"    pip install {' '.join(missing)}")
-        return False
+    """GPU packages check (Marlin GEMM kernels are now vendored)."""
+    print(f"\n{BOLD}Step 3: GPU Kernels{NC}")
+    print(f"  {GREEN}Marlin GEMM kernels are vendored in libkrasis_marlin.so (no pip install needed).{NC}")
+    return True
 
     print(f"  {GREEN}GPU packages installed.{NC}")
     return True

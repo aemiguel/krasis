@@ -56,8 +56,11 @@ pub struct ModelConfig {
     pub num_hidden_layers: usize,
     pub first_k_dense_replace: usize,
     /// Number of shared (always-active) experts per MoE layer. 0 = none.
-    /// Shared expert intermediate_size = n_shared_experts × moe_intermediate_size.
     pub n_shared_experts: usize,
+    /// Intermediate size of each shared expert. Usually = moe_intermediate_size,
+    /// but Nemotron uses a larger shared expert (e.g. 3712 vs 1856 for routed).
+    /// Parsed from `moe_shared_expert_intermediate_size` if present, else = moe_intermediate_size.
+    pub shared_expert_intermediate_size: usize,
     /// Scaling factor applied to routed expert output before adding shared expert output.
     /// DeepSeek V2-Lite: 1.0, Kimi K2.5: 2.827, Qwen3: N/A (no shared experts).
     pub routed_scaling_factor: f32,
@@ -67,6 +70,27 @@ pub struct ModelConfig {
     /// Sigmoid scaling factor for custom activation. Only used when swiglu_limit > 0.
     /// GPT OSS: 1.702.
     pub activation_alpha: f32,
+    /// Maps MoE index (0-based) to absolute layer index.
+    /// For standard models: [first_k_dense_replace, first_k_dense_replace+1, ...].
+    /// For hybrid models (Nemotron): non-contiguous, e.g. [1, 3, 6, 8, ...].
+    pub moe_layer_indices: Vec<usize>,
+    /// Whether experts have gate_proj (standard gated MoE: gate+up+down, w13=2*intermediate).
+    /// false for Nemotron relu2 experts (ungated: up+down only, w13=intermediate).
+    pub experts_gated: bool,
+}
+
+impl ModelConfig {
+    /// Get absolute layer index for a given MoE layer index.
+    #[inline]
+    pub fn moe_abs_layer(&self, moe_idx: usize) -> usize {
+        self.moe_layer_indices[moe_idx]
+    }
+
+    /// Total number of MoE layers.
+    #[inline]
+    pub fn num_moe_layers(&self) -> usize {
+        self.moe_layer_indices.len()
+    }
 }
 
 impl ModelConfig {
@@ -160,6 +184,15 @@ impl ModelConfig {
             }
         }
 
+        // Shared expert intermediate size: may differ from routed expert size.
+        // Nemotron: moe_shared_expert_intermediate_size=3712 vs moe_intermediate_size=1856.
+        // DeepSeek/Kimi: shared_expert_intermediate_size or n_shared_experts * moe_intermediate_size.
+        let shared_expert_intermediate_size = cfg.get("moe_shared_expert_intermediate_size")
+            .or_else(|| cfg.get("shared_expert_intermediate_size"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(n_shared_experts * moe_intermediate_size);
+
         let routed_scaling_factor = cfg.get("routed_scaling_factor")
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0) as f32;
@@ -183,6 +216,27 @@ impl ModelConfig {
             0.0
         };
 
+        // Detect if experts are gated (standard: gate+up+down) or ungated (Nemotron relu2: up+down only).
+        // Nemotron models use mlp_hidden_act="relu2" with ungated experts.
+        let experts_gated = cfg.get("mlp_hidden_act")
+            .and_then(|v| v.as_str())
+            .map(|act| act != "relu2")
+            .unwrap_or(true);
+
+        // Build MoE layer indices.
+        // For hybrid models (Nemotron): parse hybrid_override_pattern, MoE layers are 'E'.
+        // For standard models: contiguous from first_k_dense_replace.
+        let moe_layer_indices = if let Some(pattern) = cfg.get("hybrid_override_pattern")
+            .and_then(|v| v.as_str())
+        {
+            pattern.chars().enumerate()
+                .filter(|(_, c)| *c == 'E')
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            (first_k_dense_replace..num_hidden_layers).collect()
+        };
+
         Ok(ModelConfig {
             hidden_size,
             moe_intermediate_size,
@@ -191,9 +245,12 @@ impl ModelConfig {
             num_hidden_layers,
             first_k_dense_replace,
             n_shared_experts,
+            shared_expert_intermediate_size,
             routed_scaling_factor,
             swiglu_limit,
             activation_alpha,
+            moe_layer_indices,
+            experts_gated,
         })
     }
 }
@@ -247,6 +304,28 @@ impl QuantWeight {
         match self {
             QuantWeight::Int4(_) => 4,
             QuantWeight::Int8(_) => 8,
+        }
+    }
+
+    /// Create an empty (zero-size) QuantWeight for ungated experts.
+    /// Used as a dummy gate_proj when the model has no gate projection.
+    pub fn empty(num_bits: u8) -> Self {
+        if num_bits == 8 {
+            QuantWeight::Int8(QuantizedInt8 {
+                data: Vec::new(),
+                scales: Vec::new(),
+                rows: 0,
+                cols: 0,
+                group_size: DEFAULT_GROUP_SIZE,
+            })
+        } else {
+            QuantWeight::Int4(QuantizedInt4 {
+                packed: Vec::new(),
+                scales: Vec::new(),
+                rows: 0,
+                cols: 0,
+                group_size: DEFAULT_GROUP_SIZE,
+            })
         }
     }
 }
@@ -338,6 +417,13 @@ pub struct UnifiedExpertWeights {
     /// Whether data is in tiled layout (TILE_N=256 wide tiles).
     pub tiled: bool,
 
+    /// Whether w13 is gated (gate+up, 2*N) or ungated (up only, N).
+    /// Standard MoE: true (SiLU gating). Nemotron: false (relu^2 activation).
+    pub gated: bool,
+
+    /// Activation type: 0=silu_gated (standard), 1=relu2 (Nemotron).
+    pub activation_type: u8,
+
     /// Contiguous backing buffer for DMA optimization.
     /// When Some, w13_packed/w13_scales/w2_packed/w2_scales point INTO this buffer
     /// (via unsafe Vec::from_raw_parts). Layout matches GPU double-buffer:
@@ -367,39 +453,54 @@ impl UnifiedExpertWeights {
     /// Convert from separate gate/up/down ExpertWeights (INT4 only) to unified transposed format.
     ///
     /// Concatenates gate+up into w13, transposes both w13 and w2 from [N, K/8] to [K/8, N].
+    /// If gate.rows() == 0 (ungated expert), w13 = just up (width N).
     /// This is a pure rearrangement of packed u32 and scale u16 values — no re-quantization.
     pub fn from_expert_weights(ew: &ExpertWeights) -> Self {
-        let gate = ew.gate.as_int4();
         let up = ew.up.as_int4();
         let down = ew.down.as_int4();
+        let ungated = ew.gate.rows() == 0;
 
-        let hidden = gate.cols;       // K for w13
-        let intermediate = gate.rows; // N for w13 (per gate/up)
-        let group_size = gate.group_size;
-
+        let hidden = up.cols;       // K for w13
+        let intermediate = up.rows; // N for w13 (per gate/up)
+        let group_size = up.group_size;
         let packed_k = hidden / 8;
         let num_groups = hidden / group_size;
-        let two_n = 2 * intermediate;
 
-        // w13: concatenate gate[N, K/8] + up[N, K/8] → [2*N, K/8], then transpose → [K/8, 2*N]
-        let mut w13_packed = vec![0u32; packed_k * two_n];
-        for k in 0..packed_k {
-            for n in 0..intermediate {
-                // Gate weights: first N columns
-                w13_packed[k * two_n + n] = gate.packed[n * packed_k + k];
-                // Up weights: next N columns
-                w13_packed[k * two_n + intermediate + n] = up.packed[n * packed_k + k];
+        let (w13_packed, w13_scales) = if ungated {
+            // Ungated: w13 = just up [N, K/8] → transpose → [K/8, N]
+            let mut w13_packed = vec![0u32; packed_k * intermediate];
+            for k in 0..packed_k {
+                for n in 0..intermediate {
+                    w13_packed[k * intermediate + n] = up.packed[n * packed_k + k];
+                }
             }
-        }
-
-        // w13 scales: [2*N, K/gs] → transpose → [K/gs, 2*N]
-        let mut w13_scales = vec![0u16; num_groups * two_n];
-        for g in 0..num_groups {
-            for n in 0..intermediate {
-                w13_scales[g * two_n + n] = gate.scales[n * num_groups + g];
-                w13_scales[g * two_n + intermediate + n] = up.scales[n * num_groups + g];
+            let mut w13_scales = vec![0u16; num_groups * intermediate];
+            for g in 0..num_groups {
+                for n in 0..intermediate {
+                    w13_scales[g * intermediate + n] = up.scales[n * num_groups + g];
+                }
             }
-        }
+            (w13_packed, w13_scales)
+        } else {
+            // Gated: w13 = gate+up [2*N, K/8] → transpose → [K/8, 2*N]
+            let gate = ew.gate.as_int4();
+            let two_n = 2 * intermediate;
+            let mut w13_packed = vec![0u32; packed_k * two_n];
+            for k in 0..packed_k {
+                for n in 0..intermediate {
+                    w13_packed[k * two_n + n] = gate.packed[n * packed_k + k];
+                    w13_packed[k * two_n + intermediate + n] = up.packed[n * packed_k + k];
+                }
+            }
+            let mut w13_scales = vec![0u16; num_groups * two_n];
+            for g in 0..num_groups {
+                for n in 0..intermediate {
+                    w13_scales[g * two_n + n] = gate.scales[n * num_groups + g];
+                    w13_scales[g * two_n + intermediate + n] = up.scales[n * num_groups + g];
+                }
+            }
+            (w13_packed, w13_scales)
+        };
 
         // w2 (down): [hidden, intermediate/8] → transpose → [intermediate/8, hidden]
         let down_k = down.cols;        // intermediate_size (reduction for down)
@@ -435,6 +536,8 @@ impl UnifiedExpertWeights {
             up_bias: None,
             down_bias: None,
             tiled: false,
+            gated: !ungated,
+            activation_type: if ungated { 1 } else { 0 },
             contiguous_backing: None,
             borrowed: false,
         }
@@ -443,48 +546,75 @@ impl UnifiedExpertWeights {
     /// Convert from separate gate/up/down ExpertWeights (INT8) to unified transposed format.
     ///
     /// Concatenates gate+up into w13, transposes from [N, K] to [K, N].
+    /// If gate.rows() == 0 (ungated expert), w13 = just up (width N).
     /// i8 data packed into Vec<u32> as byte container.
     pub fn from_expert_weights_int8(ew: &ExpertWeights) -> Self {
-        let gate = match &ew.gate { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 gate weight") };
         let up = match &ew.up { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 up weight") };
         let down = match &ew.down { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 down weight") };
+        let ungated = ew.gate.rows() == 0;
 
-        let hidden = gate.cols;       // K for w13
-        let intermediate = gate.rows; // N for w13 (per gate/up)
-        let group_size = gate.group_size;
+        let hidden = up.cols;       // K for w13
+        let intermediate = up.rows; // N for w13 (per gate/up)
+        let group_size = up.group_size;
         let num_groups = hidden / group_size;
-        let two_n = 2 * intermediate;
 
-        // w13: concatenate gate[N, K] + up[N, K] → [2*N, K], then transpose → [K, 2*N]
-        let w13_byte_count = hidden * two_n;
-        let w13_u32_count = (w13_byte_count + 3) / 4;
-        let mut w13_bytes = vec![0i8; w13_u32_count * 4]; // pad to u32 boundary
-
-        for k in 0..hidden {
-            for n in 0..intermediate {
-                w13_bytes[k * two_n + n] = gate.data[n * hidden + k];
-                w13_bytes[k * two_n + intermediate + n] = up.data[n * hidden + k];
+        let (w13_packed, w13_scales) = if ungated {
+            // Ungated: w13 = just up [N, K] → transpose → [K, N]
+            let w_n = intermediate;
+            let w13_byte_count = hidden * w_n;
+            let w13_u32_count = (w13_byte_count + 3) / 4;
+            let mut w13_bytes = vec![0i8; w13_u32_count * 4];
+            for k in 0..hidden {
+                for n in 0..intermediate {
+                    w13_bytes[k * w_n + n] = up.data[n * hidden + k];
+                }
             }
-        }
-
-        let w13_packed: Vec<u32> = unsafe {
-            let mut v = vec![0u32; w13_u32_count];
-            std::ptr::copy_nonoverlapping(
-                w13_bytes.as_ptr() as *const u8,
-                v.as_mut_ptr() as *mut u8,
-                w13_u32_count * 4,
-            );
-            v
+            let w13_packed: Vec<u32> = unsafe {
+                let mut v = vec![0u32; w13_u32_count];
+                std::ptr::copy_nonoverlapping(
+                    w13_bytes.as_ptr() as *const u8,
+                    v.as_mut_ptr() as *mut u8,
+                    w13_u32_count * 4,
+                );
+                v
+            };
+            let mut w13_scales = vec![0u16; num_groups * w_n];
+            for g in 0..num_groups {
+                for n in 0..intermediate {
+                    w13_scales[g * w_n + n] = up.scales[n * num_groups + g];
+                }
+            }
+            (w13_packed, w13_scales)
+        } else {
+            let gate = match &ew.gate { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 gate weight") };
+            let two_n = 2 * intermediate;
+            let w13_byte_count = hidden * two_n;
+            let w13_u32_count = (w13_byte_count + 3) / 4;
+            let mut w13_bytes = vec![0i8; w13_u32_count * 4];
+            for k in 0..hidden {
+                for n in 0..intermediate {
+                    w13_bytes[k * two_n + n] = gate.data[n * hidden + k];
+                    w13_bytes[k * two_n + intermediate + n] = up.data[n * hidden + k];
+                }
+            }
+            let w13_packed: Vec<u32> = unsafe {
+                let mut v = vec![0u32; w13_u32_count];
+                std::ptr::copy_nonoverlapping(
+                    w13_bytes.as_ptr() as *const u8,
+                    v.as_mut_ptr() as *mut u8,
+                    w13_u32_count * 4,
+                );
+                v
+            };
+            let mut w13_scales = vec![0u16; num_groups * two_n];
+            for g in 0..num_groups {
+                for n in 0..intermediate {
+                    w13_scales[g * two_n + n] = gate.scales[n * num_groups + g];
+                    w13_scales[g * two_n + intermediate + n] = up.scales[n * num_groups + g];
+                }
+            }
+            (w13_packed, w13_scales)
         };
-
-        // w13 scales: [2*N, K/gs] → transpose → [K/gs, 2*N]
-        let mut w13_scales = vec![0u16; num_groups * two_n];
-        for g in 0..num_groups {
-            for n in 0..intermediate {
-                w13_scales[g * two_n + n] = gate.scales[n * num_groups + g];
-                w13_scales[g * two_n + intermediate + n] = up.scales[n * num_groups + g];
-            }
-        }
 
         // w2 (down): [hidden, intermediate] → transpose → [intermediate, hidden]
         let down_k = down.cols;        // intermediate_size
@@ -532,6 +662,8 @@ impl UnifiedExpertWeights {
             up_bias: None,
             down_bias: None,
             tiled: false,
+            gated: !ungated,
+            activation_type: if ungated { 1 } else { 0 },
             contiguous_backing: None,
             borrowed: false,
         }
@@ -552,29 +684,38 @@ impl UnifiedExpertWeights {
     fn from_expert_weights_marlin_int4(ew: &ExpertWeights) -> Self {
         use crate::weights::marlin::marlin_repack;
 
-        let gate = ew.gate.as_int4();
         let up = ew.up.as_int4();
         let down = ew.down.as_int4();
+        let ungated = ew.gate.rows() == 0;
 
-        let hidden = gate.cols;       // K for w13
-        let intermediate = gate.rows; // N per gate/up
-        let group_size = gate.group_size;
+        let hidden = up.cols;       // K for w13
+        let intermediate = up.rows; // N per gate/up
+        let group_size = up.group_size;
 
-        // Combine gate+up into single QuantizedInt4 [2*N, K]
-        let mut combined_packed = Vec::with_capacity(gate.packed.len() + up.packed.len());
-        combined_packed.extend_from_slice(&gate.packed);
-        combined_packed.extend_from_slice(&up.packed);
-
-        let mut combined_scales = Vec::with_capacity(gate.scales.len() + up.scales.len());
-        combined_scales.extend_from_slice(&gate.scales);
-        combined_scales.extend_from_slice(&up.scales);
-
-        let combined = QuantizedInt4 {
-            packed: combined_packed,
-            scales: combined_scales,
-            rows: 2 * intermediate,
-            cols: hidden,
-            group_size,
+        // Combine gate+up into w13, or just up if ungated
+        let combined = if ungated {
+            QuantizedInt4 {
+                packed: up.packed.clone(),
+                scales: up.scales.clone(),
+                rows: intermediate,
+                cols: hidden,
+                group_size,
+            }
+        } else {
+            let gate = ew.gate.as_int4();
+            let mut combined_packed = Vec::with_capacity(gate.packed.len() + up.packed.len());
+            combined_packed.extend_from_slice(&gate.packed);
+            combined_packed.extend_from_slice(&up.packed);
+            let mut combined_scales = Vec::with_capacity(gate.scales.len() + up.scales.len());
+            combined_scales.extend_from_slice(&gate.scales);
+            combined_scales.extend_from_slice(&up.scales);
+            QuantizedInt4 {
+                packed: combined_packed,
+                scales: combined_scales,
+                rows: 2 * intermediate,
+                cols: hidden,
+                group_size,
+            }
         };
 
         let w13 = marlin_repack(&combined);
@@ -615,6 +756,8 @@ impl UnifiedExpertWeights {
             up_bias: None,
             down_bias: None,
             tiled: false,
+            gated: !ungated,
+            activation_type: if ungated { 1 } else { 0 },
             contiguous_backing: None,
             borrowed: false,
         }
@@ -623,29 +766,38 @@ impl UnifiedExpertWeights {
     fn from_expert_weights_marlin_int8(ew: &ExpertWeights) -> Self {
         use crate::weights::marlin::marlin_repack_int8;
 
-        let gate = match &ew.gate { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 gate for Marlin INT8") };
         let up = match &ew.up { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 up for Marlin INT8") };
         let down = match &ew.down { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 down for Marlin INT8") };
+        let ungated = ew.gate.rows() == 0;
 
-        let hidden = gate.cols;
-        let intermediate = gate.rows;
-        let group_size = gate.group_size;
+        let hidden = up.cols;
+        let intermediate = up.rows;
+        let group_size = up.group_size;
 
-        // Combine gate+up into single QuantizedInt8 [2*N, K]
-        let mut combined_data = Vec::with_capacity(gate.data.len() + up.data.len());
-        combined_data.extend_from_slice(&gate.data);
-        combined_data.extend_from_slice(&up.data);
-
-        let mut combined_scales = Vec::with_capacity(gate.scales.len() + up.scales.len());
-        combined_scales.extend_from_slice(&gate.scales);
-        combined_scales.extend_from_slice(&up.scales);
-
-        let combined = QuantizedInt8 {
-            data: combined_data,
-            scales: combined_scales,
-            rows: 2 * intermediate,
-            cols: hidden,
-            group_size,
+        // Combine gate+up into w13, or just up if ungated
+        let combined = if ungated {
+            QuantizedInt8 {
+                data: up.data.clone(),
+                scales: up.scales.clone(),
+                rows: intermediate,
+                cols: hidden,
+                group_size,
+            }
+        } else {
+            let gate = match &ew.gate { QuantWeight::Int8(q) => q, _ => panic!("Expected INT8 gate for Marlin INT8") };
+            let mut combined_data = Vec::with_capacity(gate.data.len() + up.data.len());
+            combined_data.extend_from_slice(&gate.data);
+            combined_data.extend_from_slice(&up.data);
+            let mut combined_scales = Vec::with_capacity(gate.scales.len() + up.scales.len());
+            combined_scales.extend_from_slice(&gate.scales);
+            combined_scales.extend_from_slice(&up.scales);
+            QuantizedInt8 {
+                data: combined_data,
+                scales: combined_scales,
+                rows: 2 * intermediate,
+                cols: hidden,
+                group_size,
+            }
         };
 
         let w13 = marlin_repack_int8(&combined);
@@ -685,6 +837,8 @@ impl UnifiedExpertWeights {
             up_bias: None,
             down_bias: None,
             tiled: false,
+            gated: !ungated,
+            activation_type: if ungated { 1 } else { 0 },
             contiguous_backing: None,
             borrowed: false,
         }
@@ -738,6 +892,8 @@ impl UnifiedExpertWeights {
                 up_bias: None,
                 down_bias: None,
                 tiled: false,
+                gated: true,
+                activation_type: 0,
                 contiguous_backing: None,
                 borrowed: false,
             }
@@ -793,6 +949,8 @@ impl UnifiedExpertWeights {
                 up_bias: None,
                 down_bias: None,
                 tiled: false,
+                gated: true,
+                activation_type: 0,
                 contiguous_backing: None,
                 borrowed: false,
             }
@@ -1039,10 +1197,12 @@ fn marlin_expert_byte_sizes(config: &ModelConfig, group_size: usize, gpu_bits: u
     let h = config.hidden_size;
     let m = config.moe_intermediate_size;
     let h_w2 = marlin_w2_padded_n(h, m);
+    // w13 width: gated = 2*m (gate+up), ungated = m (up only)
+    let w13_n = if config.experts_gated { 2 * m } else { m };
     // Pack divisor: INT4 packs 8 values/u32 (h/8), INT8 packs 4 values/u32 (h/4)
     let div = if gpu_bits == 4 { 8 } else { 4 };
-    let w13_packed_bytes = (h / div) * (2 * m) * 4;
-    let w13_scales_bytes = (h / group_size) * (2 * m) * 2;
+    let w13_packed_bytes = (h / div) * w13_n * 4;
+    let w13_scales_bytes = (h / group_size) * w13_n * 2;
     let w2_packed_bytes = (m / div) * h_w2 * 4;
     let w2_scales_bytes = (m / group_size) * h_w2 * 2;
     (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes)
@@ -1055,7 +1215,8 @@ fn marlin_expert_byte_sizes(config: &ModelConfig, group_size: usize, gpu_bits: u
 fn cpu_expert_byte_sizes(config: &ModelConfig, group_size: usize, num_bits: u8) -> (usize, usize, usize, usize) {
     let h = config.hidden_size;
     let m = config.moe_intermediate_size;
-    let two_n = 2 * m;
+    // w13 width: gated = 2*m (gate+up), ungated = m (up only)
+    let two_n = if config.experts_gated { 2 * m } else { m };
 
     if num_bits == 4 {
         // INT4 transposed: same u32 packing as Marlin but NO w2 padding
@@ -1081,7 +1242,11 @@ fn cpu_expert_byte_sizes(config: &ModelConfig, group_size: usize, num_bits: u8) 
 /// w13_bits for gate/up, w2_bits for down — may differ.
 /// Returns (w13_packed_bytes, w13_scales_bytes, w2_packed_bytes, w2_scales_bytes).
 fn cpu_expert_byte_sizes_mixed(h: usize, m: usize, group_size: usize, w13_bits: u8, w2_bits: u8) -> (usize, usize, usize, usize) {
-    let two_n = 2 * m;
+    cpu_expert_byte_sizes_mixed_gated(h, m, group_size, w13_bits, w2_bits, true)
+}
+
+fn cpu_expert_byte_sizes_mixed_gated(h: usize, m: usize, group_size: usize, w13_bits: u8, w2_bits: u8, gated: bool) -> (usize, usize, usize, usize) {
+    let two_n = if gated { 2 * m } else { m };
     let w13_packed_bytes = if w13_bits == 4 {
         (h / 8) * two_n * 4
     } else {
@@ -1107,13 +1272,13 @@ fn expected_gguf_cpu_cache_size(
     let h = config.hidden_size;
     let m = config.moe_intermediate_size;
 
-    let (w13pb, w13sb, w2pb, w2sb) = cpu_expert_byte_sizes_mixed(h, m, group_size, w13_bits, w2_bits);
+    let (w13pb, w13sb, w2pb, w2sb) = cpu_expert_byte_sizes_mixed_gated(h, m, group_size, w13_bits, w2_bits, config.experts_gated);
     let per_routed_expert = w13pb + w13sb + w2pb + w2sb;
     let routed_total = num_moe_layers * config.n_routed_experts * per_routed_expert;
 
     let shared_total = if n_shared_experts > 0 {
-        let (s13p, s13s, s2p, s2s) = cpu_expert_byte_sizes_mixed(
-            h, shared_intermediate, group_size, w13_bits, w2_bits,
+        let (s13p, s13s, s2p, s2s) = cpu_expert_byte_sizes_mixed_gated(
+            h, shared_intermediate, group_size, w13_bits, w2_bits, config.experts_gated,
         );
         num_moe_layers * (s13p + s13s + s2p + s2s)
     } else {
@@ -1135,7 +1300,8 @@ fn expected_cpu_cache_size(
     let shared_total = if n_shared_experts > 0 {
         let shared_m = shared_intermediate;
         let h = config.hidden_size;
-        let two_shared_n = 2 * shared_m;
+        let w13_mul = if config.experts_gated { 2 } else { 1 };
+        let two_shared_n = w13_mul * shared_m;
         let (s_w13pb, s_w13sb, s_w2pb, s_w2sb) = if num_bits == 4 {
             (
                 (h / 8) * two_shared_n * 4,
@@ -1174,9 +1340,10 @@ fn expected_marlin_cache_size(
     let shared_total = if n_shared_experts > 0 {
         let shared_m = shared_intermediate;
         let h = config.hidden_size;
+        let w13_mul = if config.experts_gated { 2 } else { 1 };
         let div = if gpu_bits == 4 { 8 } else { 4 };
-        let s_w13p = (h / div) * (2 * shared_m) * 4;
-        let s_w13s = (h / group_size) * (2 * shared_m) * 2;
+        let s_w13p = (h / div) * (w13_mul * shared_m) * 4;
+        let s_w13s = (h / group_size) * (w13_mul * shared_m) * 2;
         let s_w2p = (shared_m / div) * h * 4;
         let s_w2s = (shared_m / group_size) * h * 2;
         num_moe_layers * (s_w13p + s_w13s + s_w2p + s_w2s)
@@ -1240,9 +1407,12 @@ impl WeightStore {
                 num_hidden_layers: 0,
                 first_k_dense_replace: 0,
                 n_shared_experts: 0,
+                shared_expert_intermediate_size: 0,
                 routed_scaling_factor: 1.0,
                 swiglu_limit: 0.0,
                 activation_alpha: 0.0,
+                moe_layer_indices: Vec::new(),
+                experts_gated: true,
             },
             group_size: DEFAULT_GROUP_SIZE,
             cpu_num_bits: 4,
@@ -1289,13 +1459,13 @@ impl WeightStore {
             .map_err(|e| format!("Failed to extract MoE config: {e}"))?;
 
         log::info!(
-            "Model config: hidden={}, moe_intermediate={}, experts={}, top-{}, layers={}, first_dense={}, cpu_bits={}, gpu_bits={}",
+            "Model config: hidden={}, moe_intermediate={}, experts={}, top-{}, layers={}, moe_layers={}, cpu_bits={}, gpu_bits={}",
             config.hidden_size, config.moe_intermediate_size, config.n_routed_experts,
-            config.num_experts_per_tok, config.num_hidden_layers, config.first_k_dense_replace,
+            config.num_experts_per_tok, config.num_hidden_layers, config.num_moe_layers(),
             cpu_num_bits, gpu_num_bits,
         );
 
-        let total_moe_layers = config.num_hidden_layers - config.first_k_dense_replace;
+        let total_moe_layers = config.num_moe_layers();
         let moe_start = start_layer.unwrap_or(0);
         if moe_start >= total_moe_layers {
             return Err(format!(
@@ -1544,7 +1714,7 @@ impl WeightStore {
         // Determine which shard files we actually need for our layer range.
         // Only open shards containing expert weights for layers in [start_moe_layer, start_moe_layer + num_moe_layers).
         // This avoids mmapping all 64 shards when each PP rank only needs ~20.
-        let first_abs_layer = start_moe_layer + config.first_k_dense_replace;
+        let first_abs_layer = config.moe_abs_layer(start_moe_layer);
         let last_abs_layer = first_abs_layer + num_moe_layers; // exclusive
         let mut needed_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (tensor_name, shard_name) in &index.weight_map {
@@ -1582,12 +1752,20 @@ impl WeightStore {
         let layers_prefix = detect_expert_prefix(&index.weight_map)?;
         log::info!("Detected expert prefix: {layers_prefix}");
 
+        // Detect expert sublayer: "mlp" (standard) or "mixer" (Nemotron)
+        let expert_sublayer = detect_expert_sublayer(&index.weight_map);
+        log::info!("Detected expert sublayer: {expert_sublayer}");
+
+        // Detect whether experts have gate_proj (standard gated MoE) or just up_proj (Nemotron relu2)
+        let experts_gated = has_gate_proj_experts(&index.weight_map);
+        log::info!("Experts gated (have gate_proj): {experts_gated}");
+
         // Detect pre-quantized vs BF16 weights
         let prequantized = is_prequantized(&index.weight_map);
         let effective_group_size = if prequantized {
             // Use the first layer THIS rank owns (not global first_moe) since we
             // only opened shards for our layer range
-            let probe_layer = start_moe_layer + config.first_k_dense_replace;
+            let probe_layer = config.moe_abs_layer(start_moe_layer);
             let native_gs = detect_prequant_group_size(
                 &index.weight_map, &shards, &layers_prefix, probe_layer,
             )?;
@@ -1610,14 +1788,29 @@ impl WeightStore {
         );
 
         for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
-            let layer_idx = moe_idx + config.first_k_dense_replace;
+            let layer_idx = config.moe_abs_layer(moe_idx);
             let layer_start = std::time::Instant::now();
             let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
 
             for eidx in 0..config.n_routed_experts {
-                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.experts.{eidx}");
 
-                let (gate, up, down) = if prequantized {
+                let (gate, up, down) = if !experts_gated {
+                    // Nemotron: ungated experts (no gate_proj, just up_proj + down_proj)
+                    if prequantized {
+                        let u = QuantWeight::Int4(load_prequantized_weight(
+                            &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        let d = QuantWeight::Int4(load_prequantized_weight(
+                            &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        (QuantWeight::empty(4), u, d)
+                    } else {
+                        load_and_quantize_expert_ungated(
+                            &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
+                        )?
+                    }
+                } else if prequantized {
                     // Pre-quantized models are always INT4 (compressed-tensors format)
                     let g = QuantWeight::Int4(load_prequantized_weight(
                         &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
@@ -1655,19 +1848,31 @@ impl WeightStore {
 
         // Load shared experts (always BF16, quantized to INT4/INT8 like routed)
         let shared_experts = if config.n_shared_experts > 0 {
-            let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+            let shared_intermediate = config.shared_expert_intermediate_size;
             let shared_name = detect_shared_expert_name(&index.weight_map);
             log::info!(
                 "Loading shared experts: n_shared={}, intermediate_size={}, naming='{}'",
                 config.n_shared_experts, shared_intermediate, shared_name,
             );
+            // Detect if shared expert has gate_proj
+            let shared_has_gate = {
+                let probe_layer = config.moe_abs_layer(start_moe_layer);
+                let probe_key = format!("{layers_prefix}.layers.{probe_layer}.{expert_sublayer}.{shared_name}.gate_proj.weight");
+                index.weight_map.contains_key(&probe_key)
+            };
             let mut shared = Vec::with_capacity(num_moe_layers);
             for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
-                let layer_idx = moe_idx + config.first_k_dense_replace;
-                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.{shared_name}");
-                let (gate, up, down) = load_and_quantize_expert(
-                    &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
-                )?;
+                let layer_idx = config.moe_abs_layer(moe_idx);
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
+                let (gate, up, down) = if shared_has_gate {
+                    load_and_quantize_expert(
+                        &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
+                    )?
+                } else {
+                    load_and_quantize_expert_ungated(
+                        &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
+                    )?
+                };
                 shared.push(ExpertWeights { gate, up, down });
             }
             log::info!("Loaded {} shared expert layers", shared.len());
@@ -1940,13 +2145,20 @@ impl WeightStore {
             .map_err(|e| format!("Failed to parse safetensors index: {e}"))?;
         let layers_prefix = detect_expert_prefix(&index.weight_map)?;
         let shared_name = detect_shared_expert_name(&index.weight_map);
+        let expert_sublayer = detect_expert_sublayer(&index.weight_map);
+        let experts_gated = has_gate_proj_experts(&index.weight_map);
 
         // Collect shard names needed for shared experts
         let mut shard_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let shared_projs: &[&str] = if experts_gated {
+            &["gate_proj", "up_proj", "down_proj"]
+        } else {
+            &["up_proj", "down_proj"]
+        };
         for moe_idx in 0..num_moe_layers {
-            let layer_idx = moe_idx + config.first_k_dense_replace;
-            let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.{shared_name}");
-            for proj in &["gate_proj", "up_proj", "down_proj"] {
+            let layer_idx = config.moe_abs_layer(moe_idx);
+            let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
+            for proj in shared_projs {
                 let name = format!("{prefix}.{proj}.weight");
                 if let Some(shard) = index.weight_map.get(&name) {
                     shard_names.insert(shard.clone());
@@ -1962,20 +2174,26 @@ impl WeightStore {
             shards.insert(name.clone(), st);
         }
 
-        let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+        let shared_intermediate = config.shared_expert_intermediate_size;
         log::info!(
-            "Loading shared experts: n_shared={}, intermediate_size={}, {} layers, naming='{}'",
-            config.n_shared_experts, shared_intermediate, num_moe_layers, shared_name,
+            "Loading shared experts: n_shared={}, intermediate_size={}, {} layers, naming='{}', gated={}",
+            config.n_shared_experts, shared_intermediate, num_moe_layers, shared_name, experts_gated,
         );
 
         let start = std::time::Instant::now();
         let mut shared = Vec::with_capacity(num_moe_layers);
         for moe_idx in 0..num_moe_layers {
-            let layer_idx = moe_idx + config.first_k_dense_replace;
-            let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.{shared_name}");
-            let (gate, up, down) = load_and_quantize_expert(
-                &prefix, &index.weight_map, &shards, group_size, num_bits,
-            )?;
+            let layer_idx = config.moe_abs_layer(moe_idx);
+            let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
+            let (gate, up, down) = if experts_gated {
+                load_and_quantize_expert(
+                    &prefix, &index.weight_map, &shards, group_size, num_bits,
+                )?
+            } else {
+                load_and_quantize_expert_ungated(
+                    &prefix, &index.weight_map, &shards, group_size, num_bits,
+                )?
+            };
             shared.push(ExpertWeights { gate, up, down });
         }
         log::info!(
@@ -2013,12 +2231,14 @@ impl WeightStore {
             .map_err(|e| format!("Failed to parse safetensors index: {e}"))?;
 
         // Determine which shard files we need
-        let first_abs_layer = start_moe_layer + config.first_k_dense_replace;
-        let last_abs_layer = first_abs_layer + num_moe_layers;
+        // Collect absolute layer indices for all MoE layers we need
+        let moe_abs_layers: std::collections::HashSet<usize> = (start_moe_layer..(start_moe_layer + num_moe_layers))
+            .map(|mi| config.moe_abs_layer(mi))
+            .collect();
         let mut needed_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (tensor_name, shard_name) in &index.weight_map {
             if let Some(layer_num) = parse_layer_number(tensor_name) {
-                if layer_num >= first_abs_layer && layer_num < last_abs_layer {
+                if moe_abs_layers.contains(&layer_num) {
                     needed_shards.insert(shard_name.clone());
                 }
             }
@@ -2049,8 +2269,11 @@ impl WeightStore {
         let mxfp4 = is_mxfp4(&index.weight_map);
         let stacked = !mxfp4 && is_stacked_experts(&index.weight_map);
         let prequantized = !mxfp4 && !stacked && is_prequantized(&index.weight_map);
+        let experts_gated = has_gate_proj_experts(&index.weight_map);
+        let expert_sublayer = detect_expert_sublayer(&index.weight_map);
+        log::info!("Cache build: experts gated={experts_gated}, sublayer={expert_sublayer}");
         let effective_group_size = if prequantized {
-            let probe_layer = start_moe_layer + config.first_k_dense_replace;
+            let probe_layer = config.moe_abs_layer(start_moe_layer);
             let native_gs = detect_prequant_group_size(
                 &index.weight_map, &shards, &layers_prefix, probe_layer,
             )?;
@@ -2106,7 +2329,7 @@ impl WeightStore {
         let overall_start = std::time::Instant::now();
 
         // Prefetch first layer's expert data asynchronously
-        let first_layer_idx = start_moe_layer + config.first_k_dense_replace;
+        let first_layer_idx = config.moe_abs_layer(start_moe_layer);
         if stacked || mxfp4 {
             // Stacked/MXFP4: prefetch bulk tensors for first layer
             let suffixes: &[&str] = if stacked {
@@ -2128,7 +2351,14 @@ impl WeightStore {
             let fmt = if stacked { "stacked" } else { "MXFP4" };
             log::info!("Issued {fmt} prefetch for layer {first_layer_idx} bulk tensors");
         } else {
-            let proj_names = if prequantized {
+            let proj_names = if !experts_gated {
+                if prequantized {
+                    vec!["up_proj.weight_packed", "up_proj.weight_scale",
+                         "down_proj.weight_packed", "down_proj.weight_scale"]
+                } else {
+                    vec!["up_proj.weight", "down_proj.weight"]
+                }
+            } else if prequantized {
                 vec!["gate_proj.weight_packed", "gate_proj.weight_scale",
                      "up_proj.weight_packed", "up_proj.weight_scale",
                      "down_proj.weight_packed", "down_proj.weight_scale"]
@@ -2138,7 +2368,7 @@ impl WeightStore {
             for eidx in 0..config.n_routed_experts {
                 for proj in &proj_names {
                     let tensor_name = format!(
-                        "{layers_prefix}.layers.{first_layer_idx}.mlp.experts.{eidx}.{proj}"
+                        "{layers_prefix}.layers.{first_layer_idx}.{expert_sublayer}.experts.{eidx}.{proj}"
                     );
                     if let Some(shard_name) = index.weight_map.get(&tensor_name) {
                         if let Some(shard) = shards.get(shard_name) {
@@ -2152,7 +2382,7 @@ impl WeightStore {
 
         // Stream routed experts layer by layer
         for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
-            let layer_idx = moe_idx + config.first_k_dense_replace;
+            let layer_idx = config.moe_abs_layer(moe_idx);
             let layer_start = std::time::Instant::now();
 
             // Phase 1: Load expert weights
@@ -2170,8 +2400,23 @@ impl WeightStore {
             } else {
                 let mut data = Vec::with_capacity(config.n_routed_experts);
                 for eidx in 0..config.n_routed_experts {
-                    let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
-                    let (gate, up, down) = if prequantized {
+                    let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.experts.{eidx}");
+                    let (gate, up, down) = if !experts_gated {
+                        // Nemotron: ungated experts (no gate_proj, just up_proj + down_proj)
+                        if prequantized {
+                            let u = QuantWeight::Int4(load_prequantized_weight(
+                                &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                            )?);
+                            let d = QuantWeight::Int4(load_prequantized_weight(
+                                &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                            )?);
+                            (QuantWeight::empty(4), u, d)
+                        } else {
+                            load_and_quantize_expert_ungated(
+                                &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                            )?
+                        }
+                    } else if prequantized {
                         if gpu_bits == 8 {
                             // Pre-quantized INT4 → need to dequant and re-quantize as INT8
                             // For now, load BF16 and quantize fresh (fall through to non-prequant path)
@@ -2204,7 +2449,7 @@ impl WeightStore {
             // Prefetch next layer's data while we do CPU-bound Marlin repack
             let next_moe_idx = moe_idx + 1;
             if next_moe_idx < start_moe_layer + num_moe_layers {
-                let next_layer_idx = next_moe_idx + config.first_k_dense_replace;
+                let next_layer_idx = config.moe_abs_layer(next_moe_idx);
                 if stacked || mxfp4 {
                     let suffixes: &[&str] = if stacked {
                         &["gate_up_proj", "down_proj"]
@@ -2214,7 +2459,7 @@ impl WeightStore {
                     };
                     for suffix in suffixes {
                         let tensor_name = format!(
-                            "{layers_prefix}.layers.{next_layer_idx}.mlp.experts.{suffix}"
+                            "{layers_prefix}.layers.{next_layer_idx}.{expert_sublayer}.experts.{suffix}"
                         );
                         if let Some(shard_name) = index.weight_map.get(&tensor_name) {
                             if let Some(shard) = shards.get(shard_name) {
@@ -2223,7 +2468,14 @@ impl WeightStore {
                         }
                     }
                 } else {
-                    let proj_names: &[&str] = if prequantized {
+                    let proj_names: &[&str] = if !experts_gated {
+                        if prequantized {
+                            &["up_proj.weight_packed", "up_proj.weight_scale",
+                              "down_proj.weight_packed", "down_proj.weight_scale"]
+                        } else {
+                            &["up_proj.weight", "down_proj.weight"]
+                        }
+                    } else if prequantized {
                         &["gate_proj.weight_packed", "gate_proj.weight_scale",
                           "up_proj.weight_packed", "up_proj.weight_scale",
                           "down_proj.weight_packed", "down_proj.weight_scale"]
@@ -2233,7 +2485,7 @@ impl WeightStore {
                     for eidx in 0..config.n_routed_experts {
                         for proj in proj_names {
                             let tensor_name = format!(
-                                "{layers_prefix}.layers.{next_layer_idx}.mlp.experts.{eidx}.{proj}"
+                                "{layers_prefix}.layers.{next_layer_idx}.{expert_sublayer}.experts.{eidx}.{proj}"
                             );
                             if let Some(shard_name) = index.weight_map.get(&tensor_name) {
                                 if let Some(shard) = shards.get(shard_name) {
@@ -2293,13 +2545,19 @@ impl WeightStore {
         if config.n_shared_experts > 0 {
             let shared_name = detect_shared_expert_name(&index.weight_map);
             eprintln!("    GPU Marlin: writing shared experts...");
-            log::info!("Streaming shared experts ({} layers, naming='{}')...", num_moe_layers, shared_name);
+            log::info!("Streaming shared experts ({} layers, naming='{}', gated={})...", num_moe_layers, shared_name, experts_gated);
             for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
-                let layer_idx = moe_idx + config.first_k_dense_replace;
-                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.{shared_name}");
-                let (gate, up, down) = load_and_quantize_expert(
-                    &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
-                )?;
+                let layer_idx = config.moe_abs_layer(moe_idx);
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
+                let (gate, up, down) = if experts_gated {
+                    load_and_quantize_expert(
+                        &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                    )?
+                } else {
+                    load_and_quantize_expert_ungated(
+                        &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                    )?
+                };
                 let ew = ExpertWeights { gate, up, down };
                 let marlin = UnifiedExpertWeights::from_expert_weights_marlin(&ew, gpu_bits);
 
@@ -2566,7 +2824,7 @@ impl WeightStore {
         }
 
         // Validate file size
-        let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+        let shared_intermediate = config.shared_expert_intermediate_size;
         let expected = expected_marlin_cache_size(
             config, group_size, total_moe_layers, config.n_shared_experts, shared_intermediate, gpu_bits,
         );
@@ -2612,6 +2870,7 @@ impl WeightStore {
         for layer_idx in 0..num_layers_to_load {
             let (backing, layer_experts) = read_marlin_layer(
                 &mmap, &mut offset, h, m, group_size, gpu_bits, config.n_routed_experts,
+                config.experts_gated,
             );
             layer_backings_gpu.push(backing);
             experts_gpu.push(layer_experts);
@@ -2629,11 +2888,13 @@ impl WeightStore {
         let mut shared_experts_gpu = Vec::new();
         if config.n_shared_experts > 0 {
             let routed_total = total_moe_layers * per_routed_layer;
-            let shared_m = config.n_shared_experts * config.moe_intermediate_size;
+            let shared_m = config.shared_expert_intermediate_size;
+            let shared_gated = config.experts_gated;
             let div = if gpu_bits == 4 { 8 } else { 4 };
+            let w13_mul = if shared_gated { 2 } else { 1 };
             let (s_w13pb, s_w13sb, s_w2pb, s_w2sb) = (
-                (h / div) * (2 * shared_m) * 4,
-                (h / group_size) * (2 * shared_m) * 2,
+                (h / div) * (w13_mul * shared_m) * 4,
+                (h / group_size) * (w13_mul * shared_m) * 2,
                 (shared_m / div) * h * 4,
                 (shared_m / group_size) * h * 2,
             );
@@ -2644,7 +2905,7 @@ impl WeightStore {
 
             for _i in 0..num_layers_to_load {
                 shared_experts_gpu.push(
-                    read_marlin_expert(&mmap, &mut offset, h, shared_m, group_size, gpu_bits),
+                    read_marlin_expert_gated(&mmap, &mut offset, h, shared_m, group_size, gpu_bits, shared_gated),
                 );
             }
             log::info!("  Loaded {} shared experts (Marlin)", num_layers_to_load);
@@ -2718,12 +2979,14 @@ impl WeightStore {
             .map_err(|e| format!("Failed to parse safetensors index: {e}"))?;
 
         // Determine needed shards
-        let first_abs_layer = start_moe_layer + config.first_k_dense_replace;
-        let last_abs_layer = first_abs_layer + num_moe_layers;
+        // Collect absolute layer indices for all MoE layers we need
+        let moe_abs_layers: std::collections::HashSet<usize> = (start_moe_layer..(start_moe_layer + num_moe_layers))
+            .map(|mi| config.moe_abs_layer(mi))
+            .collect();
         let mut needed_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (tensor_name, shard_name) in &index.weight_map {
             if let Some(layer_num) = parse_layer_number(tensor_name) {
-                if layer_num >= first_abs_layer && layer_num < last_abs_layer {
+                if moe_abs_layers.contains(&layer_num) {
                     needed_shards.insert(shard_name.clone());
                 }
             }
@@ -2753,8 +3016,11 @@ impl WeightStore {
         let mxfp4 = is_mxfp4(&index.weight_map);
         let stacked = !mxfp4 && is_stacked_experts(&index.weight_map);
         let prequantized = !mxfp4 && !stacked && is_prequantized(&index.weight_map);
+        let experts_gated = has_gate_proj_experts(&index.weight_map);
+        let expert_sublayer = detect_expert_sublayer(&index.weight_map);
+        log::info!("CPU cache build: experts gated={experts_gated}, sublayer={expert_sublayer}");
         let effective_group_size = if prequantized {
-            let probe_layer = start_moe_layer + config.first_k_dense_replace;
+            let probe_layer = config.moe_abs_layer(start_moe_layer);
             let native_gs = detect_prequant_group_size(
                 &index.weight_map, &shards, &layers_prefix, probe_layer,
             )?;
@@ -2803,7 +3069,7 @@ impl WeightStore {
 
         // Stream routed experts layer by layer
         for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
-            let layer_idx = moe_idx + config.first_k_dense_replace;
+            let layer_idx = config.moe_abs_layer(moe_idx);
             let layer_start = std::time::Instant::now();
 
             // Phase 1: Sequential I/O — load expert weights from safetensors
@@ -2821,8 +3087,22 @@ impl WeightStore {
             } else {
                 let mut data = Vec::with_capacity(config.n_routed_experts);
                 for eidx in 0..config.n_routed_experts {
-                    let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.experts.{eidx}");
-                    let (gate, up, down) = if prequantized {
+                    let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.experts.{eidx}");
+                    let (gate, up, down) = if !experts_gated {
+                        if prequantized {
+                            let u = QuantWeight::Int4(load_prequantized_weight(
+                                &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                            )?);
+                            let d = QuantWeight::Int4(load_prequantized_weight(
+                                &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                            )?);
+                            (QuantWeight::empty(4), u, d)
+                        } else {
+                            load_and_quantize_expert_ungated(
+                                &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                            )?
+                        }
+                    } else if prequantized {
                         if cpu_num_bits != 4 {
                             return Err(format!(
                                 "CPU INT{cpu_num_bits} cache not supported for pre-quantized INT4 models (would need dequant+requant)"
@@ -2903,13 +3183,19 @@ impl WeightStore {
         if config.n_shared_experts > 0 {
             let shared_name = detect_shared_expert_name(&index.weight_map);
             eprintln!("    CPU INT{}: writing shared experts...", cpu_num_bits);
-            log::info!("Streaming shared experts for CPU cache ({} layers, naming='{}')...", num_moe_layers, shared_name);
+            log::info!("Streaming shared experts for CPU cache ({} layers, naming='{}', gated={})...", num_moe_layers, shared_name, experts_gated);
             for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
-                let layer_idx = moe_idx + config.first_k_dense_replace;
-                let prefix = format!("{layers_prefix}.layers.{layer_idx}.mlp.{shared_name}");
-                let (gate, up, down) = load_and_quantize_expert(
-                    &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
-                )?;
+                let layer_idx = config.moe_abs_layer(moe_idx);
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
+                let (gate, up, down) = if experts_gated {
+                    load_and_quantize_expert(
+                        &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                    )?
+                } else {
+                    load_and_quantize_expert_ungated(
+                        &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                    )?
+                };
                 let ew = ExpertWeights { gate, up, down };
                 let cpu_exp = if cpu_num_bits == 8 {
                     UnifiedExpertWeights::from_expert_weights_int8(&ew)
@@ -3030,7 +3316,7 @@ impl WeightStore {
         }
 
         // Validate file size
-        let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+        let shared_intermediate = config.shared_expert_intermediate_size;
         let expected = expected_cpu_cache_size(
             config, group_size, expected_bits, total_moe_layers,
             config.n_shared_experts, shared_intermediate,
@@ -3074,8 +3360,8 @@ impl WeightStore {
         for layer_idx in 0..num_layers_to_load {
             let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
             for _eidx in 0..config.n_routed_experts {
-                layer_experts.push(read_unified_expert_cpu(
-                    &mmap, &mut offset, h, m, group_size, expected_bits,
+                layer_experts.push(read_unified_expert_cpu_gated(
+                    &mmap, &mut offset, h, m, group_size, expected_bits, config.experts_gated,
                 ));
             }
             experts_cpu.push(layer_experts);
@@ -3093,20 +3379,22 @@ impl WeightStore {
         let mut shared_experts_cpu = Vec::new();
         if config.n_shared_experts > 0 {
             let routed_total = total_moe_layers * per_routed_layer;
-            let shared_m = config.n_shared_experts * config.moe_intermediate_size;
+            let shared_m = config.shared_expert_intermediate_size;
+            let shared_gated = config.experts_gated;
+            let w13_mul = if shared_gated { 2 } else { 1 };
             let (s_w13pb, s_w13sb, s_w2pb, s_w2sb) = if expected_bits == 4 {
                 (
-                    (h / 8) * (2 * shared_m) * 4,
-                    (h / group_size) * (2 * shared_m) * 2,
+                    (h / 8) * (w13_mul * shared_m) * 4,
+                    (h / group_size) * (w13_mul * shared_m) * 2,
                     (shared_m / 8) * h * 4,
                     (shared_m / group_size) * h * 2,
                 )
             } else {
-                let s_w13_bytes = h * (2 * shared_m);
+                let s_w13_bytes = h * (w13_mul * shared_m);
                 let s_w2_bytes = shared_m * h;
                 (
                     ((s_w13_bytes + 3) / 4) * 4,
-                    (h / group_size) * (2 * shared_m) * 2,
+                    (h / group_size) * (w13_mul * shared_m) * 2,
                     ((s_w2_bytes + 3) / 4) * 4,
                     (shared_m / group_size) * h * 2,
                 )
@@ -3118,7 +3406,7 @@ impl WeightStore {
 
             for _i in 0..num_layers_to_load {
                 shared_experts_cpu.push(
-                    read_unified_expert_cpu(&mmap, &mut offset, h, shared_m, group_size, expected_bits),
+                    read_unified_expert_cpu_gated(&mmap, &mut offset, h, shared_m, group_size, expected_bits, shared_gated),
                 );
             }
             log::info!("  Loaded {} shared experts (CPU INT{})", num_layers_to_load, expected_bits);
@@ -3167,7 +3455,7 @@ impl WeightStore {
             return Some(gs);
         }
 
-        let first_moe_layer = config.first_k_dense_replace;
+        let first_moe_layer = config.moe_abs_layer(0);
         let packed_name = format!(
             "{layers_prefix}.layers.{first_moe_layer}.mlp.experts.0.gate_proj.weight_packed"
         );
@@ -3333,13 +3621,12 @@ impl WeightStore {
             }
         }
 
-        let first_k = self.config.first_k_dense_replace;
         let num_cpu = self.experts_cpu.len();
         let num_gpu = self.experts_gpu.len();
         let mut attached_count = 0;
 
         for moe_idx in 0..std::cmp::max(num_cpu, num_gpu) {
-            let layer_idx = moe_idx + first_k;
+            let layer_idx = self.config.moe_abs_layer(moe_idx);
             let biases = match load_mxfp4_expert_biases(
                 layer_idx, &layers_prefix, &index.weight_map, &shards, &self.config,
             ) {
@@ -3454,7 +3741,7 @@ impl WeightStore {
             config.num_experts_per_tok, config.num_hidden_layers, cpu_num_bits,
         );
 
-        let total_moe_layers = config.num_hidden_layers - config.first_k_dense_replace;
+        let total_moe_layers = config.num_moe_layers();
         let moe_start = start_layer.unwrap_or(0);
         let remaining = total_moe_layers - moe_start;
         let num_moe_layers = match max_layers {
@@ -3605,7 +3892,7 @@ impl WeightStore {
             let n_experts = config.n_routed_experts;
 
             for moe_idx in moe_start..(moe_start + num_moe_layers) {
-                let abs_layer = moe_idx + config.first_k_dense_replace;
+                let abs_layer = config.moe_abs_layer(moe_idx);
                 let layer_start = std::time::Instant::now();
                 let mut layer_experts = Vec::with_capacity(n_experts);
 
@@ -3701,14 +3988,14 @@ impl WeightStore {
 
             // Load shared experts from GGUF (if present)
             if config.n_shared_experts > 0 {
-                let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+                let shared_intermediate = config.shared_expert_intermediate_size;
                 log::info!(
                     "Loading shared experts from GGUF: n_shared={}, intermediate={}",
                     config.n_shared_experts, shared_intermediate,
                 );
 
                 for moe_idx in moe_start..(moe_start + num_moe_layers) {
-                    let abs_layer = moe_idx + config.first_k_dense_replace;
+                    let abs_layer = config.moe_abs_layer(moe_idx);
 
                     if let Some((gate_name, up_name, down_name)) = gguf.find_shared_expert_tensors(abs_layer) {
                         let gate_info = gguf.tensors.get(&gate_name)
@@ -3797,7 +4084,7 @@ impl WeightStore {
         let mut gate_types = std::collections::BTreeSet::new();
         let mut down_types = std::collections::BTreeSet::new();
         for moe_idx in 0..total_moe_layers {
-            let abs_layer = moe_idx + config.first_k_dense_replace;
+            let abs_layer = config.moe_abs_layer(moe_idx);
             if merged {
                 let gate_name = format!("blk.{abs_layer}.ffn_gate_exps.weight");
                 let down_name = format!("blk.{abs_layer}.ffn_down_exps.weight");
@@ -3833,7 +4120,7 @@ impl WeightStore {
         for gt_name in &gate_types_str {
             // Find this type and check exactness
             for moe_idx in 0..total_moe_layers {
-                let abs_layer = moe_idx + config.first_k_dense_replace;
+                let abs_layer = config.moe_abs_layer(moe_idx);
                 let name = if merged {
                     format!("blk.{abs_layer}.ffn_gate_exps.weight")
                 } else {
@@ -3855,7 +4142,7 @@ impl WeightStore {
         }
         for dt_name in &down_types_str {
             for moe_idx in 0..total_moe_layers {
-                let abs_layer = moe_idx + config.first_k_dense_replace;
+                let abs_layer = config.moe_abs_layer(moe_idx);
                 let name = if merged {
                     format!("blk.{abs_layer}.ffn_down_exps.weight")
                 } else {
@@ -3902,7 +4189,7 @@ impl WeightStore {
 
         // Stream routed experts layer by layer
         for moe_idx in 0..total_moe_layers {
-            let abs_layer = moe_idx + config.first_k_dense_replace;
+            let abs_layer = config.moe_abs_layer(moe_idx);
             let layer_start = std::time::Instant::now();
 
             if merged {
@@ -4022,11 +4309,11 @@ impl WeightStore {
 
         // Stream shared experts
         if config.n_shared_experts > 0 {
-            let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+            let shared_intermediate = config.shared_expert_intermediate_size;
             log::info!("Streaming shared experts for GGUF cache ({} layers)...", total_moe_layers);
 
             for moe_idx in 0..total_moe_layers {
-                let abs_layer = moe_idx + config.first_k_dense_replace;
+                let abs_layer = config.moe_abs_layer(moe_idx);
 
                 if let Some((gate_name, up_name, down_name)) = gguf_file.find_shared_expert_tensors(abs_layer) {
                     let gate_info = gguf_file.tensors.get(&gate_name)
@@ -4151,7 +4438,7 @@ impl WeightStore {
         }
 
         // Validate file size
-        let shared_intermediate = config.n_shared_experts * config.moe_intermediate_size;
+        let shared_intermediate = config.shared_expert_intermediate_size;
         let expected = expected_gguf_cpu_cache_size(
             config, group_size, h_w13_bits, h_w2_bits,
             total_moe_layers, config.n_shared_experts, shared_intermediate,
@@ -4173,7 +4460,7 @@ impl WeightStore {
         let m = config.moe_intermediate_size;
 
         // Compute per-expert byte sizes
-        let (w13pb, w13sb, w2pb, w2sb) = cpu_expert_byte_sizes_mixed(h, m, group_size, h_w13_bits, h_w2_bits);
+        let (w13pb, w13sb, w2pb, w2sb) = cpu_expert_byte_sizes_mixed_gated(h, m, group_size, h_w13_bits, h_w2_bits, config.experts_gated);
         let per_routed_expert = w13pb + w13sb + w2pb + w2sb;
         let per_routed_layer = config.n_routed_experts * per_routed_expert;
 
@@ -4184,8 +4471,8 @@ impl WeightStore {
         for layer_idx in 0..num_layers_to_load {
             let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
             for _eidx in 0..config.n_routed_experts {
-                layer_experts.push(read_unified_expert_cpu_mixed(
-                    &mmap, &mut offset, h, m, group_size, h_w13_bits, h_w2_bits,
+                layer_experts.push(read_unified_expert_cpu_mixed_gated(
+                    &mmap, &mut offset, h, m, group_size, h_w13_bits, h_w2_bits, config.experts_gated,
                 ));
             }
             experts_cpu.push(layer_experts);
@@ -4202,8 +4489,8 @@ impl WeightStore {
         let mut shared_experts_cpu = Vec::new();
         if config.n_shared_experts > 0 {
             let routed_total = total_moe_layers * per_routed_layer;
-            let shared_m = config.n_shared_experts * config.moe_intermediate_size;
-            let (s13p, s13s, s2p, s2s) = cpu_expert_byte_sizes_mixed(h, shared_m, group_size, h_w13_bits, h_w2_bits);
+            let shared_m = config.shared_expert_intermediate_size;
+            let (s13p, s13s, s2p, s2s) = cpu_expert_byte_sizes_mixed_gated(h, shared_m, group_size, h_w13_bits, h_w2_bits, config.experts_gated);
             let per_shared = s13p + s13s + s2p + s2s;
 
             let shared_base = CACHE_HEADER_SIZE + routed_total + start_moe_layer * per_shared;
@@ -4211,7 +4498,7 @@ impl WeightStore {
 
             for _i in 0..num_layers_to_load {
                 shared_experts_cpu.push(
-                    read_unified_expert_cpu_mixed(&mmap, &mut offset, h, shared_m, group_size, h_w13_bits, h_w2_bits),
+                    read_unified_expert_cpu_mixed_gated(&mmap, &mut offset, h, shared_m, group_size, h_w13_bits, h_w2_bits, config.experts_gated),
                 );
             }
             log::info!("  Loaded {} shared experts (GGUF→AVX2)", num_layers_to_load);
@@ -4421,13 +4708,14 @@ fn read_marlin_layer(
     group_size: usize,
     gpu_bits: u8,
     n_experts: usize,
+    gated: bool,
 ) -> (LayerExpertBacking, Vec<UnifiedExpertWeights>) {
     let h = hidden_size;
     let m = intermediate_size;
     let div = if gpu_bits == 4 { 8 } else { 4 };
     let packed_k = h / div;
     let num_groups = h / group_size;
-    let two_n = 2 * m;
+    let two_n = if gated { 2 * m } else { m };
     let h_w2 = marlin_w2_padded_n(h, m);
     let down_packed_k = m / div;
     let down_num_groups = m / group_size;
@@ -4527,6 +4815,8 @@ fn read_marlin_layer(
             up_bias: None,
             down_bias: None,
             tiled: false,
+            gated,
+            activation_type: if gated { 0 } else { 1 },
             contiguous_backing: None,
             borrowed: true,
         });
@@ -4545,12 +4835,25 @@ fn read_marlin_expert(
     group_size: usize,
     gpu_bits: u8,
 ) -> UnifiedExpertWeights {
+    read_marlin_expert_gated(data, offset, hidden_size, intermediate_size, group_size, gpu_bits, true)
+}
+
+/// Like read_marlin_expert but with explicit gated flag for ungated (relu2) experts.
+fn read_marlin_expert_gated(
+    data: &[u8],
+    offset: &mut usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    group_size: usize,
+    gpu_bits: u8,
+    gated: bool,
+) -> UnifiedExpertWeights {
     let h = hidden_size;
     let m = intermediate_size;
     let div = if gpu_bits == 4 { 8 } else { 4 }; // pack divisor
     let packed_k = h / div;
     let num_groups = h / group_size;
-    let two_n = 2 * m;
+    let two_n = if gated { 2 * m } else { m };
 
     // Compute byte sizes per component
     let w13_packed_bytes = packed_k * two_n * 4;
@@ -4636,6 +4939,8 @@ fn read_marlin_expert(
         up_bias: None,
         down_bias: None,
         tiled: false,
+        gated,
+        activation_type: if gated { 0 } else { 1 },
         contiguous_backing: Some(backing),
         borrowed: false,
     }
@@ -4651,9 +4956,21 @@ fn read_unified_expert_cpu(
     group_size: usize,
     num_bits: u8,
 ) -> UnifiedExpertWeights {
+    read_unified_expert_cpu_gated(data, offset, hidden_size, intermediate_size, group_size, num_bits, true)
+}
+
+fn read_unified_expert_cpu_gated(
+    data: &[u8],
+    offset: &mut usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    group_size: usize,
+    num_bits: u8,
+    gated: bool,
+) -> UnifiedExpertWeights {
     let h = hidden_size;
     let m = intermediate_size;
-    let two_n = 2 * m;
+    let two_n = if gated { 2 * m } else { m };
     let num_groups = h / group_size;
 
     let (w13_packed_count, w2_packed_count) = if num_bits == 4 {
@@ -4725,6 +5042,8 @@ fn read_unified_expert_cpu(
         up_bias: None,
         down_bias: None,
         tiled: false,
+        gated,
+        activation_type: if gated { 0 } else { 1 },
         contiguous_backing: None,
         borrowed: false,
     }
@@ -4741,9 +5060,22 @@ fn read_unified_expert_cpu_mixed(
     w13_bits: u8,
     w2_bits: u8,
 ) -> UnifiedExpertWeights {
+    read_unified_expert_cpu_mixed_gated(data, offset, hidden_size, intermediate_size, group_size, w13_bits, w2_bits, true)
+}
+
+fn read_unified_expert_cpu_mixed_gated(
+    data: &[u8],
+    offset: &mut usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    group_size: usize,
+    w13_bits: u8,
+    w2_bits: u8,
+    gated: bool,
+) -> UnifiedExpertWeights {
     let h = hidden_size;
     let m = intermediate_size;
-    let two_n = 2 * m;
+    let two_n = if gated { 2 * m } else { m };
     let num_groups = h / group_size;
 
     // w13 packed size depends on w13_bits
@@ -4817,6 +5149,8 @@ fn read_unified_expert_cpu_mixed(
         up_bias: None,
         down_bias: None,
         tiled: false,
+        gated,
+        activation_type: if gated { 0 } else { 1 },
         contiguous_backing: None,
         borrowed: false,
     }
@@ -4980,7 +5314,8 @@ fn detect_physical_cores() -> usize {
 fn detect_expert_prefix(weight_map: &HashMap<String, String>) -> Result<String, String> {
     for key in weight_map.keys() {
         if let Some(pos) = key.find(".layers.") {
-            if key.contains(".mlp.experts.") {
+            // Standard MoE: .mlp.experts.  Nemotron: .mixer.experts.
+            if key.contains(".mlp.experts.") || key.contains(".mixer.experts.") {
                 let prefix = &key[..pos];
                 // Skip MTP (multi-token prediction) weights — not real model layers
                 if prefix == "mtp" || prefix.ends_with(".mtp") {
@@ -4993,14 +5328,34 @@ fn detect_expert_prefix(weight_map: &HashMap<String, String>) -> Result<String, 
     Err("Could not detect expert weight prefix from safetensors index".to_string())
 }
 
+/// Detect expert sublayer: "mlp" (standard) or "mixer" (Nemotron).
+fn detect_expert_sublayer(weight_map: &HashMap<String, String>) -> &'static str {
+    for key in weight_map.keys() {
+        if key.contains(".mixer.experts.") {
+            return "mixer";
+        }
+    }
+    "mlp"
+}
+
+/// Check if experts have gate_proj (standard gated MoE) or just up_proj (Nemotron).
+fn has_gate_proj_experts(weight_map: &HashMap<String, String>) -> bool {
+    for key in weight_map.keys() {
+        if key.contains(".experts.") && key.contains("gate_proj") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Detect shared expert naming: "shared_experts" (DeepSeek) vs "shared_expert" (QCN).
 /// Returns the substring to use in weight name construction.
 fn detect_shared_expert_name(weight_map: &HashMap<String, String>) -> &'static str {
     for key in weight_map.keys() {
-        if key.contains(".mlp.shared_experts.") {
+        if key.contains(".mlp.shared_experts.") || key.contains(".mixer.shared_experts.") {
             return "shared_experts";
         }
-        if key.contains(".mlp.shared_expert.") {
+        if key.contains(".mlp.shared_expert.") || key.contains(".mixer.shared_expert.") {
             return "shared_expert";
         }
     }
@@ -5505,6 +5860,54 @@ fn load_and_quantize_expert(
     }
 }
 
+/// Load and quantize an ungated expert (no gate_proj, just up_proj + down_proj).
+/// Returns (gate=empty, up, down) tuple compatible with ExpertWeights.
+fn load_and_quantize_expert_ungated(
+    prefix: &str,
+    weight_map: &HashMap<String, String>,
+    shards: &HashMap<String, MmapSafetensors>,
+    group_size: usize,
+    num_bits: u8,
+) -> Result<(QuantWeight, QuantWeight, QuantWeight), String> {
+    if num_bits == 4 {
+        let u = QuantWeight::Int4(load_and_quantize_weight(
+            prefix, "up_proj", weight_map, shards, group_size,
+        )?);
+        let d = QuantWeight::Int4(load_and_quantize_weight(
+            prefix, "down_proj", weight_map, shards, group_size,
+        )?);
+        Ok((QuantWeight::empty(4), u, d))
+    } else {
+        let load_int8 = |proj_name: &str| -> Result<QuantWeight, String> {
+            let tensor_name = format!("{prefix}.{proj_name}.weight");
+            let shard_name = weight_map.get(&tensor_name)
+                .ok_or_else(|| format!("Tensor not found in index: {tensor_name}"))?;
+            let shard = shards.get(shard_name)
+                .ok_or_else(|| format!("Shard not loaded: {shard_name}"))?;
+            let info = shard.tensor_info(&tensor_name)
+                .ok_or_else(|| format!("Tensor not in shard: {tensor_name}"))?;
+            let rows = info.shape[0];
+            let cols = info.shape[1];
+            if info.dtype.is_fp8() {
+                let fp8_data: &[u8] = shard.tensor_as_slice(&tensor_name)
+                    .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+                let scale_name = format!("{tensor_name}_scale_inv");
+                let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
+                let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
+                Ok(QuantWeight::Int8(quantize_int8(&bf16_data, rows, cols, group_size)))
+            } else {
+                let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
+                    .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+                Ok(QuantWeight::Int8(quantize_int8(bf16_data, rows, cols, group_size)))
+            }
+        };
+
+        let u = load_int8("up_proj")?;
+        let d = load_int8("down_proj")?;
+        Ok((QuantWeight::empty(8), u, d))
+    }
+}
+
 /// Load a per-tensor FP8 scale_inv value. Handles both BF16 scalar and FP32 scalar formats.
 fn load_fp8_scale(
     scale_name: &str,
@@ -5762,7 +6165,7 @@ mod tests {
         assert!(mpath.exists(), "Marlin cache file should exist after load");
 
         let size = std::fs::metadata(&mpath).unwrap().len();
-        let shared_intermediate = store.config.n_shared_experts * store.config.moe_intermediate_size;
+        let shared_intermediate = store.config.shared_expert_intermediate_size;
         let expected = expected_marlin_cache_size(
             &store.config, store.group_size, store.num_moe_layers(),
             store.config.n_shared_experts, shared_intermediate, 4,
@@ -5865,6 +6268,36 @@ mod tests {
         // No shared experts in Qwen3
         assert_eq!(config.n_shared_experts, 0);
         assert_eq!(config.routed_scaling_factor, 1.0);
+        // All layers are MoE → indices 0..94
+        assert_eq!(config.num_moe_layers(), 94);
+        assert_eq!(config.moe_abs_layer(0), 0);
+        assert_eq!(config.moe_abs_layer(93), 93);
+    }
+
+    #[test]
+    fn test_config_nemotron_hybrid() {
+        let json: serde_json::Value = serde_json::from_str(r#"{
+            "hidden_size": 2688,
+            "moe_intermediate_size": 2688,
+            "num_local_experts": 128,
+            "num_experts_per_tok": 6,
+            "num_hidden_layers": 52,
+            "n_shared_experts": 1,
+            "hybrid_override_pattern": "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+        }"#).unwrap();
+        let config = ModelConfig::from_json(&json).unwrap();
+        assert_eq!(config.hidden_size, 2688);
+        assert_eq!(config.num_hidden_layers, 52);
+        assert_eq!(config.n_routed_experts, 128);
+        // 23 MoE layers from the hybrid pattern
+        assert_eq!(config.num_moe_layers(), 23);
+        // First MoE is at position 1 (second character 'E')
+        assert_eq!(config.moe_abs_layer(0), 1);
+        // Last MoE is at position 51
+        assert_eq!(config.moe_abs_layer(22), 51);
+        // Non-contiguous: positions 1, 3, 6, ...
+        assert_eq!(config.moe_abs_layer(1), 3);
+        assert_eq!(config.moe_abs_layer(2), 6);
     }
 
     #[test]

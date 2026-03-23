@@ -192,7 +192,9 @@ pub fn expert_forward_unified(
 ) {
     let k = expert.hidden_size;
     let n = expert.intermediate_size;
-    let two_n = 2 * n;
+    // Gated experts: w13 = [gate|up] → output size 2*N
+    // Ungated experts (Nemotron relu2): w13 = [up] → output size N
+    let w13_out_n = if expert.gated { 2 * n } else { n };
     let gs = expert.group_size;
 
     // Dispatch based on weight precision and tiling
@@ -207,7 +209,7 @@ pub fn expert_forward_unified(
                 &expert.w13_packed, &expert.w13_scales,
                 act_int16, act_scales,
                 &mut scratch.w13_out,
-                k, two_n, gs,
+                k, w13_out_n, gs,
             );
         }
         (4, false) => {
@@ -220,7 +222,7 @@ pub fn expert_forward_unified(
                 &expert.w13_packed, &expert.w13_scales,
                 act_int16, act_scales,
                 &mut scratch.w13_out,
-                k, two_n, gs,
+                k, w13_out_n, gs,
             );
         }
         (8, true) => {
@@ -233,7 +235,7 @@ pub fn expert_forward_unified(
                 &expert.w13_packed, &expert.w13_scales,
                 act_int16, act_scales,
                 &mut scratch.w13_out,
-                k, two_n, gs,
+                k, w13_out_n, gs,
             );
         }
         (8, false) => {
@@ -246,11 +248,27 @@ pub fn expert_forward_unified(
                 &expert.w13_packed, &expert.w13_scales,
                 act_int16, act_scales,
                 &mut scratch.w13_out,
-                k, two_n, gs,
+                k, w13_out_n, gs,
             );
         }
         _ => panic!("Unsupported num_bits: {}", expert.num_bits),
     }
+
+    // Ungated relu2 activation (Nemotron): relu(x)^2, then quantize
+    if expert.activation_type == 1 {
+        for i in 0..n {
+            let x = scratch.w13_out[i];
+            scratch.w13_out[i] = if x > 0.0 { x * x } else { 0.0 };
+        }
+        quantize_activation_int16_f32(
+            &scratch.w13_out[..n],
+            gs,
+            &mut scratch.hidden_int16,
+            &mut scratch.hidden_scales,
+        );
+    }
+    // Gated activations below (standard MoE)
+    else {
 
     // Apply gate/up biases if present (GPT OSS)
     if let Some(ref gate_bias) = expert.gate_bias {
@@ -312,6 +330,8 @@ pub fn expert_forward_unified(
             &mut scratch.hidden_scales,
         );
     }
+
+    } // end of gated activation else block
 
     // w2 matmul: expert_out[hidden_size] = hidden[N] @ w2[N, hidden_size]
     // Use w2_bits (may differ from num_bits for mixed-precision GGUF sources)
@@ -1714,7 +1734,7 @@ impl KrasisEngine {
                     let h = config.hidden_size as f64;
                     let m = config.moe_intermediate_size as f64;
                     let n_exp = config.n_routed_experts as f64;
-                    let total_moe = config.num_hidden_layers - config.first_k_dense_replace;
+                    let total_moe = config.num_moe_layers();
                     let start_l = start_layer.unwrap_or(0);
                     let remaining = total_moe.saturating_sub(start_l);
                     let num_layers = max_layers.map_or(remaining, |n| n.min(remaining));

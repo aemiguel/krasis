@@ -1,0 +1,41 @@
+{
+  "atol": 0.05,
+  "rtol": 0.05,
+  "note": "FP8 E4M3 round-trip M=1000 D=128. Tests quantization bounds, not exact match.",
+  "inputs": {
+    "k": {
+      "file": "input_k.bin",
+      "shape": [
+        1000,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "v": {
+      "file": "input_v.bin",
+      "shape": [
+        1000,
+        128
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "k_roundtrip": {
+      "file": "expected_k_roundtrip.bin",
+      "shape": [
+        1000,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "v_roundtrip": {
+      "file": "expected_v_roundtrip.bin",
+      "shape": [
+        1000,
+        128
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

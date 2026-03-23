@@ -144,7 +144,7 @@ def _estimate_expert_ram_gb(cfg, cpu_expert_bits: int = 4, group_size: int = 128
     m = cfg.moe_intermediate_size  # N for w13, K_down for w2
     gs = group_size
     n_experts = cfg.n_routed_experts
-    num_moe_layers = cfg.num_hidden_layers - cfg.first_k_dense_replace
+    num_moe_layers = cfg.num_moe_layers
 
     if cpu_expert_bits == 4:
         # w13 packed: (h//8) * 2*m * 4 bytes, w13 scales: (h//gs) * 2*m * 2 bytes
@@ -319,17 +319,35 @@ def _compute_layer_groups(
     first_k = cfg.first_k_dense_replace
     all_layers = list(range(rank.layer_start, rank.layer_end))
 
-    # Separate dense and MoE layers within this rank
-    dense_layers = [l for l in all_layers if l < first_k]
-    moe_layers = [l for l in all_layers if l >= first_k]
+    # Build abs_layer → moe_index mapping for hybrid models
+    # For standard models: MoE layers are first_k..N, so moe_idx = l - first_k
+    # For hybrid (Nemotron): MoE layers are scattered, need sequential mapping
+    if cfg.layer_types is not None:
+        _abs_to_moe = {}
+        _moe_seq = 0
+        for i, lt in enumerate(cfg.layer_types):
+            if lt == "moe":
+                _abs_to_moe[i] = _moe_seq
+                _moe_seq += 1
+        dense_layers = [l for l in all_layers if l not in _abs_to_moe]
+        moe_layers = [l for l in all_layers if l in _abs_to_moe]
+    else:
+        _abs_to_moe = None
+        dense_layers = [l for l in all_layers if l < first_k]
+        moe_layers = [l for l in all_layers if l >= first_k]
 
     if not moe_layers:
         # All dense layers — single group, no experts
         return [(all_layers, [])]
 
+    def _to_moe_idx(abs_layer):
+        if _abs_to_moe is not None:
+            return _abs_to_moe[abs_layer]
+        return abs_layer - first_k
+
     # Active-only or single group: all layers in one group
     if divisor <= 1:
-        moe_indices = [l - first_k for l in moe_layers]
+        moe_indices = [_to_moe_idx(l) for l in moe_layers]
         return [(all_layers, moe_indices)]
 
     # Split MoE layers into groups
@@ -343,13 +361,20 @@ def _compute_layer_groups(
         if start >= num_moe:
             break
         group_moe = moe_layers[start:end]
-        group_moe_indices = [l - first_k for l in group_moe]
+        group_moe_indices = [_to_moe_idx(l) for l in group_moe]
 
-        if g == 0:
-            # Dense layers go in the first group
+        if _abs_to_moe is not None:
+            # Hybrid model: include interleaved non-MoE layers in correct position.
+            # Each group spans from first_moe to last_moe (inclusive), plus any
+            # non-MoE layers before the first group or between groups.
+            range_start = 0 if g == 0 else group_moe[0]
+            range_end = group_moe[-1] + 1
+            group_all = [l for l in all_layers if range_start <= l < range_end]
+        elif g == 0:
+            # Standard model: dense layers go in the first group
             group_all = dense_layers + group_moe
         else:
-            group_all = group_moe
+            group_all = list(group_moe)
 
         groups.append((group_all, group_moe_indices))
 
@@ -462,9 +487,9 @@ class KrasisModel:
         devices: Optional[List[str]] = None,
         kv_dtype: torch.dtype = torch.float8_e4m3fn,
         krasis_threads: int = 40,
-        gpu_prefill: bool = True,
+        gpu_prefill: bool = False,  # Rust prefill replaces Python GpuPrefillManager
         gpu_prefill_threshold: int = 300,
-        attention_backend: str = "flashinfer",  # "flashinfer" or "trtllm"
+        attention_backend: str = "rust",  # "rust" (Rust prefill) or "trtllm" (unsupported)
         quant_cfg: QuantConfig = None,
         force_load: bool = False,
         layer_group_size: int = 1,
@@ -568,6 +593,20 @@ class KrasisModel:
         # For hybrid models: maps absolute layer idx → KV cache layer offset
         # within its device's cache. Linear attention layers get -1 (no KV).
         self._kv_layer_offsets: dict = {}  # layer_idx -> offset or -1
+
+        # Maps absolute layer index → 0-based MoE sequential index.
+        # For standard models: moe_idx = abs_layer - first_k_dense_replace
+        # For hybrid (Nemotron): MoE layers are scattered, this provides the mapping.
+        self._abs_to_moe_idx: dict = {}
+        if self.cfg.layer_types is not None:
+            moe_seq = 0
+            for i, lt in enumerate(self.cfg.layer_types):
+                if lt == "moe":
+                    self._abs_to_moe_idx[i] = moe_seq
+                    moe_seq += 1
+        else:
+            for i in range(self.cfg.first_k_dense_replace, self.cfg.num_hidden_layers):
+                self._abs_to_moe_idx[i] = i - self.cfg.first_k_dense_replace
 
         # Detect shared_expert_gate from weight map (Qwen3-Next)
         self._has_shared_expert_gate = self._detect_shared_expert_gate()
@@ -761,43 +800,40 @@ class KrasisModel:
 
             # ── 2. Triton/Marlin JIT Compilation ──
             try:
-                K, N, gs, bits = self.cfg.hidden_size, self.cfg.moe_intermediate_size, 128, 4
+                K, N, bits = self.cfg.hidden_size, self.cfg.moe_intermediate_size, 4
+                # Match the group_size auto-adjustment in the Rust cache builder
+                gs = 128
+                if K % gs != 0 or N % gs != 0:
+                    gs = 64
                 nb2 = bits // 2
                 n_dummy = 2
+                # Gated (silu): w13 width = 2*N (gate+up), ungated (relu2): w13 width = N (up only)
+                gated = self.cfg.mlp_hidden_act != "relu2"
+                w13_n = 2 * N if gated else N
 
                 if is_primary:
-                    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
-                    from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+                    # Fused MoE warmup no longer needed — Rust prefill dlopens
+                    # the vendored MarlinDefault kernel directly from libkrasis_marlin.so.
+                    # Just warm up the vendored Marlin GEMM via a small dummy call.
+                    from krasis.marlin_utils import gptq_marlin_gemm, marlin_make_workspace, get_scalar_type
                     ws = marlin_make_workspace(device, max_blocks_per_sm=4)
-                    # w1 (gate+up): [E, K//16, 2*N*nb2], scale: [E, K//gs, 2*N]
-                    w1 = torch.zeros(n_dummy, K // 16, 2 * N * nb2, dtype=torch.int32, device=device)
-                    w1s = torch.zeros(n_dummy, K // gs, 2 * N, dtype=torch.bfloat16, device=device)
-                    # w2 (down): [E, N//16, K*nb2], scale: [E, N//gs, K]
-                    w2 = torch.zeros(n_dummy, N // 16, K * nb2, dtype=torch.int32, device=device)
-                    w2s = torch.zeros(n_dummy, N // gs, K, dtype=torch.bfloat16, device=device)
-                    x = torch.zeros(1, K, dtype=torch.bfloat16, device=device)
-                    g = torch.empty(1, n_dummy, device=device)
-                    tw = torch.zeros(1, 1, dtype=torch.float32, device=device)
-                    ti = torch.zeros(1, 1, dtype=torch.int32, device=device)
-                    fused_marlin_moe(
-                        hidden_states=x, w1=w1, w2=w2,
-                        w1_scale=w1s, w2_scale=w2s,
-                        gating_output=g, topk_weights=tw, topk_ids=ti,
-                        global_num_experts=n_dummy, expert_map=None,
-                        g_idx1=torch.empty(n_dummy, 0, dtype=torch.int32, device=device),
-                        g_idx2=torch.empty(n_dummy, 0, dtype=torch.int32, device=device),
-                        sort_indices1=torch.empty(n_dummy, 0, dtype=torch.int32, device=device),
-                        sort_indices2=torch.empty(n_dummy, 0, dtype=torch.int32, device=device),
-                        w1_zeros=None, w2_zeros=None,
-                        workspace=ws, num_bits=bits, is_k_full=True,
+                    st = get_scalar_type(bits)
+                    dummy_a = torch.zeros(1, K, dtype=torch.bfloat16, device=device)
+                    dummy_b = torch.zeros(K // 16, N * (bits // 2), dtype=torch.int32, device=device)
+                    dummy_s = torch.zeros(K // gs, N, dtype=torch.bfloat16, device=device)
+                    gptq_marlin_gemm(
+                        a=dummy_a, c=None, b_q_weight=dummy_b, b_scales=dummy_s,
+                        global_scale=None, b_zeros=None, g_idx=None, perm=None,
+                        workspace=ws, b_q_type=st, size_m=1, size_n=N, size_k=K,
+                        is_k_full=True,
                     )
                     torch.cuda.synchronize(device)
                 else:
                     # Warm up the Triton kernel with dummy standard-GPTQ data
-                    w13_marlin = torch.zeros(n_dummy, K // 16, 2 * N * nb2, dtype=torch.int32)
-                    w13s_marlin = torch.zeros(n_dummy, K // gs, 2 * N, dtype=torch.bfloat16)
-                    w13_std = inverse_marlin_repack(w13_marlin, K, 2*N, bits).to(device)
-                    w13s_std = inverse_scale_permute(w13s_marlin, K, 2*N, gs).to(device)
+                    w13_marlin = torch.zeros(n_dummy, K // 16, w13_n * nb2, dtype=torch.int32)
+                    w13s_marlin = torch.zeros(n_dummy, K // gs, w13_n, dtype=torch.bfloat16)
+                    w13_std = inverse_marlin_repack(w13_marlin, K, w13_n, bits).to(device)
+                    w13s_std = inverse_scale_permute(w13s_marlin, K, w13_n, gs).to(device)
                     # w2 (down projection) has different dimensions: input=N, output=K
                     w2_marlin = torch.zeros(n_dummy, N // 16, K * nb2, dtype=torch.int32)
                     w2s_marlin = torch.zeros(n_dummy, N // gs, K, dtype=torch.bfloat16)
@@ -883,7 +919,11 @@ class KrasisModel:
 
         # ── Attention weights ──
         attn = layer.attention
-        if layer.layer_type == "linear_attention":
+        if layer.layer_type == "mamba2":
+            result["mamba2"] = layer.mamba2_weights
+        elif layer.layer_type == "moe" and attn is None:
+            pass  # MoE-only layer, no attention weights
+        elif layer.layer_type == "linear_attention":
             result["linear_attention"] = {
                 "in_proj_qkvz": attn.in_proj_qkvz,
                 "in_proj_ba": attn.in_proj_ba,
@@ -932,25 +972,33 @@ class KrasisModel:
             if layer.e_score_correction_bias is not None:
                 result["gate"]["e_score_correction_bias"] = layer.e_score_correction_bias
             if layer.shared_expert is not None:
-                # Reconstruct original gate_proj/up_proj from fused gate_up_proj
                 se = {}
-                gate_up = layer.shared_expert["gate_up_proj"]
-                if isinstance(gate_up, tuple):
-                    # INT8: split (weight, scale) along dim 0
-                    mid_w = gate_up[0].shape[0] // 2
-                    mid_s = gate_up[1].shape[0] // 2
-                    se["gate_proj"] = (gate_up[0][:mid_w], gate_up[1][:mid_s])
-                    se["up_proj"] = (gate_up[0][mid_w:], gate_up[1][mid_s:])
+                if "gate_up_proj" in layer.shared_expert:
+                    # Standard MoE: reconstruct original gate_proj/up_proj from fused gate_up_proj
+                    gate_up = layer.shared_expert["gate_up_proj"]
+                    if isinstance(gate_up, tuple):
+                        # INT8: split (weight, scale) along dim 0
+                        mid_w = gate_up[0].shape[0] // 2
+                        mid_s = gate_up[1].shape[0] // 2
+                        se["gate_proj"] = (gate_up[0][:mid_w], gate_up[1][:mid_s])
+                        se["up_proj"] = (gate_up[0][mid_w:], gate_up[1][mid_s:])
+                    else:
+                        mid = gate_up.shape[0] // 2
+                        se["gate_proj"] = gate_up[:mid]
+                        se["up_proj"] = gate_up[mid:]
                 else:
-                    mid = gate_up.shape[0] // 2
-                    se["gate_proj"] = gate_up[:mid]
-                    se["up_proj"] = gate_up[mid:]
+                    # Nemotron MoE: up_proj + down_proj only (no gate_proj)
+                    se["up_proj"] = layer.shared_expert["up_proj"]
                 se["down_proj"] = layer.shared_expert["down_proj"]
                 if layer.shared_expert_gate is not None:
                     se["shared_expert_gate"] = layer.shared_expert_gate
                 result["shared_expert"] = se
         elif layer.dense_mlp is not None:
             result["dense_mlp"] = dict(layer.dense_mlp)
+
+        # ── Latent MoE projections (Nemotron) ──
+        if hasattr(layer, 'latent_proj') and layer.latent_proj is not None:
+            result["latent_proj"] = dict(layer.latent_proj)
 
         return result
 
@@ -1019,9 +1067,14 @@ class KrasisModel:
                 )
                 # Extract attention weights to CPU, null GPU refs
                 w = self._extract_layer_weights(layer, layer.device)
-                attn_key = "linear_attention" if layer.layer_type == "linear_attention" else "attention"
+                if layer.layer_type == "linear_attention":
+                    attn_key = "linear_attention"
+                elif layer.layer_type == "mamba2":
+                    attn_key = "mamba2"
+                else:
+                    attn_key = "attention"
                 attn_dict = w.get(attn_key, {})
-                cpu_attn = self._copy_weights_dict(attn_dict, 'cpu')
+                cpu_attn = self._copy_weights_dict(attn_dict, 'cpu') if attn_dict else {}
                 # Store for _init_stream_attention to pin later
                 self._attn_cpu_weights[layer_idx] = {
                     "norms": w["norms"],
@@ -1035,15 +1088,18 @@ class KrasisModel:
                     self._attn_cpu_weights[layer_idx]["shared_expert"] = w["shared_expert"]
                 if "dense_mlp" in w:
                     self._attn_cpu_weights[layer_idx]["dense_mlp"] = w["dense_mlp"]
+                if "latent_proj" in w:
+                    self._attn_cpu_weights[layer_idx]["latent_proj"] = w["latent_proj"]
                 # Null attention on GPU (keep norms/gate/shared — already on GPU)
                 attn = layer.attention
-                for attr_name in list(vars(attn).keys()):
-                    val = getattr(attn, attr_name, None)
-                    if isinstance(val, torch.Tensor) and val.device.type == 'cuda':
-                        setattr(attn, attr_name, None)
-                    elif isinstance(val, tuple) and len(val) == 2:
-                        if all(isinstance(t, torch.Tensor) for t in val):
+                if attn is not None:
+                    for attr_name in list(vars(attn).keys()):
+                        val = getattr(attn, attr_name, None)
+                        if isinstance(val, torch.Tensor) and val.device.type == 'cuda':
                             setattr(attn, attr_name, None)
+                        elif isinstance(val, tuple) and len(val) == 2:
+                            if all(isinstance(t, torch.Tensor) for t in val):
+                                setattr(attn, attr_name, None)
                 self.layers.append(layer)
                 if (layer_idx + 1) % 10 == 0 or layer_idx == L - 1:
                     torch.cuda.empty_cache()
@@ -1109,20 +1165,23 @@ class KrasisModel:
         total = 0
         for layer in self.layers:
             # Norms
-            total += layer.input_norm_weight.nelement() * layer.input_norm_weight.element_size()
-            total += layer.post_attn_norm_weight.nelement() * layer.post_attn_norm_weight.element_size()
+            if layer.input_norm_weight is not None:
+                total += layer.input_norm_weight.nelement() * layer.input_norm_weight.element_size()
+            if layer.post_attn_norm_weight is not None:
+                total += layer.post_attn_norm_weight.nelement() * layer.post_attn_norm_weight.element_size()
 
-            # Attention weights
+            # Attention weights (skip Mamba2/MoE-only layers which have no attention)
             attn = layer.attention
-            for attr_name in dir(attn):
-                val = getattr(attn, attr_name, None)
-                if isinstance(val, torch.Tensor) and val.device.type == 'cuda':
-                    total += val.nelement() * val.element_size()
-                elif isinstance(val, tuple) and len(val) == 2:
-                    # INT8 (weight, scale) tuple
-                    for t in val:
-                        if isinstance(t, torch.Tensor) and t.device.type == 'cuda':
-                            total += t.nelement() * t.element_size()
+            if attn is not None:
+                for attr_name in dir(attn):
+                    val = getattr(attn, attr_name, None)
+                    if isinstance(val, torch.Tensor) and val.device.type == 'cuda':
+                        total += val.nelement() * val.element_size()
+                    elif isinstance(val, tuple) and len(val) == 2:
+                        # INT8 (weight, scale) tuple
+                        for t in val:
+                            if isinstance(t, torch.Tensor) and t.device.type == 'cuda':
+                                total += t.nelement() * t.element_size()
 
             # Gate weights + shared expert (MoE layers)
             if layer.is_moe:
@@ -1613,7 +1672,7 @@ class KrasisModel:
         )
 
         # ── Send routing weights to Rust for fused routing+MoE (M=1 decode) ──
-        num_moe_layers = self.cfg.num_hidden_layers - self.cfg.first_k_dense_replace
+        num_moe_layers = self.cfg.num_moe_layers
         engine.set_routing_config(
             scoring_func=self.cfg.scoring_func,
             norm_topk_prob=self.cfg.norm_topk_prob,
@@ -1640,15 +1699,17 @@ class KrasisModel:
         logger.info("Routing weights sent to Rust engine (%d MoE layers)", moe_idx)
 
     def _init_gpu_prefill(self):
-        """Create GpuPrefillManager for primary GPU only.
-
-        In multi-GPU mode, prefill runs exclusively on the primary GPU (most VRAM).
-        Aux GPUs are only used for decode (layer-split with HCS).
+        """DEPRECATED: Python GPU prefill has been replaced by Rust prefill engine.
+        This method is a no-op. Left as a stub for compatibility with
+        any code that calls it (guarded by gpu_prefill_enabled=False).
         """
-        from krasis.gpu_prefill import GpuPrefillManager
+        raise NotImplementedError(
+            "Python GpuPrefillManager has been removed. "
+            "Prefill is now handled by the Rust prefill engine."
+        )
 
         engine_ref = getattr(self, 'krasis_engine', None)
-        num_moe_layers = self.cfg.num_hidden_layers - self.cfg.first_k_dense_replace
+        num_moe_layers = self.cfg.num_moe_layers
         # Only create prefill manager for primary GPU — aux GPUs are decode-only
         prefill_devices = [self.all_devices[0]]
         num_ranks = 1
@@ -1675,7 +1736,11 @@ class KrasisModel:
                     rank=i,
                     num_ranks=num_ranks,
                     num_experts_per_tok=self.cfg.num_experts_per_tok,
+                    shared_expert_intermediate_size=self.cfg.effective_shared_expert_intermediate,
                 )
+                # Set gated mode for ungated (relu2) expert architectures
+                if self.cfg.mlp_hidden_act == "relu2":
+                    manager.set_gated_experts(False)
                 self.gpu_prefill_managers[dev_str] = manager
                 logger.info("GPU prefill manager created for %s (rank %d/%d)", dev_str, i, num_ranks)
 
@@ -1754,7 +1819,7 @@ class KrasisModel:
         per-layer norms, attention weights (MLA/GQA/linear), MoE gate
         + shared expert weights, and dense MLP weights.
 
-        Device-bound caches (RoPE, FlashInfer wrappers, CUDA graphs)
+        Device-bound caches (RoPE, CUDA graphs)
         are invalidated — they re-create lazily on the new device.
         """
         mv = self._move_weight
@@ -1785,10 +1850,14 @@ class KrasisModel:
 
             # ── Attention weights ──
             attn = layer.attention
-            attn_saved = {"device": attn.device}
+            attn_saved = {}
 
-            if layer.layer_type == "linear_attention":
+            if attn is None:
+                # GQA attention handled by Rust prefill — no Python attention object
+                attn_saved = {"type": "rust_prefill"}
+            elif layer.layer_type == "linear_attention":
                 # GatedDeltaNetAttention
+                attn_saved["device"] = attn.device
                 for name in ("in_proj_qkvz", "in_proj_ba", "out_proj",
                              "conv1d_weight", "A_log", "dt_bias", "norm_weight"):
                     attn_saved[name] = getattr(attn, name)
@@ -1806,55 +1875,13 @@ class KrasisModel:
                 attn._la_input = None
                 attn._la_output = None
                 attn._la_stream = torch.cuda.Stream(device=device)
-
-            elif hasattr(attn, "kv_a_proj"):
-                # MLAAttention
-                mla_weights = ["kv_a_proj", "o_proj", "kv_a_norm_weight", "w_kc", "w_vc"]
-                if attn.has_q_lora:
-                    mla_weights += ["q_a_proj", "q_b_proj", "q_a_norm_weight"]
-                else:
-                    mla_weights += ["q_proj"]
-                for name in mla_weights:
-                    attn_saved[name] = getattr(attn, name)
-                    setattr(attn, name, mv(getattr(attn, name), device))
-                # Invalidate device-bound caches
-                attn_saved["_rope_cos_sin"] = attn._rope_cos_sin
-                attn_saved["_attn_wrapper"] = attn._attn_wrapper
-                attn._rope_cos_sin = None
-                import flashinfer
-                workspace_buf = torch.empty(
-                    128 * 1024 * 1024, dtype=torch.uint8, device=device
-                )
-                attn._attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-                    workspace_buf,
-                )
-
+                attn.device = device
             else:
-                # GQAAttention
-                gqa_weights = ["q_proj", "k_proj", "v_proj", "o_proj"]
-                gqa_optional = ["q_proj_bias", "k_proj_bias", "v_proj_bias",
-                                "o_proj_bias", "sinks", "q_norm", "k_norm"]
-                for name in gqa_weights:
-                    attn_saved[name] = getattr(attn, name)
-                    setattr(attn, name, mv(getattr(attn, name), device))
-                for name in gqa_optional:
-                    val = getattr(attn, name, None)
-                    if val is not None:
-                        attn_saved[name] = val
-                        setattr(attn, name, mv(val, device))
-                # Invalidate device-bound caches
-                attn_saved["_rope_cos_sin"] = attn._rope_cos_sin
-                attn_saved["_prefill_wrapper"] = attn._prefill_wrapper
-                attn._rope_cos_sin = None
-                import flashinfer
-                workspace_buf = torch.empty(
-                    128 * 1024 * 1024, dtype=torch.uint8, device=device
-                )
-                attn._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    workspace_buf,
+                raise NotImplementedError(
+                    f"MLA attention replication not supported. "
+                    f"Layer {layer.layer_idx} has unsupported attention type."
                 )
 
-            attn.device = device
             ls["attention"] = attn_saved
 
             # ── MoE weights ──
@@ -1935,9 +1962,12 @@ class KrasisModel:
             # Attention
             attn = layer.attention
             attn_saved = ls["attention"]
-            attn.device = attn_saved["device"]
 
-            if layer.layer_type == "linear_attention":
+            if attn is None:
+                # GQA handled by Rust prefill — nothing to restore
+                pass
+            elif layer.layer_type == "linear_attention":
+                attn.device = attn_saved["device"]
                 for name in ("in_proj_qkvz", "in_proj_ba", "out_proj",
                              "conv1d_weight", "A_log", "dt_bias", "norm_weight"):
                     setattr(attn, name, attn_saved[name])
@@ -1947,29 +1977,8 @@ class KrasisModel:
                 attn._la_input = attn_saved["_la_input"]
                 attn._la_output = attn_saved["_la_output"]
                 attn._la_stream = attn_saved["_la_stream"]
-
-            elif hasattr(attn, "kv_a_proj"):
-                # MLA
-                mla_weights = ["kv_a_proj", "o_proj", "kv_a_norm_weight", "w_kc", "w_vc"]
-                if attn.has_q_lora:
-                    mla_weights += ["q_a_proj", "q_b_proj", "q_a_norm_weight"]
-                else:
-                    mla_weights += ["q_proj"]
-                for name in mla_weights:
-                    setattr(attn, name, attn_saved[name])
-                attn._rope_cos_sin = attn_saved["_rope_cos_sin"]
-                attn._attn_wrapper = attn_saved["_attn_wrapper"]
-
             else:
-                # GQA
-                for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                    setattr(attn, name, attn_saved[name])
-                for name in ("q_proj_bias", "k_proj_bias", "v_proj_bias",
-                             "o_proj_bias", "sinks", "q_norm", "k_norm"):
-                    if name in attn_saved:
-                        setattr(attn, name, attn_saved[name])
-                attn._rope_cos_sin = attn_saved["_rope_cos_sin"]
-                attn._prefill_wrapper = attn_saved["_prefill_wrapper"]
+                pass  # MLA not supported
 
             # MoE
             if "moe" in ls:
@@ -2426,8 +2435,8 @@ class KrasisModel:
             kv_cache = self.kv_caches[gpu_idx]
             seq_state = seq_states[gpu_idx]
 
-            # MoE layer index for Krasis engine
-            moe_layer_idx = abs_layer_idx - first_k if abs_layer_idx >= first_k else None
+            # MoE layer index for Krasis engine (0-based sequential)
+            moe_layer_idx = self._abs_to_moe_idx.get(abs_layer_idx)
             kv_layer_offset = self._kv_layer_offsets.get(abs_layer_idx, 0)
 
             # Transfer hidden to layer device if needed
@@ -2715,8 +2724,8 @@ class KrasisModel:
         if residual is not None:
             residual = _to_device(residual, first_dev)
 
-        import flashinfer
-        flashinfer.norm.fused_add_rmsnorm(
+        from krasis.layer import _fused_add_rmsnorm
+        _fused_add_rmsnorm(
             hidden, residual, self.final_norm, self.cfg.rms_norm_eps
         )
 
@@ -3128,7 +3137,7 @@ class KrasisModel:
 
                 for li, abs_layer_idx in enumerate(group_layers):
                     layer = self.layers[abs_layer_idx]
-                    moe_layer_idx = abs_layer_idx - first_k if abs_layer_idx >= first_k else None
+                    moe_layer_idx = self._abs_to_moe_idx.get(abs_layer_idx)
                     kv_layer_offset = self._kv_layer_offsets.get(abs_layer_idx, 0)
 
                     # Streaming attention: double-buffered load
@@ -3548,7 +3557,7 @@ class KrasisModel:
 
         # ── Final result: logits ──
         # final_norm and lm_head are always on GPU0 (first device)
-        import flashinfer
+        from krasis.layer import _fused_add_rmsnorm
         first_dev = self.all_devices[0]
 
         if return_all_logits:
@@ -3557,7 +3566,7 @@ class KrasisModel:
             all_r = torch.cat(chunk_residual, dim=0)     # [M, hidden_size]
             all_h = _to_device(all_h, first_dev)
             all_r = _to_device(all_r, first_dev)
-            flashinfer.norm.fused_add_rmsnorm(
+            _fused_add_rmsnorm(
                 all_h, all_r, self.final_norm, self.cfg.rms_norm_eps
             )
             final_logits = _linear(all_h, self.lm_head_data).float()
@@ -3567,7 +3576,7 @@ class KrasisModel:
             last_r = chunk_residual[-1][-1:]
             last_h = _to_device(last_h, first_dev)
             last_r = _to_device(last_r, first_dev)
-            flashinfer.norm.fused_add_rmsnorm(
+            _fused_add_rmsnorm(
                 last_h, last_r, self.final_norm, self.cfg.rms_norm_eps
             )
             final_logits = _linear(last_h, self.lm_head_data).float()
@@ -3624,6 +3633,14 @@ class KrasisModel:
                 if layer.layer_type == "linear_attention":
                     layer.attention.reset_state()
 
+        # Reset Mamba2 SSM states for new sequence (zero conv_state and ssm_state)
+        # Prefill will write fresh final states, but zeroing ensures no stale state leaks
+        decode_states = getattr(self, '_mamba2_decode_states', None)
+        if decode_states:
+            for buffers in decode_states.values():
+                buffers['conv_state'].zero_()
+                buffers['ssm_state'].zero_()
+
         device = torch.device(self.ranks[0].device)
         generated = []
 
@@ -3662,6 +3679,7 @@ class KrasisModel:
             if gpu_store is None:
                 raise RuntimeError("GPU decode store not configured. Call setup_gpu_decode_store() first.")
             self._export_kv_to_rust(seq_states_per_rank, len(prompt_tokens))
+            self._transfer_mamba2_states()
             self._update_la_state_ptrs()
             self._update_la_state_ptrs_aux()
             # Multi-GPU: free prefill-only attention before decode
@@ -3780,6 +3798,13 @@ class KrasisModel:
                 if layer.layer_type == "linear_attention":
                     layer.attention.reset_state()
 
+        # Reset Mamba2 SSM states for new sequence
+        decode_states = getattr(self, '_mamba2_decode_states', None)
+        if decode_states:
+            for buffers in decode_states.values():
+                buffers['conv_state'].zero_()
+                buffers['ssm_state'].zero_()
+
         device = torch.device(self.ranks[0].device)
 
         # Multi-GPU: re-upload prefill-only attention (freed after last decode)
@@ -3837,6 +3862,7 @@ class KrasisModel:
         if gpu_store is None:
             raise RuntimeError("GpuDecodeStore not configured. Call setup_gpu_decode_store() first.")
         self._export_kv_to_rust(seq_states, len(prompt_tokens))
+        self._transfer_mamba2_states()
         self._update_la_state_ptrs()
         self._update_la_state_ptrs_aux()
 
@@ -3892,7 +3918,14 @@ class KrasisModel:
         # offloaded weights to CPU, leaving tensor attributes as None.
         max_qkv = self.cfg.hidden_size * 3  # default for standard GQA
         for layer in self.layers:
-            if layer.layer_type == "linear_attention":
+            if layer.attention is None:
+                # Mamba2 or MoE-only layers have no attention QKV buffers
+                if layer.layer_type == "mamba2" and layer.mamba2_weights is not None:
+                    # Mamba2 in_proj output is large: d_inner*2 + conv_dim + num_heads
+                    m2 = self.cfg
+                    in_proj_out = m2.mamba_d_inner * 2 + m2.mamba_conv_dim + m2.mamba_num_heads
+                    max_qkv = max(max_qkv, in_proj_out)
+            elif layer.layer_type == "linear_attention":
                 attn = layer.attention
                 # in_proj_qkvz output dim = nk*(dk + dk + hr*dv + hr*dv)
                 qkvz_out = attn.num_k_heads * (2 * attn.k_head_dim + 2 * attn.head_ratio * attn.v_head_dim)
@@ -3901,7 +3934,7 @@ class KrasisModel:
                 # MLA: q_absorbed [num_heads * ckv_dim] is the largest buffer
                 ma = layer.attention
                 q_out = ma.num_heads * (ma.qk_nope_dim + ma.qk_rope_dim)
-                q_absorbed = ma.num_heads * ma.ckv_dim  # padded to 512 for FlashInfer
+                q_absorbed = ma.num_heads * ma.ckv_dim  # padded to 512 for MLA
                 kv_out = ma.ckv_dim + ma.qk_rope_dim
                 max_qkv = max(max_qkv, q_out, q_absorbed, kv_out)
             elif hasattr(layer.attention, 'num_heads'):
@@ -4007,8 +4040,7 @@ class KrasisModel:
         _marlin_scalar_type_int4 = None
         _marlin_scalar_type_int8 = None
         if attn_quant == "awq":
-            from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
-            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import get_scalar_type
+            from krasis.marlin_utils import marlin_make_workspace, get_scalar_type
             _marlin_workspace = marlin_make_workspace(device)
             _marlin_scalar_type_int4 = get_scalar_type(4, False)
             _marlin_scalar_type_int8 = get_scalar_type(8, False)
@@ -4165,6 +4197,17 @@ class KrasisModel:
             attn = layer.attention
             inp_norm = layer.input_norm_weight
             post_norm = layer.post_attn_norm_weight
+
+            # ── Nemotron Mamba2 layer registration ──
+            if layer.layer_type == "mamba2":
+                self._register_mamba2_layer(store, layer_idx, layer, device)
+                store.register_mlp(layer_idx, "none")
+                continue
+
+            # ── Nemotron MoE-only layer (no attention) ──
+            if layer.layer_type == "moe":
+                self._register_nemotron_moe_only_layer(store, layer_idx, layer, device)
+                continue
 
             # AWQ v2: load per-layer per-channel scales for input projections
             _layer_awq_scales = None
@@ -4363,7 +4406,7 @@ class KrasisModel:
                 attn._rust_w_vc = attn.w_vc.contiguous().to(device)
                 self._rust_decode_weights.extend([attn._rust_w_kc, attn._rust_w_vc])
 
-                # MLA FP8 KV caches: share FlashInfer's paged cache directly
+                # MLA FP8 KV caches: share paged cache directly
                 # For single-sequence decode, paged layout [pages, page_size, dim]
                 # is identical to flat layout [position, dim] in memory.
                 cache = self.kv_caches[0]
@@ -4397,7 +4440,7 @@ class KrasisModel:
                     q_a_norm_ptr=q_a_norm_ptr,
                     q_proj_wid=q_proj_wid,
                     q_lora_rank=attn.q_lora_rank if attn.has_q_lora else 0,
-                    ckv_cache_dim=attn.ckv_dim,  # padded to ≥512 for FlashInfer MLA
+                    ckv_cache_dim=attn.ckv_dim,  # padded to ≥512 for MLA decode
                 )
 
                 # Set up RoPE tables from first MLA layer
@@ -4500,10 +4543,12 @@ class KrasisModel:
                 else:
                     k_norm_ptr = 0
 
+                post_norm_ptr = post_norm.data_ptr() if post_norm is not None else 0
+                post_norm_size = post_norm.numel() if post_norm is not None else 0
                 store.register_gqa_layer(
                     layer_idx=layer_idx,
                     input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
-                    post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
+                    post_attn_norm_ptr=post_norm_ptr, post_attn_norm_size=post_norm_size,
                     q_proj_wid=q_wid, k_proj_wid=k_wid,
                     v_proj_wid=v_wid, o_proj_wid=o_wid,
                     fused_qkv_wid=None,
@@ -4549,6 +4594,34 @@ class KrasisModel:
         if self.krasis_engine is not None:
             store.setup_from_engine(self.krasis_engine)
 
+        # Register Nemotron MoE config (relu2, ungated, latent projections) — must come
+        # after setup_from_engine which populates moe_layers[abs_layer_idx].
+        if self.cfg.model_type == "nemotron_h":
+            for layer_idx, layer in enumerate(self.layers):
+                if layer.layer_type == "moe":
+                    latent = layer.latent_proj
+                    if latent is not None:
+                        fc1_down = latent["fc1_latent_proj"]
+                        fc2_up = latent["fc2_latent_proj"]
+                        self._rust_decode_weights.extend([fc1_down, fc2_up])
+                        ld_wid = store.register_weight(
+                            fc1_down.data_ptr(), fc1_down.shape[0], fc1_down.shape[1], 0)
+                        lu_wid = store.register_weight(
+                            fc2_up.data_ptr(), fc2_up.shape[0], fc2_up.shape[1], 0)
+                    else:
+                        ld_wid = None
+                        lu_wid = None
+                    store.set_moe_nemotron_config(
+                        layer_idx=layer_idx,
+                        activation_type=1,
+                        gated_experts=False,
+                        latent_down_wid=ld_wid,
+                        latent_up_wid=lu_wid,
+                        moe_input_size=self.cfg.moe_latent_size,
+                    )
+                    logger.info("Set Nemotron MoE config for layer %d (latent_down=%s, latent_up=%s)",
+                                layer_idx, ld_wid, lu_wid)
+
         # Register shared_expert_gate weights (sigmoid gate for shared expert output)
         # These are BF16 tensors loaded by Python, not in the Rust engine cache
         self._rust_shared_gate_refs = []
@@ -4562,14 +4635,17 @@ class KrasisModel:
                             layer_idx, sg_wid, sg.shape)
 
         # Register shared FP8 KV cache pointers — Rust decode reads/writes the
-        # same GPU buffers that FlashInfer uses during prefill. No separate
+        # same GPU buffers that Rust prefill writes. No separate
         # allocation, no D2D export copy between prefill and decode.
         cache = self.kv_caches[0]
         if cache is not None and cache.k_cache is not None:
             kv_ptrs = []
             gqa_cache_idx = 0
             for layer_idx, layer in enumerate(self.layers):
-                if layer.layer_type != "linear_attention" and not hasattr(layer.attention, 'kv_a_proj'):
+                # Only full GQA attention layers have KV cache slots.
+                # Skip: linear_attention (no KV), MLA (has kv_a_proj), mamba2 (SSM state), moe-only (no attention).
+                if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
+                    and not hasattr(layer.attention, 'kv_a_proj')):
                     k_layer = cache.k_cache[gqa_cache_idx]  # [max_pages, page_size, nkv, hd]
                     v_layer = cache.v_cache[gqa_cache_idx]
                     gqa_cache_idx += 1
@@ -4608,6 +4684,104 @@ class KrasisModel:
         # Rust handles swapping slot contents between Marlin and simple INT4.
 
         return store
+
+    def _register_mamba2_layer(self, store, layer_idx, layer, device):
+        """Register a Mamba2 SSM layer with the Rust decode store."""
+        inp_norm = layer.input_norm_weight
+        m2 = layer.mamba2_weights
+        cfg = self.cfg
+
+        # Mamba2 projection weights: in_proj [in_proj_out, hidden_size], out_proj [hidden_size, d_inner]
+        # Register as Marlin GEMV weights for decode
+        in_proj = m2["in_proj"]
+        out_proj = m2["out_proj"]
+        self._rust_decode_weights.extend([in_proj, out_proj])
+        in_proj_wid = store.register_weight(
+            in_proj.data_ptr(), in_proj.shape[0], in_proj.shape[1], 0)
+        out_proj_wid = store.register_weight(
+            out_proj.data_ptr(), out_proj.shape[0], out_proj.shape[1], 0)
+
+        # Conv1d weight: [conv_dim, conv_kernel] FP32 on GPU
+        conv_w = m2["conv1d_weight"].float().contiguous().to(device)
+        self._rust_decode_weights.append(conv_w)
+
+        # Conv1d bias: [conv_dim] FP32 on GPU (optional)
+        conv_bias = m2.get("conv1d_bias")
+        if conv_bias is not None:
+            conv_bias = conv_bias.float().contiguous().to(device)
+            self._rust_decode_weights.append(conv_bias)
+            store.set_mamba2_conv_bias(layer_idx, conv_bias.data_ptr())
+
+        # A_log, D, dt_bias, norm: all FP32 on GPU
+        a_log = m2["A_log"].float().contiguous().to(device)
+        d_param = m2["D"].float().contiguous().to(device)
+        dt_bias = m2["dt_bias"].float().contiguous().to(device)
+        norm_w = m2["norm_weight"].float().contiguous().to(device)
+        self._rust_decode_weights.extend([a_log, d_param, dt_bias, norm_w])
+
+        # Allocate SSM state buffers on GPU (persistent across tokens)
+        # Conv state: [conv_dim, conv_kernel] FP32
+        # SSM state: [num_heads, head_dim, state_size] FP32
+        conv_dim = cfg.mamba_conv_dim
+        conv_state = torch.zeros(conv_dim, cfg.mamba_conv_kernel,
+                                 dtype=torch.float32, device=device)
+        ssm_state = torch.zeros(cfg.mamba_num_heads, cfg.mamba_head_dim, cfg.ssm_state_size,
+                                dtype=torch.float32, device=device)
+        self._rust_decode_weights.extend([conv_state, ssm_state])
+        # Save references for prefill -> decode state transfer
+        if not hasattr(self, '_mamba2_decode_states'):
+            self._mamba2_decode_states = {}
+        self._mamba2_decode_states[layer_idx] = {
+            'conv_state': conv_state,
+            'ssm_state': ssm_state,
+        }
+
+        store.register_mamba2_layer(
+            layer_idx=layer_idx,
+            input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
+            post_attn_norm_ptr=0, post_attn_norm_size=0,  # Nemotron: no post_attn_norm
+            in_proj_wid=in_proj_wid, out_proj_wid=out_proj_wid,
+            conv_weight_ptr=conv_w.data_ptr(),
+            a_ptr=a_log.data_ptr(), d_ptr=d_param.data_ptr(),
+            dt_bias_ptr=dt_bias.data_ptr(), norm_weight_ptr=norm_w.data_ptr(),
+            conv_state_ptr=conv_state.data_ptr(), ssm_state_ptr=ssm_state.data_ptr(),
+            num_heads=cfg.mamba_num_heads, head_dim=cfg.mamba_head_dim,
+            state_size=cfg.ssm_state_size,
+            expand=cfg.mamba_expand, conv_kernel=cfg.mamba_conv_kernel,
+        )
+        # Set n_groups for B/C sharing (same for all Mamba2 layers)
+        store.set_mamba2_n_groups(cfg.mamba_n_groups)
+
+        logger.info("Registered Mamba2 layer %d (conv_dim=%d, heads=%d, state=%d)",
+                     layer_idx, conv_dim, cfg.mamba_num_heads, cfg.ssm_state_size)
+
+    def _register_nemotron_moe_only_layer(self, store, layer_idx, layer, device):
+        """Register a Nemotron MoE-only layer (no attention) with the Rust decode store.
+
+        These layers have: input_norm → LatentMoE → residual (no attention, no post_attn_norm).
+        Since the Rust decode loop expects input_norm + attn + post_attn_norm + MLP, we register
+        the layer with a 'None' attention type and the MoE as the MLP.
+        """
+        inp_norm = layer.input_norm_weight
+
+        # Register as GQA with 0 heads (skips attention computation).
+        # post_attn_norm ptr=0/size=0 tells Rust to skip post-norm (Nemotron has no post_attn_norm).
+        store.register_gqa_layer(
+            layer_idx=layer_idx,
+            input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
+            post_attn_norm_ptr=0, post_attn_norm_size=0,
+            q_proj_wid=0, k_proj_wid=0, v_proj_wid=0, o_proj_wid=0,
+            fused_qkv_wid=None,
+            num_heads=0, num_kv_heads=0, head_dim=0, sm_scale=0.0,
+            q_norm_ptr=0, k_norm_ptr=0, gated=False,
+        )
+
+        # Register MoE placeholder — actual expert data is wired by setup_from_engine,
+        # and Nemotron config (relu2, latent projections) is set after that.
+        store.register_mlp(layer_idx, "moe")
+
+        logger.info("Registered Nemotron MoE-only layer %d (MoE config deferred to post-engine setup)",
+                     layer_idx)
 
     def setup_gpu_decode_store_aux(self, gpu_idx: int, split_layer: int, layer_end: int = 0) -> "GpuDecodeStore":
         """Create an auxiliary GpuDecodeStore for multi-GPU decode.
@@ -5203,7 +5377,10 @@ class KrasisModel:
             kv_ptrs = []
             gqa_cache_idx = 0
             for layer_idx, layer in enumerate(self.layers):
-                if layer.layer_type != "linear_attention" and not hasattr(layer.attention, 'kv_a_proj'):
+                # Only full GQA attention layers have KV cache slots.
+                # Skip: linear_attention (no KV), MLA (has kv_a_proj), mamba2 (SSM state), moe-only (no attention).
+                if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
+                    and not hasattr(layer.attention, 'kv_a_proj')):
                     if split_layer <= layer_idx < layer_end:
                         # Allocate FP8 KV cache on aux GPU matching primary's shape
                         k_src = cache.k_cache[gqa_cache_idx]
@@ -5250,7 +5427,7 @@ class KrasisModel:
     def _export_kv_to_rust(self, seq_states, prompt_len: int):
         """Set KV cache position for Rust decode after prefill.
 
-        The KV cache is shared — FlashInfer already wrote FP8 data into the
+        The KV cache is shared — Rust prefill already wrote FP8 data into the
         same GPU buffers that Rust decode reads. No data copy needed, just
         tell Rust how many tokens are valid.
         """
@@ -5265,6 +5442,33 @@ class KrasisModel:
             return
 
         store.set_kv_position(prompt_len)
+
+    def _transfer_mamba2_states(self):
+        """Copy Mamba2 conv_state and ssm_state from Python prefill into Rust decode buffers.
+
+        After prefill, each Mamba2 layer has saved its final conv_state and ssm_state
+        on the layer object. These must be copied into the pre-allocated GPU buffers
+        that the Rust decode engine uses. The buffers have fixed addresses (registered
+        during _register_mamba2_layer), so we copy in-place to preserve pointers.
+        """
+        decode_states = getattr(self, '_mamba2_decode_states', None)
+        if not decode_states:
+            return
+
+        for layer_idx, buffers in decode_states.items():
+            layer = self.layers[layer_idx]
+
+            # Conv state: prefill produces [1, conv_dim, conv_kernel], Rust expects [conv_dim, conv_kernel] FP32
+            if hasattr(layer, '_mamba2_conv_state') and layer._mamba2_conv_state is not None:
+                conv_src = layer._mamba2_conv_state.squeeze(0).float().contiguous()
+                buffers['conv_state'].copy_(conv_src)
+                layer._mamba2_conv_state = None  # Free prefill tensor
+
+            # SSM state: prefill produces [1, num_heads, head_dim, state_size], Rust expects [num_heads, head_dim, state_size] FP32
+            if hasattr(layer, '_mamba2_ssm_state') and layer._mamba2_ssm_state is not None:
+                ssm_src = layer._mamba2_ssm_state.squeeze(0).float().contiguous()
+                buffers['ssm_state'].copy_(ssm_src)
+                layer._mamba2_ssm_state = None  # Free prefill tensor
 
     def _update_la_state_ptrs(self):
         """Re-register LA state pointers after prefill (states may have been reallocated).

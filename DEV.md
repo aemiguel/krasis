@@ -28,13 +28,10 @@ These versions are known to work together. Don't upgrade without testing.
 | Package | Version | Notes |
 |---------|---------|-------|
 | torch | 2.9.1+cu128 | CUDA 12.8 |
-| flashinfer | 0.6.3 | Must match torch CUDA version |
-| sglang | 0.5.9 | Provides fused_marlin_moe kernels |
-| flash_attn | 2.8.3 | |
+| sgl-kernel | 0.0.1+ | Provides Marlin GEMM + fused MoE kernels |
 | transformers | 4.57.1 | |
 | safetensors | 0.7.0 | |
 | maturin | 1.12.4 | At ~/.local/bin/maturin |
-| torchao | 0.9.0 | |
 
 ### Installing from scratch
 
@@ -48,8 +45,7 @@ conda activate krasis
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 # GPU kernels (these are the [gpu] optional deps from pyproject.toml)
-pip install flashinfer -i https://flashinfer.ai/whl/cu128/torch2.9/
-pip install sglang[all] flash_attn
+pip install sgl-kernel
 
 # Krasis dev install
 pip install maturin
@@ -120,11 +116,11 @@ Or pass a path to any .conf file directly.
 
 ## Troubleshooting
 
-### "No module named sglang/flashinfer"
+### "No module named sgl_kernel"
 
 The [gpu] optional deps aren't installed. Fix:
 ```bash
-./dev python -m pip install sglang[all] flashinfer -i https://flashinfer.ai/whl/cu128/torch2.9/
+./dev python -m pip install sgl-kernel
 ```
 
 ### Stale Rust code

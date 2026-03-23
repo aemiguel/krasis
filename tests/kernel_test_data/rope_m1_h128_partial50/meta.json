@@ -1,0 +1,68 @@
+{
+  "atol": 0.001,
+  "rtol": 0.001,
+  "note": "RoPE M=1 num_q=32 num_kv=8 hd=128 partial=0.5 half_dim=32",
+  "inputs": {
+    "q": {
+      "file": "input_q.bin",
+      "shape": [
+        1,
+        32,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "k": {
+      "file": "input_k.bin",
+      "shape": [
+        1,
+        8,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "positions": {
+      "file": "input_positions.bin",
+      "shape": [
+        1
+      ],
+      "dtype": "i32"
+    },
+    "cos_cache": {
+      "file": "input_cos_cache.bin",
+      "shape": [
+        101,
+        32
+      ],
+      "dtype": "f32"
+    },
+    "sin_cache": {
+      "file": "input_sin_cache.bin",
+      "shape": [
+        101,
+        32
+      ],
+      "dtype": "f32"
+    }
+  },
+  "outputs": {
+    "q_out": {
+      "file": "expected_q_out.bin",
+      "shape": [
+        1,
+        32,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "k_out": {
+      "file": "expected_k_out.bin",
+      "shape": [
+        1,
+        8,
+        128
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

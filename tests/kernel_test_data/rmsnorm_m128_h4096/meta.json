@@ -1,0 +1,32 @@
+{
+  "atol": 0.001,
+  "rtol": 0.001,
+  "note": "RMSNorm M=128 H=4096 eps=1e-06",
+  "inputs": {
+    "x": {
+      "file": "input_x.bin",
+      "shape": [
+        128,
+        4096
+      ],
+      "dtype": "bf16"
+    },
+    "weight": {
+      "file": "input_weight.bin",
+      "shape": [
+        4096
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        128,
+        4096
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

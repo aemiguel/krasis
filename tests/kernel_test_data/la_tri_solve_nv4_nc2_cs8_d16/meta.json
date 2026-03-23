@@ -1,0 +1,39 @@
+{
+  "atol": 1e-05,
+  "rtol": 1e-05,
+  "note": "LA triangular solve nv=4 chunks=2 cs=8 dim=16",
+  "inputs": {
+    "b": {
+      "file": "input_b.bin",
+      "shape": [
+        4,
+        2,
+        8,
+        16
+      ],
+      "dtype": "f32"
+    },
+    "A": {
+      "file": "input_A.bin",
+      "shape": [
+        4,
+        2,
+        8,
+        8
+      ],
+      "dtype": "f32"
+    }
+  },
+  "outputs": {
+    "x_out": {
+      "file": "expected_x_out.bin",
+      "shape": [
+        4,
+        2,
+        8,
+        16
+      ],
+      "dtype": "f32"
+    }
+  }
+}

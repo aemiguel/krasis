@@ -1,15 +1,16 @@
-"""Test FP8 KV cache with FlashInfer MLA attention.
+"""Test FP8 KV cache with MLA attention — DISABLED.
 
-Verifies that:
-1. FP8 KV cache allocates correctly (half the memory of BF16)
-2. append_paged_mla_kv_cache works with FP8
-3. Attention produces correct output with FP8 cache (upcast to BF16 before kernel)
-4. End-to-end generation works with FP8 KV
+MLA attention has been removed (DeepSeek models not currently supported).
+This test requires flashinfer which is no longer a dependency.
+Keeping the file for reference — tests will skip with a message.
 """
 
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
+
+print("SKIP: MLA attention tests disabled (flashinfer removed)")
+sys.exit(0)
 
 import torch
 

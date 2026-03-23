@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["flashinfer>=0.1", "sgl-kernel>=0.0.1", "sglang>=0.4"]
+gpu = []  # Marlin GEMM kernels are now vendored (libkrasis_marlin.so)
 
 [project.urls]
 Homepage = "https://github.com/brontoguana/krasis"

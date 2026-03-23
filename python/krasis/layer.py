@@ -18,7 +18,6 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
-import flashinfer
 
 from krasis.config import ModelConfig
 from krasis.kv_cache import PagedKVCache, SequenceKVState
@@ -27,6 +26,33 @@ from krasis.weight_loader import int8_linear
 logger = logging.getLogger(__name__)
 
 from krasis.timing import TIMING
+
+
+def _rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm using torch."""
+    variance = x.float().pow(2).mean(-1, keepdim=True)
+    return (x.float() * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
+
+
+def _fused_add_rmsnorm(hidden: torch.Tensor, residual: torch.Tensor,
+                        weight: torch.Tensor, eps: float):
+    """In-place fused add + RMSNorm.
+    hidden = RMSNorm(hidden + residual, weight, eps)
+    residual = hidden + residual (before norm)
+    """
+    combined = hidden + residual
+    residual.copy_(combined)
+    variance = combined.float().pow(2).mean(-1, keepdim=True)
+    normed = (combined.float() * torch.rsqrt(variance + eps) * weight.float()).to(hidden.dtype)
+    hidden.copy_(normed)
+
+
+def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    """SiLU-and-mul.
+    Input: [M, 2*N], output: [M, N]. Splits in half, applies silu(first) * second.
+    """
+    half = x.shape[-1] // 2
+    return torch.nn.functional.silu(x[..., :half]) * x[..., half:]
 
 
 def _linear(x: torch.Tensor, weight_data) -> torch.Tensor:
@@ -55,7 +81,7 @@ class TransformerLayer:
         krasis_engine=None,
         gpu_prefill_manager=None,
         gpu_prefill_threshold: int = 300,
-        attention_backend: str = "flashinfer",
+        attention_backend: str = "rust",
     ):
         self.cfg = cfg
         self.layer_idx = layer_idx
@@ -68,18 +94,39 @@ class TransformerLayer:
         self.post_attn_norm_weight = weights["norms"]["post_attention_layernorm"]
 
         # Attention — select backend based on layer type and attention type
-        if self.layer_type == "linear_attention":
+        if self.layer_type == "mamba2":
+            # Mamba2 SSM layer: weights for both prefill (Python) and decode (Rust)
+            self.attention = None
+            self.mamba2_weights = weights.get("mamba2")
+            # Prefill state: conv_state and ssm_state, allocated on first prefill
+            self._mamba2_conv_state = None
+            self._mamba2_ssm_state = None
+        elif self.layer_type == "moe":
+            # MoE-only layer (Nemotron): no attention
+            self.attention = None
+            self.mamba2_weights = None
+        elif self.layer_type == "linear_attention":
             from krasis.linear_attention import GatedDeltaNetAttention
             self.attention = GatedDeltaNetAttention(cfg, layer_idx, weights["linear_attention"], device)
-        elif cfg.is_gqa:
-            from krasis.attention import GQAAttention
-            self.attention = GQAAttention(cfg, layer_idx, weights["attention"], device)
+            self.mamba2_weights = None
+        elif cfg.is_gqa or cfg.is_nemotron_h:
+            # GQA attention is handled by Rust prefill engine — no Python attention object needed
+            self.attention = None
+            self.mamba2_weights = None
         elif attention_backend == "trtllm":
-            from krasis.trtllm_attention import TRTLLMMLAAttention
-            self.attention = TRTLLMMLAAttention(cfg, layer_idx, weights["attention"], device)
+            raise NotImplementedError(
+                "MLA attention (trtllm backend) is not currently supported. "
+                "DeepSeek models require native CUDA MLA kernels (not yet implemented)."
+            )
         else:
-            from krasis.attention import MLAAttention
-            self.attention = MLAAttention(cfg, layer_idx, weights["attention"], device)
+            # MLA attention — not currently supported
+            raise NotImplementedError(
+                "MLA attention is not currently supported. "
+                "DeepSeek models require native CUDA MLA kernels (not yet implemented)."
+            )
+
+        # Latent MoE projections (Nemotron)
+        self.latent_proj = weights.get("latent_proj")
 
         # MLP weights
         if self.is_moe:
@@ -88,7 +135,8 @@ class TransformerLayer:
             self.e_score_correction_bias = weights["gate"].get("e_score_correction_bias")
             self.shared_expert = weights.get("shared_expert")  # {gate_proj, up_proj, down_proj}
             # Fuse gate_proj + up_proj into single matmul to save kernel launch
-            if self.shared_expert is not None:
+            # (skip for Nemotron shared experts which have no gate_proj)
+            if self.shared_expert is not None and "gate_proj" in self.shared_expert:
                 gp = self.shared_expert["gate_proj"]
                 up = self.shared_expert["up_proj"]
                 if isinstance(gp, tuple):
@@ -163,11 +211,11 @@ class TransformerLayer:
         """
         if residual is None:
             residual = hidden
-            hidden = flashinfer.norm.rmsnorm(
+            hidden = _rmsnorm(
                 hidden, self.input_norm_weight, self.cfg.rms_norm_eps
             )
         else:
-            flashinfer.norm.fused_add_rmsnorm(
+            _fused_add_rmsnorm(
                 hidden, residual, self.input_norm_weight, self.cfg.rms_norm_eps
             )
         return hidden, residual
@@ -181,7 +229,7 @@ class TransformerLayer:
 
         Used by split-attention EP dispatch where attention is handled externally.
         """
-        flashinfer.norm.fused_add_rmsnorm(
+        _fused_add_rmsnorm(
             attn_out, residual, self.post_attn_norm_weight, self.cfg.rms_norm_eps
         )
         return attn_out, residual
@@ -219,11 +267,11 @@ class TransformerLayer:
         # ── Pre-attention norm ──
         if residual is None:
             residual = hidden
-            hidden = flashinfer.norm.rmsnorm(
+            hidden = _rmsnorm(
                 hidden, self.input_norm_weight, self.cfg.rms_norm_eps
             )
         else:
-            flashinfer.norm.fused_add_rmsnorm(
+            _fused_add_rmsnorm(
                 hidden, residual, self.input_norm_weight, self.cfg.rms_norm_eps
             )
 
@@ -241,7 +289,7 @@ class TransformerLayer:
             )
 
         # ── Post-attention norm ──
-        flashinfer.norm.fused_add_rmsnorm(
+        _fused_add_rmsnorm(
             attn_out, residual, self.post_attn_norm_weight, self.cfg.rms_norm_eps
         )
         return attn_out, residual
@@ -282,12 +330,12 @@ class TransformerLayer:
         # ── Pre-attention norm ──
         if residual is None:
             residual = hidden
-            hidden = flashinfer.norm.rmsnorm(
+            hidden = _rmsnorm(
                 hidden, self.input_norm_weight, self.cfg.rms_norm_eps
             )
         else:
             # fused_add_rmsnorm is IN-PLACE: residual += hidden, then hidden = rmsnorm(residual)
-            flashinfer.norm.fused_add_rmsnorm(
+            _fused_add_rmsnorm(
                 hidden, residual, self.input_norm_weight, self.cfg.rms_norm_eps
             )
 
@@ -295,10 +343,16 @@ class TransformerLayer:
             torch.cuda.synchronize()
             t_after_norm1 = time.perf_counter()
 
-        # ── Attention ──
+        # ── Mixer (Attention / Mamba2 / MoE-only) ──
         skip_attn = (TransformerLayer.attn_skip_after is not None
                      and self.layer_idx >= TransformerLayer.attn_skip_after)
-        if skip_attn:
+        if self.layer_type == "mamba2":
+            attn_out = self._mamba2_prefill(hidden)
+        elif self.layer_type == "moe" and self.attention is None:
+            # Nemotron MoE-only layer: no attention, hidden passes through to MoE.
+            # For single-sublayer blocks: pre_norm output goes directly to MoE.
+            attn_out = hidden  # no attention transformation
+        elif skip_attn:
             # Skip attention: zero hidden so residual passes through unchanged
             attn_out = torch.zeros_like(hidden)
         elif self.layer_type == "linear_attention":
@@ -316,11 +370,20 @@ class TransformerLayer:
             t_after_attn = time.perf_counter()
 
         # ── Post-attention norm ──
-        # fused_add_rmsnorm is IN-PLACE: residual += attn_out, then attn_out = rmsnorm(residual)
-        flashinfer.norm.fused_add_rmsnorm(
-            attn_out, residual, self.post_attn_norm_weight, self.cfg.rms_norm_eps
-        )
-        hidden = attn_out  # now contains normed value
+        # Nemotron: single-sublayer blocks have no post_attn_norm (post_attn_norm_weight is None).
+        # The mixer output goes directly to MLP (if any) or becomes the layer output.
+        if self.post_attn_norm_weight is None:
+            # Nemotron: no post-norm. For MoE-only layers, hidden is already the pre-normed
+            # input ready for MoE. For attention/mamba2 layers, attn_out is the mixer output.
+            # Either way, the mixer output becomes the "hidden" for the MLP step (or final output).
+            hidden = attn_out
+        else:
+            # Standard transformer: fused residual add + RMSNorm
+            # fused_add_rmsnorm is IN-PLACE: residual += attn_out, then attn_out = rmsnorm(residual)
+            _fused_add_rmsnorm(
+                attn_out, residual, self.post_attn_norm_weight, self.cfg.rms_norm_eps
+            )
+            hidden = attn_out  # now contains normed value
 
         if layer_timing:
             torch.cuda.synchronize()
@@ -452,8 +515,11 @@ class TransformerLayer:
 
         elif self.is_moe:
             mlp_out = self._moe_forward(hidden, moe_layer_idx)
-        else:
+        elif self.dense_mlp is not None:
             mlp_out = self._dense_mlp_forward(hidden)
+        else:
+            # No MLP (Nemotron attention-only layers): mixer output IS the layer output
+            mlp_out = hidden
 
         if layer_timing:
             torch.cuda.synchronize()
@@ -511,7 +577,7 @@ class TransformerLayer:
         gate = _linear(hidden, self.dense_mlp["gate_proj"])
         up = _linear(hidden, self.dense_mlp["up_proj"])
         # SiLU(gate) * up
-        activated = flashinfer.activation.silu_and_mul(
+        activated = _silu_and_mul(
             torch.cat([gate, up], dim=-1)
         )
         del gate, up
@@ -519,10 +585,16 @@ class TransformerLayer:
 
     def _shared_expert_forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Shared expert MLP on GPU, with optional sigmoid gate (Qwen3-Next)."""
-        # Fused gate+up: single matmul → [M, 2N], then silu_and_mul → [M, N]
-        gate_up = _linear(hidden, self.shared_expert["gate_up_proj"])
-        activated = flashinfer.activation.silu_and_mul(gate_up)
-        del gate_up
+        if "gate_up_proj" in self.shared_expert:
+            # Standard: fused gate+up → [M, 2N], then silu_and_mul → [M, N]
+            gate_up = _linear(hidden, self.shared_expert["gate_up_proj"])
+            activated = _silu_and_mul(gate_up)
+            del gate_up
+        else:
+            # Nemotron: up_proj only, relu^2 activation (no gate_proj)
+            up = _linear(hidden, self.shared_expert["up_proj"])
+            activated = torch.relu(up).square()
+            del up
         output = _linear(activated, self.shared_expert["down_proj"])
 
         # Apply sigmoid gate if present (Qwen3-Next):
@@ -578,11 +650,8 @@ class TransformerLayer:
     ) -> torch.Tensor:
         """MoE forward: routing + shared expert (GPU) + routed experts (CPU).
 
-        Kimi K2.5 specifics:
-        - Scoring: sigmoid (not softmax)
-        - e_score_correction_bias added before top-k selection
-        - norm_topk_prob: divide by sum of selected weights
-        - routed_scaling_factor: 2.827
+        For LatentMoE (Nemotron): wraps expert compute with latent projections.
+        Gate routing operates on full hidden_size, experts on latent_size.
         """
         M = hidden.shape[0]
         timing = TIMING.decode and M == 1
@@ -590,8 +659,16 @@ class TransformerLayer:
         if timing:
             t_start = time.perf_counter()
 
+        # ── LatentMoE: project to latent space for expert compute ──
+        has_latent = self.latent_proj is not None
+        if has_latent:
+            expert_input = _linear(hidden, self.latent_proj["fc1_latent_proj"])
+        else:
+            expert_input = hidden
+
         # ── Routing ──
         # gate: [M, hidden] @ [n_experts, hidden]^T → [M, n_experts]
+        # NOTE: gate always operates on FULL hidden_size, not latent
         router_logits = torch.matmul(hidden.float(), self.gate_weight.float().t())
         if self.gate_bias is not None:
             router_logits = router_logits + self.gate_bias.float()
@@ -677,18 +754,22 @@ class TransformerLayer:
                 shared_future = self._shared_expert_forward(hidden)
 
         # ── Dispatch: GPU path (prefill) vs CPU decode ──
+        # For LatentMoE: experts work on expert_input (latent dim), not hidden
         if self.gpu_prefill_manager is not None and M >= self.gpu_prefill_threshold:
             # GPU path: INT4 Marlin kernel handles routing + expert computation
-            output = self._gpu_prefill_forward(hidden, topk_ids, topk_weights, moe_layer_idx)
+            output = self._gpu_prefill_forward(expert_input, topk_ids, topk_weights, moe_layer_idx)
         else:
             # CPU path: Krasis engine handles routed experts
-            output = self._routed_expert_forward(hidden, topk_ids, topk_weights, moe_layer_idx)
+            output = self._routed_expert_forward(expert_input, topk_ids, topk_weights, moe_layer_idx)
+
+        # ── LatentMoE: project back from latent space ──
+        if has_latent:
+            output = _linear(output, self.latent_proj["fc2_latent_proj"])
 
         if timing:
             t_dispatch = time.perf_counter()
 
-        # If shared_expert_gate exists, Rust engine skips shared expert —
-        # we handle it on GPU with the sigmoid gate
+        # Shared expert operates on original hidden (full dimension), not latent
         if shared_future is not None:
             # Sync shared stream and add result
             torch.cuda.current_stream(self.device).wait_stream(self._shared_stream)
@@ -825,5 +906,119 @@ class TransformerLayer:
             bytearray(output_bytes), dtype=torch.bfloat16
         ).reshape(M, self.cfg.hidden_size)
         output = output.to(self.device)
+
+        return output
+
+    def _mamba2_prefill(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Mamba2 SSM prefill using parallel chunked SSD algorithm.
+
+        Uses vendored Triton kernels (from sglang/vllm, originally Tri Dao's mamba_ssm)
+        for GPU-parallel SSD computation. Same algorithm as vLLM/SGLang production inference.
+
+        After prefill, conv_state and ssm_state are saved for the Rust decode engine.
+
+        Args:
+            hidden: [M, hidden_size] BF16 — pre-normed input
+
+        Returns:
+            output: [M, hidden_size] BF16 — Mamba2 layer output
+        """
+        from krasis.mamba2_ops import mamba_chunk_scan_combined
+        import causal_conv1d
+
+        m2 = self.mamba2_weights
+        cfg = self.cfg
+        M = hidden.shape[0]
+        batch_size = 1
+
+        d_inner = cfg.mamba_num_heads * cfg.mamba_head_dim
+        n_groups = cfg.mamba_n_groups
+        state_size = cfg.ssm_state_size
+        conv_dim = d_inner + 2 * n_groups * state_size
+        num_heads = cfg.mamba_num_heads
+        head_dim = cfg.mamba_head_dim
+        chunk_size = cfg.mamba_chunk_size
+
+        # 1. in_proj: [M, hidden_size] -> [M, proj_size]
+        #    proj_size = d_inner (gate/z) + conv_dim (xBC) + num_heads (dt)
+        projected = _linear(hidden, m2["in_proj"])
+
+        # 2. Split: gate(z), xBC, dt
+        gate, hidden_states_B_C, time_step = torch.split(
+            projected, [d_inner, conv_dim, num_heads], dim=-1
+        )
+
+        # 3. Causal conv1d over xBC dimension
+        # causal_conv1d_fn expects [batch, dim, seqlen] layout
+        conv_weight = m2["conv1d_weight"]
+        if conv_weight.dim() == 3:
+            conv_weight = conv_weight.squeeze(1)  # [conv_dim, 1, kernel] -> [conv_dim, kernel]
+
+        # Save conv_state: last (kernel-1) tokens of xBC for decode
+        conv_kernel = cfg.mamba_conv_kernel
+        xBC_t = hidden_states_B_C.unsqueeze(0).transpose(1, 2)  # [1, conv_dim, M]
+        if M >= conv_kernel:
+            self._mamba2_conv_state = torch.nn.functional.pad(
+                xBC_t, (conv_kernel - xBC_t.shape[-1], 0)
+            )[:, :, -conv_kernel:]
+        else:
+            self._mamba2_conv_state = torch.nn.functional.pad(
+                xBC_t, (conv_kernel - xBC_t.shape[-1], 0)
+            )
+
+        conv_bias = m2.get("conv1d_bias")
+        hidden_states_B_C = causal_conv1d.causal_conv1d_fn(
+            x=xBC_t,
+            weight=conv_weight,
+            bias=conv_bias,
+            activation="silu",
+        ).transpose(1, 2)[:, :M]  # [1, M, conv_dim]
+
+        # 4. Split xBC -> x, B, C
+        groups_state_size = n_groups * state_size
+        x_ssm, B, C = torch.split(
+            hidden_states_B_C,
+            [d_inner, groups_state_size, groups_state_size],
+            dim=-1,
+        )
+
+        # 5. Parallel SSD scan
+        A = -torch.exp(m2["A_log"].float())  # [num_heads]
+
+        scan_output, ssm_state = mamba_chunk_scan_combined(
+            x_ssm.view(batch_size, M, num_heads, head_dim),
+            time_step.unsqueeze(0) if time_step.dim() == 2 else time_step,
+            A,
+            B.view(batch_size, M, n_groups, state_size),
+            C.view(batch_size, M, n_groups, state_size),
+            chunk_size=chunk_size,
+            D=m2["D"],
+            z=None,
+            seq_idx=None,
+            return_final_states=True,
+            dt_bias=m2["dt_bias"],
+            dt_softplus=True,
+        )
+
+        # Save SSM state for decode
+        self._mamba2_ssm_state = ssm_state  # [1, num_heads, head_dim, state_size]
+
+        # 6. Gated RMSNorm: norm(scan_output) * silu(gate)
+        scan_output = scan_output.view(batch_size, M, d_inner)
+        norm_weight = m2["norm_weight"]
+        # Group-wise RMSNorm with gate
+        group_size = d_inner // n_groups
+        scan_f32 = scan_output.float()
+        gate_f32 = gate.unsqueeze(0) if gate.dim() == 2 else gate
+        gated = scan_f32 * torch.nn.functional.silu(gate_f32.float())
+        # Group-wise RMSNorm
+        gated_grouped = gated.view(batch_size, M, n_groups, group_size)
+        variance = gated_grouped.pow(2).mean(-1, keepdim=True)
+        gated_normed = gated_grouped * torch.rsqrt(variance + cfg.rms_norm_eps)
+        gated_normed = gated_normed.view(batch_size, M, d_inner)
+        output = (norm_weight * gated_normed).to(hidden.dtype)
+
+        # 7. out_proj: [1, M, d_inner] -> [1, M, hidden_size]
+        output = _linear(output.squeeze(0), m2["out_proj"])
 
         return output

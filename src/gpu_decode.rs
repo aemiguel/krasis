@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use cudarc::cublas::{CudaBlas, sys as cublas_sys};
 use cudarc::cublas::result as cublas_result;
-use cudarc::driver::{CudaDevice, DevicePtr, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig};
 use cudarc::driver::sys as cuda_sys;
 
 // PTX compiled from src/cuda/decode_kernels.cu at build time.
@@ -122,6 +122,14 @@ const KERNEL_NAMES: &[&str] = &[
     "mla_split_q",
     "mla_absorb_wkc",
     "mla_apply_wvc",
+    // Mamba2 SSM kernels (Nemotron-H hybrid models)
+    "mamba2_conv1d",
+    "mamba2_ssm_step",
+    "mamba2_discretize",
+    "mamba2_gate_output",
+    // relu2 expert activation (Nemotron LatentMoE)
+    "relu2_w2_batched",
+    "relu2_w2_int8_batched",
 ];
 
 const MODULE_NAME: &str = "decode_kernels";
@@ -688,6 +696,17 @@ struct MoeLayerData {
     e_score_corr_ptr: u64,
     /// Shared expert gate weight ID (None if no shared gate).
     shared_gate_wid: Option<usize>,
+    /// Expert activation type: 0=silu_gated (gate_proj+up_proj with SiLU), 1=relu2 (up_proj only, relu^2).
+    activation_type: u8,
+    /// Whether experts have a gate projection (w13 = [gate|up]) or just up_proj (w13 = [up]).
+    gated_experts: bool,
+    /// Latent down projection weight ID (hidden -> latent, e.g. 4096->1024). None for standard MoE.
+    latent_down_wid: Option<usize>,
+    /// Latent up projection weight ID (latent -> hidden, e.g. 1024->4096). None for standard MoE.
+    latent_up_wid: Option<usize>,
+    /// Expert input/output size for LatentMoE (e.g. 1024). 0 = use hidden_size (standard MoE).
+    /// This is the K dimension for w13 GEMV and N dimension for w2 GEMV.
+    moe_input_size: usize,
 }
 
 // ── GPU weight descriptor ──────────────────────────────────────────────
@@ -827,7 +846,7 @@ enum GpuAttnConfig {
         // Dimensions
         num_heads: usize,
         kv_lora_rank: usize,       // real kv_lora_rank from model (e.g. 256 for Mistral)
-        ckv_cache_dim: usize,      // effective ckv dim in cache (≥512 for FlashInfer MLA)
+        ckv_cache_dim: usize,      // effective ckv dim in cache (≥512 for MLA decode)
         qk_nope_dim: usize,
         qk_rope_dim: usize,
         v_head_dim: usize,
@@ -837,6 +856,25 @@ enum GpuAttnConfig {
         // MLA KV cache (separate ckv and kpe, FP8)
         ckv_cache_ptr: u64,        // [max_seq, ckv_cache_dim] FP8
         kpe_cache_ptr: u64,        // [max_seq, qk_rope_dim] FP8
+    },
+    /// Mamba2 selective state space layer (Nemotron-H hybrid models).
+    /// O(1) per-token decode, no KV cache. State is always GPU-resident.
+    Mamba2 {
+        in_proj: usize,            // weight ID: hidden_size -> expand * (head_dim + 2*state_size + 1) * num_heads
+        out_proj: usize,           // weight ID: expand * head_dim * num_heads -> hidden_size
+        conv_weight_ptr: u64,      // [conv_dim, conv_kernel] FP32 on GPU
+        a_ptr: u64,                // [num_heads] FP32 — discretization parameter A
+        d_ptr: u64,                // [num_heads] FP32 — skip connection D
+        dt_bias_ptr: u64,          // [num_heads] FP32
+        norm_weight_ptr: u64,      // [expand * head_dim * num_heads] FP32 — output RMSNorm
+        num_heads: usize,          // 128 for Nemotron
+        head_dim: usize,           // 64
+        state_size: usize,         // 128
+        expand: usize,             // 2
+        conv_kernel: usize,        // 4
+        conv_dim: usize,           // expand * head_dim * num_heads (conv input dim)
+        conv_state_ptr: u64,       // [conv_dim, conv_kernel] FP32 on GPU (per-sequence)
+        ssm_state_ptr: u64,        // [num_heads, head_dim, state_size] FP32 on GPU (per-sequence)
     },
 }
 
@@ -985,6 +1023,14 @@ struct CachedKernels {
     mla_split_q: cudarc::driver::CudaFunction,
     mla_absorb_wkc: cudarc::driver::CudaFunction,
     mla_apply_wvc: cudarc::driver::CudaFunction,
+    // Mamba2 SSM kernels (Nemotron-H)
+    mamba2_conv1d: cudarc::driver::CudaFunction,
+    mamba2_ssm_step: cudarc::driver::CudaFunction,
+    mamba2_discretize: cudarc::driver::CudaFunction,
+    mamba2_gate_output: cudarc::driver::CudaFunction,
+    // relu2 expert activation (Nemotron LatentMoE)
+    relu2_w2_batched: cudarc::driver::CudaFunction,
+    relu2_w2_int8_batched: cudarc::driver::CudaFunction,
 }
 
 // ── Main GPU decode graph ──────────────────────────────────────────────
@@ -1136,6 +1182,18 @@ struct GpuDecodeGraph {
     d_la_recur_out: cudarc::driver::CudaSlice<f32>,
     d_la_gated_out: cudarc::driver::CudaSlice<f32>,
 
+    // Mamba2 SSM scratch (FP32)
+    d_mamba2_conv_out: Option<cudarc::driver::CudaSlice<f32>>,  // [conv_dim] FP32
+    mamba2_conv_out_size: usize,  // track allocated size (CudaSlice has no .len())
+    /// Number of B/C groups for Mamba2 (n_groups from config, e.g. 8)
+    mamba2_n_groups: usize,
+    /// Conv bias pointers per Mamba2 layer (FP32 on GPU, keyed by layer_idx)
+    mamba2_conv_bias_ptrs: std::collections::HashMap<usize, u64>,
+
+    /// LatentMoE: override pointer for expert w13 input. 0 = use d_hidden (standard MoE).
+    /// Set to the latent buffer ptr before moe_forward for LatentMoE layers.
+    moe_input_override_ptr: u64,
+
     // Host-side buffers for D2H copies
     h_topk_ids: Vec<i32>,
     h_topk_weights: Vec<f32>,
@@ -1171,9 +1229,9 @@ struct GpuDecodeGraph {
     norm_bias_one: bool,
 
     /// GQA KV cache: raw device pointers to FP8 E4M3 [max_seq, kv_stride] per layer.
-    /// Memory is owned by Python (PagedKVCache tensors). Prefill writes FP8 via
-    /// FlashInfer, decode writes FP8 via kv_cache_write kernel. Shared buffer,
-    /// no export copy needed.
+    /// Memory is owned by Python (PagedKVCache tensors). Rust prefill writes FP8
+    /// via kv_cache_append kernel, decode writes FP8 via kv_cache_write kernel.
+    /// Shared buffer, no export copy needed.
     kv_k_ptrs: Vec<u64>,  // device pointers, one per layer (indexed by layer_idx)
     kv_v_ptrs: Vec<u64>,
     kv_max_seq: usize,
@@ -1953,6 +2011,11 @@ impl GpuDecodeStore {
             d_la_conv_out,
             d_la_recur_out,
             d_la_gated_out,
+            d_mamba2_conv_out: None,
+            mamba2_conv_out_size: 0,
+            mamba2_n_groups: 1,
+            mamba2_conv_bias_ptrs: std::collections::HashMap::new(),
+            moe_input_override_ptr: 0,
             h_topk_ids: vec![0i32; max_experts_per_tok],
             h_topk_weights: vec![0.0f32; max_experts_per_tok],
             h_logits: vec![0.0f32; vocab_size],
@@ -2127,12 +2190,20 @@ impl GpuDecodeStore {
                 mla_split_q: get("mla_split_q")?,
                 mla_absorb_wkc: get("mla_absorb_wkc")?,
                 mla_apply_wvc: get("mla_apply_wvc")?,
+                // Mamba2 SSM kernels
+                mamba2_conv1d: get("mamba2_conv1d")?,
+                mamba2_ssm_step: get("mamba2_ssm_step")?,
+                mamba2_discretize: get("mamba2_discretize")?,
+                mamba2_gate_output: get("mamba2_gate_output")?,
+                // relu2 expert activation
+                relu2_w2_batched: get("relu2_w2_batched")?,
+                relu2_w2_int8_batched: get("relu2_w2_int8_batched")?,
             };
             // Extract raw CUfunction handles for spec routing on spec_stream.
             self.raw_sigmoid_topk = CudaFunc(extract_cu_function(&kernels.sigmoid_topk));
             self.raw_softmax_topk = CudaFunc(extract_cu_function(&kernels.softmax_topk));
             self.graph.as_mut().unwrap().kernels = Some(kernels);
-            log::info!("GpuDecodeStore: cached 41 kernel function handles");
+            log::info!("GpuDecodeStore: cached kernel function handles");
         }
 
         // Pre-allocate CUDA events (reuse across MoE forward calls)
@@ -2454,6 +2525,10 @@ impl GpuDecodeStore {
                     if let Some(w) = q_a_proj { decode_wids.insert(*w); }
                     if let Some(w) = q_b_proj { decode_wids.insert(*w); }
                     if let Some(w) = q_proj { decode_wids.insert(*w); }
+                }
+                GpuAttnConfig::Mamba2 { in_proj, out_proj, .. } => {
+                    decode_wids.insert(*in_proj);
+                    decode_wids.insert(*out_proj);
                 }
             }
         }
@@ -3051,6 +3126,33 @@ impl GpuDecodeStore {
                 format!("MoE layer {} not registered", layer_idx)))?;
         moe.shared_gate_wid = Some(wid);
         log::info!("Set shared_gate_wid={} for MoE layer {}", wid, layer_idx);
+        Ok(())
+    }
+
+    /// Configure Nemotron-specific MoE fields: relu2 activation, ungated experts, latent projections.
+    #[pyo3(signature = (layer_idx, activation_type, gated_experts, latent_down_wid, latent_up_wid, moe_input_size))]
+    fn set_moe_nemotron_config(
+        &mut self,
+        layer_idx: usize,
+        activation_type: u8,    // 0=silu_gated, 1=relu2
+        gated_experts: bool,    // false for Nemotron (up_proj only, no gate_proj)
+        latent_down_wid: Option<usize>,  // hidden->latent projection
+        latent_up_wid: Option<usize>,    // latent->hidden projection
+        moe_input_size: usize,  // expert I/O dimension (latent_size), 0=use hidden_size
+    ) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let moe = graph.moe_layers.get_mut(layer_idx)
+            .and_then(|m| m.as_mut())
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("MoE layer {} not registered", layer_idx)))?;
+        moe.activation_type = activation_type;
+        moe.gated_experts = gated_experts;
+        moe.latent_down_wid = latent_down_wid;
+        moe.latent_up_wid = latent_up_wid;
+        moe.moe_input_size = moe_input_size;
+        log::info!("Set Nemotron MoE config for layer {}: activation={}, gated={}, latent_down={:?}, latent_up={:?}, input_size={}",
+                   layer_idx, activation_type, gated_experts, latent_down_wid, latent_up_wid, moe_input_size);
         Ok(())
     }
 
@@ -4231,7 +4333,7 @@ impl GpuDecodeStore {
         q_proj_wid: Option<usize>, q_lora_rank: usize,
         ckv_cache_dim: usize,
     ) -> PyResult<()> {
-        // ckv_cache_dim: effective dimension in cache (≥512 for FlashInfer MLA).
+        // ckv_cache_dim: effective dimension in cache (≥512 for MLA decode).
         // If 0 (default), use kv_lora_rank directly.
         let ckv_cache_dim = if ckv_cache_dim == 0 { kv_lora_rank } else { ckv_cache_dim };
 
@@ -4283,6 +4385,87 @@ impl GpuDecodeStore {
         };
         log::info!("GpuDecodeStore: registered MLA layer {} (heads={}, kv_lora_rank={}, ckv_cache_dim={}, nope={}, rope={}, v_hd={})",
             layer_idx, num_heads, kv_lora_rank, ckv_cache_dim, qk_nope_dim, qk_rope_dim, v_head_dim);
+        Ok(())
+    }
+
+    /// Register a Mamba2 SSM layer for GPU decode (Nemotron-H hybrid models).
+    /// Mamba2 layers have O(1) per-token state, no KV cache, always GPU-resident.
+    #[allow(clippy::too_many_arguments)]
+    fn register_mamba2_layer(
+        &mut self,
+        layer_idx: usize,
+        input_norm_ptr: usize, input_norm_size: usize,
+        post_attn_norm_ptr: usize, post_attn_norm_size: usize,
+        in_proj_wid: usize, out_proj_wid: usize,
+        conv_weight_ptr: usize, a_ptr: usize, d_ptr: usize,
+        dt_bias_ptr: usize, norm_weight_ptr: usize,
+        conv_state_ptr: usize, ssm_state_ptr: usize,
+        num_heads: usize, head_dim: usize, state_size: usize,
+        expand: usize, conv_kernel: usize,
+    ) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let conv_dim = expand * head_dim * num_heads;
+        while graph.layers.len() <= layer_idx {
+            graph.layers.push(GpuDecodeLayer {
+                input_norm_ptr: 0,
+                input_norm_size: 0,
+                post_attn_norm_ptr: 0,
+                post_attn_norm_size: 0,
+                attn: GpuAttnConfig::GQA {
+                    q_proj: 0, k_proj: 0, v_proj: 0, o_proj: 0, fused_qkv: None,
+                    num_heads: 0, num_kv_heads: 0, head_dim: 0, sm_scale: 0.0,
+                    q_norm_ptr: 0, k_norm_ptr: 0, gated: false,
+                },
+                mlp: GpuMlpConfig::None,
+            });
+        }
+        graph.layers[layer_idx].input_norm_ptr = input_norm_ptr as u64;
+        graph.layers[layer_idx].input_norm_size = input_norm_size;
+        graph.layers[layer_idx].post_attn_norm_ptr = post_attn_norm_ptr as u64;
+        graph.layers[layer_idx].post_attn_norm_size = post_attn_norm_size;
+        graph.layers[layer_idx].attn = GpuAttnConfig::Mamba2 {
+            in_proj: in_proj_wid,
+            out_proj: out_proj_wid,
+            conv_weight_ptr: conv_weight_ptr as u64,
+            a_ptr: a_ptr as u64,
+            d_ptr: d_ptr as u64,
+            dt_bias_ptr: dt_bias_ptr as u64,
+            norm_weight_ptr: norm_weight_ptr as u64,
+            num_heads,
+            head_dim,
+            state_size,
+            expand,
+            conv_kernel,
+            conv_dim,
+            conv_state_ptr: conv_state_ptr as u64,
+            ssm_state_ptr: ssm_state_ptr as u64,
+        };
+        // Allocate mamba2 conv_out buffer if not yet allocated (sized to max conv_dim)
+        if graph.mamba2_conv_out_size < conv_dim {
+            graph.d_mamba2_conv_out = Some(self.device.alloc_zeros::<f32>(conv_dim)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("alloc mamba2_conv_out: {:?}", e)))?);
+            graph.mamba2_conv_out_size = conv_dim;
+        }
+        log::info!("GpuDecodeStore: registered Mamba2 layer {} (heads={}, hd={}, state={}, conv_dim={}), total_layers={}",
+            layer_idx, num_heads, head_dim, state_size, conv_dim, graph.layers.len());
+        Ok(())
+    }
+
+    /// Set Mamba2 n_groups parameter (shared across all Mamba2 layers).
+    fn set_mamba2_n_groups(&mut self, n_groups: usize) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        graph.mamba2_n_groups = n_groups;
+        log::info!("GpuDecodeStore: set mamba2_n_groups={}", n_groups);
+        Ok(())
+    }
+
+    /// Register conv bias pointer for a Mamba2 layer (FP32 on GPU).
+    fn set_mamba2_conv_bias(&mut self, layer_idx: usize, conv_bias_ptr: usize) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        graph.mamba2_conv_bias_ptrs.insert(layer_idx, conv_bias_ptr as u64);
         Ok(())
     }
 
@@ -4363,7 +4546,7 @@ impl GpuDecodeStore {
     }
 
     /// Register shared FP8 KV cache pointers from Python's PagedKVCache.
-    /// Python owns the memory (FP8 E4M3 contiguous tensors). Both FlashInfer
+    /// Python owns the memory (FP8 E4M3 contiguous tensors). Both Rust
     /// prefill and Rust decode read/write the same buffers — no export copy.
     ///
     /// kv_ptrs: list of (layer_idx, k_data_ptr, v_data_ptr) device pointers.
@@ -5008,6 +5191,26 @@ impl GpuDecodeStore {
 // ── Pure-Rust methods for GPU decode (no PyO3, used by Rust HTTP server) ──
 
 impl GpuDecodeStore {
+    /// Set KV cache position after Rust prefill (no GIL needed).
+    /// Equivalent to the pyo3 `set_kv_position` but callable from Rust directly.
+    pub fn set_kv_position_rust(&mut self, seq_len: usize) {
+        if let Some(ref mut graph) = self.graph {
+            graph.kv_current_pos = seq_len;
+            log::info!("Rust prefill: set KV position to {}", seq_len);
+        }
+    }
+
+    /// Export HCS cache_fast snapshot for the Rust prefill engine.
+    /// Returns (cache_fast_slice, num_experts_per_layer). Empty if no HCS.
+    pub fn export_hcs_snapshot(&self) -> (&[[u64; 4]], usize) {
+        if let Some(ref graph) = self.graph {
+            if let Some(ref hcs) = graph.hcs {
+                return (&hcs.cache_fast, hcs.num_experts_per_layer);
+            }
+        }
+        (&[], 0)
+    }
+
     /// Set min_new_tokens and stop_ids for suppression (called from Rust server code).
     pub fn set_min_new_tokens_ext(&mut self, n: usize, stop_ids: Vec<usize>) {
         self.min_new_tokens = n;
@@ -5076,6 +5279,534 @@ impl GpuDecodeStore {
                 }
             }
         }
+    }
+
+    /// Create a Rust PrefillEngine from the registered weights in this decode store.
+    /// This extracts all layer weight pointers, MoE expert data, and allocates prefill scratch.
+    /// The returned engine can run prefill without any Python/GIL involvement.
+    #[allow(dead_code)]
+    pub fn create_prefill_engine(
+        &self,
+        max_tokens: usize,
+    ) -> Result<crate::gpu_prefill::PrefillEngine, String> {
+        use crate::gpu_prefill::*;
+
+        let graph = self.graph.as_ref()
+            .ok_or("GpuDecodeStore not configured")?;
+
+        // Load prefill kernels
+        let kernels = PrefillKernels::load(self.device.clone())?;
+
+        // Create streams
+        let prefill_stream = unsafe {
+            let mut stream: cuda_sys::CUstream = std::ptr::null_mut();
+            let err = cuda_sys::lib().cuStreamCreate(
+                &mut stream,
+                cuda_sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Create prefill stream: {:?}", err));
+            }
+            stream
+        };
+        let copy_stream = unsafe {
+            let mut stream: cuda_sys::CUstream = std::ptr::null_mut();
+            let err = cuda_sys::lib().cuStreamCreate(
+                &mut stream,
+                cuda_sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Create prefill copy stream: {:?}", err));
+            }
+            stream
+        };
+
+        // Create cuBLAS handle
+        let cublas_handle = cudarc::cublas::result::create_handle()
+            .map_err(|e| format!("Create cuBLAS handle: {:?}", e))?;
+
+        // Build model config
+        let num_layers = graph.layers.len();
+        let mut layer_types = vec![0u8; num_layers];
+        let mut num_q_heads = 0usize;
+        let mut num_kv_heads = 0usize;
+        let mut head_dim = 0usize;
+
+        // Detect dimensions from first GQA layer
+        for l in &graph.layers {
+            match &l.attn {
+                GpuAttnConfig::GQA { num_heads, num_kv_heads: nkv, head_dim: hd, .. } => {
+                    num_q_heads = *num_heads;
+                    num_kv_heads = *nkv;
+                    head_dim = *hd;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // Detect Mamba2 dimensions
+        let mut mamba_d_inner = 0;
+        let mut mamba_d_state = 0;
+        let mut mamba_num_heads = 0;
+        let mut mamba_head_dim = 0;
+        let mut mamba_conv_dim = 0;
+        let mut mamba_conv_kernel = 0;
+        let mut mamba_n_groups = 1;
+
+        // Detect linear attention dimensions
+        let mut la_nk = 0usize; let mut la_nv = 0usize;
+        let mut la_dk = 0usize; let mut la_dv = 0usize;
+        let mut la_hr = 0usize; let mut la_kd = 0usize;
+        let mut la_cd = 0usize; let mut la_scale = 0.0f32;
+
+        for (i, l) in graph.layers.iter().enumerate() {
+            match &l.attn {
+                GpuAttnConfig::GQA { .. } => { layer_types[i] = 0; }
+                GpuAttnConfig::Mamba2 { num_heads, head_dim: hd, state_size,
+                                        expand, conv_kernel, conv_dim, .. } => {
+                    layer_types[i] = 1;
+                    mamba_d_inner = expand * hd * num_heads;
+                    mamba_d_state = *state_size;
+                    mamba_num_heads = *num_heads;
+                    mamba_head_dim = *hd;
+                    mamba_conv_dim = *conv_dim;
+                    mamba_conv_kernel = *conv_kernel;
+                    // n_groups: derive from Mamba2 config or default to 1
+                    mamba_n_groups = 1; // TODO: should be stored in config
+                }
+                GpuAttnConfig::LinearAttention { nk, nv: nv_val, dk: dk_val, dv: dv_val,
+                    hr, kernel_dim, conv_dim, scale, .. } =>
+                {
+                    layer_types[i] = 3;
+                    la_nk = *nk; la_nv = *nv_val;
+                    la_dk = *dk_val; la_dv = *dv_val;
+                    la_hr = *hr; la_kd = *kernel_dim;
+                    la_cd = *conv_dim; la_scale = *scale;
+                }
+                GpuAttnConfig::MLA { .. } => { layer_types[i] = 0; }
+            }
+        }
+
+        // Detect MoE config from first MoE layer
+        let mut n_routed = 0usize;
+        let mut n_topk = 0usize;
+        let mut scoring_func = 0u8;
+        let mut norm_topk = false;
+        let mut routed_sf = 1.0f32;
+        let mut moe_gated = true;
+        let mut moe_activation = 0u8;
+        for ml in &graph.moe_layers {
+            if let Some(m) = ml {
+                n_routed = m.num_experts;
+                n_topk = m.topk;
+                scoring_func = m.scoring_func;
+                norm_topk = m.norm_topk_prob;
+                routed_sf = m.routed_scaling_factor;
+                moe_gated = m.gated_experts;
+                moe_activation = m.activation_type;
+                break;
+            }
+        }
+
+        let config = PrefillModelConfig {
+            hidden_size: graph.hidden_size,
+            intermediate_size: graph.moe_intermediate_size.max(graph.intermediate_size),
+            num_hidden_layers: num_layers,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            vocab_size: graph.vocab_size,
+            rms_norm_eps: graph.eps,
+            max_seq_len: max_tokens,
+            n_routed_experts: n_routed,
+            num_experts_per_tok: n_topk,
+            expert_bits: graph.expert_bits,
+            group_size: graph.group_size,
+            sms: graph.num_sms,
+            device_ordinal: 0, // TODO: get from device
+            layer_types,
+            first_k_dense: 0, // TODO: from model config
+            scoring_func,
+            norm_topk_prob: norm_topk,
+            routed_scaling_factor: routed_sf,
+            moe_gated,
+            moe_activation,
+            mamba_d_inner,
+            mamba_d_state,
+            mamba_num_heads,
+            mamba_head_dim,
+            mamba_conv_dim,
+            mamba_conv_kernel,
+            mamba_n_groups,
+            tie_word_embeddings: false,
+            la_num_k_heads: la_nk,
+            la_num_v_heads: la_nv,
+            la_k_head_dim: la_dk,
+            la_v_head_dim: la_dv,
+            la_head_ratio: la_hr.max(1),
+            la_conv_kernel_dim: la_kd,
+            la_conv_dim: la_cd,
+            la_scale,
+            la_chunk_size: 64,
+            rope_half_dim: graph.rope_half_dim,
+            prefill_chunk_size: 5000, // match Python default; 0 = no chunking
+            layer_group_size: 4,      // group MoE layers for expert DMA pipelining
+        };
+
+        // Build per-layer weights
+        let mut layer_weights = Vec::with_capacity(num_layers);
+        let extract_marlin = |wid: usize| -> Option<MarlinWeight> {
+            let w = &graph.weights[wid];
+            if w.dtype == 4 || w.dtype == 5 {
+                Some(MarlinWeight {
+                    packed: w.ptr,
+                    scales: w.scales_ptr,
+                    n: w.rows,
+                    k: w.cols,
+                    num_groups: w.cols / w.group_size.max(1),
+                    group_size: w.group_size,
+                    num_bits: if w.dtype == 4 { 8 } else { 4 },
+                })
+            } else {
+                None
+            }
+        };
+
+        for (i, l) in graph.layers.iter().enumerate() {
+            let mut lw = PrefillLayerWeights {
+                input_norm: l.input_norm_ptr,
+                post_attn_norm: l.post_attn_norm_ptr,
+                q_proj: None, k_proj: None, v_proj: None, o_proj: None, gqa_gated: false,
+                mamba2_in_proj: None, mamba2_out_proj: None,
+                mamba2_conv_weight: 0, mamba2_conv_bias: 0,
+                mamba2_A: 0, mamba2_D: 0, mamba2_dt_bias: 0, mamba2_norm: 0,
+                moe_gate_ptr: 0, moe_gate_rows: 0, moe_gate_cols: 0,
+                moe_gate_bias_ptr: 0, moe_e_score_corr_ptr: 0,
+                moe_num_experts: 0, moe_topk: 0,
+                moe_scoring_func: 0, moe_norm_topk_prob: false,
+                moe_routed_scaling_factor: 1.0,
+                moe_gated: true, moe_activation: 0,
+                shared_w1: None, shared_w2: None,
+                layer_type: config.layer_types[i],
+                moe_layer_idx: None,
+                la_in_proj_qkvz: None, la_in_proj_ba: None, la_out_proj: None,
+                la_conv_weight_ptr: 0, la_a_log_ptr: 0, la_dt_bias_ptr: 0,
+                la_norm_weight_ptr: 0, la_conv_state_ptr: 0, la_recur_state_ptr: 0,
+            };
+
+            match &l.attn {
+                GpuAttnConfig::GQA { q_proj, k_proj, v_proj, o_proj, gated, .. } => {
+                    lw.q_proj = extract_marlin(*q_proj);
+                    lw.k_proj = extract_marlin(*k_proj);
+                    lw.v_proj = extract_marlin(*v_proj);
+                    lw.o_proj = extract_marlin(*o_proj);
+                    lw.gqa_gated = *gated;
+                }
+                GpuAttnConfig::Mamba2 { in_proj, out_proj,
+                    conv_weight_ptr, a_ptr, d_ptr, dt_bias_ptr, norm_weight_ptr, .. } =>
+                {
+                    lw.mamba2_in_proj = extract_marlin(*in_proj);
+                    lw.mamba2_out_proj = extract_marlin(*out_proj);
+                    lw.mamba2_conv_weight = *conv_weight_ptr;
+                    lw.mamba2_A = *a_ptr;
+                    lw.mamba2_D = *d_ptr;
+                    lw.mamba2_dt_bias = *dt_bias_ptr;
+                    lw.mamba2_norm = *norm_weight_ptr;
+                }
+                GpuAttnConfig::LinearAttention { in_proj_qkvz, in_proj_ba, out_proj,
+                    conv_weight_ptr, a_log_ptr, dt_bias_ptr, norm_weight_ptr,
+                    conv_state_ptr, recur_state_ptr, .. } =>
+                {
+                    lw.la_in_proj_qkvz = extract_marlin(*in_proj_qkvz);
+                    lw.la_in_proj_ba = extract_marlin(*in_proj_ba);
+                    lw.la_out_proj = extract_marlin(*out_proj);
+                    lw.la_conv_weight_ptr = *conv_weight_ptr;
+                    lw.la_a_log_ptr = *a_log_ptr;
+                    lw.la_dt_bias_ptr = *dt_bias_ptr;
+                    lw.la_norm_weight_ptr = *norm_weight_ptr;
+                    lw.la_conv_state_ptr = *conv_state_ptr;
+                    lw.la_recur_state_ptr = *recur_state_ptr;
+                }
+                _ => {} // MLA: TODO
+            }
+
+            // MoE config
+            match &l.mlp {
+                GpuMlpConfig::MoE { gate_weight, gate_bias_ptr, e_score_corr_ptr,
+                    num_experts, topk, scoring_func: sf, norm_topk_prob: ntp,
+                    routed_scaling_factor: rsf,
+                    shared_gate_up, shared_down, .. } =>
+                {
+                    let gw = &graph.weights[*gate_weight];
+                    lw.moe_gate_ptr = gw.ptr;
+                    lw.moe_gate_rows = gw.rows;
+                    lw.moe_gate_cols = gw.cols;
+                    lw.moe_gate_bias_ptr = *gate_bias_ptr;
+                    lw.moe_e_score_corr_ptr = *e_score_corr_ptr;
+                    lw.moe_num_experts = *num_experts;
+                    lw.moe_topk = *topk;
+                    lw.moe_scoring_func = *sf;
+                    lw.moe_norm_topk_prob = *ntp;
+                    lw.moe_routed_scaling_factor = *rsf;
+                    lw.moe_gated = moe_gated;
+                    lw.moe_activation = moe_activation;
+                    lw.moe_layer_idx = Some(i);
+                    if let Some(wid) = shared_gate_up {
+                        lw.shared_w1 = extract_marlin(*wid);
+                    }
+                    if let Some(wid) = shared_down {
+                        lw.shared_w2 = extract_marlin(*wid);
+                    }
+                }
+                GpuMlpConfig::Dense { gate_proj, up_proj: _, down_proj } => {
+                    // For dense MLP, gate_proj serves as w1 (gate_up)
+                    lw.shared_w1 = extract_marlin(*gate_proj);
+                    lw.shared_w2 = extract_marlin(*down_proj);
+                }
+                GpuMlpConfig::None => {}
+            }
+
+            layer_weights.push(lw);
+        }
+
+        // Build MoE expert data
+        let mut moe_layers: Vec<Option<PrefillMoeLayerData>> = Vec::new();
+        for ml in &graph.moe_layers {
+            moe_layers.push(ml.as_ref().map(|m| {
+                let experts = m.experts.iter().map(|e| ExpertWeightPtrs {
+                    w13_packed_ptr: e.w13_packed_ptr,
+                    w13_packed_bytes: e.w13_packed_bytes,
+                    w13_scales_ptr: e.w13_scales_ptr,
+                    w13_scales_bytes: e.w13_scales_bytes,
+                    w2_packed_ptr: e.w2_packed_ptr,
+                    w2_packed_bytes: e.w2_packed_bytes,
+                    w2_scales_ptr: e.w2_scales_ptr,
+                    w2_scales_bytes: e.w2_scales_bytes,
+                    contiguous_ptr: e.contiguous_ptr,
+                    contiguous_bytes: e.contiguous_bytes,
+                }).collect();
+                let shared = m.shared.as_ref().map(|e| ExpertWeightPtrs {
+                    w13_packed_ptr: e.w13_packed_ptr,
+                    w13_packed_bytes: e.w13_packed_bytes,
+                    w13_scales_ptr: e.w13_scales_ptr,
+                    w13_scales_bytes: e.w13_scales_bytes,
+                    w2_packed_ptr: e.w2_packed_ptr,
+                    w2_packed_bytes: e.w2_packed_bytes,
+                    w2_scales_ptr: e.w2_scales_ptr,
+                    w2_scales_bytes: e.w2_scales_bytes,
+                    contiguous_ptr: e.contiguous_ptr,
+                    contiguous_bytes: e.contiguous_bytes,
+                });
+                PrefillMoeLayerData { experts, shared }
+            }));
+        }
+
+        // Allocate scratch
+        let scratch = allocate_scratch(&self.device, &config, max_tokens)?;
+
+        // Create CUDA events for double-buffer synchronization
+        let dma_event = unsafe {
+            let mut event: cuda_sys::CUevent = std::ptr::null_mut();
+            let err = cuda_sys::lib().cuEventCreate(
+                &mut event,
+                cuda_sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Create DMA event: {:?}", err));
+            }
+            event
+        };
+        let compute_event = unsafe {
+            let mut event: cuda_sys::CUevent = std::ptr::null_mut();
+            let err = cuda_sys::lib().cuEventCreate(
+                &mut event,
+                cuda_sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Create compute event: {:?}", err));
+            }
+            event
+        };
+
+        // Snapshot current HCS state (if available)
+        let (hcs_cache_fast, hcs_ne) = if let Some(ref hcs) = graph.hcs {
+            (hcs.cache_fast.clone(), hcs.num_experts_per_layer)
+        } else {
+            (Vec::new(), 0)
+        };
+
+        // Create shared expert stream and event (gap 4: always-async shared expert)
+        let shared_stream = unsafe {
+            let mut stream: cuda_sys::CUstream = std::ptr::null_mut();
+            let err = cuda_sys::lib().cuStreamCreate(
+                &mut stream,
+                cuda_sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Create shared expert stream: {:?}", err));
+            }
+            stream
+        };
+        let shared_event = unsafe {
+            let mut event: cuda_sys::CUevent = std::ptr::null_mut();
+            let err = cuda_sys::lib().cuEventCreate(
+                &mut event,
+                cuda_sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Create shared event: {:?}", err));
+            }
+            event
+        };
+
+        // Shared expert needs its own Marlin workspace to avoid conflicts
+        let d_shared_fp32_scratch = self.device.alloc_zeros::<f32>(
+            max_tokens * std::cmp::max(graph.hidden_size, config.intermediate_size)
+        ).map_err(|e| format!("alloc shared_fp32_scratch: {e}"))?;
+        let d_shared_workspace = self.device.alloc_zeros::<i32>(
+            graph.num_sms * 4
+        ).map_err(|e| format!("alloc shared_workspace: {e}"))?;
+
+        // Compute per-expert byte sizes for fused MoE
+        let inter = config.intermediate_size;
+        let h = graph.hidden_size;
+        let gs = config.group_size;
+        let bits = config.expert_bits as usize;
+
+        let w1_n = if config.moe_gated { 2 * inter } else { inter };
+        let w1_packed_per_expert = (h / 16) * w1_n * (bits / 2);
+        let w1_scales_per_expert = (h / gs) * w1_n * 2;
+        let w2_packed_per_expert = (inter / 16) * h * (bits / 2);
+        let w2_scales_per_expert = (inter / gs) * h * 2;
+
+        // Fused MoE contiguous buffers: [E, per_expert_bytes] for all experts
+        // Only allocate if we have MoE layers and the fused kernel is available
+        let has_moe = n_routed > 0;
+        let has_fused = kernels.fused_moe_fn.is_some();
+        let alloc_fused_buf = |size: usize, name: &str| -> Result<Option<CudaSlice<u8>>, String> {
+            if has_moe && has_fused {
+                Ok(Some(self.device.alloc_zeros::<u8>(size).map_err(|e| format!("alloc {name}: {e}"))?))
+            } else {
+                Ok(None)
+            }
+        };
+
+        // Two sets (A/B) for double-buffered layer-group preloading
+        let total_w1_packed = n_routed * w1_packed_per_expert;
+        let total_w1_scales = n_routed * w1_scales_per_expert;
+        let total_w2_packed = n_routed * w2_packed_per_expert;
+        let total_w2_scales = n_routed * w2_scales_per_expert;
+
+        let d_fused_expert_w1_a = alloc_fused_buf(total_w1_packed.max(1), "fused_w1_a")?;
+        let d_fused_expert_w1s_a = alloc_fused_buf(total_w1_scales.max(1), "fused_w1s_a")?;
+        let d_fused_expert_w2_a = alloc_fused_buf(total_w2_packed.max(1), "fused_w2_a")?;
+        let d_fused_expert_w2s_a = alloc_fused_buf(total_w2_scales.max(1), "fused_w2s_a")?;
+        let d_fused_expert_w1_b = alloc_fused_buf(total_w1_packed.max(1), "fused_w1_b")?;
+        let d_fused_expert_w1s_b = alloc_fused_buf(total_w1_scales.max(1), "fused_w1s_b")?;
+        let d_fused_expert_w2_b = alloc_fused_buf(total_w2_packed.max(1), "fused_w2_b")?;
+        let d_fused_expert_w2s_b = alloc_fused_buf(total_w2_scales.max(1), "fused_w2s_b")?;
+
+        // Sorted MoE buffers for fused kernel dispatch
+        let block_size = 128; // MarlinDefault block_size_m
+        let max_sorted = if has_moe && has_fused {
+            // max: each of M*topk tokens padded up to block_size per expert
+            // Worst case: every expert gets ceil(M*topk/E, block_size) * block_size
+            // Simpler bound: M * topk + n_routed * block_size
+            max_tokens * n_topk + n_routed * block_size
+        } else { 1 };
+
+        let alloc_fused_i32 = |n: usize, name: &str| -> Result<Option<CudaSlice<i32>>, String> {
+            if has_moe && has_fused {
+                Ok(Some(self.device.alloc_zeros::<i32>(n).map_err(|e| format!("alloc {name}: {e}"))?))
+            } else { Ok(None) }
+        };
+        let alloc_fused_u16 = |n: usize, name: &str| -> Result<Option<CudaSlice<u16>>, String> {
+            if has_moe && has_fused {
+                Ok(Some(self.device.alloc_zeros::<u16>(n).map_err(|e| format!("alloc {name}: {e}"))?))
+            } else { Ok(None) }
+        };
+        let alloc_fused_f32 = |n: usize, name: &str| -> Result<Option<CudaSlice<f32>>, String> {
+            if has_moe && has_fused {
+                Ok(Some(self.device.alloc_zeros::<f32>(n).map_err(|e| format!("alloc {name}: {e}"))?))
+            } else { Ok(None) }
+        };
+
+        let max_blocks = if has_moe && has_fused { max_sorted / block_size + n_routed } else { 1 };
+
+        let d_sorted_token_ids = alloc_fused_i32(max_sorted, "sorted_token_ids")?;
+        let d_fused_expert_ids = alloc_fused_i32(max_blocks, "fused_expert_ids")?;
+        let d_num_tokens_post = alloc_fused_i32(1, "num_tokens_post")?;
+        let d_fused_input = alloc_fused_u16(max_sorted * h, "fused_input")?;
+        let d_fused_inter_cache = alloc_fused_u16(max_sorted * w1_n, "fused_inter_cache")?;
+        let d_fused_inter2 = alloc_fused_u16(max_sorted * inter, "fused_inter2")?;
+        let d_fused_output = alloc_fused_u16(max_sorted * h, "fused_output")?;
+        let d_fused_c_tmp = alloc_fused_f32(max_sorted * h, "fused_c_tmp")?;
+
+        // Build engine
+        let topk = config.num_experts_per_tok.max(1);
+        let q_type = if config.expert_bits == 8 {
+            crate::gpu_prefill::ScalarType::U8B128
+        } else {
+            crate::gpu_prefill::ScalarType::U4B8
+        };
+        Ok(PrefillEngine {
+            kernels,
+            config,
+            scratch,
+            layer_weights,
+            moe_layers,
+            embedding_ptr: graph.embedding_ptr,
+            final_norm_ptr: graph.final_norm_ptr,
+            lm_head: extract_marlin(graph.lm_head_wid),
+            rope_cos_ptr: graph.d_rope_cos.as_ref().map_or(0, |c| *c.device_ptr()),
+            rope_sin_ptr: graph.d_rope_sin.as_ref().map_or(0, |c| *c.device_ptr()),
+            kv_k_ptrs: graph.kv_k_ptrs.clone(),
+            kv_v_ptrs: graph.kv_v_ptrs.clone(),
+            kv_max_seq: graph.kv_max_seq,
+            stream: prefill_stream,
+            copy_stream,
+            cublas_handle,
+            h_logits: Vec::new(),
+            h_topk_ids: vec![0i32; max_tokens * topk],
+            h_topk_weights: vec![0.0f32; max_tokens * topk],
+            h_gather_src_map: Vec::new(),
+            h_gather_weight_map: Vec::new(),
+            hcs_cache_fast,
+            hcs_num_experts_per_layer: hcs_ne,
+            dma_event,
+            compute_event,
+            attn_weight_bufs: None,
+            flash_attn_fn: crate::gpu_prefill::load_flash_attn(),
+            shared_stream,
+            shared_event,
+            d_shared_fp32_scratch,
+            d_shared_workspace,
+            d_fused_expert_w1_a,
+            d_fused_expert_w1s_a,
+            d_fused_expert_w2_a,
+            d_fused_expert_w2s_a,
+            d_fused_expert_w1_b,
+            d_fused_expert_w1s_b,
+            d_fused_expert_w2_b,
+            d_fused_expert_w2s_b,
+            fused_expert_buf_cur: 0,
+            w1_packed_per_expert,
+            w1_scales_per_expert,
+            w2_packed_per_expert,
+            w2_scales_per_expert,
+            d_sorted_token_ids,
+            d_fused_expert_ids,
+            d_num_tokens_post,
+            d_fused_input,
+            d_fused_inter_cache,
+            d_fused_inter2,
+            d_fused_output,
+            d_fused_c_tmp,
+            max_sorted,
+            preloaded_moe_layer: None,
+            q_type,
+        })
     }
 
     /// Upload Marlin INT8 repacked weights to GPU and register.
@@ -6012,6 +6743,9 @@ impl GpuDecodeStore {
                         graph.captured_mla_ptrs.push((li, *ckv_cache_ptr, *kpe_cache_ptr));
                     }
                 }
+                GpuAttnConfig::Mamba2 { .. } => {
+                    // Mamba2 state is always GPU-resident, no pointer tracking needed for graph capture
+                }
             }
         }
         eprintln!("[krasis] Pointer snapshot: {} LA ptrs, {} KV ptrs, {} MLA ptrs",
@@ -6198,13 +6932,19 @@ impl GpuDecodeStore {
                     }
                 }
 
-                // Batched silu + w2
+                // Batched activation + w2
+                // Select kernel based on activation type: 0=silu_gated, 1=relu2
+                let is_relu2 = moe.activation_type == 1;
                 let w2_n_tiles = (hs + 15) / 16;
-                let w2_smem = (intermediate * 2 + 1024 * 4 + 64 * 4) as u32;
-                let w2_kernel = if is_int8 {
-                    k.fused_silu_w2_int8_batched.clone()
+                // relu2 input is [K] (up_proj only), silu is [2*K] (gate+up)
+                let w2_input_k = if is_relu2 { intermediate } else { intermediate };
+                let w2_smem = (w2_input_k * 2 + 1024 * 4 + 64 * 4) as u32;
+                let w2_kernel = if is_relu2 {
+                    if is_int8 { k.relu2_w2_int8_batched.clone() }
+                    else { k.relu2_w2_batched.clone() }
                 } else {
-                    k.fused_silu_w2_batched.clone()
+                    if is_int8 { k.fused_silu_w2_int8_batched.clone() }
+                    else { k.fused_silu_w2_batched.clone() }
                 };
                 unsafe {
                     w2_kernel.launch(
@@ -6976,6 +7716,13 @@ impl GpuDecodeStore {
                         let ow = &graph.weights[*o_proj];
                         self.gemv_bf16_internal(ow, *graph.d_scratch.device_ptr(),
                             *graph.d_hidden.device_ptr())?;
+                    }
+
+                    GpuAttnConfig::Mamba2 { .. } => {
+                        // Mamba2 cannot use CUDA graph capture (SSM state changes per token).
+                        // This arm should not be reached in graph-captured decode.
+                        return Err("Mamba2 layers are not compatible with CUDA graph capture. \
+                            Use non-graph decode path.".to_string());
                     }
                 }
 
@@ -8003,6 +8750,14 @@ impl GpuDecodeStore {
                     let nh = *num_heads;
                     let nkv = *num_kv_heads;
                     let hd = *head_dim;
+
+                    // MoE-only layers (Nemotron): 0 heads means skip attention entirely.
+                    // The hidden state passes through norm → MoE without attention.
+                    if nh == 0 {
+                        // Skip attention: attn_out stays zero (via norm, no attn_out added to residual).
+                        // hidden is already in d_hidden after norm, ready for MoE.
+                    } else {
+
                     let kv_stride = nkv * hd;
                     let t_gqa_s1 = Instant::now();
 
@@ -8317,6 +9072,8 @@ impl GpuDecodeStore {
                     }
 
                     gqa_cache_idx += 1;
+
+                    } // end of `if nh > 0` else block (skip MoE-only layers)
                 }
 
                 GpuAttnConfig::MLA {
@@ -8480,7 +9237,7 @@ impl GpuDecodeStore {
                     }
 
                     // ── MLA Step 6: Absorb w_kc (q_nope @ w_kc → q_absorbed) ──
-                    // w_kc is [H, nope, ccd] (padded to ≥512 for FlashInfer MLA)
+                    // w_kc is [H, nope, ccd] (padded to ≥512 for MLA decode)
                     {
                         let threads = 256u32;
                         unsafe {
@@ -8578,6 +9335,159 @@ impl GpuDecodeStore {
                         *graph.d_hidden.device_ptr(),
                     )?;
                 }
+
+                GpuAttnConfig::Mamba2 {
+                    in_proj, out_proj,
+                    conv_weight_ptr, a_ptr, d_ptr, dt_bias_ptr, norm_weight_ptr,
+                    num_heads, head_dim, state_size, expand: _, conv_kernel, conv_dim,
+                    conv_state_ptr, ssm_state_ptr,
+                } => {
+                    // ── Mamba2 Decode Step ──
+                    // 1. in_proj GEMV: hidden -> [z, x_inner, dt, B, C]
+                    let in_w = &graph.weights[*in_proj];
+                    let in_proj_dim = in_w.rows; // total in_proj output dim
+                    let d_inner = num_heads * head_dim;
+                    let n_groups = graph.mamba2_n_groups.max(1);
+
+                    // Output goes to d_scratch (large enough for in_proj output)
+                    self.gemv_bf16_internal(in_w, *graph.d_hidden.device_ptr(),
+                        *graph.d_scratch.device_ptr())?;
+
+                    // Convert in_proj output from BF16 to FP32 in d_fp32_scratch
+                    unsafe {
+                        k.bf16_to_fp32.clone().launch(
+                            LaunchConfig::for_num_elems(in_proj_dim as u32),
+                            (*graph.d_fp32_scratch.device_ptr(),
+                             *graph.d_scratch.device_ptr(),
+                             in_proj_dim as i32),
+                        ).map_err(|e| format!("bf16_to_fp32 mamba2 in_proj[{}]: {:?}", layer_idx, e))?;
+                    }
+
+                    // Split in_proj output: [z(d_inner), xBC(conv_dim), dt(num_heads)]
+                    // xBC = [x(d_inner), B(n_groups*state_size), C(n_groups*state_size)]
+                    let fp32_base = *graph.d_fp32_scratch.device_ptr();
+                    let z_ptr = fp32_base;
+                    let xbc_ptr = fp32_base + (d_inner * 4) as u64;
+                    let dt_ptr = fp32_base + ((d_inner + *conv_dim) * 4) as u64;
+                    // B and C are after x in the xBC segment
+                    let b_ptr = xbc_ptr + (d_inner * 4) as u64;
+                    let c_ptr = b_ptr + (n_groups * state_size * 4) as u64;
+                    // 2. Conv1d: update conv_state, convolve + SiLU
+                    // conv operates on xBC (x + B + C concatenated)
+                    // Output overwrites xBC in-place (same buffer, safe since we read first)
+                    let conv_out_ptr = graph.d_mamba2_conv_out.as_ref()
+                        .map(|b| *b.device_ptr())
+                        .unwrap_or(xbc_ptr); // fallback to xBC
+                    unsafe {
+                        let conv_bias_ptr = graph.mamba2_conv_bias_ptrs
+                            .get(&layer_idx).copied().unwrap_or(0u64);
+                        k.mamba2_conv1d.clone().launch(
+                            LaunchConfig {
+                                grid_dim: ((*conv_dim as u32 + 255) / 256, 1, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            (
+                                *conv_state_ptr,
+                                xbc_ptr,
+                                *conv_weight_ptr,
+                                conv_bias_ptr,
+                                conv_out_ptr,
+                                *conv_dim as i32,
+                                *conv_kernel as i32,
+                            ),
+                        ).map_err(|e| format!("mamba2_conv1d[{}]: {:?}", layer_idx, e))?;
+                    }
+
+                    // After conv1d, the convolved output contains x_conv, B_conv, C_conv
+                    // x_conv is the first d_inner elements of conv_out
+                    let x_conv_ptr = conv_out_ptr;
+                    let b_conv_ptr = conv_out_ptr + (d_inner * 4) as u64;
+                    let c_conv_ptr = b_conv_ptr + (n_groups * state_size * 4) as u64;
+
+                    // 3. Discretize: dt, A_bar, B_bar
+                    // Use tail of fp32_scratch for temporaries
+                    let scratch_offset = in_proj_dim;
+                    let dt_out_ptr = fp32_base + (scratch_offset * 4) as u64;
+                    let a_bar_ptr = dt_out_ptr + (*num_heads * 4) as u64;
+                    let b_bar_ptr = a_bar_ptr + (*num_heads * 4) as u64;
+                    unsafe {
+                        k.mamba2_discretize.clone().launch(
+                            LaunchConfig {
+                                grid_dim: (1, 1, 1),
+                                block_dim: ((*num_heads as u32).max(1), 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            (
+                                dt_ptr,
+                                *dt_bias_ptr,
+                                *a_ptr,
+                                b_conv_ptr,
+                                dt_out_ptr,
+                                a_bar_ptr,
+                                b_bar_ptr,
+                                *num_heads as i32,
+                                *state_size as i32,
+                                n_groups as i32,
+                            ),
+                        ).map_err(|e| format!("mamba2_discretize[{}]: {:?}", layer_idx, e))?;
+                    }
+
+                    // 4. SSM step: h = A_bar*h + B_bar*x, y = C*h
+                    let y_ptr = dt_out_ptr + ((*num_heads + *num_heads + *num_heads * state_size) * 4) as u64;
+                    unsafe {
+                        k.mamba2_ssm_step.clone().launch(
+                            LaunchConfig {
+                                grid_dim: (*num_heads as u32, 1, 1),
+                                block_dim: ((*head_dim as u32).min(256), 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            (
+                                *ssm_state_ptr,
+                                x_conv_ptr,
+                                a_bar_ptr,
+                                b_bar_ptr,
+                                c_conv_ptr,
+                                y_ptr,
+                                *num_heads as i32,
+                                *head_dim as i32,
+                                *state_size as i32,
+                                n_groups as i32,
+                            ),
+                        ).map_err(|e| format!("mamba2_ssm_step[{}]: {:?}", layer_idx, e))?;
+                    }
+
+                    // 5. Gate + skip + per-group RMSNorm:
+                    // output = norm_weight * groupRMSNorm(silu(z) * (y + D*x_conv)) -> BF16
+                    // x_conv (post-conv) is the correct x for D skip, NOT x_inner (pre-conv)
+                    let group_size = d_inner / n_groups;
+                    unsafe {
+                        k.mamba2_gate_output.clone().launch(
+                            LaunchConfig {
+                                grid_dim: (n_groups as u32, 1, 1),  // one block per group
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: (256 + group_size) as u32 * 4,  // reduction + gated values
+                            },
+                            (
+                                z_ptr,
+                                y_ptr,
+                                *d_ptr,
+                                x_conv_ptr,  // post-conv x, NOT pre-conv x_inner
+                                *norm_weight_ptr,
+                                *graph.d_scratch.device_ptr(),  // BF16 output
+                                d_inner as i32,
+                                *head_dim as i32,
+                                n_groups as i32,
+                                eps,
+                            ),
+                        ).map_err(|e| format!("mamba2_gate_output[{}]: {:?}", layer_idx, e))?;
+                    }
+
+                    // 6. out_proj GEMV: d_inner -> hidden_size
+                    let out_w = &graph.weights[*out_proj];
+                    self.gemv_bf16_internal(out_w, *graph.d_scratch.device_ptr(),
+                        *graph.d_hidden.device_ptr())?;
+                }
             }
 
             // Timing: after attention
@@ -8588,12 +9498,15 @@ impl GpuDecodeStore {
                 match &layer.attn {
                     GpuAttnConfig::LinearAttention { .. } => graph.t_attn_la += attn_elapsed,
                     GpuAttnConfig::GQA { .. } => graph.t_attn_gqa += attn_elapsed,
+                    GpuAttnConfig::Mamba2 { .. } => graph.t_attn_la += attn_elapsed, // reuse LA timing
                     _ => {}
                 }
             }
 
             // ── Post-attention norm (fused residual add + RMSNorm) ──
-            {
+            // Nemotron layers: post_attn_norm_size==0 means skip (single-sublayer blocks).
+            // The mixer output in d_hidden will be added to d_residual by the NEXT layer's pre-norm.
+            if layer.post_attn_norm_size > 0 {
                 let smem = (hs as u32) * 4;
                 let threads = 256u32.min(hs as u32);
                 let cfg = LaunchConfig {
@@ -8641,24 +9554,55 @@ impl GpuDecodeStore {
             }
             log::trace!("gpu_decode_step: layer {} mlp/moe (has_moe={})", layer_idx, has_moe);
             if has_moe {
-                // Use the fast Rust MoE forward path (HCS + double-buffered DMA)
-                // d_hidden → MoE → d_moe_out, then add d_moe_out to d_hidden
+                // Check for LatentMoE: apply fc1_latent_proj before MoE dispatch
+                let has_latent = graph.moe_layers.get(layer_idx)
+                    .and_then(|m| m.as_ref())
+                    .map(|m| m.latent_down_wid.is_some())
+                    .unwrap_or(false);
+
+                if has_latent {
+                    let moe = graph.moe_layers[layer_idx].as_ref().unwrap();
+                    let ld_wid = moe.latent_down_wid.unwrap();
+                    // fc1_latent_proj: d_hidden -> d_scratch (latent input in BF16)
+                    // d_scratch is safe here: not used by gate GEMV (which uses d_fp32_scratch)
+                    // and not read again until after all w13 GEMVs complete.
+                    let ld_w = &graph.weights[ld_wid];
+                    self.gemv_bf16_internal(ld_w, *graph.d_hidden.device_ptr(),
+                        *graph.d_scratch.device_ptr())?;
+                    // Tell moe_forward to use d_scratch as expert input instead of d_hidden
+                    graph.moe_input_override_ptr = *graph.d_scratch.device_ptr();
+                }
+
+                // MoE forward: gate reads d_hidden (always), experts read override ptr (if set)
                 self.moe_forward_with_graph(graph, layer_idx)
                     .map_err(|e| format!("moe_forward[{}]: {}", layer_idx, e))?;
 
-                // Add MoE output to hidden state: d_hidden = d_moe_out
-                // (MoE output replaces hidden, residual stream continues)
-                let t_d2d = Instant::now();
-                unsafe {
-                    let err = cuda_sys::lib().cuMemcpyDtoD_v2(
-                        *graph.d_hidden.device_ptr(),
-                        *graph.d_moe_out.device_ptr(),
-                        hs * 2); // BF16
-                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                        return Err(format!("D2D moe_out->hidden[{}]: {:?}", layer_idx, err));
-                    }
+                // Reset override for next layer
+                graph.moe_input_override_ptr = 0;
+
+                if has_latent {
+                    let moe = graph.moe_layers[layer_idx].as_ref().unwrap();
+                    let lu_wid = moe.latent_up_wid.unwrap();
+                    // fc2_latent_proj: d_moe_out(latent_size) -> d_hidden(hidden_size)
+                    let lu_w = &graph.weights[lu_wid];
+                    self.gemv_bf16_internal(lu_w, *graph.d_moe_out.device_ptr(),
+                        *graph.d_hidden.device_ptr())?;
                 }
-                if timing { graph.t_moe_d2d_copy += (Instant::now() - t_d2d).as_secs_f64(); }
+
+                // Copy MoE output to hidden state (skip if latent already wrote to d_hidden)
+                if !has_latent {
+                    let t_d2d = Instant::now();
+                    unsafe {
+                        let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                            *graph.d_hidden.device_ptr(),
+                            *graph.d_moe_out.device_ptr(),
+                            hs * 2); // BF16
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(format!("D2D moe_out->hidden[{}]: {:?}", layer_idx, err));
+                        }
+                    }
+                    if timing { graph.t_moe_d2d_copy += (Instant::now() - t_d2d).as_secs_f64(); }
+                }
                 #[cfg(feature = "gpu-debug")]
                 {
                     self.device.synchronize().map_err(|e| format!("sync moe dbg: {:?}", e))?;
@@ -10345,6 +11289,10 @@ impl GpuDecodeStore {
 
                 GpuAttnConfig::MLA { .. } => {
                     return Err("MLA not implemented for batched decode".to_string());
+                }
+
+                GpuAttnConfig::Mamba2 { .. } => {
+                    return Err("Mamba2 not implemented for batched decode".to_string());
                 }
             }
 
@@ -12476,6 +13424,11 @@ impl GpuDecodeStore {
             gate_bias_ptr: gate_bias_ptr as u64,
             e_score_corr_ptr: e_score_corr_ptr as u64,
             shared_gate_wid,
+            activation_type: 0,     // silu_gated (default for existing models)
+            gated_experts: true,    // existing models have gate_proj+up_proj
+            latent_down_wid: None,  // no latent projections for standard MoE
+            latent_up_wid: None,
+            moe_input_size: 0,     // 0 = use hidden_size (standard MoE)
         });
 
         // Pin shared expert in VRAM if present (Certainty Rule: always accessed, zero DMA at runtime)
@@ -13432,6 +14385,8 @@ impl GpuDecodeStore {
         let gate_bias_ptr = moe.gate_bias_ptr;
         let e_score_corr_ptr = moe.e_score_corr_ptr;
         let is_int8 = graph.expert_bits == 8;
+        let act_type = moe.activation_type;
+        let gated = moe.gated_experts;
         let inv_wp = if is_int8 {
             *graph.d_inv_weight_perm_int8.device_ptr()
         } else {
@@ -13439,9 +14394,20 @@ impl GpuDecodeStore {
         };
         let inv_sp = *graph.d_inv_scale_perm.device_ptr();
 
+        // LatentMoE: expert input/output dimension may differ from hidden_size
+        let expert_hs = if moe.moe_input_size > 0 { moe.moe_input_size } else { hs };
+        // Expert w13 input pointer: d_scratch (latent) for LatentMoE, d_hidden for standard
+        let expert_input_ptr = if graph.moe_input_override_ptr != 0 {
+            graph.moe_input_override_ptr
+        } else {
+            *graph.d_hidden.device_ptr()
+        };
+
         // v2 K-split config for w13 GEMV (only use v2 if k_splits > 1)
-        let w13_n = 2 * intermediate;
-        let w13_k_tiles = hs / 16;
+        // For ungated experts: w13_n = intermediate (up_proj only)
+        // For gated experts: w13_n = 2 * intermediate (gate_proj + up_proj)
+        let w13_n = if gated { 2 * intermediate } else { intermediate };
+        let w13_k_tiles = expert_hs / 16;
         let w13_max_ksplits = w13_k_tiles / 16;
         let w13_ksplits = if w13_max_ksplits > 1 {
             let n_tiles = (w13_n + 15) / 16;
@@ -13833,9 +14799,10 @@ impl GpuDecodeStore {
         // ── Step 5: Zero d_moe_out accumulator ──
         {
             unsafe {
+                // For LatentMoE: only zero expert_hs elements (latent_size, not hidden_size)
                 k.zero_bf16.clone().launch(
-                    LaunchConfig::for_num_elems(hs as u32),
-                    (*graph.d_moe_out.device_ptr(), hs as i32),
+                    LaunchConfig::for_num_elems(expert_hs as u32),
+                    (*graph.d_moe_out.device_ptr(), expert_hs as i32),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("zero_bf16: {:?}", e)))?;
             }
@@ -14064,7 +15031,7 @@ impl GpuDecodeStore {
 
             // Batched w13 GEMV v2: all HCS experts in one launch
             let w13_n_tiles = (w13_n + 15) / 16;
-            let w13_smem = (hs * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
+            let w13_smem = (expert_hs * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
             let w13_kernel = if is_int8 {
                 k.marlin_gemv_int8_v2_batched.clone()
             } else {
@@ -14080,10 +15047,10 @@ impl GpuDecodeStore {
                     (
                         d_w13p,
                         d_w13s,
-                        *graph.d_hidden.device_ptr(),
+                        expert_input_ptr,
                         *graph.d_batch_partials.device_ptr(),
                         inv_wp, inv_sp,
-                        hs as i32, w13_n as i32, gs as i32, w13_ksplits as i32,
+                        expert_hs as i32, w13_n as i32, gs as i32, w13_ksplits as i32,
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("batched w13 v2: {:?}", e)))?;
@@ -14112,13 +15079,19 @@ impl GpuDecodeStore {
             }
             let t_silu_w2 = Instant::now();
 
-            // Batched silu+w2 GEMV: all experts in one launch, writes to per-expert output
-            let w2_n_tiles = (hs + 15) / 16;
+            // Batched activation+w2 GEMV: all experts in one launch
+            // For relu2 (act_type=1): use relu2_w2 kernel (ungated, relu^2 activation)
+            // For silu (act_type=0): use fused_silu_w2 kernel (gated, SiLU*gate activation)
+            let w2_n_tiles = (expert_hs + 15) / 16;
             let w2_smem = (intermediate * 2 + 1024 * 4 + 64 * 4) as u32;
-            let w2_kernel = if is_int8 {
-                k.fused_silu_w2_int8_batched.clone()
+            let w2_kernel = if act_type == 1 {
+                // relu2: ungated experts
+                if is_int8 { k.relu2_w2_int8_batched.clone() }
+                else { k.relu2_w2_batched.clone() }
             } else {
-                k.fused_silu_w2_batched.clone()
+                // silu: gated experts
+                if is_int8 { k.fused_silu_w2_int8_batched.clone() }
+                else { k.fused_silu_w2_batched.clone() }
             };
             unsafe {
                 w2_kernel.launch(
@@ -14133,17 +15106,17 @@ impl GpuDecodeStore {
                         *graph.d_batch_gate_ups.device_ptr(),
                         *graph.d_batch_expert_outs.device_ptr(),
                         inv_wp, inv_sp,
-                        intermediate as i32, hs as i32, gs as i32,
+                        intermediate as i32, expert_hs as i32, gs as i32,
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("batched silu_w2: {:?}", e)))?;
+                    format!("batched w2: {:?}", e)))?;
             }
 
             // Multi-expert weighted add: sum all expert outputs into moe_out
             unsafe {
                 k.multi_expert_weighted_add_bf16.clone().launch(
                     LaunchConfig {
-                        grid_dim: (((hs + 255) / 256) as u32, 1, 1),
+                        grid_dim: (((expert_hs + 255) / 256) as u32, 1, 1),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     },
@@ -14151,7 +15124,7 @@ impl GpuDecodeStore {
                         *graph.d_moe_out.device_ptr(),
                         *graph.d_batch_expert_outs.device_ptr(),
                         d_wts,
-                        hs as i32, hcs_batch_count as i32,
+                        expert_hs as i32, hcs_batch_count as i32,
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("multi_expert_weighted_add: {:?}", e)))?;
@@ -14173,9 +15146,9 @@ impl GpuDecodeStore {
                 if use_v2_w13 {
                     self.launch_marlin_gemv_v2(
                         w13p, w13s,
-                        *graph.d_hidden.device_ptr(),
+                        expert_input_ptr,
                         partial_ptr, inv_wp, inv_sp,
-                        hs, w13_n, gs, w13_ksplits, k, is_int8,
+                        expert_hs, w13_n, gs, w13_ksplits, k, is_int8,
                     )?;
                     self.launch_reduce_ksplits_bf16(
                         *graph.d_expert_gate_up.device_ptr(),
@@ -14185,10 +15158,10 @@ impl GpuDecodeStore {
                 } else {
                     self.launch_marlin_gemv_raw(
                         w13p, w13s,
-                        *graph.d_hidden.device_ptr(),
+                        expert_input_ptr,
                         *graph.d_expert_gate_up.device_ptr(),
                         inv_wp, inv_sp,
-                        hs, w13_n, gs, is_int8,
+                        expert_hs, w13_n, gs, is_int8,
                     )?;
                 }
                 self.launch_fused_silu_accum(
@@ -14196,7 +15169,7 @@ impl GpuDecodeStore {
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs,
+                    intermediate, expert_hs, gs,
                     weight, 0u64, k, is_int8,
                 )?;
             }
@@ -14293,13 +15266,13 @@ impl GpuDecodeStore {
                 // Compute from buf[slot]
                 let t_dma_compute = Instant::now();
                 let base = buf_base[slot];
-                // w13 GEMV: hidden -> gate_up (v2 K-split if beneficial)
+                // w13 GEMV: expert_input -> gate_up (v2 K-split if beneficial)
                 if use_v2_w13 {
                     self.launch_marlin_gemv_v2(
                         base + w13p_off as u64, base + w13s_off as u64,
-                        *graph.d_hidden.device_ptr(),
+                        expert_input_ptr,
                         partial_ptr, inv_wp, inv_sp,
-                        hs, w13_n, gs, w13_ksplits, k, is_int8,
+                        expert_hs, w13_n, gs, w13_ksplits, k, is_int8,
                     )?;
                     self.launch_reduce_ksplits_bf16(
                         *graph.d_expert_gate_up.device_ptr(),
@@ -14309,10 +15282,10 @@ impl GpuDecodeStore {
                 } else {
                     self.launch_marlin_gemv_raw(
                         base + w13p_off as u64, base + w13s_off as u64,
-                        *graph.d_hidden.device_ptr(),
+                        expert_input_ptr,
                         *graph.d_expert_gate_up.device_ptr(),
                         inv_wp, inv_sp,
-                        hs, w13_n, gs, is_int8,
+                        expert_hs, w13_n, gs, is_int8,
                     )?;
                 }
 
@@ -14330,13 +15303,13 @@ impl GpuDecodeStore {
                         eid, vals[0], vals[1], vals[2], vals[3], weight);
                 }
 
-                // Fused: silu_mul + w2 GEMV + weighted_add (3 launches -> 1)
+                // Fused: activation + w2 GEMV + weighted_add (3 launches -> 1)
                 self.launch_fused_silu_accum(
                     base + w2p_off as u64, base + w2s_off as u64,
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs,
+                    intermediate, expert_hs, gs,
                     weight, 0u64,
                     k, is_int8,
                 )?;
@@ -14396,13 +15369,13 @@ impl GpuDecodeStore {
                     cuda_sys::lib().cuStreamWaitEvent(default_stream, ev_dma_w13, 0);
                 }
 
-                // w13 GEMV: hidden -> gate_up (v2 K-split if beneficial)
+                // w13 GEMV: expert_input -> gate_up (v2 K-split if beneficial)
                 if use_v2_w13 {
                     self.launch_marlin_gemv_v2(
                         buf_w13_packed, buf_w13_scales,
-                        *graph.d_hidden.device_ptr(),
+                        expert_input_ptr,
                         partial_ptr, inv_wp, inv_sp,
-                        hs, w13_n, gs, w13_ksplits, k, is_int8,
+                        expert_hs, w13_n, gs, w13_ksplits, k, is_int8,
                     )?;
                     self.launch_reduce_ksplits_bf16(
                         *graph.d_expert_gate_up.device_ptr(),
@@ -14412,10 +15385,10 @@ impl GpuDecodeStore {
                 } else {
                     self.launch_marlin_gemv_raw(
                         buf_w13_packed, buf_w13_scales,
-                        *graph.d_hidden.device_ptr(),
+                        expert_input_ptr,
                         *graph.d_expert_gate_up.device_ptr(),
                         inv_wp, inv_sp,
-                        hs, w13_n, gs, is_int8,
+                        expert_hs, w13_n, gs, is_int8,
                     )?;
                 }
 
@@ -14440,13 +15413,13 @@ impl GpuDecodeStore {
                     cuda_sys::lib().cuStreamWaitEvent(default_stream, ev_dma_w2, 0);
                 }
 
-                // Fused: silu_mul + w2 GEMV + weighted_add (3 launches -> 1)
+                // Fused: activation + w2 GEMV + weighted_add (3 launches -> 1)
                 self.launch_fused_silu_accum(
                     buf_w2_packed, buf_w2_scales,
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs,
+                    intermediate, expert_hs, gs,
                     weight, 0u64,
                     k, is_int8,
                 )?;
@@ -14575,12 +15548,12 @@ impl GpuDecodeStore {
         if rsf != 1.0 {
             unsafe {
                 k.scale_bf16.clone().launch(
-                    LaunchConfig::for_num_elems(hs as u32),
+                    LaunchConfig::for_num_elems(expert_hs as u32),
                     (
                         *graph.d_moe_out.device_ptr(),
                         *graph.d_moe_out.device_ptr(),
                         rsf,
-                        hs as i32,
+                        expert_hs as i32,
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("scale_bf16: {:?}", e)))?;
@@ -14800,12 +15773,10 @@ impl GpuDecodeStore {
         );
 
         let mut max_expert_bytes = 0usize;
-        let first_k_dense = config.first_k_dense_replace;
 
         for moe_idx in 0..n_moe_layers {
             // Map MoE layer index to absolute layer index
-            // (e.g. QCN has first_k_dense_replace=1, so moe_idx 0 = abs layer 1)
-            let abs_layer_idx = moe_idx + first_k_dense;
+            let abs_layer_idx = config.moe_abs_layer(moe_idx);
 
             // Upload gate weight as FP32 to VRAM
             let (gate_bf16, correction_bias) = engine.get_routing_weights(moe_idx)
@@ -15268,7 +16239,7 @@ impl GpuDecodeStore {
         ));
 
         // Extrapolate to full model decode
-        let num_moe_layers = config.num_hidden_layers - config.first_k_dense_replace;
+        let num_moe_layers = config.num_moe_layers();
         let estimated_moe_time = avg_total * num_moe_layers as f64;
         results.push(format!(
             "Estimated MoE decode: {:.1}ms for {} layers → {:.1} tok/s (MoE-only, no attention)",

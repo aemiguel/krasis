@@ -1,0 +1,25 @@
+{
+  "atol": 0.001,
+  "rtol": 0.001,
+  "note": "ReLU\u00b2 M=128 N=2048",
+  "inputs": {
+    "x": {
+      "file": "input_x.bin",
+      "shape": [
+        128,
+        2048
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        128,
+        2048
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

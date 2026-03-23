@@ -20,11 +20,7 @@ except ImportError:
     # Native module not built yet
     pass
 
-try:
-    from krasis.gpu_prefill import GpuPrefillManager
-except ImportError:
-    # SGLang/sgl_kernel not available
-    pass
+# GpuPrefillManager removed — Rust prefill engine replaces it
 
 try:
     from krasis.vram_budget import compute_vram_budget, compute_launcher_budget

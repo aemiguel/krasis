@@ -1,0 +1,49 @@
+{
+  "atol": 0.0,
+  "rtol": 0.0,
+  "note": "Uninterleave QKVZ M=32 nk=8 dk=128 hr=4 dv=128 (exact permutation)",
+  "inputs": {
+    "qkvz": {
+      "file": "input_qkvz.bin",
+      "shape": [
+        32,
+        10240
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "q": {
+      "file": "expected_q.bin",
+      "shape": [
+        32,
+        1024
+      ],
+      "dtype": "bf16"
+    },
+    "k": {
+      "file": "expected_k.bin",
+      "shape": [
+        32,
+        1024
+      ],
+      "dtype": "bf16"
+    },
+    "v": {
+      "file": "expected_v.bin",
+      "shape": [
+        32,
+        4096
+      ],
+      "dtype": "bf16"
+    },
+    "z": {
+      "file": "expected_z.bin",
+      "shape": [
+        32,
+        4096
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

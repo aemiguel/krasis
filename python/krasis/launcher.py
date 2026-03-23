@@ -1058,7 +1058,7 @@ class Launcher:
                 rank.get("shared_expert_mb", 0) +
                 rank.get("dense_mlp_mb", 0) +
                 rank.get("lm_head_mb", 0) +
-                rank.get("flashinfer_mb", 0) +
+                rank.get("prefill_scratch_mb", 0) +
                 rank.get("prefill_workspace_mb", 0) +
                 rank.get("cuda_overhead_mb", 0)
             )
@@ -1472,7 +1472,7 @@ class Launcher:
             overhead_mb = int(
                 rank.get("embedding_mb", 0) + rank.get("norms_gates_mb", 0) +
                 rank.get("shared_expert_mb", 0) + rank.get("dense_mlp_mb", 0) +
-                rank.get("lm_head_mb", 0) + rank.get("flashinfer_mb", 0) +
+                rank.get("lm_head_mb", 0) + rank.get("prefill_scratch_mb", 0) +
                 rank.get("prefill_workspace_mb", 0) + rank.get("cuda_overhead_mb", 0)
             )
             kv_label = "fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16"
@@ -1735,27 +1735,8 @@ def _check_gpu_deps():
         # Add to PATH so subprocess/ninja can find nvcc
         if cuda_bin not in os.environ.get("PATH", ""):
             os.environ["PATH"] = cuda_bin + ":" + os.environ.get("PATH", "")
-        # Set CUDA_HOME so PyTorch/FlashInfer JIT find the right toolkit
+        # Set CUDA_HOME so PyTorch JIT finds the right toolkit
         os.environ["CUDA_HOME"] = cuda_home
-
-        # Clear stale FlashInfer JIT cache if it references a missing nvcc.
-        # FlashInfer caches ninja build files with absolute nvcc paths —
-        # if nvcc moved (e.g. old /usr/bin/nvcc removed), the cache is broken.
-        import glob
-        fi_cache = os.path.expanduser("~/.cache/flashinfer")
-        if os.path.isdir(fi_cache):
-            for build_ninja in glob.glob(os.path.join(fi_cache, "**/build.ninja"), recursive=True):
-                try:
-                    with open(build_ninja) as f:
-                        content = f.read()
-                    # Check if the cached nvcc path still exists
-                    if "/usr/bin/nvcc" in content and not os.path.isfile("/usr/bin/nvcc"):
-                        # Stale cache — remove the containing directory
-                        cache_dir = os.path.dirname(build_ninja)
-                        import shutil as _shutil
-                        _shutil.rmtree(cache_dir, ignore_errors=True)
-                except OSError:
-                    pass
 
     problems = []
 
@@ -1777,36 +1758,8 @@ def _check_gpu_deps():
     except ImportError:
         problems.append("PyTorch")
 
-    # Check GPU packages
-    for pkg, import_name in [("flashinfer", "flashinfer"),
-                              ("sgl-kernel", "sgl_kernel"),
-                              ("sglang", "sglang")]:
-        try:
-            __import__(import_name)
-        except ImportError:
-            problems.append(pkg)
-
-    # Check Triton has GPU support (not CPU fallback)
-    try:
-        import triton
-        if not hasattr(triton, 'runtime') or not hasattr(triton.runtime, 'driver'):
-            problems.append("triton (no GPU backend)")
-        else:
-            # Try to get a CUDA driver — this fails if Triton fell back to CPU
-            try:
-                driver = triton.runtime.driver.active
-                if driver is None or 'cpu' in str(type(driver)).lower():
-                    problems.append("triton (GPU backend unavailable — check CUDA)")
-            except Exception:
-                pass  # older triton versions may not have this
-    except ImportError:
-        problems.append("triton")
-
-    # Check Python.h headers (needed for FlashInfer JIT compilation)
-    import sysconfig
-    inc = sysconfig.get_path("include")
-    if not inc or not os.path.isfile(os.path.join(inc, "Python.h")):
-        problems.append(f"python{sys.version_info.major}.{sys.version_info.minor}-dev (Python.h headers)")
+    # GPU packages: sgl-kernel no longer needed (Marlin GEMM is vendored)
+    # Triton no longer required (Rust prefill uses compiled CUDA kernels)
 
     if problems:
         print(f"{RED}Missing GPU dependencies: {', '.join(problems)}{NC}")

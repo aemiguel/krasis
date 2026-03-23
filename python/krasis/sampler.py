@@ -1,9 +1,8 @@
-"""Token sampling using FlashInfer kernels."""
+"""Token sampling using torch."""
 
 from typing import Optional, Set
 
 import torch
-from flashinfer.sampling import top_k_top_p_sampling_from_logits
 
 
 def sample(
@@ -41,8 +40,25 @@ def sample(
     if temperature != 1.0:
         logits = logits / temperature
 
-    # FlashInfer 0.6.1: returns single tensor of sampled token IDs
-    samples = top_k_top_p_sampling_from_logits(
-        logits, top_k=top_k, top_p=top_p, filter_apply_order="joint",
-    )
+    # Top-k filtering
+    if top_k > 0:
+        top_k = min(top_k, logits.size(-1))
+        topk_vals, _ = torch.topk(logits, top_k, dim=-1)
+        threshold = topk_vals[:, -1].unsqueeze(-1)
+        logits = logits.where(logits >= threshold, torch.tensor(float('-inf'), device=logits.device))
+
+    # Top-p (nucleus) filtering
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probs > top_p
+        # Shift so that first token above threshold is kept
+        sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+        sorted_indices_to_remove[:, 0] = False
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits = logits.masked_fill(indices_to_remove, float('-inf'))
+
+    probs = torch.softmax(logits, dim=-1)
+    samples = torch.multinomial(probs, num_samples=1).squeeze(-1)
     return samples.to(torch.int32)

@@ -1,0 +1,89 @@
+{
+  "atol": 0.0001,
+  "rtol": 0.0001,
+  "note": "LA chunk recurrence nv=4 cs=8 dk=16 dv=16. Tests compute_v_new + chunk_output + state_update.",
+  "inputs": {
+    "q": {
+      "file": "input_q.bin",
+      "shape": [
+        4,
+        8,
+        16
+      ],
+      "dtype": "f32"
+    },
+    "k": {
+      "file": "input_k.bin",
+      "shape": [
+        4,
+        8,
+        16
+      ],
+      "dtype": "f32"
+    },
+    "v_corr": {
+      "file": "input_v_corr.bin",
+      "shape": [
+        4,
+        8,
+        16
+      ],
+      "dtype": "f32"
+    },
+    "k_cumd": {
+      "file": "input_k_cumd.bin",
+      "shape": [
+        4,
+        8,
+        16
+      ],
+      "dtype": "f32"
+    },
+    "g_cum": {
+      "file": "input_g_cum.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "f32"
+    },
+    "state": {
+      "file": "input_state.bin",
+      "shape": [
+        4,
+        16,
+        16
+      ],
+      "dtype": "f32"
+    }
+  },
+  "outputs": {
+    "v_new": {
+      "file": "expected_v_new.bin",
+      "shape": [
+        4,
+        8,
+        16
+      ],
+      "dtype": "f32"
+    },
+    "output": {
+      "file": "expected_output.bin",
+      "shape": [
+        4,
+        8,
+        16
+      ],
+      "dtype": "f32"
+    },
+    "state_out": {
+      "file": "expected_state_out.bin",
+      "shape": [
+        4,
+        16,
+        16
+      ],
+      "dtype": "f32"
+    }
+  }
+}

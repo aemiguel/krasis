@@ -175,13 +175,19 @@ class WeightLoader:
 
     def load_embedding(self, device: torch.device) -> torch.Tensor:
         """Load embedding table (BF16, ~2.2 GB for Kimi K2.5)."""
+        # Nemotron uses "embeddings" instead of "embed_tokens"
         name = f"{self.cfg.layers_prefix}.embed_tokens.weight"
+        if name not in self._weight_map:
+            name = f"{self.cfg.layers_prefix}.embeddings.weight"
         logger.info("Loading embedding: %s", name)
         return self._load_bf16(name, device)
 
     def load_final_norm(self, device: torch.device) -> torch.Tensor:
         """Load final RMSNorm weight (BF16, tiny)."""
+        # Nemotron uses "norm_f" instead of "norm"
         name = f"{self.cfg.layers_prefix}.norm.weight"
+        if name not in self._weight_map:
+            name = f"{self.cfg.layers_prefix}.norm_f.weight"
         logger.info("Loading final norm: %s", name)
         w = self._load_bf16(name, device)
         if self.cfg.norm_bias_one:
@@ -469,6 +475,98 @@ class WeightLoader:
 
         return weights
 
+    def load_mamba2_weights(
+        self, layer_idx: int, device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Load Mamba2 SSM weights for one layer (Nemotron-H).
+
+        Loads: in_proj, out_proj (quantizable projections),
+               conv1d.weight, conv1d.bias, A_log, D, dt_bias, norm.weight (always BF16/FP32).
+        """
+        # Nemotron-H uses "mixer" instead of "self_attn"
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mixer"
+        weights = {}
+
+        # Large projections (quantizable via Marlin for decode)
+        weights["in_proj"] = self._load_bf16(f"{prefix}.in_proj.weight", device)
+        weights["out_proj"] = self._load_bf16(f"{prefix}.out_proj.weight", device)
+
+        # Small SSM parameters — always FP32 for numerical precision
+        weights["conv1d_weight"] = self._load_bf16(f"{prefix}.conv1d.weight", device)
+        conv_bias_name = f"{prefix}.conv1d.bias"
+        if conv_bias_name in self._weight_map:
+            weights["conv1d_bias"] = self._load_bf16(conv_bias_name, device)
+        weights["A_log"] = self._load_bf16(f"{prefix}.A_log", device)
+        weights["D"] = self._load_bf16(f"{prefix}.D", device)
+        weights["dt_bias"] = self._load_bf16(f"{prefix}.dt_bias", device)
+        weights["norm_weight"] = self._load_bf16(f"{prefix}.norm.weight", device)
+
+        return weights
+
+    def load_nemotron_attention_weights(
+        self, layer_idx: int, device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Load GQA attention weights for a Nemotron-H attention layer.
+
+        Same structure as standard GQA but uses 'mixer' prefix instead of 'self_attn'.
+        """
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mixer"
+        weights = {}
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            weights[proj] = self._load_bf16(f"{prefix}.{proj}.weight", device)
+        return weights
+
+    def load_latent_moe_projections(
+        self, layer_idx: int, device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Load LatentMoE latent projections for a Nemotron-H MoE layer.
+
+        Returns fc1_latent_proj (hidden -> latent) and fc2_latent_proj (latent -> hidden).
+        """
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mixer"
+        return {
+            "fc1_latent_proj": self._load_bf16(f"{prefix}.fc1_latent_proj.weight", device),
+            "fc2_latent_proj": self._load_bf16(f"{prefix}.fc2_latent_proj.weight", device),
+        }
+
+    def load_nemotron_moe_gate(
+        self, layer_idx: int, device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Load MoE gate for a Nemotron-H layer (uses 'mixer.gate' prefix)."""
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mixer.gate"
+        result = {
+            "weight": self._load_bf16(f"{prefix}.weight", device),
+        }
+        corr_name = f"{prefix}.e_score_correction_bias"
+        if corr_name in self._weight_map:
+            result["e_score_correction_bias"] = self._load_bf16(corr_name, device)
+        return result
+
+    def load_nemotron_shared_expert(
+        self, layer_idx: int, device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Load shared expert for Nemotron-H (relu2 activation, no gate_proj)."""
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mixer.shared_experts"
+        load = self._load_and_quantize if self.quant_cfg.shared_expert == "int8" else self._load_bf16
+        return {
+            "up_proj": load(f"{prefix}.up_proj.weight", device),
+            "down_proj": load(f"{prefix}.down_proj.weight", device),
+        }
+
+    def load_nemotron_layer_norm(
+        self, layer_idx: int, device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Load layer norm for Nemotron-H (single norm per layer, no post_attn_norm).
+
+        Nemotron blocks have exactly one mixer (Mamba2/MoE/Attention) with pre-norm only.
+        post_attention_layernorm is set to None to signal the decode loop to skip it.
+        """
+        name = f"{self.cfg.layers_prefix}.layers.{layer_idx}.norm.weight"
+        return {
+            "input_layernorm": self._load_bf16(name, device),
+            "post_attention_layernorm": None,  # signal: skip post_attn_norm
+        }
+
     def load_layer(
         self, layer_idx: int, device: torch.device,
         attn_device: torch.device = None,
@@ -482,14 +580,17 @@ class WeightLoader:
 
         Returns a dict with:
         - "norms": {input_layernorm, post_attention_layernorm}
-        - "attention" or "linear_attention": attention weights
-        - "layer_type": "linear_attention" or "full_attention"
-        - "mlp": dense MLP weights (if dense layer) OR MoE gate + shared expert
+        - "attention" or "linear_attention" or "mamba2": attention/SSM weights
+        - "layer_type": "linear_attention" | "full_attention" | "mamba2" | "moe"
         - "is_moe": bool
         """
         if attn_device is None:
             attn_device = device
         start = time.perf_counter()
+
+        # Nemotron-H: dispatch by hybrid_override_pattern layer type
+        if self.cfg.is_nemotron_h:
+            return self._load_nemotron_layer(layer_idx, device, start)
 
         is_linear = self.cfg.is_linear_attention_layer(layer_idx)
         if is_linear:
@@ -526,6 +627,52 @@ class WeightLoader:
         logger.info(
             "Layer %d loaded in %.1fs (GPU alloc: %.0f MB, moe=%s, type=%s)",
             layer_idx, elapsed, alloc_mb, result["is_moe"], layer_type,
+        )
+        return result
+
+    def _load_nemotron_layer(
+        self, layer_idx: int, device: torch.device, start: float,
+    ) -> Dict[str, any]:
+        """Load a Nemotron-H layer based on the hybrid pattern type."""
+        layer_type = self.cfg.layer_types[layer_idx]
+        norms = self.load_nemotron_layer_norm(layer_idx, device)
+
+        if layer_type == "mamba2":
+            result = {
+                "norms": norms,
+                "is_moe": False,
+                "layer_type": "mamba2",
+                "mamba2": self.load_mamba2_weights(layer_idx, device),
+            }
+        elif layer_type == "moe":
+            result = {
+                "norms": norms,
+                "is_moe": True,
+                "layer_type": "moe",
+                "gate": self.load_nemotron_moe_gate(layer_idx, device),
+            }
+            # LatentMoE projections: only if moe_latent_size > 0 (Ultra models)
+            if self.cfg.moe_latent_size > 0:
+                result["latent_proj"] = self.load_latent_moe_projections(layer_idx, device)
+            if self.cfg.n_shared_experts > 0:
+                result["shared_expert"] = self.load_nemotron_shared_expert(layer_idx, device)
+        elif layer_type == "full_attention":
+            # Nemotron attention layers are JUST attention (no MoE).
+            # Each block has exactly one mixer: Mamba2, MoE, or Attention.
+            result = {
+                "norms": norms,
+                "is_moe": False,
+                "layer_type": "full_attention",
+                "attention": self.load_nemotron_attention_weights(layer_idx, device),
+            }
+        else:
+            raise ValueError(f"Unknown Nemotron layer type: {layer_type}")
+
+        elapsed = time.perf_counter() - start
+        alloc_mb = torch.cuda.memory_allocated(device) / (1024**2)
+        logger.info(
+            "Layer %d loaded in %.1fs (GPU alloc: %.0f MB, type=%s)",
+            layer_idx, elapsed, alloc_mb, layer_type,
         )
         return result
 

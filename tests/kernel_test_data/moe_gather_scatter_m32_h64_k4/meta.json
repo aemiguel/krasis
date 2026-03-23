@@ -1,0 +1,48 @@
+{
+  "atol": 0.0001,
+  "rtol": 0.0001,
+  "note": "MoE gather+scatter M=32 hidden=64 topk=4 E=8 total_padded=1024",
+  "inputs": {
+    "src": {
+      "file": "input_src.bin",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "bf16"
+    },
+    "sorted_ids": {
+      "file": "input_sorted_ids.bin",
+      "shape": [
+        1024
+      ],
+      "dtype": "i32"
+    },
+    "expert_out": {
+      "file": "input_expert_out.bin",
+      "shape": [
+        1024,
+        64
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "gather_out": {
+      "file": "expected_gather_out.bin",
+      "shape": [
+        1024,
+        64
+      ],
+      "dtype": "bf16"
+    },
+    "accum": {
+      "file": "expected_accum.bin",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "f32"
+    }
+  }
+}

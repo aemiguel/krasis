@@ -1,0 +1,27 @@
+{
+  "atol": 0.0,
+  "rtol": 0.0,
+  "note": "3D transpose FP32 [32,500,128] -> [500,32,128] (exact)",
+  "inputs": {
+    "x": {
+      "file": "input_x.bin",
+      "shape": [
+        32,
+        500,
+        128
+      ],
+      "dtype": "f32"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        500,
+        32,
+        128
+      ],
+      "dtype": "f32"
+    }
+  }
+}

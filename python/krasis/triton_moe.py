@@ -1,6 +1,6 @@
 """Triton GEMV kernel for M=1 MoE decode on auxiliary GPUs.
 
-sgl_kernel's moe_wna16_marlin_gemm crashes on non-primary GPUs because
+The original sglang moe_wna16_marlin_gemm crashed on non-primary GPUs because
 its CUDA dispatch defaults to device 0 without calling cudaSetDevice().
 This module provides a Triton-based alternative that works on any device.
 

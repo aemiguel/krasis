@@ -1,0 +1,41 @@
+{
+  "atol": 0.0,
+  "rtol": 0.0,
+  "note": "Concat3 BF16 M=500 dims=[128,128,128] (exact)",
+  "inputs": {
+    "a": {
+      "file": "input_a.bin",
+      "shape": [
+        500,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "b": {
+      "file": "input_b.bin",
+      "shape": [
+        500,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "c": {
+      "file": "input_c.bin",
+      "shape": [
+        500,
+        128
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        500,
+        384
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

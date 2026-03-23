@@ -1,0 +1,41 @@
+{
+  "atol": 0.05,
+  "rtol": 0.05,
+  "note": "FP8 E4M3 round-trip M=256 D=512. Write BF16 through kv_cache_append_fp8, read back, compare.",
+  "inputs": {
+    "k": {
+      "file": "input_k.bin",
+      "shape": [
+        256,
+        512
+      ],
+      "dtype": "bf16"
+    },
+    "v": {
+      "file": "input_v.bin",
+      "shape": [
+        256,
+        512
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "k_roundtrip": {
+      "file": "expected_k_roundtrip.bin",
+      "shape": [
+        256,
+        512
+      ],
+      "dtype": "bf16"
+    },
+    "v_roundtrip": {
+      "file": "expected_v_roundtrip.bin",
+      "shape": [
+        256,
+        512
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

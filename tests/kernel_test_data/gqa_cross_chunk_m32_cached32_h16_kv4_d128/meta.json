@@ -1,0 +1,61 @@
+{
+  "atol": 0.05,
+  "rtol": 0.05,
+  "note": "Cross-chunk GQA: 32 cached (FP8) + 32 new (BF16). Tolerance wider due to FP8 cache + MMA.",
+  "inputs": {
+    "q_new": {
+      "file": "input_q_new.bin",
+      "shape": [
+        32,
+        16,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "k_new": {
+      "file": "input_k_new.bin",
+      "shape": [
+        32,
+        4,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "v_new": {
+      "file": "input_v_new.bin",
+      "shape": [
+        32,
+        4,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "k_cache_fp8": {
+      "file": "input_k_cache_fp8.bin",
+      "shape": [
+        32,
+        512
+      ],
+      "dtype": "fp8e4m3"
+    },
+    "v_cache_fp8": {
+      "file": "input_v_cache_fp8.bin",
+      "shape": [
+        32,
+        512
+      ],
+      "dtype": "fp8e4m3"
+    }
+  },
+  "outputs": {
+    "out_new": {
+      "file": "expected_out_new.bin",
+      "shape": [
+        32,
+        16,
+        128
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

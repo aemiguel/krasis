@@ -5795,9 +5795,12 @@ pub fn bench_decode_synthetic(
         num_hidden_layers: num_layers,
         first_k_dense_replace,
         n_shared_experts,
+        shared_expert_intermediate_size: n_shared_experts * moe_intermediate,
         routed_scaling_factor: 1.0,
         swiglu_limit: 0.0,
         activation_alpha: 0.0,
+        moe_layer_indices: (first_k_dense_replace..num_layers).collect(),
+        experts_gated: true,  // Always gated for CPU decode path (only used by existing models)
     };
     moe_store.group_size = group_size;
     moe_store.cpu_num_bits = num_bits;
@@ -5831,6 +5834,8 @@ pub fn bench_decode_synthetic(
                 up_bias: None,
                 down_bias: None,
                 tiled: false,
+                gated: true,
+                activation_type: 0,
                 contiguous_backing: None,
                 borrowed: false,
             });

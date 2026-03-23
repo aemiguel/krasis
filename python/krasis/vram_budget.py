@@ -410,16 +410,13 @@ def compute_launcher_budget(
     gate_f32_bytes_all_layers = hidden * n_experts * 4 * total_moe_layers_all  # F32 routing copy
     norm_bytes_all_layers = 2 * hidden * 2 * total_layers  # BF16
 
-    # FlashInfer workspace allocation (computed from model dims + GPU SMs)
-    from krasis.attention import compute_flashinfer_workspace_bytes
-    num_sm = _detect_gpu_sm_count()
-    gqa_head_dim = cfg.get("head_dim", hidden // cfg["num_attention_heads"]) if not is_mla else 0
-    flashinfer_workspace_bytes = compute_flashinfer_workspace_bytes(
-        num_sm=num_sm,
-        num_qo_heads=cfg["num_attention_heads"],
-        num_kv_heads=cfg["num_key_value_heads"],
-        gqa_head_dim=gqa_head_dim,
-    )
+    # Rust prefill workspace: scratch buffers for intermediates during prefill.
+    # Sized from model dimensions.
+    # Main cost: MoE intermediate buffers + attention scratch + LA scratch.
+    top_k = cfg.get("num_experts_per_tok", cfg.get("num_selected_experts", 8))
+    moe_inter = cfg.get("moe_intermediate_size", 0)
+    # Rust prefill scratch: max(hidden, inter*2) * max_tokens * 4 (FP32) + expert buffers
+    rust_prefill_workspace_bytes = max(hidden, (moe_inter * 2 if moe_inter > 0 else 0)) * 5000 * 4
 
     # Prefill workspace: intermediate tensors during MoE forward.
     # fused_marlin_moe allocates intermediate_cache1/3 and intermediate_cache2.
@@ -513,7 +510,7 @@ def compute_launcher_budget(
             shared_bytes + dense_mlp_bytes +
             gate_bytes +
             ebuf_bytes +
-            flashinfer_workspace_bytes +
+            rust_prefill_workspace_bytes +
             prefill_workspace_bytes +
             cuda_overhead * 1024 * 1024
         )
@@ -542,7 +539,7 @@ def compute_launcher_budget(
             "lm_head_mb": base_lmhead_bytes / MB,
             "norms_gates_mb": (gate_bytes + rank_norm_bytes) / MB,
             "cuda_overhead_mb": cuda_overhead,
-            "flashinfer_mb": flashinfer_workspace_bytes / MB,
+            "prefill_scratch_mb": rust_prefill_workspace_bytes / MB,
             "prefill_workspace_mb": prefill_workspace_bytes / MB,
             "total_mb": total_bytes / MB,
             "free_mb": free_bytes / MB,

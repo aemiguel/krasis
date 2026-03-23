@@ -19,6 +19,26 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+# Pre-scan config file for CFG_SELECTED_GPUS to set CUDA_VISIBLE_DEVICES
+# BEFORE any torch/CUDA imports, since CUDA init happens at import time.
+def _prescan_selected_gpus():
+    import argparse as _ap
+    _pre = _ap.ArgumentParser(add_help=False)
+    _pre.add_argument("--config", default=None)
+    _pre_args, _ = _pre.parse_known_args()
+    if _pre_args.config and os.path.isfile(_pre_args.config):
+        with open(_pre_args.config) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line.startswith("CFG_SELECTED_GPUS="):
+                    _val = _line.split("=", 1)[1].strip().strip('"').strip("'")
+                    _gpus = [x.strip() for x in _val.split(",") if x.strip()]
+                    if _gpus:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(_gpus)
+                        print(f"Pre-scan: set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+                    break
+_prescan_selected_gpus()
+
 from krasis.config import QuantConfig, cache_dir_for_model
 from krasis.model import KrasisModel
 
@@ -434,7 +454,7 @@ def _warmup_prefill(model: KrasisModel):
     """Run a 50K-token prefill to warm up GPU kernels, CUDA caches, and lazy allocations.
 
     Uses a large prompt to trigger peak VRAM usage (all layer group buffers,
-    FlashInfer workspace, KV cache pages). This is called BEFORE HCS allocation
+    Rust prefill scratch, KV cache pages). This is called BEFORE HCS allocation
     so the VRAM monitor captures realistic peak usage.
     """
     import json as _json
@@ -710,6 +730,7 @@ def main():
                     # Handle special cases for CFG_ format
                     if key == "CFG_SELECTED_GPUS":
                         # Convert comma-separated GPU indices to num_gpus count
+                        # CUDA_VISIBLE_DEVICES is set earlier in _prescan_selected_gpus()
                         gpu_list = [x.strip() for x in val.split(",") if x.strip()]
                         if gpu_list:
                             config_defaults["num_gpus"] = len(gpu_list)
@@ -1065,13 +1086,13 @@ def main():
     vram_monitor.report_event("model_loaded")
 
     # ── Phase 1: Warmup (trigger all lazy CUDA allocations) ──
-    # torch.compile, KV cache, FlashInfer workspace, cuBLAS handles, decode buffers.
+    # torch.compile, KV cache, Rust prefill scratch, cuBLAS handles, decode buffers.
     # These cause a transient VRAM spike that is freed afterwards. The monitor
     # captures the spike for visibility but is reset before HCS budget measurement.
     _model._hcs_device = None
     _model._multi_gpu_hcs = False
     _status("Warmup (prefill + decode, no HCS)")
-    _dim("Triggering lazy CUDA allocations (torch.compile, FlashInfer, cuBLAS)")
+    _dim("Triggering lazy CUDA allocations (torch.compile, cuBLAS, Rust prefill)")
     vram_monitor.report_event("warmup_start")
     t_warmup = time.time()
     # Use layer_group_size=1 for warmup to avoid DMA pipeline issues with grouped prefill

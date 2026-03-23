@@ -1,0 +1,25 @@
+{
+  "atol": 0.005,
+  "rtol": 0.005,
+  "note": "SiLU+Mul M=128 N=512 (sigmoid chain has extra BF16 rounding)",
+  "inputs": {
+    "gate_up": {
+      "file": "input_gate_up.bin",
+      "shape": [
+        128,
+        1024
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        128,
+        512
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

@@ -547,7 +547,7 @@ def find_krasis_command() -> str:
     """Find the installed krasis command. Fails if not found.
 
     Prefers the conda env krasis because that's the environment with GPU
-    dependencies (PyTorch, flashinfer, etc). The ~/.local/bin/krasis may
+    dependencies (PyTorch, sgl-kernel, etc). The ~/.local/bin/krasis may
     point to a bare venv without GPU deps.
     """
     # Prefer the conda env — this is the real production install

@@ -161,26 +161,31 @@ class ActivationCapture:
 
     def __enter__(self):
         from krasis.layer import TransformerLayer
-        import flashinfer
 
         self._orig_forward = TransformerLayer.forward
         self._orig_forward_attn = TransformerLayer.forward_attn
         capture = self
 
+        def _rms_norm(x, weight, eps):
+            """RMSNorm using torch."""
+            variance = x.float().pow(2).mean(-1, keepdim=True)
+            x = x.float() * torch.rsqrt(variance + eps)
+            return (weight.float() * x).to(x.dtype)
+
         def _capture_activations(layer_self, hidden, residual):
             """Compute post-norm hidden state and accumulate per-channel stats."""
             with torch.no_grad():
                 if residual is None:
-                    post_norm = flashinfer.norm.rmsnorm(
+                    post_norm = _rms_norm(
                         hidden.clone(), layer_self.input_norm_weight,
                         layer_self.cfg.rms_norm_eps)
                 else:
                     h = hidden.clone()
                     r = residual.clone()
-                    flashinfer.norm.fused_add_rmsnorm(
-                        h, r, layer_self.input_norm_weight,
+                    h = h + r
+                    post_norm = _rms_norm(
+                        h, layer_self.input_norm_weight,
                         layer_self.cfg.rms_norm_eps)
-                    post_norm = h
 
                 # Per-channel mean magnitude: [hidden_size]
                 channel_mag = post_norm.float().abs().mean(dim=0)

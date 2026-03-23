@@ -300,6 +300,20 @@ class ModelConfig:
     expert_quant_method: str = ""      # "mxfp4" for GPT OSS, "" for standard BF16
     swiglu_limit: float = 0.0         # GPT OSS: 7.0 — clamp SwiGLU output to [-limit, limit]
 
+    # Nemotron-H (hybrid Mamba2 + MoE + Attention)
+    model_type: str = ""               # e.g. "nemotron_h", "qwen3_next", etc.
+    hybrid_override_pattern: str = ""  # e.g. "MEMEMEM*E..." — M=Mamba2, E=MoE, *=Attention
+    mamba_num_heads: int = 0           # Mamba2 SSM heads (e.g. 128 for Super, 64 for Nano)
+    mamba_head_dim: int = 0            # Mamba2 SSM per-head dim (e.g. 64)
+    ssm_state_size: int = 0            # Mamba2 SSM state size (e.g. 128)
+    mamba_expand: int = 0              # Mamba2 expansion factor (e.g. 2)
+    mamba_conv_kernel: int = 0         # Mamba2 conv1d kernel size (e.g. 4)
+    mamba_n_groups: int = 1            # Mamba2 number of groups for B/C (e.g. 8)
+    mamba_chunk_size: int = 128        # Mamba2 SSD chunk size (must be power of 2)
+    moe_latent_size: int = 0           # LatentMoE: latent projection dim (e.g. 1024)
+    moe_shared_expert_intermediate_size: int = 0  # LatentMoE shared expert intermediate
+    mlp_hidden_act: str = "silu"       # MLP activation: "silu" or "relu2"
+
     # Norm convention: Qwen3NextRMSNorm uses (1 + weight) * x, stored weights are ~0
     # Standard RMSNorm uses weight * x, stored weights are ~1
     norm_bias_one: bool = False  # True for qwen3_next models
@@ -359,11 +373,21 @@ class ModelConfig:
         else:
             first_k_dense = 0
 
+        # Model architecture type
+        arch = cfg.get("model_type", "")
+
         # Hybrid model: compute layer_types
         full_attn_interval = cfg.get("full_attention_interval", 0)
         num_layers = cfg["num_hidden_layers"]
         layer_types = None
-        if "layer_types" in cfg:
+        hybrid_pattern = cfg.get("hybrid_override_pattern", "")
+        if hybrid_pattern and arch == "nemotron_h":
+            # Nemotron-H: parse M=mamba2, E=moe, *=attention from pattern
+            type_map = {"M": "mamba2", "E": "moe", "*": "full_attention"}
+            layer_types = [type_map.get(c, "full_attention") for c in hybrid_pattern]
+            assert len(layer_types) == num_layers, (
+                f"hybrid_override_pattern length {len(layer_types)} != num_hidden_layers {num_layers}")
+        elif "layer_types" in cfg:
             # GPT OSS: explicit layer_types array (sliding_attention / full_attention)
             layer_types = cfg["layer_types"]
         elif full_attn_interval > 0:
@@ -377,12 +401,14 @@ class ModelConfig:
         # Norm convention: Qwen3NextRMSNorm uses (1 + weight) * x
         # with weight initialized to zeros, while standard models use weight * x
         # with weight initialized to ones. We add 1.0 to stored weights at load time.
-        arch = cfg.get("model_type", "")
         norm_bias_one = arch in ("qwen3_next", "qwen3_5_moe_text")
+
+        # Nemotron-H shared expert intermediate: separate field name
+        nemotron_shared_inter = cfg.get("moe_shared_expert_intermediate_size", 0)
 
         # Shared experts: n_shared_experts or infer from shared_expert_intermediate_size
         n_shared = cfg.get("n_shared_experts", 0)
-        shared_inter = cfg.get("shared_expert_intermediate_size", 0)
+        shared_inter = cfg.get("shared_expert_intermediate_size", nemotron_shared_inter)
         if n_shared == 0 and shared_inter > 0:
             n_shared = 1  # infer single shared expert
 
@@ -445,10 +471,11 @@ class ModelConfig:
             shared_expert_intermediate_size=shared_inter,
             first_k_dense_replace=first_k_dense,
             routed_scaling_factor=cfg.get("routed_scaling_factor", 1.0),
-            scoring_func=cfg.get("scoring_func", "softmax"),
+            scoring_func=cfg.get("scoring_func",
+                                 "sigmoid" if arch == "nemotron_h" else "softmax"),
             topk_method=cfg.get("topk_method", "greedy"),
             norm_topk_prob=cfg.get("norm_topk_prob", False),
-            rms_norm_eps=cfg.get("rms_norm_eps", 1e-6),
+            rms_norm_eps=cfg.get("rms_norm_eps", cfg.get("norm_eps", cfg.get("layer_norm_epsilon", 1e-6))),
             hidden_act=cfg.get("hidden_act", "silu"),
             rope_theta=rope_theta,
             rope_scaling=cfg.get("rope_scaling") or rope_params or {},
@@ -459,6 +486,19 @@ class ModelConfig:
             sliding_window=sliding_window,
             expert_quant_method=expert_quant_method,
             swiglu_limit=swiglu_limit,
+            # Nemotron-H fields
+            model_type=arch,
+            hybrid_override_pattern=hybrid_pattern,
+            mamba_num_heads=cfg.get("mamba_num_heads", 0),
+            mamba_head_dim=cfg.get("mamba_head_dim", 0),
+            ssm_state_size=cfg.get("ssm_state_size", 0),
+            mamba_expand=cfg.get("expand", 0),
+            mamba_conv_kernel=cfg.get("conv_kernel", 0),
+            mamba_n_groups=cfg.get("n_groups", 1),
+            mamba_chunk_size=cfg.get("chunk_size", 128),
+            moe_latent_size=cfg.get("moe_latent_size", 0),
+            moe_shared_expert_intermediate_size=nemotron_shared_inter,
+            mlp_hidden_act=cfg.get("mlp_hidden_act", cfg.get("hidden_act", "silu")),
             norm_bias_one=norm_bias_one,
             tie_word_embeddings=tie,
             bos_token_id=raw.get("bos_token_id", cfg.get("bos_token_id", 0)),
@@ -482,6 +522,8 @@ class ModelConfig:
 
     @property
     def num_moe_layers(self) -> int:
+        if self.hybrid_override_pattern:
+            return self.hybrid_override_pattern.count('E')
         return self.num_hidden_layers - self.first_k_dense_replace
 
     @property
@@ -515,8 +557,13 @@ class ModelConfig:
         return self.q_lora_rank is not None and self.q_lora_rank > 0
 
     @property
+    def is_nemotron_h(self) -> bool:
+        """True for Nemotron-H hybrid models (Mamba2 + MoE + Attention)."""
+        return self.model_type == "nemotron_h"
+
+    @property
     def is_hybrid(self) -> bool:
-        """True if model has a mix of linear attention and full attention layers."""
+        """True if model has a mix of layer types (LA+GQA, or Mamba2+MoE+Attention)."""
         return self.layer_types is not None
 
     def is_linear_attention_layer(self, layer_idx: int) -> bool:
@@ -524,6 +571,18 @@ class ModelConfig:
         if self.layer_types is None:
             return False
         return self.layer_types[layer_idx] == "linear_attention"
+
+    def is_mamba2_layer(self, layer_idx: int) -> bool:
+        """True if this layer uses Mamba2 SSM (Nemotron-H)."""
+        if self.layer_types is None:
+            return False
+        return self.layer_types[layer_idx] == "mamba2"
+
+    def is_moe_only_layer(self, layer_idx: int) -> bool:
+        """True if this layer is MoE-only (no attention, Nemotron-H 'E' layers)."""
+        if self.layer_types is None:
+            return False
+        return self.layer_types[layer_idx] == "moe"
 
     def is_sliding_attention_layer(self, layer_idx: int) -> bool:
         """True if this layer uses sliding window attention (GPT OSS)."""
@@ -553,7 +612,20 @@ class ModelConfig:
             return self.n_shared_experts * self.moe_intermediate_size
         return 0
 
+    @property
+    def mamba_d_inner(self) -> int:
+        """Mamba2 inner dimension = num_heads * head_dim."""
+        return self.mamba_num_heads * self.mamba_head_dim
+
+    @property
+    def mamba_conv_dim(self) -> int:
+        """Mamba2 conv1d dimension = d_inner + 2 * n_groups * state_size."""
+        return self.mamba_d_inner + 2 * self.mamba_n_groups * self.ssm_state_size
+
     def is_moe_layer(self, layer_idx: int) -> bool:
+        if self.is_nemotron_h:
+            # Nemotron: only MoE layers have experts. Attention and Mamba2 layers do not.
+            return self.layer_types[layer_idx] == "moe"
         return layer_idx >= self.first_k_dense_replace
 
 

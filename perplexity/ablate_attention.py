@@ -20,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-import flashinfer
 
 _script_dir = Path(__file__).resolve().parent
 _krasis_root = _script_dir.parent
@@ -29,6 +28,7 @@ sys.path.insert(0, str(_krasis_root / "python"))
 from krasis.config import QuantConfig
 from krasis.model import KrasisModel
 from krasis.kv_cache import SequenceKVState
+from krasis.layer import _rmsnorm, _fused_add_rmsnorm
 from perplexity.measure_ppl import load_dataset_text
 
 logger = logging.getLogger(__name__)
@@ -144,11 +144,11 @@ def _make_skip_attn(layer):
         # Pre-attention norm (same as normal)
         if residual is None:
             residual = hidden.clone()
-            hidden = flashinfer.norm.rmsnorm(
+            hidden = _rmsnorm(
                 hidden, layer.input_norm_weight, layer.cfg.rms_norm_eps
             )
         else:
-            flashinfer.norm.fused_add_rmsnorm(
+            _fused_add_rmsnorm(
                 hidden, residual, layer.input_norm_weight, layer.cfg.rms_norm_eps
             )
 
@@ -156,7 +156,7 @@ def _make_skip_attn(layer):
         attn_out = torch.zeros_like(hidden)
 
         # Post-attention norm
-        flashinfer.norm.fused_add_rmsnorm(
+        _fused_add_rmsnorm(
             attn_out, residual, layer.post_attn_norm_weight, layer.cfg.rms_norm_eps
         )
         return attn_out, residual

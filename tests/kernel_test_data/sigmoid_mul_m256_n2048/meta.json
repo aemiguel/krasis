@@ -1,0 +1,33 @@
+{
+  "atol": 0.001,
+  "rtol": 0.001,
+  "note": "Sigmoid-gated multiply M=256 N=2048",
+  "inputs": {
+    "attn": {
+      "file": "input_attn.bin",
+      "shape": [
+        256,
+        2048
+      ],
+      "dtype": "bf16"
+    },
+    "gate": {
+      "file": "input_gate.bin",
+      "shape": [
+        256,
+        2048
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        256,
+        2048
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

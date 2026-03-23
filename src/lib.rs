@@ -4,6 +4,7 @@ pub mod draft_model;
 pub mod gguf;
 pub mod gguf_kernels;
 pub mod gpu_decode;
+pub mod gpu_prefill;
 pub mod kernel;
 pub mod moe;
 pub mod numa;

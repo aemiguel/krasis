@@ -112,9 +112,9 @@ def _linear(x: torch.Tensor, weight_data) -> torch.Tensor:
     """Dispatch to Marlin GEMM, INT8, or BF16 linear based on weight type."""
     from krasis.attention import MarlinWeight
     if isinstance(weight_data, MarlinWeight):
-        import sgl_kernel
+        from krasis.marlin_utils import gptq_marlin_gemm
         M = x.shape[0]
-        return sgl_kernel.gptq_marlin_gemm(
+        return gptq_marlin_gemm(
             a=x.contiguous(),
             c=None,
             b_q_weight=weight_data.packed,

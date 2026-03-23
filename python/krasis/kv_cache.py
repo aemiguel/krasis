@@ -1,10 +1,10 @@
 """Paged KV cache supporting both MLA and GQA attention.
 
 MLA (DeepSeek/Kimi): compresses all KV heads into a single latent vector per token.
-  Split (FlashInfer MLA):
+  Split:
     - ckv_cache: [num_layers, num_pages, page_size, kv_lora_rank]
     - kpe_cache: [num_layers, num_pages, page_size, qk_rope_head_dim]
-  Combined (TRTLLM MLA):
+  Combined:
     - kv_cache: [num_layers, num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
 
 GQA (Qwen3): standard K/V caches with head dimension (NHD layout).
@@ -56,7 +56,7 @@ class PagedKVCache:
 
         # Compute cache dimensions based on attention type
         if cfg.is_mla:
-            # FlashInfer MLA requires ckv_dim=512. Pad if kv_lora_rank < 512.
+            # MLA decode requires ckv_dim=512. Pad if kv_lora_rank < 512.
             self.ckv_dim = max(cfg.kv_lora_rank, 512)  # ≥ 512
             self.kpe_dim = cfg.qk_rope_head_dim    # 64
             self.kv_cache_dim = self.ckv_dim + self.kpe_dim  # 576
@@ -78,8 +78,8 @@ class PagedKVCache:
             bytes_per_page = self._bytes_per_page()
 
             # Cap to actual free VRAM minus computed safety margin.
-            # Safety = FlashInfer workspace (computed from model dims + GPU SMs)
-            # + max prefill intermediate (MoE or dense MLP) + 200 MB base.
+            # Safety = Rust prefill scratch + max prefill intermediate
+            # (MoE or dense MLP) + 200 MB base.
             free_bytes, _ = torch.cuda.mem_get_info(device)
             chunk_est = 5000
             # MoE intermediates: [M*topk, 2*moe_inter] + [M*topk, hidden], bf16
@@ -92,16 +92,10 @@ class PagedKVCache:
             dense_inter = cfg.intermediate_size
             dense_ws = chunk_est * dense_inter * 8 if dense_inter > 0 else 0
             prefill_ws = max(moe_ws, dense_ws)
-            from krasis.attention import compute_flashinfer_workspace_bytes
-            num_sm = torch.cuda.get_device_properties(device).multi_processor_count
-            flashinfer_ws = compute_flashinfer_workspace_bytes(
-                num_sm=num_sm,
-                num_qo_heads=cfg.num_attention_heads,
-                num_kv_heads=cfg.num_key_value_heads,
-                gqa_head_dim=cfg.gqa_head_dim or 0,
-            )
+            # Rust prefill scratch estimate
+            rust_prefill_scratch = max(cfg.hidden_size, cfg.moe_intermediate_size * 2) * 5000 * 4
             base_headroom = 200 * 1024 * 1024
-            safety_bytes = flashinfer_ws + prefill_ws + base_headroom
+            safety_bytes = rust_prefill_scratch + prefill_ws + base_headroom
             safety_mb = safety_bytes / (1024 * 1024)
             available_bytes = max(0, free_bytes - safety_bytes)
             if budget_bytes > available_bytes:
@@ -110,7 +104,7 @@ class PagedKVCache:
                 new_mb = budget_bytes / (1024 * 1024)
                 logger.warning(
                     "KV cache: requested %d MB but only %.0f MB available "
-                    "(%.0f MB free - %.0f MB safety [%.0f prefill + 256 FlashInfer + 200 base]), "
+                    "(%.0f MB free - %.0f MB safety [%.0f prefill + 200 base]), "
                     "capping to %.0f MB",
                     int(old_mb), available_bytes / (1024 * 1024),
                     free_bytes / (1024 * 1024), safety_mb,
@@ -154,7 +148,7 @@ class PagedKVCache:
             alloc_mb = self.kv_cache.nbytes / (1024**2)
             layout_str = "mla-combined"
         else:
-            # FlashInfer MLA format: split ckv + kpe caches
+            # MLA split format: ckv + kpe caches
             self.ckv_cache = torch.zeros(
                 num_layers, max_pages, page_size, self.ckv_dim,
                 dtype=kv_dtype, device=device,
@@ -212,7 +206,7 @@ class PagedKVCache:
     # ── MLA cache access ──
 
     def get_layer_caches(self, layer_offset: int):
-        """Get split cache tensors for MLA (FlashInfer).
+        """Get split cache tensors for MLA.
 
         Returns (ckv_cache, kpe_cache) each [max_pages, page_size, dim].
         """
@@ -227,7 +221,7 @@ class PagedKVCache:
     # ── GQA cache access ──
 
     def get_gqa_layer_caches(self, layer_offset: int):
-        """Get (k_cache, v_cache) for GQA (FlashInfer standard paged attention).
+        """Get (k_cache, v_cache) for GQA.
 
         Returns (k, v) each [max_pages, page_size, num_kv_heads, head_dim].
         """
@@ -239,7 +233,7 @@ class SequenceKVState:
     """KV cache state for a single sequence (request).
 
     Tracks which pages are allocated and current position.
-    Provides FlashInfer-compatible index arrays.
+    Provides paged KV index arrays.
     """
 
     def __init__(self, cache: PagedKVCache, seq_id: int = 0):
@@ -269,11 +263,11 @@ class SequenceKVState:
             self.seq_len = 0
 
     def kv_indices(self, device: torch.device) -> torch.Tensor:
-        """Page indices for FlashInfer: all allocated pages."""
+        """Page indices: all allocated pages."""
         return torch.tensor(self.pages, dtype=torch.int32, device=device) if self.pages else torch.zeros(0, dtype=torch.int32, device=device)
 
     def kv_indptr(self, device: torch.device) -> torch.Tensor:
-        """Page indptr for FlashInfer (single sequence): [0, num_allocated_pages]."""
+        """Page indptr (single sequence): [0, num_allocated_pages]."""
         return torch.tensor([0, len(self.pages)], dtype=torch.int32, device=device)
 
     def kv_len_arr(self, device: torch.device) -> torch.Tensor:
@@ -288,7 +282,7 @@ class SequenceKVState:
         return rem if rem > 0 else self.cache.page_size
 
     def last_page_len_tensor(self, device: torch.device) -> torch.Tensor:
-        """Last page length as tensor (for FlashInfer decode)."""
+        """Last page length as tensor (for decode)."""
         return torch.tensor([self.last_page_len()], dtype=torch.int32, device=device)
 
     def block_tables(self, device: torch.device, pad_to_multiple: int = 8) -> torch.Tensor:

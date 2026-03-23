@@ -1,0 +1,48 @@
+{
+  "atol": 0.003,
+  "rtol": 0.005,
+  "note": "Fused add+RMSNorm M=128 H=2048 (parallel reduction rounding)",
+  "inputs": {
+    "residual": {
+      "file": "input_residual.bin",
+      "shape": [
+        128,
+        2048
+      ],
+      "dtype": "bf16"
+    },
+    "x": {
+      "file": "input_x.bin",
+      "shape": [
+        128,
+        2048
+      ],
+      "dtype": "bf16"
+    },
+    "weight": {
+      "file": "input_weight.bin",
+      "shape": [
+        2048
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "residual_out": {
+      "file": "expected_residual_out.bin",
+      "shape": [
+        128,
+        2048
+      ],
+      "dtype": "bf16"
+    },
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        128,
+        2048
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

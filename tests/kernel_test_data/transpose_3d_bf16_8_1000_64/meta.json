@@ -1,0 +1,27 @@
+{
+  "atol": 0.0,
+  "rtol": 0.0,
+  "note": "3D transpose BF16 [8,1000,64] -> [1000,8,64] (exact)",
+  "inputs": {
+    "x": {
+      "file": "input_x.bin",
+      "shape": [
+        8,
+        1000,
+        64
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        1000,
+        8,
+        64
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

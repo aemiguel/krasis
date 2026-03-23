@@ -1,0 +1,32 @@
+{
+  "atol": 0.0,
+  "rtol": 0.0,
+  "note": "Embedding lookup M=64 D=2048 vocab=1000 (exact)",
+  "inputs": {
+    "table": {
+      "file": "input_table.bin",
+      "shape": [
+        1000,
+        2048
+      ],
+      "dtype": "bf16"
+    },
+    "token_ids": {
+      "file": "input_token_ids.bin",
+      "shape": [
+        64
+      ],
+      "dtype": "i32"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        64,
+        2048
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

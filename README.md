@@ -90,7 +90,7 @@ This creates a Python environment at `~/.krasis/venv`, installs Krasis, symlinks
 krasis-setup
 ```
 
-This installs the CUDA toolkit (if needed), PyTorch, and FlashInfer. May need sudo for the CUDA toolkit. Only required once.
+This installs the CUDA toolkit (if needed), PyTorch, and sgl-kernel. May need sudo for the CUDA toolkit. Only required once.
 
 ### 3. Download a model
 

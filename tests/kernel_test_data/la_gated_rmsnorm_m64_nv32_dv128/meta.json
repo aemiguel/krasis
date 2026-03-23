@@ -1,0 +1,41 @@
+{
+  "atol": 0.003,
+  "rtol": 0.003,
+  "note": "Gated RMSNorm M=64 nv=32 dv=128",
+  "inputs": {
+    "x": {
+      "file": "input_x.bin",
+      "shape": [
+        64,
+        32,
+        128
+      ],
+      "dtype": "f32"
+    },
+    "gate": {
+      "file": "input_gate.bin",
+      "shape": [
+        64,
+        32,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "weight": {
+      "file": "input_weight.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        262144
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

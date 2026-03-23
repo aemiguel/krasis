@@ -1,0 +1,49 @@
+{
+  "atol": 0.0001,
+  "rtol": 0.0001,
+  "note": "Causal conv1d+SiLU M=64 conv_dim=384 kernel=4",
+  "inputs": {
+    "x": {
+      "file": "input_x.bin",
+      "shape": [
+        64,
+        384
+      ],
+      "dtype": "bf16"
+    },
+    "weight": {
+      "file": "input_weight.bin",
+      "shape": [
+        384,
+        4
+      ],
+      "dtype": "f32"
+    },
+    "conv_state": {
+      "file": "input_conv_state.bin",
+      "shape": [
+        384,
+        4
+      ],
+      "dtype": "f32"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        384,
+        64
+      ],
+      "dtype": "f32"
+    },
+    "state_out": {
+      "file": "expected_state_out.bin",
+      "shape": [
+        384,
+        4
+      ],
+      "dtype": "f32"
+    }
+  }
+}

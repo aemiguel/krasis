@@ -106,6 +106,9 @@ struct ServerState {
     multi_gpu_split_layers: Vec<usize>,
     /// Multi-GPU: number of GQA layers before each split point (for KV cache indexing).
     multi_gpu_gqa_offsets: Vec<usize>,
+    /// Rust-native prefill engine (None = use Python prefill).
+    /// When set, prefill runs entirely in Rust — zero GIL, zero Python.
+    rust_prefill: Option<crate::gpu_prefill::PrefillEngine>,
 }
 
 /// Parsed HTTP request.
@@ -414,7 +417,7 @@ fn format_completion_with_tool_calls(
 /// Handle a single HTTP request.
 fn handle_request(
     mut tcp_stream: TcpStream,
-    state: &ServerState,
+    state: &mut ServerState,
 ) {
     let cloned = match tcp_stream.try_clone() {
         Ok(c) => c,
@@ -486,7 +489,7 @@ struct RequestOverhead {
 fn handle_chat_completion(
     stream: &mut TcpStream,
     body: &str,
-    state: &ServerState,
+    state: &mut ServerState,
 ) {
     let t_request = Instant::now();
 
@@ -575,21 +578,20 @@ fn handle_chat_completion(
     };
     let has_tools = !tools_json.is_empty();
 
-    // ── Estimate prompt tokens for soft-tier HCS eviction ──
+    // ── Render chat template (reused for both token estimation and Rust prefill) ──
+    let rendered = match state.chat_template.apply_with_tools(&messages_json, &tools_json, true) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("Chat template failed: {}", e);
+            let _ = send_json(
+                stream,
+                500,
+                &format!(r#"{{"error":"Chat template failed: {}. This indicates a broken model setup."}}"#, e),
+            );
+            return;
+        }
+    };
     let estimated_tokens = {
-        // Apply actual chat template (with tools) to get full rendered text, then tokenize
-        let rendered = match state.chat_template.apply_with_tools(&messages_json, &tools_json, true) {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("Chat template failed: {}", e);
-                let _ = send_json(
-                    stream,
-                    500,
-                    &format!(r#"{{"error":"Chat template failed: {}. This indicates a broken model setup."}}"#, e),
-                );
-                return;
-            }
-        };
         let token_count = match state.tokenizer.encode(rendered.as_str(), false) {
             Ok(e) => e.len(),
             Err(e) => {
@@ -619,35 +621,53 @@ fn handle_chat_completion(
     // ── Snapshot VRAM before prefill ──
     log::info!("VRAM before prefill: {} MB free", store_for_evict.query_vram_free_mb());
 
-    // ── Call Python for prefill (GIL required) ──
+    // ── Prefill: Rust path (zero GIL) or Python fallback ──
     crate::vram_monitor::report_event("prefill_start");
     let t_prefill_gil = Instant::now();
-    let prefill_result = Python::with_gil(|py| -> PyResult<(usize, usize, Vec<usize>, bool)> {
-        let result = state.py_model.call_method(
-            py,
-            "server_prefill",
-            (
-                &messages_json,
-                max_tokens,
-                temperature,
-                top_k,
-                top_p,
-                presence_penalty,
-                enable_thinking,
-                stop_tokens.clone(),
-                "gpu",
-                &tools_json,
-            ),
-            None,
-        )?;
-        let first_token: usize = result.getattr(py, "first_token")?.extract(py)?;
-        let prompt_len: usize = result.getattr(py, "prompt_len")?.extract(py)?;
-        let stop_ids: Vec<usize> = result.getattr(py, "stop_ids")?.extract(py)?;
-        let kv_overflow: bool = result.getattr(py, "kv_overflow")
-            .and_then(|v| v.extract(py))
-            .unwrap_or(false);
-        Ok((first_token, prompt_len, stop_ids, kv_overflow))
-    });
+
+    let prefill_result: Result<(usize, usize, Vec<usize>, bool), String> = {
+        // ── Rust prefill: zero GIL, zero Python ──
+        let token_ids: Vec<u32> = match state.tokenizer.encode(rendered.as_str(), true) {
+            Ok(e) => e.get_ids().to_vec(),
+            Err(e) => {
+                let _ = send_json(stream, 500, &format!(r#"{{"error":"Tokenize: {}"}}"#, e));
+                return;
+            }
+        };
+        let engine = state.rust_prefill.as_mut().unwrap();
+
+        // Update HCS snapshot so prefill can use GPU-resident experts directly
+        {
+            let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
+            let (cache_fast, ne) = store.export_hcs_snapshot();
+            engine.update_hcs_snapshot(cache_fast, ne);
+        }
+
+        let kv_max_seq = engine.kv_max_seq;
+        let kv_overflow = token_ids.len() > kv_max_seq;
+
+        let result = engine.run_prefill(
+            &token_ids,
+            temperature,
+            &[], // suppress tokens handled by decode
+        );
+
+        // Convert stop token strings to IDs
+        let stop_ids: Vec<usize> = stop_tokens.iter().filter_map(|s| {
+            state.tokenizer.token_to_id(s).map(|id| id as usize)
+        }).collect();
+
+        match result {
+            Ok(r) => {
+                // Set KV cache position on decode store so decode knows where to continue
+                let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+                store.set_kv_position_rust(r.prompt_len);
+                Ok((r.first_token as usize, r.prompt_len, stop_ids, kv_overflow))
+            }
+            Err(e) => Err(e),
+        }
+    };
+
     let prefill_gil_ms = t_prefill_gil.elapsed().as_secs_f64() * 1000.0;
     crate::vram_monitor::report_event("prefill_end");
 
@@ -1279,6 +1299,8 @@ pub struct RustServer {
     aux_gpu_store_addrs: Vec<usize>,
     multi_gpu_split_layers: Vec<usize>,
     multi_gpu_gqa_offsets: Vec<usize>,
+    /// Rust prefill engine for benchmark path (zero GIL)
+    prefill_engine: Option<crate::gpu_prefill::PrefillEngine>,
 }
 
 #[pymethods]
@@ -1299,6 +1321,23 @@ impl RustServer {
         multi_gpu_split_layers: Vec<usize>,
         multi_gpu_gqa_offsets: Vec<usize>,
     ) -> Self {
+        // Create Rust prefill engine for benchmark path
+        let prefill_engine = if gpu_store_addr != 0 {
+            let store = unsafe { &*(gpu_store_addr as *const GpuDecodeStore) };
+            match store.create_prefill_engine(max_context_tokens) {
+                Ok(engine) => {
+                    log::info!("RustServer: Rust prefill engine created for benchmarks (max_tokens={})", max_context_tokens);
+                    Some(engine)
+                }
+                Err(e) => {
+                    log::error!("RustServer: Rust prefill engine failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             host,
             port,
@@ -1313,6 +1352,7 @@ impl RustServer {
             aux_gpu_store_addrs,
             multi_gpu_split_layers,
             multi_gpu_gqa_offsets,
+            prefill_engine,
         }
     }
 
@@ -1429,7 +1469,23 @@ impl RustServer {
                 None
             };
 
-            let state = ServerState {
+            // Create Rust prefill engine (always — no Python fallback)
+            let rust_prefill = {
+                let store = unsafe { &*(gpu_store_addr as *const GpuDecodeStore) };
+                match store.create_prefill_engine(max_context_tokens) {
+                    Ok(engine) => {
+                        log::info!("Rust prefill engine created (max_tokens={})", max_context_tokens);
+                        Some(engine)
+                    }
+                    Err(e) => {
+                        log::error!("Rust prefill engine failed: {}", e);
+                        log::error!("Cannot start server without Rust prefill engine");
+                        return;
+                    }
+                }
+            };
+
+            let mut state = ServerState {
                 py_model,
                 model_name,
                 tokenizer,
@@ -1443,6 +1499,7 @@ impl RustServer {
                 aux_gpu_store_addrs,
                 multi_gpu_split_layers,
                 multi_gpu_gqa_offsets,
+                rust_prefill,
             };
 
             while running.load(Ordering::Acquire) {
@@ -1456,7 +1513,7 @@ impl RustServer {
                         stream
                             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
                             .ok();
-                        handle_request(stream, &state);
+                        handle_request(stream, &mut state);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // No connection ready, sleep briefly and retry
@@ -1489,7 +1546,7 @@ impl RustServer {
     /// Safety: assumes no concurrent HTTP requests during benchmark.
     #[pyo3(signature = (messages_json, max_new_tokens, temperature=0.6, enable_thinking=false))]
     fn benchmark_request(
-        &self,
+        &mut self,
         py: Python<'_>,
         messages_json: String,
         max_new_tokens: usize,
@@ -1527,32 +1584,48 @@ impl RustServer {
         // NOTE: aux GPU never does prefill, so no eviction needed there
         let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
 
-        // Prefill (Python, GIL held)
+        // Prefill (Rust, zero GIL)
         crate::vram_monitor::report_event("prefill_start");
         let t_prefill = Instant::now();
-        let stop_tokens: Vec<String> = Vec::new();
-        let result = self.py_model.call_method(
-            py,
-            "server_prefill",
-            (
-                &messages_json,
-                max_new_tokens,
-                temperature,
-                50usize,        // top_k
-                0.95f32,        // top_p
-                0.0f32,         // presence_penalty
-                enable_thinking,
-                stop_tokens,
-                "gpu",
-            ),
-            None,
-        )?;
-        let first_token: usize = result.getattr(py, "first_token")?.extract(py)?;
-        let prompt_len: usize = result.getattr(py, "prompt_len")?.extract(py)?;
-        let stop_ids: Vec<usize> = result.getattr(py, "stop_ids")?.extract(py)?;
-        let kv_overflow: bool = result.getattr(py, "kv_overflow")
-            .and_then(|v| v.extract(py))
-            .unwrap_or(false);
+
+        let engine = self.prefill_engine.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Rust prefill engine not available for benchmark")
+        })?;
+
+        // Update HCS snapshot
+        {
+            let store_ref = unsafe { &*(self.gpu_store_addr as *const GpuDecodeStore) };
+            let (cache_fast, ne) = store_ref.export_hcs_snapshot();
+            engine.update_hcs_snapshot(cache_fast, ne);
+        }
+
+        // Tokenize using Rust tokenizer
+        let token_ids: Vec<u32> = {
+            let rendered = chat_template.apply(&messages_json, true)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Chat template failed: {}", e)))?;
+            let encoding = tokenizer.encode(rendered.as_str(), true)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Tokenizer failed: {}", e)))?;
+            encoding.get_ids().to_vec()
+        };
+
+        let kv_overflow = token_ids.len() > engine.kv_max_seq;
+
+        let prefill_result = engine.run_prefill(
+            &token_ids,
+            temperature,
+            &[],
+        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+            format!("Rust prefill failed: {}", e)))?;
+
+        let first_token = prefill_result.first_token as usize;
+        let prompt_len = prefill_result.prompt_len;
+        let stop_ids: Vec<usize> = Vec::new(); // benchmark doesn't use stop tokens
+
+        // Set KV cache position on decode store
+        store.set_kv_position_rust(prompt_len);
+
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         crate::vram_monitor::report_event("prefill_end");
 

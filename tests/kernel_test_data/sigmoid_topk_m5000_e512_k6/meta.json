@@ -1,0 +1,33 @@
+{
+  "atol": 1e-05,
+  "rtol": 1e-05,
+  "note": "Sigmoid top-K M=5000 E=512 topk=6. IDs must match exactly, weights within FP32 tolerance.",
+  "inputs": {
+    "gate": {
+      "file": "input_gate.bin",
+      "shape": [
+        5000,
+        512
+      ],
+      "dtype": "f32"
+    }
+  },
+  "outputs": {
+    "topk_weights": {
+      "file": "expected_topk_weights.bin",
+      "shape": [
+        5000,
+        6
+      ],
+      "dtype": "f32"
+    },
+    "topk_ids": {
+      "file": "expected_topk_ids.bin",
+      "shape": [
+        5000,
+        6
+      ],
+      "dtype": "i32"
+    }
+  }
+}

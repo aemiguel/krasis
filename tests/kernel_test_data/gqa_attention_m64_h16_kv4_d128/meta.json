@@ -1,0 +1,45 @@
+{
+  "atol": 0.01,
+  "rtol": 0.01,
+  "note": "GQA attention M=64 num_q=16 num_kv=4 hd=128 scale=0.088388. Uses MMA so tolerance is wider.",
+  "inputs": {
+    "q": {
+      "file": "input_q.bin",
+      "shape": [
+        64,
+        16,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "k": {
+      "file": "input_k.bin",
+      "shape": [
+        64,
+        4,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "v": {
+      "file": "input_v.bin",
+      "shape": [
+        64,
+        4,
+        128
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        64,
+        16,
+        128
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

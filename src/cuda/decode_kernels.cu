@@ -5188,3 +5188,432 @@ extern "C" __global__ void la_fused_post_proj(
         out_h[i] = *reinterpret_cast<unsigned short*>(&result);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+// Mamba2 SSM kernels (Nemotron-H hybrid models)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Conv1d state update: shift conv_state left, insert new input, apply conv weights + SiLU.
+// conv_state: [conv_dim, conv_kernel] FP32 — updated in-place (shift left, insert x_input)
+// x_input: [conv_dim] FP32 (new input to shift in)
+// conv_weight: [conv_dim, 1, conv_kernel] BF16 (original HF shape, flattened to [conv_dim, conv_kernel])
+// conv_bias: [conv_dim] BF16 (or null)
+// output: [conv_dim] FP32 (convolved + SiLU activated)
+// Grid: (ceil(conv_dim/256), 1, 1), Block: (256, 1, 1)
+extern "C" __global__ void mamba2_conv1d(
+    float* __restrict__ conv_state,
+    const float* __restrict__ x_input,
+    const float* __restrict__ conv_weight,
+    const float* __restrict__ conv_bias,
+    float* __restrict__ output,
+    int conv_dim, int conv_kernel
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= conv_dim) return;
+
+    // Shift conv_state left: state[idx][j] = state[idx][j+1] for j < kernel-1
+    float* state_row = conv_state + idx * conv_kernel;
+    for (int j = 0; j < conv_kernel - 1; j++) {
+        state_row[j] = state_row[j + 1];
+    }
+    // Insert new input at the right end
+    state_row[conv_kernel - 1] = x_input[idx];
+
+    // Convolve: dot product of state with conv_weight
+    const float* weight_row = conv_weight + idx * conv_kernel;
+    float acc = 0.0f;
+    for (int j = 0; j < conv_kernel; j++) {
+        acc += state_row[j] * weight_row[j];
+    }
+    // Add bias if present
+    if (conv_bias != nullptr) {
+        acc += conv_bias[idx];
+    }
+
+    // SiLU activation: x * sigmoid(x)
+    float sigmoid_val = 1.0f / (1.0f + expf(-acc));
+    output[idx] = acc * sigmoid_val;
+}
+
+// Discretize: compute dt, A_bar, B_bar from continuous parameters.
+// For Mamba2 with n_groups: B and C are [n_groups, state_size], shared across heads in each group.
+// delta: [num_heads] FP32 (from in_proj split)
+// dt_bias: [num_heads] FP32
+// A_log: [num_heads] FP32 (log-space A parameter, NOT exp'd yet)
+// B: [n_groups * state_size] FP32 (from in_proj split, n_groups groups)
+// dt_out: [num_heads] FP32 = softplus(delta + dt_bias)
+// A_bar: [num_heads] FP32 = exp(A * dt) where A = -exp(A_log)
+// B_bar: [num_heads * state_size] FP32 = dt[h] * B[group(h)]
+// Grid: (1, 1, 1), Block: (max(num_heads, 256), 1, 1) — num_heads is typically 64-128
+extern "C" __global__ void mamba2_discretize(
+    const float* __restrict__ delta,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ A_log,
+    const float* __restrict__ B,
+    float* __restrict__ dt_out,
+    float* __restrict__ A_bar,
+    float* __restrict__ B_bar,
+    int num_heads, int state_size, int n_groups
+) {
+    int h = threadIdx.x;
+    if (h >= num_heads) return;
+
+    // dt = softplus(delta + dt_bias) = log(1 + exp(x))
+    float x = delta[h] + dt_bias[h];
+    float dt;
+    if (x > 20.0f) {
+        dt = x;  // softplus(x) ≈ x for large x
+    } else {
+        dt = logf(1.0f + expf(x));
+    }
+    dt_out[h] = dt;
+
+    // A = -exp(A_log), A_bar = exp(A * dt)
+    float A_val = -expf(A_log[h]);
+    A_bar[h] = expf(A_val * dt);
+
+    // B_bar: each head maps to a group. B_bar[h, s] = dt[h] * B[group(h), s]
+    int heads_per_group = num_heads / n_groups;
+    int group = h / heads_per_group;
+    const float* B_group = B + group * state_size;
+    float* B_bar_h = B_bar + h * state_size;
+    for (int s = 0; s < state_size; s++) {
+        B_bar_h[s] = dt * B_group[s];
+    }
+}
+
+// SSM recurrence step: h = A_bar * h + outer(B_bar, x), y = C · h
+// This is the core Mamba2 decode operation — O(1) per token.
+//
+// ssm_state: [num_heads, head_dim, state_size] FP32 (updated in-place)
+// x: [num_heads * head_dim] FP32 (convolved input, split from in_proj)
+// A_bar: [num_heads] FP32 (per-head decay)
+// B_bar: [num_heads * state_size] FP32 (per-head input gate)
+// C: [n_groups * state_size] FP32 (output gate, grouped)
+// y: [num_heads * head_dim] FP32 (output)
+//
+// Grid: (num_heads, 1, 1), Block: (min(head_dim, 256), 1, 1)
+// Each block handles one head: loops over head_dim elements.
+extern "C" __global__ void mamba2_ssm_step(
+    float* __restrict__ ssm_state,
+    const float* __restrict__ x,
+    const float* __restrict__ A_bar,
+    const float* __restrict__ B_bar,
+    const float* __restrict__ C,
+    float* __restrict__ y,
+    int num_heads, int head_dim, int state_size, int n_groups
+) {
+    int h = blockIdx.x;
+    if (h >= num_heads) return;
+    int d = threadIdx.x;
+    if (d >= head_dim) return;
+
+    float a = A_bar[h];
+    const float* b_h = B_bar + h * state_size;
+    int heads_per_group = num_heads / n_groups;
+    int group = h / heads_per_group;
+    const float* c_group = C + group * state_size;
+    float x_val = x[h * head_dim + d];
+
+    // State pointer for this head and dim: ssm_state[h, d, :] = [state_size] FP32
+    float* state = ssm_state + (h * head_dim + d) * state_size;
+
+    // h = A_bar * h + B_bar * x, y = C @ h
+    float y_val = 0.0f;
+    for (int s = 0; s < state_size; s++) {
+        float new_state = a * state[s] + b_h[s] * x_val;
+        state[s] = new_state;
+        y_val += c_group[s] * new_state;
+    }
+
+    y[h * head_dim + d] = y_val;
+}
+
+// Gate + skip + per-group RMSNorm: output = norm_weight * groupRMSNorm(silu(z) * (y + D*x)) -> BF16
+// Matches Mamba2 reference: gate is applied BEFORE normalization, norm is per-group.
+//
+// z: [d_inner] FP32 (gate values from in_proj)
+// y: [d_inner] FP32 (SSM output, does NOT include D*x)
+// D: [num_heads] FP32 (skip connection per head)
+// x_skip: [d_inner] FP32 (post-conv x, same x that went into SSM)
+// norm_weight: [d_inner] FP32 (RMSNorm weight)
+// output: [d_inner] BF16
+//
+// Order: gated = (y + D*x) * silu(z), then per-group RMSNorm(gated) * norm_weight
+// Grid: (n_groups, 1, 1), Block: (256, 1, 1) — one block per group
+extern "C" __global__ void mamba2_gate_output(
+    const float* __restrict__ z,
+    const float* __restrict__ y,
+    const float* __restrict__ D,
+    const float* __restrict__ x_skip,
+    const float* __restrict__ norm_weight,
+    unsigned short* __restrict__ output,
+    int d_inner, int head_dim, int n_groups, float eps
+) {
+    int group = blockIdx.x;
+    int group_size = d_inner / n_groups;
+    int group_offset = group * group_size;
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    // Shared memory layout: [0..num_threads-1] for reduction, [num_threads..num_threads+group_size-1] for gated values
+    extern __shared__ float smem[];
+    float* s_gated = smem + num_threads;
+
+    // Pass 1: compute gated = (y + D*x) * silu(z), store in shared mem, accumulate sum of squares
+    float local_ss = 0.0f;
+    for (int i = tid; i < group_size; i += num_threads) {
+        int idx = group_offset + i;
+        int head = idx / head_dim;
+        float y_d = y[idx] + D[head] * x_skip[idx];
+        float z_val = z[idx];
+        float silu_z = z_val / (1.0f + expf(-z_val));
+        float gated = y_d * silu_z;
+        s_gated[i] = gated;
+        local_ss += gated * gated;
+    }
+    smem[tid] = local_ss;
+    __syncthreads();
+
+    // Block reduction for sum of squares
+    for (int s = num_threads >> 1; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    float rms_inv = rsqrtf(smem[0] / (float)group_size + eps);
+
+    // Pass 2: apply per-group RMSNorm * weight -> BF16 output
+    for (int i = tid; i < group_size; i += num_threads) {
+        int idx = group_offset + i;
+        float normed = s_gated[i] * rms_inv * norm_weight[idx];
+        __nv_bfloat16 bf16_val = __float2bfloat16(normed);
+        output[idx] = *reinterpret_cast<unsigned short*>(&bf16_val);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// relu2 expert kernels (Nemotron LatentMoE)
+// Analogous to fused_silu_w2_batched but with relu^2 activation
+// and no gate projection (input is just up_proj output, not gate+up).
+// ═══════════════════════════════════════════════════════════════════════
+
+// INT4 Marlin variant — relu(up_out)^2 then Marlin INT4 GEMV for down_proj
+// Grid: (n_tiles, 1, num_experts), Block: (256, 1, 1)
+// up_outs: [num_experts * K] BF16 — just up_proj output, NO gate
+extern "C" __global__ void relu2_w2_batched(
+    const unsigned long long* __restrict__ w2_packed_ptrs,
+    const unsigned long long* __restrict__ w2_scales_ptrs,
+    const unsigned short* __restrict__ up_outs,
+    unsigned short* __restrict__ expert_outs,
+    const int* __restrict__ inv_weight_perm,
+    const int* __restrict__ inv_scale_perm,
+    int K, int N, int group_size
+) {
+    int expert_idx = blockIdx.z;
+    const unsigned int* packed = (const unsigned int*)w2_packed_ptrs[expert_idx];
+    const unsigned short* w2_scales = (const unsigned short*)w2_scales_ptrs[expert_idx];
+    const unsigned short* up_out = up_outs + expert_idx * K;  // just K, not 2*K
+    unsigned short* out = expert_outs + expert_idx * N;
+
+    extern __shared__ char smem_raw[];
+    unsigned short* s_input = (unsigned short*)smem_raw;
+    int* s_inv_wperm = (int*)(smem_raw + K * 2);
+    int* s_inv_sperm = (int*)(smem_raw + K * 2 + 1024 * 4);
+
+    int tid = threadIdx.x;
+
+    // Apply relu^2 while loading up_out into shared memory
+    for (int i = tid; i < K; i += 256) {
+        float u = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&up_out[i]));
+        float relu_u = fmaxf(u, 0.0f);
+        float relu2_u = relu_u * relu_u;
+        __nv_bfloat16 val = __float2bfloat16(relu2_u);
+        s_input[i] = *reinterpret_cast<unsigned short*>(&val);
+    }
+    for (int i = tid; i < 1024; i += 256) s_inv_wperm[i] = inv_weight_perm[i];
+    if (tid < 64) s_inv_sperm[tid] = inv_scale_perm[tid];
+    __syncthreads();
+
+    int k_slice = tid & 15;
+    int tn = tid >> 4;
+    int n_tile = blockIdx.x;
+    int n = n_tile * 16 + tn;
+    if (n >= N) return;
+
+    int k_tiles_total = K >> 4;
+    int out_cols = N << 1;
+    int tiles_per_slice = k_tiles_total >> 4;
+    int kt_start = k_slice * tiles_per_slice;
+    int kt_end = (k_slice == 15) ? k_tiles_total : (kt_start + tiles_per_slice);
+
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 3;
+        perm_shift[tk] = (perm_pos & 7) << 2;
+    }
+
+    float acc = 0.0f;
+    int cur_scale_group = -1;
+    float cached_scale = 0.0f;
+
+    for (int kt = kt_start; kt < kt_end; kt++) {
+        int k_base = kt << 4;
+        int row_base = kt * out_cols;
+        int sg_start = k_base / group_size;
+        int sg_end = (k_base + 15) / group_size;
+
+        if (sg_start != cur_scale_group) {
+            cur_scale_group = sg_start;
+            int scale_flat = sg_start * N + n;
+            int schunk = scale_flat >> 6;
+            int slocal = scale_flat & 63;
+            int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+            unsigned short scale_bits = w2_scales[sperm_pos];
+            cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        }
+
+        if (sg_start == sg_end) {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
+                acc += w_val * cached_scale * x;
+            }
+        } else {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                int k = k_base + tk;
+                int sg = k / group_size;
+                if (sg != cur_scale_group) {
+                    cur_scale_group = sg;
+                    int scale_flat = sg * N + n;
+                    int schunk = scale_flat >> 6;
+                    int slocal = scale_flat & 63;
+                    int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                    unsigned short scale_bits = w2_scales[sperm_pos];
+                    cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+                }
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+                acc += w_val * cached_scale * x;
+            }
+        }
+    }
+
+    // Warp shuffle reduction across 16 k_slices
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset, 16);
+    }
+
+    if (k_slice == 0) {
+        __nv_bfloat16 result = __float2bfloat16(acc);
+        out[n] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
+// INT8 Marlin variant — relu(up_out)^2 then Marlin INT8 GEMV for down_proj
+// Grid: (n_tiles, 1, num_experts), Block: (256, 1, 1)
+extern "C" __global__ void relu2_w2_int8_batched(
+    const unsigned long long* __restrict__ w2_packed_ptrs,
+    const unsigned long long* __restrict__ w2_scales_ptrs,
+    const unsigned short* __restrict__ up_outs,
+    unsigned short* __restrict__ expert_outs,
+    const int* __restrict__ inv_weight_perm,
+    const int* __restrict__ inv_scale_perm,
+    int K, int N, int group_size
+) {
+    int expert_idx = blockIdx.z;
+    const signed char* packed = (const signed char*)w2_packed_ptrs[expert_idx];
+    const unsigned short* w2_scales = (const unsigned short*)w2_scales_ptrs[expert_idx];
+    const unsigned short* up_out = up_outs + expert_idx * K;
+    unsigned short* out = expert_outs + expert_idx * N;
+
+    extern __shared__ char smem_raw[];
+    unsigned short* s_input = (unsigned short*)smem_raw;
+    int* s_inv_wperm = (int*)(smem_raw + K * 2);
+    int* s_inv_sperm = (int*)(smem_raw + K * 2 + 1024 * 4);
+
+    int tid = threadIdx.x;
+
+    // Apply relu^2 while loading up_out into shared memory
+    for (int i = tid; i < K; i += 256) {
+        float u = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&up_out[i]));
+        float relu_u = fmaxf(u, 0.0f);
+        float relu2_u = relu_u * relu_u;
+        __nv_bfloat16 val = __float2bfloat16(relu2_u);
+        s_input[i] = *reinterpret_cast<unsigned short*>(&val);
+    }
+    for (int i = tid; i < 1024; i += 256) s_inv_wperm[i] = inv_weight_perm[i];
+    if (tid < 64) s_inv_sperm[tid] = inv_scale_perm[tid];
+    __syncthreads();
+
+    int k_slice = tid & 15;
+    int tn = tid >> 4;
+    int n_tile = blockIdx.x;
+    int n = n_tile * 16 + tn;
+    if (n >= N) return;
+
+    int k_tiles_total = K >> 4;
+    int tiles_per_slice = k_tiles_total >> 4;
+    int kt_start = k_slice * tiles_per_slice;
+    int kt_end = (k_slice == 15) ? k_tiles_total : (kt_start + tiles_per_slice);
+
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        perm_u32_col[tk] = (chunk << 10) + s_inv_wperm[local_idx];
+    }
+
+    float acc = 0.0f;
+    int cur_scale_group = -1;
+    float cached_scale = 0.0f;
+
+    for (int kt = kt_start; kt < kt_end; kt++) {
+        int k_base = kt << 4;
+        int row_base = kt * N;
+        int sg = k_base / group_size;
+
+        if (sg != cur_scale_group) {
+            cur_scale_group = sg;
+            int scale_flat = sg * N + n;
+            int schunk = scale_flat >> 6;
+            int slocal = scale_flat & 63;
+            int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+            unsigned short scale_bits = w2_scales[sperm_pos];
+            cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        }
+
+        #pragma unroll
+        for (int tk = 0; tk < 16; tk++) {
+            float w_val = (float)packed[row_base + perm_u32_col[tk]];
+            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
+            acc += w_val * cached_scale * x;
+        }
+    }
+
+    // Warp shuffle reduction
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset, 16);
+    }
+
+    if (k_slice == 0) {
+        __nv_bfloat16 result = __float2bfloat16(acc);
+        out[n] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}

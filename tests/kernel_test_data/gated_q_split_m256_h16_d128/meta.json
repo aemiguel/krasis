@@ -1,0 +1,36 @@
+{
+  "atol": 0.0,
+  "rtol": 0.0,
+  "note": "Gated Q split M=256 H=16 D=128 (exact)",
+  "inputs": {
+    "qg": {
+      "file": "input_qg.bin",
+      "shape": [
+        256,
+        16,
+        256
+      ],
+      "dtype": "bf16"
+    }
+  },
+  "outputs": {
+    "q": {
+      "file": "expected_q.bin",
+      "shape": [
+        256,
+        16,
+        128
+      ],
+      "dtype": "bf16"
+    },
+    "gate": {
+      "file": "expected_gate.bin",
+      "shape": [
+        256,
+        16,
+        128
+      ],
+      "dtype": "bf16"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "atol": 0.0001,
+  "rtol": 0.0001,
+  "note": "L2 norm per head M=128 num_heads=32 dim=128 scale=11.31",
+  "inputs": {
+    "x": {
+      "file": "input_x.bin",
+      "shape": [
+        128,
+        32,
+        128
+      ],
+      "dtype": "f32"
+    }
+  },
+  "outputs": {
+    "out": {
+      "file": "expected_out.bin",
+      "shape": [
+        128,
+        32,
+        128
+      ],
+      "dtype": "f32"
+    }
+  }
+}

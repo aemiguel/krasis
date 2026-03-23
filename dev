@@ -19,6 +19,7 @@
 #                                     from the first non-passed model. Without a target, runs
 #                                     all models with no resume capability.
 #   ./dev awq-calibrate <config>    Run AWQ calibration, produce attention template
+#   ./dev test-kernels [name]       Run CUDA kernel unit tests (or filter by name)
 #   ./dev chat [args]               Run krasis chat from source
 #   ./dev sanity                    Run sanity test prompts against running server
 #   ./dev kill                      Kill all krasis processes and free GPU memory
@@ -156,6 +157,13 @@ auto_rebuild() {
 # Called before every run/test to prevent OOMs from stale processes.
 
 cleanup_gpu() {
+    # Optional arg: config file path. If provided, only check GPUs listed in CFG_SELECTED_GPUS.
+    local conf="${1:-}"
+    local selected_gpus=""
+    if [[ -n "$conf" && -f "$conf" ]]; then
+        selected_gpus=$(grep '^CFG_SELECTED_GPUS=' "$conf" 2>/dev/null | head -1 | cut -d'"' -f2 || true)
+    fi
+
     # Find all krasis server/stress/benchmark Python processes (but not this script)
     local pids
     pids=$(pgrep -f 'python.*krasis\.' 2>/dev/null || true)
@@ -205,12 +213,24 @@ cleanup_gpu() {
 
     # Now wait for GPU memory to actually be released.
     # CUDA memory isn't freed until the process fully exits.
-    info "Waiting for GPU memory to clear..."
+    if [[ -n "$selected_gpus" ]]; then
+        info "Waiting for selected GPUs ($selected_gpus) to clear..."
+    else
+        info "Waiting for GPU memory to clear..."
+    fi
     local gpu_timeout=30
     local gpu_waited=0
     while [[ $gpu_waited -lt $gpu_timeout ]]; do
         local all_clear=true
         while IFS=', ' read -r idx used gpu_mem_total; do
+            # If selected_gpus is set, only check those GPUs
+            if [[ -n "$selected_gpus" ]]; then
+                local check_this=false
+                for sg in $(echo "$selected_gpus" | tr ',' ' '); do
+                    [[ "$idx" == "$sg" ]] && check_this=true
+                done
+                $check_this || continue
+            fi
             # Baseline is ~200-300 MiB (desktop compositor). 500 MiB threshold.
             if [[ "$used" -gt 500 ]]; then
                 all_clear=false
@@ -219,7 +239,11 @@ cleanup_gpu() {
         done < <(nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null)
 
         if $all_clear; then
-            ok "All GPUs clear."
+            if [[ -n "$selected_gpus" ]]; then
+                ok "Selected GPUs ($selected_gpus) clear."
+            else
+                ok "All GPUs clear."
+            fi
             return 0
         fi
 
@@ -248,7 +272,7 @@ do_run() {
     local conf
     conf=$(resolve_config "$1")
     shift
-    cleanup_gpu
+    cleanup_gpu "$conf"
     auto_rebuild
     info "Launching from: $conf"
     exec "$PYTHON" -m krasis.server --config "$conf" "$@"
@@ -260,7 +284,7 @@ do_test() {
     conf=$(resolve_config "$1")
     local thorough=false
     [[ "${2:-}" == "--thorough" ]] && thorough=true
-    cleanup_gpu
+    cleanup_gpu "$conf"
     auto_rebuild
 
     local port
@@ -582,7 +606,7 @@ do_benchmark() {
     local conf
     conf=$(resolve_config "$1")
     shift
-    cleanup_gpu
+    cleanup_gpu "$conf"
     auto_rebuild
     local logfile
     logfile="$SCRIPT_DIR/logs/benchmarks/krasis_benchmark_$(basename "$conf" .conf)_$(date +%Y%m%d_%H%M%S).log"
@@ -598,7 +622,7 @@ do_perplexity() {
     local conf
     conf=$(resolve_config "$1")
     shift
-    cleanup_gpu
+    cleanup_gpu "$conf"
     auto_rebuild
     local logfile
     logfile="$SCRIPT_DIR/logs/perplexity/krasis_perplexity_$(basename "$conf" .conf)_$(date +%Y%m%d_%H%M%S).log"
@@ -614,7 +638,7 @@ do_awq_calibrate() {
     local conf
     conf=$(resolve_config "$1")
     shift
-    cleanup_gpu
+    cleanup_gpu "$conf"
     auto_rebuild
     info "Running AWQ calibration: $conf"
     cd "$SCRIPT_DIR" && "$PYTHON" -m krasis.awq_calibrate --config "$conf" "$@"
@@ -625,6 +649,37 @@ do_network() {
     local port="$1"
     shift
     exec "$PYTHON" "$SCRIPT_DIR/tests/test_network.py" --port "$port" "$@"
+}
+
+do_test_kernels() {
+    info "Running CUDA kernel unit tests..."
+    # First ensure test data exists
+    local test_data_dir="$SCRIPT_DIR/tests/kernel_test_data"
+    if [[ ! -d "$test_data_dir" ]] || [[ -z "$(ls -A "$test_data_dir" 2>/dev/null)" ]]; then
+        info "Generating kernel test data..."
+        cd "$SCRIPT_DIR" && "$PYTHON" tests/generate_kernel_test_data.py
+    fi
+
+    # PyO3 extension modules need Python library for test linking.
+    # Get the python lib dir from the conda env Python.
+    local pyver
+    pyver=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    local pylibdir
+    pylibdir=$("$PYTHON" -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+    export PYO3_PYTHON="$PYTHON"
+    export LD_LIBRARY_PATH="$pylibdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    # Tell the linker where to find libpython and to link it
+    export RUSTFLAGS="${RUSTFLAGS:-} -L $pylibdir -l python${pyver}"
+
+    # Build and run kernel tests (lib only, skip other test binaries)
+    cd "$SCRIPT_DIR"
+    if [[ $# -gt 0 ]]; then
+        local filter="kernel_tests::test_$1"
+        info "Filter: $filter"
+        cargo test --release --lib "$filter" -- --nocapture 2>&1
+    else
+        cargo test --release --lib kernel_tests -- --nocapture 2>&1
+    fi
 }
 
 do_kill() {
@@ -733,6 +788,7 @@ case "$cmd" in
     perplexity)     do_perplexity "$@" ;;
     awq-calibrate)  do_awq_calibrate "$@" ;;
     network)        do_network "$@" ;;
+    test-kernels)   do_test_kernels "$@" ;;
     shell)          do_shell "$@" ;;
     python)         do_python "$@" ;;
     help|-h|--help)
@@ -756,6 +812,7 @@ case "$cmd" in
         echo "  test <config>             Short model test (benchmark + network tests)"
         echo "  test <config> --thorough  Thorough test (+ stress + large prompts)"
         echo "  network <port> [flags]    Run network tests against running server"
+        echo "  test-kernels [name]       Run CUDA kernel unit tests (or filter by name)"
         echo "  chat [args]               Run krasis chat from source"
         echo "  sanity                    Run sanity test prompts against running server"
         echo "  kill                      Kill all krasis/GPU processes, reset if needed"

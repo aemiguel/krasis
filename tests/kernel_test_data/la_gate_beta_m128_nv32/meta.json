@@ -1,0 +1,55 @@
+{
+  "atol": 0.0001,
+  "rtol": 0.0001,
+  "note": "LA gating M=128 nv=32",
+  "inputs": {
+    "b": {
+      "file": "input_b.bin",
+      "shape": [
+        128,
+        32
+      ],
+      "dtype": "bf16"
+    },
+    "a": {
+      "file": "input_a.bin",
+      "shape": [
+        128,
+        32
+      ],
+      "dtype": "bf16"
+    },
+    "A_log": {
+      "file": "input_A_log.bin",
+      "shape": [
+        32
+      ],
+      "dtype": "f32"
+    },
+    "dt_bias": {
+      "file": "input_dt_bias.bin",
+      "shape": [
+        32
+      ],
+      "dtype": "f32"
+    }
+  },
+  "outputs": {
+    "beta": {
+      "file": "expected_beta.bin",
+      "shape": [
+        128,
+        32
+      ],
+      "dtype": "f32"
+    },
+    "gate": {
+      "file": "expected_gate.bin",
+      "shape": [
+        128,
+        32
+      ],
+      "dtype": "f32"
+    }
+  }
+}
