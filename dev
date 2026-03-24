@@ -18,6 +18,7 @@
 #                                     to a state file. Re-running with the same target resumes
 #                                     from the first non-passed model. Without a target, runs
 #                                     all models with no resume capability.
+#   ./dev reference-test <config>   Compare engine output against BF16 reference data
 #   ./dev awq-calibrate <config>    Run AWQ calibration, produce attention template
 #   ./dev test-kernels [name]       Run CUDA kernel unit tests (or filter by name)
 #   ./dev chat [args]               Run krasis chat from source
@@ -695,6 +696,20 @@ do_validate() {
     exec "$PYTHON" "$SCRIPT_DIR/tests/validate_model.py" "$conf_path" "$@"
 }
 
+do_reference_test() {
+    [[ $# -lt 1 ]] && err "Usage: ./dev reference-test <config> [--verbose] [--no-server] [--port PORT]
+  Runs reference test comparing engine output against BF16 reference data.
+  Produces an HTML report in logs/reference-tests/.
+  Example: ./dev reference-test qwen35-a4"
+    local conf
+    conf=$(resolve_config "$1")
+    shift
+    cleanup_gpu "$conf"
+    auto_rebuild
+    info "Running reference test: $conf"
+    KRASIS_DEV_SCRIPT=1 "$PYTHON" "$SCRIPT_DIR/tests/reference_test.py" "$conf" "$@"
+}
+
 do_kill() {
     info "Killing all krasis processes and freeing GPU memory..."
 
@@ -798,6 +813,7 @@ case "$cmd" in
     benchmark)      do_benchmark "$@" ;;
     release-test)   do_release_test "$@" ;;
     release-test-all) do_release_test_all "$@" ;;
+    reference-test) do_reference_test "$@" ;;
     perplexity)     do_perplexity "$@" ;;
     awq-calibrate)  do_awq_calibrate "$@" ;;
     network)        do_network "$@" ;;
@@ -815,6 +831,7 @@ case "$cmd" in
         echo "  run <config> [flags]      Launch server (add --benchmark for benchmarks)"
         echo "  benchmark <config>        Run standard benchmark and exit"
         echo "  release-test <model>      Run full release test (5 configs, report)"
+        echo "  reference-test <config>   Compare engine output against BF16 reference data"
         echo "  release-test-all [target] Run release test on all supported models sequentially"
         echo "                            Without a target: runs all, no state saved."
         echo "                            With a target (e.g. 'rc8'): saves progress to state file."

@@ -111,6 +111,9 @@ struct ServerState {
     rust_prefill: Arc<std::sync::Mutex<Option<crate::gpu_prefill::PrefillEngine>>>,
     /// When true, enable test-only endpoints (e.g. /v1/internal/prefill_logits).
     test_endpoints: bool,
+    /// Model's EOS token IDs (from generation_config.json).
+    /// These are always included in stop_ids for decode, matching the main branch behavior.
+    eos_stop_ids: Vec<usize>,
 }
 
 /// Parsed HTTP request.
@@ -495,6 +498,14 @@ fn handle_request(
             }
         }
 
+        ("POST", "/v1/internal/reference_test") => {
+            if state.test_endpoints {
+                handle_reference_test(&mut tcp_stream, &request.body, state);
+            } else {
+                let _ = send_json(&mut tcp_stream, 404, r#"{"error":"Test endpoints not enabled. Start server with --test-endpoints"}"#);
+            }
+        }
+
         _ => {
             let _ = send_json(&mut tcp_stream, 404, r#"{"error":"Not found"}"#);
         }
@@ -688,10 +699,16 @@ fn handle_chat_completion(
             &[], // suppress tokens handled by decode
         );
 
-        // Convert stop token strings to IDs
-        let stop_ids: Vec<usize> = stop_tokens.iter().filter_map(|s| {
-            state.tokenizer.token_to_id(s).map(|id| id as usize)
-        }).collect();
+        // Convert stop token strings to IDs, and always include model's EOS tokens
+        let mut stop_ids: Vec<usize> = state.eos_stop_ids.clone();
+        for s in &stop_tokens {
+            if let Some(id) = state.tokenizer.token_to_id(s) {
+                let id = id as usize;
+                if !stop_ids.contains(&id) {
+                    stop_ids.push(id);
+                }
+            }
+        }
 
         match result {
             Ok(r) => {
@@ -954,6 +971,210 @@ fn handle_prefill_logits(
         ));
     }
     let response = format!(r#"{{"positions":[{}]}}"#, pos_json.join(","));
+    let _ = send_json(stream, 200, &response);
+}
+
+/// Handle /v1/internal/reference_test endpoint.
+/// Accepts raw input_token_ids, runs greedy prefill + decode, returns output tokens with logprobs.
+/// Used for comparing engine output against BF16 reference data.
+fn handle_reference_test(
+    stream: &mut TcpStream,
+    body: &str,
+    state: &mut ServerState,
+) {
+    let t_start = Instant::now();
+
+    // Parse request
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = send_json(stream, 400, &format!(r#"{{"error":"Invalid JSON: {}"}}"#, e));
+            return;
+        }
+    };
+
+    // Required: input_token_ids (raw token IDs, no tokenization or template applied)
+    let input_token_ids: Vec<u32> = match req.get("input_token_ids") {
+        Some(serde_json::Value::Array(arr)) => {
+            arr.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect()
+        }
+        _ => {
+            let _ = send_json(stream, 400, r#"{"error":"Missing or invalid input_token_ids array"}"#);
+            return;
+        }
+    };
+
+    let max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+    let top_logprobs = req.get("top_logprobs").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    // Stop token IDs (from reference data's eos_token_ids)
+    let stop_ids: Vec<usize> = match req.get("stop_token_ids") {
+        Some(serde_json::Value::Array(arr)) => {
+            arr.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect()
+        }
+        _ => state.eos_stop_ids.clone(),
+    };
+
+    log::info!("reference_test: {} input tokens, max_tokens={}, top_logprobs={}, stop_ids={:?}",
+        input_token_ids.len(), max_tokens, top_logprobs, stop_ids);
+
+    // ── Evict soft HCS before prefill ──
+    let store_for_evict = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+    let (_evicted, _freed_mb) = store_for_evict.hcs_evict_for_prefill(input_token_ids.len());
+
+    // ── Prefill with raw token IDs (no tokenization, no chat template) ──
+    let mut engine_guard = state.rust_prefill.lock().unwrap();
+    let engine = match engine_guard.as_mut() {
+        Some(e) => e,
+        None => {
+            let _ = send_json(stream, 500, r#"{"error":"Rust prefill engine not available"}"#);
+            return;
+        }
+    };
+
+    // Update HCS snapshot
+    {
+        let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
+        let (cache_fast, ne) = store.export_hcs_snapshot();
+        engine.update_hcs_snapshot(cache_fast, ne);
+    }
+
+    // Swap to Marlin for prefill
+    {
+        let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+        if let Err(e) = store.swap_to_marlin_rust() {
+            log::error!("reference_test: Failed to swap to Marlin: {}", e);
+        }
+    }
+
+    // Run prefill with temperature=0 (greedy)
+    let prefill_result = engine.run_prefill(
+        &input_token_ids,
+        0.0, // temperature=0 for greedy
+        &[], // no suppress tokens
+    );
+
+    let (first_token, prompt_len) = match prefill_result {
+        Ok(r) => (r.first_token as usize, r.prompt_len),
+        Err(e) => {
+            let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill failed: {}"}}"#, e));
+            Python::with_gil(|py| {
+                let _ = state.py_model.call_method0(py, "server_cleanup");
+            });
+            return;
+        }
+    };
+
+    // Set KV position and swap to simple INT4 for decode
+    {
+        let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+        store.set_kv_position_rust(prompt_len);
+        if let Err(e) = store.swap_to_simple_int4_rust() {
+            log::error!("reference_test: Failed to swap to simple INT4: {}", e);
+        }
+    }
+
+    let prefill_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+
+    // ── Reload soft HCS after prefill ──
+    let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+    {
+        let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async(prompt_len);
+        if queued > 0 {
+            log::info!("reference_test: HCS soft reload queued {} experts", queued);
+        }
+    }
+
+    // Disable thinking suppression for reference test (greedy, no thinking budget logic)
+    store.set_think_end_suppress(None, 0);
+    store.set_min_new_tokens_ext(0, vec![]);
+
+    // ── Greedy decode with logprobs collection ──
+    let t_decode = Instant::now();
+    let tokenizer = &state.tokenizer;
+
+    // Collect all output tokens and their top-k logprobs
+    let mut output_tokens: Vec<(usize, Vec<(u32, f32)>)> = Vec::new();
+    let mut all_text = String::new();
+    let mut finish_reason = "length".to_string();
+
+    // First token
+    let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
+    all_text.push_str(&first_text);
+    // First token logprobs are not available from prefill, store empty
+    output_tokens.push((first_token, vec![]));
+
+    let decode_budget = max_tokens.saturating_sub(1);
+
+    {
+        let mut on_token = |token_id: usize, text: &str, fr: Option<&str>, token_logprobs: Option<&[(u32, f32)]>| -> bool {
+            all_text.push_str(text);
+            let lps = token_logprobs.map(|s| s.to_vec()).unwrap_or_default();
+            output_tokens.push((token_id, lps));
+            if let Some(r) = fr {
+                finish_reason = r.to_string();
+            }
+            true
+        };
+
+        store.gpu_generate_stream(
+            first_token,
+            prompt_len,
+            decode_budget,
+            0.0,  // temperature=0 (greedy)
+            1,    // top_k=1 (greedy)
+            1.0,  // top_p=1.0
+            &stop_ids,
+            tokenizer,
+            0.0,  // no presence penalty
+            top_logprobs,
+            on_token,
+        );
+    }
+
+    let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+
+    // ── Cleanup ──
+    Python::with_gil(|py| {
+        let _ = state.py_model.call_method0(py, "server_cleanup");
+    });
+
+    let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+
+    // ── Format response ──
+    let mut per_token_json = Vec::new();
+    for (tid, logprobs) in &output_tokens {
+        let mut tk_json = Vec::new();
+        for &(lp_tid, lp_val) in logprobs {
+            tk_json.push(format!(r#"{{"token_id":{},"log_prob":{:.6}}}"#, lp_tid, lp_val));
+        }
+        // Get log_prob for the selected token (first in top-k if available)
+        let selected_lp = logprobs.iter()
+            .find(|&&(t, _)| t == *tid as u32)
+            .map(|&(_, lp)| lp)
+            .unwrap_or(0.0);
+        per_token_json.push(format!(
+            r#"{{"token_id":{},"log_prob":{:.6},"top_k":[{}]}}"#,
+            tid, selected_lp, tk_json.join(",")
+        ));
+    }
+
+    // Escape text for JSON
+    let text_escaped = serde_json::to_string(&all_text).unwrap_or_else(|_| "\"\"".to_string());
+
+    let response = format!(
+        r#"{{"token_ids":[{}],"text":{},"num_tokens":{},"per_token_data":[{}],"finish_reason":"{}","timing":{{"prefill_ms":{:.1},"decode_ms":{:.1},"total_ms":{:.1},"prompt_tokens":{}}}}}"#,
+        output_tokens.iter().map(|(t, _)| t.to_string()).collect::<Vec<_>>().join(","),
+        text_escaped,
+        output_tokens.len(),
+        per_token_json.join(","),
+        finish_reason,
+        prefill_ms, decode_ms, total_ms, prompt_len
+    );
+
+    log::info!("reference_test: {} output tokens in {:.0}ms (prefill={:.0}ms decode={:.0}ms), finish={}",
+        output_tokens.len(), total_ms, prefill_ms, decode_ms, finish_reason);
+
     let _ = send_json(stream, 200, &response);
 }
 
@@ -1576,6 +1797,40 @@ impl RustServer {
                 }
             };
 
+            // Load EOS token IDs from generation_config.json (same directory as tokenizer.json).
+            // These are required for the model to stop generating — without them, decode
+            // never terminates (the main branch gets these from Python prefill result).
+            let eos_stop_ids = {
+                let p = std::path::Path::new(&tokenizer_path);
+                let gen_cfg_path = p.parent().unwrap_or(p).join("generation_config.json");
+                let mut ids = Vec::new();
+                if let Ok(data) = std::fs::read_to_string(&gen_cfg_path) {
+                    if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+                        match cfg.get("eos_token_id") {
+                            Some(serde_json::Value::Number(n)) => {
+                                if let Some(id) = n.as_u64() {
+                                    ids.push(id as usize);
+                                }
+                            }
+                            Some(serde_json::Value::Array(arr)) => {
+                                for v in arr {
+                                    if let Some(id) = v.as_u64() {
+                                        ids.push(id as usize);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if ids.is_empty() {
+                    log::warn!("No eos_token_id found in generation_config.json — decode may not stop");
+                } else {
+                    log::info!("EOS stop tokens: {:?}", ids);
+                }
+                ids
+            };
+
             // Load chat template from tokenizer_config.json (same directory as tokenizer.json)
             let tokenizer_config_path = {
                 let p = std::path::Path::new(&tokenizer_path);
@@ -1681,6 +1936,7 @@ impl RustServer {
                 multi_gpu_gqa_offsets,
                 rust_prefill,
                 test_endpoints,
+                eos_stop_ids,
             };
 
             while running.load(Ordering::Acquire) {
@@ -1810,7 +2066,28 @@ impl RustServer {
 
         let first_token = prefill_result.first_token as usize;
         let prompt_len = prefill_result.prompt_len;
-        let stop_ids: Vec<usize> = Vec::new(); // benchmark doesn't use stop tokens
+        // Load EOS tokens for benchmark path (same logic as serve_forever)
+        let stop_ids: Vec<usize> = {
+            let p = std::path::Path::new(&self.tokenizer_path);
+            let gen_cfg_path = p.parent().unwrap_or(p).join("generation_config.json");
+            let mut ids = Vec::new();
+            if let Ok(data) = std::fs::read_to_string(&gen_cfg_path) {
+                if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+                    match cfg.get("eos_token_id") {
+                        Some(serde_json::Value::Number(n)) => {
+                            if let Some(id) = n.as_u64() { ids.push(id as usize); }
+                        }
+                        Some(serde_json::Value::Array(arr)) => {
+                            for v in arr {
+                                if let Some(id) = v.as_u64() { ids.push(id as usize); }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ids
+        };
 
         // Set KV cache position on decode store
         store.set_kv_position_rust(prompt_len);
