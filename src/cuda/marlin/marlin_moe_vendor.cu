@@ -387,7 +387,18 @@ void moe_marlin_mm_impl(
         m_block_size_8, has_act_order, has_zp, group_blocks,
         num_threads, is_zp_float);
 
-    if (kernel == MarlinDefault) return;  // unsupported config
+    if (kernel == MarlinDefault) {
+        fprintf(stderr, "[DIAG Marlin MoE] KERNEL NOT FOUND! thread_m_blocks=%d thread_n_blocks=%d thread_k_blocks=%d "
+                "m_block_size_8=%d num_bits=%d group_blocks=%d num_threads=%d prob_m=%d prob_n=%d prob_k=%d\n",
+                thread_m_blocks, thread_n_blocks, thread_k_blocks,
+                (int)m_block_size_8, num_bits, group_blocks, num_threads, prob_m, prob_n, prob_k);
+        return;
+    }
+
+    fprintf(stderr, "[DIAG Marlin MoE] LAUNCHING kernel: blocks=%d threads=%d smem=%d "
+            "thread_m=%d thread_n=%d thread_k=%d prob_m=%d prob_n=%d prob_k=%d\n",
+            blocks, num_threads, max_shared_mem,
+            thread_m_blocks, thread_n_blocks, thread_k_blocks, prob_m, prob_n, prob_k);
 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
 

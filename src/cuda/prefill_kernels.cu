@@ -530,8 +530,12 @@ extern "C" __global__ void softmax_topk_kernel(
                 top_idxs[pos] = i;
             }
         }
+        /* Normalize top-k weights to sum to 1.0 */
+        float wsum = 0.0f;
+        for (int k = 0; k < topk; k++) wsum += top_vals[k];
+        float inv_wsum = (wsum > 0.0f) ? 1.0f / wsum : 0.0f;
         for (int k = 0; k < topk; k++) {
-            tw[k] = top_vals[k];
+            tw[k] = top_vals[k] * inv_wsum;
             ti[k] = top_idxs[k];
         }
     }
@@ -1232,6 +1236,26 @@ extern "C" __global__ void moe_add_shared_kernel(
     const __nv_bfloat16* s = shared_out + (int64_t)row * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         a[i] += bf16_to_float(s[i]);
+    }
+}
+
+/* ── MoE Add Shared (gated) ──────────────────────────────────────────── */
+
+/* Same as moe_add_shared, but applies sigmoid gating: accum += sigmoid(gate[row]) * shared_out[row]
+ * gate_values is [M] FP32 (output of hidden @ gate_weight GEMM). */
+extern "C" __global__ void moe_add_shared_gated_kernel(
+    float* __restrict__ accum,
+    const __nv_bfloat16* __restrict__ shared_out,
+    const float* __restrict__ gate_values,
+    int M, int D)
+{
+    int row = blockIdx.x;
+    if (row >= M) return;
+    float gate = 1.0f / (1.0f + expf(-gate_values[row]));
+    float* a = accum + (int64_t)row * D;
+    const __nv_bfloat16* s = shared_out + (int64_t)row * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        a[i] += gate * bf16_to_float(s[i]);
     }
 }
 
@@ -2014,9 +2038,9 @@ extern "C" __global__ void la_chunk_output_kernel(
             }
             inter *= exp_g;
 
-            /* Intra-chunk: sum_{s<t} [(q[t] @ k[s]) * decay(t,s)] * v_new[s, d] */
+            /* Intra-chunk: sum_{s<=t} [(q[t] @ k[s]) * decay(t,s)] * v_new[s, d] */
             float intra = 0.0f;
-            for (int s = 0; s < t; s++) {
+            for (int s = 0; s <= t; s++) {
                 float qk_dot = 0.0f;
                 for (int j = 0; j < dk; j++) {
                     qk_dot += q_h[t * dk + j] * k_h[s * dk + j];
@@ -2191,9 +2215,9 @@ extern "C" __global__ void la_chunk_output_strided_kernel(
             }
             inter *= exp_g;
 
-            /* Intra-chunk: sum_{s<t} [(q[t] @ k[s]) * decay(t,s)] * v_new[s, d] */
+            /* Intra-chunk: sum_{s<=t} [(q[t] @ k[s]) * decay(t,s)] * v_new[s, d] */
             float intra = 0.0f;
-            for (int s = 0; s < t; s++) {
+            for (int s = 0; s <= t; s++) {
                 float qk_dot = 0.0f;
                 for (int j = 0; j < dk; j++) {
                     qk_dot += q_h[t * dk + j] * k_h[s * dk + j];

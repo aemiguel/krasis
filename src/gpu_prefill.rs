@@ -66,7 +66,8 @@ unsafe fn launch(
         std::ptr::null_mut(),
     );
     if err != cuda_sys::CUresult::CUDA_SUCCESS {
-        Err(format!("Kernel launch failed: {:?}", err))
+        Err(format!("Kernel launch failed: {:?} (grid={:?}, block={:?}, smem={}, nparams={}, func_ptr={:?})",
+            err, grid, block, smem, params.len(), func.0))
     } else {
         Ok(())
     }
@@ -97,6 +98,7 @@ pub struct PrefillKernels {
     moe_scatter_add: RawCuFunc,
     moe_zero_accum: RawCuFunc,
     moe_add_shared: RawCuFunc,
+    moe_add_shared_gated: RawCuFunc,
     moe_accum_to_bf16: RawCuFunc,
     fp32_to_bf16_batch: RawCuFunc,
 
@@ -235,7 +237,8 @@ impl ScalarType {
 
 pub struct PrefillModelConfig {
     pub hidden_size: usize,
-    pub intermediate_size: usize,
+    pub intermediate_size: usize,      // max(moe_inter, dense_inter) for general scratch
+    pub moe_intermediate_size: usize,  // actual MoE expert intermediate for MoE-specific buffers
     pub num_hidden_layers: usize,
     pub num_q_heads: usize,
     pub num_kv_heads: usize,
@@ -246,6 +249,7 @@ pub struct PrefillModelConfig {
     pub n_routed_experts: usize,
     pub num_experts_per_tok: usize,
     pub expert_bits: u8,
+    pub shared_expert_bits: u8,
     pub group_size: usize,
     pub sms: usize,
     pub device_ordinal: usize,
@@ -289,6 +293,13 @@ pub struct MarlinWeight {
     pub num_bits: u8,
 }
 
+/// BF16 weight for cuBLAS GEMM (used when attention_quant="bf16").
+pub struct Bf16Weight {
+    pub ptr: u64,    // BF16 data on GPU [n, k] column-major (transposed)
+    pub n: usize,    // output dim
+    pub k: usize,    // input dim
+}
+
 pub struct PrefillLayerWeights {
     pub input_norm: u64,
     pub post_attn_norm: u64,    // 0 = None
@@ -296,6 +307,10 @@ pub struct PrefillLayerWeights {
     pub k_proj: Option<MarlinWeight>,
     pub v_proj: Option<MarlinWeight>,
     pub o_proj: Option<MarlinWeight>,
+    pub q_proj_bf16: Option<Bf16Weight>,
+    pub k_proj_bf16: Option<Bf16Weight>,
+    pub v_proj_bf16: Option<Bf16Weight>,
+    pub o_proj_bf16: Option<Bf16Weight>,
     pub gqa_gated: bool,        // QCN: q_proj outputs [query, gate], apply sigmoid(gate) before o_proj
     pub mamba2_in_proj: Option<MarlinWeight>,
     pub mamba2_out_proj: Option<MarlinWeight>,
@@ -321,13 +336,20 @@ pub struct PrefillLayerWeights {
     pub moe_activation: u8,         // 0=silu, 1=relu2
     pub shared_w1: Option<MarlinWeight>,
     pub shared_w2: Option<MarlinWeight>,
+    /// Shared expert gate weight ptr (BF16, [hidden, 1]). 0 = no gate (weight=1.0).
+    pub shared_gate_ptr: u64,
+    pub shared_gate_rows: usize,
+    pub shared_gate_cols: usize,
     pub layer_type: u8,
     /// MoE layer index in the MoeLayerData array (for expert data lookup).
     pub moe_layer_idx: Option<usize>,
-    // Linear attention weights
+    // Linear attention weights (Marlin or BF16)
     pub la_in_proj_qkvz: Option<MarlinWeight>,
     pub la_in_proj_ba: Option<MarlinWeight>,
     pub la_out_proj: Option<MarlinWeight>,
+    pub la_in_proj_qkvz_bf16: Option<Bf16Weight>,
+    pub la_in_proj_ba_bf16: Option<Bf16Weight>,
+    pub la_out_proj_bf16: Option<Bf16Weight>,
     pub la_conv_weight_ptr: u64,     // [conv_dim, kernel_dim] FP32
     pub la_a_log_ptr: u64,           // [nv] FP32
     pub la_dt_bias_ptr: u64,         // [nv] FP32
@@ -426,6 +448,12 @@ pub struct PrefillResult {
     pub prefill_time_ms: f64,
 }
 
+/// Per-position top-k logprob data from prefill logit extraction.
+pub struct PrefillLogitPosition {
+    pub position: usize,
+    pub top_k: Vec<(usize, f32)>, // (token_id, logprob)
+}
+
 // ════════════════════════════════════════════════════════════════════════
 //  Prefill Engine
 // ════════════════════════════════════════════════════════════════════════
@@ -439,6 +467,9 @@ pub struct PrefillEngine {
     pub embedding_ptr: u64,
     pub final_norm_ptr: u64,
     pub lm_head: Option<MarlinWeight>,
+    pub lm_head_bf16_ptr: u64,   // BF16 weight pointer (when lm_head is None)
+    pub lm_head_bf16_rows: usize, // vocab_size
+    pub lm_head_bf16_cols: usize, // hidden_size
     pub rope_cos_ptr: u64,
     pub rope_sin_ptr: u64,
     pub kv_k_ptrs: Vec<u64>,       // per-layer K cache pointers (FP8)
@@ -566,20 +597,149 @@ impl PrefillEngine {
 
     /// Run the full prefill pipeline with token chunking.
     /// Long prompts are split into chunks to bound intermediate GPU memory usage.
+    /// Ensure the CUDA primary context for our device is active on the calling thread.
+    /// This is needed when run_prefill is called from a thread different from the one
+    /// that created the engine (e.g. benchmark thread vs main server thread).
+    fn bind_cuda_context(&self) -> Result<(), String> {
+        unsafe {
+            let mut ctx: cuda_sys::CUcontext = std::ptr::null_mut();
+            let rc = cuda_sys::lib().cuDevicePrimaryCtxRetain(
+                &mut ctx,
+                self.config.device_ordinal as i32,
+            );
+            if rc != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuDevicePrimaryCtxRetain failed: {:?}", rc));
+            }
+            let rc = cuda_sys::lib().cuCtxSetCurrent(ctx);
+            if rc != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuCtxSetCurrent failed: {:?}", rc));
+            }
+        }
+        Ok(())
+    }
+
+    /// Download BF16 data from GPU and compute L2 norm of a single row (position).
+    /// Used for diagnostic comparison against BF16 reference norms.
+    fn diag_l2_norm(&self, ptr: u64, pos: usize, stride: usize, dim: usize) -> f32 {
+        let offset_bytes = pos * stride * 2; // BF16 = 2 bytes
+        let mut buf = vec![0u16; dim];
+        unsafe {
+            cuda_sys::lib().cuStreamSynchronize(self.stream);
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr + offset_bytes as u64,
+                (dim * 2) as usize,
+            );
+        }
+        let mut sum = 0.0f64;
+        for &v in &buf {
+            let bits = v as u32;
+            let f = f32::from_bits(bits << 16) as f64;
+            sum += f * f;
+        }
+        (sum.sqrt()) as f32
+    }
+
+    /// Download FP32 data from GPU and compute L2 norm of a single row.
+    fn diag_l2_norm_f32(&self, ptr: u64, pos: usize, stride: usize, dim: usize) -> f32 {
+        let offset_bytes = pos * stride * 4; // FP32 = 4 bytes
+        let mut buf = vec![0.0f32; dim];
+        unsafe {
+            cuda_sys::lib().cuStreamSynchronize(self.stream);
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr + offset_bytes as u64,
+                (dim * 4) as usize,
+            );
+        }
+        let mut sum = 0.0f64;
+        for &v in &buf {
+            sum += (v as f64) * (v as f64);
+        }
+        (sum.sqrt()) as f32
+    }
+
+    /// Download FP32 values from GPU and return them.
+    fn diag_download_f32(&self, ptr: u64, count: usize) -> Vec<f32> {
+        let mut buf = vec![0.0f32; count];
+        unsafe {
+            cuda_sys::lib().cuStreamSynchronize(self.stream);
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr,
+                (count * 4) as usize,
+            );
+        }
+        buf
+    }
+
+    /// Print L2 norms at multiple positions for a given buffer, in a format
+    /// that can be compared against the BF16 sublayer reference data.
+    fn diag_print_norms(&self, label: &str, ptr: u64, positions: &[usize], h: usize) {
+        unsafe { cuda_sys::lib().cuStreamSynchronize(self.stream); }
+        let mut parts = Vec::new();
+        for &pos in positions {
+            let norm = self.diag_l2_norm(ptr, pos, h, h);
+            parts.push(format!("{}:{:.6}", pos, norm));
+        }
+        eprintln!("[DIAG] {} {}", label, parts.join(" "));
+    }
+
+    /// Parse reference positions from KRASIS_PREFILL_DIAG_POSITIONS env var,
+    /// or use default positions matching the sublayer reference capture.
+    fn diag_positions(m: usize) -> Vec<usize> {
+        if let Ok(val) = std::env::var("KRASIS_PREFILL_DIAG_POSITIONS") {
+            val.split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .filter(|&p| p < m)
+                .collect()
+        } else {
+            // Default: match reference capture positions [0,1,2,3,4, last-4..last]
+            let mut pos: Vec<usize> = (0..std::cmp::min(5, m)).collect();
+            if m > 5 {
+                for p in m.saturating_sub(5)..m {
+                    if !pos.contains(&p) {
+                        pos.push(p);
+                    }
+                }
+            }
+            pos
+        }
+    }
+
+    /// Get the diagnostic layer limit from KRASIS_PREFILL_DIAG_LAYERS env var.
+    /// Default: 1 (only layer 0). Set to e.g. 5 for layers 0-4, or 999 for all.
+    fn diag_layer_limit() -> usize {
+        std::env::var("KRASIS_PREFILL_DIAG_LAYERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1)
+    }
+
     pub fn run_prefill(
         &mut self,
         token_ids: &[u32],
         temperature: f32,
         suppress_tokens: &[u32],
     ) -> Result<PrefillResult, String> {
+        // Bind CUDA context to calling thread (needed for cross-thread use)
+        self.bind_cuda_context()?;
+
         let t0 = Instant::now();
         let total_m = token_ids.len();
         let h = self.config.hidden_size;
         let num_hidden_layers = self.config.num_hidden_layers;
-
         if total_m == 0 {
             return Err("Empty token sequence".to_string());
         }
+
+        // Diagnostic mode: compare per-layer norms against BF16 reference
+        // Set KRASIS_PREFILL_DIAG=1 to enable.
+        // KRASIS_PREFILL_DIAG_LAYERS=N to check N layers (default 1 = layer 0 only)
+        // KRASIS_PREFILL_DIAG_POSITIONS=0,1,2,3,4,28,29,30,31,32 to set positions
+        let diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
+        let diag_positions = if diag { Self::diag_positions(total_m) } else { vec![] };
+        let diag_layer_limit = if diag { Self::diag_layer_limit() } else { 0 };
 
         // Determine chunk size: use config value, fall back to max_tokens
         let chunk_size = if self.config.prefill_chunk_size > 0 {
@@ -590,6 +750,38 @@ impl PrefillEngine {
 
         // Process token chunks
         let num_chunks = (total_m + chunk_size - 1) / chunk_size;
+
+        // Zero LA recurrent + conv state for fresh prefill (each prefill processes full prompt)
+        if let Some(ref la_state_buf) = self.scratch.d_la_state {
+            let nv = self.config.la_num_v_heads;
+            let dk = self.config.la_k_head_dim;
+            let dv = self.config.la_v_head_dim;
+            let state_elems = nv * dk * dv;
+            unsafe {
+                cuda_sys::lib().cuMemsetD32Async(
+                    *la_state_buf.device_ptr(), 0, state_elems, self.stream);
+            }
+        }
+        for layer_idx in 0..num_hidden_layers {
+            let lw = &self.layer_weights[layer_idx];
+            if lw.la_conv_state_ptr != 0 {
+                let conv_dim = self.config.la_conv_dim;
+                let kernel_dim = self.config.la_conv_kernel_dim;
+                unsafe {
+                    cuda_sys::lib().cuMemsetD32Async(
+                        lw.la_conv_state_ptr, 0, conv_dim * kernel_dim, self.stream);
+                }
+            }
+            if lw.la_recur_state_ptr != 0 {
+                let nv = self.config.la_num_v_heads;
+                let dk = self.config.la_k_head_dim;
+                let dv = self.config.la_v_head_dim;
+                unsafe {
+                    cuda_sys::lib().cuMemsetD32Async(
+                        lw.la_recur_state_ptr, 0, nv * dk * dv, self.stream);
+                }
+            }
+        }
 
         for chunk_idx in 0..num_chunks {
             let chunk_start = chunk_idx * chunk_size;
@@ -602,15 +794,42 @@ impl PrefillEngine {
             }
 
             // 1. Upload token IDs and positions for this chunk
-            self.upload_tokens_with_offset(chunk_tokens, chunk_start)?;
+            self.upload_tokens_with_offset(chunk_tokens, chunk_start)
+                .map_err(|e| format!("upload_tokens chunk {}: {}", chunk_idx, e))?;
 
             // 2. Embedding lookup
-            self.launch_embedding(m)?;
+            self.launch_embedding(m)
+                .map_err(|e| format!("embedding chunk {} m={}: {}", chunk_idx, m, e))?;
+
+            if diag && chunk_idx == 0 {
+                eprintln!("[DIAG] === Prefill diagnostic: m={} positions={:?} layers=0..{} ===",
+                    m, diag_positions, diag_layer_limit);
+                self.diag_print_norms("embedding",
+                    *self.scratch.d_hidden.device_ptr(), &diag_positions, h);
+            }
 
             // 3. Layer-by-layer forward pass
             let mut has_residual = false;
             for layer_idx in 0..num_hidden_layers {
                 let layer_type = self.layer_weights[layer_idx].layer_type;
+
+                // DIAG: check norm weight values for layer 0
+                if diag && chunk_idx == 0 && layer_idx == 0 {
+                    let norm_ptr = self.layer_weights[0].input_norm;
+                    let mut norm_buf = vec![0u16; std::cmp::min(10, h)];
+                    unsafe {
+                        cuda_sys::lib().cuStreamSynchronize(self.stream);
+                        cuda_sys::lib().cuMemcpyDtoH_v2(
+                            norm_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                            norm_ptr,
+                            (norm_buf.len() * 2) as usize,
+                        );
+                    }
+                    let vals: Vec<f32> = norm_buf.iter().map(|&v| f32::from_bits((v as u32) << 16)).collect();
+                    eprintln!("[DIAG] layer0 input_norm_weight ptr={:#x} first_10_vals={:?}", norm_ptr, vals);
+                    let norm_l2 = self.diag_l2_norm(norm_ptr, 0, h, h);
+                    eprintln!("[DIAG] layer0 input_norm_weight L2={:.6}", norm_l2);
+                }
 
                 // Pre-attention RMSNorm
                 if !has_residual {
@@ -618,13 +837,13 @@ impl PrefillEngine {
                         *self.scratch.d_residual.device_ptr(),
                         *self.scratch.d_hidden.device_ptr(),
                         (m * h * 2) as u64,
-                    )?;
+                    ).map_err(|e| format!("copy residual layer {}: {}", layer_idx, e))?;
                     self.launch_rmsnorm(
                         *self.scratch.d_hidden.device_ptr(),
                         *self.scratch.d_residual.device_ptr(),
                         self.layer_weights[layer_idx].input_norm,
                         m, h,
-                    )?;
+                    ).map_err(|e| format!("rmsnorm layer {}: {}", layer_idx, e))?;
                     has_residual = true;
                 } else {
                     self.launch_fused_add_rmsnorm(
@@ -632,13 +851,15 @@ impl PrefillEngine {
                         *self.scratch.d_hidden.device_ptr(),
                         self.layer_weights[layer_idx].input_norm,
                         m, h,
-                    )?;
+                    ).map_err(|e| format!("fused_add_rmsnorm layer {}: {}", layer_idx, e))?;
                 }
 
                 // Mixer
                 match layer_type {
-                    0 => self.forward_gqa_chunked(layer_idx, m, chunk_start)?,
-                    1 => self.forward_mamba2(layer_idx, m)?,
+                    0 => self.forward_gqa_chunked(layer_idx, m, chunk_start)
+                        .map_err(|e| format!("gqa layer {}: {}", layer_idx, e))?,
+                    1 => self.forward_mamba2(layer_idx, m)
+                        .map_err(|e| format!("mamba2 layer {}: {}", layer_idx, e))?,
                     2 => {
                         self.memcpy_d2d(
                             *self.scratch.d_attn_out.device_ptr(),
@@ -646,7 +867,8 @@ impl PrefillEngine {
                             (m * h * 2) as u64,
                         )?;
                     }
-                    3 => self.forward_linear_attention(layer_idx, m)?,
+                    3 => self.forward_linear_attention(layer_idx, m)
+                        .map_err(|e| format!("linear_attn layer {}: {}", layer_idx, e))?,
                     _ => {
                         self.memcpy_d2d(
                             *self.scratch.d_attn_out.device_ptr(),
@@ -654,6 +876,13 @@ impl PrefillEngine {
                             (m * h * 2) as u64,
                         )?;
                     }
+                }
+
+                if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
+                    let lt_name = match layer_type { 0 => "gqa", 1 => "mamba2", 3 => "la", _ => "?" };
+                    self.diag_print_norms(
+                        &format!("layer{:02}_{}_mixer", layer_idx, lt_name),
+                        *self.scratch.d_attn_out.device_ptr(), &diag_positions, h);
                 }
 
                 // Post-attention RMSNorm
@@ -680,15 +909,32 @@ impl PrefillEngine {
 
                 // MLP (dense or MoE)
                 if self.layer_weights[layer_idx].moe_gate_ptr != 0 {
-                    self.forward_moe(layer_idx, m)?;
+                    if diag && layer_idx < diag_layer_limit {
+                        eprintln!("[DIAG] layer{:02} -> forward_moe (gate_ptr=0x{:x})",
+                            layer_idx, self.layer_weights[layer_idx].moe_gate_ptr);
+                    }
+                    self.forward_moe(layer_idx, m)
+                        .map_err(|e| format!("moe layer {}: {}", layer_idx, e))?;
 
                     // Gap 2: start preloading next MoE layer's experts into the other buffer
                     if self.kernels.fused_moe_fn.is_some() && self.d_fused_expert_w1_a.is_some() {
                         self.preload_next_moe_layer(layer_idx, num_hidden_layers)?;
                     }
                 } else if self.layer_weights[layer_idx].shared_w1.is_some() {
+                    if diag && layer_idx < diag_layer_limit {
+                        eprintln!("[DIAG] layer{:02} -> forward_dense_mlp", layer_idx);
+                    }
                     self.forward_dense_mlp(layer_idx, m)?;
+                } else if diag && layer_idx < diag_layer_limit {
+                    eprintln!("[DIAG] layer{:02} -> NO MLP (no gate, no shared_w1)", layer_idx);
                 }
+
+                if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
+                    self.diag_print_norms(
+                        &format!("layer{:02}_mlp", layer_idx),
+                        *self.scratch.d_hidden.device_ptr(), &diag_positions, h);
+                }
+
             }
         }
 
@@ -703,6 +949,11 @@ impl PrefillEngine {
             m, h,
         )?;
 
+        if diag {
+            let final_norm = self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m - 1, h, h);
+            eprintln!("[DIAG] final_norm output: last_pos l2={:.6}", final_norm);
+        }
+
         // 5. LM head + sampling
         let first_token = self.lm_head_and_sample(m, temperature, suppress_tokens)?;
 
@@ -713,6 +964,169 @@ impl PrefillEngine {
         log::info!("Rust prefill: {} tok in {:.1}ms ({:.0} tok/s)", total_m, ms, total_m as f64 / (ms / 1000.0));
 
         Ok(PrefillResult { first_token, prompt_len: total_m, prefill_time_ms: ms })
+    }
+
+    /// Run prefill and extract top-k logprobs at sampled positions.
+    /// Used by the /v1/internal/prefill_logits test endpoint.
+    pub fn run_prefill_logits(
+        &mut self,
+        token_ids: &[u32],
+        top_k: usize,
+        sample_every: usize,
+    ) -> Result<Vec<PrefillLogitPosition>, String> {
+        self.bind_cuda_context()?;
+
+        let t0 = Instant::now();
+        let total_m = token_ids.len();
+        let h = self.config.hidden_size;
+        let v = self.config.vocab_size;
+        let num_hidden_layers = self.config.num_hidden_layers;
+
+        if total_m == 0 {
+            return Err("Empty token sequence".to_string());
+        }
+
+        // No chunking for logits -- we need all positions in one pass to extract from hidden states
+        let m = total_m;
+        if m > self.scratch.max_tokens {
+            return Err(format!("Prompt {} tokens > scratch {}", m, self.scratch.max_tokens));
+        }
+
+        // 1. Upload token IDs and positions
+        self.upload_tokens_with_offset(token_ids, 0)?;
+
+        // 2. Embedding lookup
+        self.launch_embedding(m)?;
+
+        // 3. Layer-by-layer forward pass
+        let mut has_residual = false;
+        for layer_idx in 0..num_hidden_layers {
+            let layer_type = self.layer_weights[layer_idx].layer_type;
+
+            if !has_residual {
+                self.memcpy_d2d(
+                    *self.scratch.d_residual.device_ptr(),
+                    *self.scratch.d_hidden.device_ptr(),
+                    (m * h * 2) as u64,
+                )?;
+                self.launch_rmsnorm(
+                    *self.scratch.d_hidden.device_ptr(),
+                    *self.scratch.d_residual.device_ptr(),
+                    self.layer_weights[layer_idx].input_norm,
+                    m, h,
+                )?;
+                has_residual = true;
+            } else {
+                self.launch_fused_add_rmsnorm(
+                    *self.scratch.d_residual.device_ptr(),
+                    *self.scratch.d_hidden.device_ptr(),
+                    self.layer_weights[layer_idx].input_norm,
+                    m, h,
+                )?;
+            }
+
+            match layer_type {
+                0 => self.forward_gqa_chunked(layer_idx, m, 0)?,
+                1 => self.forward_mamba2(layer_idx, m)?,
+                2 => {
+                    self.memcpy_d2d(
+                        *self.scratch.d_attn_out.device_ptr(),
+                        *self.scratch.d_hidden.device_ptr(),
+                        (m * h * 2) as u64,
+                    )?;
+                }
+                3 => self.forward_linear_attention(layer_idx, m)?,
+                _ => {
+                    self.memcpy_d2d(
+                        *self.scratch.d_attn_out.device_ptr(),
+                        *self.scratch.d_hidden.device_ptr(),
+                        (m * h * 2) as u64,
+                    )?;
+                }
+            }
+
+            let post_norm = self.layer_weights[layer_idx].post_attn_norm;
+            if post_norm != 0 {
+                self.launch_fused_add_rmsnorm(
+                    *self.scratch.d_residual.device_ptr(),
+                    *self.scratch.d_attn_out.device_ptr(),
+                    post_norm,
+                    m, h,
+                )?;
+                self.memcpy_d2d(
+                    *self.scratch.d_hidden.device_ptr(),
+                    *self.scratch.d_attn_out.device_ptr(),
+                    (m * h * 2) as u64,
+                )?;
+            } else {
+                self.memcpy_d2d(
+                    *self.scratch.d_hidden.device_ptr(),
+                    *self.scratch.d_attn_out.device_ptr(),
+                    (m * h * 2) as u64,
+                )?;
+            }
+
+            if self.layer_weights[layer_idx].moe_gate_ptr != 0 {
+                self.forward_moe(layer_idx, m)?;
+                if self.kernels.fused_moe_fn.is_some() && self.d_fused_expert_w1_a.is_some() {
+                    self.preload_next_moe_layer(layer_idx, num_hidden_layers)?;
+                }
+            } else if self.layer_weights[layer_idx].shared_w1.is_some() {
+                self.forward_dense_mlp(layer_idx, m)?;
+            }
+        }
+
+        // 4. Final RMSNorm
+        self.launch_fused_add_rmsnorm(
+            *self.scratch.d_residual.device_ptr(),
+            *self.scratch.d_hidden.device_ptr(),
+            self.final_norm_ptr,
+            m, h,
+        )?;
+
+        // 5. Extract logits at sampled positions via LM head
+        let mut results = Vec::new();
+        self.h_logits.resize(v, 0.0);
+
+        // Determine which positions to sample
+        let positions: Vec<usize> = (0..m).filter(|&p| p % sample_every == 0 || p == m - 1).collect();
+
+        for &pos in &positions {
+            // Run LM head on this position's hidden state
+            let pos_hidden = *self.scratch.d_hidden.device_ptr() + (pos * h * 2) as u64;
+
+            if let Some(ref lm) = self.lm_head {
+                self.marlin_gemm(pos_hidden, lm, *self.scratch.d_logits.device_ptr(), 1)?;
+            } else {
+                return Err("No LM head".to_string());
+            }
+
+            // Download logits
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyDtoHAsync_v2(
+                    self.h_logits.as_mut_ptr() as *mut _,
+                    *self.scratch.d_logits.device_ptr(),
+                    (v * 4) as usize,
+                    self.stream,
+                );
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("Download logits: {:?}", err));
+                }
+            }
+            self.stream_sync()?;
+
+            // Extract top-k logprobs
+            let top = crate::decode::extract_top_logprobs(&self.h_logits, v, top_k);
+            results.push(PrefillLogitPosition {
+                position: pos,
+                top_k: top.iter().map(|&(tid, lp)| (tid as usize, lp)).collect(),
+            });
+        }
+
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        log::info!("Prefill logits: {} positions from {} tokens in {:.1}ms", positions.len(), total_m, ms);
+
+        Ok(results)
     }
 
     // ── Upload ──
@@ -885,6 +1299,27 @@ impl PrefillEngine {
         let f = self.kernels.marlin_mm.ok_or("Marlin GEMM not loaded")?;
         let st = if w.num_bits == 4 { &ScalarType::U4B8 } else { &ScalarType::U8B128 };
 
+        // Zero the workspace lock array before each call. Marlin uses it for
+        // inter-block barrier synchronization (barrier_acquire spins until
+        // locks[off] == expected). Stale non-zero values from prior calls cause
+        // deadlocks or incorrect sync, producing zeros or garbage.
+        let ws_ptr = *self.scratch.d_workspace.device_ptr();
+        let ws_len = self.config.sms * 4;
+        unsafe {
+            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
+        }
+
+        // Zero the C_tmp (FP32 scratch) region used by this GEMM call.
+        // When use_fp32_reduce=true and use_atomic_add=true, the Marlin kernel
+        // atomicAdds partial results to C_tmp. Stale values from prior GEMM calls
+        // accumulate, inflating output norms. This is critical for sequential
+        // expert GEMM dispatch where hundreds of calls share the same C_tmp buffer.
+        let ctmp_ptr = *self.scratch.d_fp32_scratch.device_ptr();
+        let ctmp_len = m * w.n;  // FP32 elements needed for this call
+        unsafe {
+            cuda_sys::lib().cuMemsetD32Async(ctmp_ptr, 0, ctmp_len, self.stream);
+        }
+
         unsafe {
             f(
                 a as *const _, w.packed as *const _,
@@ -892,7 +1327,7 @@ impl PrefillEngine {
                 w.scales as *const _, std::ptr::null(), std::ptr::null(),
                 std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
                 m as i32, w.n as i32, w.k as i32, w.k as i32,
-                *self.scratch.d_workspace.device_ptr() as *mut _,
+                ws_ptr as *mut _,
                 st, false, true, false,
                 w.num_groups as i32, w.group_size as i32,
                 self.config.device_ordinal as i32,
@@ -902,6 +1337,51 @@ impl PrefillEngine {
             );
         }
         Ok(())
+    }
+
+    /// cuBLAS BF16 GEMM: C = A @ W^T, all BF16, computed in FP32.
+    /// A: [m, k] BF16 row-major, W: [n, k] BF16 row-major, C: [m, n] BF16 row-major
+    fn cublas_bf16_gemm(&self, a: u64, w: &Bf16Weight, c: u64, m: usize) -> Result<(), String> {
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        unsafe {
+            use cudarc::cublas::sys as cublas_sys;
+            use cudarc::cublas::result as cublas_result;
+
+            cublas_result::set_stream(
+                self.cublas_handle,
+                self.stream as cublas_sys::cudaStream_t,
+            ).map_err(|e| format!("cublas set_stream: {:?}", e))?;
+
+            cublas_result::gemm_ex(
+                self.cublas_handle,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                w.n as i32, m as i32, w.k as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                w.ptr as *const std::ffi::c_void,
+                cublas_sys::cudaDataType::CUDA_R_16BF, w.k as i32,
+                a as *const std::ffi::c_void,
+                cublas_sys::cudaDataType::CUDA_R_16BF, w.k as i32,
+                &beta as *const f32 as *const std::ffi::c_void,
+                c as *mut std::ffi::c_void,
+                cublas_sys::cudaDataType::CUDA_R_16BF, w.n as i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            ).map_err(|e| format!("cublas bf16 GEMM: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Dispatch GEMM: Marlin (INT4/INT8) or cuBLAS BF16 fallback.
+    fn la_gemm(&self, a: u64, marlin: &Option<MarlinWeight>, bf16: &Option<Bf16Weight>, c: u64, m: usize) -> Result<(), String> {
+        if let Some(w) = marlin {
+            self.marlin_gemm(a, w, c, m)
+        } else if let Some(w) = bf16 {
+            self.cublas_bf16_gemm(a, w, c, m)
+        } else {
+            Err("LA GEMM: no Marlin or BF16 weight available".to_string())
+        }
     }
 
     // ── GQA Attention ──
@@ -918,24 +1398,19 @@ impl PrefillEngine {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
 
-        let qp = lw.q_proj.as_ref().ok_or("missing q_proj")?;
-        let kp = lw.k_proj.as_ref().ok_or("missing k_proj")?;
-        let vp = lw.v_proj.as_ref().ok_or("missing v_proj")?;
-        let op = lw.o_proj.as_ref().ok_or("missing o_proj")?;
-
         let hidden = *self.scratch.d_hidden.device_ptr();
         let q = *self.scratch.d_q.device_ptr();
         let k = *self.scratch.d_k.device_ptr();
         let v = *self.scratch.d_v.device_ptr();
         let attn_out = *self.scratch.d_attn_out.device_ptr();
 
-        // Q/K/V projections
+        // Q/K/V projections (Marlin or cuBLAS BF16)
         let gate_ptr: u64;
         if lw.gqa_gated {
             // Gated attention: q_proj outputs [M, num_q_heads, head_dim * 2]
             // GEMM into scratch1, then split into Q + gate via single kernel
             let q_raw = *self.scratch.d_scratch1.device_ptr();
-            self.marlin_gemm(hidden, qp, q_raw, m)?;
+            self.la_gemm(hidden, &lw.q_proj, &lw.q_proj_bf16, q_raw, m)?;
 
             let gate_buf = *self.scratch.d_scratch2.device_ptr();
             let threads = std::cmp::max(32, ((std::cmp::min(256, cfg.head_dim) + 31) / 32) * 32) as u32;
@@ -955,11 +1430,11 @@ impl PrefillEngine {
             }
             gate_ptr = gate_buf;
         } else {
-            self.marlin_gemm(hidden, qp, q, m)?;
+            self.la_gemm(hidden, &lw.q_proj, &lw.q_proj_bf16, q, m)?;
             gate_ptr = 0;
         }
-        self.marlin_gemm(hidden, kp, k, m)?;
-        self.marlin_gemm(hidden, vp, v, m)?;
+        self.la_gemm(hidden, &lw.k_proj, &lw.k_proj_bf16, k, m)?;
+        self.la_gemm(hidden, &lw.v_proj, &lw.v_proj_bf16, v, m)?;
 
         // Look up per-layer KV cache pointers (needed for both attention and cache append)
         let layer_k_ptr = if layer_idx < self.kv_k_ptrs.len() { self.kv_k_ptrs[layer_idx] } else { 0 };
@@ -1086,7 +1561,7 @@ impl PrefillEngine {
 
         // O projection (use scratch1 as temp to avoid input/output aliasing)
         let o_temp = *self.scratch.d_scratch1.device_ptr();
-        self.marlin_gemm(attn_out, op, o_temp, m)?;
+        self.la_gemm(attn_out, &lw.o_proj, &lw.o_proj_bf16, o_temp, m)?;
         self.memcpy_d2d(attn_out, o_temp, (m * cfg.hidden_size * 2) as u64)?;
 
         Ok(())
@@ -1216,9 +1691,20 @@ impl PrefillEngine {
         let chunk_size = cfg.la_chunk_size;
         let scale = cfg.la_scale;
 
-        let in_proj_qkvz = lw.la_in_proj_qkvz.as_ref().ok_or("missing la_in_proj_qkvz")?;
-        let in_proj_ba = lw.la_in_proj_ba.as_ref().ok_or("missing la_in_proj_ba")?;
-        let out_proj = lw.la_out_proj.as_ref().ok_or("missing la_out_proj")?;
+        // LA projections: prefer Marlin INT4/INT8, fall back to cuBLAS BF16
+        if lw.la_in_proj_qkvz.is_none() && lw.la_in_proj_qkvz_bf16.is_none() {
+            return Err("missing la_in_proj_qkvz (no Marlin or BF16)".to_string());
+        }
+        if lw.la_in_proj_ba.is_none() && lw.la_in_proj_ba_bf16.is_none() {
+            return Err("missing la_in_proj_ba (no Marlin or BF16)".to_string());
+        }
+        if lw.la_out_proj.is_none() && lw.la_out_proj_bf16.is_none() {
+            return Err("missing la_out_proj (no Marlin or BF16)".to_string());
+        }
+        if layer_idx == 0 && std::env::var("KRASIS_PREFILL_DIAG").is_ok() {
+            eprintln!("[DIAG L00] LA config: nk={} nv={} dk={} dv={} hr={} chunk_size={} scale={:.4} kernel_dim={} conv_dim={}",
+                nk, nv, dk, dv, hr, chunk_size, scale, kernel_dim, conv_dim);
+        }
 
         let hidden = *self.scratch.d_hidden.device_ptr();
         let attn_out = *self.scratch.d_attn_out.device_ptr();
@@ -1249,7 +1735,13 @@ impl PrefillEngine {
         let ba_dim = nk * 2 * hr;
 
         // 1. in_proj_qkvz GEMM: [M, hidden] -> [M, qkvz_dim] BF16
-        self.marlin_gemm(hidden, in_proj_qkvz, proj_buf, m)?;
+        self.la_gemm(hidden, &lw.la_in_proj_qkvz, &lw.la_in_proj_qkvz_bf16, proj_buf, m)?;
+        let la_diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok()
+            && layer_idx < Self::diag_layer_limit();
+        if la_diag {
+            let gemm_norm = self.diag_l2_norm(proj_buf, 0, qkvz_dim, qkvz_dim);
+            eprintln!("[DIAG L{:02}] qkvz_gemm pos0 norm={:.6} (dim={})", layer_idx, gemm_norm, qkvz_dim);
+        }
 
         // 2. Uninterleave QKVZ: proj_buf -> q_bf16, k_bf16, v_bf16(as bf16), z
         //    We'll use scratch1 for q_bf16 [M, nk*dk], scratch2 for k_bf16 [M, nk*dk]
@@ -1289,8 +1781,19 @@ impl PrefillEngine {
                 )?;
             }
 
+            // DIAG: norms after uninterleave
+            if la_diag {
+                self.stream_sync()?;
+                let q_norm = self.diag_l2_norm(q_bf16, 0, key_dim, key_dim);
+                let k_norm = self.diag_l2_norm(k_bf16, 0, key_dim, key_dim);
+                let v_norm = self.diag_l2_norm(v_bf16, 0, value_dim, value_dim);
+                let z_norm = self.diag_l2_norm(la_z, 0, value_dim, value_dim);
+                eprintln!("[DIAG L{:02}] after_uninterleave pos0: q={:.6} k={:.6} v={:.6} z={:.6}",
+                    layer_idx, q_norm, k_norm, v_norm, z_norm);
+            }
+
             // 3. in_proj_ba GEMM: [M, hidden] -> [M, ba_dim] BF16
-            self.marlin_gemm(hidden, in_proj_ba, proj_buf, m)?;
+            self.la_gemm(hidden, &lw.la_in_proj_ba, &lw.la_in_proj_ba_bf16, proj_buf, m)?;
 
             // 4. Uninterleave BA -> b [M, nv] BF16, a [M, nv] BF16
             {
@@ -1409,6 +1912,16 @@ impl PrefillEngine {
                 }
             }
 
+            // DIAG: norms after conv split (before L2 norm, FP32)
+            if la_diag {
+                self.stream_sync()?;
+                let q_f32 = self.diag_l2_norm_f32(la_q, 0, key_dim, key_dim);
+                let k_f32 = self.diag_l2_norm_f32(la_k, 0, key_dim, key_dim);
+                let v_f32 = self.diag_l2_norm_f32(la_v, 0, value_dim, value_dim);
+                eprintln!("[DIAG L{:02}] after_conv_split pos0: q={:.6} k={:.6} v={:.6} (FP32, pre-l2norm)",
+                    layer_idx, q_f32, k_f32, v_f32);
+            }
+
             // 7. Compute gate and beta
             {
                 let gt = std::cmp::max(32, ((std::cmp::min(1024, nv) + 31) / 32) * 32) as u32;
@@ -1515,6 +2028,19 @@ impl PrefillEngine {
                         ],
                     )?;
                 }
+            }
+
+            // DIAG: norms after L2 norm (scale applied to q, k unit-normed per head)
+            if la_diag {
+                self.stream_sync()?;
+                let q_normed = self.diag_l2_norm_f32(la_q, 0, nv * dk, nv * dk);
+                let k_normed = self.diag_l2_norm_f32(la_k, 0, nv * dk, nv * dk);
+                eprintln!("[DIAG L{:02}] after_l2norm pos0: q={:.6} k={:.6} (q scaled by {:.6}, k by 1.0)",
+                    layer_idx, q_normed, k_normed, scale);
+                // Expected: each q head has norm = scale = 0.0884, so total q_norm = sqrt(nv) * scale
+                // Expected: each k head has norm = 1.0, so total k_norm = sqrt(nv) * 1.0
+                eprintln!("[DIAG L{:02}] expected: q={:.6} k={:.6}",
+                    layer_idx, (nv as f32).sqrt() * scale, (nv as f32).sqrt());
             }
 
             // 10. Pad to multiple of chunk_size
@@ -1845,6 +2371,15 @@ impl PrefillEngine {
             self.launch_transpose_3d_f32(la_v, output_buf, nv, total_len, dv)?;
             // la_v now has [total_len, nv, dv] FP32 — first m positions are valid
 
+            if la_diag {
+                // Recurrence output norm at pos 0 (before gated RMSNorm)
+                let recur_norm = self.diag_l2_norm_f32(la_v, 0, nv * dv, nv * dv);
+                // Z gate norm at pos 0 (BF16)
+                let z_norm = self.diag_l2_norm(la_z, 0, value_dim, value_dim);
+                eprintln!("[DIAG L{:02}] recurrence pos0 norm={:.6} (before gated_rmsnorm)", layer_idx, recur_norm);
+                eprintln!("[DIAG L{:02}] z_gate pos0 norm={:.6}", layer_idx, z_norm);
+            }
+
             // 20. Gated RMSNorm: out = rmsnorm(x) * weight * silu(z)
             {
                 let nt = std::cmp::max(32, ((std::cmp::min(256, dv) + 31) / 32) * 32) as u32;
@@ -1874,9 +2409,18 @@ impl PrefillEngine {
 
             // 21. Output projection: [M, nv*dv] BF16 -> [M, hidden] BF16
             // Use scratch1 as temp to avoid Marlin GEMM input/output aliasing.
+            if la_diag {
+                let pre_oproj_norm = self.diag_l2_norm(attn_out, 0, value_dim, value_dim);
+                eprintln!("[DIAG L{:02}] pre_out_proj pos0 norm={:.6} (after gated_rmsnorm, dim={})", layer_idx, pre_oproj_norm, value_dim);
+            }
             let o_temp = *self.scratch.d_scratch1.device_ptr();
-            self.marlin_gemm(attn_out, out_proj, o_temp, m)?;
+            self.la_gemm(attn_out, &lw.la_out_proj, &lw.la_out_proj_bf16, o_temp, m)?;
             self.memcpy_d2d(attn_out, o_temp, (m * cfg.hidden_size * 2) as u64)?;
+            if la_diag {
+                let post_oproj_norm = self.diag_l2_norm(attn_out, 0, cfg.hidden_size, cfg.hidden_size);
+                eprintln!("[DIAG L{:02}] post_out_proj pos0 norm={:.6} (mixer output, dim={})", layer_idx, post_oproj_norm, cfg.hidden_size);
+            }
+
         }
 
         Ok(())
@@ -1920,22 +2464,23 @@ impl PrefillEngine {
     // ── MoE Forward ──
 
     fn forward_moe(&mut self, layer_idx: usize, m: usize) -> Result<(), String> {
-        // Try fused MoE path first (gap 1: single kernel for all experts)
-        if self.kernels.fused_moe_fn.is_some() && self.d_fused_input.is_some() {
-            return self.forward_moe_fused(layer_idx, m);
-        }
-        // Fallback: per-expert sequential dispatch
+        // TODO: Fused MoE path disabled for debugging - sequential path uses proven Marlin GEMM
+        // if self.kernels.fused_moe_fn.is_some() && self.d_fused_input.is_some() {
+        //     return self.forward_moe_fused(layer_idx, m);
+        // }
+        // Per-expert sequential dispatch
         self.forward_moe_sequential(layer_idx, m)
     }
 
     /// Fused MoE forward using MarlinDefault kernel.
     /// One kernel launch handles ALL active experts per GEMM (w1, w2).
     fn forward_moe_fused(&mut self, layer_idx: usize, m: usize) -> Result<(), String> {
+        let diag_moe = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
         let lw = &self.layer_weights[layer_idx];
         let h = self.config.hidden_size;
         let n_experts = lw.moe_num_experts;
         let topk = lw.moe_topk;
-        let inter = self.config.intermediate_size;
+        let inter = self.config.moe_intermediate_size;
         let scoring_func = lw.moe_scoring_func;
         let gated = lw.moe_gated;
         let activation = lw.moe_activation;
@@ -2002,7 +2547,7 @@ impl PrefillEngine {
         }
 
         // 3. moe_align_block_size: padded prefix sum + build sorted token/expert maps
-        let block_size = 128i32; // MarlinDefault block_size_m
+        let block_size = 64i32; // MarlinDefault max thread_m_blocks=4 -> max block_size=64
         let expert_counts_ptr = *self.scratch.d_expert_counts.device_ptr();
         let expert_offsets_ptr = *self.scratch.d_expert_offsets.device_ptr();
         let write_offsets_ptr = *self.scratch.d_write_offsets.device_ptr();
@@ -2068,8 +2613,8 @@ impl PrefillEngine {
             let mut p1 = *fused_expert_ids_ptr;
             let mut p2 = write_offsets_ptr;
             let mut p3 = topk_ids_ptr;
-            let mut p4 = expert_counts_ptr;
-            let mut p5 = expert_offsets_ptr;
+            let mut p4 = expert_offsets_ptr;
+            let mut p5 = expert_counts_ptr;
             let mut p6 = m as i32;
             let mut p7 = topk as i32;
             let mut p8 = n_experts as i32;
@@ -2091,6 +2636,28 @@ impl PrefillEngine {
                     ],
                 )?;
             }
+        }
+
+        // DIAG: dump routing info for layer 0
+        if diag_moe && layer_idx == 0 {
+            self.stream_sync()?;
+            // topk_weights for token 0: [topk] floats
+            let mut h_tw = vec![0.0f32; topk];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_tw.as_mut_ptr() as *mut _,
+                    topk_weights_ptr, (topk * 4) as usize);
+            }
+            let mut h_ti = vec![0i32; topk];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_ti.as_mut_ptr() as *mut _,
+                    topk_ids_ptr, (topk * 4) as usize);
+            }
+            eprintln!("[DIAG MoE L0] topk_ids[tok0]={:?}", h_ti);
+            eprintln!("[DIAG MoE L0] topk_weights[tok0]={:?}", h_tw);
+            eprintln!("[DIAG MoE L0] scale_factor={}, scoring_func={}, n_experts={}, topk={}",
+                scale_factor, scoring_func, n_experts, topk);
         }
 
         // 4. Load expert weights for this layer into contiguous GPU buffer
@@ -2218,6 +2785,81 @@ impl PrefillEngine {
             }
         }
 
+        // DIAG: check gather output and total_sorted
+        if diag_moe && layer_idx == 0 {
+            eprintln!("[DIAG MoE L0] total_sorted={}", total_sorted);
+            if total_sorted > 0 {
+                self.stream_sync()?;
+                // Check hidden (MLP input) at token 0
+                let mut h_hid = vec![0u16; 8];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_hid.as_mut_ptr() as *mut _,
+                        hidden, 16);
+                }
+                let hid_f32: Vec<f32> = h_hid.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+                eprintln!("[DIAG MoE L0] hidden(mlp_input)[0..8] = {:?}", hid_f32);
+
+                // Find first non-padding sorted position
+                let mut h_sids = vec![0i32; std::cmp::min(16, total_sorted)];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_sids.as_mut_ptr() as *mut _,
+                        *sorted_ids_ptr, (h_sids.len() * 4) as usize);
+                }
+                eprintln!("[DIAG MoE L0] sorted_ids[0..{}] = {:?}", h_sids.len(), h_sids);
+
+                // Check gathered input at first REAL token (non-padding)
+                let first_real = h_sids.iter().position(|&id| id < m as i32).unwrap_or(0);
+                let mut h_gi = vec![0u16; 8];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_gi.as_mut_ptr() as *mut _,
+                        fused_input_ptr + (first_real * h * 2) as u64, 16);
+                }
+                let gi_f32: Vec<f32> = h_gi.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+                eprintln!("[DIAG MoE L0] fused_input[sorted_pos={}(tok={})][0..8] = {:?}",
+                    first_real, h_sids[first_real], gi_f32);
+
+                // Check expert_ids
+                let n_blocks = (total_sorted + 63) / 64; // block_size=64
+                let mut h_eids = vec![0i32; std::cmp::min(16, n_blocks)];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_eids.as_mut_ptr() as *mut _,
+                        *fused_expert_ids_ptr, (h_eids.len() * 4) as usize);
+                }
+                eprintln!("[DIAG MoE L0] expert_ids[0..{}] = {:?}", h_eids.len(), h_eids);
+                eprintln!("[DIAG MoE L0] n_blocks={}, w1_packed_per_expert={}, w1_scales_per_expert={}",
+                    n_blocks, self.w1_packed_per_expert, self.w1_scales_per_expert);
+
+                // Check expert_counts for some active experts
+                let mut h_counts = vec![0i32; n_experts];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_counts.as_mut_ptr() as *mut _,
+                        expert_counts_ptr, (n_experts * 4) as usize);
+                }
+                let nonzero: Vec<(usize,i32)> = h_counts.iter().enumerate()
+                    .filter(|(_, &c)| c > 0).take(10).map(|(i,&c)| (i,c)).collect();
+                let total_count: i32 = h_counts.iter().sum();
+                eprintln!("[DIAG MoE L0] expert_counts total={}, first 10 nonzero={:?}", total_count, nonzero);
+
+                // Check expert_offsets at active expert indices
+                let mut h_offs_all = vec![0i32; n_experts + 1];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_offs_all.as_mut_ptr() as *mut _,
+                        expert_offsets_ptr, ((n_experts + 1) * 4) as usize);
+                }
+                // Show offsets for experts with tokens
+                let nonzero_offs: Vec<(usize,i32,i32)> = nonzero.iter().take(5)
+                    .map(|&(e,c)| (e, h_offs_all[e], c)).collect();
+                eprintln!("[DIAG MoE L0] expert_offsets (eid,offset,count) = {:?}", nonzero_offs);
+                eprintln!("[DIAG MoE L0] expert_offsets[E]={} (should = total_sorted={})", h_offs_all[n_experts], total_sorted);
+            }
+        }
+
         // 8. Call MarlinDefault for w1 (gate_up projection)
         let fused_fn = self.kernels.fused_moe_fn.ok_or("fused MoE fn not loaded")?;
         let w1_n = if gated { 2 * inter } else { inter };
@@ -2231,6 +2873,13 @@ impl PrefillEngine {
 
         let gs = self.config.group_size as i32;
         let q_type_ptr = &self.q_type as *const ScalarType as *const std::ffi::c_void;
+
+        // Zero the workspace lock array before fused w1 GEMM (runs on CUDA default stream).
+        let ws_ptr = *self.scratch.d_workspace.device_ptr();
+        let ws_len = self.config.sms * 4;
+        unsafe {
+            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, std::ptr::null_mut());
+        }
 
         unsafe {
             fused_fn(
@@ -2268,11 +2917,60 @@ impl PrefillEngine {
                 std::ptr::null_mut(),                // stream_ptr (null = default)
                 -1,                                  // thread_k (auto)
                 -1,                                  // thread_n (auto)
-                0,                                   // sms (auto)
+                self.config.sms as i32,              // sms
                 false,                               // use_atomic
                 true,                                // fp32_reduce
                 false,                               // is_zp_float
             );
+        }
+
+        // DIAG: check w1 output at both padding and real token positions
+        if diag_moe && layer_idx == 0 {
+            unsafe { cuda_sys::lib().cuCtxSynchronize(); }
+            // Check C_tmp (FP32 intermediate) - this is what the kernel writes to with fp32_reduce
+            let mut h_ctmp = vec![0.0f32; 8];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_ctmp.as_mut_ptr() as *mut _,
+                    fused_c_tmp_ptr, 32);
+            }
+            eprintln!("[DIAG MoE L0] C_tmp[0..8] (FP32) = {:?}", h_ctmp);
+            // Check C_tmp at a real token position (position 4 * w1_n = 4 * 1024)
+            let mut h_ctmp_r = vec![0.0f32; 8];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_ctmp_r.as_mut_ptr() as *mut _,
+                    fused_c_tmp_ptr + (4 * w1_n * 4) as u64, 32);
+            }
+            eprintln!("[DIAG MoE L0] C_tmp[pos4, 0..8] (FP32) = {:?}", h_ctmp_r);
+
+            // Check position 0 (padding)
+            let mut h_w1 = vec![0u16; 8];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_w1.as_mut_ptr() as *mut _,
+                    fused_inter_ptr, 16);
+            }
+            let w1_f32: Vec<f32> = h_w1.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+            eprintln!("[DIAG MoE L0] fused_inter[sorted_pos=0](w1 out) = {:?}", w1_f32);
+            // Check first real token position (sorted_pos=4 from earlier)
+            let real_pos = 4usize; // first non-padding position
+            let mut h_w1r = vec![0u16; 8];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_w1r.as_mut_ptr() as *mut _,
+                    fused_inter_ptr + (real_pos * w1_n * 2) as u64, 16);
+            }
+            let w1r_f32: Vec<f32> = h_w1r.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+            eprintln!("[DIAG MoE L0] fused_inter[sorted_pos=4](w1 out) = {:?}", w1r_f32);
+            // Also check expert buffer (are weights loaded?)
+            let mut h_ew = vec![0u32; 4];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_ew.as_mut_ptr() as *mut _,
+                    w1_base, 16);
+            }
+            eprintln!("[DIAG MoE L0] w1_base (expert packed)[0..4] = {:?}", h_ew);
         }
 
         // 9. Activation (silu_mul or relu2) on fused_inter -> fused_inter2
@@ -2318,6 +3016,10 @@ impl PrefillEngine {
 
         // Apply scale_factor to topk_weights before w2 if needed
         // MarlinDefault multiplies output by topk_weights when mul_topk_weights=true
+        // Zero workspace before fused w2 GEMM
+        unsafe {
+            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, std::ptr::null_mut());
+        }
         unsafe {
             fused_fn(
                 w2_input as *const _,                // A: [total_sorted, K=inter]
@@ -2354,7 +3056,7 @@ impl PrefillEngine {
                 std::ptr::null_mut(),                 // stream_ptr (null = default)
                 -1,                                   // thread_k (auto)
                 -1,                                   // thread_n (auto)
-                0,                                    // sms (auto)
+                self.config.sms as i32,               // sms
                 false,                                // use_atomic
                 true,                                 // fp32_reduce
                 false,                                // is_zp_float
@@ -2410,6 +3112,41 @@ impl PrefillEngine {
             }
         }
 
+        // DIAG: check accum after scatter (before shared expert)
+        if diag_moe && layer_idx == 0 {
+            self.stream_sync()?;
+            // Read full FP32 accum for ALL tokens
+            let mut h_accum_all = vec![0.0f32; m * h];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_accum_all.as_mut_ptr() as *mut _,
+                    moe_accum, (m * h * 4) as usize);
+            }
+            // Per-token norms
+            for tok in [0usize, 1, 16, 20] {
+                if tok < m {
+                    let row = &h_accum_all[tok*h..(tok+1)*h];
+                    let norm: f32 = row.iter().map(|v| v*v).sum::<f32>().sqrt();
+                    let maxv = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    eprintln!("[DIAG MoE L0] accum[tok={}] norm={:.6}, max={:.6}", tok, norm, maxv);
+                }
+            }
+            // Full accum stats
+            let full_norm: f32 = h_accum_all.iter().map(|v| v*v).sum::<f32>().sqrt();
+            let full_max = h_accum_all.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!("[DIAG MoE L0] accum full: norm={:.6}, max={:.6}", full_norm, full_max);
+
+            // Also check one slot of fused_output to see if routing weights were applied
+            let mut h_fout = vec![0u16; std::cmp::min(8, h)];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_fout.as_mut_ptr() as *mut _,
+                    fused_output_ptr, (h_fout.len() * 2) as usize);
+            }
+            let f_f32: Vec<f32> = h_fout.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+            eprintln!("[DIAG MoE L0] fused_output[0][0..8] = {:?}", f_f32);
+        }
+
         // 12. Wait for shared expert and add to accumulator
         if has_shared {
             unsafe {
@@ -2459,7 +3196,7 @@ impl PrefillEngine {
         let h = self.config.hidden_size;
         let n_experts = lw.moe_num_experts;
         let topk = lw.moe_topk;
-        let inter = self.config.intermediate_size;
+        let inter = self.config.moe_intermediate_size;
         let scoring_func = lw.moe_scoring_func;
         let gated = lw.moe_gated;
         let activation = lw.moe_activation;
@@ -2627,6 +3364,37 @@ impl PrefillEngine {
             .map(|&x| x as usize).collect();
         let total_active = expert_offsets[n_experts];
 
+        // Diagnostic: dump routing weights, expert ids, and active counts for layer 0
+        let diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
+        let diag_layer_limit = Self::diag_layer_limit();
+        if diag && layer_idx < diag_layer_limit {
+            // Download top-k weights and ids for token 0
+            let mut h_weights = vec![0.0f32; m * topk];
+            let mut h_ids = vec![0i32; m * topk];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_weights.as_mut_ptr() as *mut _, topk_weights_ptr,
+                    (m * topk * 4) as usize,
+                );
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_ids.as_mut_ptr() as *mut _, topk_ids_ptr,
+                    (m * topk * 4) as usize,
+                );
+            }
+            // Token 0 routing
+            let w0: Vec<f32> = h_weights[..topk].to_vec();
+            let ids0: Vec<i32> = h_ids[..topk].to_vec();
+            let wsum: f32 = w0.iter().sum();
+            eprintln!("[DIAG] layer{:02}_moe scoring_func={} norm_topk={} scale_factor={:.4} topk={} n_experts={}",
+                layer_idx, scoring_func, _norm_topk, scale_factor, topk, n_experts);
+            eprintln!("[DIAG] layer{:02}_moe tok0_experts={:?} tok0_weights={:.4?} tok0_wsum={:.6}",
+                layer_idx, ids0, w0, wsum);
+            eprintln!("[DIAG] layer{:02}_moe total_active={} active_experts={}",
+                layer_idx, total_active, expert_offsets.iter().enumerate()
+                    .filter(|(i, _)| *i < n_experts && expert_offsets[*i + 1] > expert_offsets[*i])
+                    .count());
+        }
+
         // 5. Gather tokens: hidden [M, hidden] -> gathered [total_active, hidden]
         let gathered = *self.scratch.d_moe_gathered.device_ptr();
         if total_active > 0 {
@@ -2666,6 +3434,25 @@ impl PrefillEngine {
                     ],
                 )?;
             }
+        }
+
+        // Diagnostic: check gathered input norms before expert GEMMs
+        if diag && layer_idx < diag_layer_limit && total_active > 0 {
+            let diag_positions = Self::diag_positions(m);
+            let mut parts = Vec::new();
+            for &pos in &diag_positions {
+                let n = self.diag_l2_norm(gathered, pos, h, h);
+                parts.push(format!("{}:{:.4}", pos, n));
+            }
+            eprintln!("[DIAG] layer{:02}_moe gathered_input_norms (first {} rows) {}",
+                layer_idx, std::cmp::min(total_active, diag_positions.len()), parts.join(" "));
+            // Also show d_hidden input norms (what the MoE receives after post-attn-norm)
+            let mut h_parts = Vec::new();
+            for &pos in &diag_positions {
+                let n = self.diag_l2_norm(hidden, pos, h, h);
+                h_parts.push(format!("{}:{:.4}", pos, n));
+            }
+            eprintln!("[DIAG] layer{:02}_moe d_hidden_input_norms {}", layer_idx, h_parts.join(" "));
         }
 
         // 7-8. Shared expert + routed experts
@@ -2735,8 +3522,9 @@ impl PrefillEngine {
         }
 
         // Launch shared expert async if all experts are HCS-resident (no DMA conflict)
+        // Force sync when diagnostics are active so we can add intermediate norm checks
         let all_hcs = work.iter().all(|w| w.is_hcs);
-        let shared_async = has_shared && all_hcs;
+        let shared_async = has_shared && all_hcs && !(diag && layer_idx < diag_layer_limit);
         if shared_async {
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
@@ -2758,7 +3546,12 @@ impl PrefillEngine {
         }
 
         // Cold experts: double-buffered DMA pipeline
-        let cold_work: Vec<&ExpertWork> = work.iter().filter(|w| !w.is_hcs).collect();
+        // TEMP: skip cold experts to test HCS-only path
+        let cold_work: Vec<&ExpertWork> = if std::env::var("KRASIS_SKIP_COLD").is_ok() {
+            Vec::new()
+        } else {
+            work.iter().filter(|w| !w.is_hcs).collect()
+        };
 
         if !cold_work.is_empty() {
             if let Some(moe_idx) = moe_layer_idx {
@@ -2810,6 +3603,90 @@ impl PrefillEngine {
             }
         }
 
+        // Diagnostic: dump per-row expert_out norms before scatter to find outliers
+        if diag && layer_idx < diag_layer_limit && total_active > 0 {
+            self.stream_sync()?;
+            // Download expert_out [total_active, h] BF16 and gather_src_map [total_active] i32
+            let mut h_expert_out = vec![0u16; total_active * h];
+            let mut h_src_map = vec![0i32; total_active];
+            let mut h_wt_map = vec![0.0f32; total_active];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_expert_out.as_mut_ptr() as *mut _, expert_out,
+                    (total_active * h * 2) as usize);
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_src_map.as_mut_ptr() as *mut _, gather_src_ptr,
+                    (total_active * 4) as usize);
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_wt_map.as_mut_ptr() as *mut _, gather_wt_ptr,
+                    (total_active * 4) as usize);
+            }
+            // Compute per-row norms and map row -> expert
+            let mut token_max_norm: std::collections::HashMap<i32, (f32, usize, usize)> = std::collections::HashMap::new();
+            let mut outlier_rows = Vec::new();
+            for row in 0..total_active {
+                let mut sumsq = 0.0f64;
+                for j in 0..h {
+                    let bits = h_expert_out[row * h + j];
+                    let val = f32::from_bits((bits as u32) << 16) as f64;
+                    sumsq += val * val;
+                }
+                let norm = (sumsq as f32).sqrt();
+                let tok = h_src_map[row];
+                let wt = h_wt_map[row];
+                // Map row to expert via expert_offsets
+                let eid = expert_offsets.windows(2).enumerate()
+                    .find(|(_, w)| row >= w[0] && row < w[1])
+                    .map(|(i, _)| i).unwrap_or(9999);
+                let entry = token_max_norm.entry(tok).or_insert((0.0, row, eid));
+                if norm > entry.0 { *entry = (norm, row, eid); }
+                if norm > 5.0 {
+                    outlier_rows.push((row, tok, norm, wt, eid));
+                }
+            }
+            if !outlier_rows.is_empty() {
+                eprintln!("[DIAG] layer{:02}_moe OUTLIER expert_out rows (norm>5): {} of {} rows",
+                    layer_idx, outlier_rows.len(), total_active);
+                for &(row, tok, norm, wt, eid) in outlier_rows.iter().take(30) {
+                    let is_hcs = work.iter().find(|w| w.eid == eid).map(|w| w.is_hcs).unwrap_or(false);
+                    eprintln!("[DIAG]   row={} tok={} expert={} norm={:.4} wt={:.6} hcs={}",
+                        row, tok, eid, norm, wt, is_hcs);
+                }
+            }
+            // Also check gathered input norm for outlier rows
+            let mut h_gathered = vec![0u16; total_active * h];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_gathered.as_mut_ptr() as *mut _, gathered,
+                    (total_active * h * 2) as usize);
+            }
+            if !outlier_rows.is_empty() {
+                eprintln!("[DIAG] layer{:02}_moe outlier input vs output:", layer_idx);
+                for &(row, tok, out_norm, _wt, eid) in outlier_rows.iter().take(10) {
+                    let mut in_sumsq = 0.0f64;
+                    for j in 0..h {
+                        let bits = h_gathered[row * h + j];
+                        let val = f32::from_bits((bits as u32) << 16) as f64;
+                        in_sumsq += val * val;
+                    }
+                    let in_norm = (in_sumsq as f32).sqrt();
+                    eprintln!("[DIAG]   row={} tok={} expert={} in_norm={:.4} out_norm={:.4} ratio={:.2}x",
+                        row, tok, eid, in_norm, out_norm, out_norm / in_norm);
+                }
+            }
+            // Show per-token max norms for diagnostic positions
+            let diag_positions = Self::diag_positions(m);
+            let mut parts = Vec::new();
+            for &pos in &diag_positions {
+                if let Some(&(max_norm, _max_row, _max_eid)) = token_max_norm.get(&(pos as i32)) {
+                    parts.push(format!("{}:{:.4}", pos, max_norm));
+                } else {
+                    parts.push(format!("{}:N/A", pos));
+                }
+            }
+            eprintln!("[DIAG] layer{:02}_moe per_tok_max_expert_norm {}", layer_idx, parts.join(" "));
+        }
+
         // 9. Scatter + accumulate: expert_out -> moe_accum with weights
         if total_active > 0 {
             let st = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
@@ -2834,6 +3711,17 @@ impl PrefillEngine {
             }
         }
 
+        // Diagnostic: routed accum norms at all diagnostic positions
+        if diag && layer_idx < diag_layer_limit {
+            let diag_positions = Self::diag_positions(m);
+            let mut routed_parts = Vec::new();
+            for &pos in &diag_positions {
+                let n = self.diag_l2_norm_f32(moe_accum, pos, h, h);
+                routed_parts.push(format!("{}:{:.6}", pos, n));
+            }
+            eprintln!("[DIAG] layer{:02}_moe routed_accum {}", layer_idx, routed_parts.join(" "));
+        }
+
         // 10. Shared expert: add to accumulator
         if has_shared {
             if shared_async {
@@ -2850,9 +3738,24 @@ impl PrefillEngine {
                 let s2_buf = *self.scratch.d_scratch2.device_ptr();
                 let shared_inter = sw1.n / (if gated { 2 } else { 1 });
 
+                if diag && layer_idx < diag_layer_limit {
+                    eprintln!("[DIAG] layer{:02}_moe shared_expert sw1: n={} k={} bits={} gs={} groups={}",
+                        layer_idx, sw1.n, sw1.k, sw1.num_bits, sw1.group_size, sw1.num_groups);
+                    eprintln!("[DIAG] layer{:02}_moe shared_expert sw2: n={} k={} bits={} gs={} groups={}",
+                        layer_idx, sw2.n, sw2.k, sw2.num_bits, sw2.group_size, sw2.num_groups);
+                    eprintln!("[DIAG] layer{:02}_moe shared_inter={} gated={} activation={}",
+                        layer_idx, shared_inter, gated, activation);
+                }
+
                 self.marlin_gemm(hidden, sw1, s1_buf, m)?;
 
                 if gated {
+                    if diag && layer_idx < diag_layer_limit {
+                        // s1_buf has w1 output: [m, w13_n] BF16
+                        let w1_norm = self.diag_l2_norm(s1_buf, 0, sw1.n, sw1.n);
+                        eprintln!("[DIAG] layer{:02}_moe shared_w1_out_norm pos0={:.6} (dim={})", layer_idx, w1_norm, sw1.n);
+                    }
+
                     let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
                     let mut ac0 = s2_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
                     let kernel = if activation == 1 { self.kernels.relu2 } else { self.kernels.silu_mul };
@@ -2866,6 +3769,13 @@ impl PrefillEngine {
                             ],
                         )?;
                     }
+
+                    if diag && layer_idx < diag_layer_limit {
+                        // s2_buf has activation output: [m, shared_inter] BF16
+                        let act_norm = self.diag_l2_norm(s2_buf, 0, shared_inter, shared_inter);
+                        eprintln!("[DIAG] layer{:02}_moe shared_act_out_norm pos0={:.6} (dim={})", layer_idx, act_norm, shared_inter);
+                    }
+
                     self.marlin_gemm(s2_buf, sw2, s1_buf, m)?;
                 } else {
                     let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
@@ -2885,21 +3795,105 @@ impl PrefillEngine {
                 }
             }
 
-            // Add shared expert result (in scratch1) to accumulator
+            // Add shared expert result (in scratch1) to accumulator, with optional sigmoid gate
             let s1_buf = *self.scratch.d_scratch1.device_ptr();
-            let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
-            let mut as0 = moe_accum; let mut as1 = s1_buf;
-            let mut as2 = m as i32; let mut as3 = h as i32;
-            unsafe {
-                launch(self.kernels.moe_add_shared,
-                    (m as u32, 1, 1), (ast, 1, 1), 0, self.stream,
-                    &mut [
-                        &mut as0 as *mut _ as *mut std::ffi::c_void,
-                        &mut as1 as *mut _ as *mut std::ffi::c_void,
-                        &mut as2 as *mut _ as *mut std::ffi::c_void,
-                        &mut as3 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
+            let sg_ptr = lw.shared_gate_ptr;
+            if sg_ptr != 0 {
+                // Compute shared gate: hidden [m, h] @ gate [h, 1] -> gate_out [m, 1] FP32
+                let gate_out = *self.scratch.d_gate_out.device_ptr(); // reuse gate_out buffer (has room for m * n_experts, m*1 is fine)
+                let alpha: f32 = 1.0;
+                let beta: f32 = 0.0;
+                unsafe {
+                    use cudarc::cublas::sys as cublas_sys;
+                    use cudarc::cublas::result as cublas_result;
+                    cublas_result::set_stream(
+                        self.cublas_handle,
+                        self.stream as cublas_sys::cudaStream_t,
+                    ).map_err(|e| format!("cublas set_stream: {:?}", e))?;
+                    cublas_result::gemm_ex(
+                        self.cublas_handle,
+                        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                        lw.shared_gate_rows as i32, m as i32, lw.shared_gate_cols as i32,
+                        &alpha as *const f32 as *const std::ffi::c_void,
+                        sg_ptr as *const std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_16BF, lw.shared_gate_cols as i32,
+                        hidden as *const std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
+                        &beta as *const f32 as *const std::ffi::c_void,
+                        gate_out as *mut std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_32F, lw.shared_gate_rows as i32,
+                        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).map_err(|e| format!("shared gate GEMM: {:?}", e))?;
+                }
+                // Add shared expert with sigmoid gating
+                let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
+                let mut as0 = moe_accum; let mut as1 = s1_buf;
+                let mut as2 = gate_out; let mut as3 = m as i32; let mut as4 = h as i32;
+                unsafe {
+                    launch(self.kernels.moe_add_shared_gated,
+                        (m as u32, 1, 1), (ast, 1, 1), 0, self.stream,
+                        &mut [
+                            &mut as0 as *mut _ as *mut std::ffi::c_void,
+                            &mut as1 as *mut _ as *mut std::ffi::c_void,
+                            &mut as2 as *mut _ as *mut std::ffi::c_void,
+                            &mut as3 as *mut _ as *mut std::ffi::c_void,
+                            &mut as4 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+            } else {
+                // No gate, add directly
+                let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
+                let mut as0 = moe_accum; let mut as1 = s1_buf;
+                let mut as2 = m as i32; let mut as3 = h as i32;
+                unsafe {
+                    launch(self.kernels.moe_add_shared,
+                        (m as u32, 1, 1), (ast, 1, 1), 0, self.stream,
+                        &mut [
+                            &mut as0 as *mut _ as *mut std::ffi::c_void,
+                            &mut as1 as *mut _ as *mut std::ffi::c_void,
+                            &mut as2 as *mut _ as *mut std::ffi::c_void,
+                            &mut as3 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+            }
+        }
+
+        // Diagnostic: total accum norms + shared expert norms + gate values at all positions
+        if diag && layer_idx < diag_layer_limit {
+            let diag_positions = Self::diag_positions(m);
+            // Total accum (routed + shared)
+            let mut total_parts = Vec::new();
+            for &pos in &diag_positions {
+                let n = self.diag_l2_norm_f32(moe_accum, pos, h, h);
+                total_parts.push(format!("{}:{:.6}", pos, n));
+            }
+            eprintln!("[DIAG] layer{:02}_moe total_accum {}", layer_idx, total_parts.join(" "));
+            // Shared expert output norms
+            let s1_ptr = *self.scratch.d_scratch1.device_ptr();
+            let mut shared_parts = Vec::new();
+            for &pos in &diag_positions {
+                let n = self.diag_l2_norm(s1_ptr, pos, h, h);
+                shared_parts.push(format!("{}:{:.6}", pos, n));
+            }
+            eprintln!("[DIAG] layer{:02}_moe shared_out {}", layer_idx, shared_parts.join(" "));
+            // Gate values (if gated)
+            let sg_ptr = lw.shared_gate_ptr;
+            if sg_ptr != 0 {
+                let gate_out_ptr = *self.scratch.d_gate_out.device_ptr();
+                let gate_vals = self.diag_download_f32(gate_out_ptr, m);
+                let mut gate_parts = Vec::new();
+                for &pos in &diag_positions {
+                    if pos < gate_vals.len() {
+                        let raw = gate_vals[pos];
+                        let sig = 1.0 / (1.0 + (-raw).exp());
+                        gate_parts.push(format!("{}:raw={:.4},sig={:.4}", pos, raw, sig));
+                    }
+                }
+                eprintln!("[DIAG] layer{:02}_moe gate_values {}", layer_idx, gate_parts.join(" "));
             }
         }
 
@@ -2947,6 +3941,13 @@ impl PrefillEngine {
 
         let shared_scratch = *self.d_shared_fp32_scratch.device_ptr();
         let shared_ws = *self.d_shared_workspace.device_ptr();
+        let shared_ws_len = self.config.sms * 4;
+
+        // Zero workspace + C_tmp before w1 GEMM
+        unsafe {
+            cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
+            cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw1.n, self.shared_stream);
+        }
 
         // w1 GEMM on shared_stream
         unsafe {
@@ -2981,6 +3982,11 @@ impl PrefillEngine {
                     ],
                 )?;
             }
+            // Zero workspace + C_tmp before w2 GEMM
+            unsafe {
+                cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
+                cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw2.n, self.shared_stream);
+            }
             // w2 GEMM on shared_stream
             unsafe {
                 f(
@@ -3010,6 +4016,11 @@ impl PrefillEngine {
                         &mut ac2 as *mut _ as *mut std::ffi::c_void,
                     ],
                 )?;
+            }
+            // Zero workspace + C_tmp before w2 GEMM
+            unsafe {
+                cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
+                cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw2.n, self.shared_stream);
             }
             unsafe {
                 f(
@@ -3146,6 +4157,7 @@ impl PrefillEngine {
         let hidden = *self.scratch.d_hidden.device_ptr();
         let s1_buf = *self.scratch.d_scratch1.device_ptr();
         let s2_buf = *self.scratch.d_scratch2.device_ptr();
+        let shared_ws_len = self.config.sms * 4;
 
         let sw1 = lw.shared_w1.as_ref().ok_or("missing shared w1")?;
         let sw2 = lw.shared_w2.as_ref().ok_or("missing shared w2")?;
@@ -3158,8 +4170,10 @@ impl PrefillEngine {
         let shared_scratch = *self.d_shared_fp32_scratch.device_ptr();
         let shared_ws = *self.d_shared_workspace.device_ptr();
 
-        // w1 GEMM on shared_stream
+        // w1 GEMM on shared_stream — zero workspace locks + C_tmp first
         unsafe {
+            cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
+            cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw1.n, self.shared_stream);
             f(
                 hidden as *const _, sw1.packed as *const _,
                 s1_buf as *mut _, shared_scratch as *mut _,
@@ -3191,8 +4205,10 @@ impl PrefillEngine {
                     ],
                 )?;
             }
-            // w2 GEMM on shared_stream
+            // w2 GEMM on shared_stream — zero workspace locks + C_tmp first
             unsafe {
+                cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
+                cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw2.n, self.shared_stream);
                 f(
                     s2_buf as *const _, sw2.packed as *const _,
                     s1_buf as *mut _, shared_scratch as *mut _,
@@ -3221,7 +4237,10 @@ impl PrefillEngine {
                     ],
                 )?;
             }
+            // w2 GEMM on shared_stream — zero workspace locks + C_tmp first
             unsafe {
+                cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
+                cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw2.n, self.shared_stream);
                 f(
                     s1_buf as *const _, sw2.packed as *const _,
                     s2_buf as *mut _, shared_scratch as *mut _,
@@ -3255,13 +4274,12 @@ impl PrefillEngine {
     ) -> Result<(), String> {
         let (w13p_dst, w13s_dst, w2p_dst, w2s_dst) = *buf;
         unsafe {
-            if e.contiguous_ptr != 0 && e.contiguous_bytes > 0 {
-                let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                    w13p_dst, e.contiguous_ptr as *const _, e.contiguous_bytes, self.copy_stream);
-                if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                    return Err(format!("DMA expert contiguous: {:?}", err));
-                }
-            } else {
+            // Always use 4 separate DMAs. The contiguous single-DMA path is broken
+            // for prefill because the destination buffers (w13p, w13s, w2p, w2s) are
+            // separate GPU allocations that are NOT contiguous in memory. The single
+            // DMA would write all data starting at w13p_dst, leaving the other
+            // destination buffers with stale data.
+            {
                 let _ = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
                     w13p_dst, e.w13_packed_ptr as *const _, e.w13_packed_bytes, self.copy_stream);
                 let _ = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
@@ -3368,8 +4386,36 @@ impl PrefillEngine {
 
         if let Some(ref lm) = self.lm_head {
             self.marlin_gemm(last_tok, lm, *self.scratch.d_logits.device_ptr(), 1)?;
+        } else if self.lm_head_bf16_ptr != 0 {
+            // BF16 LM head via cuBLAS GEMM
+            use cudarc::cublas::sys as cublas_sys;
+            use cudarc::cublas::result as cublas_result;
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            unsafe {
+                cublas_result::set_stream(
+                    self.cublas_handle,
+                    self.stream as cublas_sys::cudaStream_t,
+                ).map_err(|e| format!("cuBLAS set stream: {:?}", e))?;
+                cublas_result::gemm_ex(
+                    self.cublas_handle,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    self.lm_head_bf16_rows as i32, 1, self.lm_head_bf16_cols as i32,
+                    &alpha as *const f32 as *const std::ffi::c_void,
+                    self.lm_head_bf16_ptr as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, self.lm_head_bf16_cols as i32,
+                    last_tok as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
+                    &beta as *const f32 as *const std::ffi::c_void,
+                    *self.scratch.d_logits.device_ptr() as *mut std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_32F, self.lm_head_bf16_rows as i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                ).map_err(|e| format!("LM head BF16 GEMM: {:?}", e))?;
+            }
         } else {
-            return Err("No LM head".to_string());
+            return Err("No LM head (neither Marlin nor BF16)".to_string());
         }
 
         // Download logits
@@ -3461,6 +4507,7 @@ impl PrefillKernels {
                 "moe_scatter_add_kernel",
                 "moe_zero_accum_kernel",
                 "moe_add_shared_kernel",
+                "moe_add_shared_gated_kernel",
                 "fp32_to_bf16_batch_kernel",
                 // Linear attention kernels
                 "la_uninterleave_qkvz_kernel",
@@ -3497,6 +4544,8 @@ impl PrefillKernels {
                 "moe_scatter_sorted_kernel",
                 "moe_gather_sorted_kernel",
                 "moe_scatter_fused_kernel",
+                "moe_accum_to_bf16_kernel",
+                "kv_cache_append_fp8_kernel",
             ],
         ).map_err(|e| format!("Load prefill PTX: {e}"))?;
 
@@ -3511,6 +4560,31 @@ impl PrefillKernels {
             log::info!("Prefill: loaded Marlin GEMM from vendored libkrasis_marlin.so");
         } else {
             log::warn!("Prefill: Marlin GEMM not available");
+        }
+
+        // Opt-in to extended shared memory for flash attention kernel.
+        // Models with head_dim > ~176 need > 48KB smem per block.
+        // Query the device's max smem and set the kernel attribute.
+        let flash_attn_func = get("flash_attn_tiled_kernel")?;
+        unsafe {
+            let mut max_smem: i32 = 0;
+            cuda_sys::lib().cuDeviceGetAttribute(
+                &mut max_smem,
+                cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                0,
+            );
+            if max_smem > 49152 {
+                let rc = cuda_sys::lib().cuFuncSetAttribute(
+                    flash_attn_func.0,
+                    cuda_sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    max_smem,
+                );
+                if rc == cuda_sys::CUresult::CUDA_SUCCESS {
+                    log::info!("Prefill flash attention: opt-in shared memory = {} KB", max_smem / 1024);
+                } else {
+                    log::warn!("Prefill flash attention: failed to set extended smem ({} bytes): {:?}", max_smem, rc);
+                }
+            }
         }
 
         Ok(PrefillKernels {
@@ -3533,6 +4607,7 @@ impl PrefillKernels {
             moe_scatter_add: get("moe_scatter_add_kernel")?,
             moe_zero_accum: get("moe_zero_accum_kernel")?,
             moe_add_shared: get("moe_add_shared_kernel")?,
+            moe_add_shared_gated: get("moe_add_shared_gated_kernel")?,
             moe_accum_to_bf16: get("moe_accum_to_bf16_kernel")?,
             fp32_to_bf16_batch: get("fp32_to_bf16_batch_kernel")?,
             la_uninterleave_qkvz: get("la_uninterleave_qkvz_kernel")?,
@@ -3555,7 +4630,7 @@ impl PrefillKernels {
             la_transpose_f32: get("la_transpose_f32_kernel")?,
             transpose_3d_021: get("transpose_3d_021_kernel")?,
             transpose_3d_021_bf16: get("transpose_3d_021_bf16_kernel")?,
-            flash_attn_tiled: get("flash_attn_tiled_kernel")?,
+            flash_attn_tiled: flash_attn_func,
             gated_q_split: get("gated_q_split_kernel")?,
             la_split_conv_output: get("la_split_conv_output_kernel")?,
             concat_3_bf16: get("concat_3_bf16_kernel")?,
@@ -3590,7 +4665,8 @@ pub fn allocate_scratch(
     max_tokens: usize,
 ) -> Result<PrefillScratch, String> {
     let h = config.hidden_size;
-    let inter = config.intermediate_size;
+    let inter = config.intermediate_size;           // max of dense + moe for general scratch
+    let moe_inter = config.moe_intermediate_size;   // actual MoE expert intermediate
     let topk = config.num_experts_per_tok.max(1);
 
     let alloc_u16 = |n: usize, name: &str| -> Result<CudaSlice<u16>, String> {
@@ -3610,6 +4686,8 @@ pub fn allocate_scratch(
 
     let has_mamba2 = config.layer_types.iter().any(|&t| t == 1);
     let has_la = config.layer_types.iter().any(|&t| t == 3);
+    // LA pads to chunk_size multiples, so total_len can be up to max_tokens + chunk_size - 1
+    let la_max_len = if has_la { max_tokens + config.la_chunk_size } else { max_tokens };
 
     Ok(PrefillScratch {
         d_hidden: alloc_u16(max_tokens * h, "hidden")?,
@@ -3618,23 +4696,41 @@ pub fn allocate_scratch(
         d_scratch2: alloc_u16(max_inter, "scratch2")?,
         d_fp32_scratch: {
             // fp32_scratch must be large enough for:
-            // 1. Conv1d transpose: max_tokens * conv_dim (LA layers)
-            // 2. LA chunk loop: nv * max_tokens * dv (output buf)
+            // 1. Marlin C_tmp (FP32 reduce): max_tokens * max_gemm_n
+            //    Largest GEMM output dimension across all layers:
+            //    - LA in_proj_qkvz: nk * group_dim (e.g. 16 * 768 = 12288 for Q3.5)
+            //    - GQA q_proj: num_q_heads * head_dim * (2 if gated)
+            //    - LA out_proj: hidden_size
+            //    - Dense MLP gate_up: inter * 2
+            // 2. Conv1d transpose: max_tokens * conv_dim (LA layers)
+            // 3. LA chunk loop: nv * max_tokens * dv (output buf)
             //    + nv * chunk_size * (2*dk + dv) + nv * chunk_size (temp buffers)
-            // 3. Marlin workspace: max_tokens * max(h, inter)
-            let base_size = max_tokens * std::cmp::max(h, inter);
+            let mut max_gemm_n = std::cmp::max(h, inter * 2);
+            // GQA q_proj (gated = 2x)
+            let gqa_q_n = config.num_q_heads * config.head_dim * 2;
+            if gqa_q_n > max_gemm_n { max_gemm_n = gqa_q_n; }
+            if has_la {
+                let nk = config.la_num_k_heads;
+                let dk = config.la_k_head_dim;
+                let dv = config.la_v_head_dim;
+                let hr = config.la_head_ratio.max(1);
+                let group_dim = 2 * dk + 2 * hr * dv;
+                let qkvz_n = nk * group_dim;
+                if qkvz_n > max_gemm_n { max_gemm_n = qkvz_n; }
+            }
+            let marlin_ctmp = max_tokens * max_gemm_n;
             let la_size = if has_la {
                 let nv = config.la_num_v_heads;
                 let dk = config.la_k_head_dim;
                 let dv = config.la_v_head_dim;
                 let cs = config.la_chunk_size;
                 let conv_dim = config.la_conv_dim;
-                let output_buf = nv * max_tokens * dv;
+                let output_buf = nv * la_max_len * dv;
                 let chunk_temps = nv * cs * (2 * dk + dv) + nv * cs;
-                let conv_transpose = max_tokens * conv_dim;
+                let conv_transpose = la_max_len * conv_dim;
                 std::cmp::max(output_buf + chunk_temps, conv_transpose)
             } else { 0 };
-            alloc_f32(std::cmp::max(base_size, la_size), "fp32_scratch")?
+            alloc_f32(std::cmp::max(marlin_ctmp, la_size), "fp32_scratch")?
         },
         d_workspace: alloc_i32(config.sms * 4, "workspace")?,
         d_topk_weights: alloc_f32(max_tokens * topk, "topk_weights")?,
@@ -3672,8 +4768,8 @@ pub fn allocate_scratch(
         d_moe_accum: alloc_f32(max_tokens * h, "moe_accum")?,
         d_moe_gathered: alloc_u16(max_tokens * topk * h, "moe_gathered")?,
         d_moe_expert_out: alloc_u16(max_tokens * topk * h, "moe_expert_out")?,
-        d_moe_gate_up: alloc_u16(max_tokens * topk * inter * 2, "moe_gate_up")?,
-        d_moe_inter: alloc_u16(max_tokens * topk * inter, "moe_inter")?,
+        d_moe_gate_up: alloc_u16(max_tokens * topk * moe_inter * 2, "moe_gate_up")?,
+        d_moe_inter: alloc_u16(max_tokens * topk * moe_inter, "moe_inter")?,
         d_gather_src_map: alloc_i32(max_tokens * topk, "gather_src_map")?,
         d_gather_weight_map: alloc_f32(max_tokens * topk, "gather_weight_map")?,
         // GPU-only routing scratch
@@ -3683,99 +4779,101 @@ pub fn allocate_scratch(
         // Expert DMA double-buffers (A and B, each sized for one expert)
         d_expert_w13_packed_a: {
             let w13_size = if config.n_routed_experts > 0 {
-                let w13_n = if config.moe_gated { 2 * inter } else { inter };
+                let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
                 (h / 16) * w13_n * (config.expert_bits as usize / 2)
             } else { 1 };
             device.alloc_zeros::<u8>(w13_size).map_err(|e| format!("alloc expert_w13_packed_a: {e}"))?
         },
         d_expert_w13_scales_a: {
             let scale_size = if config.n_routed_experts > 0 {
-                let w13_n = if config.moe_gated { 2 * inter } else { inter };
+                let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
                 (h / config.group_size) * w13_n * 2
             } else { 1 };
             device.alloc_zeros::<u8>(scale_size).map_err(|e| format!("alloc expert_w13_scales_a: {e}"))?
         },
         d_expert_w2_packed_a: {
             let w2_size = if config.n_routed_experts > 0 {
-                (inter / 16) * h * (config.expert_bits as usize / 2)
+                (moe_inter / 16) * h * (config.expert_bits as usize / 2)
             } else { 1 };
             device.alloc_zeros::<u8>(w2_size).map_err(|e| format!("alloc expert_w2_packed_a: {e}"))?
         },
         d_expert_w2_scales_a: {
             let scale_size = if config.n_routed_experts > 0 {
-                (inter / config.group_size) * h * 2
+                (moe_inter / config.group_size) * h * 2
             } else { 1 };
             device.alloc_zeros::<u8>(scale_size).map_err(|e| format!("alloc expert_w2_scales_a: {e}"))?
         },
         d_expert_w13_packed_b: {
             let w13_size = if config.n_routed_experts > 0 {
-                let w13_n = if config.moe_gated { 2 * inter } else { inter };
+                let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
                 (h / 16) * w13_n * (config.expert_bits as usize / 2)
             } else { 1 };
             device.alloc_zeros::<u8>(w13_size).map_err(|e| format!("alloc expert_w13_packed_b: {e}"))?
         },
         d_expert_w13_scales_b: {
             let scale_size = if config.n_routed_experts > 0 {
-                let w13_n = if config.moe_gated { 2 * inter } else { inter };
+                let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
                 (h / config.group_size) * w13_n * 2
             } else { 1 };
             device.alloc_zeros::<u8>(scale_size).map_err(|e| format!("alloc expert_w13_scales_b: {e}"))?
         },
         d_expert_w2_packed_b: {
             let w2_size = if config.n_routed_experts > 0 {
-                (inter / 16) * h * (config.expert_bits as usize / 2)
+                (moe_inter / 16) * h * (config.expert_bits as usize / 2)
             } else { 1 };
             device.alloc_zeros::<u8>(w2_size).map_err(|e| format!("alloc expert_w2_packed_b: {e}"))?
         },
         d_expert_w2_scales_b: {
             let scale_size = if config.n_routed_experts > 0 {
-                (inter / config.group_size) * h * 2
+                (moe_inter / config.group_size) * h * 2
             } else { 1 };
             device.alloc_zeros::<u8>(scale_size).map_err(|e| format!("alloc expert_w2_scales_b: {e}"))?
         },
         // Linear attention scratch buffers
+        // LA pads to chunk_size multiples, so total_len can be up to max_tokens + chunk_size - 1.
+        // Allocate with la_max_len to avoid buffer overflow on padded data.
         d_la_q: if has_la {
-            Some(alloc_f32(max_tokens * config.la_num_v_heads * config.la_k_head_dim, "la_q")?)
+            Some(alloc_f32(la_max_len * config.la_num_v_heads * config.la_k_head_dim, "la_q")?)
         } else { None },
         d_la_k: if has_la {
-            Some(alloc_f32(max_tokens * config.la_num_v_heads * config.la_k_head_dim, "la_k")?)
+            Some(alloc_f32(la_max_len * config.la_num_v_heads * config.la_k_head_dim, "la_k")?)
         } else { None },
         d_la_v: if has_la {
-            Some(alloc_f32(max_tokens * config.la_num_v_heads * config.la_v_head_dim, "la_v")?)
+            Some(alloc_f32(la_max_len * config.la_num_v_heads * config.la_v_head_dim, "la_v")?)
         } else { None },
         d_la_z: if has_la {
-            Some(alloc_u16(max_tokens * config.la_num_v_heads * config.la_v_head_dim, "la_z")?)
+            Some(alloc_u16(la_max_len * config.la_num_v_heads * config.la_v_head_dim, "la_z")?)
         } else { None },
         d_la_b: if has_la {
-            Some(alloc_u16(max_tokens * config.la_num_v_heads, "la_b")?)
+            Some(alloc_u16(la_max_len * config.la_num_v_heads, "la_b")?)
         } else { None },
         d_la_a: if has_la {
-            Some(alloc_u16(max_tokens * config.la_num_v_heads, "la_a")?)
+            Some(alloc_u16(la_max_len * config.la_num_v_heads, "la_a")?)
         } else { None },
         d_la_beta: if has_la {
-            Some(alloc_f32(max_tokens * config.la_num_v_heads, "la_beta")?)
+            Some(alloc_f32(la_max_len * config.la_num_v_heads, "la_beta")?)
         } else { None },
         d_la_gate: if has_la {
-            Some(alloc_f32(max_tokens * config.la_num_v_heads, "la_gate")?)
+            Some(alloc_f32(la_max_len * config.la_num_v_heads, "la_gate")?)
         } else { None },
         d_la_conv_out: if has_la {
-            Some(alloc_f32(config.la_conv_dim * max_tokens, "la_conv_out")?)
+            Some(alloc_f32(config.la_conv_dim * la_max_len, "la_conv_out")?)
         } else { None },
         d_la_v_beta: if has_la {
-            Some(alloc_f32(config.la_num_v_heads * max_tokens * config.la_v_head_dim, "la_v_beta")?)
+            Some(alloc_f32(config.la_num_v_heads * la_max_len * config.la_v_head_dim, "la_v_beta")?)
         } else { None },
         d_la_k_beta: if has_la {
-            Some(alloc_f32(config.la_num_v_heads * max_tokens * config.la_k_head_dim, "la_k_beta")?)
+            Some(alloc_f32(config.la_num_v_heads * la_max_len * config.la_k_head_dim, "la_k_beta")?)
         } else { None },
         d_la_v_new: if has_la {
             Some(alloc_f32(config.la_num_v_heads * config.la_chunk_size * config.la_v_head_dim, "la_v_new")?)
         } else { None },
         d_la_g_cum: if has_la {
-            let num_chunks = (max_tokens + config.la_chunk_size - 1) / config.la_chunk_size;
+            let num_chunks = (la_max_len + config.la_chunk_size - 1) / config.la_chunk_size;
             Some(alloc_f32(config.la_num_v_heads * num_chunks * config.la_chunk_size, "la_g_cum")?)
         } else { None },
         d_la_attn: if has_la {
-            let num_chunks = (max_tokens + config.la_chunk_size - 1) / config.la_chunk_size;
+            let num_chunks = (la_max_len + config.la_chunk_size - 1) / config.la_chunk_size;
             Some(alloc_f32(config.la_num_v_heads * num_chunks * config.la_chunk_size * config.la_chunk_size, "la_attn")?)
         } else { None },
         d_la_state: if has_la {

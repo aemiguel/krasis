@@ -949,8 +949,11 @@ class KrasisModel:
             else:
                 attn_d["q_proj"] = attn.q_proj
             result["attention"] = attn_d
+        elif hasattr(layer, 'gqa_weights') and layer.gqa_weights:
+            # GQA — weights stored directly on layer (no attention wrapper)
+            result["attention"] = dict(layer.gqa_weights)
         else:
-            # GQA
+            # GQA with legacy attention object (shouldn't happen but safe fallback)
             attn_d = {
                 "q_proj": attn.q_proj,
                 "k_proj": attn.k_proj,
@@ -1699,14 +1702,8 @@ class KrasisModel:
         logger.info("Routing weights sent to Rust engine (%d MoE layers)", moe_idx)
 
     def _init_gpu_prefill(self):
-        """DEPRECATED: Python GPU prefill has been replaced by Rust prefill engine.
-        This method is a no-op. Left as a stub for compatibility with
-        any code that calls it (guarded by gpu_prefill_enabled=False).
-        """
-        raise NotImplementedError(
-            "Python GpuPrefillManager has been removed. "
-            "Prefill is now handled by the Rust prefill engine."
-        )
+        """No-op: Python GPU prefill has been replaced by Rust prefill engine."""
+        pass
 
         engine_ref = getattr(self, 'krasis_engine', None)
         num_moe_layers = self.cfg.num_moe_layers
@@ -4198,6 +4195,14 @@ class KrasisModel:
             inp_norm = layer.input_norm_weight
             post_norm = layer.post_attn_norm_weight
 
+            # DIAG: check raw norm values BEFORE AWQ fold
+            if layer_idx == 0:
+                import sys
+                _rv = inp_norm.data.cpu().float()[:10].tolist()
+                _rl2 = inp_norm.data.cpu().float().norm().item()
+                print(f"[PY-DIAG] layer0 inp_norm BEFORE_AWQ first10={_rv}", file=sys.stderr)
+                print(f"[PY-DIAG] layer0 inp_norm BEFORE_AWQ L2={_rl2:.6f}", file=sys.stderr)
+
             # ── Nemotron Mamba2 layer registration ──
             if layer.layer_type == "mamba2":
                 self._register_mamba2_layer(store, layer_idx, layer, device)
@@ -4279,6 +4284,24 @@ class KrasisModel:
                         (inp_norm.float() / s.float()).to(inp_norm.dtype))
                     logger.debug("AWQ: folded scales into input_norm for layer %d "
                                  "(mean_scale=%.4f)", layer_idx, s.mean().item())
+
+                # DIAG: trace input_norm pointer and values at registration time
+                if layer_idx == 0:
+                    import sys
+                    _nv = inp_norm.data.cpu().float()[:10].tolist()
+                    _nl2 = inp_norm.data.cpu().float().norm().item()
+                    print(f"[PY-DIAG] layer0 inp_norm ptr={inp_norm.data_ptr():#x} "
+                          f"numel={inp_norm.numel()} dtype={inp_norm.dtype} "
+                          f"device={inp_norm.device}", file=sys.stderr)
+                    print(f"[PY-DIAG] layer0 inp_norm first10={_nv}", file=sys.stderr)
+                    print(f"[PY-DIAG] layer0 inp_norm L2={_nl2:.6f}", file=sys.stderr)
+                    # Also check post_norm
+                    _pv = post_norm.data.cpu().float()[:10].tolist()
+                    _pl2 = post_norm.data.cpu().float().norm().item()
+                    print(f"[PY-DIAG] layer0 post_norm ptr={post_norm.data_ptr():#x} "
+                          f"numel={post_norm.numel()} dtype={post_norm.dtype}", file=sys.stderr)
+                    print(f"[PY-DIAG] layer0 post_norm first10={_pv}", file=sys.stderr)
+                    print(f"[PY-DIAG] layer0 post_norm L2={_pl2:.6f}", file=sys.stderr)
 
                 # Conv weight: [conv_dim, 1, kernel_dim] -> [conv_dim, kernel_dim]
                 # Rust LA kernels work in FP32, so create FP32 copies of BF16 tensors.
@@ -4457,27 +4480,28 @@ class KrasisModel:
                     rope_set = True
 
             else:
-                # GQA attention — when quantizing, keep on CPU to avoid putting
-                # full BF16 in VRAM. Only upload to GPU for BF16 mode.
+                # GQA attention — get weights from layer.gqa_weights dict
+                # (attn object was removed when FlashInfer was dropped)
+                gqa_w = layer.gqa_weights
                 if self._stream_attn_enabled and layer_idx in self._stream_attn_cpu:
                     cpu_w = self._stream_attn_cpu[layer_idx]
                     if attn_quant == "bf16":
-                        q_w = cpu_w.get("q_proj", attn.q_proj).to(device, non_blocking=True)
-                        k_w = cpu_w.get("k_proj", attn.k_proj).to(device, non_blocking=True)
-                        v_w = cpu_w.get("v_proj", attn.v_proj).to(device, non_blocking=True)
-                        o_w = cpu_w.get("o_proj", attn.o_proj).to(device, non_blocking=True)
+                        q_w = cpu_w.get("q_proj", gqa_w["q_proj"]).to(device, non_blocking=True)
+                        k_w = cpu_w.get("k_proj", gqa_w["k_proj"]).to(device, non_blocking=True)
+                        v_w = cpu_w.get("v_proj", gqa_w["v_proj"]).to(device, non_blocking=True)
+                        o_w = cpu_w.get("o_proj", gqa_w["o_proj"]).to(device, non_blocking=True)
                         self._rust_decode_weights.extend([q_w, k_w, v_w, o_w])
                     else:
                         # Quantizing: pass CPU tensors directly, never touch VRAM with BF16
-                        q_w = cpu_w.get("q_proj", attn.q_proj)
-                        k_w = cpu_w.get("k_proj", attn.k_proj)
-                        v_w = cpu_w.get("v_proj", attn.v_proj)
-                        o_w = cpu_w.get("o_proj", attn.o_proj)
+                        q_w = cpu_w.get("q_proj", gqa_w["q_proj"])
+                        k_w = cpu_w.get("k_proj", gqa_w["k_proj"])
+                        v_w = cpu_w.get("v_proj", gqa_w["v_proj"])
+                        o_w = cpu_w.get("o_proj", gqa_w["o_proj"])
                 else:
-                    q_w = attn.q_proj
-                    k_w = attn.k_proj
-                    v_w = attn.v_proj
-                    o_w = attn.o_proj
+                    q_w = gqa_w["q_proj"]
+                    k_w = gqa_w["k_proj"]
+                    v_w = gqa_w["v_proj"]
+                    o_w = gqa_w["o_proj"]
 
                 # AWQ v2: pass per-channel scales for input projections (q/k/v)
                 _q_scales = _layer_awq_scales if (
@@ -4501,16 +4525,33 @@ class KrasisModel:
                                               awq_scales=_v_scales)
                 o_wid = _register_attn_weight(o_w, layer_idx, "gqa", "o_proj")
 
-                # Replace attention weight attributes with MarlinWeight for prefill
+                # Replace attention weight references with MarlinWeight for prefill
                 from krasis.attention import MarlinWeight
+                gqa_w = layer.gqa_weights if hasattr(layer, 'gqa_weights') else None
                 if q_wid in self._marlin_attn_weights:
-                    attn.q_proj = MarlinWeight(*self._marlin_attn_weights[q_wid])
+                    mw = MarlinWeight(*self._marlin_attn_weights[q_wid])
+                    if gqa_w is not None:
+                        gqa_w["q_proj"] = mw
+                    elif attn is not None:
+                        attn.q_proj = mw
                 if k_wid in self._marlin_attn_weights:
-                    attn.k_proj = MarlinWeight(*self._marlin_attn_weights[k_wid])
+                    mw = MarlinWeight(*self._marlin_attn_weights[k_wid])
+                    if gqa_w is not None:
+                        gqa_w["k_proj"] = mw
+                    elif attn is not None:
+                        attn.k_proj = mw
                 if v_wid in self._marlin_attn_weights:
-                    attn.v_proj = MarlinWeight(*self._marlin_attn_weights[v_wid])
+                    mw = MarlinWeight(*self._marlin_attn_weights[v_wid])
+                    if gqa_w is not None:
+                        gqa_w["v_proj"] = mw
+                    elif attn is not None:
+                        attn.v_proj = mw
                 if o_wid in self._marlin_attn_weights:
-                    attn.o_proj = MarlinWeight(*self._marlin_attn_weights[o_wid])
+                    mw = MarlinWeight(*self._marlin_attn_weights[o_wid])
+                    if gqa_w is not None:
+                        gqa_w["o_proj"] = mw
+                    elif attn is not None:
+                        attn.o_proj = mw
 
                 # AWQ v2: fold 1/s into input_norm_weight for GQA layers
                 if _layer_awq_scales is not None and (
@@ -4527,24 +4568,29 @@ class KrasisModel:
                 # When streaming, use CPU-pinned source for these small weights
                 if self._stream_attn_enabled and layer_idx in self._stream_attn_cpu:
                     cpu_gqa = self._stream_attn_cpu[layer_idx]
-                    q_norm_src = cpu_gqa.get("q_norm", attn.q_norm)
-                    k_norm_src = cpu_gqa.get("k_norm", attn.k_norm)
+                    q_norm_src = cpu_gqa.get("q_norm", gqa_w.get("q_norm"))
+                    k_norm_src = cpu_gqa.get("k_norm", gqa_w.get("k_norm"))
                 else:
-                    q_norm_src = attn.q_norm
-                    k_norm_src = attn.k_norm
+                    q_norm_src = gqa_w.get("q_norm")
+                    k_norm_src = gqa_w.get("k_norm")
                 if q_norm_src is not None:
-                    attn._rust_q_norm = q_norm_src.float().contiguous().to(device)
-                    q_norm_ptr = attn._rust_q_norm.data_ptr()
+                    _rust_q_norm = q_norm_src.float().contiguous().to(device)
+                    self._rust_decode_weights.append(_rust_q_norm)
+                    q_norm_ptr = _rust_q_norm.data_ptr()
                 else:
                     q_norm_ptr = 0
                 if k_norm_src is not None:
-                    attn._rust_k_norm = k_norm_src.float().contiguous().to(device)
-                    k_norm_ptr = attn._rust_k_norm.data_ptr()
+                    _rust_k_norm = k_norm_src.float().contiguous().to(device)
+                    self._rust_decode_weights.append(_rust_k_norm)
+                    k_norm_ptr = _rust_k_norm.data_ptr()
                 else:
                     k_norm_ptr = 0
 
                 post_norm_ptr = post_norm.data_ptr() if post_norm is not None else 0
                 post_norm_size = post_norm.numel() if post_norm is not None else 0
+                _gqa_head_dim = self.cfg.gqa_head_dim or self.cfg.head_dim
+                _gqa_sm_scale = 1.0 / (_gqa_head_dim ** 0.5)
+                _gqa_gated = hasattr(self.cfg, 'gated_attention') and self.cfg.gated_attention
                 store.register_gqa_layer(
                     layer_idx=layer_idx,
                     input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
@@ -4552,10 +4598,11 @@ class KrasisModel:
                     q_proj_wid=q_wid, k_proj_wid=k_wid,
                     v_proj_wid=v_wid, o_proj_wid=o_wid,
                     fused_qkv_wid=None,
-                    num_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
-                    head_dim=attn.head_dim, sm_scale=attn.sm_scale,
+                    num_heads=self.cfg.num_attention_heads,
+                    num_kv_heads=self.cfg.num_key_value_heads,
+                    head_dim=_gqa_head_dim, sm_scale=_gqa_sm_scale,
                     q_norm_ptr=q_norm_ptr, k_norm_ptr=k_norm_ptr,
-                    gated=attn.gated_attention,
+                    gated=_gqa_gated,
                 )
 
                 # Set up RoPE tables from first GQA layer
@@ -4563,9 +4610,13 @@ class KrasisModel:
                     max_seq = max(
                         c.max_context_tokens for c in self.kv_caches if c is not None
                     )
-                    cos, sin = attn._get_rope_cos_sin(max_seq)
-                    cos_f32 = cos.float().contiguous()
-                    sin_f32 = sin.float().contiguous()
+                    rope_half = self.cfg.rotary_dim // 2
+                    inv_freq = 1.0 / (self.cfg.rope_theta ** (
+                        torch.arange(0, rope_half * 2, 2, dtype=torch.float32) / (rope_half * 2)))
+                    t = torch.arange(max_seq, dtype=torch.float32)
+                    freqs = torch.outer(t, inv_freq)
+                    cos_f32 = freqs.cos().contiguous()
+                    sin_f32 = freqs.sin().contiguous()
                     self._rust_rope_cos = cos_f32
                     self._rust_rope_sin = sin_f32
                     store.set_rope_tables(

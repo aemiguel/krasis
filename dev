@@ -682,6 +682,19 @@ do_test_kernels() {
     fi
 }
 
+do_validate() {
+    local config="${1:?Usage: ./dev validate <config> [--no-server] [--l1-only] [--no-logprobs] [--no-prefill]}"
+    shift
+    local conf_path
+    conf_path=$(resolve_config "$config")
+    if [[ ! -f "$conf_path" ]]; then
+        die "Config not found: $conf_path"
+    fi
+    do_build
+    info "Running model validation: $conf_path"
+    exec "$PYTHON" "$SCRIPT_DIR/tests/validate_model.py" "$conf_path" "$@"
+}
+
 do_kill() {
     info "Killing all krasis processes and freeing GPU memory..."
 
@@ -789,6 +802,7 @@ case "$cmd" in
     awq-calibrate)  do_awq_calibrate "$@" ;;
     network)        do_network "$@" ;;
     test-kernels)   do_test_kernels "$@" ;;
+    validate)       do_validate "$@" ;;
     shell)          do_shell "$@" ;;
     python)         do_python "$@" ;;
     help|-h|--help)
@@ -812,6 +826,7 @@ case "$cmd" in
         echo "  test <config>             Short model test (benchmark + network tests)"
         echo "  test <config> --thorough  Thorough test (+ stress + large prompts)"
         echo "  network <port> [flags]    Run network tests against running server"
+        echo "  validate <config>         Validate model output against BF16 reference"
         echo "  test-kernels [name]       Run CUDA kernel unit tests (or filter by name)"
         echo "  chat [args]               Run krasis chat from source"
         echo "  sanity                    Run sanity test prompts against running server"

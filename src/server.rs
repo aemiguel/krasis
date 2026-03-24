@@ -106,9 +106,11 @@ struct ServerState {
     multi_gpu_split_layers: Vec<usize>,
     /// Multi-GPU: number of GQA layers before each split point (for KV cache indexing).
     multi_gpu_gqa_offsets: Vec<usize>,
-    /// Rust-native prefill engine (None = use Python prefill).
-    /// When set, prefill runs entirely in Rust — zero GIL, zero Python.
-    rust_prefill: Option<crate::gpu_prefill::PrefillEngine>,
+    /// Shared Rust prefill engine — Arc+Mutex shared with benchmark path.
+    /// When engine is available inside the Mutex, prefill runs entirely in Rust.
+    rust_prefill: Arc<std::sync::Mutex<Option<crate::gpu_prefill::PrefillEngine>>>,
+    /// When true, enable test-only endpoints (e.g. /v1/internal/prefill_logits).
+    test_endpoints: bool,
 }
 
 /// Parsed HTTP request.
@@ -210,6 +212,7 @@ fn format_sse_token(
     text: &str,
     finish_reason: Option<&str>,
     created: u64,
+    logprobs: Option<&[(u32, f32)]>,
 ) -> String {
     let delta = if text.is_empty() {
         "{}".to_string()
@@ -222,9 +225,22 @@ fn format_sse_token(
         Some(r) => format!(r#""{}""#, r),
         None => "null".to_string(),
     };
+    let logprobs_str = if let Some(lps) = logprobs {
+        // OpenAI format: {"content": [{"token": "...", "logprob": -0.5, "top_logprobs": [{"token": "...", "logprob": -0.5}, ...]}]}
+        let mut top_entries = Vec::new();
+        for &(tid, lp) in lps.iter() {
+            top_entries.push(format!(r#"{{"token_id":{},"logprob":{:.6}}}"#, tid, lp));
+        }
+        let top_str = top_entries.join(",");
+        // The first entry is the selected token
+        let selected_lp = if !lps.is_empty() { lps[0].1 } else { 0.0 };
+        format!(r#","logprobs":{{"content":[{{"logprob":{:.6},"top_logprobs":[{}]}}]}}"#, selected_lp, top_str)
+    } else {
+        String::new()
+    };
     format!(
-        r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[{{"index":0,"delta":{},"finish_reason":{}}}]}}"#,
-        request_id, created, model_name, delta, fr
+        r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[{{"index":0,"delta":{},"finish_reason":{}{}}}]}}"#,
+        request_id, created, model_name, delta, fr, logprobs_str
     )
 }
 
@@ -471,6 +487,14 @@ fn handle_request(
             handle_chat_completion(&mut tcp_stream, &request.body, state);
         }
 
+        ("POST", "/v1/internal/prefill_logits") => {
+            if state.test_endpoints {
+                handle_prefill_logits(&mut tcp_stream, &request.body, state);
+            } else {
+                let _ = send_json(&mut tcp_stream, 404, r#"{"error":"Test endpoints not enabled. Start server with --test-endpoints"}"#);
+            }
+        }
+
         _ => {
             let _ = send_json(&mut tcp_stream, 404, r#"{"error":"Not found"}"#);
         }
@@ -525,6 +549,9 @@ fn handle_chat_completion(
     let top_k = req.get("top_k").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     let top_p = req.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.95) as f32;
     let presence_penalty = req.get("presence_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let req_logprobs = req.get("logprobs").and_then(|v| v.as_bool()).unwrap_or(false);
+    let req_top_logprobs = req.get("top_logprobs").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+    let logprobs_top_n = if req_logprobs { req_top_logprobs } else { 0 };
     let enable_thinking = req.get("enable_thinking").and_then(|v| v.as_bool()).unwrap_or(state.default_enable_thinking);
 
     let request_id = format!("chatcmpl-{:016x}", {
@@ -634,7 +661,8 @@ fn handle_chat_completion(
                 return;
             }
         };
-        let engine = state.rust_prefill.as_mut().unwrap();
+        let mut engine_guard = state.rust_prefill.lock().unwrap();
+        let engine = engine_guard.as_mut().unwrap();
 
         // Update HCS snapshot so prefill can use GPU-resident experts directly
         {
@@ -801,7 +829,7 @@ fn handle_chat_completion(
         first_token, prompt_len, max_tokens, temperature,
         top_k, top_p, presence_penalty, &stop_ids,
         &request_id, &state.model_name, created,
-        &overhead, has_tools, enable_thinking,
+        &overhead, has_tools, enable_thinking, logprobs_top_n,
     );
     crate::vram_monitor::report_event("decode_end");
 
@@ -818,6 +846,95 @@ fn handle_chat_completion(
         "Request {} complete: total={:.0}ms | parse={:.1}ms evict={:.1}ms prefill={:.0}ms reload={:.0}ms cleanup={:.1}ms",
         request_id, total_ms, parse_ms, evict_ms, prefill_gil_ms, reload_ms, cleanup_gil_ms
     );
+}
+
+/// Handle /v1/internal/prefill_logits endpoint.
+/// Runs a full prefill pass and extracts top-k logprobs at sampled positions.
+fn handle_prefill_logits(
+    stream: &mut TcpStream,
+    body: &str,
+    state: &mut ServerState,
+) {
+    // Parse request
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = send_json(stream, 400, &format!(r#"{{"error":"Invalid JSON: {}"}}"#, e));
+            return;
+        }
+    };
+
+    let messages_json = match req.get("messages") {
+        Some(m) => m.to_string(),
+        None => {
+            let _ = send_json(stream, 400, r#"{"error":"Missing messages"}"#);
+            return;
+        }
+    };
+    let top_k = req.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let sample_every = req.get("sample_every").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    let enable_thinking = req.get("enable_thinking").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Apply chat template
+    let rendered = match state.chat_template.apply(&messages_json, enable_thinking) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = send_json(stream, 500, &format!(r#"{{"error":"Chat template: {}"}}"#, e));
+            return;
+        }
+    };
+
+    // Tokenize
+    let token_ids: Vec<u32> = match state.tokenizer.encode(rendered.as_str(), true) {
+        Ok(e) => e.get_ids().to_vec(),
+        Err(e) => {
+            let _ = send_json(stream, 500, &format!(r#"{{"error":"Tokenize: {}"}}"#, e));
+            return;
+        }
+    };
+
+    log::info!("prefill_logits: {} tokens, top_k={}, sample_every={}", token_ids.len(), top_k, sample_every);
+
+    // Run prefill logits extraction
+    let mut engine_guard = state.rust_prefill.lock().unwrap();
+    let engine = match engine_guard.as_mut() {
+        Some(e) => e,
+        None => {
+            let _ = send_json(stream, 500, r#"{"error":"Rust prefill engine not available"}"#);
+            return;
+        }
+    };
+
+    // Update HCS snapshot
+    {
+        let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
+        let (cache_fast, ne) = store.export_hcs_snapshot();
+        engine.update_hcs_snapshot(cache_fast, ne);
+    }
+
+    let positions = match engine.run_prefill_logits(&token_ids, top_k, sample_every) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill logits: {}"}}"#, e));
+            return;
+        }
+    };
+
+    // Format response: {positions: [{position, top_k: [{token_id, logprob}]}]}
+    let mut pos_json = Vec::new();
+    for p in &positions {
+        let mut tk_json = Vec::new();
+        for &(tid, lp) in &p.top_k {
+            tk_json.push(format!(r#"{{"token_id":{},"logprob":{:.6}}}"#, tid, lp));
+        }
+        pos_json.push(format!(
+            r#"{{"position":{},"top_k":[{}]}}"#,
+            p.position,
+            tk_json.join(",")
+        ));
+    }
+    let response = format!(r#"{{"positions":[{}]}}"#, pos_json.join(","));
+    let _ = send_json(stream, 200, &response);
 }
 
 /// GPU decode: GIL-free Rust decode loop via GpuDecodeStore.
@@ -843,6 +960,7 @@ fn handle_gpu_decode(
     overhead: &RequestOverhead,
     has_tools: bool,
     enable_thinking: bool,
+    logprobs_top_n: usize,
 ) {
     // Resolve thinking end token early — used by both streaming and non-streaming paths
     let think_end_id = if enable_thinking { state.thinking_end_token } else { None };
@@ -859,14 +977,14 @@ fn handle_gpu_decode(
         // The prompt already includes <think>, but the client needs it in the
         // output to know this is a thinking block (for display suppression).
         if think_end_id.is_some() {
-            let think_chunk = format_sse_token(request_id, model_name, "<think>", None, created);
+            let think_chunk = format_sse_token(request_id, model_name, "<think>", None, created, None);
             let _ = send_sse_chunk(stream, &think_chunk);
         }
 
         // When tool use is active, buffer first token (might need tool call parsing).
         // Otherwise send immediately for lowest latency.
         if !has_tools {
-            let chunk = format_sse_token(request_id, model_name, &first_text, None, created);
+            let chunk = format_sse_token(request_id, model_name, &first_text, None, created, None);
             let _ = send_sse_chunk(stream, &chunk);
         }
 
@@ -961,18 +1079,18 @@ fn handle_gpu_decode(
                 if let Some(idx) = first_text.find("<tool_call>") {
                     let before = &first_text[..idx];
                     if !before.is_empty() {
-                        let chunk = format_sse_token(request_id, model_name, before, None, created);
+                        let chunk = format_sse_token(request_id, model_name, before, None, created, None);
                         let _ = tx.send(format!("data: {}\n\n", chunk));
                     }
                 }
             } else if !first_text.is_empty() {
-                let chunk = format_sse_token(request_id, model_name, &first_text, None, created);
+                let chunk = format_sse_token(request_id, model_name, &first_text, None, created, None);
                 let _ = tx.send(format!("data: {}\n\n", chunk));
             }
         }
 
         // Shared callback for both single-GPU and multi-GPU decode
-        let mut on_token = |token_id: usize, text: &str, finish_reason: Option<&str>| -> bool {
+        let mut on_token = |token_id: usize, text: &str, finish_reason: Option<&str>, token_logprobs: Option<&[(u32, f32)]>| -> bool {
             decode_token_count += 1;
 
             // ── Track thinking state ──
@@ -1015,7 +1133,7 @@ fn handle_gpu_decode(
                         let before = &text[..idx];
                         if !before.is_empty() {
                             let chunk = format_sse_token(
-                                request_id, model_name, before, None, created,
+                                request_id, model_name, before, None, created, None,
                             );
                             let _ = tx.send(format!("data: {}\n\n", chunk));
                         }
@@ -1024,7 +1142,7 @@ fn handle_gpu_decode(
                     // Normal content — stream it (no finish_reason; handled post-generation)
                     if !text.is_empty() {
                         let chunk = format_sse_token(
-                            request_id, model_name, text, None, created,
+                            request_id, model_name, text, None, created, token_logprobs,
                         );
                         let _ = tx.send(format!("data: {}\n\n", chunk));
                     }
@@ -1040,7 +1158,7 @@ fn handle_gpu_decode(
             } else {
                 // Original non-tool path
                 let chunk = format_sse_token(
-                    request_id, model_name, text, effective_finish, created,
+                    request_id, model_name, text, effective_finish, created, token_logprobs,
                 );
                 let formatted = format!("data: {}\n\n", chunk);
                 if tx.send(formatted).is_err()
@@ -1079,6 +1197,7 @@ fn handle_gpu_decode(
                 stop_ids,
                 tokenizer,
                 presence_penalty,
+                logprobs_top_n,
                 &mut on_token,
             );
         } else {
@@ -1093,6 +1212,7 @@ fn handle_gpu_decode(
                 stop_ids,
                 tokenizer,
                 presence_penalty,
+                logprobs_top_n,
                 on_token,
             );
         }
@@ -1117,7 +1237,7 @@ fn handle_gpu_decode(
                     let _ = tx.send(format!("data: {}\n\n", args_chunk));
                 }
                 let finish_chunk = format_sse_token(
-                    request_id, model_name, "", Some("tool_calls"), created,
+                    request_id, model_name, "", Some("tool_calls"), created, None,
                 );
                 let _ = tx.send(format!("data: {}\n\n", finish_chunk));
                 log::info!(
@@ -1128,7 +1248,7 @@ fn handle_gpu_decode(
                 // No tool calls — send finish with original reason
                 let fr = if tc_finish.is_empty() { "stop" } else { &tc_finish };
                 let finish_chunk = format_sse_token(
-                    request_id, model_name, "", Some(fr), created,
+                    request_id, model_name, "", Some(fr), created, None,
                 );
                 let _ = tx.send(format!("data: {}\n\n", finish_chunk));
             }
@@ -1194,7 +1314,7 @@ fn handle_gpu_decode(
         };
 
         {
-            let mut on_token = |token_id: usize, text: &str, finish_reason: Option<&str>| -> bool {
+            let mut on_token = |token_id: usize, text: &str, finish_reason: Option<&str>, _logprobs: Option<&[(u32, f32)]>| -> bool {
                 all_text.push_str(text);
                 total_tokens += 1;
 
@@ -1235,6 +1355,7 @@ fn handle_gpu_decode(
                     stop_ids,
                     tokenizer,
                     presence_penalty,
+                    logprobs_top_n,
                     &mut on_token,
                 );
             } else {
@@ -1248,6 +1369,7 @@ fn handle_gpu_decode(
                     stop_ids,
                     tokenizer,
                     presence_penalty,
+                    logprobs_top_n,
                     on_token,
                 );
             }
@@ -1299,14 +1421,18 @@ pub struct RustServer {
     aux_gpu_store_addrs: Vec<usize>,
     multi_gpu_split_layers: Vec<usize>,
     multi_gpu_gqa_offsets: Vec<usize>,
-    /// Rust prefill engine for benchmark path (zero GIL)
-    prefill_engine: Option<crate::gpu_prefill::PrefillEngine>,
+    /// Shared Rust prefill engine — used by both serve_forever (HTTP requests)
+    /// and benchmark_request (engine benchmarks). Arc+Mutex allows both paths
+    /// to share the single pre-allocated engine without moving it.
+    prefill_engine: Arc<std::sync::Mutex<Option<crate::gpu_prefill::PrefillEngine>>>,
+    /// Enable test-only endpoints (/v1/internal/prefill_logits)
+    test_endpoints: bool,
 }
 
 #[pymethods]
 impl RustServer {
     #[new]
-    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, thinking_end_token_id=0, gpu_store_addr=0, aux_gpu_store_addrs=Vec::new(), multi_gpu_split_layers=Vec::new(), multi_gpu_gqa_offsets=Vec::new()))]
+    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, thinking_end_token_id=0, gpu_store_addr=0, aux_gpu_store_addrs=Vec::new(), multi_gpu_split_layers=Vec::new(), multi_gpu_gqa_offsets=Vec::new(), test_endpoints=false))]
     fn new(
         py_model: PyObject,
         host: String,
@@ -1320,18 +1446,31 @@ impl RustServer {
         aux_gpu_store_addrs: Vec<usize>,
         multi_gpu_split_layers: Vec<usize>,
         multi_gpu_gqa_offsets: Vec<usize>,
+        test_endpoints: bool,
     ) -> Self {
-        // Create Rust prefill engine for benchmark path
+        // Take the pre-allocated Rust prefill engine from the decode store.
+        // The engine was pre-allocated from Python (before HCS pool loading)
+        // so it already has its VRAM allocated. Creating a new one here would
+        // fail because HCS has consumed most remaining VRAM.
         let prefill_engine = if gpu_store_addr != 0 {
-            let store = unsafe { &*(gpu_store_addr as *const GpuDecodeStore) };
-            match store.create_prefill_engine(max_context_tokens) {
-                Ok(engine) => {
-                    log::info!("RustServer: Rust prefill engine created for benchmarks (max_tokens={})", max_context_tokens);
+            let store = unsafe { &mut *(gpu_store_addr as *mut GpuDecodeStore) };
+            match store.take_prefill_engine() {
+                Some(engine) => {
+                    log::info!("RustServer: took pre-allocated prefill engine for benchmarks");
                     Some(engine)
                 }
-                Err(e) => {
-                    log::error!("RustServer: Rust prefill engine failed: {}", e);
-                    None
+                None => {
+                    log::warn!("RustServer: no pre-allocated prefill engine, creating on demand");
+                    match store.create_prefill_engine(max_context_tokens) {
+                        Ok(engine) => {
+                            log::info!("RustServer: prefill engine created on demand (max_tokens={})", max_context_tokens);
+                            Some(engine)
+                        }
+                        Err(e) => {
+                            log::error!("RustServer: prefill engine failed: {}", e);
+                            None
+                        }
+                    }
                 }
             }
         } else {
@@ -1352,7 +1491,8 @@ impl RustServer {
             aux_gpu_store_addrs,
             multi_gpu_split_layers,
             multi_gpu_gqa_offsets,
-            prefill_engine,
+            prefill_engine: Arc::new(std::sync::Mutex::new(prefill_engine)),
+            test_endpoints,
         }
     }
 
@@ -1372,6 +1512,7 @@ impl RustServer {
         let aux_gpu_store_addrs = self.aux_gpu_store_addrs.clone();
         let multi_gpu_split_layers = self.multi_gpu_split_layers.clone();
         let multi_gpu_gqa_offsets = self.multi_gpu_gqa_offsets.clone();
+        let test_endpoints = self.test_endpoints;
         let running = self.running.clone();
 
         // Install raw SIGINT + SIGTERM handlers BEFORE releasing the GIL.
@@ -1469,18 +1610,37 @@ impl RustServer {
                 None
             };
 
-            // Create Rust prefill engine (always — no Python fallback)
+            // Share the prefill engine from the RustServer via Arc clone.
+            // If RustServer::new() took the pre-allocated engine (it should have),
+            // it's already in the shared Mutex. If not, try the decode store.
             let rust_prefill = {
-                let store = unsafe { &*(gpu_store_addr as *const GpuDecodeStore) };
-                match store.create_prefill_engine(max_context_tokens) {
-                    Ok(engine) => {
-                        log::info!("Rust prefill engine created (max_tokens={})", max_context_tokens);
-                        Some(engine)
-                    }
-                    Err(e) => {
-                        log::error!("Rust prefill engine failed: {}", e);
-                        log::error!("Cannot start server without Rust prefill engine");
-                        return;
+                let has_engine = self.prefill_engine.lock().unwrap().is_some();
+                if has_engine {
+                    log::info!("Rust prefill engine shared via Arc (was pre-allocated)");
+                    self.prefill_engine.clone()
+                } else {
+                    // Not in the shared Mutex — try the decode store
+                    let store = unsafe { &mut *(gpu_store_addr as *mut GpuDecodeStore) };
+                    match store.take_prefill_engine() {
+                        Some(engine) => {
+                            log::info!("Rust prefill engine taken from decode store pre-allocated slot");
+                            let arc = Arc::new(std::sync::Mutex::new(Some(engine)));
+                            arc
+                        }
+                        None => {
+                            log::warn!("No pre-allocated prefill engine — creating on demand");
+                            match store.create_prefill_engine(max_context_tokens) {
+                                Ok(engine) => {
+                                    log::info!("Rust prefill engine created on demand (max_tokens={})", max_context_tokens);
+                                    Arc::new(std::sync::Mutex::new(Some(engine)))
+                                }
+                                Err(e) => {
+                                    log::error!("Rust prefill engine failed: {}", e);
+                                    log::error!("Cannot start server without Rust prefill engine");
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
             };
@@ -1500,6 +1660,7 @@ impl RustServer {
                 multi_gpu_split_layers,
                 multi_gpu_gqa_offsets,
                 rust_prefill,
+                test_endpoints,
             };
 
             while running.load(Ordering::Acquire) {
@@ -1546,7 +1707,7 @@ impl RustServer {
     /// Safety: assumes no concurrent HTTP requests during benchmark.
     #[pyo3(signature = (messages_json, max_new_tokens, temperature=0.6, enable_thinking=false))]
     fn benchmark_request(
-        &mut self,
+        &self,
         py: Python<'_>,
         messages_json: String,
         max_new_tokens: usize,
@@ -1588,7 +1749,10 @@ impl RustServer {
         crate::vram_monitor::report_event("prefill_start");
         let t_prefill = Instant::now();
 
-        let engine = self.prefill_engine.as_mut().ok_or_else(|| {
+        let mut engine_guard = self.prefill_engine.lock().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Prefill engine lock poisoned: {}", e))
+        })?;
+        let engine = engine_guard.as_mut().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("Rust prefill engine not available for benchmark")
         })?;
 
@@ -1678,7 +1842,8 @@ impl RustServer {
                     &stop_ids,
                     &tokenizer,
                     0.0,    // presence_penalty
-                    |_token_id: usize, _text: &str, _finish_reason: Option<&str>| {
+                    0,      // logprobs_top_n
+                    |_token_id: usize, _text: &str, _finish_reason: Option<&str>, _logprobs: Option<&[(u32, f32)]>| {
                         count += 1;
                         true
                     },
@@ -1694,7 +1859,8 @@ impl RustServer {
                     &stop_ids,
                     &tokenizer,
                     0.0,    // presence_penalty
-                    |_token_id, _text, _finish_reason| {
+                    0,      // logprobs_top_n
+                    |_token_id, _text, _finish_reason, _logprobs: Option<&[(u32, f32)]>| {
                         count += 1;
                         true
                     },

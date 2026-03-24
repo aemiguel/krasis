@@ -5170,6 +5170,40 @@ unsafe fn mla_project_wvc_avx2(
 ///   warmup: Number of warmup steps before timing
 ///   timing: Enable per-component timing (KRASIS_CPU_DECODE_TIMING)
 ///   num_bits: Weight quantization (4 or 8)
+/// Extract top-N log probabilities from raw logits.
+/// Returns Vec of (token_id, log_prob) sorted by descending probability.
+/// The logits are NOT modified. This is O(vocab_size) — only called when
+/// the request includes logprobs=true, so zero cost in production.
+pub fn extract_top_logprobs(logits: &[f32], vocab_size: usize, top_n: usize) -> Vec<(u32, f32)> {
+    if top_n == 0 || vocab_size == 0 {
+        return Vec::new();
+    }
+    // Compute log-softmax: log_prob[i] = logit[i] - log(sum(exp(logit[j])))
+    // Numerically stable: subtract max first
+    let max_logit = logits[..vocab_size].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f64 = logits[..vocab_size].iter()
+        .map(|&x| ((x - max_logit) as f64).exp())
+        .sum();
+    let log_sum_exp = max_logit as f64 + sum_exp.ln();
+
+    // Build (token_id, log_prob) for all tokens, keep top_n
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(top_n + 1);
+    for (i, &logit) in logits[..vocab_size].iter().enumerate() {
+        let log_prob = (logit as f64 - log_sum_exp) as f32;
+        if top.len() < top_n {
+            top.push((i as u32, log_prob));
+            if top.len() == top_n {
+                top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        } else if log_prob > top[top_n - 1].1 {
+            top[top_n - 1] = (i as u32, log_prob);
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    top
+}
+
 #[pyfunction]
 #[pyo3(signature = (config_path, num_steps=100, warmup=5, timing=false, num_bits=4, max_experts=0, num_threads=40, tiled=true))]
 pub fn bench_decode_synthetic(

@@ -314,6 +314,10 @@ class ModelConfig:
     moe_shared_expert_intermediate_size: int = 0  # LatentMoE shared expert intermediate
     mlp_hidden_act: str = "silu"       # MLP activation: "silu" or "relu2"
 
+    # GQA output gating: q_proj outputs [query, gate], apply sigmoid(gate) before o_proj
+    # Qwen3.5 calls this attn_output_gate, Qwen3Next uses it implicitly
+    gated_attention: bool = False
+
     # Norm convention: Qwen3NextRMSNorm uses (1 + weight) * x, stored weights are ~0
     # Standard RMSNorm uses weight * x, stored weights are ~1
     norm_bias_one: bool = False  # True for qwen3_next models
@@ -402,6 +406,10 @@ class ModelConfig:
         # with weight initialized to zeros, while standard models use weight * x
         # with weight initialized to ones. We add 1.0 to stored weights at load time.
         norm_bias_one = arch in ("qwen3_next", "qwen3_5_moe_text")
+
+        # Gated attention: q_proj outputs [query, gate], apply sigmoid(gate) before o_proj
+        # Qwen3.5 uses explicit attn_output_gate flag; Qwen3Next always uses it
+        gated_attention = cfg.get("attn_output_gate", arch in ("qwen3_next", "qwen3_5_moe_text"))
 
         # Nemotron-H shared expert intermediate: separate field name
         nemotron_shared_inter = cfg.get("moe_shared_expert_intermediate_size", 0)
@@ -499,6 +507,7 @@ class ModelConfig:
             moe_latent_size=cfg.get("moe_latent_size", 0),
             moe_shared_expert_intermediate_size=nemotron_shared_inter,
             mlp_hidden_act=cfg.get("mlp_hidden_act", cfg.get("hidden_act", "silu")),
+            gated_attention=gated_attention,
             norm_bias_one=norm_bias_one,
             tie_word_embeddings=tie,
             bos_token_id=raw.get("bos_token_id", cfg.get("bos_token_id", 0)),

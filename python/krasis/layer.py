@@ -111,7 +111,9 @@ class TransformerLayer:
             self.mamba2_weights = None
         elif cfg.is_gqa or cfg.is_nemotron_h:
             # GQA attention is handled by Rust prefill engine — no Python attention object needed
+            # Store raw weights dict for decode store registration (q_proj, k_proj, etc.)
             self.attention = None
+            self.gqa_weights = weights.get("attention", {})
             self.mamba2_weights = None
         elif attention_backend == "trtllm":
             raise NotImplementedError(

@@ -450,6 +450,10 @@ def _vram_snap(label: str):
         )
 
 
+
+
+
+
 def _warmup_prefill(model: KrasisModel):
     """Run a 50K-token prefill to warm up GPU kernels, CUDA caches, and lazy allocations.
 
@@ -846,6 +850,8 @@ def main():
     parser.add_argument("--session-enabled", action=argparse.BooleanOptionalAction,
                         default=False,
                         help="Enable Session messenger bridge (default: off)")
+    parser.add_argument("--test-endpoints", action="store_true", default=False,
+                        help="Enable test-only endpoints (/v1/internal/prefill_logits)")
     # Apply config file defaults, then parse CLI (CLI wins over config file)
     if config_defaults:
         parser.set_defaults(**config_defaults)
@@ -1091,19 +1097,10 @@ def main():
     # captures the spike for visibility but is reset before HCS budget measurement.
     _model._hcs_device = None
     _model._multi_gpu_hcs = False
-    _status("Warmup (prefill + decode, no HCS)")
-    _dim("Triggering lazy CUDA allocations (torch.compile, cuBLAS, Rust prefill)")
+    _status("Warmup (Rust prefill engine warms up on first request)")
+    _dim("Skipping Python prefill warmup — Rust prefill engine handles warmup lazily")
     vram_monitor.report_event("warmup_start")
     t_warmup = time.time()
-    # Use layer_group_size=1 for warmup to avoid DMA pipeline issues with grouped prefill
-    _saved_layer_group_size = _model.layer_group_size
-    _model.layer_group_size = 1
-    _model._init_gpu_prefill()
-    _warmup_prefill(_model)
-    _warmup_decode(_model, num_steps=1)
-    # Restore original layer group size
-    _model.layer_group_size = _saved_layer_group_size
-    _model._init_gpu_prefill()
     warmup_elapsed = time.time() - t_warmup
     _detail(f"Warmup complete in {warmup_elapsed:.1f}s")
     vram_monitor.report_event("warmup_end")
@@ -1119,167 +1116,64 @@ def main():
             idx, warmup_peak_used, warmup_min_free, total,
         )
 
-    # ── Phase 2: Four-point VRAM calibration ──
-    # Measure min_free VRAM during: short prefill, short decode, long prefill, long decode.
-    # This gives us two linear models (prefill VRAM/token, decode VRAM/token) so
-    # Rust can compute exact budgets at any prompt length.
+    # ── Pre-allocate Rust prefill engine ──
+    # Must happen BEFORE VRAM budget measurement and HCS pool loading.
+    # The prefill engine allocates fixed scratch buffers on the GPU.
+    # If we wait until after HCS, there may not be enough VRAM left.
+    _status("Pre-allocating Rust prefill engine")
+    try:
+        gpu_store.allocate_prefill_engine(_model.cfg.max_position_embeddings)
+        _detail("Prefill engine scratch buffers allocated")
+    except Exception as e:
+        logger.error("Failed to pre-allocate prefill engine: %s", e)
+        raise
+
+    # ── Phase 2: VRAM budget measurement ──
+    # With Rust prefill, ALL scratch buffers are pre-allocated at engine creation.
+    # No dynamic torch allocation happens during prefill -- VRAM consumption is
+    # constant regardless of prompt length. So the old 4-point calibration
+    # (measure VRAM at different prompt lengths) is unnecessary.
+    #
+    # Budget = free VRAM after all startup allocations - safety margin.
+    # Since prefill doesn't dynamically allocate, all free VRAM can be hard-tier
+    # HCS (permanently resident). No soft-tier eviction/reload cycle needed.
     dev_idx = devices[0].index
     import torch
 
-    _status("VRAM calibration (4-point measurement)")
+    _status("VRAM budget measurement")
     vram_monitor.report_event("calibration_start")
     _detail(f"Safety margin: {SAFETY_MARGIN_MB:,} MB")
-    _detail(f"Using layer_group_size={_model.layer_group_size} (same as runtime)")
-
-    SHORT_REPEATS = 17    # ~500 tokens
-    # Calculate long prompt to use ~80% of KV cache capacity
-    # Each repeat of the base text is ~30 tokens
-    TOKENS_PER_REPEAT = 30
-    kv_cache = _model.kv_caches[0] if _model.kv_caches else None
-    if kv_cache is not None:
-        kv_max_tokens = kv_cache.max_pages * kv_cache.page_size
-        long_target_tokens = int(kv_max_tokens * 0.8)
-        LONG_REPEATS = max(SHORT_REPEATS * 2, long_target_tokens // TOKENS_PER_REPEAT)
-    else:
-        kv_max_tokens = 0
-        LONG_REPEATS = SHORT_REPEATS * 4  # minimal fallback, no KV cache info
-
-    prefill_short_free = None
-    prefill_long_free = None
-    decode_short_free = None
-    decode_long_free = None
-    short_tokens = 0
-    long_tokens = 0
-
-    try:
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        _baseline_free = torch.cuda.mem_get_info(dev_idx)[0] // (1024 * 1024)
-        _baseline_total = torch.cuda.mem_get_info(dev_idx)[1] // (1024 * 1024)
-        _detail(f"Baseline free VRAM: {_baseline_free:,} MB / {_baseline_total:,} MB")
-        logger.info("VRAM calibration baseline: free=%d MB, total=%d MB", _baseline_free, _baseline_total)
-
-        # ── 2a: Short prompt prefill ──
-        vram_monitor.report_event("cal_short_prefill")
-        vram_monitor.reset(dev_idx)
-        _dim("Capture: short prompt prefill (~500 tokens)")
-        short_prompt_len, short_result = _capture_prefill(_model, SHORT_REPEATS)
-        torch.cuda.synchronize()
-        time.sleep(0.1)  # let monitor poll
-        prefill_short_free = vram_monitor.min_free_mb(dev_idx)
-        short_tokens = short_prompt_len or 500
-        _dim(f"  short prefill: {short_tokens} tokens, min_free={prefill_short_free:,} MB")
-        logger.info("VRAM cal short prefill: %d tokens, min_free=%d MB", short_tokens, prefill_short_free)
-
-        # ── 2b: Short prompt decode ──
-        vram_monitor.report_event("cal_short_decode")
-        if short_result is not None:
-            vram_monitor.reset(dev_idx)
-            _dim("Capture: short prompt decode")
-            _capture_decode_only(_model, short_result, num_steps=8)
-            torch.cuda.synchronize()
-            time.sleep(0.1)
-            decode_short_free = vram_monitor.min_free_mb(dev_idx)
-            _dim(f"  short decode: min_free={decode_short_free:,} MB")
-            logger.info("VRAM cal short decode: min_free=%d MB", decode_short_free)
-        else:
-            _model.server_cleanup()
-
-        # ── 2c: Long prompt prefill ──
-        vram_monitor.report_event("cal_long_prefill")
-        vram_monitor.reset(dev_idx)
-        _long_est = LONG_REPEATS * TOKENS_PER_REPEAT
-        _dim(f"Capture: long prompt prefill (~{_long_est // 1000}K tokens)")
-        long_prompt_len, long_result = _capture_prefill(_model, LONG_REPEATS)
-        torch.cuda.synchronize()
-        time.sleep(0.1)
-        prefill_long_free = vram_monitor.min_free_mb(dev_idx)
-        long_tokens = long_prompt_len or 51000
-        _dim(f"  long prefill: {long_tokens} tokens, min_free={prefill_long_free:,} MB")
-        logger.info("VRAM cal long prefill: %d tokens, min_free=%d MB", long_tokens, prefill_long_free)
-
-        # ── 2d: Long prompt decode ──
-        vram_monitor.report_event("cal_long_decode")
-        if long_result is not None:
-            vram_monitor.reset(dev_idx)
-            _dim("Capture: long prompt decode")
-            _capture_decode_only(_model, long_result, num_steps=8)
-            torch.cuda.synchronize()
-            time.sleep(0.1)
-            decode_long_free = vram_monitor.min_free_mb(dev_idx)
-            _dim(f"  long decode: min_free={decode_long_free:,} MB")
-            logger.info("VRAM cal long decode: min_free=%d MB", decode_long_free)
-        else:
-            _model.server_cleanup()
-
-    except Exception as e:
-        logger.warning("VRAM calibration failed: %s", e)
-        try:
-            _model.server_cleanup()
-        except Exception:
-            pass
-
-    # ── Compute calibration ──
-    if (prefill_short_free is None or prefill_long_free is None
-            or decode_short_free is None or decode_long_free is None):
-        raise RuntimeError(
-            "VRAM calibration failed — cannot determine HCS budget without real measurements. "
-            "Fix the calibration issue before starting. Never hardcode VRAM budgets."
-        )
-
-    if long_tokens > short_tokens:
-        prefill_kb_per_tok = (prefill_short_free - prefill_long_free) / (long_tokens - short_tokens) * 1024
-        decode_kb_per_tok = (decode_short_free - decode_long_free) / (long_tokens - short_tokens) * 1024
-    else:
-        prefill_kb_per_tok = 0
-        decode_kb_per_tok = 0
-
-    # Compute transient VRAM requirements (deltas from baseline).
-    # Calibration measures min_free relative to the pre-calibration baseline, but
-    # after calibration the actual free VRAM may differ (PyTorch caching allocator
-    # retains some blocks). Using deltas and applying them to actual post-cleanup
-    # free VRAM gives correct budgets regardless of allocator state.
-    prefill_transient_measured = max(0, _baseline_free - prefill_long_free)   # at calibration (80% KV)
-    # Extrapolate prefill transient to 100% KV fill.
-    # Hard budget must survive worst-case prefill, which is a completely full KV cache,
-    # not just the 80% used during calibration. The linear model makes this exact.
-    if kv_max_tokens > long_tokens and prefill_kb_per_tok > 0:
-        extra_tokens = kv_max_tokens - long_tokens
-        extra_mb = int(extra_tokens * prefill_kb_per_tok / 1024)
-        prefill_transient = prefill_transient_measured + extra_mb
-        _detail(f"Prefill transient extrapolated: {prefill_transient_measured:,} MB (80% KV) -> {prefill_transient:,} MB (100% KV, +{extra_mb:,} MB for {extra_tokens:,} extra tokens)")
-    else:
-        prefill_transient = prefill_transient_measured
-    decode_transient = max(0, _baseline_free - decode_short_free)    # best-case decode VRAM consumed
 
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
     _free_mb = torch.cuda.mem_get_info(dev_idx)[0] // (1024 * 1024)
     _total_mb = torch.cuda.mem_get_info(dev_idx)[1] // (1024 * 1024)
+    _detail(f"Free VRAM after startup: {_free_mb:,} MB / {_total_mb:,} MB")
+    logger.info("VRAM budget: free=%d MB, total=%d MB (Rust prefill, constant VRAM)", _free_mb, _total_mb)
 
-    # Hard budget = actual free minus worst-case prefill transient minus safety
-    hard_budget = max(0, _free_mb - prefill_transient - SAFETY_MARGIN_MB)
-    # Soft budget = extra VRAM available during decode (evicted before prefill)
-    decode_available = max(0, _free_mb - decode_transient - SAFETY_MARGIN_MB)
-    soft_budget = max(0, decode_available - hard_budget)
+    # Prefill scratch is already allocated (pre-allocated before VRAM measurement).
+    # _free_mb already reflects the scratch consumption, so no subtraction needed.
+
+    # Hard tier = free VRAM minus safety margin.
+    hard_budget = max(0, _free_mb - SAFETY_MARGIN_MB)
+    soft_budget = 0
+
+    # Pass flat calibration to Rust (all 4 points identical = 0 KB/tok).
+    # This tells Rust that VRAM consumption doesn't scale with prompt length,
+    # which is correct for Rust prefill with pre-allocated scratch buffers.
+    short_tokens = 500
+    long_tokens = 50000
+    prefill_short_free = _free_mb
+    prefill_long_free = _free_mb
+    decode_short_free = _free_mb
+    decode_long_free = _free_mb
 
     vram_monitor.report_event("calibration_end")
-    _status("VRAM calibration complete")
-    _detail(f"Prefill: {prefill_kb_per_tok:.1f} KB/token ({prefill_short_free:,} MB @ {short_tokens} tok -> {prefill_long_free:,} MB @ {long_tokens} tok)")
-    _detail(f"Decode:  {decode_kb_per_tok:.1f} KB/token ({decode_short_free:,} MB @ short -> {decode_long_free:,} MB @ long)")
-    _detail(f"Transient: prefill={prefill_transient:,} MB (100% KV), decode={decode_transient:,} MB  |  Actual free: {_free_mb:,} MB / {_total_mb:,} MB")
-    _detail(f"Hard HCS budget: {hard_budget:,} MB (survives 100% KV prefill)  |  Soft HCS budget: {soft_budget:,} MB (max, adaptive per-request)  |  Total: {hard_budget + soft_budget:,} MB")
-    logger.info("VRAM budget (4-point): hard=%d MB, soft=%d MB, actual_free=%d MB, prefill_transient=%d MB, decode_transient=%d MB, prefill=%.1f KB/tok, decode=%.1f KB/tok",
-                hard_budget, soft_budget, _free_mb, prefill_transient, decode_transient, prefill_kb_per_tok, decode_kb_per_tok)
-
-    # Free PyTorch's cached CUDA blocks before HCS allocation.
-    # After calibration, PyTorch holds freed KV/expert blocks in its caching allocator.
-    # These are "allocated" from CUDA's perspective, reducing cudaMemGetInfo free.
-    # HCS uses cuMemAlloc (not PyTorch), so it needs CUDA-level free memory.
-    gc.collect()
-    torch.cuda.empty_cache()
+    _status("VRAM budget complete")
+    _detail(f"Hard HCS budget: {hard_budget:,} MB (free={_free_mb}, safety={SAFETY_MARGIN_MB})")
+    _detail(f"Soft HCS budget: {soft_budget:,} MB (no eviction needed)")
+    logger.info("VRAM budget: hard=%d MB, soft=%d MB, free=%d MB", hard_budget, soft_budget, _free_mb)
 
     # ── Pre-compute multi-GPU layer splits (before HCS, so we can filter rankings) ──
     # Splits are based on total HCS budget (hard+soft) on each GPU, so layers
@@ -1553,25 +1447,13 @@ def main():
             _dim(f"Loaded in {hcs_elapsed:.1f}s")
             logger.info("HCS pool: %s (%.1fs)", result, hcs_elapsed)
 
-    # ── Decode validation (after HCS) ──
-    # Must evict soft tier before prefill (same as runtime request flow).
-    # The Rust server does this at server.rs:590; here we mirror that for the
-    # Python-side warmup path. Without this, prefill OOMs when hard+soft fill
-    # VRAM to within the safety margin.
+    # ── Decode validation ──
+    # With Rust prefill, decode warmup happens on the first real request.
+    # The Rust server handles prefill + decode in a single codepath.
+    # No Python-side warmup needed.
     vram_monitor.report_event("validation_start")
     _status("Decode validation")
-    gpu_store = getattr(_model, '_gpu_decode_store', None)
-    if gpu_store is not None:
-        evicted, freed = gpu_store.py_hcs_evict_for_prefill(500)
-        if evicted > 0:
-            _dim(f"Evicted {evicted} soft experts for validation prefill ({freed:.0f} MB)")
-    _warmup_decode(_model, num_steps=2)
-    # Reload soft tier after validation
-    if gpu_store is not None:
-        reloaded, reloaded_mb = gpu_store.py_hcs_reload_after_prefill()
-        if reloaded > 0:
-            _dim(f"Reloaded {reloaded} soft experts after validation ({reloaded_mb:.0f} MB)")
-    _detail("Decode validation passed")
+    _detail("Skipped: Rust prefill engine handles warmup on first request")
     vram_monitor.report_event("validation_end")
 
     # ── Enable VRAM monitor runtime warnings ──
@@ -1951,6 +1833,7 @@ def main():
         all_aux_gpu_store_addrs,
         all_multi_gpu_split_layers,
         all_multi_gpu_gqa_offsets,
+        test_endpoints=getattr(args, 'test_endpoints', False),
     )
 
     def _handle_exit(sig, frame):

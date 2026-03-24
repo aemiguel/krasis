@@ -1050,6 +1050,8 @@ struct GpuDecodeGraph {
     group_size: usize,
     /// Expert quantization bits: 4 (INT4 Marlin) or 8 (INT8 Marlin).
     expert_bits: u8,
+    /// Shared expert quantization bits (may differ from expert_bits, e.g. INT8 shared with INT4 routed).
+    shared_expert_bits: u8,
 
     weights: Vec<GpuWeight>,
     layers: Vec<GpuDecodeLayer>,
@@ -1529,6 +1531,9 @@ pub struct GpuDecodeStore {
     debug_capture_layers: bool,
     #[cfg(feature = "gpu-debug")]
     debug_layer_captures: Vec<Vec<u16>>,
+    /// Pre-allocated Rust prefill engine.
+    /// Created early (before HCS) to claim scratch VRAM while it's still available.
+    prefill_engine_slot: Option<crate::gpu_prefill::PrefillEngine>,
 }
 
 #[pymethods]
@@ -1774,7 +1779,26 @@ impl GpuDecodeStore {
             debug_capture_layers: false,
             #[cfg(feature = "gpu-debug")]
             debug_layer_captures: Vec::new(),
+            prefill_engine_slot: None,
         })
+    }
+
+    /// Pre-allocate the Rust prefill engine.
+    /// Must be called BEFORE HCS pool loading so scratch buffers claim VRAM
+    /// while it's still available. The engine is stored internally and
+    /// taken by the Rust server via take_prefill_engine().
+    #[pyo3(signature = (max_context_tokens))]
+    fn allocate_prefill_engine(&mut self, max_context_tokens: usize) -> PyResult<()> {
+        match self.create_prefill_engine(max_context_tokens) {
+            Ok(engine) => {
+                log::info!("Prefill engine pre-allocated (max_tokens={})", max_context_tokens);
+                self.prefill_engine_slot = Some(engine);
+                Ok(())
+            }
+            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to allocate prefill engine: {}", e)
+            ))
+        }
     }
 
     /// Initialize the decode graph with model dimensions.
@@ -1938,6 +1962,7 @@ impl GpuDecodeStore {
             moe_intermediate_size: moe_inter,
             group_size,
             expert_bits,
+            shared_expert_bits: expert_bits, // default: same as routed; overridden when shared expert is registered
             weights: Vec::with_capacity(num_layers * 8),
             layers: Vec::with_capacity(num_layers),
             embedding_ptr: 0,
@@ -5200,6 +5225,12 @@ impl GpuDecodeStore {
         }
     }
 
+    /// Take the pre-allocated prefill engine from the slot.
+    /// Called by the Rust server during startup. Returns None if not pre-allocated.
+    pub fn take_prefill_engine(&mut self) -> Option<crate::gpu_prefill::PrefillEngine> {
+        self.prefill_engine_slot.take()
+    }
+
     /// Export HCS cache_fast snapshot for the Rust prefill engine.
     /// Returns (cache_fast_slice, num_experts_per_layer). Empty if no HCS.
     pub fn export_hcs_snapshot(&self) -> (&[[u64; 4]], usize) {
@@ -5412,6 +5443,7 @@ impl GpuDecodeStore {
         let config = PrefillModelConfig {
             hidden_size: graph.hidden_size,
             intermediate_size: graph.moe_intermediate_size.max(graph.intermediate_size),
+            moe_intermediate_size: graph.moe_intermediate_size,
             num_hidden_layers: num_layers,
             num_q_heads,
             num_kv_heads,
@@ -5422,6 +5454,7 @@ impl GpuDecodeStore {
             n_routed_experts: n_routed,
             num_experts_per_tok: n_topk,
             expert_bits: graph.expert_bits,
+            shared_expert_bits: graph.shared_expert_bits,
             group_size: graph.group_size,
             sms: graph.num_sms,
             device_ordinal: 0, // TODO: get from device
@@ -5472,12 +5505,22 @@ impl GpuDecodeStore {
                 None
             }
         };
+        let extract_bf16 = |wid: usize| -> Option<Bf16Weight> {
+            let w = &graph.weights[wid];
+            if w.dtype == 0 {  // BF16
+                Some(Bf16Weight { ptr: w.ptr, n: w.rows, k: w.cols })
+            } else {
+                None
+            }
+        };
 
         for (i, l) in graph.layers.iter().enumerate() {
             let mut lw = PrefillLayerWeights {
                 input_norm: l.input_norm_ptr,
                 post_attn_norm: l.post_attn_norm_ptr,
-                q_proj: None, k_proj: None, v_proj: None, o_proj: None, gqa_gated: false,
+                q_proj: None, k_proj: None, v_proj: None, o_proj: None,
+                q_proj_bf16: None, k_proj_bf16: None, v_proj_bf16: None, o_proj_bf16: None,
+                gqa_gated: false,
                 mamba2_in_proj: None, mamba2_out_proj: None,
                 mamba2_conv_weight: 0, mamba2_conv_bias: 0,
                 mamba2_A: 0, mamba2_D: 0, mamba2_dt_bias: 0, mamba2_norm: 0,
@@ -5488,9 +5531,11 @@ impl GpuDecodeStore {
                 moe_routed_scaling_factor: 1.0,
                 moe_gated: true, moe_activation: 0,
                 shared_w1: None, shared_w2: None,
+                shared_gate_ptr: 0, shared_gate_rows: 0, shared_gate_cols: 0,
                 layer_type: config.layer_types[i],
                 moe_layer_idx: None,
                 la_in_proj_qkvz: None, la_in_proj_ba: None, la_out_proj: None,
+                la_in_proj_qkvz_bf16: None, la_in_proj_ba_bf16: None, la_out_proj_bf16: None,
                 la_conv_weight_ptr: 0, la_a_log_ptr: 0, la_dt_bias_ptr: 0,
                 la_norm_weight_ptr: 0, la_conv_state_ptr: 0, la_recur_state_ptr: 0,
             };
@@ -5501,6 +5546,11 @@ impl GpuDecodeStore {
                     lw.k_proj = extract_marlin(*k_proj);
                     lw.v_proj = extract_marlin(*v_proj);
                     lw.o_proj = extract_marlin(*o_proj);
+                    // BF16 fallback for attention_quant="bf16"
+                    if lw.q_proj.is_none() { lw.q_proj_bf16 = extract_bf16(*q_proj); }
+                    if lw.k_proj.is_none() { lw.k_proj_bf16 = extract_bf16(*k_proj); }
+                    if lw.v_proj.is_none() { lw.v_proj_bf16 = extract_bf16(*v_proj); }
+                    if lw.o_proj.is_none() { lw.o_proj_bf16 = extract_bf16(*o_proj); }
                     lw.gqa_gated = *gated;
                 }
                 GpuAttnConfig::Mamba2 { in_proj, out_proj,
@@ -5521,6 +5571,16 @@ impl GpuDecodeStore {
                     lw.la_in_proj_qkvz = extract_marlin(*in_proj_qkvz);
                     lw.la_in_proj_ba = extract_marlin(*in_proj_ba);
                     lw.la_out_proj = extract_marlin(*out_proj);
+                    // BF16 fallback for attention_quant="bf16"
+                    if lw.la_in_proj_qkvz.is_none() {
+                        lw.la_in_proj_qkvz_bf16 = extract_bf16(*in_proj_qkvz);
+                    }
+                    if lw.la_in_proj_ba.is_none() {
+                        lw.la_in_proj_ba_bf16 = extract_bf16(*in_proj_ba);
+                    }
+                    if lw.la_out_proj.is_none() {
+                        lw.la_out_proj_bf16 = extract_bf16(*out_proj);
+                    }
                     lw.la_conv_weight_ptr = *conv_weight_ptr;
                     lw.la_a_log_ptr = *a_log_ptr;
                     lw.la_dt_bias_ptr = *dt_bias_ptr;
@@ -5532,6 +5592,12 @@ impl GpuDecodeStore {
             }
 
             // MoE config
+            if i < 3 {
+                eprintln!("[PREFILL-INIT] layer {} mlp={}, moe_layers.len()={}, moe_layers[{}]={:?}",
+                    i, match &l.mlp { GpuMlpConfig::MoE{..} => "MoE", GpuMlpConfig::Dense{..} => "Dense", GpuMlpConfig::None => "None" },
+                    graph.moe_layers.len(), i,
+                    graph.moe_layers.get(i).map(|x| x.is_some()));
+            }
             match &l.mlp {
                 GpuMlpConfig::MoE { gate_weight, gate_bias_ptr, e_score_corr_ptr,
                     num_experts, topk, scoring_func: sf, norm_topk_prob: ntp,
@@ -5564,9 +5630,61 @@ impl GpuDecodeStore {
                     lw.shared_w1 = extract_marlin(*gate_proj);
                     lw.shared_w2 = extract_marlin(*down_proj);
                 }
-                GpuMlpConfig::None => {}
+                GpuMlpConfig::None => {
+                    // MoE layers use GpuMlpConfig::None as placeholder — actual MoE data
+                    // is in graph.moe_layers[i]. Bridge the gap here.
+                    if let Some(Some(moe_data)) = graph.moe_layers.get(i) {
+                        let gw = &graph.weights[moe_data.gate_wid];
+                        lw.moe_gate_ptr = gw.ptr;
+                        lw.moe_gate_rows = gw.rows;
+                        lw.moe_gate_cols = gw.cols;
+                        lw.moe_gate_bias_ptr = moe_data.gate_bias_ptr;
+                        lw.moe_e_score_corr_ptr = moe_data.e_score_corr_ptr;
+                        lw.moe_num_experts = moe_data.num_experts;
+                        lw.moe_topk = moe_data.topk;
+                        lw.moe_scoring_func = moe_data.scoring_func;
+                        lw.moe_norm_topk_prob = moe_data.norm_topk_prob;
+                        lw.moe_routed_scaling_factor = moe_data.routed_scaling_factor;
+                        lw.moe_gated = moe_data.gated_experts;
+                        lw.moe_activation = moe_data.activation_type;
+                        lw.moe_layer_idx = Some(i);
+                        // Shared expert gate weight (sigmoid gating of shared expert output)
+                        if let Some(sg_wid) = moe_data.shared_gate_wid {
+                            let sg_w = &graph.weights[sg_wid];
+                            lw.shared_gate_ptr = sg_w.ptr;
+                            lw.shared_gate_rows = sg_w.rows;
+                            lw.shared_gate_cols = sg_w.cols;
+                        }
+                        // Shared expert weights: look for pinned VRAM copies first
+                        if let Some(Some(se_vram)) = graph.shared_expert_vram.get(i) {
+                            let bits = graph.shared_expert_bits;
+                            lw.shared_w1 = Some(MarlinWeight {
+                                packed: se_vram.w13_packed_ptr(),
+                                scales: se_vram.w13_scales_ptr(),
+                                n: graph.moe_intermediate_size * 2,
+                                k: graph.hidden_size,
+                                num_groups: graph.hidden_size / graph.group_size.max(1),
+                                group_size: graph.group_size,
+                                num_bits: bits,
+                            });
+                            lw.shared_w2 = Some(MarlinWeight {
+                                packed: se_vram.w2_packed_ptr(),
+                                scales: se_vram.w2_scales_ptr(),
+                                n: graph.hidden_size,
+                                k: graph.moe_intermediate_size,
+                                num_groups: graph.moe_intermediate_size / graph.group_size.max(1),
+                                group_size: graph.group_size,
+                                num_bits: bits,
+                            });
+                        }
+                    }
+                }
             }
 
+            if i < 3 {
+                eprintln!("[PREFILL-INIT] layer {} -> moe_gate_ptr={:#x}, shared_w1={}, shared_w2={}, moe_layer_idx={:?}",
+                    i, lw.moe_gate_ptr, lw.shared_w1.is_some(), lw.shared_w2.is_some(), lw.moe_layer_idx);
+            }
             layer_weights.push(lw);
         }
 
@@ -5602,8 +5720,18 @@ impl GpuDecodeStore {
             }));
         }
 
-        // Allocate scratch
-        let scratch = allocate_scratch(&self.device, &config, max_tokens)?;
+        // Allocate scratch -- sized to prefill_chunk_size, not max_tokens.
+        // run_prefill() chunks prompts into prefill_chunk_size pieces, so scratch
+        // only needs to hold one chunk at a time. This avoids allocating tens of GB
+        // for large context windows (e.g. 131072 tokens).
+        let scratch_tokens = if config.prefill_chunk_size > 0 {
+            std::cmp::min(max_tokens, config.prefill_chunk_size)
+        } else {
+            max_tokens
+        };
+        log::info!("Prefill scratch: {} tokens (chunk_size={}, max_context={})",
+            scratch_tokens, config.prefill_chunk_size, max_tokens);
+        let scratch = allocate_scratch(&self.device, &config, scratch_tokens)?;
 
         // Create CUDA events for double-buffer synchronization
         let dma_event = unsafe {
@@ -5660,43 +5788,81 @@ impl GpuDecodeStore {
             event
         };
 
-        // Shared expert needs its own Marlin workspace to avoid conflicts
+        // Shared expert needs its own Marlin workspace to avoid conflicts.
+        // Uses moe_intermediate_size (shared expert has the same intermediate as routed experts)
+        // and scratch_tokens (only processes one chunk at a time).
         let d_shared_fp32_scratch = self.device.alloc_zeros::<f32>(
-            max_tokens * std::cmp::max(graph.hidden_size, config.intermediate_size)
+            scratch_tokens * std::cmp::max(graph.hidden_size, config.moe_intermediate_size)
         ).map_err(|e| format!("alloc shared_fp32_scratch: {e}"))?;
         let d_shared_workspace = self.device.alloc_zeros::<i32>(
             graph.num_sms * 4
         ).map_err(|e| format!("alloc shared_workspace: {e}"))?;
 
         // Compute per-expert byte sizes for fused MoE
-        let inter = config.intermediate_size;
+        // Uses moe_intermediate_size (per-expert), not intermediate_size (dense MLP max)
+        let moe_inter = config.moe_intermediate_size;
         let h = graph.hidden_size;
         let gs = config.group_size;
         let bits = config.expert_bits as usize;
 
-        let w1_n = if config.moe_gated { 2 * inter } else { inter };
-        let w1_packed_per_expert = (h / 16) * w1_n * (bits / 2);
+        let w1_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
+        // Marlin packed layout: [K/16, N, 16*bits/8] bytes per expert
+        // Total = K * N * bits / 8 bytes
+        let w1_packed_per_expert = h * w1_n * bits / 8;
         let w1_scales_per_expert = (h / gs) * w1_n * 2;
-        let w2_packed_per_expert = (inter / 16) * h * (bits / 2);
-        let w2_scales_per_expert = (inter / gs) * h * 2;
+        let w2_packed_per_expert = moe_inter * h * bits / 8;
+        let w2_scales_per_expert = (moe_inter / gs) * h * 2;
 
         // Fused MoE contiguous buffers: [E, per_expert_bytes] for all experts
         // Only allocate if we have MoE layers and the fused kernel is available
+        // AND there is enough free VRAM. Otherwise fall back to per-expert sequential dispatch.
         let has_moe = n_routed > 0;
-        let has_fused = kernels.fused_moe_fn.is_some();
+        let has_fused_kernel = kernels.fused_moe_fn.is_some();
+
+        // Estimate total VRAM needed for fused MoE buffers before allocating
+        let block_size = 128usize; // MarlinDefault block_size_m
+        let total_w1_packed = n_routed * w1_packed_per_expert;
+        let total_w1_scales = n_routed * w1_scales_per_expert;
+        let total_w2_packed = n_routed * w2_packed_per_expert;
+        let total_w2_scales = n_routed * w2_scales_per_expert;
+        let fused_sorted_count = scratch_tokens * n_topk + n_routed * block_size;
+        let fused_blocks = fused_sorted_count / block_size + n_routed;
+
+        let fused_expert_bytes = 2 * (total_w1_packed + total_w1_scales + total_w2_packed + total_w2_scales); // 2 sets (A/B)
+        let fused_sorted_bytes = fused_sorted_count * 4 // sorted_token_ids (i32)
+            + fused_blocks * 4 // expert_ids (i32)
+            + 4 // num_tokens_post (i32)
+            + fused_sorted_count * h * 2 // fused_input (u16)
+            + fused_sorted_count * w1_n * 2 // fused_inter_cache (u16)
+            + fused_sorted_count * moe_inter * 2 // fused_inter2 (u16)
+            + fused_sorted_count * h * 2 // fused_output (u16)
+            + fused_sorted_count * h * 4; // fused_c_tmp (f32)
+        let fused_total_mb = (fused_expert_bytes + fused_sorted_bytes) / (1024 * 1024);
+
+        // Check free VRAM (leave 100 MB headroom for kernel intermediates)
+        let fused_vram_ok = if has_moe && has_fused_kernel {
+            let (free, _total) = cudarc::driver::result::mem_get_info()
+                .map_err(|e| format!("mem_get_info: {e}"))?;
+            let free_mb = free / (1024 * 1024);
+            let ok = free_mb > fused_total_mb + 100;
+            if ok {
+                log::info!("Fused MoE: allocating {} MB ({} MB free)", fused_total_mb, free_mb);
+            } else {
+                log::info!("Fused MoE: skipping (needs {} MB, only {} MB free) — using per-expert dispatch",
+                    fused_total_mb, free_mb);
+            }
+            ok
+        } else { false };
+
+        let has_fused = has_fused_kernel && fused_vram_ok;
+
         let alloc_fused_buf = |size: usize, name: &str| -> Result<Option<CudaSlice<u8>>, String> {
-            if has_moe && has_fused {
+            if has_fused {
                 Ok(Some(self.device.alloc_zeros::<u8>(size).map_err(|e| format!("alloc {name}: {e}"))?))
             } else {
                 Ok(None)
             }
         };
-
-        // Two sets (A/B) for double-buffered layer-group preloading
-        let total_w1_packed = n_routed * w1_packed_per_expert;
-        let total_w1_scales = n_routed * w1_scales_per_expert;
-        let total_w2_packed = n_routed * w2_packed_per_expert;
-        let total_w2_scales = n_routed * w2_scales_per_expert;
 
         let d_fused_expert_w1_a = alloc_fused_buf(total_w1_packed.max(1), "fused_w1_a")?;
         let d_fused_expert_w1s_a = alloc_fused_buf(total_w1_scales.max(1), "fused_w1s_a")?;
@@ -5708,38 +5874,32 @@ impl GpuDecodeStore {
         let d_fused_expert_w2s_b = alloc_fused_buf(total_w2_scales.max(1), "fused_w2s_b")?;
 
         // Sorted MoE buffers for fused kernel dispatch
-        let block_size = 128; // MarlinDefault block_size_m
-        let max_sorted = if has_moe && has_fused {
-            // max: each of M*topk tokens padded up to block_size per expert
-            // Worst case: every expert gets ceil(M*topk/E, block_size) * block_size
-            // Simpler bound: M * topk + n_routed * block_size
-            max_tokens * n_topk + n_routed * block_size
-        } else { 1 };
+        let max_sorted = if has_fused { fused_sorted_count } else { 1 };
 
         let alloc_fused_i32 = |n: usize, name: &str| -> Result<Option<CudaSlice<i32>>, String> {
-            if has_moe && has_fused {
+            if has_fused {
                 Ok(Some(self.device.alloc_zeros::<i32>(n).map_err(|e| format!("alloc {name}: {e}"))?))
             } else { Ok(None) }
         };
         let alloc_fused_u16 = |n: usize, name: &str| -> Result<Option<CudaSlice<u16>>, String> {
-            if has_moe && has_fused {
+            if has_fused {
                 Ok(Some(self.device.alloc_zeros::<u16>(n).map_err(|e| format!("alloc {name}: {e}"))?))
             } else { Ok(None) }
         };
         let alloc_fused_f32 = |n: usize, name: &str| -> Result<Option<CudaSlice<f32>>, String> {
-            if has_moe && has_fused {
+            if has_fused {
                 Ok(Some(self.device.alloc_zeros::<f32>(n).map_err(|e| format!("alloc {name}: {e}"))?))
             } else { Ok(None) }
         };
 
-        let max_blocks = if has_moe && has_fused { max_sorted / block_size + n_routed } else { 1 };
+        let max_blocks = if has_fused { fused_blocks } else { 1 };
 
         let d_sorted_token_ids = alloc_fused_i32(max_sorted, "sorted_token_ids")?;
         let d_fused_expert_ids = alloc_fused_i32(max_blocks, "fused_expert_ids")?;
         let d_num_tokens_post = alloc_fused_i32(1, "num_tokens_post")?;
         let d_fused_input = alloc_fused_u16(max_sorted * h, "fused_input")?;
         let d_fused_inter_cache = alloc_fused_u16(max_sorted * w1_n, "fused_inter_cache")?;
-        let d_fused_inter2 = alloc_fused_u16(max_sorted * inter, "fused_inter2")?;
+        let d_fused_inter2 = alloc_fused_u16(max_sorted * moe_inter, "fused_inter2")?;
         let d_fused_output = alloc_fused_u16(max_sorted * h, "fused_output")?;
         let d_fused_c_tmp = alloc_fused_f32(max_sorted * h, "fused_c_tmp")?;
 
@@ -5759,6 +5919,18 @@ impl GpuDecodeStore {
             embedding_ptr: graph.embedding_ptr,
             final_norm_ptr: graph.final_norm_ptr,
             lm_head: extract_marlin(graph.lm_head_wid),
+            lm_head_bf16_ptr: {
+                let w = &graph.weights[graph.lm_head_wid];
+                if w.dtype == 0 { w.ptr } else { 0 }
+            },
+            lm_head_bf16_rows: {
+                let w = &graph.weights[graph.lm_head_wid];
+                if w.dtype == 0 { w.rows } else { 0 }
+            },
+            lm_head_bf16_cols: {
+                let w = &graph.weights[graph.lm_head_wid];
+                if w.dtype == 0 { w.cols } else { 0 }
+            },
             rope_cos_ptr: graph.d_rope_cos.as_ref().map_or(0, |c| *c.device_ptr()),
             rope_sin_ptr: graph.d_rope_sin.as_ref().map_or(0, |c| *c.device_ptr()),
             kv_k_ptrs: graph.kv_k_ptrs.clone(),
@@ -5768,8 +5940,8 @@ impl GpuDecodeStore {
             copy_stream,
             cublas_handle,
             h_logits: Vec::new(),
-            h_topk_ids: vec![0i32; max_tokens * topk],
-            h_topk_weights: vec![0.0f32; max_tokens * topk],
+            h_topk_ids: vec![0i32; scratch_tokens * topk],
+            h_topk_weights: vec![0.0f32; scratch_tokens * topk],
             h_gather_src_map: Vec::new(),
             h_gather_weight_map: Vec::new(),
             hcs_cache_fast,
@@ -10039,10 +10211,11 @@ impl GpuDecodeStore {
         stop_ids: &[usize],
         tokenizer: &tokenizers::Tokenizer,
         presence_penalty: f32,
+        logprobs_top_n: usize,
         mut on_token: F,
     ) -> usize
     where
-        F: FnMut(usize, &str, Option<&str>) -> bool,
+        F: FnMut(usize, &str, Option<&str>, Option<&[(u32, f32)]>) -> bool,
     {
         use std::time::Instant;
 
@@ -10417,7 +10590,12 @@ impl GpuDecodeStore {
             t_sample_total += Instant::now().duration_since(t_sample_start).as_secs_f64();
 
             let finished = finish_reason.is_some();
-            let cont = on_token(target_pred, &text, finish_reason);
+            let token_lp = if logprobs_top_n > 0 {
+                let last_aux = unsafe { &*(aux_store_addrs[num_aux - 1] as *const GpuDecodeStore) };
+                let logits_ref = &last_aux.graph.as_ref().unwrap().h_logits;
+                Some(crate::decode::extract_top_logprobs(logits_ref, vocab_size, logprobs_top_n))
+            } else { None };
+            let cont = on_token(target_pred, &text, finish_reason, token_lp.as_deref());
             if finished || !cont { break; }
         }
 
@@ -12490,10 +12668,11 @@ impl GpuDecodeStore {
         stop_ids: &[usize],
         tokenizer: &tokenizers::Tokenizer,
         presence_penalty: f32,
+        logprobs_top_n: usize,
         mut on_token: F,
     ) -> usize
     where
-        F: FnMut(usize, &str, Option<&str>) -> bool,
+        F: FnMut(usize, &str, Option<&str>, Option<&[(u32, f32)]>) -> bool,
     {
         use std::time::Instant;
 
@@ -12694,36 +12873,42 @@ impl GpuDecodeStore {
                         log::error!("gpu_generate_stream: decode_step error: {}", e);
                         break;
                     }
-                    let logits = &mut self.graph.as_mut().unwrap().h_logits;
-                    if presence_penalty != 0.0 {
-                        for &tok in &seen_tokens {
-                            if tok < vocab_size { logits[tok] -= presence_penalty; }
+                    let (target_pred, token_logprobs) = {
+                        let logits = &mut self.graph.as_mut().unwrap().h_logits;
+                        if presence_penalty != 0.0 {
+                            for &tok in &seen_tokens {
+                                if tok < vocab_size { logits[tok] -= presence_penalty; }
+                            }
                         }
-                    }
-                    for &tok in &self.suppress_tokens {
-                        if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
-                    }
-                    let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
-                    let think_within_budget = self.think_suppress_budget == 0
-                        || self.think_suppress_count < self.think_suppress_budget;
-                    if generated < self.min_new_tokens || (think_end_active && think_within_budget) {
-                        for &tok in &self.stop_token_ids_for_suppress {
+                        for &tok in &self.suppress_tokens {
                             if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                         }
-                    }
-                    // Force-inject </think> when thinking budget is exhausted
-                    let target_pred = if think_end_active && !think_within_budget {
-                        if let Some(te) = self.think_end_token_for_suppress {
-                            eprintln!("[krasis] Thinking budget exhausted ({} tokens) — force-injecting </think>",
-                                self.think_suppress_count);
-                            te
+                        let think_end_active = self.think_end_token_for_suppress.is_some() && !self.think_end_seen;
+                        let think_within_budget = self.think_suppress_budget == 0
+                            || self.think_suppress_count < self.think_suppress_budget;
+                        if generated < self.min_new_tokens || (think_end_active && think_within_budget) {
+                            for &tok in &self.stop_token_ids_for_suppress {
+                                if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
+                            }
+                        }
+                        // Force-inject </think> when thinking budget is exhausted
+                        let target_pred = if think_end_active && !think_within_budget {
+                            if let Some(te) = self.think_end_token_for_suppress {
+                                eprintln!("[krasis] Thinking budget exhausted ({} tokens) — force-injecting </think>",
+                                    self.think_suppress_count);
+                                te
+                            } else {
+                                crate::decode::sample_from_logits_pub(
+                                    logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
+                            }
                         } else {
                             crate::decode::sample_from_logits_pub(
                                 logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
-                        }
-                    } else {
-                        crate::decode::sample_from_logits_pub(
-                            logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
+                        };
+                        let token_logprobs = if logprobs_top_n > 0 {
+                            Some(crate::decode::extract_top_logprobs(logits, vocab_size, logprobs_top_n))
+                        } else { None };
+                        (target_pred, token_logprobs)
                     };
                     self.notify_token_generated(target_pred);
                     seen_tokens.insert(target_pred);
@@ -12736,7 +12921,7 @@ impl GpuDecodeStore {
                         else { None };
                     if finish_reason.is_some() { text.push_str(&detok.flush()); }
                     let finished = finish_reason.is_some();
-                    let cont = on_token(target_pred, &text, finish_reason);
+                    let cont = on_token(target_pred, &text, finish_reason, token_logprobs.as_deref());
                     if finished || !cont { break; }
                     continue;
                 }
@@ -12814,7 +12999,11 @@ impl GpuDecodeStore {
                         else { None };
                     if finish_reason.is_some() { text.push_str(&detok.flush()); }
                     let finished = finish_reason.is_some();
-                    let cont = on_token(target_pred, &text, finish_reason);
+                    let spec_logprobs = if logprobs_top_n > 0 {
+                        let bl = &self.graph.as_ref().unwrap().h_batch_logits;
+                        Some(crate::decode::extract_top_logprobs(&bl[..vocab_size], vocab_size, logprobs_top_n))
+                    } else { None };
+                    let cont = on_token(target_pred, &text, finish_reason, spec_logprobs.as_deref());
                     if finished || !cont {
                         let _ = self.restore_la_states();
                         if let Some(ref mut draft) = self.draft {
@@ -12861,7 +13050,12 @@ impl GpuDecodeStore {
                                 else { None };
                             if finish_reason.is_some() { text.push_str(&detok.flush()); }
                             let finished = finish_reason.is_some();
-                            let cont = on_token(draft_tokens[i], &text, finish_reason);
+                            let draft_logprobs = if logprobs_top_n > 0 {
+                                let bl = &self.graph.as_ref().unwrap().h_batch_logits;
+                                let offset = i * vocab_size;
+                                Some(crate::decode::extract_top_logprobs(&bl[offset..offset + vocab_size], vocab_size, logprobs_top_n))
+                            } else { None };
+                            let cont = on_token(draft_tokens[i], &text, finish_reason, draft_logprobs.as_deref());
                             if finished || !cont { stopped = true; break; }
                         } else {
                             // Reject: use target's prediction at this position
@@ -12876,7 +13070,12 @@ impl GpuDecodeStore {
                                 else { None };
                             if finish_reason.is_some() { text.push_str(&detok.flush()); }
                             let finished = finish_reason.is_some();
-                            let cont = on_token(next_token, &text, finish_reason);
+                            let reject_logprobs = if logprobs_top_n > 0 {
+                                let bl = &self.graph.as_ref().unwrap().h_batch_logits;
+                                let offset = i * vocab_size;
+                                Some(crate::decode::extract_top_logprobs(&bl[offset..offset + vocab_size], vocab_size, logprobs_top_n))
+                            } else { None };
+                            let cont = on_token(next_token, &text, finish_reason, reject_logprobs.as_deref());
                             if finished || !cont { stopped = true; }
                             break;
                         }
@@ -12910,7 +13109,12 @@ impl GpuDecodeStore {
                             else { None };
                         if finish_reason.is_some() { text.push_str(&detok.flush()); }
                         let finished = finish_reason.is_some();
-                        let cont = on_token(next_token, &text, finish_reason);
+                        let bonus_logprobs = if logprobs_top_n > 0 {
+                            let bl = &self.graph.as_ref().unwrap().h_batch_logits;
+                            let offset = draft_tokens.len() * vocab_size;
+                            Some(crate::decode::extract_top_logprobs(&bl[offset..offset + vocab_size], vocab_size, logprobs_top_n))
+                        } else { None };
+                        let cont = on_token(next_token, &text, finish_reason, bonus_logprobs.as_deref());
                         if finished || !cont { stopped = true; }
                     }
                 }
@@ -13092,7 +13296,11 @@ impl GpuDecodeStore {
                     text.push_str(&detok.flush());
                 }
                 let finished = finish_reason.is_some();
-                let cont = on_token(target_pred, &text, finish_reason);
+                let top_logprobs = if logprobs_top_n > 0 {
+                    let logits = &self.graph.as_ref().unwrap().h_logits;
+                    Some(crate::decode::extract_top_logprobs(logits, vocab_size, logprobs_top_n))
+                } else { None };
+                let cont = on_token(target_pred, &text, finish_reason, top_logprobs.as_deref());
                 if finished || !cont { break; }
             }
         }
@@ -13436,6 +13644,21 @@ impl GpuDecodeStore {
             graph.shared_expert_vram.push(None);
         }
         if let Some(ref se) = graph.moe_layers[layer_idx].as_ref().unwrap().shared {
+            // Infer shared expert quantization bits from packed weight size.
+            // INT4: packed_bytes = k * n / 2, INT8: packed_bytes = k * n
+            let se_n_w13 = graph.moe_intermediate_size * 2; // gated: gate+up
+            let se_k_w13 = graph.hidden_size;
+            let expected_int8 = se_k_w13 * se_n_w13;
+            eprintln!("[SHARED_EXPERT_BITS] layer={} packed={} expected_int8={} moe_inter={} hidden={}",
+                layer_idx, se.w13_packed_bytes, expected_int8, graph.moe_intermediate_size, graph.hidden_size);
+            if se.w13_packed_bytes >= expected_int8 {
+                graph.shared_expert_bits = 8;
+                eprintln!("[SHARED_EXPERT_BITS] => INT8 (bits=8)");
+            } else {
+                graph.shared_expert_bits = 4;
+                eprintln!("[SHARED_EXPERT_BITS] => INT4 (bits=4)");
+            }
+
             let total_bytes_se = se.w13_packed_bytes + se.w13_scales_bytes
                 + se.w2_packed_bytes + se.w2_scales_bytes;
             let align = 512usize;
