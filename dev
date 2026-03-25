@@ -19,6 +19,7 @@
 #                                     from the first non-passed model. Without a target, runs
 #                                     all models with no resume capability.
 #   ./dev reference-test <config>   Compare engine output against BF16 reference data
+#   ./dev reference-test --compare <model>  Run 4 quant configs, produce comparative report
 #   ./dev awq-calibrate <config>    Run AWQ calibration, produce attention template
 #   ./dev test-kernels [name]       Run CUDA kernel unit tests (or filter by name)
 #   ./dev chat [args]               Run krasis chat from source
@@ -698,16 +699,31 @@ do_validate() {
 
 do_reference_test() {
     [[ $# -lt 1 ]] && err "Usage: ./dev reference-test <config> [--verbose] [--no-server] [--port PORT]
+       ./dev reference-test --compare <model> [--verbose]
   Runs reference test comparing engine output against BF16 reference data.
   Produces an HTML report in logs/reference-tests/.
-  Example: ./dev reference-test qwen35-a4"
-    local conf
-    conf=$(resolve_config "$1")
-    shift
-    cleanup_gpu "$conf"
-    auto_rebuild
-    info "Running reference test: $conf"
-    KRASIS_DEV_SCRIPT=1 "$PYTHON" "$SCRIPT_DIR/tests/reference_test.py" "$conf" "$@"
+  Single config:  ./dev reference-test qwen35-a4
+  Comparison:     ./dev reference-test --compare qcn"
+
+    if [[ "$1" == "--compare" ]]; then
+        shift
+        [[ $# -lt 1 ]] && err "Usage: ./dev reference-test --compare <model>
+  Available models: qcn, q35b, q122b"
+        local model="$1"
+        shift
+        cleanup_gpu
+        auto_rebuild
+        info "Running comparative reference test: $model"
+        KRASIS_DEV_SCRIPT=1 "$PYTHON" "$SCRIPT_DIR/tests/reference_test.py" --compare "$model" "$@"
+    else
+        local conf
+        conf=$(resolve_config "$1")
+        shift
+        cleanup_gpu "$conf"
+        auto_rebuild
+        info "Running reference test: $conf"
+        KRASIS_DEV_SCRIPT=1 "$PYTHON" "$SCRIPT_DIR/tests/reference_test.py" "$conf" "$@"
+    fi
 }
 
 do_kill() {
@@ -832,6 +848,7 @@ case "$cmd" in
         echo "  benchmark <config>        Run standard benchmark and exit"
         echo "  release-test <model>      Run full release test (5 configs, report)"
         echo "  reference-test <config>   Compare engine output against BF16 reference data"
+        echo "  reference-test --compare <model>  Run 4 quant configs, comparative report"
         echo "  release-test-all [target] Run release test on all supported models sequentially"
         echo "                            Without a target: runs all, no state saved."
         echo "                            With a target (e.g. 'rc8'): saves progress to state file."
