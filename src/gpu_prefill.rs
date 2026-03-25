@@ -500,9 +500,6 @@ pub struct PrefillEngine {
     // These are only used when attention weights are BF16 (not AWQ/INT4).
     // For AWQ attention, weights are small and permanently GPU-resident.
     pub attn_weight_bufs: Option<AttnWeightStreamBufs>,
-    // FlashAttention library function pointer (dlopen'd from flash_attn .so)
-    // When available, replaces the tiled attention kernel for better performance.
-    pub flash_attn_fn: Option<FlashAttnFn>,
     // Dedicated stream for shared expert (gap 4: always async regardless of cold DMA)
     pub shared_stream: cuda_sys::CUstream,
     pub shared_event: cuda_sys::CUevent,
@@ -552,25 +549,6 @@ pub struct AttnWeightStreamBufs {
     pub buf_size: usize,        // Size of each buffer in bytes
 }
 
-/// FlashAttention varlen forward function signature.
-/// Matches flash_attn_varlen_func from the FlashAttention C API.
-type FlashAttnFn = unsafe extern "C" fn(
-    /*q*/ *const std::ffi::c_void,
-    /*k*/ *const std::ffi::c_void,
-    /*v*/ *const std::ffi::c_void,
-    /*out*/ *mut std::ffi::c_void,
-    /*cu_seqlens_q*/ *const i32,
-    /*cu_seqlens_k*/ *const i32,
-    /*max_seqlen_q*/ i32,
-    /*max_seqlen_k*/ i32,
-    /*softmax_scale*/ f32,
-    /*is_causal*/ bool,
-    /*num_heads*/ i32,
-    /*num_heads_k*/ i32,
-    /*head_dim*/ i32,
-    /*batch_size*/ i32,
-    /*stream*/ u64,
-) -> i32;
 
 // Safety: PrefillEngine contains raw CUDA pointers (CUstream, CUevent, CUfunction, cuBLAS handle).
 // These are only accessed from the server's request handler which processes one request at a time
@@ -5519,62 +5497,6 @@ fn load_fused_moe() -> Option<FusedMoeFn> {
     None
 }
 
-/// Try to load FlashAttention C API via dlopen (public for use from gpu_decode.rs).
-pub fn load_flash_attn() -> Option<FlashAttnFn> {
-    let f = load_flash_attn_fn();
-    if f.is_some() {
-        log::info!("Prefill: FlashAttention C API loaded");
-    } else {
-        log::info!("Prefill: FlashAttention not found, using tiled kernel");
-    }
-    f
-}
-
-/// Try to load FlashAttention C API via dlopen.
-/// Looks for flash_attn_varlen_fwd in the flash_attn package's .so files.
-fn load_flash_attn_fn() -> Option<FlashAttnFn> {
-    let home = std::env::var("HOME").ok()?;
-
-    // Look for flash_attn C++ .so in conda envs
-    for env in &["krasis", "ktransformers"] {
-        for pv in &["3.11", "3.12", "3.10", "3.13"] {
-            let base = format!(
-                "{}/miniconda3/envs/{}/lib/python{}/site-packages/flash_attn",
-                home, env, pv
-            );
-            if let Ok(entries) = std::fs::read_dir(&base) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                        if name.contains("flash_attn_2_cuda") && name.ends_with(".so") {
-                            unsafe {
-                                let lib = libc::dlopen(
-                                    std::ffi::CString::new(p.to_string_lossy().as_bytes()).ok()?.as_ptr(),
-                                    libc::RTLD_NOW | libc::RTLD_LOCAL,
-                                );
-                                if !lib.is_null() {
-                                    // Try common symbol names for the varlen forward function
-                                    for sym_name in &[
-                                        b"mha_varlen_fwd\0" as &[u8],
-                                        b"flash_attn_varlen_fwd\0" as &[u8],
-                                    ] {
-                                        let sym = libc::dlsym(lib, sym_name.as_ptr() as *const _);
-                                        if !sym.is_null() {
-                                            log::info!("Loaded FlashAttention from {:?}", p);
-                                            return Some(std::mem::transmute(sym));
-                                        }
-                                    }
-                                    libc::dlclose(lib);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
 
 // ════════════════════════════════════════════════════════════════════════
 //  Kernel Unit Tests

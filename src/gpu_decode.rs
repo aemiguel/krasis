@@ -6064,7 +6064,6 @@ impl GpuDecodeStore {
             dma_event,
             compute_event,
             attn_weight_bufs: None,
-            flash_attn_fn: crate::gpu_prefill::load_flash_attn(),
             shared_stream,
             shared_event,
             d_shared_fp32_scratch,
