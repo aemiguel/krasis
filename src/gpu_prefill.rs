@@ -358,6 +358,9 @@ pub struct PrefillLayerWeights {
     pub la_norm_weight_ptr: u64,     // [dv] BF16
     pub la_conv_state_ptr: u64,      // [conv_dim, kernel_dim] FP32 (decode state)
     pub la_recur_state_ptr: u64,     // [nv, dk, dv] FP32 (decode state)
+    // QK norm (Qwen3 models): per-head RMSNorm on Q and K after projection, before RoPE
+    pub q_norm_ptr: u64,             // BF16 [head_dim], 0 = no QK norm
+    pub k_norm_ptr: u64,             // BF16 [head_dim], 0 = no QK norm
 }
 
 /// Expert weight pointers for DMA to GPU (mirrors ExpertDataPtr).
@@ -536,6 +539,9 @@ pub struct PrefillEngine {
     pub preloaded_moe_layer: Option<usize>,
     // ScalarType for Marlin GEMM dispatch (matches weight quantization format)
     pub q_type: ScalarType,
+    // BF16 copies of QK norm weights (converted from FP32 at engine creation)
+    // Kept alive here so GPU memory isn't freed.
+    pub qk_norm_bf16_bufs: Vec<CudaSlice<u16>>,
 }
 
 /// Double-buffer BF16 attention weight streaming buffers.
@@ -1555,6 +1561,16 @@ impl PrefillEngine {
         }
         self.la_gemm(hidden, &lw.k_proj, &lw.k_proj_bf16, k, m)?;
         self.la_gemm(hidden, &lw.v_proj, &lw.v_proj_bf16, v, m)?;
+
+        // QK LayerNorm: per-head RMSNorm on Q and K after projection, before RoPE
+        // Q is [m, num_q_heads, head_dim], K is [m, num_kv_heads, head_dim]
+        // Treat as [m*num_heads, head_dim] rows — existing rmsnorm kernel handles this.
+        if lw.q_norm_ptr != 0 {
+            self.launch_rmsnorm(q, q, lw.q_norm_ptr, m * cfg.num_q_heads, cfg.head_dim)?;
+        }
+        if lw.k_norm_ptr != 0 {
+            self.launch_rmsnorm(k, k, lw.k_norm_ptr, m * cfg.num_kv_heads, cfg.head_dim)?;
+        }
 
         // Look up per-layer KV cache pointers (needed for both attention and cache append)
         let layer_k_ptr = if layer_idx < self.kv_k_ptrs.len() { self.kv_k_ptrs[layer_idx] } else { 0 };

@@ -5601,10 +5601,12 @@ impl GpuDecodeStore {
                 la_in_proj_qkvz_bf16: None, la_in_proj_ba_bf16: None, la_out_proj_bf16: None,
                 la_conv_weight_ptr: 0, la_a_log_ptr: 0, la_dt_bias_ptr: 0,
                 la_norm_weight_ptr: 0, la_conv_state_ptr: 0, la_recur_state_ptr: 0,
+                q_norm_ptr: 0, k_norm_ptr: 0,
             };
 
             match &l.attn {
-                GpuAttnConfig::GQA { q_proj, k_proj, v_proj, o_proj, gated, .. } => {
+                GpuAttnConfig::GQA { q_proj, k_proj, v_proj, o_proj, gated,
+                                     q_norm_ptr, k_norm_ptr, .. } => {
                     lw.q_proj = extract_marlin(*q_proj);
                     lw.k_proj = extract_marlin(*k_proj);
                     lw.v_proj = extract_marlin(*v_proj);
@@ -5615,6 +5617,8 @@ impl GpuDecodeStore {
                     if lw.v_proj.is_none() { lw.v_proj_bf16 = extract_bf16(*v_proj); }
                     if lw.o_proj.is_none() { lw.o_proj_bf16 = extract_bf16(*o_proj); }
                     lw.gqa_gated = *gated;
+                    lw.q_norm_ptr = *q_norm_ptr;
+                    lw.k_norm_ptr = *k_norm_ptr;
                 }
                 GpuAttnConfig::Mamba2 { in_proj, out_proj,
                     conv_weight_ptr, a_ptr, d_ptr, dt_bias_ptr, norm_weight_ptr, .. } =>
@@ -5768,6 +5772,35 @@ impl GpuDecodeStore {
                     i, lw.moe_gate_ptr, lw.shared_w1.is_some(), lw.shared_w2.is_some(), lw.moe_layer_idx);
             }
             layer_weights.push(lw);
+        }
+
+        // Convert QK norm weights from FP32 (decode format) to BF16 (prefill kernel format).
+        // The decode path stores these as FP32 on GPU, but the prefill rmsnorm kernel expects BF16.
+        let mut qk_norm_bf16_bufs: Vec<CudaSlice<u16>> = Vec::new();
+        for lw in layer_weights.iter_mut() {
+            for norm_ptr in [&mut lw.q_norm_ptr, &mut lw.k_norm_ptr] {
+                if *norm_ptr != 0 {
+                    let d = head_dim;
+                    // Download FP32 from GPU
+                    let mut h_fp32 = vec![0.0f32; d];
+                    unsafe {
+                        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                            h_fp32.as_mut_ptr() as *mut std::ffi::c_void,
+                            *norm_ptr, (d * 4) as usize,
+                        );
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(format!("QK norm FP32 download: {:?}", err));
+                        }
+                    }
+                    // Convert FP32 -> BF16 on CPU
+                    let h_bf16: Vec<u16> = h_fp32.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect();
+                    // Upload BF16 to GPU
+                    let d_bf16 = self.device.htod_copy(h_bf16)
+                        .map_err(|e| format!("QK norm BF16 upload: {e}"))?;
+                    *norm_ptr = *d_bf16.device_ptr();
+                    qk_norm_bf16_bufs.push(d_bf16);
+                }
+            }
         }
 
         // Build MoE expert data
@@ -6060,6 +6093,7 @@ impl GpuDecodeStore {
             max_sorted,
             preloaded_moe_layer: None,
             q_type,
+            qk_norm_bf16_bufs,
         })
     }
 
