@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 // ---- Stub for at::PhiloxCudaState ----
 // FA2 stores this in Flash_fwd_params for dropout RNG.

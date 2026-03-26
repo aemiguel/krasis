@@ -12,6 +12,7 @@
 //! All memory managed via cudarc (CUDA driver API).
 //! Kernels loaded from PTX (simple ops) or dlopen'd from vendored libkrasis_marlin.so (Marlin).
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -152,6 +153,8 @@ pub struct PrefillKernels {
     pub fused_moe_fn: Option<FusedMoeFn>,
     // FlashAttention-2: vendored (dlopen from libkrasis_flash_attn.so)
     pub flash_attn_fwd: Option<FlashAttnFwdFn>,
+    // FlashAttention-2 FP8 KV: BF16 Q with FP8 E4M3 K/V (for cross-chunk FP8 KV cache)
+    pub flash_attn_fwd_fp8kv: Option<FlashAttnFwdFn>,
 }
 
 /// Function pointer for marlin::marlin_mm<nv_bfloat16>.
@@ -622,6 +625,18 @@ pub struct PrefillEngine {
     // BF16 copies of QK norm weights (converted from FP32 at engine creation)
     // Kept alive here so GPU memory isn't freed.
     pub qk_norm_bf16_bufs: Vec<CudaSlice<u16>>,
+    // GQA sub-component timing accumulators (Cell for interior mutability in &self methods)
+    pub gqa_timing_enabled: Cell<bool>,
+    pub t_gqa_proj: Cell<f64>,       // Q/K/V projection GEMMs
+    pub t_gqa_norm: Cell<f64>,       // QK LayerNorm
+    pub t_gqa_rope: Cell<f64>,       // RoPE
+    pub t_gqa_kv_prep: Cell<f64>,    // KV cache store (FP8 path) or dequant+concat (BF16 path)
+    pub t_gqa_fa2: Cell<f64>,        // FlashAttention-2 kernel call
+    pub t_gqa_gate: Cell<f64>,       // sigmoid gate (gated attention)
+    pub t_gqa_oproj: Cell<f64>,      // O projection GEMM
+    pub gqa_fa2_calls: Cell<u64>,    // number of FA2 calls (for averaging)
+    pub gqa_fp8_calls: Cell<u64>,    // how many used FP8 path
+    pub gqa_bf16_calls: Cell<u64>,   // how many used BF16 dequant path
     // FLA (Flash Linear Attention) vendored kernels — replaces custom LA chunk recurrence
     pub fla: Option<FlaKernels>,
     // FLA intermediate buffers (allocated once at engine init if FLA available)
@@ -918,6 +933,20 @@ impl PrefillEngine {
 
         // Per-component timing (KRASIS_PREFILL_TIMING=1)
         let timing = std::env::var("KRASIS_PREFILL_TIMING").is_ok();
+        // Enable GQA sub-timing and reset accumulators
+        self.gqa_timing_enabled.set(timing);
+        if timing {
+            self.t_gqa_proj.set(0.0);
+            self.t_gqa_norm.set(0.0);
+            self.t_gqa_rope.set(0.0);
+            self.t_gqa_kv_prep.set(0.0);
+            self.t_gqa_fa2.set(0.0);
+            self.t_gqa_gate.set(0.0);
+            self.t_gqa_oproj.set(0.0);
+            self.gqa_fa2_calls.set(0);
+            self.gqa_fp8_calls.set(0);
+            self.gqa_bf16_calls.set(0);
+        }
         let mut t_norm_ms = 0.0f64;
         let mut t_attn_ms = 0.0f64;
         let mut t_gqa_ms = 0.0f64;
@@ -1153,6 +1182,31 @@ impl PrefillEngine {
             eprintln!("[PREFILL-TIMING]   embed:  {:>8.1}ms ({:>5.1}%)", t_embed_ms, t_embed_ms / ms * 100.0);
             eprintln!("[PREFILL-TIMING]   norm:   {:>8.1}ms ({:>5.1}%)", t_norm_ms, t_norm_ms / ms * 100.0);
             eprintln!("[PREFILL-TIMING]   attn:   {:>8.1}ms ({:>5.1}%)  [gqa: {:.1}ms, la: {:.1}ms]", t_attn_ms, t_attn_ms / ms * 100.0, t_gqa_ms, t_la_ms);
+            // GQA sub-component breakdown
+            let gp = self.t_gqa_proj.get();
+            let gn = self.t_gqa_norm.get();
+            let gr = self.t_gqa_rope.get();
+            let gk = self.t_gqa_kv_prep.get();
+            let gf = self.t_gqa_fa2.get();
+            let gg = self.t_gqa_gate.get();
+            let go = self.t_gqa_oproj.get();
+            let ga = gp + gn + gr + gk + gf + gg + go;
+            let fc = self.gqa_fa2_calls.get();
+            let fp8c = self.gqa_fp8_calls.get();
+            let bf16c = self.gqa_bf16_calls.get();
+            if ga > 0.0 {
+                eprintln!("[PREFILL-TIMING]     gqa breakdown ({} FA2 calls: {} bf16, {} fp8):",
+                    fc, bf16c, fp8c);
+                eprintln!("[PREFILL-TIMING]       proj:    {:>8.1}ms ({:>5.1}% of gqa)", gp, if t_gqa_ms > 0.0 { gp / t_gqa_ms * 100.0 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       qknorm:  {:>8.1}ms ({:>5.1}% of gqa)", gn, if t_gqa_ms > 0.0 { gn / t_gqa_ms * 100.0 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       rope:    {:>8.1}ms ({:>5.1}% of gqa)", gr, if t_gqa_ms > 0.0 { gr / t_gqa_ms * 100.0 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       kv_prep: {:>8.1}ms ({:>5.1}% of gqa)", gk, if t_gqa_ms > 0.0 { gk / t_gqa_ms * 100.0 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       fa2:     {:>8.1}ms ({:>5.1}% of gqa)  [{:.1}ms/call avg]",
+                    gf, if t_gqa_ms > 0.0 { gf / t_gqa_ms * 100.0 } else { 0.0 },
+                    if fc > 0 { gf / fc as f64 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       gate:    {:>8.1}ms ({:>5.1}% of gqa)", gg, if t_gqa_ms > 0.0 { gg / t_gqa_ms * 100.0 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       o_proj:  {:>8.1}ms ({:>5.1}% of gqa)", go, if t_gqa_ms > 0.0 { go / t_gqa_ms * 100.0 } else { 0.0 });
+            }
             eprintln!("[PREFILL-TIMING]   moe:    {:>8.1}ms ({:>5.1}%)", t_moe_ms, t_moe_ms / ms * 100.0);
             eprintln!("[PREFILL-TIMING]   other:  {:>8.1}ms ({:>5.1}%)", unaccounted, unaccounted / ms * 100.0);
         }
@@ -1746,6 +1800,7 @@ impl PrefillEngine {
     ) -> Result<(), String> {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
+        let gt = self.gqa_timing_enabled.get();
 
         let hidden = *self.scratch.d_hidden.device_ptr();
         let q = *self.scratch.d_q.device_ptr();
@@ -1754,6 +1809,7 @@ impl PrefillEngine {
         let attn_out = *self.scratch.d_attn_out.device_ptr();
 
         // Q/K/V projections (Marlin or cuBLAS BF16)
+        let gt0 = Instant::now();
         let gate_ptr: u64;
         if lw.gqa_gated {
             // Gated attention: q_proj outputs [M, num_q_heads, head_dim * 2]
@@ -1785,9 +1841,12 @@ impl PrefillEngine {
         self.la_gemm(hidden, &lw.k_proj, &lw.k_proj_bf16, k, m)?;
         self.la_gemm(hidden, &lw.v_proj, &lw.v_proj_bf16, v, m)?;
 
+        if gt { self.stream_sync()?; self.t_gqa_proj.set(self.t_gqa_proj.get() + gt0.elapsed().as_secs_f64() * 1000.0); }
+
         // QK LayerNorm: per-head RMSNorm on Q and K after projection, before RoPE
         // Q is [m, num_q_heads, head_dim], K is [m, num_kv_heads, head_dim]
         // Treat as [m*num_heads, head_dim] rows — existing rmsnorm kernel handles this.
+        let gt1 = Instant::now();
         if lw.q_norm_ptr != 0 {
             self.launch_rmsnorm(q, q, lw.q_norm_ptr, m * cfg.num_q_heads, cfg.head_dim)?;
         }
@@ -1795,11 +1854,14 @@ impl PrefillEngine {
             self.launch_rmsnorm(k, k, lw.k_norm_ptr, m * cfg.num_kv_heads, cfg.head_dim)?;
         }
 
+        if gt { self.stream_sync()?; self.t_gqa_norm.set(self.t_gqa_norm.get() + gt1.elapsed().as_secs_f64() * 1000.0); }
+
         // Look up per-layer KV cache pointers (needed for both attention and cache append)
         let layer_k_ptr = if layer_idx < self.kv_k_ptrs.len() { self.kv_k_ptrs[layer_idx] } else { 0 };
         let layer_v_ptr = if layer_idx < self.kv_v_ptrs.len() { self.kv_v_ptrs[layer_idx] } else { 0 };
 
         // RoPE (uses rope_half_dim for partial rotary support)
+        let gt2 = Instant::now();
         if self.rope_cos_ptr != 0 {
             let half = if cfg.rope_half_dim > 0 { cfg.rope_half_dim } else { cfg.head_dim / 2 };
             let rt = std::cmp::max(32, ((std::cmp::min(512, half) + 31) / 32) * 32) as u32;
@@ -1826,8 +1888,11 @@ impl PrefillEngine {
             }
         }
 
+        if gt { self.stream_sync()?; self.t_gqa_rope.set(self.t_gqa_rope.get() + gt2.elapsed().as_secs_f64() * 1000.0); }
+
         // Attention: use vendored FlashAttention-2 when available (start_pos==0),
         // otherwise fall back to custom tiled kernel for cross-chunk KV cache support.
+        let mut kv_cache_already_stored = false; // Set true by FP8 cross-chunk path
         if let Some(fa2_fwd) = self.kernels.flash_attn_fwd {
             if start_pos == 0 {
                 // FA2 varlen forward: Q/K/V are [total_q, heads, head_dim] contiguous BF16.
@@ -1846,6 +1911,8 @@ impl PrefillEngine {
                     );
                 }
 
+                if gt { self.stream_sync()?; }
+                let gt_fa2 = Instant::now();
                 let ret = unsafe {
                     fa2_fwd(
                         q as *const _,
@@ -1872,87 +1939,184 @@ impl PrefillEngine {
                 if ret != 0 {
                     return Err(format!("FlashAttention-2 forward failed with code {}", ret));
                 }
+                if gt {
+                    self.stream_sync()?;
+                    self.t_gqa_fa2.set(self.t_gqa_fa2.get() + gt_fa2.elapsed().as_secs_f64() * 1000.0);
+                    self.gqa_fa2_calls.set(self.gqa_fa2_calls.get() + 1);
+                    self.gqa_bf16_calls.set(self.gqa_bf16_calls.get() + 1);
+                }
             } else if layer_k_ptr != 0 && layer_v_ptr != 0 {
-                // Cross-chunk: dequant FP8 cache + concat current BF16 K/V, then FA2
+                // Cross-chunk attention: Q attends to all K/V (cached FP8 + current BF16)
                 let kv_stride = cfg.num_kv_heads * cfg.head_dim;
                 let total_kv = start_pos + m;
-                let kv_buf_bytes = (total_kv * kv_stride * 2) as u64; // BF16
 
-                // Use fp32_scratch as temporary BF16 K/V buffer (not in use during GQA)
-                let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
-                let full_k_bf16 = fp32_scratch;
-                let full_v_bf16 = fp32_scratch + kv_buf_bytes;
+                if let Some(fa2_fp8) = self.kernels.flash_attn_fwd_fp8kv {
+                    // FP8 FA2 path: store current K/V to FP8 cache FIRST, then
+                    // FA2 reads directly from cache (all FP8). No temp buffer needed.
+                    let gt_kv_store = Instant::now();
+                    let kv_stride_i32 = kv_stride as i32;
+                    let kt = std::cmp::max(32, ((std::cmp::min(256, kv_stride) + 31) / 32) * 32) as u32;
+                    let mut k0 = layer_k_ptr; let mut k1 = layer_v_ptr;
+                    let mut k2 = k; let mut k3 = v;
+                    let mut k4 = m as i32; let mut k5 = kv_stride_i32;
+                    let mut k6 = self.kv_max_seq as i32; let mut k7 = start_pos as i32;
+                    unsafe {
+                        launch(self.kernels.kv_cache_append,
+                            (m as u32, 1, 1), (kt, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut k0 as *mut _ as *mut std::ffi::c_void,
+                                &mut k1 as *mut _ as *mut std::ffi::c_void,
+                                &mut k2 as *mut _ as *mut std::ffi::c_void,
+                                &mut k3 as *mut _ as *mut std::ffi::c_void,
+                                &mut k4 as *mut _ as *mut std::ffi::c_void,
+                                &mut k5 as *mut _ as *mut std::ffi::c_void,
+                                &mut k6 as *mut _ as *mut std::ffi::c_void,
+                                &mut k7 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
+                    if gt {
+                        self.stream_sync()?;
+                        self.t_gqa_kv_prep.set(self.t_gqa_kv_prep.get() + gt_kv_store.elapsed().as_secs_f64() * 1000.0);
+                    }
 
-                // Launch dequant+concat for K and V
-                let grid = (total_kv as u32, 1, 1);
-                let kv_threads = std::cmp::max(32, ((std::cmp::min(512, kv_stride) + 31) / 32) * 32) as u32;
-                unsafe {
-                    // K: dequant cache [0..start_pos] + concat current [0..m]
-                    let mut a0 = full_k_bf16; let mut a1 = layer_k_ptr; let mut a2 = k;
-                    let mut a3 = start_pos as i32; let mut a4 = m as i32;
-                    let mut a5 = kv_stride as i32;
-                    launch(self.kernels.kv_dequant_concat,
-                        grid, (kv_threads, 1, 1), 0, self.stream,
-                        &mut [&mut a0 as *mut _ as *mut std::ffi::c_void,
-                              &mut a1 as *mut _ as *mut std::ffi::c_void,
-                              &mut a2 as *mut _ as *mut std::ffi::c_void,
-                              &mut a3 as *mut _ as *mut std::ffi::c_void,
-                              &mut a4 as *mut _ as *mut std::ffi::c_void,
-                              &mut a5 as *mut _ as *mut std::ffi::c_void])?;
-                    // V: same pattern
-                    let mut a0 = full_v_bf16; let mut a1 = layer_v_ptr; let mut a2 = v;
-                    launch(self.kernels.kv_dequant_concat,
-                        grid, (kv_threads, 1, 1), 0, self.stream,
-                        &mut [&mut a0 as *mut _ as *mut std::ffi::c_void,
-                              &mut a1 as *mut _ as *mut std::ffi::c_void,
-                              &mut a2 as *mut _ as *mut std::ffi::c_void,
-                              &mut a3 as *mut _ as *mut std::ffi::c_void,
-                              &mut a4 as *mut _ as *mut std::ffi::c_void,
-                              &mut a5 as *mut _ as *mut std::ffi::c_void])?;
-                }
+                    // FA2 FP8: Q (BF16) attends to K/V (FP8 in cache [0..total_kv])
+                    let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+                    let lse_ptr = self.scratch.d_fa2_lse.as_ref()
+                        .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
+                        .unwrap_or(std::ptr::null_mut());
+                    let cu_q_data: [i32; 2] = [0, m as i32];
+                    let cu_k_data: [i32; 2] = [0, total_kv as i32];
+                    let cu_ptr = *self.scratch.d_workspace.device_ptr();
+                    let cu_k_ptr = cu_ptr + 8;
+                    unsafe {
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            cu_ptr, cu_q_data.as_ptr() as *const _, 8, self.stream);
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            cu_k_ptr, cu_k_data.as_ptr() as *const _, 8, self.stream);
+                    }
 
-                // Call FA2 with Q[0..m] attending to full K/V[0..total_kv]
-                // cu_seqlens_q = [0, m], cu_seqlens_k = [0, total_kv]
-                let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
-                let lse_ptr = self.scratch.d_fa2_lse.as_ref()
-                    .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
-                    .unwrap_or(std::ptr::null_mut());
-                let cu_q_data: [i32; 2] = [0, m as i32];
-                let cu_k_data: [i32; 2] = [0, total_kv as i32];
-                let cu_ptr = *self.scratch.d_workspace.device_ptr();
-                let cu_k_ptr = cu_ptr + 8; // offset 8 bytes for k seqlens
-                unsafe {
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        cu_ptr, cu_q_data.as_ptr() as *const _, 8, self.stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        cu_k_ptr, cu_k_data.as_ptr() as *const _, 8, self.stream);
-                }
+                    let gt_fa2 = Instant::now();
+                    // FP8 KV cache layout: [max_seq, num_kv_heads * head_dim], stride = kv_stride
+                    let ret = unsafe {
+                        fa2_fp8(
+                            q as *const _,
+                            layer_k_ptr as *const _,  // FP8 KV cache directly
+                            layer_v_ptr as *const _,  // FP8 KV cache directly
+                            attn_out as *mut _,
+                            lse_ptr,
+                            cu_ptr as *const _,    // cu_seqlens_q = [0, m]
+                            cu_k_ptr as *const _,  // cu_seqlens_k = [0, total_kv]
+                            1,                     // batch_size
+                            m as i32,              // seqlen_q (max)
+                            total_kv as i32,       // seqlen_k (max)
+                            cfg.num_q_heads as i32,
+                            cfg.num_kv_heads as i32,
+                            cfg.head_dim as i32,
+                            m as i32,              // total_q
+                            total_kv as i32,       // total_k
+                            scale,
+                            1,                     // is_causal=1: FA2 auto-adjusts mask for seqlen_k > seqlen_q
+                            1,                     // unpadded_lse
+                            self.stream as *mut _,
+                        )
+                    };
+                    if ret != 0 {
+                        return Err(format!("FlashAttention-2 FP8 KV cross-chunk failed: {}", ret));
+                    }
+                    if gt {
+                        self.stream_sync()?;
+                        self.t_gqa_fa2.set(self.t_gqa_fa2.get() + gt_fa2.elapsed().as_secs_f64() * 1000.0);
+                        self.gqa_fa2_calls.set(self.gqa_fa2_calls.get() + 1);
+                        self.gqa_fp8_calls.set(self.gqa_fp8_calls.get() + 1);
+                    }
+                    kv_cache_already_stored = true;
+                } else {
+                    // Fallback: dequant FP8 cache + concat current BF16 K/V, then FA2 BF16
+                    let kv_buf_bytes = (total_kv * kv_stride * 2) as u64; // BF16
+                    let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
+                    let full_k_bf16 = fp32_scratch;
+                    let full_v_bf16 = fp32_scratch + kv_buf_bytes;
 
-                let ret = unsafe {
-                    fa2_fwd(
-                        q as *const _,
-                        full_k_bf16 as *const _,
-                        full_v_bf16 as *const _,
-                        attn_out as *mut _,
-                        lse_ptr,
-                        cu_ptr as *const _,    // cu_seqlens_q = [0, m]
-                        cu_k_ptr as *const _,  // cu_seqlens_k = [0, total_kv]
-                        1,                     // batch_size
-                        m as i32,              // seqlen_q (max)
-                        total_kv as i32,       // seqlen_k (max)
-                        cfg.num_q_heads as i32,
-                        cfg.num_kv_heads as i32,
-                        cfg.head_dim as i32,
-                        m as i32,              // total_q
-                        total_kv as i32,       // total_k
-                        scale,
-                        1,                     // is_causal
-                        1,                     // unpadded_lse
-                        self.stream as *mut _,
-                    )
-                };
-                if ret != 0 {
-                    return Err(format!("FlashAttention-2 cross-chunk forward failed: {}", ret));
+                    let gt_dequant = Instant::now();
+                    let grid = (total_kv as u32, 1, 1);
+                    let kv_threads = std::cmp::max(32, ((std::cmp::min(512, kv_stride) + 31) / 32) * 32) as u32;
+                    unsafe {
+                        let mut a0 = full_k_bf16; let mut a1 = layer_k_ptr; let mut a2 = k;
+                        let mut a3 = start_pos as i32; let mut a4 = m as i32;
+                        let mut a5 = kv_stride as i32;
+                        launch(self.kernels.kv_dequant_concat,
+                            grid, (kv_threads, 1, 1), 0, self.stream,
+                            &mut [&mut a0 as *mut _ as *mut std::ffi::c_void,
+                                  &mut a1 as *mut _ as *mut std::ffi::c_void,
+                                  &mut a2 as *mut _ as *mut std::ffi::c_void,
+                                  &mut a3 as *mut _ as *mut std::ffi::c_void,
+                                  &mut a4 as *mut _ as *mut std::ffi::c_void,
+                                  &mut a5 as *mut _ as *mut std::ffi::c_void])?;
+                        let mut a0 = full_v_bf16; let mut a1 = layer_v_ptr; let mut a2 = v;
+                        launch(self.kernels.kv_dequant_concat,
+                            grid, (kv_threads, 1, 1), 0, self.stream,
+                            &mut [&mut a0 as *mut _ as *mut std::ffi::c_void,
+                                  &mut a1 as *mut _ as *mut std::ffi::c_void,
+                                  &mut a2 as *mut _ as *mut std::ffi::c_void,
+                                  &mut a3 as *mut _ as *mut std::ffi::c_void,
+                                  &mut a4 as *mut _ as *mut std::ffi::c_void,
+                                  &mut a5 as *mut _ as *mut std::ffi::c_void])?;
+                    }
+
+                    if gt {
+                        self.stream_sync()?;
+                        self.t_gqa_kv_prep.set(self.t_gqa_kv_prep.get() + gt_dequant.elapsed().as_secs_f64() * 1000.0);
+                    }
+
+                    let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+                    let lse_ptr = self.scratch.d_fa2_lse.as_ref()
+                        .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
+                        .unwrap_or(std::ptr::null_mut());
+                    let cu_q_data: [i32; 2] = [0, m as i32];
+                    let cu_k_data: [i32; 2] = [0, total_kv as i32];
+                    let cu_ptr = *self.scratch.d_workspace.device_ptr();
+                    let cu_k_ptr = cu_ptr + 8;
+                    unsafe {
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            cu_ptr, cu_q_data.as_ptr() as *const _, 8, self.stream);
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            cu_k_ptr, cu_k_data.as_ptr() as *const _, 8, self.stream);
+                    }
+
+                    let gt_fa2_bf16 = Instant::now();
+                    let ret = unsafe {
+                        fa2_fwd(
+                            q as *const _,
+                            full_k_bf16 as *const _,
+                            full_v_bf16 as *const _,
+                            attn_out as *mut _,
+                            lse_ptr,
+                            cu_ptr as *const _,
+                            cu_k_ptr as *const _,
+                            1,
+                            m as i32,
+                            total_kv as i32,
+                            cfg.num_q_heads as i32,
+                            cfg.num_kv_heads as i32,
+                            cfg.head_dim as i32,
+                            m as i32,
+                            total_kv as i32,
+                            scale,
+                            1,                     // is_causal
+                            1,
+                            self.stream as *mut _,
+                        )
+                    };
+                    if ret != 0 {
+                        return Err(format!("FlashAttention-2 cross-chunk forward failed: {}", ret));
+                    }
+                    if gt {
+                        self.stream_sync()?;
+                        self.t_gqa_fa2.set(self.t_gqa_fa2.get() + gt_fa2_bf16.elapsed().as_secs_f64() * 1000.0);
+                        self.gqa_fa2_calls.set(self.gqa_fa2_calls.get() + 1);
+                        self.gqa_bf16_calls.set(self.gqa_bf16_calls.get() + 1);
+                    }
                 }
             } else {
                 // Cross-chunk but no KV cache pointers: fallback to custom tiled kernel
@@ -1970,7 +2134,8 @@ impl PrefillEngine {
         }
 
         // KV cache append: BF16 K,V -> FP8 E4M3 into separate per-layer caches
-        if layer_k_ptr != 0 && layer_v_ptr != 0 {
+        // Skip if FP8 cross-chunk path already stored K/V before attention.
+        if layer_k_ptr != 0 && layer_v_ptr != 0 && !kv_cache_already_stored {
             let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
             let kt = std::cmp::max(32, ((std::cmp::min(256, kv_stride as usize) + 31) / 32) * 32) as u32;
             let mut k0 = layer_k_ptr; let mut k1 = layer_v_ptr;
@@ -1995,14 +2160,15 @@ impl PrefillEngine {
         }
 
         // Gated attention: apply sigmoid(gate) to attention output
+        let gt_gate = Instant::now();
         if lw.gqa_gated && gate_ptr != 0 {
             let q_dim = (cfg.num_q_heads * cfg.head_dim) as i32;
-            let gt = std::cmp::max(32, ((std::cmp::min(1024, q_dim as usize) + 31) / 32) * 32) as u32;
+            let gate_threads = std::cmp::max(32, ((std::cmp::min(1024, q_dim as usize) + 31) / 32) * 32) as u32;
             let mut g0 = attn_out; let mut g1 = attn_out; let mut g2 = gate_ptr;
             let mut g3 = q_dim;
             unsafe {
                 launch(self.kernels.sigmoid_mul,
-                    (m as u32, 1, 1), (gt, 1, 1), 0, self.stream,
+                    (m as u32, 1, 1), (gate_threads, 1, 1), 0, self.stream,
                     &mut [
                         &mut g0 as *mut _ as *mut std::ffi::c_void,
                         &mut g1 as *mut _ as *mut std::ffi::c_void,
@@ -2012,11 +2178,14 @@ impl PrefillEngine {
                 )?;
             }
         }
+        if gt { self.stream_sync()?; self.t_gqa_gate.set(self.t_gqa_gate.get() + gt_gate.elapsed().as_secs_f64() * 1000.0); }
 
         // O projection (use scratch1 as temp to avoid input/output aliasing)
+        let gt_oproj = Instant::now();
         let o_temp = *self.scratch.d_scratch1.device_ptr();
         self.la_gemm(attn_out, &lw.o_proj, &lw.o_proj_bf16, o_temp, m)?;
         self.memcpy_d2d(attn_out, o_temp, (m * cfg.hidden_size * 2) as u64)?;
+        if gt { self.stream_sync()?; self.t_gqa_oproj.set(self.t_gqa_oproj.get() + gt_oproj.elapsed().as_secs_f64() * 1000.0); }
 
         Ok(())
     }
@@ -5921,6 +6090,7 @@ impl PrefillKernels {
             marlin_mm,
             fused_moe_fn: load_fused_moe(),
             flash_attn_fwd: load_flash_attn(),
+            flash_attn_fwd_fp8kv: load_flash_attn_fp8kv(),
         })
     }
 
@@ -6262,6 +6432,27 @@ fn load_flash_attn() -> Option<FlashAttnFwdFn> {
             return Some(std::mem::transmute(sym));
         }
         log::warn!("krasis_flash_attn_fwd_bf16 symbol not found in {}", path);
+    }
+    None
+}
+
+/// Load the FP8 KV variant of FlashAttention-2 (BF16 Q, FP8 E4M3 K/V).
+/// Same .so as regular FA2, different symbol.
+fn load_flash_attn_fp8kv() -> Option<FlashAttnFwdFn> {
+    let path = find_vendor_so("libkrasis_flash_attn.so")?;
+    unsafe {
+        let lib = libc::dlopen(
+            std::ffi::CString::new(path.as_str()).ok()?.as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL,
+        );
+        if lib.is_null() { return None; }
+
+        let sym = libc::dlsym(lib, b"krasis_flash_attn_fwd_bf16q_fp8kv\0".as_ptr() as *const _);
+        if !sym.is_null() {
+            log::info!("Loaded FlashAttention-2 FP8 KV from {}", path);
+            return Some(std::mem::transmute(sym));
+        }
+        log::warn!("krasis_flash_attn_fwd_bf16q_fp8kv symbol not found in {}", path);
     }
     None
 }

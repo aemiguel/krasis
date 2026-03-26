@@ -23,6 +23,10 @@
 namespace FLASH_NAMESPACE {
     template<typename T, int Headdim, bool Is_causal>
     void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+
+    // FP8 KV variants (instantiated in flash_fwd_hdim*_bf16q_fp8kv_*.cu)
+    template<typename T, int Headdim, bool Is_causal>
+    void run_mha_fwd_fp8kv_(Flash_fwd_params &params, cudaStream_t stream);
 }
 
 // Helper: fill Flash_fwd_params from raw pointers.
@@ -149,6 +153,7 @@ static void set_params_from_raw(
     params.rng_state = nullptr;
     params.num_splits = 0;
     params.seqlen_knew = 0;
+    params.is_kv_fp8 = false;  // Caller sets this explicitly for FP8 path
 }
 
 // ============================================================================
@@ -211,6 +216,70 @@ extern "C" int krasis_flash_attn_fwd_bf16(
             case 256: flash::run_mha_fwd_<T, 256, false>(params, stream); break;
             default:
                 fprintf(stderr, "krasis_flash_attn: unsupported head_dim=%d\n", head_dim);
+                return -1;
+        }
+    }
+
+    return 0;
+}
+
+// Forward pass: BF16 Q, FP8 E4M3 K/V (cross-chunk attention with FP8 KV cache).
+// K/V pointers point to FP8 E4M3 data. Strides are in FP8 elements.
+// The kernel loads FP8 from global memory, converts to BF16 in registers,
+// stores BF16 to shared memory, then proceeds with normal FA2 computation.
+// Only hdim128 supported (the only head dim QCN uses).
+extern "C" int krasis_flash_attn_fwd_bf16q_fp8kv(
+    // Device pointers (q_ptr = BF16, k_ptr/v_ptr = FP8 E4M3)
+    void *q_ptr, void *k_ptr, void *v_ptr, void *out_ptr,
+    void *softmax_lse_ptr,
+    void *cu_seqlens_q_ptr, void *cu_seqlens_k_ptr,
+    // Dimensions
+    int batch_size, int seqlen_q, int seqlen_k,
+    int num_heads, int num_heads_k, int head_dim,
+    int total_q, int total_k,
+    // Config
+    float softmax_scale, int is_causal,
+    int unpadded_lse,
+    // CUDA stream
+    void *stream_ptr
+) {
+    flash::Flash_fwd_params params;
+    set_params_from_raw(
+        params,
+        q_ptr, k_ptr, v_ptr, out_ptr,
+        softmax_lse_ptr,
+        cu_seqlens_q_ptr, cu_seqlens_k_ptr,
+        batch_size, seqlen_q, seqlen_k,
+        num_heads, num_heads_k, head_dim,
+        total_q, total_k,
+        softmax_scale, is_causal != 0, true, unpadded_lse != 0
+    );
+    params.is_kv_fp8 = true;
+
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
+
+    using T = cutlass::bfloat16_t;
+
+    if (is_causal) {
+        switch (head_dim) {
+            case 64:  flash::run_mha_fwd_fp8kv_<T, 64, true>(params, stream); break;
+            case 96:  flash::run_mha_fwd_fp8kv_<T, 96, true>(params, stream); break;
+            case 128: flash::run_mha_fwd_fp8kv_<T, 128, true>(params, stream); break;
+            case 192: flash::run_mha_fwd_fp8kv_<T, 192, true>(params, stream); break;
+            case 256: flash::run_mha_fwd_fp8kv_<T, 256, true>(params, stream); break;
+            default:
+                fprintf(stderr, "krasis_flash_attn_fp8kv: unsupported head_dim=%d\n", head_dim);
+                return -1;
+        }
+    } else {
+        switch (head_dim) {
+            case 64:  flash::run_mha_fwd_fp8kv_<T, 64, false>(params, stream); break;
+            case 96:  flash::run_mha_fwd_fp8kv_<T, 96, false>(params, stream); break;
+            case 128: flash::run_mha_fwd_fp8kv_<T, 128, false>(params, stream); break;
+            case 192: flash::run_mha_fwd_fp8kv_<T, 192, false>(params, stream); break;
+            case 256: flash::run_mha_fwd_fp8kv_<T, 256, false>(params, stream); break;
+            default:
+                fprintf(stderr, "krasis_flash_attn_fp8kv: unsupported head_dim=%d\n", head_dim);
                 return -1;
         }
     }

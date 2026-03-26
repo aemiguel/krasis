@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-21 21:33:19
+Krasis Benchmark — 2026-03-26 17:57:47
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,8 +7,8 @@ PP Partition:     [48] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            1007 GB total, 46.2 GB used by process
-  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 4258 MB allocated
+  RAM:            1007 GB total, 43.4 GB used by process
+  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 3792 MB allocated
   GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
 
 Quantization:
@@ -26,25 +26,25 @@ Strategy:
   Mode:           gpu_decode (layer_grouped(2))
 
 Prefill (internal) — 6 runs at different lengths:
-  Run 1:  580.3 tok/s (1,000 tokens in 1723.3ms)
-  Run 2:  2,029.8 tok/s (5,000 tokens in 2463.3ms)
-  Run 3:  2,699.5 tok/s (10,000 tokens in 3704.4ms)
-  Run 4:  3,236.1 tok/s (20,000 tokens in 6180.3ms)
-  Run 5:  3,506.3 tok/s (35,000 tokens in 9982.0ms)
-  Run 6:  3,423.7 tok/s (50,000 tokens in 14603.9ms)
-  Best:   3,506.3 tok/s (35,000 tokens)
+  Run 1:  579.2 tok/s (1,000 tokens in 1726.5ms)
+  Run 2:  2,879.4 tok/s (5,000 tokens in 1736.5ms)
+  Run 3:  2,684.8 tok/s (10,000 tokens in 3724.6ms)
+  Run 4:  2,183.9 tok/s (20,000 tokens in 9157.7ms)
+  Run 5:  1,647.7 tok/s (35,000 tokens in 21241.3ms)
+  Run 6:  1,344.1 tok/s (50,000 tokens in 37199.3ms)
+  Best:   2,879.4 tok/s (5,000 tokens)
 
 Decode (internal) — 50/100/250 tokens, 3 separate prompts:
-   50 tokens: 81.73 tok/s (12.2ms/tok)
-  100 tokens: 82.74 tok/s (12.1ms/tok)
-  250 tokens: 78.53 tok/s (12.7ms/tok)
-  Best:    82.74 tok/s
-  HCS:     16710/24576 experts (68.0%)
-  Min free VRAM: 738 MB
+   50 tokens: 65.74 tok/s (15.2ms/tok)
+  100 tokens: 68.11 tok/s (14.7ms/tok)
+  250 tokens: 63.87 tok/s (15.7ms/tok)
+  Best:    68.11 tok/s
+  HCS:     13601/24576 experts (55.3%)
+  Min free VRAM: 566 MB
 
 Round trip (network) — 50/100/250 tokens via HTTP:
-   50 tokens: 152.56 tok/s (2.65s total)
-  100 tokens: 109.36 tok/s (3.22s total)
-  250 tokens: 80.66 tok/s (5.30s total)
-  Best:    152.56 tok/s
+   50 tokens: 107.03 tok/s (2.44s total)
+  100 tokens: 85.33 tok/s (3.08s total)
+  250 tokens: 68.99 tok/s (5.53s total)
+  Best:    107.03 tok/s
 ================================================================

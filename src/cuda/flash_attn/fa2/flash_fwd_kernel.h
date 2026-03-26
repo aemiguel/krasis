@@ -48,7 +48,7 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
 }
 
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool Is_KV_FP8 = false, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -176,6 +176,27 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
+    // FP8 KV cache: precompute base pointers, BF16 smem targets, and staging buffer.
+    // The staging buffer sits after sQ+sK+sV in shared memory (linear layout, kBlockN*kHeadDim bytes).
+    // Pipeline: cp.async FP8 global -> staging (async), then expand staging -> BF16 smem (cooperative).
+    const __nv_fp8_e4m3* kv_fp8_k_ptr = nullptr;
+    const __nv_fp8_e4m3* kv_fp8_v_ptr = nullptr;
+    cutlass::bfloat16_t* smem_k_bf16 = nullptr;
+    cutlass::bfloat16_t* smem_v_bf16 = nullptr;
+    void* smem_fp8_staging = nullptr;
+    if constexpr (Is_KV_FP8) {
+        kv_fp8_k_ptr = reinterpret_cast<const __nv_fp8_e4m3*>(params.k_ptr)
+            + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)
+            + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+        kv_fp8_v_ptr = reinterpret_cast<const __nv_fp8_e4m3*>(params.v_ptr)
+            + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)
+            + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+        smem_k_bf16 = reinterpret_cast<cutlass::bfloat16_t*>(sK.data().get());
+        smem_v_bf16 = reinterpret_cast<cutlass::bfloat16_t*>(sV.data().get());
+        // Staging buffer: after Q+K+V smem. kSmemSize already accounts for Q+K+V.
+        smem_fp8_staging = smem_ + Kernel_traits::kSmemSize;
+    }
+
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
     Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
@@ -266,14 +287,22 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
-                                       binfo.actual_seqlen_k - n_block * kBlockN);
-    cute::cp_async_fence();
+    if constexpr (Is_KV_FP8) {
+        // Phase 1: cp.async FP8 bytes from global memory to staging (ASYNC)
+        int fp8_valid_rows = std::min(kBlockN, binfo.actual_seqlen_k - n_block * kBlockN);
+        FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
+            smem_fp8_staging, kv_fp8_k_ptr,
+            n_block * kBlockN, params.k_row_stride, fp8_valid_rows);
+    } else {
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+                                           binfo.actual_seqlen_k - n_block * kBlockN);
+    }
+    cute::cp_async_fence();  // Also commits any pending Q async copies
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z < 2) { print(tKgK); }
     // __syncthreads();
 
     if (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
-        FLASH_NAMESPACE::cp_async_wait<1>();
+        FLASH_NAMESPACE::cp_async_wait<Is_KV_FP8 ? 0 : 1>();
         __syncthreads();
         Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
         CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
@@ -305,14 +334,32 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
 
-        // Advance gV
-        if (masking_step > 0) {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+        // FP8: expand K staging -> sK (BF16). Staging was filled by cp.async in prologue or previous iter.
+        if constexpr (Is_KV_FP8) {
+            int fp8_valid_rows_k = (masking_step == 0 && !Is_even_MN)
+                ? std::min(kBlockN, binfo.actual_seqlen_k - n_block * kBlockN)
+                : kBlockN;
+            FLASH_NAMESPACE::expand_fp8_staging_to_bf16_smem<typename Kernel_traits::SmemLayoutKV, kBlockN, kHeadDim, kNWarps * 32, true>(
+                smem_k_bf16, smem_fp8_staging, typename Kernel_traits::SmemLayoutKV{},
+                fp8_valid_rows_k, Is_even_K ? kHeadDim : params.d);
+            __syncthreads();
+        }
+
+        // Start async V load: FP8 -> staging, BF16 -> sV
+        if constexpr (Is_KV_FP8) {
+            int v_valid_rows = std::min(kBlockN, binfo.actual_seqlen_k - n_block * kBlockN);
+            FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
+                smem_fp8_staging, kv_fp8_v_ptr,
+                n_block * kBlockN, params.v_row_stride, v_valid_rows);
         } else {
-            // Clear the smem tiles to account for predicated off loads
-            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
-                gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
-            );
+            if (masking_step > 0) {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+            } else {
+                // Clear the smem tiles to account for predicated off loads
+                FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                    gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
+                );
+            }
         }
         cute::cp_async_fence();
 
@@ -329,10 +376,31 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
 
+        // Wait for V load
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+
+        // FP8: expand V staging -> sV (BF16)
+        if constexpr (Is_KV_FP8) {
+            int fp8_valid_rows_v = (masking_step == 0 && !Is_even_MN)
+                ? std::min(kBlockN, binfo.actual_seqlen_k - n_block * kBlockN)
+                : kBlockN;
+            FLASH_NAMESPACE::expand_fp8_staging_to_bf16_smem<typename Kernel_traits::SmemLayoutKV, kBlockN, kHeadDim, kNWarps * 32, true>(
+                smem_v_bf16, smem_fp8_staging, typename Kernel_traits::SmemLayoutKV{},
+                fp8_valid_rows_v, Is_even_K ? kHeadDim : params.d);
+            __syncthreads();
+        }
+
+        // Start async next K load
         if (n_block > n_block_min) {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            if constexpr (Is_KV_FP8) {
+                int k_next_valid = std::min(kBlockN, binfo.actual_seqlen_k - (n_block - 1) * kBlockN);
+                FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
+                    smem_fp8_staging, kv_fp8_k_ptr,
+                    (n_block - 1) * kBlockN, params.k_row_stride, k_next_valid);
+            } else {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            }
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
@@ -380,7 +448,23 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
-        FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+
+        // FP8: expand K staging -> sK (BF16). All rows valid in main loop.
+        if constexpr (Is_KV_FP8) {
+            FLASH_NAMESPACE::expand_fp8_staging_to_bf16_smem<typename Kernel_traits::SmemLayoutKV, kBlockN, kHeadDim, kNWarps * 32, false>(
+                smem_k_bf16, smem_fp8_staging, typename Kernel_traits::SmemLayoutKV{},
+                kBlockN, Is_even_K ? kHeadDim : params.d);
+            __syncthreads();
+        }
+
+        // Start async V load
+        if constexpr (Is_KV_FP8) {
+            FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
+                smem_fp8_staging, kv_fp8_v_ptr,
+                n_block * kBlockN, params.v_row_stride, kBlockN);
+        } else {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+        }
         cute::cp_async_fence();
 
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
@@ -391,10 +475,27 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
+        // Wait for V load
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+
+        // FP8: expand V staging -> sV (BF16)
+        if constexpr (Is_KV_FP8) {
+            FLASH_NAMESPACE::expand_fp8_staging_to_bf16_smem<typename Kernel_traits::SmemLayoutKV, kBlockN, kHeadDim, kNWarps * 32, false>(
+                smem_v_bf16, smem_fp8_staging, typename Kernel_traits::SmemLayoutKV{},
+                kBlockN, Is_even_K ? kHeadDim : params.d);
+            __syncthreads();
+        }
+
+        // Start async next K load
         if (n_block > n_block_min) {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            if constexpr (Is_KV_FP8) {
+                FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
+                    smem_fp8_staging, kv_fp8_k_ptr,
+                    (n_block - 1) * kBlockN, params.k_row_stride, kBlockN);
+            } else {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            }
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
@@ -1072,7 +1173,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool Is_KV_FP8 = false, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1088,7 +1189,7 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, Is_KV_FP8>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

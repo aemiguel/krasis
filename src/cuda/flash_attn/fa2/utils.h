@@ -410,4 +410,167 @@ __forceinline__ __device__ void calculate_dtanh(Tensor<Engine0, Layout0> &src_te
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// FP8 KV cache: cp.async-based pipelined loading.
+//
+// Two-phase approach that restores async pipelining for FP8:
+//   Phase 1: cp.async copies raw FP8 bytes from global memory to a linear staging
+//            buffer in shared memory. This is ASYNC — threads continue executing.
+//   Phase 2: After cp.async completes, all threads cooperatively convert
+//            FP8 staging → BF16 in the swizzled KV shared memory buffer.
+//            This is pure smem→smem, ~0.2us for 8K elements.
+//
+// The old copy_fp8_to_bf16_smem did synchronous global loads, which blocked
+// all threads on memory latency with zero compute overlap. This new approach
+// lets the cp.async overlap with gemm computation (same as the BF16 path).
+
+// Phase 1: Issue cp.async to copy FP8 bytes from global memory to staging area.
+// The staging area has a simple linear layout (row-major, no swizzle).
+// Call cp_async_fence() after this, then cp_async_wait<0>() + __syncthreads()
+// before calling expand_fp8_staging_to_bf16_smem.
+template <int kBlockN, int kHeadDim, int kNThreads>
+__forceinline__ __device__ void cp_async_fp8_to_staging(
+    void* __restrict__ smem_staging,          // Linear FP8 staging buffer in smem
+    const void* __restrict__ gmem_fp8_base,   // FP8 E4M3 global memory base for this head
+    int row_offset,                           // Starting row in global memory
+    int row_stride,                           // Stride between rows in global (elements = bytes for FP8)
+    int valid_rows                            // Number of valid rows to load
+) {
+    constexpr int BYTES_PER_COPY = 16;  // 128-bit cp.async
+    constexpr int COPIES_PER_ROW = kHeadDim / BYTES_PER_COPY;
+    static_assert(kHeadDim % BYTES_PER_COPY == 0, "kHeadDim must be multiple of 16");
+    constexpr int TOTAL_COPIES = kBlockN * COPIES_PER_ROW;
+
+    const char* src_base = reinterpret_cast<const char*>(gmem_fp8_base);
+    char* dst_base = reinterpret_cast<char*>(smem_staging);
+
+    #pragma unroll
+    for (int copy_idx = threadIdx.x; copy_idx < TOTAL_COPIES; copy_idx += kNThreads) {
+        int row = copy_idx / COPIES_PER_ROW;
+        int col_chunk = copy_idx % COPIES_PER_ROW;
+
+        if (row < valid_rows) {
+            int gmem_byte_offset = (row_offset + row) * row_stride + col_chunk * BYTES_PER_COPY;
+            int smem_byte_offset = row * kHeadDim + col_chunk * BYTES_PER_COPY;
+
+            uint32_t smem_addr = __cvta_generic_to_shared(dst_base + smem_byte_offset);
+
+            asm volatile(
+                "cp.async.cg.shared.global [%0], [%1], %2;\n"
+                :: "r"(smem_addr), "l"(src_base + gmem_byte_offset), "n"(BYTES_PER_COPY)
+            );
+        } else {
+            // Zero-fill OOB rows in staging (will become zeros after expand)
+            int smem_byte_offset = row * kHeadDim + col_chunk * BYTES_PER_COPY;
+            uint4* dst = reinterpret_cast<uint4*>(dst_base + smem_byte_offset);
+            *dst = make_uint4(0, 0, 0, 0);
+        }
+    }
+}
+
+// Phase 2: Cooperatively convert FP8 staging → BF16 in swizzled shared memory.
+// Must be called after cp_async_wait<0>() + __syncthreads() to ensure staging is ready.
+// Follow with __syncthreads() before reading the BF16 smem in a gemm.
+template <typename SmemLayout, int kBlockN, int kHeadDim, int kNThreads, bool Clear_OOB = true>
+__forceinline__ __device__ void expand_fp8_staging_to_bf16_smem(
+    cutlass::bfloat16_t* __restrict__ smem_bf16,  // Swizzled BF16 destination
+    const void* __restrict__ smem_staging,         // Linear FP8 staging source
+    SmemLayout smem_layout,
+    int valid_rows,
+    int valid_cols
+) {
+    auto dst = cute::make_tensor(cute::make_smem_ptr(smem_bf16), smem_layout);
+    const __nv_fp8_e4m3* staging = reinterpret_cast<const __nv_fp8_e4m3*>(smem_staging);
+
+    // Vectorized: process 16 FP8 elements per iteration
+    constexpr int ELEMS_PER_VEC = 16;
+    static_assert(kHeadDim % ELEMS_PER_VEC == 0);
+    constexpr int total_vecs = kBlockN * (kHeadDim / ELEMS_PER_VEC);
+
+    #pragma unroll
+    for (int vidx = threadIdx.x; vidx < total_vecs; vidx += kNThreads) {
+        int row = vidx / (kHeadDim / ELEMS_PER_VEC);
+        int col_base = (vidx % (kHeadDim / ELEMS_PER_VEC)) * ELEMS_PER_VEC;
+
+        // Vectorized read from staging (linear layout, 16 bytes aligned)
+        const uint4* src_vec = reinterpret_cast<const uint4*>(
+            &staging[row * kHeadDim + col_base]);
+        uint4 fp8_vec = *src_vec;
+        const unsigned char* fp8_bytes = reinterpret_cast<const unsigned char*>(&fp8_vec);
+
+        if (row < valid_rows && col_base + ELEMS_PER_VEC <= valid_cols) {
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                __nv_fp8_e4m3 fp8_val = *reinterpret_cast<const __nv_fp8_e4m3*>(&fp8_bytes[k]);
+                float fval = float(fp8_val);
+                dst(row, col_base + k) = cutlass::bfloat16_t(__float2bfloat16(fval));
+            }
+        } else if (Clear_OOB) {
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                int col = col_base + k;
+                if (row < valid_rows && col < valid_cols) {
+                    __nv_fp8_e4m3 fp8_val = *reinterpret_cast<const __nv_fp8_e4m3*>(&fp8_bytes[k]);
+                    float fval = float(fp8_val);
+                    dst(row, col) = cutlass::bfloat16_t(__float2bfloat16(fval));
+                } else {
+                    dst(row, col) = cutlass::bfloat16_t(0.0f);
+                }
+            }
+        }
+    }
+}
+
+// Legacy synchronous FP8 copy (kept for reference, no longer used in hot path)
+template <typename SmemLayout, int kBlockN, int kHeadDim, int kNThreads, bool Clear_OOB = true>
+__forceinline__ __device__ void copy_fp8_to_bf16_smem(
+    const void* __restrict__ gmem_fp8_base,
+    cutlass::bfloat16_t* __restrict__ smem_bf16,
+    SmemLayout smem_layout,
+    int row_offset,
+    int row_stride,
+    int valid_rows,
+    int valid_cols
+) {
+    auto smem_tensor = cute::make_tensor(cute::make_smem_ptr(smem_bf16), smem_layout);
+    const auto* src = reinterpret_cast<const __nv_fp8_e4m3*>(gmem_fp8_base);
+
+    constexpr int ELEMS_PER_VEC = 16;
+    static_assert(kHeadDim % ELEMS_PER_VEC == 0, "kHeadDim must be multiple of 16");
+    constexpr int total_vecs = kBlockN * (kHeadDim / ELEMS_PER_VEC);
+
+    #pragma unroll
+    for (int vidx = threadIdx.x; vidx < total_vecs; vidx += kNThreads) {
+        int row = vidx / (kHeadDim / ELEMS_PER_VEC);
+        int col_base = (vidx % (kHeadDim / ELEMS_PER_VEC)) * ELEMS_PER_VEC;
+
+        if (row < valid_rows && col_base + ELEMS_PER_VEC <= valid_cols) {
+            int gmem_byte_offset = (row_offset + row) * row_stride + col_base;
+            uint4 fp8_vec = *reinterpret_cast<const uint4*>(&src[gmem_byte_offset]);
+            const unsigned char* fp8_bytes = reinterpret_cast<const unsigned char*>(&fp8_vec);
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                __nv_fp8_e4m3 fp8_val = *reinterpret_cast<const __nv_fp8_e4m3*>(&fp8_bytes[k]);
+                float fval = float(fp8_val);
+                smem_tensor(row, col_base + k) = cutlass::bfloat16_t(__float2bfloat16(fval));
+            }
+        } else if (Clear_OOB) {
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                int col = col_base + k;
+                if (row < valid_rows && col < valid_cols) {
+                    int gmem_idx = (row_offset + row) * row_stride + col;
+                    float fval = float(src[gmem_idx]);
+                    smem_tensor(row, col) = cutlass::bfloat16_t(__float2bfloat16(fval));
+                } else {
+                    smem_tensor(row, col) = cutlass::bfloat16_t(0.0f);
+                }
+            }
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 }  // namespace FLASH_NAMESPACE

@@ -284,7 +284,7 @@ fn compile_flash_attn_kernels() {
         format!("-I{cutlass_dir}"),
     ];
 
-    // Template instantiations to compile (BF16 forward only)
+    // Template instantiations to compile (BF16 forward only + FP8 KV variants)
     let cu_files = [
         "flash_attn_vendor.cu",
         "flash_fwd_hdim64_bf16_causal_sm80.cu",
@@ -297,6 +297,17 @@ fn compile_flash_attn_kernels() {
         "flash_fwd_hdim192_bf16_sm80.cu",
         "flash_fwd_hdim256_bf16_causal_sm80.cu",
         "flash_fwd_hdim256_bf16_sm80.cu",
+        // FP8 E4M3 K/V variants (BF16 Q, all head dims)
+        "flash_fwd_hdim64_bf16q_fp8kv_causal_sm80.cu",
+        "flash_fwd_hdim64_bf16q_fp8kv_sm80.cu",
+        "flash_fwd_hdim96_bf16q_fp8kv_causal_sm80.cu",
+        "flash_fwd_hdim96_bf16q_fp8kv_sm80.cu",
+        "flash_fwd_hdim128_bf16q_fp8kv_causal_sm80.cu",
+        "flash_fwd_hdim128_bf16q_fp8kv_sm80.cu",
+        "flash_fwd_hdim192_bf16q_fp8kv_causal_sm80.cu",
+        "flash_fwd_hdim192_bf16q_fp8kv_sm80.cu",
+        "flash_fwd_hdim256_bf16q_fp8kv_causal_sm80.cu",
+        "flash_fwd_hdim256_bf16q_fp8kv_sm80.cu",
     ];
 
     // Compile each .cu to .o

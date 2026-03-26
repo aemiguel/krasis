@@ -42,6 +42,15 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, b
     #endif
 }
 
+// FP8 KV variant: K/V are FP8 E4M3 in global memory, converted to BF16 in shared memory
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_fp8kv_kernel, bool Is_causal, bool Is_even_MN, bool Is_even_K) {
+    #if defined(ARCH_SUPPORTS_FLASH)
+        FLASH_NAMESPACE::compute_attn<Kernel_traits, /*Is_dropout=*/false, Is_causal, /*Is_local=*/false, /*Has_alibi=*/false, Is_even_MN, Is_even_K, /*Is_softcap=*/false, /*Return_softmax=*/false, /*Is_KV_FP8=*/true>(params);
+    #else
+        FLASH_UNSUPPORTED_ARCH
+    #endif
+}
+
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV) {
     #if defined(ARCH_SUPPORTS_FLASH)
         FLASH_NAMESPACE::compute_attn_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params);
@@ -101,6 +110,102 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         });
     });
 }
+
+// FP8 KV variant: simplified dispatch (no dropout, alibi, softcap, local, return_softmax)
+// Extra shared memory is allocated for the FP8 staging buffer (kBlockN * kHeadDim bytes).
+template<typename Kernel_traits, bool Is_causal>
+void run_flash_fwd_fp8kv(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr size_t fp8_staging_size = Kernel_traits::kBlockN * Kernel_traits::kHeadDim;  // bytes
+    constexpr size_t smem_size = Kernel_traits::kSmemSize + fp8_staging_size;
+    const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+    dim3 grid(num_m_block, params.b, params.h);
+    const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+        EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+            auto kernel = &flash_fwd_fp8kv_kernel<Kernel_traits, Is_causal, IsEvenMNConst && IsEvenKConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst>;
+            if (smem_size >= 48 * 1024) {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            }
+            kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+    });
+}
+
+// FP8 KV dispatch by head dimension — mirrors the BF16 run_mha_fwd_hdimN functions
+// but simplified (no dropout, no alibi, no softcap, no local attention).
+// Generic template declaration; specializations in per-hdim .cu files.
+template<typename T, int Headdim, bool Is_causal>
+void run_mha_fwd_fp8kv_(Flash_fwd_params &params, cudaStream_t stream);
+
+template<typename T, bool Is_causal>
+void run_mha_fwd_fp8kv_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 64;
+    run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_causal>(params, stream);
+}
+
+template<typename T, bool Is_causal>
+void run_mha_fwd_fp8kv_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 96;
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    if (is_sm8x) {
+        if constexpr(!Is_causal) {
+            run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_causal>(params, stream);
+        } else {
+            run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_causal>(params, stream);
+        }
+    } else {
+        run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_causal>(params, stream);
+    }
+}
+
+template<typename T, bool Is_causal>
+void run_mha_fwd_fp8kv_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 128;
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    // For sm86 or sm89, 64 x 64 is the fastest for causal,
+    // and 128 x 32 (48 KB smem) is the fastest for non-causal.
+    if (is_sm8x) {
+        if constexpr(!Is_causal) {
+            run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_causal>(params, stream);
+        } else {
+            run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_causal>(params, stream);
+        }
+    } else {
+        run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_causal>(params, stream);
+    }
+}
+
+template<typename T, bool Is_causal>
+void run_mha_fwd_fp8kv_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 192;
+    run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_causal>(params, stream);
+}
+
+template<typename T, bool Is_causal>
+void run_mha_fwd_fp8kv_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 256;
+    int device;
+    cudaGetDevice(&device);
+    int max_smem_per_sm, max_smem_per_block;
+    cudaError status_ = cudaDeviceGetAttribute(
+        &max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
+    status_ = cudaDeviceGetAttribute(
+        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != cudaSuccess) {
+      C10_CUDA_CHECK(status_);
+    }
+    if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
+        run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_causal>(params, stream);
+    } else {
+        run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_causal>(params, stream);
+    }
+}
+
 
 template<typename Kernel_traits, bool Is_causal>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
