@@ -395,11 +395,6 @@ void moe_marlin_mm_impl(
         return;
     }
 
-    fprintf(stderr, "[DIAG Marlin MoE] LAUNCHING kernel: blocks=%d threads=%d smem=%d "
-            "thread_m=%d thread_n=%d thread_k=%d prob_m=%d prob_n=%d prob_k=%d\n",
-            blocks, num_threads, max_shared_mem,
-            thread_m_blocks, thread_n_blocks, thread_k_blocks, prob_m, prob_n, prob_k);
-
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
 
     kernel<<<blocks, num_threads, max_shared_mem, stream>>>(

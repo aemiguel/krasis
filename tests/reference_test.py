@@ -128,13 +128,22 @@ def start_server(conf_path: str, script_dir: str) -> Tuple[subprocess.Popen, int
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
+    # Redirect server output to a file instead of PIPE to avoid pipe-buffer
+    # deadlock: the server writes diagnostic output to stdout/stderr, and if
+    # the pipe buffer fills up (64KB) and nobody drains it, the server blocks.
+    log_dir = os.path.join(script_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    server_log_path = os.path.join(log_dir, "reference_test_server.log")
+    server_log_file = open(server_log_path, "w")
+
     proc = subprocess.Popen(
         [python, "-m", "krasis.server", "--config", conf_path, "--test-endpoints"],
-        stdout=subprocess.PIPE,
+        stdout=server_log_file,
         stderr=subprocess.STDOUT,
         env=env,
         cwd=script_dir,
     )
+    proc._server_log_file = server_log_file  # keep reference to close later
     return proc, port
 
 
@@ -165,6 +174,12 @@ def kill_server(proc: subprocess.Popen):
         try:
             proc.kill()
             proc.wait(timeout=5)
+        except Exception:
+            pass
+    # Close server log file if we opened one
+    if hasattr(proc, '_server_log_file'):
+        try:
+            proc._server_log_file.close()
         except Exception:
             pass
 

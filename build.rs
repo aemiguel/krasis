@@ -3,6 +3,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_decode_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_prefill_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_marlin_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_flash_attn_kernels)");
 
     // Probe for libnuma — link only if the library is found.
     // The runtime code (numa.rs) checks numa_available() and falls back
@@ -28,6 +29,9 @@ fn main() {
 
     // Compile vendored Marlin GEMM kernels into libkrasis_marlin.so
     compile_marlin_kernels();
+
+    // Compile vendored FlashAttention-2 kernels into libkrasis_flash_attn.so
+    compile_flash_attn_kernels();
 }
 
 fn compile_cuda_kernels() {
@@ -225,6 +229,128 @@ fn compile_marlin_kernels() {
         }
         Err(e) => {
             println!("cargo:warning=nvcc link error for Marlin .so: {e}");
+        }
+    }
+}
+
+fn compile_flash_attn_kernels() {
+    let fa_dir = "src/cuda/flash_attn/fa2";
+    let cutlass_dir = "src/cuda/flash_attn/cutlass";
+    let vendor_src = format!("{fa_dir}/flash_attn_vendor.cu");
+
+    // Track key source files for incremental rebuilds
+    for f in [
+        &vendor_src,
+        &format!("{fa_dir}/flash_attn_vendor.h"),
+        &format!("{fa_dir}/flash.h"),
+        &format!("{fa_dir}/flash_fwd_kernel.h"),
+        &format!("{fa_dir}/flash_fwd_launch_template.h"),
+        &format!("{fa_dir}/kernel_traits.h"),
+        &format!("{fa_dir}/softmax.h"),
+        &format!("{fa_dir}/mask.h"),
+        &format!("{fa_dir}/utils.h"),
+    ] {
+        println!("cargo:rerun-if-changed={f}");
+    }
+
+    if !std::path::Path::new(&vendor_src).exists() {
+        println!("cargo:warning=FlashAttention vendor sources not found — FA kernels disabled");
+        return;
+    }
+
+    let nvcc = find_nvcc();
+    let Some(nvcc) = nvcc else {
+        println!("cargo:warning=nvcc not found — FlashAttention kernels disabled");
+        return;
+    };
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let so_path = format!("{out_dir}/libkrasis_flash_attn.so");
+
+    // Include paths: FA2 source dir + vendored CUTLASS headers
+    let common_args = vec![
+        "--expt-relaxed-constexpr".to_string(),
+        "--expt-extended-lambda".to_string(),
+        "-Xcompiler".to_string(), "-fPIC".to_string(),
+        "-arch=sm_80".to_string(),
+        "-O3".to_string(),
+        "--use_fast_math".to_string(),
+        "-DKRASIS_FA_VENDOR".to_string(),
+        "-DFLASHATTENTION_DISABLE_DROPOUT".to_string(),
+        "-DFLASHATTENTION_DISABLE_ALIBI".to_string(),
+        "-DFLASHATTENTION_DISABLE_SOFTCAP".to_string(),
+        "-DFLASHATTENTION_DISABLE_LOCAL".to_string(),
+        format!("-I{fa_dir}"),
+        format!("-I{cutlass_dir}"),
+    ];
+
+    // Template instantiations to compile (BF16 forward only)
+    let cu_files = [
+        "flash_attn_vendor.cu",
+        "flash_fwd_hdim64_bf16_causal_sm80.cu",
+        "flash_fwd_hdim64_bf16_sm80.cu",
+        "flash_fwd_hdim96_bf16_causal_sm80.cu",
+        "flash_fwd_hdim96_bf16_sm80.cu",
+        "flash_fwd_hdim128_bf16_causal_sm80.cu",
+        "flash_fwd_hdim128_bf16_sm80.cu",
+        "flash_fwd_hdim192_bf16_causal_sm80.cu",
+        "flash_fwd_hdim192_bf16_sm80.cu",
+        "flash_fwd_hdim256_bf16_causal_sm80.cu",
+        "flash_fwd_hdim256_bf16_sm80.cu",
+    ];
+
+    // Compile each .cu to .o
+    let mut obj_files = Vec::new();
+    for cu_file in &cu_files {
+        let src_path = format!("{fa_dir}/{cu_file}");
+        let obj_name = cu_file.replace(".cu", ".o");
+        let obj_path = format!("{out_dir}/fa2_{obj_name}");
+
+        println!("cargo:rerun-if-changed={src_path}");
+
+        let status = std::process::Command::new(&nvcc)
+            .arg("-c")
+            .arg("-o").arg(&obj_path)
+            .args(&common_args)
+            .arg(&src_path)
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                obj_files.push(obj_path);
+            }
+            Ok(s) => {
+                println!("cargo:warning=nvcc failed compiling {cu_file} with status {s}");
+                return;
+            }
+            Err(e) => {
+                println!("cargo:warning=nvcc error compiling {cu_file}: {e}");
+                return;
+            }
+        }
+    }
+
+    // Link all .o files into shared library
+    let mut link_cmd = std::process::Command::new(&nvcc);
+    link_cmd.arg("-shared")
+        .arg("-o").arg(&so_path);
+    for obj in &obj_files {
+        link_cmd.arg(obj);
+    }
+    link_cmd.arg("-Wno-deprecated-gpu-targets");
+
+    let status = link_cmd.status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("cargo:rustc-cfg=has_flash_attn_kernels");
+            println!("cargo:warning=Compiled vendored FlashAttention-2 kernels to {so_path}");
+        }
+        Ok(s) => {
+            println!("cargo:warning=nvcc failed linking FlashAttention .so with status {s}");
+        }
+        Err(e) => {
+            println!("cargo:warning=nvcc link error for FlashAttention .so: {e}");
         }
     }
 }

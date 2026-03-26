@@ -91,6 +91,7 @@ pub struct PrefillKernels {
     moe_sum_reduce: RawCuFunc,
     gqa_prefill: RawCuFunc,
     kv_cache_append: RawCuFunc,
+    kv_dequant_concat: RawCuFunc,
     causal_conv1d: RawCuFunc,
     mamba2_ssd: RawCuFunc,
     mamba2_extract: RawCuFunc,
@@ -141,12 +142,16 @@ pub struct PrefillKernels {
     moe_padded_prefix_sum: RawCuFunc,
     moe_scatter_sorted: RawCuFunc,
     moe_gather_sorted: RawCuFunc,
+    moe_replicate_hidden: RawCuFunc,
     moe_scatter_fused: RawCuFunc,
+    moe_scatter_weighted: RawCuFunc,
 
     // Marlin GEMM functions (loaded via dlopen from vendored libkrasis_marlin.so)
     marlin_mm: Option<MarlinMmFn>,
     // Fused MoE: vendored MarlinDefault (dlopen from libkrasis_marlin.so)
     pub fused_moe_fn: Option<FusedMoeFn>,
+    // FlashAttention-2: vendored (dlopen from libkrasis_flash_attn.so)
+    pub flash_attn_fwd: Option<FlashAttnFwdFn>,
 }
 
 /// Function pointer for marlin::marlin_mm<nv_bfloat16>.
@@ -206,6 +211,75 @@ type FusedMoeFn = unsafe extern "C" fn(
     /*fp32_reduce*/  bool,
     /*is_zp_float*/  bool,
 );
+
+/// Function pointer for vendored krasis_flash_attn_fwd_bf16.
+/// Calls FlashAttention-2 forward pass from libkrasis_flash_attn.so.
+type FlashAttnFwdFn = unsafe extern "C" fn(
+    /*q_ptr*/              *const std::ffi::c_void,
+    /*k_ptr*/              *const std::ffi::c_void,
+    /*v_ptr*/              *const std::ffi::c_void,
+    /*out_ptr*/            *mut std::ffi::c_void,
+    /*softmax_lse_ptr*/    *mut std::ffi::c_void,
+    /*cu_seqlens_q_ptr*/   *const std::ffi::c_void,
+    /*cu_seqlens_k_ptr*/   *const std::ffi::c_void,
+    /*batch_size*/         i32,
+    /*seqlen_q*/           i32,
+    /*seqlen_k*/           i32,
+    /*num_heads*/          i32,
+    /*num_heads_k*/        i32,
+    /*head_dim*/           i32,
+    /*total_q*/            i32,
+    /*total_k*/            i32,
+    /*softmax_scale*/      f32,
+    /*is_causal*/          i32,
+    /*unpadded_lse*/       i32,
+    /*stream_ptr*/         *mut std::ffi::c_void,
+) -> i32;
+
+/// FLA (Flash Linear Attention) kernel function pointers.
+/// Loaded from vendored libkrasis_fla.so (pre-compiled Triton cubins).
+/// These replace the custom chunk recurrence kernels for LA layers.
+pub struct FlaKernels {
+    // 1. chunk_local_cumsum_scalar_kernel(s, o, T, grid_x, grid_y, stream)
+    pub cumsum: FlaScalarKernelFn,
+    // 2. chunk_scaled_dot_kkt_fwd_kernel(k, g, beta, A, T, grid_x, grid_y, stream)
+    pub kkt: FlaKktKernelFn,
+    // 3. merge_16x16_to_64x64_inverse_kernel(A, Ai, T, grid_x, grid_y, stream)
+    pub solve_tril: FlaSolveTrilFn,
+    // 4. recompute_w_u_fwd_kernel(k, v, beta, w, u, A, g, T, grid_x, grid_y, stream)
+    pub wy_repr: FlaWyReprFn,
+    // 5. chunk_gated_delta_rule_fwd_kernel_h_blockdim64(k, v, w, v_new, g, h, h0, ht, T, grid_x, grid_y, stream)
+    pub state_recurrence: FlaStateRecurrenceFn,
+    // 6. chunk_fwd_kernel_o(q, k, v, h, g, o, scale, T, grid_x, grid_y, stream)
+    pub output: FlaOutputFn,
+}
+
+// FLA kernel function pointer types (matching extern "C" signatures in fla_vendor.cu)
+type FlaInitFn = unsafe extern "C" fn() -> i32;
+type FlaScalarKernelFn = unsafe extern "C" fn(
+    /*s*/ u64, /*o*/ u64, /*T*/ i32,
+    /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
+) -> u32;
+type FlaKktKernelFn = unsafe extern "C" fn(
+    /*k*/ u64, /*g*/ u64, /*beta*/ u64, /*A*/ u64, /*T*/ i32,
+    /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
+) -> u32;
+type FlaSolveTrilFn = unsafe extern "C" fn(
+    /*A*/ u64, /*Ai*/ u64, /*T*/ i32,
+    /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
+) -> u32;
+type FlaWyReprFn = unsafe extern "C" fn(
+    /*k*/ u64, /*v*/ u64, /*beta*/ u64, /*w*/ u64, /*u*/ u64, /*A*/ u64, /*g*/ u64, /*T*/ i32,
+    /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
+) -> u32;
+type FlaStateRecurrenceFn = unsafe extern "C" fn(
+    /*k*/ u64, /*v*/ u64, /*w*/ u64, /*v_new*/ u64, /*g*/ u64, /*h*/ u64, /*h0*/ u64, /*ht*/ u64, /*T*/ i32,
+    /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
+) -> u32;
+type FlaOutputFn = unsafe extern "C" fn(
+    /*q*/ u64, /*k*/ u64, /*v*/ u64, /*h*/ u64, /*g*/ u64, /*o*/ u64, /*scale*/ f32, /*T*/ i32,
+    /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
+) -> u32;
 
 /// Matches sglang::ScalarType memory layout for FFI.
 #[repr(C)]
@@ -381,6 +455,13 @@ pub struct ExpertWeightPtrs {
 pub struct PrefillMoeLayerData {
     pub experts: Vec<ExpertWeightPtrs>,
     pub shared: Option<ExpertWeightPtrs>,
+    /// Per-layer contiguous backing for bulk DMA (pinned host memory).
+    /// When set (ptr != 0), enables 4 DMA calls per layer instead of 4*E.
+    /// Points into the WeightStore's LayerExpertBacking which is pinned via cuMemHostRegister.
+    pub bulk_w13p: (usize, usize),  // (host_ptr, total_bytes) for ALL experts' w13_packed
+    pub bulk_w13s: (usize, usize),  // w13_scales
+    pub bulk_w2p: (usize, usize),   // w2_packed
+    pub bulk_w2s: (usize, usize),   // w2_scales
 }
 
 pub struct PrefillScratch {
@@ -441,6 +522,8 @@ pub struct PrefillScratch {
     pub d_la_g_cum: Option<CudaSlice<f32>>,   // [nv, num_chunks, chunk_size] FP32
     pub d_la_attn: Option<CudaSlice<f32>>,    // [nv, num_chunks, CS, CS] FP32
     pub d_la_state: Option<CudaSlice<f32>>,   // [nv, dk, dv] FP32 (recurrent state)
+    // FlashAttention-2 scratch
+    pub d_fa2_lse: Option<CudaSlice<f32>>,    // [num_heads, max_tokens] FP32 softmax LSE
     pub d_la_chunk_out: Option<CudaSlice<f32>>, // [nv, chunk_size, dv] FP32
     pub d_la_q_contig: Option<CudaSlice<f32>>, // [nv, chunk_size, dk] FP32 (separate from chunk_out to avoid aliasing)
     pub d_la_proj_buf: Option<CudaSlice<u16>>, // projection buffer [max_tokens, proj_dim] BF16
@@ -539,6 +622,18 @@ pub struct PrefillEngine {
     // BF16 copies of QK norm weights (converted from FP32 at engine creation)
     // Kept alive here so GPU memory isn't freed.
     pub qk_norm_bf16_bufs: Vec<CudaSlice<u16>>,
+    // FLA (Flash Linear Attention) vendored kernels — replaces custom LA chunk recurrence
+    pub fla: Option<FlaKernels>,
+    // FLA intermediate buffers (allocated once at engine init if FLA available)
+    pub d_fla_g_cumsum: Option<CudaSlice<f32>>,  // [B, T, H] FP32 cumsum of gate
+    pub d_fla_a: Option<CudaSlice<f32>>,          // [B, T, H, BT] FP32 attention matrix
+    pub d_fla_ai: Option<CudaSlice<u16>>,         // [B, T, H, BT] BF16 inverse matrix
+    pub d_fla_w: Option<CudaSlice<u16>>,          // [B, T, H, K] BF16 WY representation w
+    pub d_fla_u: Option<CudaSlice<u16>>,          // [B, T, H, V] BF16 WY representation u
+    pub d_fla_h: Option<CudaSlice<u16>>,          // [B, NT, H, K, V] BF16 per-chunk states
+    pub d_fla_final_state: Option<CudaSlice<f32>>,  // [B, H, K, V] FP32 final state
+    pub d_fla_v_new: Option<CudaSlice<u16>>,      // [B, T, H, V] BF16 corrected values
+    pub d_fla_o: Option<CudaSlice<u16>>,          // [B, T, H, V] BF16 output
 }
 
 /// Double-buffer BF16 attention weight streaming buffers.
@@ -788,6 +883,49 @@ impl PrefillEngine {
             }
         }
 
+        // Preload first MoE layer's experts into fused buffer A before the layer loop.
+        // This starts the double-buffer pipeline: while computing layer N,
+        // we DMA layer N+1 on copy_stream.
+        let use_fused = self.kernels.fused_moe_fn.is_some()
+            && self.d_fused_input.is_some()
+            && std::env::var("KRASIS_SEQUENTIAL_MOE").is_err();
+        if use_fused {
+            // Find first MoE layer
+            for i in 0..num_hidden_layers {
+                if self.layer_weights[i].moe_gate_ptr != 0 {
+                    if let Some(moe_idx) = self.layer_weights[i].moe_layer_idx {
+                        if let Some(Some(moe_data)) = self.moe_layers.get(moe_idx) {
+                            let w1_base = *self.d_fused_expert_w1_a.as_ref().unwrap().device_ptr();
+                            let w1s_base = *self.d_fused_expert_w1s_a.as_ref().unwrap().device_ptr();
+                            let w2_base = *self.d_fused_expert_w2_a.as_ref().unwrap().device_ptr();
+                            let w2s_base = *self.d_fused_expert_w2s_a.as_ref().unwrap().device_ptr();
+                            self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+                            unsafe {
+                                cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
+                            }
+                            self.preloaded_moe_layer = Some(i);
+                            self.fused_expert_buf_cur = 0;
+                            let mb = (moe_data.bulk_w13p.1 + moe_data.bulk_w13s.1
+                                + moe_data.bulk_w2p.1 + moe_data.bulk_w2s.1) as f64 / 1e6;
+                            eprintln!("[PREFILL] Preloading first MoE layer {} ({:.1} MB) on copy_stream",
+                                i, mb);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Per-component timing (KRASIS_PREFILL_TIMING=1)
+        let timing = std::env::var("KRASIS_PREFILL_TIMING").is_ok();
+        let mut t_norm_ms = 0.0f64;
+        let mut t_attn_ms = 0.0f64;
+        let mut t_gqa_ms = 0.0f64;
+        let mut t_la_ms = 0.0f64;
+        let mut t_moe_ms = 0.0f64;
+        let mut t_embed_ms = 0.0f64;
+        let mut t_other_ms = 0.0f64;
+
         for chunk_idx in 0..num_chunks {
             let chunk_start = chunk_idx * chunk_size;
             let chunk_end = std::cmp::min(chunk_start + chunk_size, total_m);
@@ -799,12 +937,17 @@ impl PrefillEngine {
             }
 
             // 1. Upload token IDs and positions for this chunk
+            let tc0 = Instant::now();
             self.upload_tokens_with_offset(chunk_tokens, chunk_start)
                 .map_err(|e| format!("upload_tokens chunk {}: {}", chunk_idx, e))?;
 
             // 2. Embedding lookup
             self.launch_embedding(m)
                 .map_err(|e| format!("embedding chunk {} m={}: {}", chunk_idx, m, e))?;
+            if timing {
+                self.stream_sync()?;
+                t_embed_ms += tc0.elapsed().as_secs_f64() * 1000.0;
+            }
 
             if diag && chunk_idx == 0 {
                 eprintln!("[DIAG] === Prefill diagnostic: m={} positions={:?} layers=0..{} ===",
@@ -840,6 +983,7 @@ impl PrefillEngine {
                 }
 
                 // Pre-attention RMSNorm
+                let tn0 = Instant::now();
                 if !has_residual {
                     self.memcpy_d2d(
                         *self.scratch.d_residual.device_ptr(),
@@ -861,8 +1005,10 @@ impl PrefillEngine {
                         m, h,
                     ).map_err(|e| format!("fused_add_rmsnorm layer {}: {}", layer_idx, e))?;
                 }
+                if timing { self.stream_sync()?; t_norm_ms += tn0.elapsed().as_secs_f64() * 1000.0; }
 
                 // Mixer
+                let ta0 = Instant::now();
                 match layer_type {
                     0 => self.forward_gqa_chunked(layer_idx, m, chunk_start)
                         .map_err(|e| format!("gqa layer {}: {}", layer_idx, e))?,
@@ -885,6 +1031,12 @@ impl PrefillEngine {
                         )?;
                     }
                 }
+                if timing {
+                    self.stream_sync()?;
+                    let attn_elapsed = ta0.elapsed().as_secs_f64() * 1000.0;
+                    t_attn_ms += attn_elapsed;
+                    match layer_type { 0 => t_gqa_ms += attn_elapsed, 3 => t_la_ms += attn_elapsed, _ => {} }
+                }
 
                 if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
                     let lt_name = match layer_type { 0 => "gqa", 1 => "mamba2", 3 => "la", _ => "?" };
@@ -894,6 +1046,7 @@ impl PrefillEngine {
                 }
 
                 // Post-attention RMSNorm
+                let tn1 = Instant::now();
                 let post_norm = self.layer_weights[layer_idx].post_attn_norm;
                 if post_norm != 0 {
                     self.launch_fused_add_rmsnorm(
@@ -914,6 +1067,7 @@ impl PrefillEngine {
                         (m * h * 2) as u64,
                     )?;
                 }
+                if timing { self.stream_sync()?; t_norm_ms += tn1.elapsed().as_secs_f64() * 1000.0; }
 
                 // DIAG: d_hidden before MLP (after post-attn-norm = MoE input)
                 if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
@@ -923,6 +1077,7 @@ impl PrefillEngine {
                 }
 
                 // MLP (dense or MoE)
+                let tm0 = Instant::now();
                 if self.layer_weights[layer_idx].moe_gate_ptr != 0 {
                     if diag && layer_idx < diag_layer_limit {
                         eprintln!("[DIAG] layer{:02} -> forward_moe (gate_ptr=0x{:x})",
@@ -943,6 +1098,7 @@ impl PrefillEngine {
                 } else if diag && layer_idx < diag_layer_limit {
                     eprintln!("[DIAG] layer{:02} -> NO MLP (no gate, no shared_w1)", layer_idx);
                 }
+                if timing { self.stream_sync()?; t_moe_ms += tm0.elapsed().as_secs_f64() * 1000.0; }
 
                 if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
                     self.diag_print_norms(
@@ -989,6 +1145,17 @@ impl PrefillEngine {
 
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         log::info!("Rust prefill: {} tok in {:.1}ms ({:.0} tok/s)", total_m, ms, total_m as f64 / (ms / 1000.0));
+
+        if timing {
+            let total = t_embed_ms + t_norm_ms + t_attn_ms + t_moe_ms + t_other_ms;
+            let unaccounted = ms - total;
+            eprintln!("[PREFILL-TIMING] {} tokens, {:.1}ms total ({:.0} tok/s)", total_m, ms, total_m as f64 / (ms / 1000.0));
+            eprintln!("[PREFILL-TIMING]   embed:  {:>8.1}ms ({:>5.1}%)", t_embed_ms, t_embed_ms / ms * 100.0);
+            eprintln!("[PREFILL-TIMING]   norm:   {:>8.1}ms ({:>5.1}%)", t_norm_ms, t_norm_ms / ms * 100.0);
+            eprintln!("[PREFILL-TIMING]   attn:   {:>8.1}ms ({:>5.1}%)  [gqa: {:.1}ms, la: {:.1}ms]", t_attn_ms, t_attn_ms / ms * 100.0, t_gqa_ms, t_la_ms);
+            eprintln!("[PREFILL-TIMING]   moe:    {:>8.1}ms ({:>5.1}%)", t_moe_ms, t_moe_ms / ms * 100.0);
+            eprintln!("[PREFILL-TIMING]   other:  {:>8.1}ms ({:>5.1}%)", unaccounted, unaccounted / ms * 100.0);
+        }
 
         Ok(PrefillResult { first_token, prompt_len: total_m, prefill_time_ms: ms })
     }
@@ -1056,6 +1223,32 @@ impl PrefillEngine {
 
         // 2. Embedding lookup
         self.launch_embedding(m)?;
+
+        // Preload first MoE layer (same as run_prefill)
+        let use_fused = self.kernels.fused_moe_fn.is_some()
+            && self.d_fused_input.is_some()
+            && std::env::var("KRASIS_SEQUENTIAL_MOE").is_err();
+        if use_fused {
+            for i in 0..num_hidden_layers {
+                if self.layer_weights[i].moe_gate_ptr != 0 {
+                    if let Some(moe_idx) = self.layer_weights[i].moe_layer_idx {
+                        if let Some(Some(moe_data)) = self.moe_layers.get(moe_idx) {
+                            let w1_base = *self.d_fused_expert_w1_a.as_ref().unwrap().device_ptr();
+                            let w1s_base = *self.d_fused_expert_w1s_a.as_ref().unwrap().device_ptr();
+                            let w2_base = *self.d_fused_expert_w2_a.as_ref().unwrap().device_ptr();
+                            let w2s_base = *self.d_fused_expert_w2s_a.as_ref().unwrap().device_ptr();
+                            self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+                            unsafe {
+                                cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
+                            }
+                            self.preloaded_moe_layer = Some(i);
+                            self.fused_expert_buf_cur = 0;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
 
         // 3. Layer-by-layer forward pass
         let mut has_residual = false;
@@ -1488,6 +1681,58 @@ impl PrefillEngine {
         }
     }
 
+    // ── Custom Tiled Attention (fallback when FA2 not available or cross-chunk) ──
+
+    fn launch_custom_tiled_attn(
+        &self, attn_out: u64, q: u64, k: u64, v: u64,
+        layer_k_ptr: u64, layer_v_ptr: u64,
+        m: usize, start_pos: usize,
+        cfg: &PrefillModelConfig,
+    ) -> Result<(), String> {
+        let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+        let fa_br = 16u32;
+        let fa_bc = 64usize;
+        let grid_x = ((m as u32) + fa_br - 1) / fa_br;
+        let hd = cfg.head_dim;
+        let smem = (fa_br as usize * hd * 2
+            + fa_bc * hd * 2
+            + fa_bc * hd * 2
+            + fa_br as usize * fa_bc * 4
+            + fa_br as usize * fa_bc * 2
+            + 16 * 16 * 4
+        ) as u32;
+        let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
+        let k_cache_ptr: u64 = if start_pos > 0 { layer_k_ptr } else { 0 };
+        let v_cache_ptr: u64 = if start_pos > 0 { layer_v_ptr } else { 0 };
+        let mut a0 = attn_out; let mut a1 = q;
+        let mut a2 = k_cache_ptr; let mut a3 = v_cache_ptr;
+        let mut a4 = k; let mut a5 = v;
+        let mut a6 = m as i32; let mut a7 = cfg.num_q_heads as i32;
+        let mut a8 = cfg.num_kv_heads as i32; let mut a9 = cfg.head_dim as i32;
+        let mut a10 = scale; let mut a11 = start_pos as i32; let mut a12 = kv_stride;
+        unsafe {
+            launch(self.kernels.flash_attn_tiled,
+                (grid_x, cfg.num_q_heads as u32, 1), (32, 1, 1), smem, self.stream,
+                &mut [
+                    &mut a0 as *mut _ as *mut std::ffi::c_void,
+                    &mut a1 as *mut _ as *mut std::ffi::c_void,
+                    &mut a2 as *mut _ as *mut std::ffi::c_void,
+                    &mut a3 as *mut _ as *mut std::ffi::c_void,
+                    &mut a4 as *mut _ as *mut std::ffi::c_void,
+                    &mut a5 as *mut _ as *mut std::ffi::c_void,
+                    &mut a6 as *mut _ as *mut std::ffi::c_void,
+                    &mut a7 as *mut _ as *mut std::ffi::c_void,
+                    &mut a8 as *mut _ as *mut std::ffi::c_void,
+                    &mut a9 as *mut _ as *mut std::ffi::c_void,
+                    &mut a10 as *mut _ as *mut std::ffi::c_void,
+                    &mut a11 as *mut _ as *mut std::ffi::c_void,
+                    &mut a12 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     // ── GQA Attention ──
 
     fn forward_gqa(
@@ -1581,51 +1826,146 @@ impl PrefillEngine {
             }
         }
 
-        // WMMA Flash Attention with cross-chunk support:
-        // - Positions [0, start_pos): read from FP8 KV cache
-        // - Positions [start_pos, start_pos+m): read from current BF16 K/V
-        // Kernel uses 1 warp (32 threads), BR=16 queries per block, BC=64 KV tile
-        let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
-        let fa_br = 16u32;  // queries per block (1 wmma M=16 tile)
-        let fa_bc = 64usize;  // KV tile size
-        let grid_x = ((m as u32) + fa_br - 1) / fa_br;
-        // smem: s_q[BR*hd*2] + s_k[BC*hd*2] + s_v[BC*hd*2] + s_scores[BR*BC*4] + s_p[BR*BC*2] + s_o_tmp[16*16*4]
-        let hd = cfg.head_dim;
-        let smem = (fa_br as usize * hd * 2  // s_q
-            + fa_bc * hd * 2                  // s_k
-            + fa_bc * hd * 2                  // s_v
-            + fa_br as usize * fa_bc * 4      // s_scores
-            + fa_br as usize * fa_bc * 2      // s_p
-            + 16 * 16 * 4                     // s_o_tmp
-        ) as u32;
-        let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
-        // For first chunk (start_pos==0), pass null cache pointers
-        let k_cache_ptr: u64 = if start_pos > 0 { layer_k_ptr } else { 0 };
-        let v_cache_ptr: u64 = if start_pos > 0 { layer_v_ptr } else { 0 };
-        let mut a0 = attn_out; let mut a1 = q;
-        let mut a2 = k_cache_ptr; let mut a3 = v_cache_ptr;
-        let mut a4 = k; let mut a5 = v;
-        let mut a6 = m as i32; let mut a7 = cfg.num_q_heads as i32;
-        let mut a8 = cfg.num_kv_heads as i32; let mut a9 = cfg.head_dim as i32;
-        let mut a10 = scale; let mut a11 = start_pos as i32; let mut a12 = kv_stride;
-        unsafe {
-            launch(self.kernels.flash_attn_tiled,
-                (grid_x, cfg.num_q_heads as u32, 1), (32, 1, 1), smem, self.stream,
-                &mut [
-                    &mut a0 as *mut _ as *mut std::ffi::c_void,
-                    &mut a1 as *mut _ as *mut std::ffi::c_void,
-                    &mut a2 as *mut _ as *mut std::ffi::c_void,
-                    &mut a3 as *mut _ as *mut std::ffi::c_void,
-                    &mut a4 as *mut _ as *mut std::ffi::c_void,
-                    &mut a5 as *mut _ as *mut std::ffi::c_void,
-                    &mut a6 as *mut _ as *mut std::ffi::c_void,
-                    &mut a7 as *mut _ as *mut std::ffi::c_void,
-                    &mut a8 as *mut _ as *mut std::ffi::c_void,
-                    &mut a9 as *mut _ as *mut std::ffi::c_void,
-                    &mut a10 as *mut _ as *mut std::ffi::c_void,
-                    &mut a11 as *mut _ as *mut std::ffi::c_void,
-                    &mut a12 as *mut _ as *mut std::ffi::c_void,
-                ],
+        // Attention: use vendored FlashAttention-2 when available (start_pos==0),
+        // otherwise fall back to custom tiled kernel for cross-chunk KV cache support.
+        if let Some(fa2_fwd) = self.kernels.flash_attn_fwd {
+            if start_pos == 0 {
+                // FA2 varlen forward: Q/K/V are [total_q, heads, head_dim] contiguous BF16.
+                // For single-sequence prefill: batch=1, cu_seqlens_q=[0,m], cu_seqlens_k=[0,m].
+                let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+                let lse_ptr = self.scratch.d_fa2_lse.as_ref()
+                    .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
+                    .unwrap_or(std::ptr::null_mut());
+
+                // Build cu_seqlens on host and upload (2 ints: [0, m])
+                let cu_data: [i32; 2] = [0, m as i32];
+                let cu_ptr = *self.scratch.d_workspace.device_ptr();
+                unsafe {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        cu_ptr, cu_data.as_ptr() as *const _, 8, self.stream,
+                    );
+                }
+
+                let ret = unsafe {
+                    fa2_fwd(
+                        q as *const _,
+                        k as *const _,
+                        v as *const _,
+                        attn_out as *mut _,
+                        lse_ptr,
+                        cu_ptr as *const _,  // cu_seqlens_q
+                        cu_ptr as *const _,  // cu_seqlens_k (same: self-attention)
+                        1,                   // batch_size
+                        m as i32,            // seqlen_q (max)
+                        m as i32,            // seqlen_k (max)
+                        cfg.num_q_heads as i32,
+                        cfg.num_kv_heads as i32,
+                        cfg.head_dim as i32,
+                        m as i32,            // total_q
+                        m as i32,            // total_k
+                        scale,
+                        1,                   // is_causal
+                        1,                   // unpadded_lse
+                        self.stream as *mut _,
+                    )
+                };
+                if ret != 0 {
+                    return Err(format!("FlashAttention-2 forward failed with code {}", ret));
+                }
+            } else if layer_k_ptr != 0 && layer_v_ptr != 0 {
+                // Cross-chunk: dequant FP8 cache + concat current BF16 K/V, then FA2
+                let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+                let total_kv = start_pos + m;
+                let kv_buf_bytes = (total_kv * kv_stride * 2) as u64; // BF16
+
+                // Use fp32_scratch as temporary BF16 K/V buffer (not in use during GQA)
+                let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
+                let full_k_bf16 = fp32_scratch;
+                let full_v_bf16 = fp32_scratch + kv_buf_bytes;
+
+                // Launch dequant+concat for K and V
+                let grid = (total_kv as u32, 1, 1);
+                let kv_threads = std::cmp::max(32, ((std::cmp::min(512, kv_stride) + 31) / 32) * 32) as u32;
+                unsafe {
+                    // K: dequant cache [0..start_pos] + concat current [0..m]
+                    let mut a0 = full_k_bf16; let mut a1 = layer_k_ptr; let mut a2 = k;
+                    let mut a3 = start_pos as i32; let mut a4 = m as i32;
+                    let mut a5 = kv_stride as i32;
+                    launch(self.kernels.kv_dequant_concat,
+                        grid, (kv_threads, 1, 1), 0, self.stream,
+                        &mut [&mut a0 as *mut _ as *mut std::ffi::c_void,
+                              &mut a1 as *mut _ as *mut std::ffi::c_void,
+                              &mut a2 as *mut _ as *mut std::ffi::c_void,
+                              &mut a3 as *mut _ as *mut std::ffi::c_void,
+                              &mut a4 as *mut _ as *mut std::ffi::c_void,
+                              &mut a5 as *mut _ as *mut std::ffi::c_void])?;
+                    // V: same pattern
+                    let mut a0 = full_v_bf16; let mut a1 = layer_v_ptr; let mut a2 = v;
+                    launch(self.kernels.kv_dequant_concat,
+                        grid, (kv_threads, 1, 1), 0, self.stream,
+                        &mut [&mut a0 as *mut _ as *mut std::ffi::c_void,
+                              &mut a1 as *mut _ as *mut std::ffi::c_void,
+                              &mut a2 as *mut _ as *mut std::ffi::c_void,
+                              &mut a3 as *mut _ as *mut std::ffi::c_void,
+                              &mut a4 as *mut _ as *mut std::ffi::c_void,
+                              &mut a5 as *mut _ as *mut std::ffi::c_void])?;
+                }
+
+                // Call FA2 with Q[0..m] attending to full K/V[0..total_kv]
+                // cu_seqlens_q = [0, m], cu_seqlens_k = [0, total_kv]
+                let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+                let lse_ptr = self.scratch.d_fa2_lse.as_ref()
+                    .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
+                    .unwrap_or(std::ptr::null_mut());
+                let cu_q_data: [i32; 2] = [0, m as i32];
+                let cu_k_data: [i32; 2] = [0, total_kv as i32];
+                let cu_ptr = *self.scratch.d_workspace.device_ptr();
+                let cu_k_ptr = cu_ptr + 8; // offset 8 bytes for k seqlens
+                unsafe {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        cu_ptr, cu_q_data.as_ptr() as *const _, 8, self.stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        cu_k_ptr, cu_k_data.as_ptr() as *const _, 8, self.stream);
+                }
+
+                let ret = unsafe {
+                    fa2_fwd(
+                        q as *const _,
+                        full_k_bf16 as *const _,
+                        full_v_bf16 as *const _,
+                        attn_out as *mut _,
+                        lse_ptr,
+                        cu_ptr as *const _,    // cu_seqlens_q = [0, m]
+                        cu_k_ptr as *const _,  // cu_seqlens_k = [0, total_kv]
+                        1,                     // batch_size
+                        m as i32,              // seqlen_q (max)
+                        total_kv as i32,       // seqlen_k (max)
+                        cfg.num_q_heads as i32,
+                        cfg.num_kv_heads as i32,
+                        cfg.head_dim as i32,
+                        m as i32,              // total_q
+                        total_kv as i32,       // total_k
+                        scale,
+                        1,                     // is_causal
+                        1,                     // unpadded_lse
+                        self.stream as *mut _,
+                    )
+                };
+                if ret != 0 {
+                    return Err(format!("FlashAttention-2 cross-chunk forward failed: {}", ret));
+                }
+            } else {
+                // Cross-chunk but no KV cache pointers: fallback to custom tiled kernel
+                self.launch_custom_tiled_attn(
+                    attn_out, q, k, v, layer_k_ptr, layer_v_ptr,
+                    m, start_pos, cfg,
+                )?;
+            }
+        } else {
+            // No FA2 available: use custom tiled kernel
+            self.launch_custom_tiled_attn(
+                attn_out, q, k, v, layer_k_ptr, layer_v_ptr,
+                m, start_pos, cfg,
             )?;
         }
 
@@ -2157,6 +2497,214 @@ impl PrefillEngine {
                     layer_idx, (nv as f32).sqrt() * scale, (nv as f32).sqrt());
             }
 
+            // ── FLA (Flash Linear Attention) fast path ──
+            // Uses pre-compiled Triton cubins for the Gated DeltaNet chunk recurrence.
+            // Replaces steps 10-19 (custom chunk kernels) with 6 fused FLA kernel calls.
+            // Result: FP32 output in la_v [M, nv, dv], ready for gated_rmsnorm.
+            if self.fla.is_some() {
+                let fla_bt: usize = 64; // FLA chunk size (baked into cubins)
+                let fla_pad = (fla_bt - m % fla_bt) % fla_bt;
+                let fla_total = m + fla_pad;
+                let fla_nt = fla_total / fla_bt;
+
+                // Zero-pad q, k, v, beta, gate beyond M
+                if fla_pad > 0 {
+                    unsafe {
+                        let _ = cuda_sys::lib().cuMemsetD8Async(
+                            la_q + (m * nv * dk * 4) as u64, 0, (fla_pad * nv * dk * 4) as usize, self.stream);
+                        let _ = cuda_sys::lib().cuMemsetD8Async(
+                            la_k + (m * nv * dk * 4) as u64, 0, (fla_pad * nv * dk * 4) as usize, self.stream);
+                        let _ = cuda_sys::lib().cuMemsetD8Async(
+                            la_v + (m * nv * dv * 4) as u64, 0, (fla_pad * nv * dv * 4) as usize, self.stream);
+                        let _ = cuda_sys::lib().cuMemsetD8Async(
+                            la_beta + (m * nv * 4) as u64, 0, (fla_pad * nv * 4) as usize, self.stream);
+                        let _ = cuda_sys::lib().cuMemsetD8Async(
+                            la_gate + (m * nv * 4) as u64, 0, (fla_pad * nv * 4) as usize, self.stream);
+                    }
+                }
+
+                // Convert FP32 → BF16 for FLA input tensors
+                // FLA cubins were compiled with BF16 inputs (q, k, v, beta, gate)
+                // and FP32 for cumsum output (g) and final state (ht).
+                // q: la_q (FP32) → scratch1 (BF16)
+                // k: la_k (FP32) → scratch2 (BF16)
+                // v: la_v (FP32) → scratch1 upper half (BF16)
+                // beta: la_beta (FP32) → attn_out (BF16)
+                // gate: la_gate (FP32) → scratch2 upper half (BF16) — for cumsum input
+                let q_bf16 = *self.scratch.d_scratch1.device_ptr();
+                let k_bf16 = *self.scratch.d_scratch2.device_ptr();
+                let v_bf16 = q_bf16 + (fla_total * nv * dk * 2) as u64; // upper half of scratch1
+                let beta_bf16 = attn_out;
+                let gate_bf16 = k_bf16 + (fla_total * nv * dk * 2) as u64; // after k in scratch2
+                let stream_ptr = self.stream as *mut std::ffi::c_void;
+
+                // FP32 → BF16 conversion via la_fp32_to_bf16 kernel
+                // Kernel: (out_bf16, in_fp32, D) with grid=(M,1,1), block=(D_pad,1,1)
+                // q: [fla_total, nv*dk] FP32 → BF16
+                let qk_d = (nv * dk) as i32;
+                let v_d = (nv * dv) as i32;
+                let beta_d = nv as i32;
+                let qk_threads = std::cmp::min(1024, ((nv * dk + 31) / 32) * 32) as u32;
+                let v_threads = std::cmp::min(1024, ((nv * dv + 31) / 32) * 32) as u32;
+                let beta_threads = std::cmp::min(1024, ((nv + 31) / 32) * 32) as u32;
+                unsafe {
+                    let mut p0 = q_bf16; let mut p1 = la_q; let mut p2 = qk_d;
+                    launch(self.kernels.la_fp32_to_bf16,
+                        (fla_total as u32, 1, 1), (qk_threads, 1, 1), 0, self.stream,
+                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
+                              &mut p1 as *mut _ as *mut std::ffi::c_void,
+                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
+                    let mut p0 = k_bf16; let mut p1 = la_k; let mut p2 = qk_d;
+                    launch(self.kernels.la_fp32_to_bf16,
+                        (fla_total as u32, 1, 1), (qk_threads, 1, 1), 0, self.stream,
+                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
+                              &mut p1 as *mut _ as *mut std::ffi::c_void,
+                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
+                    let mut p0 = v_bf16; let mut p1 = la_v; let mut p2 = v_d;
+                    launch(self.kernels.la_fp32_to_bf16,
+                        (fla_total as u32, 1, 1), (v_threads, 1, 1), 0, self.stream,
+                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
+                              &mut p1 as *mut _ as *mut std::ffi::c_void,
+                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
+                    let mut p0 = beta_bf16; let mut p1 = la_beta; let mut p2 = beta_d;
+                    launch(self.kernels.la_fp32_to_bf16,
+                        (fla_total as u32, 1, 1), (beta_threads, 1, 1), 0, self.stream,
+                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
+                              &mut p1 as *mut _ as *mut std::ffi::c_void,
+                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
+                    // gate: [fla_total, nv] FP32 → BF16 for cumsum input
+                    let mut p0 = gate_bf16; let mut p1 = la_gate; let mut p2 = beta_d;
+                    launch(self.kernels.la_fp32_to_bf16,
+                        (fla_total as u32, 1, 1), (beta_threads, 1, 1), 0, self.stream,
+                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
+                              &mut p1 as *mut _ as *mut std::ffi::c_void,
+                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
+                }
+
+                // Buffer assignments for FLA intermediates
+                // All FLA intermediate dtypes match what compile_kernels.py compiled:
+                //   BF16: q, k, v, beta, gate, w, u, h, h0, v_new, o, Ai
+                //   FP32: g_cumsum, A, ht
+                let la_conv_out_ptr = *self.scratch.d_la_conv_out.as_ref().ok_or("no la_conv_out")?.device_ptr();
+                let a_fla = la_conv_out_ptr;        // A: [NT*H, 64, 64] FP32
+                let ai_fla = la_k_beta;             // Ai: [NT*H, 64, 64] BF16
+                let w_fla = la_v_beta;              // w: [T, H, K] BF16
+                let u_fla = la_conv_out_ptr;        // u: [T, H, V] BF16 (reuses A after step 3)
+                let h_fla = fp32_scratch;           // h: [NT, H, K, V] BF16
+                let h_size_bytes = (fla_nt * nv * dk * dv * 2) as u64;
+                let v_new_fla = fp32_scratch + h_size_bytes; // v_new: [T, H, V] BF16
+                let v_new_size_bytes = (fla_total * nv * dv * 2) as u64;
+                let h0_fla = fp32_scratch + h_size_bytes + v_new_size_bytes; // h0: [H, K, V] BF16 (zeroed)
+                let ht_fla = la_state;              // ht: [H, K, V] FP32 (final state output)
+                let o_fla = la_v_beta;              // o: [T, H, V] BF16 (reuses w after step 5)
+
+                let fla = self.fla.as_ref().unwrap();
+                let t_arg = fla_total as i32;
+
+                // Zero h0 (BF16 initial state) — separate from ht (FP32 output)
+                unsafe {
+                    let _ = cuda_sys::lib().cuMemsetD8Async(
+                        h0_fla, 0, (nv * dk * dv * 2) as usize, self.stream);
+                }
+
+                // Step 1: cumsum — gate(BF16) → g_cumsum(FP32)
+                // Grid: (NT, B*H) = (fla_nt, nv)
+                let rc = unsafe {
+                    (fla.cumsum)(gate_bf16, la_g_cum, t_arg,
+                        fla_nt as u32, nv as u32, 1, stream_ptr)
+                };
+                if rc != 0 { return Err(format!("FLA cumsum failed: {}", rc)); }
+
+                // Step 2: kkt — k, g_cumsum, beta → A
+                // Grid: (NT, B*H) = (fla_nt, nv)
+                let rc = unsafe {
+                    (fla.kkt)(k_bf16, la_g_cum, beta_bf16, a_fla, t_arg,
+                        fla_nt as u32, nv as u32, 1, stream_ptr)
+                };
+                if rc != 0 { return Err(format!("FLA kkt failed: {}", rc)); }
+
+                // Step 3: solve_tril — A → Ai
+                // Grid: (NT, B*H) = (fla_nt, nv)
+                let rc = unsafe {
+                    (fla.solve_tril)(a_fla, ai_fla, t_arg,
+                        fla_nt as u32, nv as u32, 1, stream_ptr)
+                };
+                if rc != 0 { return Err(format!("FLA solve_tril failed: {}", rc)); }
+
+                // Step 4: recompute_w_u — k, v, beta, Ai, g → w, u
+                // Grid: (NT, B*H) = (fla_nt, nv)
+                // Note: after step 3, A (la_conv_out) is dead, so u can reuse that space
+                let rc = unsafe {
+                    (fla.wy_repr)(k_bf16, v_bf16, beta_bf16, w_fla, u_fla, ai_fla, la_g_cum, t_arg,
+                        fla_nt as u32, nv as u32, 1, stream_ptr)
+                };
+                if rc != 0 { return Err(format!("FLA wy_repr failed: {}", rc)); }
+
+                // Step 5: state_recurrence — k, u, w, g, h0 → h, v_new, ht
+                // Grid: (cdiv(V, BV), B*H) = (cdiv(dv, 32), nv) — BV=32 baked into cubin
+                // "blockdim64" in the kernel name refers to BT=64 (chunk time dim), NOT BV.
+                // C wrapper params: k, v(=u), w, v_new, g, h, h0, ht, T
+                // h0 is BF16 (zeroed), ht is FP32 — separate buffers to avoid dtype/overlap issues
+                let sr_grid_x = ((dv + 31) / 32) as u32;
+                let rc = unsafe {
+                    (fla.state_recurrence)(
+                        k_bf16,     // k (BF16)
+                        u_fla,      // v (kernel param) = Python's u (BF16)
+                        w_fla,      // w (kernel param) = Python's w (BF16)
+                        v_new_fla,  // v_new output (BF16)
+                        la_g_cum,   // g (cumsum gate, FP32)
+                        h_fla,      // h output (BF16, per-chunk states)
+                        h0_fla,     // h0 (BF16, zeroed initial state)
+                        ht_fla,     // ht (FP32, final state output)
+                        t_arg,
+                        sr_grid_x, nv as u32, 1, stream_ptr)
+                };
+                if rc != 0 { return Err(format!("FLA state_recurrence failed: {}", rc)); }
+
+                // Step 6: output — q, k, v_new, h, g → o
+                // Grid: (cdiv(V, BV), NT, B*H) = (cdiv(dv, BV), fla_nt, nv) — 3D grid
+                // BV for chunk_fwd_kernel_o was autotuned. With 8 warps: BV=128, BK=128.
+                let o_bv = 128usize; // from autotune: Config(BK=128, BV=128, num_warps=8)
+                let o_grid_x = ((dv + o_bv - 1) / o_bv) as u32;
+                // q was already pre-scaled by `scale` in step 9 (L2 norm).
+                // chunk_fwd_kernel_o multiplies ALL output by its `scale` arg (line 122:
+                //   b_o = b_o * scale + dot(A, v) * scale).
+                // Passing scale=1.0 avoids double-scaling.
+                let rc = unsafe {
+                    (fla.output)(
+                        q_bf16,     // q (already includes scale from step 9)
+                        k_bf16,     // k
+                        v_new_fla,  // v (kernel param) = v_new from step 5
+                        h_fla,      // h (per-chunk states from step 5)
+                        la_g_cum,   // g (cumsum gate, FP32)
+                        o_fla,      // o (output, BF16)
+                        1.0f32,     // scale=1.0 since q is already pre-scaled
+                        t_arg,
+                        o_grid_x, fla_nt as u32, nv as u32, stream_ptr)
+                };
+                if rc != 0 { return Err(format!("FLA output failed: {}", rc)); }
+
+                // Convert FLA output from BF16 to FP32 in la_v
+                // o_fla (la_v_beta) BF16 → la_v FP32 [fla_total, nv, dv]
+                // FLA output is [B, T, H, V] = [T, nv, dv] which is already [M, nv, dv] layout
+                unsafe {
+                    let mut p0 = la_v; let mut p1 = o_fla; let mut p2 = v_d;
+                    launch(self.kernels.la_bf16_to_fp32,
+                        (fla_total as u32, 1, 1), (v_threads, 1, 1), 0, self.stream,
+                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
+                              &mut p1 as *mut _ as *mut std::ffi::c_void,
+                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
+                }
+
+                // Copy final state to decode state buffer
+                if lw.la_recur_state_ptr != 0 {
+                    self.memcpy_d2d(lw.la_recur_state_ptr, la_state, (nv * dk * dv * 4) as u64)?;
+                }
+
+                // la_v now has [fla_total, nv, dv] FP32 — first m positions valid
+                // No transpose needed (FLA output is already [T, H, V] layout)
+            } else {
+
             // 10. Pad to multiple of chunk_size
             let pad_size = (chunk_size - m % chunk_size) % chunk_size;
             let total_len = m + pad_size;
@@ -2544,6 +3092,7 @@ impl PrefillEngine {
             // (which includes padding). We only use the first m positions after transpose.
             self.launch_transpose_3d_f32(la_v, output_buf, nv, total_len, dv)?;
             // la_v now has [total_len, nv, dv] FP32 — first m positions are valid
+            } // end else (custom chunk recurrence path)
 
             if la_diag {
                 self.stream_sync()?;
@@ -2674,10 +3223,22 @@ impl PrefillEngine {
     // ── MoE Forward ──
 
     fn forward_moe(&mut self, layer_idx: usize, m: usize) -> Result<(), String> {
-        // TODO: Fused MoE path disabled for debugging - sequential path uses proven Marlin GEMM
-        // if self.kernels.fused_moe_fn.is_some() && self.d_fused_input.is_some() {
-        //     return self.forward_moe_fused(layer_idx, m);
-        // }
+        // Use fused MoE path when available (default for prefill).
+        // Fused path: 2 kernel launches per layer (w1+w2) instead of ~1000 sequential.
+        // Uses bulk layer DMA with double-buffered cross-layer pipelining.
+        // Set KRASIS_SEQUENTIAL_MOE=1 to force sequential path for debugging.
+        let use_fused = self.kernels.fused_moe_fn.is_some()
+            && self.d_fused_input.is_some()
+            && std::env::var("KRASIS_SEQUENTIAL_MOE").is_err();
+        if use_fused {
+            if layer_idx == 0 {
+                eprintln!("[PREFILL] Using FUSED MoE path (bulk layer DMA)");
+            }
+            return self.forward_moe_fused(layer_idx, m);
+        }
+        if layer_idx == 0 {
+            eprintln!("[PREFILL] Using SEQUENTIAL MoE path");
+        }
         // Per-expert sequential dispatch
         self.forward_moe_sequential(layer_idx, m)
     }
@@ -2848,9 +3409,34 @@ impl PrefillEngine {
             }
         }
 
+        // Sync to get routing results on CPU for selective expert DMA
+        self.stream_sync()?;
+
+        // Download expert counts to determine which experts are active
+        let mut h_expert_counts = vec![0i32; n_experts];
+        unsafe {
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                h_expert_counts.as_mut_ptr() as *mut _,
+                expert_counts_ptr, (n_experts * 4) as usize);
+        }
+
+        // Download num_tokens_post_padded for fused kernel
+        let mut h_num_post = [0i32; 1];
+        unsafe {
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                h_num_post.as_mut_ptr() as *mut _,
+                *num_tokens_post_ptr, 4);
+        }
+        let total_sorted = h_num_post[0] as usize;
+        let active_experts = h_expert_counts.iter().filter(|&&c| c > 0).count();
+
+        if diag_moe && layer_idx == 0 {
+            eprintln!("[DIAG MoE L0] selective DMA: {}/{} experts active, total_sorted={}",
+                active_experts, n_experts, total_sorted);
+        }
+
         // DIAG: dump routing info for layer 0
         if diag_moe && layer_idx == 0 {
-            self.stream_sync()?;
             // topk_weights for token 0: [topk] floats
             let mut h_tw = vec![0.0f32; topk];
             unsafe {
@@ -2870,8 +3456,10 @@ impl PrefillEngine {
                 scale_factor, scoring_func, n_experts, topk);
         }
 
-        // 4. Load expert weights for this layer into contiguous GPU buffer
-        //    Uses the current buffer (A or B) of the double-buffer pair
+        // 4. Load expert weights for this layer into contiguous GPU buffer.
+        //    Uses the current buffer (A or B) of the double-buffer pair.
+        //    Bulk DMA: 4 calls per layer from pinned contiguous host memory.
+        //    HCS is for decode only — prefill loads ALL experts per layer.
         let moe_layer_idx = lw.moe_layer_idx;
         let cur = self.fused_expert_buf_cur;
         let (w1_buf, w1s_buf, w2_buf, w2s_buf) = if cur == 0 {
@@ -2886,58 +3474,17 @@ impl PrefillEngine {
         let w2_base = *w2_buf.ok_or("fused w2 buf")?.device_ptr();
         let w2s_base = *w2s_buf.ok_or("fused w2s buf")?.device_ptr();
 
-        // Skip preload if this layer was already preloaded by group pipelining
+        // Skip DMA if this layer was already preloaded by cross-layer pipelining
         if self.preloaded_moe_layer != Some(layer_idx) {
             if let Some(moe_idx) = moe_layer_idx {
                 if let Some(Some(moe_data)) = self.moe_layers.get(moe_idx) {
-                    // DMA all experts for this layer into contiguous buffer
-                    for eid in 0..moe_data.experts.len() {
-                        let e = &moe_data.experts[eid];
-                        let w1_offset = eid * self.w1_packed_per_expert;
-                        let w1s_offset = eid * self.w1_scales_per_expert;
-                        let w2_offset = eid * self.w2_packed_per_expert;
-                        let w2s_offset = eid * self.w2_scales_per_expert;
-
-                        // Check HCS first
-                        if let Some((hcs_w13p, hcs_w13s, hcs_w2p, hcs_w2s)) = self.hcs_lookup(moe_idx, eid) {
-                            // GPU-to-GPU copy from HCS location
-                            unsafe {
-                                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                                    w1_base + w1_offset as u64, hcs_w13p,
-                                    self.w1_packed_per_expert, self.copy_stream);
-                                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                                    w1s_base + w1s_offset as u64, hcs_w13s,
-                                    self.w1_scales_per_expert, self.copy_stream);
-                                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                                    w2_base + w2_offset as u64, hcs_w2p,
-                                    self.w2_packed_per_expert, self.copy_stream);
-                                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                                    w2s_base + w2s_offset as u64, hcs_w2s,
-                                    self.w2_scales_per_expert, self.copy_stream);
-                            }
-                        } else {
-                            // CPU-to-GPU DMA
-                            unsafe {
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    w1_base + w1_offset as u64,
-                                    e.w13_packed_ptr as *const _,
-                                    e.w13_packed_bytes, self.copy_stream);
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    w1s_base + w1s_offset as u64,
-                                    e.w13_scales_ptr as *const _,
-                                    e.w13_scales_bytes, self.copy_stream);
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    w2_base + w2_offset as u64,
-                                    e.w2_packed_ptr as *const _,
-                                    e.w2_packed_bytes, self.copy_stream);
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    w2s_base + w2s_offset as u64,
-                                    e.w2_scales_ptr as *const _,
-                                    e.w2_scales_bytes, self.copy_stream);
-                            }
-                        }
+                    self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+                    if layer_idx == 0 {
+                        let mb = (moe_data.bulk_w13p.1 + moe_data.bulk_w13s.1
+                            + moe_data.bulk_w2p.1 + moe_data.bulk_w2s.1) as f64 / 1e6;
+                        eprintln!("[FUSED-DMA] layer0: bulk DMA {:.1} MB ({} experts, buf={})",
+                            mb, moe_data.experts.len(), cur);
                     }
-                    // Record DMA event so compute stream waits for it
                     unsafe {
                         cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
                     }
@@ -2945,13 +3492,26 @@ impl PrefillEngine {
             }
         }
 
-        // Wait for DMA to complete
+        // Wait for DMA to complete (stream dependency, NOT context sync)
         unsafe {
             cuda_sys::lib().cuStreamWaitEvent(self.stream, self.dma_event, 0);
         }
 
-        // 5. Launch shared expert on dedicated shared_stream (gap 4: always async)
-        let has_shared = lw.shared_w1.is_some() && lw.shared_w2.is_some();
+        // Verify DMA: check first 16 bytes of fused buffer are non-zero
+        if diag_moe && layer_idx == 0 {
+            self.stream_sync()?;
+            let mut h_fused = vec![0u32; 4];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_fused.as_mut_ptr() as *mut _, w1_base, 16);
+            }
+            let is_zero = h_fused.iter().all(|&v| v == 0);
+            eprintln!("[FUSED-DMA] layer0 w1_base[0..4] = {:?} (zero={})", h_fused, is_zero);
+        }
+
+        // 5. Launch shared expert on dedicated shared_stream (async overlap with fused MoE)
+        let has_shared = (lw.shared_w1.is_some() && lw.shared_w2.is_some())
+            || (lw.shared_w1_bf16.is_some() && lw.shared_w2_bf16.is_some());
         if has_shared {
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
@@ -2960,142 +3520,65 @@ impl PrefillEngine {
             self.launch_shared_expert_on_shared_stream(layer_idx, m)?;
         }
 
-        // 6. Download num_tokens_post_padded to know total_sorted for fused kernel
-        let mut h_num_post = [0i32; 1];
-        self.stream_sync()?;
-        unsafe {
-            cuda_sys::lib().cuMemcpyDtoH_v2(
-                h_num_post.as_mut_ptr() as *mut _,
-                *num_tokens_post_ptr,
-                4,
-            );
-        }
-        let total_sorted = h_num_post[0] as usize;
-
-        // 7. Gather input tokens to sorted order
+        // 6. Replicate hidden states: [m, h] -> [m*topk, h]
+        // Required for top_k=1 trick: avoids C_tmp collision in fp32_reduce.
+        // Each (token, slot) pair needs its own entry so C_tmp positions are unique.
         let fused_input_ptr = *self.d_fused_input.as_ref().ok_or("fused_input")?.device_ptr();
-        if total_sorted > 0 {
-            let gt = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
-            let mut g0 = fused_input_ptr;
-            let mut g1 = hidden;
-            let mut g2 = *sorted_ids_ptr;
-            let mut g3 = h as i32;
-            let mut g4 = m as i32;
+        let m_topk = m * topk;
+        {
+            let rt = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
+            let mut r0 = fused_input_ptr;
+            let mut r1 = hidden;
+            let mut r2 = h as i32;
+            let mut r3 = m as i32;
+            let mut r4 = topk as i32;
             unsafe {
-                launch(self.kernels.moe_gather_sorted,
-                    (total_sorted as u32, 1, 1), (gt, 1, 1), 0, self.stream,
+                launch(self.kernels.moe_replicate_hidden,
+                    (m_topk as u32, 1, 1), (rt, 1, 1), 0, self.stream,
                     &mut [
-                        &mut g0 as *mut _ as *mut std::ffi::c_void,
-                        &mut g1 as *mut _ as *mut std::ffi::c_void,
-                        &mut g2 as *mut _ as *mut std::ffi::c_void,
-                        &mut g3 as *mut _ as *mut std::ffi::c_void,
-                        &mut g4 as *mut _ as *mut std::ffi::c_void,
+                        &mut r0 as *mut _ as *mut std::ffi::c_void,
+                        &mut r1 as *mut _ as *mut std::ffi::c_void,
+                        &mut r2 as *mut _ as *mut std::ffi::c_void,
+                        &mut r3 as *mut _ as *mut std::ffi::c_void,
+                        &mut r4 as *mut _ as *mut std::ffi::c_void,
                     ],
                 )?;
             }
         }
 
-        // DIAG: check gather output and total_sorted
-        if diag_moe && layer_idx == 0 {
-            eprintln!("[DIAG MoE L0] total_sorted={}", total_sorted);
-            if total_sorted > 0 {
-                self.stream_sync()?;
-                // Check hidden (MLP input) at token 0
-                let mut h_hid = vec![0u16; 8];
-                unsafe {
-                    cuda_sys::lib().cuMemcpyDtoH_v2(
-                        h_hid.as_mut_ptr() as *mut _,
-                        hidden, 16);
-                }
-                let hid_f32: Vec<f32> = h_hid.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-                eprintln!("[DIAG MoE L0] hidden(mlp_input)[0..8] = {:?}", hid_f32);
-
-                // Find first non-padding sorted position
-                let mut h_sids = vec![0i32; std::cmp::min(16, total_sorted)];
-                unsafe {
-                    cuda_sys::lib().cuMemcpyDtoH_v2(
-                        h_sids.as_mut_ptr() as *mut _,
-                        *sorted_ids_ptr, (h_sids.len() * 4) as usize);
-                }
-                eprintln!("[DIAG MoE L0] sorted_ids[0..{}] = {:?}", h_sids.len(), h_sids);
-
-                // Check gathered input at first REAL token (non-padding)
-                let first_real = h_sids.iter().position(|&id| id < m as i32).unwrap_or(0);
-                let mut h_gi = vec![0u16; 8];
-                unsafe {
-                    cuda_sys::lib().cuMemcpyDtoH_v2(
-                        h_gi.as_mut_ptr() as *mut _,
-                        fused_input_ptr + (first_real * h * 2) as u64, 16);
-                }
-                let gi_f32: Vec<f32> = h_gi.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-                eprintln!("[DIAG MoE L0] fused_input[sorted_pos={}(tok={})][0..8] = {:?}",
-                    first_real, h_sids[first_real], gi_f32);
-
-                // Check expert_ids
-                let n_blocks = (total_sorted + 63) / 64; // block_size=64
-                let mut h_eids = vec![0i32; std::cmp::min(16, n_blocks)];
-                unsafe {
-                    cuda_sys::lib().cuMemcpyDtoH_v2(
-                        h_eids.as_mut_ptr() as *mut _,
-                        *fused_expert_ids_ptr, (h_eids.len() * 4) as usize);
-                }
-                eprintln!("[DIAG MoE L0] expert_ids[0..{}] = {:?}", h_eids.len(), h_eids);
-                eprintln!("[DIAG MoE L0] n_blocks={}, w1_packed_per_expert={}, w1_scales_per_expert={}",
-                    n_blocks, self.w1_packed_per_expert, self.w1_scales_per_expert);
-
-                // Check expert_counts for some active experts
-                let mut h_counts = vec![0i32; n_experts];
-                unsafe {
-                    cuda_sys::lib().cuMemcpyDtoH_v2(
-                        h_counts.as_mut_ptr() as *mut _,
-                        expert_counts_ptr, (n_experts * 4) as usize);
-                }
-                let nonzero: Vec<(usize,i32)> = h_counts.iter().enumerate()
-                    .filter(|(_, &c)| c > 0).take(10).map(|(i,&c)| (i,c)).collect();
-                let total_count: i32 = h_counts.iter().sum();
-                eprintln!("[DIAG MoE L0] expert_counts total={}, first 10 nonzero={:?}", total_count, nonzero);
-
-                // Check expert_offsets at active expert indices
-                let mut h_offs_all = vec![0i32; n_experts + 1];
-                unsafe {
-                    cuda_sys::lib().cuMemcpyDtoH_v2(
-                        h_offs_all.as_mut_ptr() as *mut _,
-                        expert_offsets_ptr, ((n_experts + 1) * 4) as usize);
-                }
-                // Show offsets for experts with tokens
-                let nonzero_offs: Vec<(usize,i32,i32)> = nonzero.iter().take(5)
-                    .map(|&(e,c)| (e, h_offs_all[e], c)).collect();
-                eprintln!("[DIAG MoE L0] expert_offsets (eid,offset,count) = {:?}", nonzero_offs);
-                eprintln!("[DIAG MoE L0] expert_offsets[E]={} (should = total_sorted={})", h_offs_all[n_experts], total_sorted);
-            }
-        }
-
-        // 8. Call MarlinDefault for w1 (gate_up projection)
+        // 7. Call MarlinDefault for w1 (gate_up projection)
+        // Both w1 and w2 use top_k=1 trick: sorted_id is used as direct index.
+        // For w1: A = fused_input (replicated), kernel reads A[sorted_id] directly.
         let fused_fn = self.kernels.fused_moe_fn.ok_or("fused MoE fn not loaded")?;
         let w1_n = if gated { 2 * inter } else { inter };
         let num_groups_w1 = (h / gs) as i32;
         let fused_inter_ptr = *self.d_fused_inter_cache.as_ref().ok_or("fused_inter_cache")?.device_ptr();
         let fused_c_tmp_ptr = *self.d_fused_c_tmp.as_ref().ok_or("fused_c_tmp")?.device_ptr();
 
-        // Vendored Marlin MoE uses CUDA runtime default stream.
-        // Explicit sync before/after to ensure correct ordering.
-        self.stream_sync()?;
+        // Stream dependency: compute stream already waits on DMA event (above).
+        // Routing data is on self.stream (same as compute). No ctx sync needed.
+        let stream_ptr = self.stream as *mut std::ffi::c_void;
 
         let gs = self.config.group_size as i32;
         let q_type_ptr = &self.q_type as *const ScalarType as *const std::ffi::c_void;
 
-        // Zero the workspace lock array before fused w1 GEMM (runs on CUDA default stream).
+        // Zero the workspace lock array and C_tmp before fused w1 GEMM.
         let ws_ptr = *self.scratch.d_workspace.device_ptr();
         let ws_len = self.config.sms * 4;
         unsafe {
-            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, std::ptr::null_mut());
+            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
+            // Zero C_tmp (FP32 scratch) — Marlin uses this for fp32_reduce accumulation
+            cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, total_sorted * w1_n, self.stream);
         }
 
+        // w1: A = fused_input (replicated [m*topk, h]), top_k=1 so kernel reads A[sorted_id] directly
+        //     C written at sorted_id positions (token*topk+slot), range [0, m*topk)
+        //     C_tmp also at sorted_id positions (unique, no collision in fp32_reduce)
         unsafe {
             fused_fn(
-                fused_input_ptr as *const _,        // A: [total_sorted, K=hidden]
+                fused_input_ptr as *const _,         // A: [m*topk, K=hidden] replicated
                 w1_base as *const _,                 // B: [E, K/16, N, pack]
-                fused_inter_ptr as *mut _,           // C: [total_sorted, N=w1_n]
+                fused_inter_ptr as *mut _,           // C: written at sorted_id positions [0..m*topk)
                 fused_c_tmp_ptr as *mut _,           // C_tmp
                 std::ptr::null(),                    // b_bias (none)
                 w1s_base as *const _,                // scales: [E, num_groups, N]
@@ -3104,15 +3587,15 @@ impl PrefillEngine {
                 std::ptr::null(),                    // g_idx (none)
                 std::ptr::null(),                    // perm (none)
                 std::ptr::null(),                    // a_tmp (none)
-                *sorted_ids_ptr as *const _,         // sorted_ids
+                *sorted_ids_ptr as *const _,         // sorted_ids (vLLM format: token*topk+slot)
                 *fused_expert_ids_ptr as *const _,   // expert_ids
                 *num_tokens_post_ptr as *const _,    // num_tokens_post_padded
                 topk_weights_ptr as *const _,        // topk_weights
                 block_size,                          // moe_block_size
-                topk as i32,                         // top_k
+                1i32,                                // top_k=1: sorted_id/1 = direct index into A
                 false,                               // mul_topk_weights (false for w1)
                 false,                               // is_ep
-                total_sorted as i32,                 // size_m
+                m_topk as i32,                       // size_m = m*topk (padding threshold = m*topk*1)
                 w1_n as i32,                         // size_n
                 h as i32,                            // size_k
                 *self.scratch.d_workspace.device_ptr() as *mut _, // workspace
@@ -3124,7 +3607,7 @@ impl PrefillEngine {
                 num_groups_w1,                       // num_groups
                 gs,                                  // group_size
                 0,                                   // dev
-                std::ptr::null_mut(),                // stream_ptr (null = default)
+                stream_ptr,                          // stream_ptr (our compute stream)
                 -1,                                  // thread_k (auto)
                 -1,                                  // thread_n (auto)
                 self.config.sms as i32,              // sms
@@ -3134,56 +3617,87 @@ impl PrefillEngine {
             );
         }
 
-        // DIAG: check w1 output at both padding and real token positions
+        // DIAG: Compare MoE Marlin vs Regular Marlin for one expert
         if diag_moe && layer_idx == 0 {
-            unsafe { cuda_sys::lib().cuCtxSynchronize(); }
-            // Check C_tmp (FP32 intermediate) - this is what the kernel writes to with fp32_reduce
-            let mut h_ctmp = vec![0.0f32; 8];
+            self.stream_sync()?;
+            // Download sorted_ids and expert_ids to find first expert block
+            let mut h_sorted = vec![0i32; std::cmp::min(64, total_sorted)];
+            let mut h_expert_ids = vec![0i32; std::cmp::min(1, total_sorted / 64 + 1)];
             unsafe {
                 cuda_sys::lib().cuMemcpyDtoH_v2(
-                    h_ctmp.as_mut_ptr() as *mut _,
-                    fused_c_tmp_ptr, 32);
-            }
-            eprintln!("[DIAG MoE L0] C_tmp[0..8] (FP32) = {:?}", h_ctmp);
-            // Check C_tmp at a real token position (position 4 * w1_n = 4 * 1024)
-            let mut h_ctmp_r = vec![0.0f32; 8];
-            unsafe {
+                    h_sorted.as_mut_ptr() as *mut _, *sorted_ids_ptr, (h_sorted.len() * 4) as usize);
                 cuda_sys::lib().cuMemcpyDtoH_v2(
-                    h_ctmp_r.as_mut_ptr() as *mut _,
-                    fused_c_tmp_ptr + (4 * w1_n * 4) as u64, 32);
+                    h_expert_ids.as_mut_ptr() as *mut _, *fused_expert_ids_ptr, (h_expert_ids.len() * 4) as usize);
             }
-            eprintln!("[DIAG MoE L0] C_tmp[pos4, 0..8] (FP32) = {:?}", h_ctmp_r);
+            let first_expert = h_expert_ids[0] as usize;
+            let first_sid = h_sorted[0]; // sorted_id for first token of first expert
+            let first_token = first_sid / topk as i32;
+            eprintln!("[DIAG FUSED L0] first expert block: expert={}, sorted_id={}, token={}",
+                first_expert, first_sid, first_token);
 
-            // Check position 0 (padding)
-            let mut h_w1 = vec![0u16; 8];
+            // Read fused w1 output at sorted_id position
+            let w1_n_check = if gated { 2 * inter } else { inter };
+            let fused_w1_offset = (first_sid as usize) * w1_n_check * 2;
+            let mut h_fused_w1 = vec![0u16; std::cmp::min(8, w1_n_check)];
             unsafe {
                 cuda_sys::lib().cuMemcpyDtoH_v2(
-                    h_w1.as_mut_ptr() as *mut _,
-                    fused_inter_ptr, 16);
+                    h_fused_w1.as_mut_ptr() as *mut _,
+                    fused_inter_ptr + fused_w1_offset as u64, (h_fused_w1.len() * 2) as usize);
             }
-            let w1_f32: Vec<f32> = h_w1.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-            eprintln!("[DIAG MoE L0] fused_inter[sorted_pos=0](w1 out) = {:?}", w1_f32);
-            // Check first real token position (sorted_pos=4 from earlier)
-            let real_pos = 4usize; // first non-padding position
-            let mut h_w1r = vec![0u16; 8];
+            let fused_vals: Vec<f32> = h_fused_w1.iter()
+                .map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+
+            // Now run the REGULAR Marlin GEMM for the same expert and token for comparison
+            // Use the fused buffer's expert weights (same as what MoE kernel used)
+            let ref_w13 = MarlinWeight {
+                packed: w1_base + (first_expert * self.w1_packed_per_expert) as u64,
+                scales: w1s_base + (first_expert * self.w1_scales_per_expert) as u64,
+                n: w1_n, k: h,
+                num_groups: (h / self.config.group_size),
+                group_size: self.config.group_size, num_bits: bits,
+            };
+            // A = hidden state for first_token
+            let a_ptr = hidden + (first_token as usize * h * 2) as u64;
+            // C = write to a temp area (reuse some scratch)
+            let ref_c = *self.scratch.d_scratch2.device_ptr();
+            self.marlin_gemm(a_ptr, &ref_w13, ref_c, 1)?;
+            self.stream_sync()?;
+            let mut h_ref_w1 = vec![0u16; std::cmp::min(8, w1_n_check)];
             unsafe {
                 cuda_sys::lib().cuMemcpyDtoH_v2(
-                    h_w1r.as_mut_ptr() as *mut _,
-                    fused_inter_ptr + (real_pos * w1_n * 2) as u64, 16);
+                    h_ref_w1.as_mut_ptr() as *mut _, ref_c, (h_ref_w1.len() * 2) as usize);
             }
-            let w1r_f32: Vec<f32> = h_w1r.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-            eprintln!("[DIAG MoE L0] fused_inter[sorted_pos=4](w1 out) = {:?}", w1r_f32);
-            // Also check expert buffer (are weights loaded?)
-            let mut h_ew = vec![0u32; 4];
+            let ref_vals: Vec<f32> = h_ref_w1.iter()
+                .map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+
+            // Also compute full-row L2 for both
+            let mut h_fused_full = vec![0u16; w1_n_check];
+            let mut h_ref_full = vec![0u16; w1_n_check];
             unsafe {
                 cuda_sys::lib().cuMemcpyDtoH_v2(
-                    h_ew.as_mut_ptr() as *mut _,
-                    w1_base, 16);
+                    h_fused_full.as_mut_ptr() as *mut _,
+                    fused_inter_ptr + fused_w1_offset as u64, (w1_n_check * 2) as usize);
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_ref_full.as_mut_ptr() as *mut _, ref_c, (w1_n_check * 2) as usize);
             }
-            eprintln!("[DIAG MoE L0] w1_base (expert packed)[0..4] = {:?}", h_ew);
+            let fused_l2: f32 = h_fused_full.iter().map(|&v| {
+                let f = half::bf16::from_bits(v).to_f32(); f * f
+            }).sum::<f32>().sqrt();
+            let ref_l2: f32 = h_ref_full.iter().map(|&v| {
+                let f = half::bf16::from_bits(v).to_f32(); f * f
+            }).sum::<f32>().sqrt();
+
+            eprintln!("[DIAG FUSED L0] w1_moe[expert{}][0..8]  = {:?}, L2={:.4}",
+                first_expert, fused_vals, fused_l2);
+            eprintln!("[DIAG FUSED L0] w1_reg[expert{}][0..8]  = {:?}, L2={:.4}",
+                first_expert, ref_vals, ref_l2);
+            let match_count = fused_vals.iter().zip(ref_vals.iter())
+                .filter(|&(a, b)| (*a - *b).abs() < 0.01).count();
+            eprintln!("[DIAG FUSED L0] w1 match: {}/{} values within 0.01", match_count, fused_vals.len());
         }
 
         // 9. Activation (silu_mul or relu2) on fused_inter -> fused_inter2
+        // w1 writes C at sorted_id positions [0..m*topk), so activation grid = m_topk
         let fused_inter2_ptr = *self.d_fused_inter2.as_ref().ok_or("fused_inter2")?.device_ptr();
         if gated {
             let act_t = std::cmp::max(32, ((std::cmp::min(1024, inter) + 31) / 32) * 32) as u32;
@@ -3193,7 +3707,7 @@ impl PrefillEngine {
             let kernel = if activation == 1 { self.kernels.relu2 } else { self.kernels.silu_mul };
             unsafe {
                 launch(kernel,
-                    (total_sorted as u32, 1, 1), (act_t, 1, 1), 0, std::ptr::null_mut(), // default stream
+                    (m_topk as u32, 1, 1), (act_t, 1, 1), 0, self.stream,
                     &mut [
                         &mut ac0 as *mut _ as *mut std::ffi::c_void,
                         &mut ac1 as *mut _ as *mut std::ffi::c_void,
@@ -3209,7 +3723,7 @@ impl PrefillEngine {
             let mut ac2 = inter as i32;
             unsafe {
                 launch(self.kernels.relu2,
-                    (total_sorted as u32, 1, 1), (act_t, 1, 1), 0, std::ptr::null_mut(),
+                    (m_topk as u32, 1, 1), (act_t as u32, 1, 1), 0, self.stream,
                     &mut [
                         &mut ac0 as *mut _ as *mut std::ffi::c_void,
                         &mut ac1 as *mut _ as *mut std::ffi::c_void,
@@ -3219,22 +3733,23 @@ impl PrefillEngine {
             }
         }
 
-        // 10. MarlinDefault for w2 (down projection), with topk_weights multiplication
+        // 10. MarlinDefault for w2 (down projection)
+        // w2 trick: top_k=1, size_m=m*topk so kernel reads A[sorted_id/1] = A[sorted_id] directly
+        // This lets each (token,expert) pair access its own intermediate result
         let fused_output_ptr = *self.d_fused_output.as_ref().ok_or("fused_output")?.device_ptr();
         let num_groups_w2 = (inter / self.config.group_size) as i32;
         let w2_input = if gated { fused_inter2_ptr } else { fused_inter_ptr };
 
-        // Apply scale_factor to topk_weights before w2 if needed
-        // MarlinDefault multiplies output by topk_weights when mul_topk_weights=true
-        // Zero workspace before fused w2 GEMM
+        // Zero workspace and C_tmp before fused w2 GEMM
         unsafe {
-            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, std::ptr::null_mut());
+            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
+            cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, total_sorted * h, self.stream);
         }
         unsafe {
             fused_fn(
-                w2_input as *const _,                // A: [total_sorted, K=inter]
+                w2_input as *const _,                // A: [m*topk, K=inter] indexed by sorted_id
                 w2_base as *const _,                  // B: [E, K/16, N, pack]
-                fused_output_ptr as *mut _,           // C: [total_sorted, N=hidden]
+                fused_output_ptr as *mut _,           // C: written at sorted_id positions [0..m*topk)
                 fused_c_tmp_ptr as *mut _,            // C_tmp
                 std::ptr::null(),                     // b_bias (none)
                 w2s_base as *const _,                 // scales
@@ -3243,15 +3758,15 @@ impl PrefillEngine {
                 std::ptr::null(),                     // g_idx (none)
                 std::ptr::null(),                     // perm (none)
                 std::ptr::null(),                     // a_tmp (none)
-                *sorted_ids_ptr as *const _,          // sorted_ids
+                *sorted_ids_ptr as *const _,          // sorted_ids (vLLM format)
                 *fused_expert_ids_ptr as *const _,    // expert_ids
                 *num_tokens_post_ptr as *const _,     // num_tokens_post_padded
                 topk_weights_ptr as *const _,         // topk_weights
                 block_size,                           // moe_block_size
-                topk as i32,                          // top_k
-                true,                                 // mul_topk_weights (true for w2)
+                1i32,                                 // top_k=1: sorted_id/1 = direct index into A
+                false,                                // mul_topk_weights=false (scatter handles it)
                 false,                                // is_ep
-                total_sorted as i32,                  // size_m
+                m_topk as i32,                        // size_m = m*topk (padding threshold = m*topk*1)
                 h as i32,                             // size_n
                 inter as i32,                         // size_k
                 *self.scratch.d_workspace.device_ptr() as *mut _, // workspace
@@ -3263,7 +3778,7 @@ impl PrefillEngine {
                 num_groups_w2,                        // num_groups
                 gs,                                   // group_size
                 0,                                    // dev
-                std::ptr::null_mut(),                 // stream_ptr (null = default)
+                stream_ptr,                           // stream_ptr
                 -1,                                   // thread_k (auto)
                 -1,                                   // thread_n (auto)
                 self.config.sms as i32,               // sms
@@ -3273,15 +3788,122 @@ impl PrefillEngine {
             );
         }
 
-        // Sync default stream -> self.stream (MarlinDefault uses CUDA default stream)
-        // Record event on default stream (null), then wait on our compute stream.
-        // This is targeted — does NOT block shared_stream.
-        unsafe {
-            cuda_sys::lib().cuEventRecord(self.compute_event, std::ptr::null_mut());
-            cuda_sys::lib().cuStreamWaitEvent(self.stream, self.compute_event, 0);
+        // DIAG: compare fused w2 output vs ORIGINAL weights (HCS/cold) for token 0's experts
+        if diag_moe && layer_idx == 0 {
+            self.stream_sync()?;
+            let mut h_ti = vec![0i32; topk];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_ti.as_mut_ptr() as *mut _, topk_ids_ptr, (topk * 4) as usize);
+            }
+            let ref_c1 = *self.scratch.d_scratch2.device_ptr();
+            let ref_act_out = ref_c1 + (w1_n * 2) as u64;
+            let ref_c2 = ref_act_out + (inter * 2) as u64;
+            let act_t = std::cmp::max(32, ((std::cmp::min(1024, inter) + 31) / 32) * 32) as u32;
+
+            for slot in 0..topk {
+                let eid = h_ti[slot] as usize;
+                // Get ORIGINAL weight locations (HCS or cold), NOT from fused buffer
+                let (orig_w1p, orig_w1s, orig_w2p, orig_w2s) =
+                    if let Some(moe_idx) = moe_layer_idx {
+                        if let Some((hw1p, hw1s, hw2p, hw2s)) = self.hcs_lookup(moe_idx, eid) {
+                            (hw1p, hw1s, hw2p, hw2s)
+                        } else {
+                            // Cold expert: skip (would need H2D copy)
+                            let fused_slot_ptr = fused_output_ptr + (slot * h * 2) as u64;
+                            let fused_l2: f32 = {
+                                let mut buf = vec![0u16; h];
+                                unsafe { cuda_sys::lib().cuMemcpyDtoH_v2(
+                                    buf.as_mut_ptr() as *mut _, fused_slot_ptr, (h * 2) as usize); }
+                                buf.iter().map(|&v| { let f = half::bf16::from_bits(v).to_f32(); f*f }).sum::<f32>().sqrt()
+                            };
+                            eprintln!("[DIAG FUSED L0] slot{} expert={}: fused_L2={:.4} (COLD, skip orig comparison)", slot, eid, fused_l2);
+                            continue;
+                        }
+                    } else { continue; };
+
+                // Run pipeline with ORIGINAL weights
+                let orig_w13 = MarlinWeight {
+                    packed: orig_w1p, scales: orig_w1s,
+                    n: w1_n, k: h,
+                    num_groups: (h / self.config.group_size),
+                    group_size: self.config.group_size, num_bits: bits,
+                };
+                self.marlin_gemm(hidden, &orig_w13, ref_c1, 1)?;
+                if gated {
+                    let mut ac0 = ref_act_out; let mut ac1 = ref_c1; let mut ac2 = inter as i32;
+                    let kernel = if activation == 1 { self.kernels.relu2 } else { self.kernels.silu_mul };
+                    unsafe {
+                        launch(kernel, (1, 1, 1), (act_t, 1, 1), 0, self.stream,
+                            &mut [&mut ac0 as *mut _ as *mut std::ffi::c_void,
+                                  &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                                  &mut ac2 as *mut _ as *mut std::ffi::c_void])?;
+                    }
+                }
+                let orig_w2 = MarlinWeight {
+                    packed: orig_w2p, scales: orig_w2s,
+                    n: h, k: inter,
+                    num_groups: (inter / self.config.group_size),
+                    group_size: self.config.group_size, num_bits: bits,
+                };
+                let w2_in = if gated { ref_act_out } else { ref_c1 };
+                self.marlin_gemm(w2_in, &orig_w2, ref_c2, 1)?;
+                self.stream_sync()?;
+
+                let fused_slot_ptr = fused_output_ptr + (slot * h * 2) as u64;
+                let mut h_fused = vec![0u16; h];
+                let mut h_orig = vec![0u16; h];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(h_fused.as_mut_ptr() as *mut _, fused_slot_ptr, (h * 2) as usize);
+                    cuda_sys::lib().cuMemcpyDtoH_v2(h_orig.as_mut_ptr() as *mut _, ref_c2, (h * 2) as usize);
+                }
+                let fused_l2: f32 = h_fused.iter().map(|&v| { let f = half::bf16::from_bits(v).to_f32(); f*f }).sum::<f32>().sqrt();
+                let orig_l2: f32 = h_orig.iter().map(|&v| { let f = half::bf16::from_bits(v).to_f32(); f*f }).sum::<f32>().sqrt();
+                let diff_l2: f32 = h_fused.iter().zip(h_orig.iter()).map(|(&a, &b)| {
+                    let fa = half::bf16::from_bits(a).to_f32();
+                    let fb = half::bf16::from_bits(b).to_f32();
+                    (fa - fb) * (fa - fb)
+                }).sum::<f32>().sqrt();
+                let status = if diff_l2 < 0.01 { "MATCH" } else if diff_l2 < orig_l2 * 0.1 { "CLOSE" } else { "DIFFER" };
+                eprintln!("[DIAG FUSED L0] slot{} expert={}: fused_L2={:.4} orig_L2={:.4} diff_L2={:.4} ({})",
+                    slot, eid, fused_l2, orig_l2, diff_l2, status);
+            }
         }
 
-        // 11. Zero accumulator then scatter-add fused output back to [M, hidden]
+        // DIAG: manually compute accum for token 0 from fused_output and compare with kernel
+        if diag_moe && layer_idx == 0 {
+            self.stream_sync()?;
+            // Read fused_output for token 0's 10 slots (positions 0..topk-1)
+            let mut manual_accum = vec![0.0f32; h];
+            let mut h_tw = vec![0.0f32; topk];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_tw.as_mut_ptr() as *mut _, topk_weights_ptr, (topk * 4) as usize);
+            }
+            for k in 0..topk {
+                let mut h_row = vec![0u16; h];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_row.as_mut_ptr() as *mut _,
+                        fused_output_ptr + (k * h * 2) as u64, (h * 2) as usize);
+                }
+                let w = h_tw[k] * scale_factor;
+                let row_l2: f32 = h_row.iter().map(|&v| {
+                    let f = half::bf16::from_bits(v).to_f32(); f * f
+                }).sum::<f32>().sqrt();
+                eprintln!("[DIAG FUSED L0] fused_output[slot{}] L2={:.4}, topk_w={:.4}",
+                    k, row_l2, h_tw[k]);
+                for i in 0..h {
+                    manual_accum[i] += half::bf16::from_bits(h_row[i]).to_f32() * w;
+                }
+            }
+            let manual_l2: f32 = manual_accum.iter().map(|v| v*v).sum::<f32>().sqrt();
+            eprintln!("[DIAG FUSED L0] manual_accum[tok0][0..8] = {:?}, L2={:.4}",
+                &manual_accum[..8], manual_l2);
+        }
+
+        // 11. Zero accumulator then scatter-add with topk_weights * scale_factor
+        // moe_scatter_weighted iterates m*topk entries (no padding waste)
         let moe_accum = *self.scratch.d_moe_accum.device_ptr();
         {
             let zt = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
@@ -3299,17 +3921,18 @@ impl PrefillEngine {
                 )?;
             }
         }
-        if total_sorted > 0 {
+        if m_topk > 0 {
             let st = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
             let mut s0 = moe_accum;
             let mut s1 = fused_output_ptr;
-            let mut s2 = *sorted_ids_ptr;
+            let mut s2 = topk_weights_ptr;
             let mut s3 = h as i32;
             let mut s4 = m as i32;
-            let mut s5 = scale_factor;
+            let mut s5 = topk as i32;
+            let mut s6 = scale_factor;
             unsafe {
-                launch(self.kernels.moe_scatter_fused,
-                    (total_sorted as u32, 1, 1), (st, 1, 1), 0, self.stream,
+                launch(self.kernels.moe_scatter_weighted,
+                    (m_topk as u32, 1, 1), (st, 1, 1), 0, self.stream,
                     &mut [
                         &mut s0 as *mut _ as *mut std::ffi::c_void,
                         &mut s1 as *mut _ as *mut std::ffi::c_void,
@@ -3317,6 +3940,7 @@ impl PrefillEngine {
                         &mut s3 as *mut _ as *mut std::ffi::c_void,
                         &mut s4 as *mut _ as *mut std::ffi::c_void,
                         &mut s5 as *mut _ as *mut std::ffi::c_void,
+                        &mut s6 as *mut _ as *mut std::ffi::c_void,
                     ],
                 )?;
             }
@@ -3325,59 +3949,107 @@ impl PrefillEngine {
         // DIAG: check accum after scatter (before shared expert)
         if diag_moe && layer_idx == 0 {
             self.stream_sync()?;
-            // Read full FP32 accum for ALL tokens
-            let mut h_accum_all = vec![0.0f32; m * h];
+            let mut h_acc = vec![0.0f32; std::cmp::min(8, h)];
             unsafe {
                 cuda_sys::lib().cuMemcpyDtoH_v2(
-                    h_accum_all.as_mut_ptr() as *mut _,
-                    moe_accum, (m * h * 4) as usize);
+                    h_acc.as_mut_ptr() as *mut _, moe_accum, (h_acc.len() * 4) as usize);
             }
-            // Per-token norms
-            for tok in [0usize, 1, 16, 20] {
-                if tok < m {
-                    let row = &h_accum_all[tok*h..(tok+1)*h];
-                    let norm: f32 = row.iter().map(|v| v*v).sum::<f32>().sqrt();
-                    let maxv = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    eprintln!("[DIAG MoE L0] accum[tok={}] norm={:.6}, max={:.6}", tok, norm, maxv);
-                }
-            }
-            // Full accum stats
-            let full_norm: f32 = h_accum_all.iter().map(|v| v*v).sum::<f32>().sqrt();
-            let full_max = h_accum_all.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            eprintln!("[DIAG MoE L0] accum full: norm={:.6}, max={:.6}", full_norm, full_max);
-
-            // Also check one slot of fused_output to see if routing weights were applied
-            let mut h_fout = vec![0u16; std::cmp::min(8, h)];
+            // Also check L2 norm of full accum for token 0
+            let mut h_acc_full = vec![0.0f32; h];
             unsafe {
                 cuda_sys::lib().cuMemcpyDtoH_v2(
-                    h_fout.as_mut_ptr() as *mut _,
-                    fused_output_ptr, (h_fout.len() * 2) as usize);
+                    h_acc_full.as_mut_ptr() as *mut _, moe_accum, (h * 4) as usize);
             }
-            let f_f32: Vec<f32> = h_fout.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-            eprintln!("[DIAG MoE L0] fused_output[0][0..8] = {:?}", f_f32);
+            let norm: f32 = h_acc_full.iter().map(|v| v*v).sum::<f32>().sqrt();
+            eprintln!("[DIAG FUSED L0] accum[tok0][0..8] = {:?}, L2={:.4}", h_acc, norm);
         }
 
-        // 12. Wait for shared expert and add to accumulator
+        // 12. Wait for shared expert on shared_stream, then add to accumulator with sigmoid gate
         if has_shared {
+            // Wait for shared expert to complete on shared_stream
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.shared_event, self.shared_stream);
                 cuda_sys::lib().cuStreamWaitEvent(self.stream, self.shared_event, 0);
             }
             let s1_buf = *self.scratch.d_scratch1.device_ptr();
-            let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
-            let mut as0 = moe_accum; let mut as1 = s1_buf;
-            let mut as2 = m as i32; let mut as3 = h as i32;
-            unsafe {
-                launch(self.kernels.moe_add_shared,
-                    (m as u32, 1, 1), (ast, 1, 1), 0, self.stream,
-                    &mut [
-                        &mut as0 as *mut _ as *mut std::ffi::c_void,
-                        &mut as1 as *mut _ as *mut std::ffi::c_void,
-                        &mut as2 as *mut _ as *mut std::ffi::c_void,
-                        &mut as3 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
+            let lw_ref = &self.layer_weights[layer_idx];
+
+            // Add shared expert to accumulator (with optional sigmoid gate)
+            let sg_ptr = lw_ref.shared_gate_ptr;
+            if sg_ptr != 0 {
+                // Compute shared gate: hidden [m, h] @ gate [h, 1] -> gate_out [m, 1] FP32
+                let gate_out = *self.scratch.d_gate_out.device_ptr();
+                let alpha: f32 = 1.0;
+                let beta: f32 = 0.0;
+                unsafe {
+                    use cudarc::cublas::sys as cublas_sys;
+                    use cudarc::cublas::result as cublas_result;
+                    cublas_result::set_stream(
+                        self.cublas_handle,
+                        self.stream as cublas_sys::cudaStream_t,
+                    ).map_err(|e| format!("cublas set_stream: {:?}", e))?;
+                    cublas_result::gemm_ex(
+                        self.cublas_handle,
+                        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                        lw_ref.shared_gate_rows as i32, m as i32, lw_ref.shared_gate_cols as i32,
+                        &alpha as *const f32 as *const std::ffi::c_void,
+                        sg_ptr as *const std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_16BF, lw_ref.shared_gate_cols as i32,
+                        hidden as *const std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
+                        &beta as *const f32 as *const std::ffi::c_void,
+                        gate_out as *mut std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_32F, lw_ref.shared_gate_rows as i32,
+                        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).map_err(|e| format!("shared gate GEMM: {:?}", e))?;
+                }
+                // Add shared expert with sigmoid gating
+                let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
+                let mut as0 = moe_accum; let mut as1 = s1_buf;
+                let mut as2 = gate_out; let mut as3 = m as i32; let mut as4 = h as i32;
+                unsafe {
+                    launch(self.kernels.moe_add_shared_gated,
+                        (m as u32, 1, 1), (ast, 1, 1), 0, self.stream,
+                        &mut [
+                            &mut as0 as *mut _ as *mut std::ffi::c_void,
+                            &mut as1 as *mut _ as *mut std::ffi::c_void,
+                            &mut as2 as *mut _ as *mut std::ffi::c_void,
+                            &mut as3 as *mut _ as *mut std::ffi::c_void,
+                            &mut as4 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+            } else {
+                // No gate, add directly
+                let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
+                let mut as0 = moe_accum; let mut as1 = s1_buf;
+                let mut as2 = m as i32; let mut as3 = h as i32;
+                unsafe {
+                    launch(self.kernels.moe_add_shared,
+                        (m as u32, 1, 1), (ast, 1, 1), 0, self.stream,
+                        &mut [
+                            &mut as0 as *mut _ as *mut std::ffi::c_void,
+                            &mut as1 as *mut _ as *mut std::ffi::c_void,
+                            &mut as2 as *mut _ as *mut std::ffi::c_void,
+                            &mut as3 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
             }
+        }
+
+        // DIAG: accum after shared expert add
+        if diag_moe && layer_idx == 0 {
+            self.stream_sync()?;
+            let mut h_acc = vec![0.0f32; h];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_acc.as_mut_ptr() as *mut _, moe_accum, (h * 4) as usize);
+            }
+            let norm: f32 = h_acc.iter().map(|v| v*v).sum::<f32>().sqrt();
+            eprintln!("[DIAG FUSED L0] accum_after_shared[tok0] L2={:.4} first4={:?}", norm, &h_acc[..4]);
         }
 
         // 13. Convert FP32 accum -> BF16 hidden
@@ -3396,6 +4068,21 @@ impl PrefillEngine {
                     ],
                 )?;
             }
+        }
+
+        // DIAG: d_hidden after bf16 conversion
+        if diag_moe && layer_idx == 0 {
+            self.stream_sync()?;
+            let mut h_hid = vec![0u16; h];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_hid.as_mut_ptr() as *mut _, hidden, (h * 2) as usize);
+            }
+            let norm: f32 = h_hid.iter().map(|&v| {
+                let f = half::bf16::from_bits(v).to_f32(); f*f
+            }).sum::<f32>().sqrt();
+            eprintln!("[DIAG FUSED L0] hidden_after_bf16[tok0] L2={:.4} first4={:?}",
+                norm, h_hid[..4].iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect::<Vec<f32>>());
         }
 
         Ok(())
@@ -3963,6 +4650,23 @@ impl PrefillEngine {
             eprintln!("[DIAG] layer{:02}_moe routed_accum {}", layer_idx, routed_parts.join(" "));
         }
 
+        // DIAG: sequential path accum before shared expert (compare with fused)
+        if diag && layer_idx == 0 {
+            self.stream_sync()?;
+            let mut h_acc = vec![0.0f32; std::cmp::min(8, h)];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_acc.as_mut_ptr() as *mut _, moe_accum, (h_acc.len() * 4) as usize);
+            }
+            let mut h_acc_full = vec![0.0f32; h];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_acc_full.as_mut_ptr() as *mut _, moe_accum, (h * 4) as usize);
+            }
+            let norm: f32 = h_acc_full.iter().map(|v| v*v).sum::<f32>().sqrt();
+            eprintln!("[DIAG SEQ L0] accum[tok0][0..8] = {:?}, L2={:.4}", h_acc, norm);
+        }
+
         // 10. Shared expert: add to accumulator
         if has_shared {
             if shared_async {
@@ -4480,7 +5184,59 @@ impl PrefillEngine {
     }
 
     /// Preload next MoE layer's expert weights into the other buffer (gap 2).
+    /// Bulk DMA all expert weights for a MoE layer to GPU fused buffer.
+    /// Uses 4 contiguous H2D transfers (pinned host -> GPU) from per-layer backing.
+    /// Falls back to per-expert DMA if contiguous backing not available.
+    fn bulk_dma_layer(
+        &self,
+        moe_data: &PrefillMoeLayerData,
+        w1_base: u64, w1s_base: u64, w2_base: u64, w2s_base: u64,
+    ) -> Result<(), String> {
+        if moe_data.bulk_w13p.0 != 0 {
+            // Fast path: 4 bulk DMA calls from contiguous pinned host memory
+            unsafe {
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    w1_base, moe_data.bulk_w13p.0 as *const _,
+                    moe_data.bulk_w13p.1, self.copy_stream);
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    w1s_base, moe_data.bulk_w13s.0 as *const _,
+                    moe_data.bulk_w13s.1, self.copy_stream);
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    w2_base, moe_data.bulk_w2p.0 as *const _,
+                    moe_data.bulk_w2p.1, self.copy_stream);
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    w2s_base, moe_data.bulk_w2s.0 as *const _,
+                    moe_data.bulk_w2s.1, self.copy_stream);
+            }
+        } else {
+            // Fallback: per-expert DMA (4 calls per expert)
+            for (eid, e) in moe_data.experts.iter().enumerate() {
+                let w1_off = (eid * self.w1_packed_per_expert) as u64;
+                let w1s_off = (eid * self.w1_scales_per_expert) as u64;
+                let w2_off = (eid * self.w2_packed_per_expert) as u64;
+                let w2s_off = (eid * self.w2_scales_per_expert) as u64;
+                unsafe {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        w1_base + w1_off, e.w13_packed_ptr as *const _,
+                        e.w13_packed_bytes, self.copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        w1s_base + w1s_off, e.w13_scales_ptr as *const _,
+                        e.w13_scales_bytes, self.copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        w2_base + w2_off, e.w2_packed_ptr as *const _,
+                        e.w2_packed_bytes, self.copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        w2s_base + w2s_off, e.w2_scales_ptr as *const _,
+                        e.w2_scales_bytes, self.copy_stream);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Called after forward_moe completes for the current layer.
+    /// Starts async DMA of next MoE layer's experts into the other buffer
+    /// while compute continues on the current buffer.
     fn preload_next_moe_layer(&mut self, current_layer: usize, num_layers: usize) -> Result<(), String> {
         // Find the next MoE layer
         let mut next_moe_layer = None;
@@ -4516,58 +5272,16 @@ impl PrefillEngine {
         let w2_base = match w2_buf { Some(b) => *b.device_ptr(), None => return Ok(()) };
         let w2s_base = match w2s_buf { Some(b) => *b.device_ptr(), None => return Ok(()) };
 
-        // Record compute event so DMA waits for current compute to stop using the old buffer
+        // Record compute event so copy_stream waits for current compute
+        // to finish using the buffer before we overwrite it
         unsafe {
             cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
             cuda_sys::lib().cuStreamWaitEvent(self.copy_stream, self.compute_event, 0);
         }
 
-        // DMA all experts for next layer into the other buffer
+        // Bulk DMA all experts for next layer into the other buffer
         if let Some(Some(moe_data)) = self.moe_layers.get(next_moe_idx) {
-            for eid in 0..moe_data.experts.len() {
-                let e = &moe_data.experts[eid];
-                let w1_offset = eid * self.w1_packed_per_expert;
-                let w1s_offset = eid * self.w1_scales_per_expert;
-                let w2_offset = eid * self.w2_packed_per_expert;
-                let w2s_offset = eid * self.w2_scales_per_expert;
-
-                if let Some((hcs_w13p, hcs_w13s, hcs_w2p, hcs_w2s)) = self.hcs_lookup(next_moe_idx, eid) {
-                    unsafe {
-                        cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                            w1_base + w1_offset as u64, hcs_w13p,
-                            self.w1_packed_per_expert, self.copy_stream);
-                        cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                            w1s_base + w1s_offset as u64, hcs_w13s,
-                            self.w1_scales_per_expert, self.copy_stream);
-                        cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                            w2_base + w2_offset as u64, hcs_w2p,
-                            self.w2_packed_per_expert, self.copy_stream);
-                        cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                            w2s_base + w2s_offset as u64, hcs_w2s,
-                            self.w2_scales_per_expert, self.copy_stream);
-                    }
-                } else {
-                    unsafe {
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            w1_base + w1_offset as u64,
-                            e.w13_packed_ptr as *const _,
-                            e.w13_packed_bytes, self.copy_stream);
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            w1s_base + w1s_offset as u64,
-                            e.w13_scales_ptr as *const _,
-                            e.w13_scales_bytes, self.copy_stream);
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            w2_base + w2_offset as u64,
-                            e.w2_packed_ptr as *const _,
-                            e.w2_packed_bytes, self.copy_stream);
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            w2s_base + w2s_offset as u64,
-                            e.w2_scales_ptr as *const _,
-                            e.w2_scales_bytes, self.copy_stream);
-                    }
-                }
-            }
-            // Record DMA event so next layer's forward_moe_fused can wait on it
+            self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
             }
@@ -5097,9 +5811,12 @@ impl PrefillKernels {
                 "moe_padded_prefix_sum_kernel",
                 "moe_scatter_sorted_kernel",
                 "moe_gather_sorted_kernel",
+                "moe_replicate_hidden_kernel",
                 "moe_scatter_fused_kernel",
+                "moe_scatter_weighted_kernel",
                 "moe_accum_to_bf16_kernel",
                 "kv_cache_append_fp8_kernel",
+                "kv_cache_dequant_concat_kernel",
             ],
         ).map_err(|e| format!("Load prefill PTX: {e}"))?;
 
@@ -5154,6 +5871,7 @@ impl PrefillKernels {
             moe_sum_reduce: get("moe_sum_reduce_kernel")?,
             gqa_prefill: get("gqa_prefill_kernel")?,
             kv_cache_append: get("kv_cache_append_kernel")?,
+            kv_dequant_concat: get("kv_cache_dequant_concat_kernel")?,
             causal_conv1d: get("causal_conv1d_fwd_kernel")?,
             mamba2_ssd: get("mamba2_ssd_sequential_kernel")?,
             mamba2_extract: get("mamba2_extract_kernel")?,
@@ -5197,9 +5915,12 @@ impl PrefillKernels {
             moe_padded_prefix_sum: get("moe_padded_prefix_sum_kernel")?,
             moe_scatter_sorted: get("moe_scatter_sorted_kernel")?,
             moe_gather_sorted: get("moe_gather_sorted_kernel")?,
+            moe_replicate_hidden: get("moe_replicate_hidden_kernel")?,
             moe_scatter_fused: get("moe_scatter_fused_kernel")?,
+            moe_scatter_weighted: get("moe_scatter_weighted_kernel")?,
             marlin_mm,
             fused_moe_fn: load_fused_moe(),
+            flash_attn_fwd: load_flash_attn(),
         })
     }
 
@@ -5445,6 +6166,10 @@ pub fn allocate_scratch(
             let qkvz_dim = config.la_num_k_heads * group_dim;
             Some(alloc_u16(max_tokens * qkvz_dim, "la_proj_buf")?)
         } else { None },
+        d_fa2_lse: if config.num_q_heads > 0 {
+            // FA2 softmax_lse: [num_heads, max_tokens] in unpadded format
+            Some(alloc_f32(config.num_q_heads * max_tokens, "fa2_lse")?)
+        } else { None },
         max_tokens,
     })
 }
@@ -5479,22 +6204,167 @@ fn load_marlin_mm() -> Option<MarlinMmFn> {
 }
 
 fn load_fused_moe() -> Option<FusedMoeFn> {
-    let path = find_marlin_so()?;
+    let path = match find_marlin_so() {
+        Some(p) => p,
+        None => {
+            eprintln!("[FUSED-MOE] find_marlin_so() returned None — fused MoE unavailable");
+            return None;
+        }
+    };
     unsafe {
         let lib = libc::dlopen(
             std::ffi::CString::new(path.as_str()).ok()?.as_ptr(),
             libc::RTLD_NOW | libc::RTLD_LOCAL,
         );
-        if lib.is_null() { return None; }
+        if lib.is_null() {
+            eprintln!("[FUSED-MOE] dlopen({}) failed", path);
+            return None;
+        }
 
         let sym = libc::dlsym(lib, b"krasis_marlin_moe_mm_bf16\0".as_ptr() as *const _);
         if !sym.is_null() {
-            log::info!("Loaded vendored krasis_marlin_moe_mm_bf16 from {}", path);
+            eprintln!("[FUSED-MOE] Loaded krasis_marlin_moe_mm_bf16 from {}", path);
             return Some(std::mem::transmute(sym));
         }
-        log::warn!("krasis_marlin_moe_mm_bf16 not found in {}", path);
+        eprintln!("[FUSED-MOE] krasis_marlin_moe_mm_bf16 symbol not found in {}", path);
     }
     None
+}
+
+/// Load vendored FlashAttention-2 from libkrasis_flash_attn.so.
+fn load_flash_attn() -> Option<FlashAttnFwdFn> {
+    let path = match find_vendor_so("libkrasis_flash_attn.so") {
+        Some(p) => p,
+        None => {
+            log::warn!("libkrasis_flash_attn.so not found — FlashAttention disabled, using custom kernels");
+            return None;
+        }
+    };
+    unsafe {
+        let lib = libc::dlopen(
+            std::ffi::CString::new(path.as_str()).ok()?.as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL,
+        );
+        if lib.is_null() {
+            let err = libc::dlerror();
+            if !err.is_null() {
+                log::warn!("dlopen({}) failed: {}", path,
+                    std::ffi::CStr::from_ptr(err).to_string_lossy());
+            } else {
+                log::warn!("dlopen({}) failed", path);
+            }
+            return None;
+        }
+
+        let sym = libc::dlsym(lib, b"krasis_flash_attn_fwd_bf16\0".as_ptr() as *const _);
+        if !sym.is_null() {
+            log::info!("Loaded FlashAttention-2 from {}", path);
+            return Some(std::mem::transmute(sym));
+        }
+        log::warn!("krasis_flash_attn_fwd_bf16 symbol not found in {}", path);
+    }
+    None
+}
+
+/// Find a vendored .so file built by build.rs.
+/// Searches: 1) env var, 2) next to executable, 3) Cargo build output.
+fn find_vendor_so(name: &str) -> Option<String> {
+    // 1. Look in env var (uppercase, dots/hyphens → underscore)
+    let env_name = name.replace('.', "_").replace('-', "_").to_uppercase();
+    let env_key = format!("KRASIS_{}", env_name);
+    if let Ok(p) = std::env::var(&env_key) {
+        if std::path::Path::new(&p).exists() { return Some(p); }
+    }
+
+    // 2. Look next to the current executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join(name);
+            if p.exists() { return Some(p.to_string_lossy().to_string()); }
+        }
+    }
+
+    // 3. Search Cargo build output directories
+    let home = std::env::var("HOME").unwrap_or_default();
+    for repo in &["krasis", "krasisx"] {
+        for profile in &["release", "debug"] {
+            let build_dir = format!("{}/Documents/Claude/{}/target/{}/build", home, repo, profile);
+            if let Ok(entries) = std::fs::read_dir(&build_dir) {
+                for e in entries.flatten() {
+                    let p = e.path().join(format!("out/{}", name));
+                    if p.exists() { return Some(p.to_string_lossy().to_string()); }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Load vendored FLA (Flash Linear Attention) kernels from libkrasis_fla.so.
+/// Returns None if the .so is not found or any symbol is missing.
+pub fn load_fla() -> Option<FlaKernels> {
+    let path = match find_vendor_so("libkrasis_fla.so") {
+        Some(p) => p,
+        None => {
+            log::warn!("libkrasis_fla.so not found — FLA disabled, using custom LA kernels");
+            return None;
+        }
+    };
+    unsafe {
+        let lib = libc::dlopen(
+            std::ffi::CString::new(path.as_str()).ok()?.as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL,
+        );
+        if lib.is_null() {
+            let err = libc::dlerror();
+            if !err.is_null() {
+                log::warn!("dlopen({}) failed: {}", path,
+                    std::ffi::CStr::from_ptr(err).to_string_lossy());
+            } else {
+                log::warn!("dlopen({}) failed", path);
+            }
+            return None;
+        }
+
+        // Initialize FLA modules (loads cubins into CUDA context)
+        let init_sym = libc::dlsym(lib, b"krasis_fla_init\0".as_ptr() as *const _);
+        if init_sym.is_null() {
+            log::warn!("krasis_fla_init not found in {}", path);
+            return None;
+        }
+        let init_fn: FlaInitFn = std::mem::transmute(init_sym);
+        let rc = init_fn();
+        if rc != 0 {
+            log::warn!("krasis_fla_init() failed with rc={}", rc);
+            return None;
+        }
+
+        // Load all 6 kernel function pointers
+        macro_rules! load_sym {
+            ($name:expr) => {{
+                let sym = libc::dlsym(lib, concat!($name, "\0").as_ptr() as *const _);
+                if sym.is_null() {
+                    log::warn!("{} not found in {}", $name, path);
+                    return None;
+                }
+                std::mem::transmute(sym)
+            }};
+        }
+
+        let kernels = FlaKernels {
+            cumsum: load_sym!("krasis_fla_chunk_local_cumsum_scalar_kernel"),
+            kkt: load_sym!("krasis_fla_chunk_scaled_dot_kkt_fwd_kernel"),
+            solve_tril: load_sym!("krasis_fla_merge_16x16_to_64x64_inverse_kernel"),
+            wy_repr: load_sym!("krasis_fla_recompute_w_u_fwd_kernel"),
+            state_recurrence: load_sym!("krasis_fla_chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
+            output: load_sym!("krasis_fla_chunk_fwd_kernel_o"),
+        };
+
+        log::info!("Loaded FLA (Flash Linear Attention) kernels from {}", path);
+        eprintln!("[FLA] Loaded Flash Linear Attention kernels from {}", path);
+        Some(kernels)
+    }
 }
 
 
@@ -5624,7 +6494,9 @@ mod kernel_tests {
                     "la_chunk_output_kernel",
                     "la_state_update_kernel",
                     "moe_gather_sorted_kernel",
+                "moe_replicate_hidden_kernel",
                     "moe_scatter_fused_kernel",
+                    "moe_scatter_weighted_kernel",
                 ],
             ).expect("Failed to load prefill kernels PTX");
             GpuTestCtx { dev }
@@ -7153,26 +8025,13 @@ fn find_marlin_so() -> Option<String> {
         }
     }
 
-    // 3. Search common Cargo build output directories
+    // 3. Search Cargo build output directories for krasis (and krasisx for compat)
     let home = std::env::var("HOME").unwrap_or_default();
-    for profile in &["release", "debug"] {
-        // Walk the build directory to find the OUT_DIR
-        let build_dir = format!("{}/Documents/Claude/krasisx/target/{}/build", home, profile);
-        if let Ok(entries) = std::fs::read_dir(&build_dir) {
-            for e in entries.flatten() {
-                let p = e.path().join("out/libkrasis_marlin.so");
-                if p.exists() { return Some(p.to_string_lossy().to_string()); }
-            }
-        }
-    }
-
-    // 4. Look in the maturin target directory
-    for profile in &["release", "debug"] {
-        let build_dir = format!("{}/Documents/Claude/krasisx/target/{}/build", home, profile);
-        if let Ok(entries) = std::fs::read_dir(&build_dir) {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with("krasis-") {
+    for repo in &["krasis", "krasisx"] {
+        for profile in &["release", "debug"] {
+            let build_dir = format!("{}/Documents/Claude/{}/target/{}/build", home, repo, profile);
+            if let Ok(entries) = std::fs::read_dir(&build_dir) {
+                for e in entries.flatten() {
                     let p = e.path().join("out/libkrasis_marlin.so");
                     if p.exists() { return Some(p.to_string_lossy().to_string()); }
                 }

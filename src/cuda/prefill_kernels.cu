@@ -916,6 +916,41 @@ extern "C" __global__ void kv_cache_append_kernel(
     }
 }
 
+/* ── FP8 KV Cache Dequant + Concat for Cross-Chunk FA2 ─────────────────
+ * Dequantizes FP8 E4M3 KV cache [0..cache_len] to BF16, then copies
+ * current chunk BF16 K/V [0..m] into [cache_len..cache_len+m].
+ * Result: contiguous BF16 [cache_len+m, kv_stride] buffer for FA2.
+ * Grid: (cache_len + m, 1, 1), Block: (threads, 1, 1)
+ */
+extern "C" __global__ void kv_cache_dequant_concat_kernel(
+    __nv_bfloat16* __restrict__ out,            /* [cache_len+m, kv_stride] BF16 output */
+    const __nv_fp8_e4m3* __restrict__ kv_cache, /* [max_seq, kv_stride] FP8 cache */
+    const __nv_bfloat16* __restrict__ kv_new,   /* [m, kv_stride] BF16 current chunk */
+    int cache_len,                               /* number of cached tokens */
+    int m,                                       /* current chunk size */
+    int kv_stride)                               /* num_kv_heads * head_dim */
+{
+    int ti = blockIdx.x;
+    if (ti < cache_len) {
+        /* Dequant FP8 -> BF16 from cache */
+        int64_t off = (int64_t)ti * kv_stride;
+        for (int d = threadIdx.x; d < kv_stride; d += blockDim.x) {
+            float val = float(kv_cache[off + d]);
+            out[off + d] = __float2bfloat16(val);
+        }
+    } else {
+        /* Copy BF16 from current chunk */
+        int ci = ti - cache_len;
+        if (ci < m) {
+            int64_t src_off = (int64_t)ci * kv_stride;
+            int64_t dst_off = (int64_t)ti * kv_stride;
+            for (int d = threadIdx.x; d < kv_stride; d += blockDim.x) {
+                out[dst_off + d] = kv_new[src_off + d];
+            }
+        }
+    }
+}
+
 /* ── Mamba2 Strided Extraction ──────────────────────────────────────────
  * Extract x, B, C, dt from in_proj output [M, proj_dim] BF16 into separate
  * contiguous buffers. Replaces M per-token memcpy loops.
@@ -2885,7 +2920,7 @@ extern "C" __global__ void moe_scatter_sorted_kernel(
         if (eid >= 0 && eid < E) {
             int base = expert_offsets[eid];
             int slot = atomicAdd(&write_offsets[eid], 1);
-            sorted_token_ids[base + slot] = t;
+            sorted_token_ids[base + slot] = t * topk + k;  // vLLM format: token*topk+slot
         }
     }
     // Fill expert_ids and padding (done by first thread only)
@@ -2895,9 +2930,9 @@ extern "C" __global__ void moe_scatter_sorted_kernel(
             int count = expert_counts[e];
             int padded = expert_offsets[e + 1] - base;
             int num_blocks = padded / block_size;
-            // Fill padding slots with M (out-of-bounds, fused kernel treats as skip)
+            // Fill padding slots with M*topk (Marlin kernel checks >= prob_m * top_k)
             for (int p = count; p < padded; p++) {
-                sorted_token_ids[base + p] = M; // OOB token ID
+                sorted_token_ids[base + p] = M * topk; // padding sentinel
             }
             // Fill expert_ids for each block
             int block_start = base / block_size;
@@ -2905,6 +2940,24 @@ extern "C" __global__ void moe_scatter_sorted_kernel(
                 expert_ids_out[block_start + b] = e;
             }
         }
+    }
+}
+
+/* Replicate hidden states for fused MoE: out[i] = src[i / topk] for i in [0, M*topk).
+ * Creates [M*topk, dim] buffer where each token's hidden state appears topk times.
+ * Required for the top_k=1 trick: avoids C_tmp collision in fp32_reduce.
+ * Grid: (M * topk, 1, 1), Block: (threads, 1, 1)
+ */
+extern "C" __global__ void moe_replicate_hidden_kernel(
+    __nv_bfloat16* __restrict__ out,       // [M*topk, dim]
+    const __nv_bfloat16* __restrict__ src, // [M, dim]
+    int dim, int M, int topk
+) {
+    int idx = blockIdx.x;  // 0 to M*topk-1
+    int token = idx / topk;
+    if (token >= M) return;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        out[(int64_t)idx * dim + i] = src[(int64_t)token * dim + i];
     }
 }
 
@@ -2940,15 +2993,42 @@ extern "C" __global__ void moe_gather_sorted_kernel(
 extern "C" __global__ void moe_scatter_fused_kernel(
     float* __restrict__ accum,              // [M, hidden] FP32 accumulator (pre-zeroed)
     const __nv_bfloat16* __restrict__ src,  // [total_sorted, hidden] fused output
-    const int* __restrict__ sorted_ids,     // [total_sorted] maps sorted pos -> original token
-    int hidden, int M, float scale_factor
+    const int* __restrict__ sorted_ids,     // [total_sorted] maps sorted pos -> token*topk+slot
+    int hidden, int M, float scale_factor,
+    int topk                                // topk for vLLM-format sorted_ids (divide to get token)
 ) {
     int pos = blockIdx.x;
-    int tid = sorted_ids[pos];
+    int sid = sorted_ids[pos];
+    int tid = topk > 1 ? sid / topk : sid;
     if (tid >= M) return; // padding slot
     for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
         float val = bf16_to_float(src[pos * hidden + i]) * scale_factor;
         atomicAdd(&accum[tid * hidden + i], val);
+    }
+}
+
+
+/* Scatter fused MoE w2 output back to per-token FP32 accumulator with topk weights.
+ * After the fused Marlin w2 kernel, output is at C[sorted_id] where sorted_id = token*topk+slot.
+ * This kernel iterates over m*topk entries, applies topk_weight * scale_factor, and scatter-adds
+ * to the per-token accumulator.
+ *
+ * Grid: (M * topk, 1, 1), Block: (threads, 1, 1)
+ */
+extern "C" __global__ void moe_scatter_weighted_kernel(
+    float* __restrict__ accum,              // [M, hidden] FP32 accumulator (pre-zeroed)
+    const __nv_bfloat16* __restrict__ src,  // [M*topk, hidden] fused w2 output (indexed by sorted_id)
+    const float* __restrict__ topk_weights, // [M * topk] routing weights
+    int hidden, int M, int topk, float scale_factor
+) {
+    int sorted_id = blockIdx.x;  // 0 to M*topk-1
+    int token = sorted_id / topk;
+    if (token >= M) return;
+    float w = topk_weights[sorted_id] * scale_factor;
+    if (w == 0.0f) return;  // skip zero-weight entries
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float val = bf16_to_float(src[sorted_id * hidden + i]) * w;
+        atomicAdd(&accum[token * hidden + i], val);
     }
 }
 

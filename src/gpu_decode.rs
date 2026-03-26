@@ -5807,7 +5807,7 @@ impl GpuDecodeStore {
         let mut moe_layers: Vec<Option<PrefillMoeLayerData>> = Vec::new();
         for ml in &graph.moe_layers {
             moe_layers.push(ml.as_ref().map(|m| {
-                let experts = m.experts.iter().map(|e| ExpertWeightPtrs {
+                let experts: Vec<ExpertWeightPtrs> = m.experts.iter().map(|e| ExpertWeightPtrs {
                     w13_packed_ptr: e.w13_packed_ptr,
                     w13_packed_bytes: e.w13_packed_bytes,
                     w13_scales_ptr: e.w13_scales_ptr,
@@ -5831,7 +5831,35 @@ impl GpuDecodeStore {
                     contiguous_ptr: e.contiguous_ptr,
                     contiguous_bytes: e.contiguous_bytes,
                 });
-                PrefillMoeLayerData { experts, shared }
+                // Compute bulk DMA pointers from first expert + count.
+                // The LayerExpertBacking stores all experts contiguously per component,
+                // so expert[0]'s ptr is the start and n * per_expert is the total.
+                let ne = experts.len();
+                let (bulk_w13p, bulk_w13s, bulk_w2p, bulk_w2s) = if ne > 0 {
+                    let e0 = &experts[0];
+                    // Verify contiguity: last expert's ptr should be at expected offset
+                    let contiguous = if ne > 1 {
+                        let el = &experts[ne - 1];
+                        el.w13_packed_ptr == e0.w13_packed_ptr + (ne - 1) * e0.w13_packed_bytes
+                        && el.w13_scales_ptr == e0.w13_scales_ptr + (ne - 1) * e0.w13_scales_bytes
+                        && el.w2_packed_ptr == e0.w2_packed_ptr + (ne - 1) * e0.w2_packed_bytes
+                        && el.w2_scales_ptr == e0.w2_scales_ptr + (ne - 1) * e0.w2_scales_bytes
+                    } else { true };
+                    if contiguous {
+                        (
+                            (e0.w13_packed_ptr, ne * e0.w13_packed_bytes),
+                            (e0.w13_scales_ptr, ne * e0.w13_scales_bytes),
+                            (e0.w2_packed_ptr, ne * e0.w2_packed_bytes),
+                            (e0.w2_scales_ptr, ne * e0.w2_scales_bytes),
+                        )
+                    } else {
+                        log::warn!("MoE layer experts not contiguous — bulk DMA disabled");
+                        ((0, 0), (0, 0), (0, 0), (0, 0))
+                    }
+                } else {
+                    ((0, 0), (0, 0), (0, 0), (0, 0))
+                };
+                PrefillMoeLayerData { experts, shared, bulk_w13p, bulk_w13s, bulk_w2p, bulk_w2s }
             }));
         }
 
@@ -5955,19 +5983,22 @@ impl GpuDecodeStore {
         let fused_total_mb = (fused_expert_bytes + fused_sorted_bytes) / (1024 * 1024);
 
         // Check free VRAM (leave 100 MB headroom for kernel intermediates)
+        eprintln!("[FUSED-ALLOC] has_moe={}, has_fused_kernel={}, fused_total_mb={}", has_moe, has_fused_kernel, fused_total_mb);
         let fused_vram_ok = if has_moe && has_fused_kernel {
             let (free, _total) = cudarc::driver::result::mem_get_info()
                 .map_err(|e| format!("mem_get_info: {e}"))?;
             let free_mb = free / (1024 * 1024);
             let ok = free_mb > fused_total_mb + 100;
             if ok {
-                log::info!("Fused MoE: allocating {} MB ({} MB free)", fused_total_mb, free_mb);
+                eprintln!("[FUSED-ALLOC] Allocating {} MB ({} MB free)", fused_total_mb, free_mb);
             } else {
-                log::info!("Fused MoE: skipping (needs {} MB, only {} MB free) — using per-expert dispatch",
-                    fused_total_mb, free_mb);
+                eprintln!("[FUSED-ALLOC] SKIPPING (needs {} MB, only {} MB free)", fused_total_mb, free_mb);
             }
             ok
-        } else { false };
+        } else {
+            eprintln!("[FUSED-ALLOC] Disabled: has_moe={}, has_fused_kernel={}", has_moe, has_fused_kernel);
+            false
+        };
 
         let has_fused = has_fused_kernel && fused_vram_ok;
 
@@ -6093,6 +6124,16 @@ impl GpuDecodeStore {
             preloaded_moe_layer: None,
             q_type,
             qk_norm_bf16_bufs,
+            fla: crate::gpu_prefill::load_fla(),
+            d_fla_g_cumsum: None,
+            d_fla_a: None,
+            d_fla_ai: None,
+            d_fla_w: None,
+            d_fla_u: None,
+            d_fla_h: None,
+            d_fla_final_state: None,
+            d_fla_v_new: None,
+            d_fla_o: None,
         })
     }
 
