@@ -1152,11 +1152,8 @@ impl PrefillEngine {
                     }
                     self.forward_moe(layer_idx, m)
                         .map_err(|e| format!("moe layer {}: {}", layer_idx, e))?;
-
-                    // Gap 2: start preloading next MoE layer's experts into the other buffer
-                    if self.kernels.fused_moe_fn.is_some() && self.d_fused_expert_w1_a.is_some() {
-                        self.preload_next_moe_layer(layer_idx, num_hidden_layers)?;
-                    }
+                    // Double-buffer preload is now inside forward_moe_fused itself,
+                    // so DMA(N+1) overlaps with compute(N) on the GPU.
                 } else if self.layer_weights[layer_idx].shared_w1.is_some() {
                     if diag && layer_idx < diag_layer_limit {
                         eprintln!("[DIAG] layer{:02} -> forward_dense_mlp", layer_idx);
@@ -2028,7 +2025,13 @@ impl PrefillEngine {
                 let kv_stride = cfg.num_kv_heads * cfg.head_dim;
                 let total_kv = start_pos + m;
 
-                if let Some(fa2_fp8) = self.kernels.flash_attn_fwd_fp8kv {
+                // FP8 FA2: cp.async staging (FP8 -> staging -> BF16 smem).
+                // Only used for head_dim <= 128 where kBlockN=64 staging fits in smem.
+                // For head_dim > 128, staging forces kBlockN=32 which is slower than
+                // the dequant+BF16 path (separate dequant kernel + standard BF16 FA2).
+                let use_fp8_fa2 = self.kernels.flash_attn_fwd_fp8kv.is_some()
+                    && cfg.head_dim <= 128;
+                if let (true, Some(fa2_fp8)) = (use_fp8_fa2, self.kernels.flash_attn_fwd_fp8kv) {
                     // FP8 FA2 path: store current K/V to FP8 cache FIRST, then
                     // FA2 reads directly from cache (all FP8). No temp buffer needed.
                     let gt_kv_store = Instant::now();
@@ -3498,17 +3501,23 @@ impl PrefillEngine {
         let diag_moe = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
         let mt = self.gqa_timing_enabled.get(); // MoE timing flag (reuses same env var)
         let mt0 = if mt { self.stream_sync()?; Some(Instant::now()) } else { None };
-        let lw = &self.layer_weights[layer_idx];
+        // Extract all needed fields from layer_weights up front so the borrow
+        // on self.layer_weights is dropped before we call &mut self methods.
         let h = self.config.hidden_size;
-        let n_experts = lw.moe_num_experts;
-        let topk = lw.moe_topk;
+        let n_experts = self.layer_weights[layer_idx].moe_num_experts;
+        let topk = self.layer_weights[layer_idx].moe_topk;
         let inter = self.config.moe_intermediate_size;
-        let scoring_func = lw.moe_scoring_func;
-        let gated = lw.moe_gated;
-        let activation = lw.moe_activation;
-        let scale_factor = lw.moe_routed_scaling_factor;
+        let scoring_func = self.layer_weights[layer_idx].moe_scoring_func;
+        let gated = self.layer_weights[layer_idx].moe_gated;
+        let activation = self.layer_weights[layer_idx].moe_activation;
+        let scale_factor = self.layer_weights[layer_idx].moe_routed_scaling_factor;
         let gs = self.config.group_size;
         let bits = self.config.expert_bits;
+        let moe_layer_idx = self.layer_weights[layer_idx].moe_layer_idx;
+        let has_shared = (self.layer_weights[layer_idx].shared_w1.is_some()
+            && self.layer_weights[layer_idx].shared_w2.is_some())
+            || (self.layer_weights[layer_idx].shared_w1_bf16.is_some()
+                && self.layer_weights[layer_idx].shared_w2_bf16.is_some());
 
         let hidden = *self.scratch.d_hidden.device_ptr();
         let gate_out = *self.scratch.d_gate_out.device_ptr();
@@ -3516,7 +3525,7 @@ impl PrefillEngine {
         let topk_weights_ptr = *self.scratch.d_topk_weights.device_ptr();
 
         // 1. Gate GEMM (same as sequential)
-        let gate_ptr = lw.moe_gate_ptr;
+        let gate_ptr = self.layer_weights[layer_idx].moe_gate_ptr;
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
         unsafe {
@@ -3602,16 +3611,17 @@ impl PrefillEngine {
         }
 
         // Padded prefix sum (block_size aligned)
-        let sorted_ids_ptr = self.d_sorted_token_ids.as_ref()
+        // Dereference device_ptr() immediately to avoid holding borrows on self
+        let sorted_ids_val = *self.d_sorted_token_ids.as_ref()
             .ok_or("sorted_token_ids not allocated")?.device_ptr();
-        let fused_expert_ids_ptr = self.d_fused_expert_ids.as_ref()
+        let fused_expert_ids_val = *self.d_fused_expert_ids.as_ref()
             .ok_or("fused_expert_ids not allocated")?.device_ptr();
-        let num_tokens_post_ptr = self.d_num_tokens_post.as_ref()
+        let num_tokens_post_val = *self.d_num_tokens_post.as_ref()
             .ok_or("num_tokens_post not allocated")?.device_ptr();
         {
             let ps_threads = std::cmp::max(32, ((std::cmp::min(1024, n_experts) + 31) / 32) * 32) as u32;
             let mut p0 = expert_offsets_ptr;
-            let mut p1 = *num_tokens_post_ptr;
+            let mut p1 = num_tokens_post_val;
             let mut p2 = expert_counts_ptr;
             let mut p3 = n_experts as i32;
             let mut p4 = block_size;
@@ -3631,8 +3641,8 @@ impl PrefillEngine {
 
         // Build sorted token/expert maps
         {
-            let mut p0 = *sorted_ids_ptr;
-            let mut p1 = *fused_expert_ids_ptr;
+            let mut p0 = sorted_ids_val;
+            let mut p1 = fused_expert_ids_val;
             let mut p2 = write_offsets_ptr;
             let mut p3 = topk_ids_ptr;
             let mut p4 = expert_offsets_ptr;
@@ -3680,7 +3690,7 @@ impl PrefillEngine {
         unsafe {
             cuda_sys::lib().cuMemcpyDtoH_v2(
                 h_num_post.as_mut_ptr() as *mut _,
-                *num_tokens_post_ptr, 4);
+                num_tokens_post_val, 4);
         }
         let total_sorted = h_num_post[0] as usize;
         let active_experts = h_expert_counts.iter().filter(|&&c| c > 0).count();
@@ -3715,7 +3725,6 @@ impl PrefillEngine {
         //    Uses the current buffer (A or B) of the double-buffer pair.
         //    Bulk DMA: 4 calls per layer from pinned contiguous host memory.
         //    HCS is for decode only — prefill loads ALL experts per layer.
-        let moe_layer_idx = lw.moe_layer_idx;
         let cur = self.fused_expert_buf_cur;
         let (w1_buf, w1s_buf, w2_buf, w2s_buf) = if cur == 0 {
             (self.d_fused_expert_w1_a.as_ref(), self.d_fused_expert_w1s_a.as_ref(),
@@ -3758,6 +3767,18 @@ impl PrefillEngine {
         }
         let mt2 = if mt { Some(Instant::now()) } else { None };
 
+        // Double-buffer overlap: start DMA for next MoE layer NOW, while we
+        // compute the current layer.  DMA goes to the OTHER buffer on copy_stream,
+        // so there is no conflict with the current compute.
+        // Previous approach waited until after forward_moe returned, missing the
+        // overlap between DMA(N+1) and compute(N).
+        {
+            let num_layers = self.config.num_hidden_layers;
+            if self.d_fused_expert_w1_b.is_some() {
+                self.preload_next_moe_layer(layer_idx, num_layers)?;
+            }
+        }
+
         // Verify DMA: check first 16 bytes of fused buffer are non-zero
         if diag_moe && layer_idx == 0 {
             self.stream_sync()?;
@@ -3771,8 +3792,6 @@ impl PrefillEngine {
         }
 
         // 5. Launch shared expert on dedicated shared_stream (async overlap with fused MoE)
-        let has_shared = (lw.shared_w1.is_some() && lw.shared_w2.is_some())
-            || (lw.shared_w1_bf16.is_some() && lw.shared_w2_bf16.is_some());
         if has_shared {
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
@@ -3848,9 +3867,9 @@ impl PrefillEngine {
                 std::ptr::null(),                    // g_idx (none)
                 std::ptr::null(),                    // perm (none)
                 std::ptr::null(),                    // a_tmp (none)
-                *sorted_ids_ptr as *const _,         // sorted_ids (vLLM format: token*topk+slot)
-                *fused_expert_ids_ptr as *const _,   // expert_ids
-                *num_tokens_post_ptr as *const _,    // num_tokens_post_padded
+                sorted_ids_val as *const _,         // sorted_ids (vLLM format: token*topk+slot)
+                fused_expert_ids_val as *const _,   // expert_ids
+                num_tokens_post_val as *const _,    // num_tokens_post_padded
                 topk_weights_ptr as *const _,        // topk_weights
                 block_size,                          // moe_block_size
                 1i32,                                // top_k=1: sorted_id/1 = direct index into A
@@ -3886,9 +3905,9 @@ impl PrefillEngine {
             let mut h_expert_ids = vec![0i32; std::cmp::min(1, total_sorted / 64 + 1)];
             unsafe {
                 cuda_sys::lib().cuMemcpyDtoH_v2(
-                    h_sorted.as_mut_ptr() as *mut _, *sorted_ids_ptr, (h_sorted.len() * 4) as usize);
+                    h_sorted.as_mut_ptr() as *mut _, sorted_ids_val, (h_sorted.len() * 4) as usize);
                 cuda_sys::lib().cuMemcpyDtoH_v2(
-                    h_expert_ids.as_mut_ptr() as *mut _, *fused_expert_ids_ptr, (h_expert_ids.len() * 4) as usize);
+                    h_expert_ids.as_mut_ptr() as *mut _, fused_expert_ids_val, (h_expert_ids.len() * 4) as usize);
             }
             let first_expert = h_expert_ids[0] as usize;
             let first_sid = h_sorted[0]; // sorted_id for first token of first expert
@@ -4025,9 +4044,9 @@ impl PrefillEngine {
                 std::ptr::null(),                     // g_idx (none)
                 std::ptr::null(),                     // perm (none)
                 std::ptr::null(),                     // a_tmp (none)
-                *sorted_ids_ptr as *const _,          // sorted_ids (vLLM format)
-                *fused_expert_ids_ptr as *const _,    // expert_ids
-                *num_tokens_post_ptr as *const _,     // num_tokens_post_padded
+                sorted_ids_val as *const _,          // sorted_ids (vLLM format)
+                fused_expert_ids_val as *const _,    // expert_ids
+                num_tokens_post_val as *const _,     // num_tokens_post_padded
                 topk_weights_ptr as *const _,         // topk_weights
                 block_size,                           // moe_block_size
                 1i32,                                 // top_k=1: sorted_id/1 = direct index into A
@@ -5556,12 +5575,11 @@ impl PrefillEngine {
         let w2_base = match w2_buf { Some(b) => *b.device_ptr(), None => return Ok(()) };
         let w2s_base = match w2s_buf { Some(b) => *b.device_ptr(), None => return Ok(()) };
 
-        // Record compute event so copy_stream waits for current compute
-        // to finish using the buffer before we overwrite it
-        unsafe {
-            cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
-            cuda_sys::lib().cuStreamWaitEvent(self.copy_stream, self.compute_event, 0);
-        }
+        // No need to wait for compute: double-buffer ensures we write to the
+        // OTHER buffer while compute uses the current one.  The copy_stream is
+        // sequential, so DMA(N+1) naturally waits for DMA(N) to finish.
+        // Two full DMA cycles elapse before a buffer is reused, which exceeds
+        // the compute time per layer (26ms DMA >> 4.5ms compute).
 
         // Bulk DMA all experts for next layer into the other buffer
         if let Some(Some(moe_data)) = self.moe_layers.get(next_moe_idx) {

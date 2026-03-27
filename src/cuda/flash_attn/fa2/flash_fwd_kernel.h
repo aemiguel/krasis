@@ -176,9 +176,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
-    // FP8 KV cache: precompute base pointers, BF16 smem targets, and staging buffer.
-    // The staging buffer sits after sQ+sK+sV in shared memory (linear layout, kBlockN*kHeadDim bytes).
-    // Pipeline: cp.async FP8 global -> staging (async), then expand staging -> BF16 smem (cooperative).
+    // FP8 KV cache: two-phase staging approach with cp.async pipelining.
+    // Phase 1: cp.async loads FP8 bytes from global memory into a linear staging buffer (async).
+    // Phase 2: All threads cooperatively expand FP8 staging -> BF16 swizzled smem (smem->smem).
+    // Staging buffer lives after the regular Q+K+V smem area.
     const __nv_fp8_e4m3* kv_fp8_k_ptr = nullptr;
     const __nv_fp8_e4m3* kv_fp8_v_ptr = nullptr;
     cutlass::bfloat16_t* smem_k_bf16 = nullptr;
@@ -193,7 +194,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             + (bidh / params.h_h_k_ratio) * params.v_head_stride;
         smem_k_bf16 = reinterpret_cast<cutlass::bfloat16_t*>(sK.data().get());
         smem_v_bf16 = reinterpret_cast<cutlass::bfloat16_t*>(sV.data().get());
-        // Staging buffer: after Q+K+V smem. kSmemSize already accounts for Q+K+V.
+        // Staging buffer is appended after kSmemSize in dynamic shared memory
         smem_fp8_staging = smem_ + Kernel_traits::kSmemSize;
     }
 
@@ -288,7 +289,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     if constexpr (Is_KV_FP8) {
-        // Phase 1: cp.async FP8 bytes from global memory to staging (ASYNC)
+        // Phase 1: async copy FP8 K bytes from global to staging buffer.
         int fp8_valid_rows = std::min(kBlockN, binfo.actual_seqlen_k - n_block * kBlockN);
         FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
             smem_fp8_staging, kv_fp8_k_ptr,
@@ -297,7 +298,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
                                            binfo.actual_seqlen_k - n_block * kBlockN);
     }
-    cute::cp_async_fence();  // Also commits any pending Q async copies
+    cute::cp_async_fence();  // Commits K staging (FP8) or K copy (BF16), plus any pending Q async copies
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z < 2) { print(tKgK); }
     // __syncthreads();
 
@@ -334,7 +335,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
 
-        // FP8: expand K staging -> sK (BF16). Staging was filled by cp.async in prologue or previous iter.
+        // FP8: expand K staging -> BF16 smem, then start V staging
         if constexpr (Is_KV_FP8) {
             int fp8_valid_rows_k = (masking_step == 0 && !Is_even_MN)
                 ? std::min(kBlockN, binfo.actual_seqlen_k - n_block * kBlockN)
@@ -342,16 +343,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::expand_fp8_staging_to_bf16_smem<typename Kernel_traits::SmemLayoutKV, kBlockN, kHeadDim, kNWarps * 32, true>(
                 smem_k_bf16, smem_fp8_staging, typename Kernel_traits::SmemLayoutKV{},
                 fp8_valid_rows_k, Is_even_K ? kHeadDim : params.d);
-            __syncthreads();
-        }
-
-        // Start async V load: FP8 -> staging, BF16 -> sV
-        if constexpr (Is_KV_FP8) {
-            int v_valid_rows = std::min(kBlockN, binfo.actual_seqlen_k - n_block * kBlockN);
+            __syncthreads();  // K ready in BF16 smem
+            // Start V staging (async, overlaps with QK GEMM)
+            int fp8_valid_rows_v = (masking_step == 0 && !Is_even_MN)
+                ? std::min(kBlockN, binfo.actual_seqlen_k - n_block * kBlockN)
+                : kBlockN;
             FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
                 smem_fp8_staging, kv_fp8_v_ptr,
-                n_block * kBlockN, params.v_row_stride, v_valid_rows);
-        } else {
+                n_block * kBlockN, params.v_row_stride, fp8_valid_rows_v);
+        }
+
+        // Start V load: BF16 cp.async (FP8 staging started above)
+        if constexpr (!Is_KV_FP8) {
             if (masking_step > 0) {
                 FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
             } else {
@@ -376,34 +379,34 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
 
-        // Wait for V load
-        FLASH_NAMESPACE::cp_async_wait<0>();
-        __syncthreads();
-
-        // FP8: expand V staging -> sV (BF16)
         if constexpr (Is_KV_FP8) {
+            // FP8: V staging was started before QK GEMM. Wait and expand.
+            cute::cp_async_fence();
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
             int fp8_valid_rows_v = (masking_step == 0 && !Is_even_MN)
                 ? std::min(kBlockN, binfo.actual_seqlen_k - n_block * kBlockN)
                 : kBlockN;
             FLASH_NAMESPACE::expand_fp8_staging_to_bf16_smem<typename Kernel_traits::SmemLayoutKV, kBlockN, kHeadDim, kNWarps * 32, true>(
                 smem_v_bf16, smem_fp8_staging, typename Kernel_traits::SmemLayoutKV{},
                 fp8_valid_rows_v, Is_even_K ? kHeadDim : params.d);
+            __syncthreads();  // V ready in BF16 smem
+        } else {
+            // Wait for V cp.async
+            FLASH_NAMESPACE::cp_async_wait<0>();
             __syncthreads();
         }
 
-        // Start async next K load
+        // Start next K load
         if (n_block > n_block_min) {
             if constexpr (Is_KV_FP8) {
-                int k_next_valid = std::min(kBlockN, binfo.actual_seqlen_k - (n_block - 1) * kBlockN);
-                FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
-                    smem_fp8_staging, kv_fp8_k_ptr,
-                    (n_block - 1) * kBlockN, params.k_row_stride, k_next_valid);
+                // Nothing here — next K will be loaded at the end of this iteration after PV GEMM.
             } else {
                 FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
             }
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
@@ -435,6 +438,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
+        // FP8: start next K staging after PV GEMM (async, overlaps with loop control)
+        if constexpr (Is_KV_FP8) {
+            if (n_block > n_block_min) {
+                FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
+                    smem_fp8_staging, kv_fp8_k_ptr,
+                    (n_block - 1) * kBlockN, params.k_row_stride,
+                    std::min(kBlockN, binfo.actual_seqlen_k - (n_block - 1) * kBlockN));
+                cute::cp_async_fence();
+            }
+        }
+
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
             --n_block;
@@ -449,23 +463,23 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
 
-        // FP8: expand K staging -> sK (BF16). All rows valid in main loop.
+        // FP8: expand K staging -> BF16 smem, then start V staging
         if constexpr (Is_KV_FP8) {
             FLASH_NAMESPACE::expand_fp8_staging_to_bf16_smem<typename Kernel_traits::SmemLayoutKV, kBlockN, kHeadDim, kNWarps * 32, false>(
                 smem_k_bf16, smem_fp8_staging, typename Kernel_traits::SmemLayoutKV{},
                 kBlockN, Is_even_K ? kHeadDim : params.d);
-            __syncthreads();
-        }
-
-        // Start async V load
-        if constexpr (Is_KV_FP8) {
+            __syncthreads();  // K ready in BF16 smem
+            // Start V staging (async, overlaps with QK GEMM)
             FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
                 smem_fp8_staging, kv_fp8_v_ptr,
                 n_block * kBlockN, params.v_row_stride, kBlockN);
-        } else {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         }
-        cute::cp_async_fence();
+
+        // Start V load: BF16 cp.async
+        if constexpr (!Is_KV_FP8) {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+            cute::cp_async_fence();
+        }
 
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -475,30 +489,29 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
-        // Wait for V load
-        FLASH_NAMESPACE::cp_async_wait<0>();
-        __syncthreads();
-
-        // FP8: expand V staging -> sV (BF16)
         if constexpr (Is_KV_FP8) {
+            // FP8: V staging was started before QK GEMM. Wait and expand.
+            cute::cp_async_fence();
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
             FLASH_NAMESPACE::expand_fp8_staging_to_bf16_smem<typename Kernel_traits::SmemLayoutKV, kBlockN, kHeadDim, kNWarps * 32, false>(
                 smem_v_bf16, smem_fp8_staging, typename Kernel_traits::SmemLayoutKV{},
                 kBlockN, Is_even_K ? kHeadDim : params.d);
+            __syncthreads();  // V ready in BF16 smem
+        } else {
+            // Wait for V cp.async
+            FLASH_NAMESPACE::cp_async_wait<0>();
             __syncthreads();
         }
 
-        // Start async next K load
-        if (n_block > n_block_min) {
-            if constexpr (Is_KV_FP8) {
-                FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
-                    smem_fp8_staging, kv_fp8_k_ptr,
-                    (n_block - 1) * kBlockN, params.k_row_stride, kBlockN);
-            } else {
+        // Start next K load (BF16 only — FP8 stages after PV GEMM below)
+        if constexpr (!Is_KV_FP8) {
+            if (n_block > n_block_min) {
                 FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
             }
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(
@@ -527,6 +540,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+
+        // FP8: start next K staging after PV GEMM (async, overlaps with softmax/loop)
+        if constexpr (Is_KV_FP8) {
+            if (n_block > n_block_min) {
+                FLASH_NAMESPACE::cp_async_fp8_to_staging<kBlockN, kHeadDim, kNWarps * 32>(
+                    smem_fp8_staging, kv_fp8_k_ptr,
+                    (n_block - 1) * kBlockN, params.k_row_stride, kBlockN);
+                cute::cp_async_fence();
+            }
+        }
     }
 
     // Epilogue

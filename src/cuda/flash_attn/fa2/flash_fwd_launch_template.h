@@ -112,10 +112,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 // FP8 KV variant: simplified dispatch (no dropout, alibi, softcap, local, return_softmax)
-// Extra shared memory is allocated for the FP8 staging buffer (kBlockN * kHeadDim bytes).
+// Uses cp.async staging: FP8 bytes load async into a linear staging buffer, then expand to BF16 smem.
+// Extra smem = kBlockN * kHeadDim bytes for the staging buffer.
 template<typename Kernel_traits, bool Is_causal>
 void run_flash_fwd_fp8kv(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr size_t fp8_staging_size = Kernel_traits::kBlockN * Kernel_traits::kHeadDim;  // bytes
+    constexpr size_t fp8_staging_size = Kernel_traits::kBlockN * Kernel_traits::kHeadDim;  // 1 byte per FP8 element
     constexpr size_t smem_size = Kernel_traits::kSmemSize + fp8_staging_size;
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.b, params.h);
@@ -183,27 +184,19 @@ void run_mha_fwd_fp8kv_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, bool Is_causal>
 void run_mha_fwd_fp8kv_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 192;
-    run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_causal>(params, stream);
+    // FP8 staging: kBlockN=32 to fit staging buffer in smem.
+    // smem = Q(48KB) + K+V(24KB) + staging(6KB) = 78KB, fits in 99KB.
+    // kBlockN=64 would need 108KB (96KB base + 12KB staging), exceeds limit.
+    run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 128, 32, 8, false, false, T>, Is_causal>(params, stream);
 }
 
 template<typename T, bool Is_causal>
 void run_mha_fwd_fp8kv_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 256;
-    int device;
-    cudaGetDevice(&device);
-    int max_smem_per_sm, max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
-    status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
-      C10_CUDA_CHECK(status_);
-    }
-    if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
-        run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_causal>(params, stream);
-    } else {
-        run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_causal>(params, stream);
-    }
+    // FP8 staging: kBlockN=32 to fit staging buffer in smem.
+    // smem = Q(32KB) + K+V(32KB) + staging(8KB) = 72KB, fits in 99KB.
+    // kBlockN=64 would need 112KB (96KB base + 16KB staging), exceeds limit.
+    run_flash_fwd_fp8kv<Flash_fwd_kernel_traits<Headdim, 64, 32, 4, false, false, T>, Is_causal>(params, stream);
 }
 
 
