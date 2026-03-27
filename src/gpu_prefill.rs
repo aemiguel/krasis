@@ -626,6 +626,16 @@ pub struct PrefillEngine {
     pub max_sorted: usize,
     // Preloaded layer index tracking for group-level double-buffer (gap 2)
     pub preloaded_moe_layer: Option<usize>,
+    // Expert pinning pool for prefill MoE optimization
+    // The pool holds hottest experts (from gate pre-scan) in GPU VRAM.
+    // Per-layer DMA copies pinned experts via fast D2D instead of slow PCIe H2D.
+    pub pinning_pool_ptr: u64,                           // Raw GPU pointer for pinning pool (0 = not allocated)
+    pub pinning_pool_bytes: usize,                       // Total allocated bytes
+    pub pinned_expert_offsets: Vec<Vec<Option<usize>>>,  // [moe_layer_idx][expert_id] -> byte offset in pool (None = not pinned)
+    pub pinning_pool_expert_bytes: usize,                // total bytes per expert in pool (w1p + w1s + w2p + w2s)
+    pub pinning_active: bool,
+    // Pre-scan routing data: per-layer list of predicted active expert IDs per chunk
+    pub prescan_active_experts: Vec<Vec<Vec<usize>>>,    // [moe_layer_idx][chunk_idx] -> Vec<expert_id>
     // ScalarType for Marlin GEMM dispatch (matches weight quantization format)
     pub q_type: ScalarType,
     // BF16 copies of QK norm weights (converted from FP32 at engine creation)
@@ -879,15 +889,26 @@ impl PrefillEngine {
         let diag_layer_limit = if diag { Self::diag_layer_limit() } else { 0 };
         let diag_moe_detail = std::env::var("KRASIS_PREFILL_DIAG_MOE_DETAIL").is_ok();
 
-        // Determine chunk size: use config value, fall back to max_tokens
-        let chunk_size = if self.config.prefill_chunk_size > 0 {
-            self.config.prefill_chunk_size
+        // Dynamic chunk sizing: use largest clean divisor that fits in scratch buffers.
+        // This minimises the number of chunk passes (and therefore MoE DMA repetitions).
+        let max_chunk = if self.config.prefill_chunk_size > 0 {
+            self.config.prefill_chunk_size.min(self.scratch.max_tokens)
         } else {
             self.scratch.max_tokens
         };
-
-        // Process token chunks
-        let num_chunks = (total_m + chunk_size - 1) / chunk_size;
+        let (chunk_size, num_chunks) = if total_m <= max_chunk {
+            // Single chunk — best case, zero redundant DMA
+            (total_m, 1)
+        } else {
+            // Clean divisor: N equal-sized chunks, no runt
+            let n = (total_m + max_chunk - 1) / max_chunk;
+            let cs = (total_m + n - 1) / n;
+            (cs, n)
+        };
+        if num_chunks > 1 {
+            eprintln!("[PREFILL] Dynamic chunking: {} tokens -> {} chunks of {} (max_chunk={})",
+                total_m, num_chunks, chunk_size, max_chunk);
+        }
 
         // Zero LA recurrent + conv state for fresh prefill (each prefill processes full prompt)
         if let Some(ref la_state_buf) = self.scratch.d_la_state {
@@ -921,14 +942,60 @@ impl PrefillEngine {
             }
         }
 
-        // Preload first MoE layer's experts into fused buffer A before the layer loop.
-        // This starts the double-buffer pipeline: while computing layer N,
-        // we DMA layer N+1 on copy_stream.
         let use_fused = self.kernels.fused_moe_fn.is_some()
             && self.d_fused_input.is_some()
             && std::env::var("KRASIS_SEQUENTIAL_MOE").is_err();
+
+        // ═══════════════════════════════════════════════════════════
+        //  Gate pre-scan + expert pinning (before main chunk loop)
+        // ═══════════════════════════════════════════════════════════
+        // Run gate GEMMs on embedded tokens to predict expert routing,
+        // then pin the hottest experts in a VRAM pool for fast D2D access.
+        // This eliminates most PCIe DMA for repeatedly-used experts.
+        let pinning_enabled = use_fused
+            && self.config.n_routed_experts > 0
+            && std::env::var("KRASIS_NO_PINNING").is_err();
+
+        if pinning_enabled {
+            // Embed the full prompt (or chunk-by-chunk for pre-scan)
+            // We use chunk_size chunks to stay within scratch buffer limits
+            let prescan_m = std::cmp::min(total_m, self.scratch.max_tokens);
+            let prescan_tokens = &token_ids[..prescan_m];
+
+            // Upload tokens and embed for pre-scan
+            self.upload_tokens_with_offset(prescan_tokens, 0)
+                .map_err(|e| format!("prescan upload: {}", e))?;
+            self.launch_embedding(prescan_m)
+                .map_err(|e| format!("prescan embedding: {}", e))?;
+
+            // Run gate pre-scan on embedded tokens
+            match self.gate_prescan(prescan_m, chunk_size, num_chunks) {
+                Ok(prescan_counts) => {
+                    if !prescan_counts.is_empty() {
+                        // Allocate pinning pool and fill with hottest experts
+                        match self.allocate_pinning_pool(&prescan_counts) {
+                            Ok(per_layer) => {
+                                if per_layer > 0 {
+                                    eprintln!("[PREFILL] Expert pinning active: {}/{} per layer",
+                                        per_layer, self.config.n_routed_experts);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[PREFILL] Pinning pool allocation failed (non-fatal): {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[PREFILL] Gate pre-scan failed (non-fatal): {}", e);
+                }
+            }
+        }
+
+        // Preload first MoE layer's experts into fused buffer A.
+        // With pinning active, use selective DMA (pinned D2D + cold H2D).
+        // Without pinning, use bulk DMA (4 large contiguous transfers).
         if use_fused {
-            // Find first MoE layer
             for i in 0..num_hidden_layers {
                 if self.layer_weights[i].moe_gate_ptr != 0 {
                     if let Some(moe_idx) = self.layer_weights[i].moe_layer_idx {
@@ -937,16 +1004,46 @@ impl PrefillEngine {
                             let w1s_base = *self.d_fused_expert_w1s_a.as_ref().unwrap().device_ptr();
                             let w2_base = *self.d_fused_expert_w2_a.as_ref().unwrap().device_ptr();
                             let w2s_base = *self.d_fused_expert_w2s_a.as_ref().unwrap().device_ptr();
-                            self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+
+                            // Find which MoE layer index this corresponds to for pinning lookup
+                            let mi = (0..self.config.num_hidden_layers)
+                                .filter(|&j| self.layer_weights[j].moe_gate_ptr != 0)
+                                .position(|j| j == i);
+
+                            if let Some(mi) = mi {
+                                // Use pre-scan data or HCS for selective DMA
+                                let active = if !self.prescan_active_experts.is_empty()
+                                    && mi < self.prescan_active_experts.len()
+                                    && !self.prescan_active_experts[mi].is_empty()
+                                {
+                                    self.prescan_active_experts[mi][0].clone()
+                                } else {
+                                    // No pre-scan data: transfer all experts
+                                    (0..self.config.n_routed_experts).collect()
+                                };
+                                if !self.prescan_active_experts.is_empty() || self.hcs_num_experts_per_layer > 0 {
+                                    let (h, p, c) = self.selective_dma_layer(
+                                        moe_data, i, mi,
+                                        w1_base, w1s_base, w2_base, w2s_base,
+                                        &active)?;
+                                    eprintln!("[PREFILL] First MoE layer {} selective DMA: {} hcs + {} pinned + {} cold",
+                                        i, h, p, c);
+                                } else {
+                                    self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+                                    let mb = (moe_data.bulk_w13p.1 + moe_data.bulk_w13s.1
+                                        + moe_data.bulk_w2p.1 + moe_data.bulk_w2s.1) as f64 / 1e6;
+                                    eprintln!("[PREFILL] Preloading first MoE layer {} ({:.1} MB) on copy_stream",
+                                        i, mb);
+                                }
+                            } else {
+                                self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+                            }
+
                             unsafe {
                                 cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
                             }
                             self.preloaded_moe_layer = Some(i);
                             self.fused_expert_buf_cur = 0;
-                            let mb = (moe_data.bulk_w13p.1 + moe_data.bulk_w13s.1
-                                + moe_data.bulk_w2p.1 + moe_data.bulk_w2s.1) as f64 / 1e6;
-                            eprintln!("[PREFILL] Preloading first MoE layer {} ({:.1} MB) on copy_stream",
-                                i, mb);
                         }
                     }
                     break;
@@ -1206,6 +1303,18 @@ impl PrefillEngine {
 
         // 6. Sync
         self.stream_sync()?;
+
+        // Free pinning pool — VRAM is released for decode HCS allocation
+        if self.pinning_active {
+            if self.pinning_pool_ptr != 0 {
+                unsafe { cuda_sys::lib().cuMemFree_v2(self.pinning_pool_ptr); }
+                self.pinning_pool_ptr = 0;
+                self.pinning_pool_bytes = 0;
+            }
+            self.pinned_expert_offsets.clear();
+            self.pinning_active = false;
+            self.prescan_active_experts.clear();
+        }
 
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         log::info!("Rust prefill: {} tok in {:.1}ms ({:.0} tok/s)", total_m, ms, total_m as f64 / (ms / 1000.0));
@@ -3742,12 +3851,32 @@ impl PrefillEngine {
         if self.preloaded_moe_layer != Some(layer_idx) {
             if let Some(moe_idx) = moe_layer_idx {
                 if let Some(Some(moe_data)) = self.moe_layers.get(moe_idx) {
-                    self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
-                    if layer_idx == 0 {
-                        let mb = (moe_data.bulk_w13p.1 + moe_data.bulk_w13s.1
-                            + moe_data.bulk_w2p.1 + moe_data.bulk_w2s.1) as f64 / 1e6;
-                        eprintln!("[FUSED-DMA] layer0: bulk DMA {:.1} MB ({} experts, buf={})",
-                            mb, moe_data.experts.len(), cur);
+                    if !self.prescan_active_experts.is_empty() || self.hcs_num_experts_per_layer > 0 {
+                        // Selective DMA: use real routing to transfer only active experts
+                        let active: Vec<usize> = h_expert_counts.iter().enumerate()
+                            .filter_map(|(eid, &cnt)| if cnt > 0 { Some(eid) } else { None })
+                            .collect();
+                        // Find MoE layer index for pinning lookup
+                        let mi = (0..self.config.num_hidden_layers)
+                            .filter(|&j| self.layer_weights[j].moe_gate_ptr != 0)
+                            .position(|j| j == layer_idx)
+                            .unwrap_or(0);
+                        let (h, p, c) = self.selective_dma_layer(
+                            moe_data, layer_idx, mi,
+                            w1_base, w1s_base, w2_base, w2s_base,
+                            &active)?;
+                        if layer_idx == 0 {
+                            eprintln!("[FUSED-DMA] layer0: selective DMA {} hcs (D2D) + {} pinned (D2D) + {} cold (H2D), buf={}",
+                                h, p, c, cur);
+                        }
+                    } else {
+                        self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+                        if layer_idx == 0 {
+                            let mb = (moe_data.bulk_w13p.1 + moe_data.bulk_w13s.1
+                                + moe_data.bulk_w2p.1 + moe_data.bulk_w2s.1) as f64 / 1e6;
+                            eprintln!("[FUSED-DMA] layer0: bulk DMA {:.1} MB ({} experts, buf={})",
+                                mb, moe_data.experts.len(), cur);
+                        }
                     }
                     unsafe {
                         cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
@@ -5581,9 +5710,53 @@ impl PrefillEngine {
         // Two full DMA cycles elapse before a buffer is reused, which exceeds
         // the compute time per layer (26ms DMA >> 4.5ms compute).
 
-        // Bulk DMA all experts for next layer into the other buffer
+        // DMA experts for next layer into the other buffer.
+        // With pinning: selective DMA using pre-scan routing (pinned D2D + cold H2D).
+        // Without pinning: bulk DMA (4 large contiguous transfers).
         if let Some(Some(moe_data)) = self.moe_layers.get(next_moe_idx) {
-            self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+            let has_prescan = !self.prescan_active_experts.is_empty();
+            let has_hcs = self.hcs_num_experts_per_layer > 0;
+
+            if has_prescan || has_hcs {
+                // Find the MoE layer index for the next layer
+                let mi = (0..self.config.num_hidden_layers)
+                    .filter(|&j| self.layer_weights[j].moe_gate_ptr != 0)
+                    .position(|j| j == next_layer);
+
+                if let Some(mi) = mi {
+                    // Use pre-scan data: union of all chunks' active experts for this layer
+                    let mut active_set = vec![false; self.config.n_routed_experts];
+                    if has_prescan && mi < self.prescan_active_experts.len() {
+                        for chunk_experts in &self.prescan_active_experts[mi] {
+                            for &eid in chunk_experts {
+                                if eid < active_set.len() { active_set[eid] = true; }
+                            }
+                        }
+                    }
+                    // Also include all pinned experts (they need D2D copy)
+                    if self.pinning_active && mi < self.pinned_expert_offsets.len() {
+                        for (eid, off) in self.pinned_expert_offsets[mi].iter().enumerate() {
+                            if off.is_some() { active_set[eid] = true; }
+                        }
+                    }
+                    // If no prescan data, fall back to all experts
+                    let active: Vec<usize> = if active_set.iter().any(|&a| a) {
+                        active_set.iter().enumerate()
+                            .filter_map(|(eid, &a)| if a { Some(eid) } else { None })
+                            .collect()
+                    } else {
+                        (0..self.config.n_routed_experts).collect()
+                    };
+                    let _ = self.selective_dma_layer(
+                        moe_data, next_layer, mi,
+                        w1_base, w1s_base, w2_base, w2s_base,
+                        &active);
+                } else {
+                    self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+                }
+            } else {
+                self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+            }
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
             }
@@ -5592,6 +5765,368 @@ impl PrefillEngine {
         }
 
         Ok(())
+    }
+
+    /// Gate pre-scan: run gate GEMMs + top-K for all MoE layers on embedded tokens.
+    /// Returns per-MoE-layer per-expert activation count, and populates
+    /// self.prescan_active_experts with per-chunk active expert lists.
+    /// The input is the embedding output (d_hidden), which is an approximation
+    /// of the true per-layer hidden state. Expert activation follows a power law,
+    /// so even approximate routing identifies the hottest experts correctly.
+    fn gate_prescan(&mut self, total_m: usize, chunk_size: usize, num_chunks: usize)
+        -> Result<Vec<Vec<u32>>, String>
+    {
+        let h = self.config.hidden_size;
+        let n_experts = self.config.n_routed_experts;
+        if n_experts == 0 { return Ok(Vec::new()); }
+        let topk = self.config.num_experts_per_tok;
+        let num_layers = self.config.num_hidden_layers;
+
+        // Identify MoE layers (those with gate weights)
+        let moe_layer_indices: Vec<usize> = (0..num_layers)
+            .filter(|&i| self.layer_weights[i].moe_gate_ptr != 0)
+            .collect();
+        let num_moe_layers = moe_layer_indices.len();
+        if num_moe_layers == 0 { return Ok(Vec::new()); }
+
+        // Activation counts: [moe_layer][expert] -> total token count
+        let mut counts: Vec<Vec<u32>> = vec![vec![0u32; n_experts]; num_moe_layers];
+        // Per-chunk active experts: [moe_layer][chunk] -> Vec<expert_id>
+        let mut per_chunk: Vec<Vec<Vec<usize>>> = vec![vec![Vec::new(); num_chunks]; num_moe_layers];
+
+        // Use d_hidden as input (contains embedded tokens)
+        let hidden = *self.scratch.d_hidden.device_ptr();
+        let gate_out = *self.scratch.d_gate_out.device_ptr();
+        let topk_ids_ptr = *self.scratch.d_topk_ids.device_ptr();
+        let topk_weights_ptr = *self.scratch.d_topk_weights.device_ptr();
+        let scoring_func = self.layer_weights[moe_layer_indices[0]].moe_scoring_func;
+
+        let t_prescan = Instant::now();
+
+        for (mi, &layer_idx) in moe_layer_indices.iter().enumerate() {
+            let gate_ptr = self.layer_weights[layer_idx].moe_gate_ptr;
+
+            // Gate GEMM: [total_m, hidden] @ [hidden, n_experts] -> [total_m, n_experts] FP32
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            unsafe {
+                use cudarc::cublas::sys as cublas_sys;
+                use cudarc::cublas::result as cublas_result;
+                cublas_result::set_stream(
+                    self.cublas_handle,
+                    self.stream as cublas_sys::cudaStream_t,
+                ).map_err(|e| format!("prescan cublas set_stream: {:?}", e))?;
+                cublas_result::gemm_ex(
+                    self.cublas_handle,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    n_experts as i32, total_m as i32, h as i32,
+                    &alpha as *const f32 as *const std::ffi::c_void,
+                    gate_ptr as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
+                    hidden as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
+                    &beta as *const f32 as *const std::ffi::c_void,
+                    gate_out as *mut std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_32F, n_experts as i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                ).map_err(|e| format!("prescan gate GEMM layer {}: {:?}", layer_idx, e))?;
+            }
+
+            // Top-K routing
+            {
+                let t = std::cmp::max(32, ((std::cmp::min(1024, n_experts) + 31) / 32) * 32) as u32;
+                let mut p0 = topk_weights_ptr;
+                let mut p1 = topk_ids_ptr;
+                let mut p2 = gate_out;
+                let mut p3 = n_experts as i32;
+                let mut p4 = topk as i32;
+                let kernel = if scoring_func == 1 { self.kernels.sigmoid_topk } else { self.kernels.softmax_topk };
+                let smem = (n_experts * 4 + topk * 8 + if scoring_func == 0 { 32 * 4 } else { 0 }) as u32;
+                unsafe {
+                    launch(kernel,
+                        (total_m as u32, 1, 1), (t, 1, 1), smem, self.stream,
+                        &mut [
+                            &mut p0 as *mut _ as *mut std::ffi::c_void,
+                            &mut p1 as *mut _ as *mut std::ffi::c_void,
+                            &mut p2 as *mut _ as *mut std::ffi::c_void,
+                            &mut p3 as *mut _ as *mut std::ffi::c_void,
+                            &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+            }
+
+            // Download topk_ids to CPU
+            self.stream_sync()?;
+            let total_topk = total_m * topk;
+            if self.h_topk_ids.len() < total_topk {
+                self.h_topk_ids.resize(total_topk, 0);
+            }
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    self.h_topk_ids.as_mut_ptr() as *mut _,
+                    topk_ids_ptr, (total_topk * 4) as usize);
+            }
+
+            // Count activations per expert, and per-chunk active sets
+            let mut layer_counts = vec![0u32; n_experts];
+            for chunk_idx in 0..num_chunks {
+                let cstart = chunk_idx * chunk_size;
+                let cend = std::cmp::min(cstart + chunk_size, total_m);
+                let mut chunk_active = vec![false; n_experts];
+                for tok in cstart..cend {
+                    for k in 0..topk {
+                        let eid = self.h_topk_ids[tok * topk + k] as usize;
+                        if eid < n_experts {
+                            layer_counts[eid] += 1;
+                            chunk_active[eid] = true;
+                        }
+                    }
+                }
+                let active_list: Vec<usize> = (0..n_experts).filter(|&e| chunk_active[e]).collect();
+                per_chunk[mi][chunk_idx] = active_list;
+            }
+            counts[mi] = layer_counts;
+        }
+
+        self.prescan_active_experts = per_chunk;
+        let ms = t_prescan.elapsed().as_secs_f64() * 1000.0;
+        let total_active: usize = counts.iter().map(|c| c.iter().filter(|&&v| v > 0).count()).sum();
+        eprintln!("[PREFILL] Gate pre-scan: {} MoE layers in {:.1}ms, avg {:.0} active experts/layer",
+            num_moe_layers, ms, total_active as f64 / num_moe_layers as f64);
+
+        Ok(counts)
+    }
+
+    /// Allocate expert pinning pool and fill with hottest experts from pre-scan data.
+    /// Returns the number of experts pinned per layer.
+    fn allocate_pinning_pool(&mut self, prescan_counts: &[Vec<u32>]) -> Result<usize, String> {
+        if prescan_counts.is_empty() { return Ok(0); }
+        let n_experts = self.config.n_routed_experts;
+        let num_moe_layers = prescan_counts.len();
+
+        // Compute per-expert byte sizes (same as fused buffer layout)
+        let expert_bytes = self.w1_packed_per_expert + self.w1_scales_per_expert
+            + self.w2_packed_per_expert + self.w2_scales_per_expert;
+        if expert_bytes == 0 { return Ok(0); }
+        self.pinning_pool_expert_bytes = expert_bytes;
+
+        // Measure free VRAM at runtime
+        let (free, _total) = unsafe {
+            let mut f = 0usize;
+            let mut t = 0usize;
+            cuda_sys::lib().cuMemGetInfo_v2(&mut f as *mut _, &mut t as *mut _);
+            (f, t)
+        };
+
+        // Reserve safety margin (proportional to GPU size, min 512 MB)
+        let safety = std::cmp::max(512 * 1024 * 1024, free / 8);
+        let pool_budget = if free > safety { free - safety } else { 0 };
+
+        // Total pinnable experts across all layers
+        let max_total_experts = pool_budget / expert_bytes;
+        let experts_per_layer = std::cmp::min(max_total_experts / num_moe_layers, n_experts);
+
+        if experts_per_layer == 0 {
+            eprintln!("[PREFILL] Pinning pool: insufficient VRAM ({:.0} MB free, {:.1} MB safety), skipping",
+                free as f64 / 1e6, safety as f64 / 1e6);
+            return Ok(0);
+        }
+
+        let total_pinned = experts_per_layer * num_moe_layers;
+        let pool_bytes = total_pinned * expert_bytes;
+
+        eprintln!("[PREFILL] Pinning pool: {:.0} MB free, pinning {}/{} experts/layer ({} total, {:.0} MB)",
+            free as f64 / 1e6, experts_per_layer, n_experts, total_pinned, pool_bytes as f64 / 1e6);
+
+        // Allocate the pool using raw CUDA driver API
+        let pool_base: u64 = unsafe {
+            let mut dptr: u64 = 0;
+            let err = cuda_sys::lib().cuMemAlloc_v2(&mut dptr, pool_bytes);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuMemAlloc pinning pool {} bytes: {:?}", pool_bytes, err));
+            }
+            cuda_sys::lib().cuMemsetD8Async(dptr, 0, pool_bytes, self.stream);
+            dptr
+        };
+
+        // For each MoE layer, sort experts by activation count and pin the top N
+        let mut offsets: Vec<Vec<Option<usize>>> = vec![vec![None; n_experts]; num_moe_layers];
+
+        // Identify MoE layers
+        let moe_layer_indices: Vec<usize> = (0..self.config.num_hidden_layers)
+            .filter(|&i| self.layer_weights[i].moe_gate_ptr != 0)
+            .collect();
+
+        let t_pin = Instant::now();
+
+        for (mi, &layer_idx) in moe_layer_indices.iter().enumerate() {
+            if mi >= num_moe_layers { break; }
+
+            // Sort experts by activation count (descending)
+            let mut ranked: Vec<(usize, u32)> = prescan_counts[mi].iter()
+                .enumerate()
+                .map(|(eid, &cnt)| (eid, cnt))
+                .collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let moe_idx = match self.layer_weights[layer_idx].moe_layer_idx {
+                Some(idx) => idx,
+                None => continue,
+            };
+
+            // Pin top experts
+            for rank in 0..experts_per_layer {
+                let (eid, _cnt) = ranked[rank];
+                let pool_offset = (mi * experts_per_layer + rank) * expert_bytes;
+                offsets[mi][eid] = Some(pool_offset);
+
+                // DMA expert weights from CPU to pinning pool
+                if let Some(Some(moe_data)) = self.moe_layers.get(moe_idx) {
+                    if eid < moe_data.experts.len() {
+                        let e = &moe_data.experts[eid];
+                        let dst = pool_base + pool_offset as u64;
+                        let mut off = 0u64;
+                        unsafe {
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                dst + off, e.w13_packed_ptr as *const _, e.w13_packed_bytes, self.copy_stream);
+                            off += self.w1_packed_per_expert as u64;
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                dst + off, e.w13_scales_ptr as *const _, e.w13_scales_bytes, self.copy_stream);
+                            off += self.w1_scales_per_expert as u64;
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                dst + off, e.w2_packed_ptr as *const _, e.w2_packed_bytes, self.copy_stream);
+                            off += self.w2_packed_per_expert as u64;
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                dst + off, e.w2_scales_ptr as *const _, e.w2_scales_bytes, self.copy_stream);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Wait for all DMA to complete
+        unsafe {
+            cuda_sys::lib().cuStreamSynchronize(self.copy_stream);
+        }
+
+        let pin_ms = t_pin.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[PREFILL] Pinned {} experts/layer across {} layers in {:.0}ms ({:.0} MB @ {:.1} GB/s)",
+            experts_per_layer, num_moe_layers, pin_ms,
+            pool_bytes as f64 / 1e6,
+            pool_bytes as f64 / 1e9 / (pin_ms / 1000.0));
+
+        self.pinning_pool_ptr = pool_base;
+        self.pinning_pool_bytes = pool_bytes;
+        self.pinned_expert_offsets = offsets;
+        self.pinning_active = true;
+
+        Ok(experts_per_layer)
+    }
+
+    /// Selective DMA: copy only specific experts to fused buffer.
+    /// Three-tier lookup: HCS D2D > pinning pool D2D > cold H2D from CPU.
+    /// model_layer_idx is the full model layer index (for HCS cache_fast lookup).
+    /// moe_layer_idx is the MoE-specific sequential index (for pinning pool lookup).
+    fn selective_dma_layer(
+        &self,
+        moe_data: &PrefillMoeLayerData,
+        model_layer_idx: usize,  // model layer index for HCS lookup
+        moe_layer_idx: usize,    // index into pinned_expert_offsets
+        w1_base: u64, w1s_base: u64, w2_base: u64, w2s_base: u64,
+        active_experts: &[usize],  // list of expert IDs to transfer
+    ) -> Result<(usize, usize, usize), String>  // (hcs_count, pinned_count, cold_count)
+    {
+        let mut hcs = 0usize;
+        let mut pinned = 0usize;
+        let mut cold = 0usize;
+        let pool_base = self.pinning_pool_ptr;
+
+        for &eid in active_experts {
+            if eid >= moe_data.experts.len() { continue; }
+
+            let w1_off = (eid * self.w1_packed_per_expert) as u64;
+            let w1s_off = (eid * self.w1_scales_per_expert) as u64;
+            let w2_off = (eid * self.w2_packed_per_expert) as u64;
+            let w2s_off = (eid * self.w2_scales_per_expert) as u64;
+
+            // Tier 1: Check HCS hard pool (already GPU-resident from decode)
+            if let Some((hw1p, hw1s, hw2p, hw2s)) = self.hcs_lookup(model_layer_idx, eid) {
+                // Fast D2D from HCS cache to fused buffer
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                        w1_base + w1_off, hw1p,
+                        self.w1_packed_per_expert, self.copy_stream);
+                    cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                        w1s_base + w1s_off, hw1s,
+                        self.w1_scales_per_expert, self.copy_stream);
+                    cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                        w2_base + w2_off, hw2p,
+                        self.w2_packed_per_expert, self.copy_stream);
+                    cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                        w2s_base + w2s_off, hw2s,
+                        self.w2_scales_per_expert, self.copy_stream);
+                }
+                hcs += 1;
+                continue;
+            }
+
+            // Tier 2: Check pinning pool (pre-scan hot experts)
+            let pin_offset = if self.pinning_active
+                && moe_layer_idx < self.pinned_expert_offsets.len()
+                && eid < self.pinned_expert_offsets[moe_layer_idx].len()
+            {
+                self.pinned_expert_offsets[moe_layer_idx][eid]
+            } else {
+                None
+            };
+
+            if let Some(pool_off) = pin_offset {
+                // Fast D2D from pinning pool to fused buffer
+                let src = pool_base + pool_off as u64;
+                let mut src_off = 0u64;
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                        w1_base + w1_off, src + src_off,
+                        self.w1_packed_per_expert, self.copy_stream);
+                    src_off += self.w1_packed_per_expert as u64;
+                    cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                        w1s_base + w1s_off, src + src_off,
+                        self.w1_scales_per_expert, self.copy_stream);
+                    src_off += self.w1_scales_per_expert as u64;
+                    cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                        w2_base + w2_off, src + src_off,
+                        self.w2_packed_per_expert, self.copy_stream);
+                    src_off += self.w2_packed_per_expert as u64;
+                    cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                        w2s_base + w2s_off, src + src_off,
+                        self.w2_scales_per_expert, self.copy_stream);
+                }
+                pinned += 1;
+            } else {
+                // Tier 3: Cold - H2D from CPU via copy_stream
+                let e = &moe_data.experts[eid];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        w1_base + w1_off, e.w13_packed_ptr as *const _,
+                        e.w13_packed_bytes, self.copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        w1s_base + w1s_off, e.w13_scales_ptr as *const _,
+                        e.w13_scales_bytes, self.copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        w2_base + w2_off, e.w2_packed_ptr as *const _,
+                        e.w2_packed_bytes, self.copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        w2s_base + w2s_off, e.w2_scales_ptr as *const _,
+                        e.w2_scales_bytes, self.copy_stream);
+                }
+                cold += 1;
+            }
+        }
+
+        Ok((hcs, pinned, cold))
     }
 
     /// Launch shared expert on the dedicated shared_stream (gap 4).
