@@ -1129,14 +1129,12 @@ def main():
         raise
 
     # ── Phase 2: VRAM budget measurement ──
-    # With Rust prefill, ALL scratch buffers are pre-allocated at engine creation.
-    # No dynamic torch allocation happens during prefill -- VRAM consumption is
-    # constant regardless of prompt length. So the old 4-point calibration
-    # (measure VRAM at different prompt lengths) is unnecessary.
-    #
-    # Budget = free VRAM after all startup allocations - safety margin.
-    # Since prefill doesn't dynamically allocate, all free VRAM can be hard-tier
-    # HCS (permanently resident). No soft-tier eviction/reload cycle needed.
+    # With dynamic per-prompt scratch allocation, scratch is minimal at init and
+    # grows before each prefill (then freed after). HCS gets two tiers:
+    #   hard = experts that survive worst-case prefill (small, permanent)
+    #   soft = experts that fill VRAM during decode, evicted when prefill needs space
+    # The max scratch reservation tells us how much VRAM prefill can claim,
+    # so hard_budget = free - max_scratch - safety.
     dev_idx = devices[0].index
     import torch
 
@@ -1150,29 +1148,34 @@ def main():
     _free_mb = torch.cuda.mem_get_info(dev_idx)[0] // (1024 * 1024)
     _total_mb = torch.cuda.mem_get_info(dev_idx)[1] // (1024 * 1024)
     _detail(f"Free VRAM after startup: {_free_mb:,} MB / {_total_mb:,} MB")
-    logger.info("VRAM budget: free=%d MB, total=%d MB (Rust prefill, constant VRAM)", _free_mb, _total_mb)
+    logger.info("VRAM budget: free=%d MB, total=%d MB", _free_mb, _total_mb)
 
-    # Prefill scratch is already allocated (pre-allocated before VRAM measurement).
-    # _free_mb already reflects the scratch consumption, so no subtraction needed.
+    # Compute max scratch reservation from model config dimensions.
+    # This is how much VRAM prepare_for_prefill() will claim for worst-case prompts.
+    max_scratch_tokens = min(50000, _model.cfg.max_position_embeddings)
+    max_scratch_mb = gpu_store.prefill_scratch_reservation_mb(max_scratch_tokens)
+    _detail(f"Max scratch reservation: {max_scratch_mb:,} MB (at {max_scratch_tokens:,} tokens)")
 
-    # Hard tier = free VRAM minus safety margin.
-    hard_budget = max(0, _free_mb - SAFETY_MARGIN_MB)
-    soft_budget = 0
+    # Hard tier = survives worst-case prefill. Soft tier = reclaimable scratch area.
+    hard_budget = max(0, _free_mb - max_scratch_mb - SAFETY_MARGIN_MB)
+    soft_budget = max_scratch_mb  # During decode, scratch is released → soft HCS fills this space
 
-    # Pass flat calibration to Rust (all 4 points identical = 0 KB/tok).
-    # This tells Rust that VRAM consumption doesn't scale with prompt length,
-    # which is correct for Rust prefill with pre-allocated scratch buffers.
+    # Pass calibration to Rust. Hard budget is small (permanent). Soft is the scratch area.
     short_tokens = 500
-    long_tokens = 50000
-    prefill_short_free = _free_mb
-    prefill_long_free = _free_mb
-    decode_short_free = _free_mb
-    decode_long_free = _free_mb
+    long_tokens = max_scratch_tokens
+    # During prefill: free VRAM = hard_budget + safety (soft evicted, scratch allocated)
+    prefill_free = hard_budget + SAFETY_MARGIN_MB
+    # During decode: free VRAM = hard_budget + soft_budget + safety (scratch released)
+    decode_free = _free_mb
+    prefill_short_free = prefill_free
+    prefill_long_free = prefill_free
+    decode_short_free = decode_free
+    decode_long_free = decode_free
 
     vram_monitor.report_event("calibration_end")
     _status("VRAM budget complete")
-    _detail(f"Hard HCS budget: {hard_budget:,} MB (free={_free_mb}, safety={SAFETY_MARGIN_MB})")
-    _detail(f"Soft HCS budget: {soft_budget:,} MB (no eviction needed)")
+    _detail(f"Hard HCS budget: {hard_budget:,} MB (free={_free_mb}, scratch={max_scratch_mb}, safety={SAFETY_MARGIN_MB})")
+    _detail(f"Soft HCS budget: {soft_budget:,} MB (reclaimable scratch area)")
     logger.info("VRAM budget: hard=%d MB, soft=%d MB, free=%d MB", hard_budget, soft_budget, _free_mb)
 
     # ── Pre-compute multi-GPU layer splits (before HCS, so we can filter rankings) ──

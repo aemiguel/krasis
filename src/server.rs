@@ -693,11 +693,22 @@ fn handle_chat_completion(
             }
         }
 
+        // Dynamically allocate scratch sized for this prompt
+        if let Err(e) = engine.prepare_for_prefill(token_ids.len()) {
+            let _ = send_json(stream, 500, &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e));
+            return;
+        }
+
         let result = engine.run_prefill(
             &token_ids,
             temperature,
             &[], // suppress tokens handled by decode
         );
+
+        // Release scratch to free VRAM for decode/HCS
+        if let Err(e) = engine.release_scratch() {
+            log::error!("Failed to release scratch: {}", e);
+        }
 
         // Convert stop token strings to IDs, and always include model's EOS tokens
         let mut stop_ids: Vec<usize> = state.eos_stop_ids.clone();
@@ -948,13 +959,27 @@ fn handle_prefill_logits(
         }
     }
 
+    // Dynamically allocate scratch for this prompt
+    // run_prefill_logits needs scratch sized for all tokens (no chunking)
+    if let Err(e) = engine.prepare_for_prefill(token_ids.len()) {
+        let _ = send_json(stream, 500, &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e));
+        return;
+    }
+
     let positions = match engine.run_prefill_logits(&token_ids, top_k, sample_every) {
         Ok(p) => p,
         Err(e) => {
+            // Release scratch even on error
+            let _ = engine.release_scratch();
             let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill logits: {}"}}"#, e));
             return;
         }
     };
+
+    // Release scratch after logits extraction
+    if let Err(e) = engine.release_scratch() {
+        log::error!("Failed to release scratch after prefill_logits: {}", e);
+    }
 
     // Format response: {positions: [{position, top_k: [{token_id, logprob}]}]}
     let mut pos_json = Vec::new();
@@ -1046,12 +1071,23 @@ fn handle_reference_test(
         }
     }
 
+    // Dynamically allocate scratch for this prompt
+    if let Err(e) = engine.prepare_for_prefill(input_token_ids.len()) {
+        let _ = send_json(stream, 500, &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e));
+        return;
+    }
+
     // Run prefill with temperature=0 (greedy)
     let prefill_result = engine.run_prefill(
         &input_token_ids,
         0.0, // temperature=0 for greedy
         &[], // no suppress tokens
     );
+
+    // Release scratch to free VRAM for decode/HCS
+    if let Err(e) = engine.release_scratch() {
+        log::error!("reference_test: Failed to release scratch: {}", e);
+    }
 
     let (first_token, prompt_len) = match prefill_result {
         Ok(r) => (r.first_token as usize, r.prompt_len),
@@ -2056,12 +2092,22 @@ impl RustServer {
             log::error!("Failed to swap to Marlin for prefill: {}", e);
         }
 
+        // Dynamically allocate scratch for this prompt
+        engine.prepare_for_prefill(token_ids.len())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Scratch alloc failed: {}", e)))?;
+
         let prefill_result = engine.run_prefill(
             &token_ids,
             temperature,
             &[],
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
             format!("Rust prefill failed: {}", e)))?;
+
+        // Release scratch to free VRAM for decode/HCS
+        if let Err(e) = engine.release_scratch() {
+            log::error!("Failed to release scratch: {}", e);
+        }
 
         let first_token = prefill_result.first_token as usize;
         let prompt_len = prefill_result.prompt_len;

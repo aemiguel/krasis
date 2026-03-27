@@ -1801,6 +1801,18 @@ impl GpuDecodeStore {
         }
     }
 
+    /// Return the max VRAM (MB) that prefill scratch will need for a given prompt size.
+    /// Used by the VRAM budget calculator to reserve space for dynamic scratch growth.
+    #[pyo3(signature = (max_tokens))]
+    fn prefill_scratch_reservation_mb(&self, max_tokens: usize) -> PyResult<usize> {
+        let engine = self.prefill_engine_slot.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Prefill engine not allocated yet"))?;
+        let (fixed_bytes, per_token_bytes) = crate::gpu_prefill::compute_scratch_vram(&engine.config);
+        let total_bytes = fixed_bytes + per_token_bytes * max_tokens;
+        Ok(total_bytes / (1024 * 1024))
+    }
+
     /// Initialize the decode graph with model dimensions.
     #[pyo3(signature = (hidden_size, num_layers, vocab_size, eps, max_experts_per_tok=10, max_intermediate_size=0, max_qkv_size=0, group_size=128, expert_bits=4, moe_intermediate_size=0))]
     fn configure(
@@ -5549,36 +5561,12 @@ impl GpuDecodeStore {
             layer_group_size: 4,      // group MoE layers for expert DMA pipelining
         };
 
-        // Compute dynamic prefill chunk size from available VRAM.
-        // Strategy: maximize chunk size (fewer MoE DMA passes = faster prefill).
-        // HCS gets whatever VRAM remains after prefill scratch is allocated.
-        // Data shows HCS coverage has minimal impact on decode speed (55 tok/s
-        // at both 15% and 48% HCS), while chunk count directly scales DMA cost.
-        {
-            let (fixed_bytes, per_token_bytes) = crate::gpu_prefill::compute_scratch_vram(&config);
-            let mut free: usize = 0;
-            let mut _total: usize = 0;
-            unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
-
-            // Safety margin for CUDA allocator overhead, context, fragmentation.
-            // Proportional to total VRAM: ~7.5% covers PyTorch caching allocator
-            // and driver overhead observed on 32GB cards. Floor at 600 MB.
-            let safety_mb = std::cmp::max(600, _total / (1024 * 1024) * 75 / 1000);
-            let reserved = safety_mb * 1024 * 1024;
-            let usable = free.saturating_sub(reserved).saturating_sub(fixed_bytes);
-            let max_by_vram = if per_token_bytes > 0 { usable / per_token_bytes } else { 50000 };
-            // Cap at 50K tokens, floor at 2000
-            let chunk_size = max_by_vram.max(2000).min(50000);
-            config.prefill_chunk_size = chunk_size;
-            let scratch_mb = (fixed_bytes + per_token_bytes * chunk_size) as f64 / (1024.0 * 1024.0);
-            let remaining_mb = (free.saturating_sub(reserved)
-                .saturating_sub(fixed_bytes + per_token_bytes * chunk_size)) as f64 / (1024.0 * 1024.0);
-            eprintln!("[PREFILL] Dynamic chunk size: {} tokens ({:.0} MB scratch+fused, {} bytes/tok, \
-                {:.0} MB VRAM free, {:.0} MB remaining for HCS, {} MB safety)",
-                chunk_size, scratch_mb, per_token_bytes,
-                free as f64 / (1024.0 * 1024.0),
-                remaining_mb, safety_mb);
-        }
+        // Scratch allocation is DYNAMIC per-prompt via prepare_for_prefill/release_scratch.
+        // At init, allocate minimal 1-token scratch so HCS gets maximum VRAM.
+        // Before each prefill, prepare_for_prefill() reallocates to the actual prompt size.
+        // After each prefill, release_scratch() shrinks back and frees VRAM for decode HCS.
+        config.prefill_chunk_size = 0; // Set dynamically per prompt
+        eprintln!("[PREFILL] Dynamic scratch allocation enabled (per-prompt sizing)");
 
         // Build per-layer weights
         let mut layer_weights = Vec::with_capacity(num_layers);
@@ -5894,18 +5882,14 @@ impl GpuDecodeStore {
             }));
         }
 
-        // Allocate scratch -- sized to prefill_chunk_size, not max_tokens.
-        // run_prefill() chunks prompts into prefill_chunk_size pieces, so scratch
-        // only needs to hold one chunk at a time. This avoids allocating tens of GB
-        // for large context windows (e.g. 131072 tokens).
-        let scratch_tokens = if config.prefill_chunk_size > 0 {
-            std::cmp::min(max_tokens, config.prefill_chunk_size)
-        } else {
-            max_tokens
-        };
-        eprintln!("[PREFILL] Scratch allocated: {} tokens (chunk_size={}, max_context={})",
-            scratch_tokens, config.prefill_chunk_size, max_tokens);
-        let scratch = allocate_scratch(&self.device, &config, scratch_tokens)?;
+        // Allocate minimal scratch at init (0 tokens = just fixed-size buffers).
+        // prepare_for_prefill() dynamically resizes before each prompt.
+        // release_scratch() frees back to minimal after prefill for max HCS.
+        // GpuBuf uses raw cuMemAlloc_v2 (no cudarc pool) so alloc/free is
+        // synchronous and deterministic — no pool interaction with HCS.
+        let scratch = allocate_scratch(&self.device, &config, 0)?;
+        config.prefill_chunk_size = 0;
+        eprintln!("[PREFILL] Dynamic scratch: allocated minimal at init (sized per-prompt)");
 
         // Create CUDA events for double-buffer synchronization
         let dma_event = unsafe {
@@ -5963,10 +5947,11 @@ impl GpuDecodeStore {
         };
 
         // Shared expert needs its own Marlin workspace to avoid conflicts.
-        // Uses moe_intermediate_size (shared expert has the same intermediate as routed experts)
-        // and scratch_tokens (only processes one chunk at a time).
+        // Uses moe_intermediate_size (shared expert has the same intermediate as routed experts).
+        // Sized for max possible chunk (50K) since this is a permanent allocation.
+        let max_possible_chunk: usize = 50000;
         let d_shared_fp32_scratch = self.device.alloc_zeros::<f32>(
-            scratch_tokens * std::cmp::max(graph.hidden_size, config.moe_intermediate_size)
+            max_possible_chunk * std::cmp::max(graph.hidden_size, config.moe_intermediate_size)
         ).map_err(|e| format!("alloc shared_fp32_scratch: {e}"))?;
         let d_shared_workspace = self.device.alloc_zeros::<i32>(
             graph.num_sms * 4
@@ -6064,6 +6049,7 @@ impl GpuDecodeStore {
             crate::gpu_prefill::ScalarType::U4B8
         };
         Ok(PrefillEngine {
+            device: self.device.clone(),
             kernels,
             config,
             scratch,
@@ -6093,8 +6079,8 @@ impl GpuDecodeStore {
             copy_stream,
             cublas_handle,
             h_logits: Vec::new(),
-            h_topk_ids: vec![0i32; scratch_tokens * topk],
-            h_topk_weights: vec![0.0f32; scratch_tokens * topk],
+            h_topk_ids: vec![0i32; max_possible_chunk * topk],
+            h_topk_weights: vec![0.0f32; max_possible_chunk * topk],
             h_gather_src_map: Vec::new(),
             h_gather_weight_map: Vec::new(),
             hcs_cache_fast,

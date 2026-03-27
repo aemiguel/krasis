@@ -19,6 +19,73 @@ use std::time::Instant;
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr};
 use cudarc::driver::sys as cuda_sys;
 
+// ════════════════════════════════════════════════════════════════════════
+//  GpuBuf: raw synchronous GPU allocation (bypasses cudarc pool)
+// ════════════════════════════════════════════════════════════════════════
+//
+// cudarc's CudaSlice uses cuMemAllocAsync/cuMemFreeAsync through the CUDA
+// stream-ordered memory pool. When scratch buffers are freed and reallocated
+// between prefill cycles, the pool's async free/alloc interacts badly with
+// our CU_STREAM_NON_BLOCKING compute streams, causing GPU kernel hangs.
+//
+// GpuBuf uses cuMemAlloc_v2/cuMemFree_v2 (synchronous, no pool) so
+// allocation and deallocation are immediate and deterministic.
+
+pub struct GpuBuf<T: Copy> {
+    ptr: u64,       // CUdeviceptr
+    len: usize,     // element count (not bytes)
+    device_ordinal: i32,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+unsafe impl<T: Copy + Send> Send for GpuBuf<T> {}
+unsafe impl<T: Copy + Sync> Sync for GpuBuf<T> {}
+
+impl<T: Copy> GpuBuf<T> {
+    pub fn alloc_zeroed(count: usize) -> Result<Self, String> {
+        let bytes = count * std::mem::size_of::<T>();
+        if bytes == 0 {
+            return Ok(Self { ptr: 0, len: 0, device_ordinal: 0, _phantom: std::marker::PhantomData });
+        }
+        // Get current device ordinal for drop
+        let mut dev: i32 = 0;
+        unsafe { cuda_sys::lib().cuCtxGetDevice(&mut dev); }
+        let mut ptr: u64 = 0;
+        let err = unsafe { cuda_sys::lib().cuMemAlloc_v2(&mut ptr, bytes) };
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!("cuMemAlloc_v2({} bytes) failed: {:?}", bytes, err));
+        }
+        let err = unsafe { cuda_sys::lib().cuMemsetD8_v2(ptr, 0, bytes) };
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            unsafe { cuda_sys::lib().cuMemFree_v2(ptr); }
+            return Err(format!("cuMemsetD8({} bytes) failed: {:?}", bytes, err));
+        }
+        Ok(Self { ptr, len: count, device_ordinal: dev, _phantom: std::marker::PhantomData })
+    }
+
+    /// Compatible with CudaSlice::device_ptr() — returns &u64 so *buf.device_ptr() works.
+    pub fn device_ptr(&self) -> &u64 {
+        &self.ptr
+    }
+}
+
+impl<T: Copy> Drop for GpuBuf<T> {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            unsafe {
+                // Retain the primary context for this device and make it current,
+                // so cuMemFree_v2 works regardless of which thread we're on.
+                let mut ctx: cuda_sys::CUcontext = std::ptr::null_mut();
+                cuda_sys::lib().cuDevicePrimaryCtxRetain(&mut ctx, self.device_ordinal);
+                cuda_sys::lib().cuCtxSetCurrent(ctx);
+                cuda_sys::lib().cuMemFree_v2(self.ptr);
+                cuda_sys::lib().cuDevicePrimaryCtxRelease_v2(self.device_ordinal);
+            }
+            self.ptr = 0;
+        }
+    }
+}
+
 /// PTX source for prefill kernels (compiled by build.rs).
 #[cfg(has_prefill_kernels)]
 const PREFILL_KERNELS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/prefill_kernels.ptx"));
@@ -476,76 +543,76 @@ pub struct PrefillMoeLayerData {
 }
 
 pub struct PrefillScratch {
-    pub d_hidden: CudaSlice<u16>,
-    pub d_residual: CudaSlice<u16>,
-    pub d_scratch1: CudaSlice<u16>,
-    pub d_scratch2: CudaSlice<u16>,
-    pub d_fp32_scratch: CudaSlice<f32>,
-    pub d_workspace: CudaSlice<i32>,
-    pub d_topk_weights: CudaSlice<f32>,
-    pub d_topk_ids: CudaSlice<i32>,
-    pub d_token_ids: CudaSlice<i32>,
-    pub d_positions: CudaSlice<i32>,
-    pub d_attn_out: CudaSlice<u16>,
-    pub d_q: CudaSlice<u16>,
-    pub d_k: CudaSlice<u16>,
-    pub d_v: CudaSlice<u16>,
-    pub d_logits: CudaSlice<f32>,
-    pub d_mamba2_conv_state: Option<CudaSlice<f32>>,
-    pub d_mamba2_ssm_state: Option<CudaSlice<f32>>,
-    pub d_mamba2_in_proj: Option<CudaSlice<u16>>,
-    pub d_mamba2_ssd_out: Option<CudaSlice<u16>>,
+    pub d_hidden: GpuBuf<u16>,
+    pub d_residual: GpuBuf<u16>,
+    pub d_scratch1: GpuBuf<u16>,
+    pub d_scratch2: GpuBuf<u16>,
+    pub d_fp32_scratch: GpuBuf<f32>,
+    pub d_workspace: GpuBuf<i32>,
+    pub d_topk_weights: GpuBuf<f32>,
+    pub d_topk_ids: GpuBuf<i32>,
+    pub d_token_ids: GpuBuf<i32>,
+    pub d_positions: GpuBuf<i32>,
+    pub d_attn_out: GpuBuf<u16>,
+    pub d_q: GpuBuf<u16>,
+    pub d_k: GpuBuf<u16>,
+    pub d_v: GpuBuf<u16>,
+    pub d_logits: GpuBuf<f32>,
+    pub d_mamba2_conv_state: Option<GpuBuf<f32>>,
+    pub d_mamba2_ssm_state: Option<GpuBuf<f32>>,
+    pub d_mamba2_in_proj: Option<GpuBuf<u16>>,
+    pub d_mamba2_ssd_out: Option<GpuBuf<u16>>,
     // MoE scratch buffers
-    pub d_gate_out: CudaSlice<f32>,         // [max_tokens, max_experts] FP32
+    pub d_gate_out: GpuBuf<f32>,         // [max_tokens, max_experts] FP32
     // Shared MoE buffers: sized for fused_sorted_count (= max_tokens * topk + n_routed * block_size).
     // Used by BOTH sequential and fused MoE paths (never simultaneously).
     // Sequential uses [max_tokens * topk] entries; fused uses [fused_sorted_count].
-    pub d_moe_accum: CudaSlice<f32>,        // [fused_sorted_count, max(w1_n, h)] FP32 -- fused C_tmp or [m,h] scatter
-    pub d_moe_gathered: CudaSlice<u16>,     // [fused_sorted_count, hidden] BF16 -- fused_input or gathered
-    pub d_moe_expert_out: CudaSlice<u16>,   // [fused_sorted_count, hidden] BF16 -- fused_output or expert_out
-    pub d_moe_gate_up: CudaSlice<u16>,      // [fused_sorted_count, w1_n] BF16 -- fused_inter_cache or gate_up
-    pub d_moe_inter: CudaSlice<u16>,        // [fused_sorted_count, inter] BF16 -- fused_inter2 or inter
-    pub d_gather_src_map: CudaSlice<i32>,   // [fused_sorted_count] -- sorted_token_ids or gather_src_map
-    pub d_gather_weight_map: CudaSlice<f32>,// [max_tokens * topk]
+    pub d_moe_accum: GpuBuf<f32>,        // [fused_sorted_count, max(w1_n, h)] FP32 -- fused C_tmp or [m,h] scatter
+    pub d_moe_gathered: GpuBuf<u16>,     // [fused_sorted_count, hidden] BF16 -- fused_input or gathered
+    pub d_moe_expert_out: GpuBuf<u16>,   // [fused_sorted_count, hidden] BF16 -- fused_output or expert_out
+    pub d_moe_gate_up: GpuBuf<u16>,      // [fused_sorted_count, w1_n] BF16 -- fused_inter_cache or gate_up
+    pub d_moe_inter: GpuBuf<u16>,        // [fused_sorted_count, inter] BF16 -- fused_inter2 or inter
+    pub d_gather_src_map: GpuBuf<i32>,   // [fused_sorted_count] -- sorted_token_ids or gather_src_map
+    pub d_gather_weight_map: GpuBuf<f32>,// [max_tokens * topk]
     // Fused MoE sorted dispatch buffers (in scratch so both paths share VRAM)
-    pub d_fused_expert_ids: CudaSlice<i32>, // [fused_blocks]
-    pub d_num_tokens_post: CudaSlice<i32>,  // [1]
+    pub d_fused_expert_ids: GpuBuf<i32>, // [fused_blocks]
+    pub d_num_tokens_post: GpuBuf<i32>,  // [1]
     pub fused_sorted_count: usize,
     pub fused_blocks: usize,
     // GPU-only routing scratch
-    pub d_expert_counts: CudaSlice<i32>,    // [max_experts]
-    pub d_expert_offsets: CudaSlice<i32>,   // [max_experts + 1]
-    pub d_write_offsets: CudaSlice<i32>,    // [max_experts]
+    pub d_expert_counts: GpuBuf<i32>,    // [max_experts]
+    pub d_expert_offsets: GpuBuf<i32>,   // [max_experts + 1]
+    pub d_write_offsets: GpuBuf<i32>,    // [max_experts]
     // Expert weight DMA double-buffers (A and B for ping-pong DMA/compute overlap)
-    pub d_expert_w13_packed_a: CudaSlice<u8>,
-    pub d_expert_w13_scales_a: CudaSlice<u8>,
-    pub d_expert_w2_packed_a: CudaSlice<u8>,
-    pub d_expert_w2_scales_a: CudaSlice<u8>,
-    pub d_expert_w13_packed_b: CudaSlice<u8>,
-    pub d_expert_w13_scales_b: CudaSlice<u8>,
-    pub d_expert_w2_packed_b: CudaSlice<u8>,
-    pub d_expert_w2_scales_b: CudaSlice<u8>,
+    pub d_expert_w13_packed_a: GpuBuf<u8>,
+    pub d_expert_w13_scales_a: GpuBuf<u8>,
+    pub d_expert_w2_packed_a: GpuBuf<u8>,
+    pub d_expert_w2_scales_a: GpuBuf<u8>,
+    pub d_expert_w13_packed_b: GpuBuf<u8>,
+    pub d_expert_w13_scales_b: GpuBuf<u8>,
+    pub d_expert_w2_packed_b: GpuBuf<u8>,
+    pub d_expert_w2_scales_b: GpuBuf<u8>,
     // Linear attention scratch buffers
-    pub d_la_q: Option<CudaSlice<f32>>,       // [max_tokens, nv, dk] FP32
-    pub d_la_k: Option<CudaSlice<f32>>,       // [max_tokens, nv, dk] FP32
-    pub d_la_v: Option<CudaSlice<f32>>,       // [max_tokens, nv, dv] FP32
-    pub d_la_z: Option<CudaSlice<u16>>,       // [max_tokens, nv, dv] BF16 (gate)
-    pub d_la_b: Option<CudaSlice<u16>>,       // [max_tokens, nv] BF16
-    pub d_la_a: Option<CudaSlice<u16>>,       // [max_tokens, nv] BF16
-    pub d_la_beta: Option<CudaSlice<f32>>,    // [max_tokens, nv] FP32
-    pub d_la_gate: Option<CudaSlice<f32>>,    // [max_tokens, nv] FP32
-    pub d_la_conv_out: Option<CudaSlice<f32>>, // [conv_dim, max_tokens] FP32
-    pub d_la_v_beta: Option<CudaSlice<f32>>,  // [nv, max_tokens, dv] FP32
-    pub d_la_k_beta: Option<CudaSlice<f32>>,  // [nv, max_tokens, dk] FP32
-    pub d_la_v_new: Option<CudaSlice<f32>>,   // [nv, chunk_size, dv] FP32 (per chunk)
-    pub d_la_g_cum: Option<CudaSlice<f32>>,   // [nv, num_chunks, chunk_size] FP32
-    pub d_la_attn: Option<CudaSlice<f32>>,    // [nv, num_chunks, CS, CS] FP32
-    pub d_la_state: Option<CudaSlice<f32>>,   // [nv, dk, dv] FP32 (recurrent state)
+    pub d_la_q: Option<GpuBuf<f32>>,       // [max_tokens, nv, dk] FP32
+    pub d_la_k: Option<GpuBuf<f32>>,       // [max_tokens, nv, dk] FP32
+    pub d_la_v: Option<GpuBuf<f32>>,       // [max_tokens, nv, dv] FP32
+    pub d_la_z: Option<GpuBuf<u16>>,       // [max_tokens, nv, dv] BF16 (gate)
+    pub d_la_b: Option<GpuBuf<u16>>,       // [max_tokens, nv] BF16
+    pub d_la_a: Option<GpuBuf<u16>>,       // [max_tokens, nv] BF16
+    pub d_la_beta: Option<GpuBuf<f32>>,    // [max_tokens, nv] FP32
+    pub d_la_gate: Option<GpuBuf<f32>>,    // [max_tokens, nv] FP32
+    pub d_la_conv_out: Option<GpuBuf<f32>>, // [conv_dim, max_tokens] FP32
+    pub d_la_v_beta: Option<GpuBuf<f32>>,  // [nv, max_tokens, dv] FP32
+    pub d_la_k_beta: Option<GpuBuf<f32>>,  // [nv, max_tokens, dk] FP32
+    pub d_la_v_new: Option<GpuBuf<f32>>,   // [nv, chunk_size, dv] FP32 (per chunk)
+    pub d_la_g_cum: Option<GpuBuf<f32>>,   // [nv, num_chunks, chunk_size] FP32
+    pub d_la_attn: Option<GpuBuf<f32>>,    // [nv, num_chunks, CS, CS] FP32
+    pub d_la_state: Option<GpuBuf<f32>>,   // [nv, dk, dv] FP32 (recurrent state)
     // FlashAttention-2 scratch
-    pub d_fa2_lse: Option<CudaSlice<f32>>,    // [num_heads, max_tokens] FP32 softmax LSE
-    pub d_la_chunk_out: Option<CudaSlice<f32>>, // [nv, chunk_size, dv] FP32
-    pub d_la_q_contig: Option<CudaSlice<f32>>, // [nv, chunk_size, dk] FP32 (separate from chunk_out to avoid aliasing)
-    pub d_la_proj_buf: Option<CudaSlice<u16>>, // projection buffer [max_tokens, proj_dim] BF16
+    pub d_fa2_lse: Option<GpuBuf<f32>>,    // [num_heads, max_tokens] FP32 softmax LSE
+    pub d_la_chunk_out: Option<GpuBuf<f32>>, // [nv, chunk_size, dv] FP32
+    pub d_la_q_contig: Option<GpuBuf<f32>>, // [nv, chunk_size, dk] FP32 (separate from chunk_out to avoid aliasing)
+    pub d_la_proj_buf: Option<GpuBuf<u16>>, // projection buffer [max_tokens, proj_dim] BF16
     pub max_tokens: usize,
 }
 
@@ -566,6 +633,7 @@ pub struct PrefillLogitPosition {
 // ════════════════════════════════════════════════════════════════════════
 
 pub struct PrefillEngine {
+    pub device: Arc<CudaDevice>,
     pub kernels: PrefillKernels,
     pub config: PrefillModelConfig,
     pub scratch: PrefillScratch,
@@ -882,6 +950,120 @@ impl PrefillEngine {
             .unwrap_or(9999)
     }
 
+    /// Dynamically allocate scratch buffers sized for this prompt.
+    /// Called before each prefill. GpuBuf uses raw cuMemAlloc_v2 (synchronous,
+    /// no pool) so alloc/free is immediate — no cudarc pool interaction.
+    ///
+    /// Flow: sync GPU → trim cudarc pool (release HCS soft VRAM) → measure free
+    /// VRAM → compute chunk_size → drop old scratch → allocate new scratch.
+    pub fn prepare_for_prefill(&mut self, prompt_tokens: usize) -> Result<(), String> {
+        self.bind_cuda_context()?;
+
+        // 1. Synchronize all GPU work (ensures pending cuMemFreeAsync from HCS
+        //    soft eviction have completed on cudarc's internal stream).
+        unsafe { cuda_sys::lib().cuCtxSynchronize(); }
+
+        // 2. Trim cudarc's default memory pool to release HCS soft VRAM back to OS.
+        //    This only releases UNUSED (freed) pool memory — HCS hard pool is still
+        //    allocated and untouched. Safe because we just synchronized all streams.
+        let cold_ptr_before = self.d_cold_staging.as_ref().map_or(0, |s| *s.device_ptr());
+        let mut free_before: usize = 0;
+        let mut total_before: usize = 0;
+        unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free_before, &mut total_before); }
+        unsafe {
+            let mut pool: cuda_sys::CUmemoryPool = std::ptr::null_mut();
+            let mut dev: i32 = 0;
+            cuda_sys::lib().cuCtxGetDevice(&mut dev);
+            let err = cuda_sys::lib().cuDeviceGetDefaultMemPool(&mut pool, dev);
+            if err == cuda_sys::CUresult::CUDA_SUCCESS && !pool.is_null() {
+                let trim_err = cuda_sys::lib().cuMemPoolTrimTo(pool, 0);
+                let mut free_after: usize = 0;
+                let mut total_after: usize = 0;
+                cuda_sys::lib().cuMemGetInfo_v2(&mut free_after, &mut total_after);
+                let cold_ptr_after = self.d_cold_staging.as_ref().map_or(0, |s| *s.device_ptr());
+                eprintln!("[SCRATCH] Pool trim: {:?}, freed {} MB, cold_staging ptr: 0x{:x} -> 0x{:x} ({})",
+                    trim_err,
+                    (free_after - free_before) / (1024 * 1024),
+                    cold_ptr_before, cold_ptr_after,
+                    if cold_ptr_before == cold_ptr_after { "OK" } else { "CHANGED!" });
+            }
+        }
+
+        // 3. Drop old scratch to free its VRAM (GpuBuf::drop = cuMemFree_v2, immediate).
+        //    Replace with a zero-capacity scratch temporarily.
+        let old_tokens = self.scratch.max_tokens;
+        self.scratch = allocate_scratch(&self.device, &self.config, 0)
+            .map_err(|e| format!("alloc empty scratch: {e}"))?;
+        // Old scratch is now dropped, VRAM is freed.
+
+        // 4. Measure free VRAM and compute optimal chunk_size for this prompt.
+        let (fixed_bytes, per_token_bytes) = compute_scratch_vram(&self.config);
+        let mut free_bytes: usize = 0;
+        let mut total_bytes: usize = 0;
+        unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free_bytes, &mut total_bytes); }
+        let safety_mb = std::cmp::max(600, total_bytes / (1024 * 1024) * 75 / 1000);
+        let reserved = safety_mb * 1024 * 1024;
+
+        // Reserve for cold staging + pointer tables
+        let cold_reserve = if self.config.n_routed_experts > 0 {
+            let h = self.config.hidden_size;
+            let moe_inter = self.config.moe_intermediate_size;
+            let bits = self.config.expert_bits as usize;
+            let gs = self.config.group_size;
+            let w13_n = if self.config.moe_gated { 2 * moe_inter } else { moe_inter };
+            let packed = h * w13_n * bits / 8 + moe_inter * h * bits / 8;
+            let scales = if gs > 0 { (h / gs) * w13_n * 2 + (moe_inter / gs) * h * 2 } else { 0 };
+            self.config.n_routed_experts * (packed + scales)
+        } else { 0 };
+
+        let usable = free_bytes.saturating_sub(reserved).saturating_sub(fixed_bytes).saturating_sub(cold_reserve);
+        let max_by_vram = if per_token_bytes > 0 { usable / per_token_bytes } else { 50000 };
+
+        // Size for this prompt: cap at prompt_tokens (no point allocating more),
+        // but allow at least 1000 tokens for safety.
+        let target = prompt_tokens.min(50000);
+        let scratch_tokens = max_by_vram.min(target).max(1000);
+
+        // 5. Allocate new scratch sized for this prompt.
+        self.scratch = allocate_scratch(&self.device, &self.config, scratch_tokens)?;
+        self.config.prefill_chunk_size = scratch_tokens;
+
+        let scratch_mb = (fixed_bytes + per_token_bytes * scratch_tokens) as f64 / (1024.0 * 1024.0);
+        if scratch_tokens != old_tokens {
+            eprintln!("[PREFILL] Dynamic scratch: {} tokens ({:.0} MB) for {}-token prompt ({} MB safety, {:.0} MB free)",
+                scratch_tokens, scratch_mb, prompt_tokens, safety_mb,
+                free_bytes as f64 / (1024.0 * 1024.0));
+        }
+
+        // Verify cold staging is still readable after pool trim + scratch alloc.
+        if let Some(ref cold) = self.d_cold_staging {
+            let cold_ptr = *cold.device_ptr();
+            let mut probe: u8 = 0;
+            let err = unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(&mut probe as *mut u8 as *mut _, cold_ptr, 1)
+            };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                eprintln!("[SCRATCH] FATAL: cold staging at 0x{:x} is UNREADABLE after scratch alloc: {:?}", cold_ptr, err);
+                return Err(format!("cold staging corrupted by pool trim: {:?}", err));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Release scratch VRAM after prefill so HCS can reclaim it for decode.
+    /// GpuBuf::drop calls cuMemFree_v2 (synchronous, immediate release).
+    pub fn release_scratch(&mut self) -> Result<(), String> {
+        self.bind_cuda_context()?;
+        // Synchronize to ensure all prefill GPU work is done before freeing buffers.
+        unsafe { cuda_sys::lib().cuCtxSynchronize(); }
+        // Replace scratch with zero-capacity (drops old, frees VRAM immediately).
+        self.scratch = allocate_scratch(&self.device, &self.config, 0)
+            .map_err(|e| format!("alloc empty scratch: {e}"))?;
+        self.config.prefill_chunk_size = 0;
+        Ok(())
+    }
+
     pub fn run_prefill(
         &mut self,
         token_ids: &[u32],
@@ -988,23 +1170,11 @@ impl PrefillEngine {
             self.launch_embedding(prescan_m)
                 .map_err(|e| format!("prescan embedding: {}", e))?;
 
-            // Run gate pre-scan on embedded tokens
+            // Run gate pre-scan on embedded tokens (routing info used by pointer table DMA)
             match self.gate_prescan(prescan_m, chunk_size, num_chunks) {
-                Ok(prescan_counts) => {
-                    if !prescan_counts.is_empty() {
-                        // Allocate pinning pool and fill with hottest experts
-                        match self.allocate_pinning_pool(&prescan_counts) {
-                            Ok(per_layer) => {
-                                if per_layer > 0 {
-                                    eprintln!("[PREFILL] Expert pinning active: {}/{} per layer",
-                                        per_layer, self.config.n_routed_experts);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[PREFILL] Pinning pool allocation failed (non-fatal): {}", e);
-                            }
-                        }
-                    }
+                Ok(_prescan_counts) => {
+                    // Pinning pool is disabled — cold staging + pointer table handles
+                    // all expert DMA (HCS zero-copy + cold H2D staging).
                 }
                 Err(e) => {
                     eprintln!("[PREFILL] Gate pre-scan failed (non-fatal): {}", e);
@@ -1191,6 +1361,7 @@ impl PrefillEngine {
                     ).map_err(|e| format!("fused_add_rmsnorm layer {}: {}", layer_idx, e))?;
                 }
                 if timing { self.stream_sync()?; t_norm_ms += tn0.elapsed().as_secs_f64() * 1000.0; }
+
 
                 // Mixer
                 let ta0 = Instant::now();
@@ -2596,8 +2767,10 @@ impl PrefillEngine {
             let t = std::cmp::max(32, ((std::cmp::min(1024, total) + 31) / 32) * 32) as u32;
             let mut p0 = q_bf16;       // q out [M, key_dim] bf16
             let mut p1 = k_bf16;       // k out [M, key_dim] bf16
-            // v out goes to attn_out buffer (large enough: M * value_dim), then converted
-            let v_bf16 = attn_out;
+            // v out needs [M, value_dim] BF16. attn_out is only [M, hidden_size] which overflows
+            // when value_dim > hidden_size (e.g. QCN: 4096 vs 2048). Use la_k_beta (FP32 buf,
+            // ~411 MB) as temp -- it's not used until FLA step 3 (ai_fla), well after conv reads v.
+            let v_bf16 = *self.scratch.d_la_k_beta.as_ref().expect("d_la_k_beta required for LA").device_ptr();
             let mut p2 = v_bf16;       // v out [M, value_dim] bf16
             let mut p3 = la_z;         // z out [M, value_dim] bf16
             let mut p4 = proj_buf;
@@ -2660,10 +2833,16 @@ impl PrefillEngine {
             }
             if lt { self.stream_sync()?; self.t_la_proj.set(self.t_la_proj.get() + lt0.elapsed().as_secs_f64() * 1000.0); }
 
+            // RMSNorm output goes to a temp buffer sized [M, nv*dv] since value_dim
+            // may exceed hidden_size (QCN: 4096 vs 2048). FLA path uses la_v (free after FLA),
+            // old FP32 path uses la_v_beta (free after gate/beta ops).
+            let mut rmsnorm_out;
+
             // ── BF16 optimized pipeline (FLA path) ──
             // Fused kernels: conv outputs BF16 directly, gate_beta outputs BF16,
             // fused repeat+l2norm, no FP32/BF16 conversion overhead.
             if self.fla.is_some() {
+                rmsnorm_out = la_v;  // [M, nv*dv] FP32 = 2x needed for BF16
                 let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
                 let lt1 = Instant::now();
                 let conv_state = lw.la_conv_state_ptr;
@@ -2872,6 +3051,8 @@ impl PrefillEngine {
                 let fla = self.fla.as_ref().unwrap();
                 let t_arg = fla_total as i32;
 
+                // DEBUG: sync before FLA to catch conv/gate/repeat kernel errors
+
                 // Zero h0 (BF16 initial state) — separate from ht (FP32 output)
                 unsafe {
                     let _ = cuda_sys::lib().cuMemsetD8Async(
@@ -2956,6 +3137,7 @@ impl PrefillEngine {
                         o_grid_x, fla_nt as u32, nv as u32, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA output failed: {}", rc)); }
+                if fla_debug { self.stream_sync().map_err(|e| format!("FLA output sync: {e}"))?; eprintln!("[FLA-DBG] step6 output OK"); }
                 if lt { self.stream_sync()?; self.t_la_fla.set(self.t_la_fla.get() + lt4.elapsed().as_secs_f64() * 1000.0); }
                 let lt5 = Instant::now();
 
@@ -2967,11 +3149,12 @@ impl PrefillEngine {
                 if lt { self.stream_sync()?; self.t_la_postfla.set(self.t_la_postfla.get() + lt5.elapsed().as_secs_f64() * 1000.0); }
 
                 // Gated RMSNorm with BF16 input (reads FLA output directly, no BF16->FP32 conversion)
+                // Output is [M, nv*dv] BF16 -> rmsnorm_out (la_v, free after FLA)
                 let lt6 = Instant::now();
                 {
                     let nt = std::cmp::max(32, ((std::cmp::min(256, dv) + 31) / 32) * 32) as u32;
                     let smem = nt * 4;
-                    let mut n0 = attn_out;   // BF16 output [M, nv*dv]
+                    let mut n0 = rmsnorm_out;  // BF16 output [M, nv*dv] into la_v
                     let mut n1 = o_fla;      // BF16 input (FLA output, in la_v_beta)
                     let mut n2 = la_z;       // BF16 gate [M, nv, dv]
                     let mut n3 = lw.la_norm_weight_ptr; // FP32 weight [dv]
@@ -2997,6 +3180,7 @@ impl PrefillEngine {
 
             } else {
             // ── Old FP32 pipeline (non-FLA fallback) ──
+            rmsnorm_out = la_v_beta;  // default; overwritten by gated_rmsnorm if fla.is_none()
             let lt1 = Instant::now();
             let conv_state = lw.la_conv_state_ptr;
             let conv_weight = lw.la_conv_weight_ptr;
@@ -3516,11 +3700,15 @@ impl PrefillEngine {
             // Gated RMSNorm for non-FLA fallback path (FP32 input from chunk recurrence)
             // FLA path has its own BF16 gated_rmsnorm above
             if self.fla.is_none() {
+                // Output is [M, nv*dv] BF16. When value_dim > hidden_size,
+                // d_attn_out is too small. Use la_v_beta ([nv, M, dv] FP32) as temp.
+                // la_v (input to this kernel) can't be reused here.
+                rmsnorm_out = la_v_beta;
                 let lt6 = Instant::now();
                 {
                     let nt = std::cmp::max(32, ((std::cmp::min(256, dv) + 31) / 32) * 32) as u32;
                     let smem = nt * 4;
-                    let mut n0 = attn_out;
+                    let mut n0 = rmsnorm_out;
                     let mut n1 = la_v;
                     let mut n2 = la_z;
                     let mut n3 = lw.la_norm_weight_ptr;
@@ -3546,19 +3734,20 @@ impl PrefillEngine {
             }
             let lt7 = Instant::now();
             // 21. Output projection: [M, nv*dv] BF16 -> [M, hidden] BF16
+            // Input is rmsnorm_out (la_v or la_v_beta, sized [M, nv*dv]).
             // Use scratch1 as temp to avoid Marlin GEMM input/output aliasing.
             if la_diag {
                 self.stream_sync()?;
-                let pre_oproj_norm = self.diag_l2_norm(attn_out, 0, value_dim, value_dim);
+                let pre_oproj_norm = self.diag_l2_norm(rmsnorm_out, 0, value_dim, value_dim);
                 eprintln!("[DIAG L{:02}] pre_out_proj pos0 norm={:.6} (after gated_rmsnorm, dim={})", layer_idx, pre_oproj_norm, value_dim);
 
                 // Element-level: actual kernel output [M, nv*dv] BF16, head 0 pos 0
-                let out_vals = self.diag_download_bf16(attn_out, 4);
+                let out_vals = self.diag_download_bf16(rmsnorm_out, 4);
                 eprintln!("[DIAG L{:02}] grmsnorm out[h0p0][0:4]=[{:.8},{:.8},{:.8},{:.8}]",
                     layer_idx, out_vals[0], out_vals[1], out_vals[2], out_vals[3]);
             }
             let o_temp = *self.scratch.d_scratch1.device_ptr();
-            self.la_gemm(attn_out, &lw.la_out_proj, &lw.la_out_proj_bf16, o_temp, m)?;
+            self.la_gemm(rmsnorm_out, &lw.la_out_proj, &lw.la_out_proj_bf16, o_temp, m)?;
             self.memcpy_d2d(attn_out, o_temp, (m * cfg.hidden_size * 2) as u64)?;
             if la_diag {
                 let post_oproj_norm = self.diag_l2_norm(attn_out, 0, cfg.hidden_size, cfg.hidden_size);
@@ -3610,8 +3799,10 @@ impl PrefillEngine {
 
     fn forward_moe(&mut self, layer_idx: usize, m: usize) -> Result<(), String> {
         // Use fused MoE path when available (default for prefill).
-        // Fused path: 2 kernel launches per layer (w1+w2) instead of ~1000 sequential.
-        // Uses bulk layer DMA with double-buffered cross-layer pipelining.
+        // Supports two modes: contiguous buffer (d_fused_expert_w1_a) or pointer table
+        // (d_expert_w1_ptrs). Pointer table mode computes B_expert_off = expert_ptr - B;
+        // with B=0 (no contiguous buffer), the offset equals the absolute address, which
+        // cancels correctly in B_ptr[i] + B_expert_off accesses.
         // Set KRASIS_SEQUENTIAL_MOE=1 to force sequential path for debugging.
         let use_fused = self.kernels.fused_moe_fn.is_some()
             && (self.d_fused_expert_w1_a.is_some() || self.d_expert_w1_ptrs.is_some())
@@ -3874,11 +4065,18 @@ impl PrefillEngine {
         let w2_base = w2_buf.map_or(0, |b| *b.device_ptr());
         let w2s_base = w2s_buf.map_or(0, |b| *b.device_ptr());
 
-        // GPU pointers for the pointer table buffers
-        let w1_ptrs_gpu = self.d_expert_w1_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
-        let w1s_ptrs_gpu = self.d_expert_w1s_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
-        let w2_ptrs_gpu = self.d_expert_w2_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
-        let w2s_ptrs_gpu = self.d_expert_w2s_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
+        // GPU pointers for the pointer table buffers.
+        // IMPORTANT: Allocate fresh each layer to avoid corruption from cudarc pool
+        // overlapping with HCS raw cuMemAlloc_v2. Only 4 * 4KB = 16KB, negligible.
+        let ptrs_bytes = n_experts * 8;
+        let (w1_ptrs_gpu, w1s_ptrs_gpu, w2_ptrs_gpu, w2s_ptrs_gpu) = unsafe {
+            let mut p1: u64 = 0; let mut p2: u64 = 0; let mut p3: u64 = 0; let mut p4: u64 = 0;
+            cuda_sys::lib().cuMemAlloc_v2(&mut p1, ptrs_bytes);
+            cuda_sys::lib().cuMemAlloc_v2(&mut p2, ptrs_bytes);
+            cuda_sys::lib().cuMemAlloc_v2(&mut p3, ptrs_bytes);
+            cuda_sys::lib().cuMemAlloc_v2(&mut p4, ptrs_bytes);
+            (p1, p2, p3, p4)
+        };
 
         if use_ptr_table {
             // Build pointer tables for active experts
@@ -3990,26 +4188,40 @@ impl PrefillEngine {
                 }
             }
 
-            // Upload pointer tables to GPU (small: n_experts * 8 bytes each)
+            // Upload pointer tables to GPU using SYNCHRONOUS copy.
+            // cudarc pool allocations can be corrupted by HCS raw cuMemAlloc_v2 allocations,
+            // so we must verify the data reaches the correct GPU address.
+            // Expert H2D staging was already on copy_stream; sync it first.
             unsafe {
-                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                cuda_sys::lib().cuStreamSynchronize(self.copy_stream);
+                // Now use synchronous cuMemcpyHtoD on the default stream
+                cuda_sys::lib().cuMemcpyHtoD_v2(
                     w1_ptrs_gpu, self.h_expert_w1_ptrs.as_ptr() as *const _,
-                    n_experts * 8, self.copy_stream);
-                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    n_experts * 8);
+                cuda_sys::lib().cuMemcpyHtoD_v2(
                     w1s_ptrs_gpu, self.h_expert_w1s_ptrs.as_ptr() as *const _,
-                    n_experts * 8, self.copy_stream);
-                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    n_experts * 8);
+                cuda_sys::lib().cuMemcpyHtoD_v2(
                     w2_ptrs_gpu, self.h_expert_w2_ptrs.as_ptr() as *const _,
-                    n_experts * 8, self.copy_stream);
-                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    n_experts * 8);
+                cuda_sys::lib().cuMemcpyHtoD_v2(
                     w2s_ptrs_gpu, self.h_expert_w2s_ptrs.as_ptr() as *const _,
-                    n_experts * 8, self.copy_stream);
+                    n_experts * 8);
                 cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
             }
 
             if layer_idx == 0 {
+                // Dump host-side pointer table to verify correctness
+                let first_active = active.first().copied().unwrap_or(0);
                 eprintln!("[PTR-TABLE] layer0: {} hcs (zero-copy) + {} cold (H2D staged), active={}/{}",
                     hcs_count, cold_count, active.len(), n_experts);
+                eprintln!("[PTR-TABLE] host ptrs[0..4] = [{:#x}, {:#x}, {:#x}, {:#x}]",
+                    self.h_expert_w1_ptrs[0], self.h_expert_w1_ptrs[1],
+                    self.h_expert_w1_ptrs[2], self.h_expert_w1_ptrs[3]);
+                eprintln!("[PTR-TABLE] host ptrs first_active[{}] = {:#x}",
+                    first_active, self.h_expert_w1_ptrs[first_active]);
+                eprintln!("[PTR-TABLE] gpu buf addr={:#x}, n_experts={}, upload_bytes={}",
+                    w1_ptrs_gpu, n_experts, n_experts * 8);
             }
         } else {
             // Legacy path: contiguous fused buffer DMA
@@ -4043,8 +4255,14 @@ impl PrefillEngine {
         }
 
         // Wait for DMA/pointer table upload to complete (stream dependency)
+        if layer_idx == 0 { eprintln!("[FUSED-DBG] L0: waiting on DMA event..."); }
         unsafe {
             cuda_sys::lib().cuStreamWaitEvent(self.stream, self.dma_event, 0);
+        }
+        if layer_idx == 0 {
+            // Force sync to check if DMA completes
+            self.stream_sync()?;
+            eprintln!("[FUSED-DBG] L0: DMA+sync done, launching kernels...");
         }
         if let Some(t) = mt1 {
             // Sync to measure actual DMA wait time (timing mode only)
@@ -4146,6 +4364,22 @@ impl PrefillEngine {
         // w1: A = fused_input (replicated [m*topk, h]), top_k=1 so kernel reads A[sorted_id] directly
         //     C written at sorted_id positions (token*topk+slot), range [0, m*topk)
         //     C_tmp also at sorted_id positions (unique, no collision in fp32_reduce)
+        if layer_idx == 0 {
+            eprintln!("[FUSED-DBG] w1 params: A={:#x} B={:#x} C={:#x} C_tmp={:#x} scales={:#x}",
+                fused_input_ptr, w1_b_param, fused_inter_ptr, fused_c_tmp_ptr, w1s_b_param);
+            eprintln!("[FUSED-DBG] w1 dims: m_topk={} n={} k={} total_sorted={} block_size={} sms={}",
+                m_topk, w1_n, h, total_sorted, block_size, self.config.sms);
+            eprintln!("[FUSED-DBG] w1 ptrs: B_expert_ptrs={:#x} S_expert_ptrs={:#x} sorted={:#x}",
+                w1_ptrs_gpu, w1s_ptrs_gpu, sorted_ids_val);
+            eprintln!("[FUSED-DBG] w1 ptr_table={} cold_staging={:#x} w1_base={:#x}",
+                use_ptr_table, cold_staging_base, w1_base);
+            // Dump first 4 pointer table entries
+            let mut h_ptrs = [0u64; 4];
+            unsafe { cuda_sys::lib().cuMemcpyDtoH_v2(
+                h_ptrs.as_mut_ptr() as *mut _, w1_ptrs_gpu, 32); }
+            eprintln!("[FUSED-DBG] w1 ptrs[0..4] = [{:#x}, {:#x}, {:#x}, {:#x}]",
+                h_ptrs[0], h_ptrs[1], h_ptrs[2], h_ptrs[3]);
+        }
         unsafe {
             fused_fn(
                 fused_input_ptr as *const _,         // A: [m*topk, K=hidden] replicated
@@ -4189,6 +4423,11 @@ impl PrefillEngine {
                 if use_ptr_table { w1_ptrs_gpu as *const _ } else { std::ptr::null() },   // B_expert_ptrs
                 if use_ptr_table { w1s_ptrs_gpu as *const _ } else { std::ptr::null() },  // S_expert_ptrs
             );
+        }
+        if layer_idx == 0 {
+            eprintln!("[FUSED-DBG] L0: w1 kernel launched, syncing...");
+            self.stream_sync()?;
+            eprintln!("[FUSED-DBG] L0: w1 kernel DONE");
         }
 
         // DIAG: Compare MoE Marlin vs Regular Marlin for one expert
@@ -4684,6 +4923,16 @@ impl PrefillEngine {
             }).sum::<f32>().sqrt();
             eprintln!("[DIAG FUSED L0] hidden_after_bf16[tok0] L2={:.4} first4={:?}",
                 norm, h_hid[..4].iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect::<Vec<f32>>());
+        }
+
+        // Free per-layer pointer table GPU buffers (allocated with raw cuMemAlloc_v2)
+        if use_ptr_table {
+            unsafe {
+                cuda_sys::lib().cuMemFree_v2(w1_ptrs_gpu);
+                cuda_sys::lib().cuMemFree_v2(w1s_ptrs_gpu);
+                cuda_sys::lib().cuMemFree_v2(w2_ptrs_gpu);
+                cuda_sys::lib().cuMemFree_v2(w2s_ptrs_gpu);
+            }
         }
 
         Ok(())
@@ -7012,8 +7261,12 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     per_token += 4;
     // d_positions: max_tokens * 4
     per_token += 4;
-    // d_attn_out: max_tokens * h * 2
-    per_token += h * 2;
+    // d_attn_out: max_tokens * attn_dim * 2, where attn_dim = max(h, q_dim, value_dim)
+    // GQA writes [M, num_q_heads * head_dim], LA gated_rmsnorm no longer uses this buffer.
+    let attn_dim = h
+        .max(config.num_q_heads * config.head_dim)
+        .max(config.la_num_v_heads * config.la_v_head_dim);
+    per_token += attn_dim * 2;
     // d_q: max_tokens * num_q_heads * head_dim * 2
     per_token += config.num_q_heads * config.head_dim * 2;
     // d_k: max_tokens * num_kv_heads * head_dim * 2
@@ -7130,7 +7383,7 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
 }
 
 pub fn allocate_scratch(
-    device: &Arc<CudaDevice>,
+    _device: &Arc<CudaDevice>,
     config: &PrefillModelConfig,
     max_tokens: usize,
 ) -> Result<PrefillScratch, String> {
@@ -7139,14 +7392,19 @@ pub fn allocate_scratch(
     let moe_inter = config.moe_intermediate_size;   // actual MoE expert intermediate
     let topk = config.num_experts_per_tok.max(1);
 
-    let alloc_u16 = |n: usize, name: &str| -> Result<CudaSlice<u16>, String> {
-        device.alloc_zeros::<u16>(n).map_err(|e| format!("alloc {name}: {e}"))
+    // GpuBuf uses raw cuMemAlloc_v2 (synchronous, no pool) so alloc/free
+    // is immediate and deterministic — no interaction with cudarc's pool.
+    let alloc_u16 = |n: usize, name: &str| -> Result<GpuBuf<u16>, String> {
+        GpuBuf::<u16>::alloc_zeroed(n).map_err(|e| format!("alloc {name}: {e}"))
     };
-    let alloc_f32 = |n: usize, name: &str| -> Result<CudaSlice<f32>, String> {
-        device.alloc_zeros::<f32>(n).map_err(|e| format!("alloc {name}: {e}"))
+    let alloc_f32 = |n: usize, name: &str| -> Result<GpuBuf<f32>, String> {
+        GpuBuf::<f32>::alloc_zeroed(n).map_err(|e| format!("alloc {name}: {e}"))
     };
-    let alloc_i32 = |n: usize, name: &str| -> Result<CudaSlice<i32>, String> {
-        device.alloc_zeros::<i32>(n).map_err(|e| format!("alloc {name}: {e}"))
+    let alloc_i32 = |n: usize, name: &str| -> Result<GpuBuf<i32>, String> {
+        GpuBuf::<i32>::alloc_zeroed(n).map_err(|e| format!("alloc {name}: {e}"))
+    };
+    let alloc_u8 = |n: usize, name: &str| -> Result<GpuBuf<u8>, String> {
+        GpuBuf::<u8>::alloc_zeroed(n).map_err(|e| format!("alloc {name}: {e}"))
     };
 
     let max_inter = std::cmp::max(
@@ -7207,7 +7465,13 @@ pub fn allocate_scratch(
         d_topk_ids: alloc_i32(max_tokens * topk, "topk_ids")?,
         d_token_ids: alloc_i32(max_tokens, "token_ids")?,
         d_positions: alloc_i32(max_tokens, "positions")?,
-        d_attn_out: alloc_u16(max_tokens * h, "attn_out")?,
+        d_attn_out: {
+            // Must fit max(hidden_size, num_q_heads*head_dim, value_dim) per token
+            let attn_dim = h
+                .max(config.num_q_heads * config.head_dim)
+                .max(config.la_num_v_heads * config.la_v_head_dim);
+            alloc_u16(max_tokens * attn_dim, "attn_out")?
+        },
         d_q: alloc_u16(max_tokens * config.num_q_heads * config.head_dim, "q")?,
         d_k: alloc_u16(max_tokens * config.num_kv_heads * config.head_dim, "k")?,
         d_v: alloc_u16(max_tokens * config.num_kv_heads * config.head_dim, "v")?,
@@ -7296,52 +7560,52 @@ pub fn allocate_scratch(
                 let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
                 h * w13_n * config.expert_bits as usize / 8
             } else { 1 };
-            device.alloc_zeros::<u8>(w13_size).map_err(|e| format!("alloc expert_w13_packed_a: {e}"))?
+            alloc_u8(w13_size, "expert_w13_packed_a")?
         },
         d_expert_w13_scales_a: {
             let scale_size = if config.n_routed_experts > 0 && config.group_size > 0 {
                 let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
                 (h / config.group_size) * w13_n * 2
             } else { 1 };
-            device.alloc_zeros::<u8>(scale_size).map_err(|e| format!("alloc expert_w13_scales_a: {e}"))?
+            alloc_u8(scale_size, "expert_w13_scales_a")?
         },
         d_expert_w2_packed_a: {
             let w2_size = if config.n_routed_experts > 0 {
                 moe_inter * h * config.expert_bits as usize / 8
             } else { 1 };
-            device.alloc_zeros::<u8>(w2_size).map_err(|e| format!("alloc expert_w2_packed_a: {e}"))?
+            alloc_u8(w2_size, "expert_w2_packed_a")?
         },
         d_expert_w2_scales_a: {
             let scale_size = if config.n_routed_experts > 0 && config.group_size > 0 {
                 (moe_inter / config.group_size) * h * 2
             } else { 1 };
-            device.alloc_zeros::<u8>(scale_size).map_err(|e| format!("alloc expert_w2_scales_a: {e}"))?
+            alloc_u8(scale_size, "expert_w2_scales_a")?
         },
         d_expert_w13_packed_b: {
             let w13_size = if config.n_routed_experts > 0 {
                 let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
                 h * w13_n * config.expert_bits as usize / 8
             } else { 1 };
-            device.alloc_zeros::<u8>(w13_size).map_err(|e| format!("alloc expert_w13_packed_b: {e}"))?
+            alloc_u8(w13_size, "expert_w13_packed_b")?
         },
         d_expert_w13_scales_b: {
             let scale_size = if config.n_routed_experts > 0 && config.group_size > 0 {
                 let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
                 (h / config.group_size) * w13_n * 2
             } else { 1 };
-            device.alloc_zeros::<u8>(scale_size).map_err(|e| format!("alloc expert_w13_scales_b: {e}"))?
+            alloc_u8(scale_size, "expert_w13_scales_b")?
         },
         d_expert_w2_packed_b: {
             let w2_size = if config.n_routed_experts > 0 {
                 moe_inter * h * config.expert_bits as usize / 8
             } else { 1 };
-            device.alloc_zeros::<u8>(w2_size).map_err(|e| format!("alloc expert_w2_packed_b: {e}"))?
+            alloc_u8(w2_size, "expert_w2_packed_b")?
         },
         d_expert_w2_scales_b: {
             let scale_size = if config.n_routed_experts > 0 && config.group_size > 0 {
                 (moe_inter / config.group_size) * h * 2
             } else { 1 };
-            device.alloc_zeros::<u8>(scale_size).map_err(|e| format!("alloc expert_w2_scales_b: {e}"))?
+            alloc_u8(scale_size, "expert_w2_scales_b")?
         },
         // Linear attention scratch buffers
         // LA pads to chunk_size multiples, so total_len can be up to max_tokens + chunk_size - 1.
