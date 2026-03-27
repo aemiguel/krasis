@@ -179,7 +179,7 @@ type MarlinMmFn = unsafe extern "C" fn(
 
 /// Function pointer for vendored krasis_marlin_moe_mm_bf16.
 /// Host function that handles template dispatch internally.
-/// 38 parameters matching the extern "C" entry point.
+/// 40 parameters matching the extern "C" entry point.
 type FusedMoeFn = unsafe extern "C" fn(
     /*A*/            *const std::ffi::c_void,
     /*B*/            *const std::ffi::c_void,
@@ -219,6 +219,8 @@ type FusedMoeFn = unsafe extern "C" fn(
     /*use_atomic*/   bool,
     /*fp32_reduce*/  bool,
     /*is_zp_float*/  bool,
+    /*B_expert_ptrs*/ *const std::ffi::c_void,
+    /*S_expert_ptrs*/ *const std::ffi::c_void,
 );
 
 /// Function pointer for vendored krasis_flash_attn_fwd_bf16.
@@ -636,6 +638,23 @@ pub struct PrefillEngine {
     pub pinning_active: bool,
     // Pre-scan routing data: per-layer list of predicted active expert IDs per chunk
     pub prescan_active_experts: Vec<Vec<Vec<usize>>>,    // [moe_layer_idx][chunk_idx] -> Vec<expert_id>
+    // Expert pointer table for zero-copy MoE (avoids contiguous fused buffer)
+    // GPU-side arrays: each entry is a raw GPU pointer to that expert's weights/scales.
+    // For HCS-resident experts, points directly into HCS VRAM (zero copy).
+    // For cold experts, points into cold_staging buffer after H2D transfer.
+    pub d_expert_w1_ptrs: Option<CudaSlice<u64>>,       // [n_experts] GPU ptrs to packed w1
+    pub d_expert_w1s_ptrs: Option<CudaSlice<u64>>,      // [n_experts] GPU ptrs to w1 scales
+    pub d_expert_w2_ptrs: Option<CudaSlice<u64>>,       // [n_experts] GPU ptrs to packed w2
+    pub d_expert_w2s_ptrs: Option<CudaSlice<u64>>,      // [n_experts] GPU ptrs to w2 scales
+    // Host-side staging arrays for building pointer tables
+    pub h_expert_w1_ptrs: Vec<u64>,
+    pub h_expert_w1s_ptrs: Vec<u64>,
+    pub h_expert_w2_ptrs: Vec<u64>,
+    pub h_expert_w2s_ptrs: Vec<u64>,
+    // Cold expert staging buffer: small GPU buffer for H2D of non-HCS experts
+    pub d_cold_staging: Option<CudaSlice<u8>>,
+    pub cold_expert_bytes: usize,   // bytes per cold expert slot (w1p + w1s + w2p + w2s)
+    pub max_cold_experts: usize,    // max cold experts the staging buffer can hold
     // ScalarType for Marlin GEMM dispatch (matches weight quantization format)
     pub q_type: ScalarType,
     // BF16 copies of QK norm weights (converted from FP32 at engine creation)
@@ -993,9 +1012,10 @@ impl PrefillEngine {
         }
 
         // Preload first MoE layer's experts into fused buffer A.
+        // Skip in pointer table mode (forward_moe_fused builds tables per-layer).
         // With pinning active, use selective DMA (pinned D2D + cold H2D).
         // Without pinning, use bulk DMA (4 large contiguous transfers).
-        if use_fused {
+        if use_fused && self.d_expert_w1_ptrs.is_none() {
             for i in 0..num_hidden_layers {
                 if self.layer_weights[i].moe_gate_ptr != 0 {
                     if let Some(moe_idx) = self.layer_weights[i].moe_layer_idx {
@@ -1463,10 +1483,11 @@ impl PrefillEngine {
         self.launch_embedding(m)?;
 
         // Preload first MoE layer (same as run_prefill)
+        // Skip in pointer table mode (forward_moe_fused builds tables per-layer)
         let use_fused = self.kernels.fused_moe_fn.is_some()
             && self.d_fused_input.is_some()
             && std::env::var("KRASIS_SEQUENTIAL_MOE").is_err();
-        if use_fused {
+        if use_fused && self.d_expert_w1_ptrs.is_none() {
             for i in 0..num_hidden_layers {
                 if self.layer_weights[i].moe_gate_ptr != 0 {
                     if let Some(moe_idx) = self.layer_weights[i].moe_layer_idx {
@@ -1558,7 +1579,10 @@ impl PrefillEngine {
 
             if self.layer_weights[layer_idx].moe_gate_ptr != 0 {
                 self.forward_moe(layer_idx, m)?;
-                if self.kernels.fused_moe_fn.is_some() && self.d_fused_expert_w1_a.is_some() {
+                if self.kernels.fused_moe_fn.is_some()
+                    && self.d_fused_expert_w1_a.is_some()
+                    && self.d_expert_w1_ptrs.is_none()  // skip preload in pointer table mode
+                {
                     self.preload_next_moe_layer(layer_idx, num_hidden_layers)?;
                 }
             } else if self.layer_weights[layer_idx].shared_w1.is_some() {
@@ -3830,10 +3854,15 @@ impl PrefillEngine {
                 scale_factor, scoring_func, n_experts, topk);
         }
 
-        // 4. Load expert weights for this layer into contiguous GPU buffer.
-        //    Uses the current buffer (A or B) of the double-buffer pair.
-        //    Bulk DMA: 4 calls per layer from pinned contiguous host memory.
-        //    HCS is for decode only — prefill loads ALL experts per layer.
+        // 4. Build expert pointer tables (zero-copy for HCS, H2D staging for cold).
+        //    Instead of copying ALL experts into a contiguous fused buffer, we build
+        //    a per-expert pointer table. HCS-resident experts are referenced in-place
+        //    (zero copy), cold experts are H2D'd to a small staging buffer.
+        let use_ptr_table = self.d_expert_w1_ptrs.is_some() && self.d_cold_staging.is_some();
+        let cold_staging_base = self.d_cold_staging.as_ref().map_or(0, |s| *s.device_ptr());
+
+        // Also keep fused buffer pointers for the B parameter (needed as base reference
+        // for the kernel's B_ptr arithmetic even in pointer table mode)
         let cur = self.fused_expert_buf_cur;
         let (w1_buf, w1s_buf, w2_buf, w2s_buf) = if cur == 0 {
             (self.d_fused_expert_w1_a.as_ref(), self.d_fused_expert_w1s_a.as_ref(),
@@ -3842,50 +3871,144 @@ impl PrefillEngine {
             (self.d_fused_expert_w1_b.as_ref(), self.d_fused_expert_w1s_b.as_ref(),
              self.d_fused_expert_w2_b.as_ref(), self.d_fused_expert_w2s_b.as_ref())
         };
-        let w1_base = *w1_buf.ok_or("fused w1 buf")?.device_ptr();
-        let w1s_base = *w1s_buf.ok_or("fused w1s buf")?.device_ptr();
-        let w2_base = *w2_buf.ok_or("fused w2 buf")?.device_ptr();
-        let w2s_base = *w2s_buf.ok_or("fused w2s buf")?.device_ptr();
+        let w1_base = w1_buf.map_or(0, |b| *b.device_ptr());
+        let w1s_base = w1s_buf.map_or(0, |b| *b.device_ptr());
+        let w2_base = w2_buf.map_or(0, |b| *b.device_ptr());
+        let w2s_base = w2s_buf.map_or(0, |b| *b.device_ptr());
 
-        // Skip DMA if this layer was already preloaded by cross-layer pipelining
-        if self.preloaded_moe_layer != Some(layer_idx) {
-            if let Some(moe_idx) = moe_layer_idx {
-                if let Some(Some(moe_data)) = self.moe_layers.get(moe_idx) {
-                    if !self.prescan_active_experts.is_empty() || self.hcs_num_experts_per_layer > 0 {
-                        // Selective DMA: use real routing to transfer only active experts
-                        let active: Vec<usize> = h_expert_counts.iter().enumerate()
-                            .filter_map(|(eid, &cnt)| if cnt > 0 { Some(eid) } else { None })
-                            .collect();
-                        // Find MoE layer index for pinning lookup
-                        let mi = (0..self.config.num_hidden_layers)
-                            .filter(|&j| self.layer_weights[j].moe_gate_ptr != 0)
-                            .position(|j| j == layer_idx)
-                            .unwrap_or(0);
-                        let (h, p, c) = self.selective_dma_layer(
-                            moe_data, layer_idx, mi,
-                            w1_base, w1s_base, w2_base, w2s_base,
-                            &active)?;
-                        if layer_idx == 0 {
-                            eprintln!("[FUSED-DMA] layer0: selective DMA {} hcs (D2D) + {} pinned (D2D) + {} cold (H2D), buf={}",
-                                h, p, c, cur);
+        // GPU pointers for the pointer table buffers
+        let w1_ptrs_gpu = self.d_expert_w1_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
+        let w1s_ptrs_gpu = self.d_expert_w1s_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
+        let w2_ptrs_gpu = self.d_expert_w2_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
+        let w2s_ptrs_gpu = self.d_expert_w2s_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
+
+        if use_ptr_table {
+            // Build pointer tables for active experts
+            let active: Vec<usize> = h_expert_counts.iter().enumerate()
+                .filter_map(|(eid, &cnt)| if cnt > 0 { Some(eid) } else { None })
+                .collect();
+
+            let mi = moe_layer_idx.unwrap_or(0);
+            let mut hcs_count = 0usize;
+            let mut cold_count = 0usize;
+            let mut cold_slot = 0usize; // next available slot in cold staging
+
+            // Clear pointer tables (inactive experts get 0 = won't be accessed by kernel)
+            for i in 0..n_experts {
+                self.h_expert_w1_ptrs[i] = 0;
+                self.h_expert_w1s_ptrs[i] = 0;
+                self.h_expert_w2_ptrs[i] = 0;
+                self.h_expert_w2s_ptrs[i] = 0;
+            }
+
+            let moe_data = if let Some(moe_idx) = moe_layer_idx {
+                self.moe_layers.get(moe_idx).and_then(|o| o.as_ref())
+            } else { None };
+
+            for &eid in &active {
+                // Try HCS first (zero copy — point directly into HCS VRAM)
+                if let Some((hw1p, hw1s, hw2p, hw2s)) = self.hcs_lookup(mi, eid) {
+                    self.h_expert_w1_ptrs[eid] = hw1p;
+                    self.h_expert_w1s_ptrs[eid] = hw1s;
+                    self.h_expert_w2_ptrs[eid] = hw2p;
+                    self.h_expert_w2s_ptrs[eid] = hw2s;
+                    hcs_count += 1;
+                } else if let Some(md) = moe_data {
+                    // Cold expert: H2D to staging slot
+                    if eid < md.experts.len() && cold_slot < self.max_cold_experts {
+                        let e = &md.experts[eid];
+                        let slot_base = cold_staging_base + (cold_slot * self.cold_expert_bytes) as u64;
+                        let mut off = 0u64;
+                        // w1 packed
+                        unsafe {
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                slot_base + off, e.w13_packed_ptr as *const _,
+                                e.w13_packed_bytes, self.copy_stream);
                         }
-                    } else {
-                        self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
-                        if layer_idx == 0 {
-                            let mb = (moe_data.bulk_w13p.1 + moe_data.bulk_w13s.1
-                                + moe_data.bulk_w2p.1 + moe_data.bulk_w2s.1) as f64 / 1e6;
-                            eprintln!("[FUSED-DMA] layer0: bulk DMA {:.1} MB ({} experts, buf={})",
-                                mb, moe_data.experts.len(), cur);
+                        self.h_expert_w1_ptrs[eid] = slot_base + off;
+                        off += self.w1_packed_per_expert as u64;
+                        // w1 scales
+                        unsafe {
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                slot_base + off, e.w13_scales_ptr as *const _,
+                                e.w13_scales_bytes, self.copy_stream);
                         }
+                        self.h_expert_w1s_ptrs[eid] = slot_base + off;
+                        off += self.w1_scales_per_expert as u64;
+                        // w2 packed
+                        unsafe {
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                slot_base + off, e.w2_packed_ptr as *const _,
+                                e.w2_packed_bytes, self.copy_stream);
+                        }
+                        self.h_expert_w2_ptrs[eid] = slot_base + off;
+                        off += self.w2_packed_per_expert as u64;
+                        // w2 scales
+                        unsafe {
+                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                slot_base + off, e.w2_scales_ptr as *const _,
+                                e.w2_scales_bytes, self.copy_stream);
+                        }
+                        self.h_expert_w2s_ptrs[eid] = slot_base + off;
+                        cold_slot += 1;
+                        cold_count += 1;
                     }
-                    unsafe {
-                        cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
+                }
+            }
+
+            // Upload pointer tables to GPU (small: n_experts * 8 bytes each)
+            unsafe {
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    w1_ptrs_gpu, self.h_expert_w1_ptrs.as_ptr() as *const _,
+                    n_experts * 8, self.copy_stream);
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    w1s_ptrs_gpu, self.h_expert_w1s_ptrs.as_ptr() as *const _,
+                    n_experts * 8, self.copy_stream);
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    w2_ptrs_gpu, self.h_expert_w2_ptrs.as_ptr() as *const _,
+                    n_experts * 8, self.copy_stream);
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    w2s_ptrs_gpu, self.h_expert_w2s_ptrs.as_ptr() as *const _,
+                    n_experts * 8, self.copy_stream);
+                cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
+            }
+
+            if layer_idx == 0 {
+                eprintln!("[PTR-TABLE] layer0: {} hcs (zero-copy) + {} cold (H2D staged), active={}/{}",
+                    hcs_count, cold_count, active.len(), n_experts);
+            }
+        } else {
+            // Legacy path: contiguous fused buffer DMA
+            if self.preloaded_moe_layer != Some(layer_idx) {
+                if let Some(moe_idx) = moe_layer_idx {
+                    if let Some(Some(moe_data)) = self.moe_layers.get(moe_idx) {
+                        if !self.prescan_active_experts.is_empty() || self.hcs_num_experts_per_layer > 0 {
+                            let active: Vec<usize> = h_expert_counts.iter().enumerate()
+                                .filter_map(|(eid, &cnt)| if cnt > 0 { Some(eid) } else { None })
+                                .collect();
+                            let mi = (0..self.config.num_hidden_layers)
+                                .filter(|&j| self.layer_weights[j].moe_gate_ptr != 0)
+                                .position(|j| j == layer_idx)
+                                .unwrap_or(0);
+                            let (h, p, c) = self.selective_dma_layer(
+                                moe_data, layer_idx, mi,
+                                w1_base, w1s_base, w2_base, w2s_base,
+                                &active)?;
+                            if layer_idx == 0 {
+                                eprintln!("[FUSED-DMA] layer0: selective {} hcs + {} pinned + {} cold", h, p, c);
+                            }
+                        } else {
+                            self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+                        }
+                        unsafe {
+                            cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
+                        }
                     }
                 }
             }
         }
 
-        // Wait for DMA to complete (stream dependency, NOT context sync)
+        // Wait for DMA/pointer table upload to complete (stream dependency)
         unsafe {
             cuda_sys::lib().cuStreamWaitEvent(self.stream, self.dma_event, 0);
         }
@@ -3896,12 +4019,10 @@ impl PrefillEngine {
         }
         let mt2 = if mt { Some(Instant::now()) } else { None };
 
-        // Double-buffer overlap: start DMA for next MoE layer NOW, while we
-        // compute the current layer.  DMA goes to the OTHER buffer on copy_stream,
-        // so there is no conflict with the current compute.
-        // Previous approach waited until after forward_moe returned, missing the
-        // overlap between DMA(N+1) and compute(N).
-        {
+        // Double-buffer overlap: only needed in legacy (non-pointer-table) mode.
+        // In pointer table mode, each layer builds its tables from HCS + cold staging
+        // dynamically, so no preloading is needed.
+        if !use_ptr_table {
             let num_layers = self.config.num_hidden_layers;
             if self.d_fused_expert_w1_b.is_some() {
                 self.preload_next_moe_layer(layer_idx, num_layers)?;
@@ -3980,17 +4101,25 @@ impl PrefillEngine {
             cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, total_sorted * w1_n, self.stream);
         }
 
+        // In pointer table mode, B and scales_ptr params are used as the base reference
+        // for kernel pointer arithmetic. The pointer table entries provide the actual
+        // per-expert addresses. B can be any valid GPU address (cold_staging_base works).
+        let w1_b_param = if use_ptr_table && w1_base == 0 { cold_staging_base } else { w1_base };
+        let w1s_b_param = if use_ptr_table && w1s_base == 0 { cold_staging_base } else { w1s_base };
+        let w2_b_param = if use_ptr_table && w2_base == 0 { cold_staging_base } else { w2_base };
+        let w2s_b_param = if use_ptr_table && w2s_base == 0 { cold_staging_base } else { w2s_base };
+
         // w1: A = fused_input (replicated [m*topk, h]), top_k=1 so kernel reads A[sorted_id] directly
         //     C written at sorted_id positions (token*topk+slot), range [0, m*topk)
         //     C_tmp also at sorted_id positions (unique, no collision in fp32_reduce)
         unsafe {
             fused_fn(
                 fused_input_ptr as *const _,         // A: [m*topk, K=hidden] replicated
-                w1_base as *const _,                 // B: [E, K/16, N, pack]
+                w1_b_param as *const _,              // B: base ref (ptr table overrides per-expert)
                 fused_inter_ptr as *mut _,           // C: written at sorted_id positions [0..m*topk)
                 fused_c_tmp_ptr as *mut _,           // C_tmp
                 std::ptr::null(),                    // b_bias (none)
-                w1s_base as *const _,                // scales: [E, num_groups, N]
+                w1s_b_param as *const _,             // scales: base ref (ptr table overrides)
                 std::ptr::null(),                    // s2 (none)
                 std::ptr::null(),                    // zp (none)
                 std::ptr::null(),                    // g_idx (none)
@@ -4023,11 +4152,14 @@ impl PrefillEngine {
                 false,                               // use_atomic
                 true,                                // fp32_reduce
                 false,                               // is_zp_float
+                if use_ptr_table { w1_ptrs_gpu as *const _ } else { std::ptr::null() },   // B_expert_ptrs
+                if use_ptr_table { w1s_ptrs_gpu as *const _ } else { std::ptr::null() },  // S_expert_ptrs
             );
         }
 
         // DIAG: Compare MoE Marlin vs Regular Marlin for one expert
-        if diag_moe && layer_idx == 0 {
+        // (Skip in pointer table mode -- fused buffer offsets not valid)
+        if diag_moe && layer_idx == 0 && !use_ptr_table {
             self.stream_sync()?;
             // Download sorted_ids and expert_ids to find first expert block
             let mut h_sorted = vec![0i32; std::cmp::min(64, total_sorted)];
@@ -4163,11 +4295,11 @@ impl PrefillEngine {
         unsafe {
             fused_fn(
                 w2_input as *const _,                // A: [m*topk, K=inter] indexed by sorted_id
-                w2_base as *const _,                  // B: [E, K/16, N, pack]
+                w2_b_param as *const _,               // B: base ref (ptr table overrides per-expert)
                 fused_output_ptr as *mut _,           // C: written at sorted_id positions [0..m*topk)
                 fused_c_tmp_ptr as *mut _,            // C_tmp
                 std::ptr::null(),                     // b_bias (none)
-                w2s_base as *const _,                 // scales
+                w2s_b_param as *const _,              // scales: base ref (ptr table overrides)
                 std::ptr::null(),                     // s2 (none)
                 std::ptr::null(),                     // zp (none)
                 std::ptr::null(),                     // g_idx (none)
@@ -4200,6 +4332,8 @@ impl PrefillEngine {
                 false,                                // use_atomic
                 true,                                 // fp32_reduce
                 false,                                // is_zp_float
+                if use_ptr_table { w2_ptrs_gpu as *const _ } else { std::ptr::null() },   // B_expert_ptrs
+                if use_ptr_table { w2s_ptrs_gpu as *const _ } else { std::ptr::null() },  // S_expert_ptrs
             );
         }
 
@@ -4210,7 +4344,8 @@ impl PrefillEngine {
         let mt4 = if mt { Some(Instant::now()) } else { None };
 
         // DIAG: compare fused w2 output vs ORIGINAL weights (HCS/cold) for token 0's experts
-        if diag_moe && layer_idx == 0 {
+        // (Skip in pointer table mode)
+        if diag_moe && layer_idx == 0 && !use_ptr_table {
             self.stream_sync()?;
             let mut h_ti = vec![0i32; topk];
             unsafe {

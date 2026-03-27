@@ -81,7 +81,9 @@ __global__ void Marlin(
     int* locks,                                              // extra global storage for barrier synchronization
     bool use_atomic_add,                                     // whether to use atomic add to reduce
     bool use_fp32_reduce,                                    // whether to use fp32 global reduce
-    int max_shared_mem) {}
+    int max_shared_mem,
+    const int64_t* __restrict__ B_expert_ptrs,               // per-expert B pointer table (or nullptr)
+    const int64_t* __restrict__ S_expert_ptrs) {}            // per-expert scales pointer table (or nullptr)
 
 }  // namespace device::marlin_moe
 
@@ -326,7 +328,9 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem) {
+    int max_shared_mem,
+    const int64_t* __restrict__ B_expert_ptrs,   // per-expert B pointer table (or nullptr for contiguous)
+    const int64_t* __restrict__ S_expert_ptrs) { // per-expert scales pointer table (or nullptr)
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -522,8 +526,19 @@ __global__ void Marlin(
       global_scale = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&val));
     }
 
-    B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
-    scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
+    if (B_expert_ptrs != nullptr) {
+      // Pointer table mode: compute B offset from per-expert pointer
+      // B_ptr[i] was initialized relative to B (which may point to expert 0 or be arbitrary).
+      // B_expert_ptrs[expert_id] gives the actual GPU address for this expert's packed weights.
+      // B_expert_off = (expert_base - B) in int4 elements, so B_ptr[i] + B_expert_off
+      // correctly addresses the expert's weights.
+      B_expert_off = reinterpret_cast<const int4*>(B_expert_ptrs[expert_id]) - B;
+      scales_ptr = reinterpret_cast<const int4*>(S_expert_ptrs[expert_id]);
+    } else {
+      // Contiguous buffer mode: arithmetic offset
+      B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
+      scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
+    }
     if constexpr (has_zp) {
       zp_ptr += (expert_id - old_expert_id) * zp_expert_stride;
     }

@@ -305,7 +305,8 @@ void moe_marlin_mm_impl(
     bool has_bias, bool has_act_order, bool is_k_full, bool has_zp,
     int num_groups, int group_size, int dev, cudaStream_t stream,
     int thread_k, int thread_n, int sms,
-    bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) {
+    bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float,
+    const void* B_expert_ptrs, const void* S_expert_ptrs) {
 
     int thread_m_blocks = div_ceil(moe_block_size, 16);
     bool m_block_size_8 = moe_block_size == 8;
@@ -401,7 +402,8 @@ void moe_marlin_mm_impl(
         A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
         sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
         topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
-        prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem);
+        prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem,
+        (const int64_t*)B_expert_ptrs, (const int64_t*)S_expert_ptrs);
 }
 
 #endif  // __CUDA_ARCH__ >= 800
@@ -423,7 +425,8 @@ extern "C" void krasis_marlin_moe_mm_bf16(
     bool has_bias, bool has_act_order, bool is_k_full, bool has_zp,
     int num_groups, int group_size, int dev, void* stream_ptr,
     int thread_k, int thread_n, int sms,
-    bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) {
+    bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float,
+    const void* B_expert_ptrs, const void* S_expert_ptrs) {
 
     const sglang::ScalarType& q_type = *reinterpret_cast<const sglang::ScalarType*>(q_type_ptr);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -436,5 +439,6 @@ extern "C" void krasis_marlin_moe_mm_bf16(
         has_bias, has_act_order, is_k_full, has_zp,
         num_groups, group_size, dev, stream,
         thread_k, thread_n, sms,
-        use_atomic_add, use_fp32_reduce, is_zp_float);
+        use_atomic_add, use_fp32_reduce, is_zp_float,
+        B_expert_ptrs, S_expert_ptrs);
 }

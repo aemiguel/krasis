@@ -6128,6 +6128,40 @@ impl GpuDecodeStore {
             pinning_pool_expert_bytes: 0,
             pinning_active: false,
             prescan_active_experts: Vec::new(),
+            // Expert pointer table for zero-copy MoE
+            d_expert_w1_ptrs: if has_fused {
+                Some(self.device.alloc_zeros::<u64>(n_routed.max(1))
+                    .map_err(|e| format!("alloc expert_w1_ptrs: {e}"))?)
+            } else { None },
+            d_expert_w1s_ptrs: if has_fused {
+                Some(self.device.alloc_zeros::<u64>(n_routed.max(1))
+                    .map_err(|e| format!("alloc expert_w1s_ptrs: {e}"))?)
+            } else { None },
+            d_expert_w2_ptrs: if has_fused {
+                Some(self.device.alloc_zeros::<u64>(n_routed.max(1))
+                    .map_err(|e| format!("alloc expert_w2_ptrs: {e}"))?)
+            } else { None },
+            d_expert_w2s_ptrs: if has_fused {
+                Some(self.device.alloc_zeros::<u64>(n_routed.max(1))
+                    .map_err(|e| format!("alloc expert_w2s_ptrs: {e}"))?)
+            } else { None },
+            h_expert_w1_ptrs: vec![0u64; n_routed.max(1)],
+            h_expert_w1s_ptrs: vec![0u64; n_routed.max(1)],
+            h_expert_w2_ptrs: vec![0u64; n_routed.max(1)],
+            h_expert_w2s_ptrs: vec![0u64; n_routed.max(1)],
+            d_cold_staging: if has_fused {
+                // Cold staging: sized for n_routed experts (worst case: no HCS hits)
+                let cold_per_expert = w1_packed_per_expert + w1_scales_per_expert
+                    + w2_packed_per_expert + w2_scales_per_expert;
+                let total_cold = n_routed * cold_per_expert;
+                eprintln!("[PTR-TABLE] Allocating cold staging: {} MB ({} experts x {} bytes)",
+                    total_cold / (1024 * 1024), n_routed, cold_per_expert);
+                Some(self.device.alloc_zeros::<u8>(total_cold.max(1))
+                    .map_err(|e| format!("alloc cold_staging: {e}"))?)
+            } else { None },
+            cold_expert_bytes: w1_packed_per_expert + w1_scales_per_expert
+                + w2_packed_per_expert + w2_scales_per_expert,
+            max_cold_experts: n_routed,
             q_type,
             qk_norm_bf16_bufs,
             gqa_timing_enabled: std::cell::Cell::new(false),
