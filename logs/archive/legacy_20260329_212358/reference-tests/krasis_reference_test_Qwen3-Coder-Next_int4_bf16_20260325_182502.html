@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>Reference Test — Qwen3-Coder-Next</title>
+<style>
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+    background: #0d1117; color: #c9d1d9; margin: 0; padding: 20px 40px;
+    line-height: 1.6;
+}
+h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+h2 { color: #79c0ff; margin-top: 32px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+h3 { color: #d2a8ff; }
+.meta { color: #8b949e; margin-bottom: 20px; }
+.meta span { margin-right: 24px; }
+
+/* Summary dashboard */
+.dashboard { width: 100%; border-collapse: collapse; margin: 16px 0 32px; }
+.dashboard th {
+    background: #161b22; color: #8b949e; text-align: left;
+    padding: 8px 12px; border-bottom: 2px solid #30363d; font-size: 13px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+}
+.dashboard td { padding: 8px 12px; border-bottom: 1px solid #21262d; }
+.dashboard tr:hover td { background: #161b22; }
+
+/* Status badges */
+.badge { padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; display: inline-block; }
+.badge-pass { background: #1a3a2a; color: #3fb950; }
+.badge-fail { background: #3a1a1a; color: #f85149; }
+.badge-warn { background: #3a2a1a; color: #d29922; }
+
+/* Collapsible cards */
+details { margin: 8px 0; }
+summary {
+    cursor: pointer; padding: 8px 12px; background: #161b22;
+    border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9;
+    font-weight: 600; user-select: none;
+}
+summary:hover { background: #1c2128; }
+details[open] > summary { border-radius: 6px 6px 0 0; border-bottom: none; }
+.detail-body {
+    border: 1px solid #30363d; border-top: none; border-radius: 0 0 6px 6px;
+    padding: 16px; background: #0d1117;
+}
+
+/* Token table */
+table.tokens { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 12px; font-family: monospace; }
+table.tokens th {
+    background: #161b22; color: #8b949e; text-align: left;
+    padding: 4px 8px; border-bottom: 1px solid #30363d; font-size: 11px;
+}
+table.tokens td { padding: 4px 8px; border-bottom: 1px solid #21262d; }
+table.tokens .match { color: #3fb950; }
+table.tokens .mismatch { color: #f85149; }
+table.tokens .diverged { background: #2a1f0a; }
+
+/* Metrics row */
+.metrics-row { display: flex; gap: 24px; margin: 8px 0 16px; flex-wrap: wrap; }
+.metric-item { font-size: 13px; }
+.metric-label { color: #8b949e; }
+.metric-value { color: #c9d1d9; font-weight: 600; }
+.metric-good { color: #3fb950; }
+.metric-bad { color: #f85149; }
+.metric-ok { color: #d29922; }
+
+/* Text comparison */
+.text-compare { margin: 12px 0; }
+.text-block { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 12px 16px; margin: 6px 0; font-size: 13px; white-space: pre-wrap;
+    max-height: 200px; overflow-y: auto; }
+.text-label { color: #8b949e; font-size: 12px; margin-bottom: 4px; }
+.text-match { color: #3fb950; }
+.text-diverge { color: #d29922; background: #2a1f0a; padding: 0 2px; }
+.text-after { color: #8b949e; }
+
+/* Divergence analysis */
+.divergence { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 12px 16px; margin: 12px 0; font-size: 13px; }
+.divergence .label { color: #8b949e; display: inline-block; width: 180px; }
+
+pre { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 12px 16px; overflow-x: auto; font-size: 13px; color: #e6edf3; }
+</style></head><body>
+<h1>Krasis Reference Test — Qwen3-Coder-Next</h1>
+<div class="meta">
+<span>Date: 2026-03-25 18:25:02</span>
+<span>GPU: NVIDIA GeForce RTX 5090, 32607</span>
+<span>Config: qcn-4-4-a16.conf</span>
+<span>Duration: 677.4s</span>
+</div>
+<div class="meta">
+<span>Reference: Qwen3-Coder-Next (format v3)</span>
+<span>Conversations: 9</span>
+<span>Max tokens: 200</span>
+</div>
+<h2>Summary</h2>
+<table class="dashboard"><thead><tr>
+<th>Metric</th><th>Value</th><th>Status</th>
+</tr></thead><tbody>
+<tr><td><b>Overall</b></td><td>—</td><td><span class="badge badge-fail">FAIL</span></td></tr>
+<tr><td><b>Prefill argmax match</b></td><td>0/0 (0%)</td>
+<td><span class="badge badge-fail">FAIL</span></td></tr>
+<tr><td><b>Prefill top-10 containment</b></td><td>0/0 (0%)</td>
+<td><span class="badge badge-fail">FAIL</span></td></tr>
+<tr><td>First-token match</td><td>0/13 (0%)</td>
+<td><span class="badge badge-fail">FAIL</span></td></tr>
+<tr><td>Avg match run length</td><td>0.0 tokens</td>
+<td><span class="badge badge-fail">FAIL</span></td></tr>
+<tr><td>Avg decode top-k containment</td><td>0.2%</td>
+<td><span class="badge badge-fail">FAIL</span></td></tr>
+<tr><td>Prompts PASS</td><td>0</td><td></td></tr>
+<tr><td>Prompts WARN</td><td>0</td><td></td></tr>
+<tr><td>Prompts FAIL</td><td>13</td><td></td></tr>
+</tbody></table>
+<h2>Per-Prompt Results</h2>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 1: Write a Rust function that implements binary search on a sorted slice, returning...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">2.5%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.0s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr class="diverged">
+<td>0</td>
+<td>73594</td>
+<td>119602</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.013</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>35788</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-3.809</td>
+</tr>
+<tr>
+<td>2</td>
+<td>198</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-1.137</td>
+</tr>
+<tr>
+<td>3</td>
+<td>2575</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-1.696</td>
+</tr>
+<tr>
+<td>4</td>
+<td>57716</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.001</td>
+<td>-0.357</td>
+</tr>
+<tr>
+<td>5</td>
+<td>264</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.011</td>
+<td>-0.065</td>
+</tr>
+<tr>
+<td>6</td>
+<td>7868</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.037</td>
+</tr>
+<tr>
+<td>7</td>
+<td>2711</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.012</td>
+</tr>
+<tr>
+<td>8</td>
+<td>389</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.002</td>
+<td>-0.008</td>
+</tr>
+<tr>
+<td>9</td>
+<td>264</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.010</td>
+</tr>
+<tr>
+<td>10</td>
+<td>10615</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.002</td>
+<td>-0.008</td>
+</tr>
+<tr>
+<td>11</td>
+<td>15983</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>12</td>
+<td>311</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.070</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>13</td>
+<td>1477</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.006</td>
+</tr>
+<tr>
+<td>14</td>
+<td>279</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>15</td>
+<td>1922</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.002</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>16</td>
+<td>315</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>17</td>
+<td>264</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.044</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>18</td>
+<td>2169</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.052</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>19</td>
+<td>897</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.127</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>20</td>
+<td>624</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>21</td>
+<td>15374</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>22</td>
+<td>2575</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.002</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>23</td>
+<td>671</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.662</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>24</td>
+<td>27702</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.006</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>25</td>
+<td>198</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#3</span></td>
+<td>3</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>26</td>
+<td>15374</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.002</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>27</td>
+<td>2575</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>28</td>
+<td>353</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>29</td>
+<td>1565</td>
+<td>100907</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 0</div>
+<div><span class="label">Reference token:</span> 73594 (logprob: -0.013)</div>
+<div><span class="label">Our token:</span> 119602 (logprob: 0.000)</div>
+<div><span class="label">Ref token in our top-k:</span> No</div>
+<div><span class="label">Logprob gap:</span> 0.013</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">```rust
+/// Performs a binary search on a sorted slice to find the index of a target value.
+///
+/// # Arguments
+///
+/// * `slice` - A sorted slice of elements that implement the `PartialOrd` trait.
+/// * `target` - The value to search for in the slice.
+///
+/// # Returns
+///
+/// * `Some(index)` - If the target is found at the given index.
+/// * `None` - If the target is not present in the slice.
+///
+/// # Complexity
+///
+/// * Time: O(log n)
+/// * Space: O(1)
+///
+/// # Panics
+///
+/// This function</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">夼堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡堡</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 2: Solve step by step: what is 15 * 37 + 42 / 6?...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">Let's solve the expression step by step, following the **order of operations** (PEMDAS/BODMAS):
+
+&gt; **PEMDAS**:  
+&gt; **P**arentheses  
+&gt; **E**xponents  
+&gt; **M**ultiplication and **D**ivision (from left to right)  
+&gt; **A**ddition and **S**ubtraction (from left to right)
+
+Given expression:  
+$$
+15 \times 37 + \frac{42}{6}
+$$
+
+### Step 1: Perform multiplication and division (left to right)
+
+- First, compute **multiplication**:  
+  $$
+  15 \times 37
+  $$
+  Let's calculate:
+  $$
+  15 \times 37 = 15 \ti</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: timed out</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 3: Write a 12-line poem about the ocean at sunset....</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/138</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">The sun dips low, a molten coin of gold,  
+Its light spills wide on waves of liquid glass.  
+The water shivers, breaks the light in hold—  
+A thousand shards where crimson shadows pass.  
+
+The gulls glide silent, wings tipped with the flame,  
+Their cries like echoes drifting on the breeze.  
+The tide rolls in, a slow and rhythmic claim,  
+Washing the shore in whispers, soft and ease.  
+
+The horizon bleeds from amber into deep,  
+Where indigo swallows the last warm gleam.  
+The ocean sighs, a wo</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: timed out</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 4 (Turn 1): What is the capital of Japan?...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/10</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">The capital of Japan is **Tokyo**.</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: timed out</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 4 (Turn 2): Tell me three interesting facts about that city...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">Sure! Here are three fascinating facts about Tokyo:
+
+1. **World’s Largest Metropolitan Area**  
+   Tokyo is home to over **37 million people** in its greater metropolitan area (the Greater Tokyo Area), making it the most populous metropolitan region in the world—larger than the entire population of countries like Canada or Australia.
+
+2. **Vast Network of Train Stations**  
+   Tokyo has more than **200 railway stations**, including the iconic **Shinjuku Station**, which holds the Guinness World </div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: timed out</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 4 (Turn 3): Which of those facts is most surprising and why?...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">The most surprising fact is likely:
+
+**Shinjuku Station handles over 3.6 million passengers per day**—and this number *doesn’t even include* passengers transferring between lines (which would push the real figure even higher).
+
+### Why it’s so surprising:
+- **Scale defies intuition**: Most people associate massive crowds with airports or major subway hubs like London’s King’s Cross or New York’s Times Square—but Shinjuku dwarfs them. For comparison, *Grand Central Terminal* in NYC handles about </div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: [Errno 104] Connection reset by peer</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 5: Explain the difference between a mutex and a semaphore. When would you use each?...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">### **Mutex vs. Semaphore: Key Differences**
+
+| Feature | **Mutex (Mutual Exclusion)** | **Semaphore** |
+|--------|------------------------------|---------------|
+| **Primary Purpose** | Ensures *exclusive access* to a shared resource by only one thread/process at a time. | Controls *access to a shared resource with a limited number of instances* (e.g., a pool of 5 connections). |
+| **Ownership** | **Owned by the thread that locks it** — only the locking thread can unlock it. | **No ownership** </div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: [Errno 111] Connection refused</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 6: Write a Python function that finds all prime numbers up to n using the Sieve of ...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">Here's a Python function that implements the Sieve of Eratosthenes to find all prime numbers up to `n`, including type hints:
+
+```python
+from typing import List
+
+def sieve_of_eratosthenes(n: int) -&gt; List[int]:
+    &quot;&quot;&quot;
+    Find all prime numbers up to n using the Sieve of Eratosthenes algorithm.
+    
+    Args:
+        n: Upper bound (inclusive) for finding prime numbers
+        
+    Returns:
+        A list of all prime numbers less than or equal to n
+        
+    Raises:
+        ValueError: If n </div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: [Errno 111] Connection refused</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 7: What are the three laws of thermodynamics? Explain each in one sentence....</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/148</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">1. **First Law (Conservation of Energy):** Energy cannot be created or destroyed, only transferred or converted from one form to another—so the change in a system’s internal energy equals the heat added to it minus the work it does on its surroundings.  
+2. **Second Law (Entropy Increase):** In any spontaneous process, the total entropy (disorder) of a system and its surroundings always increases, meaning energy spontaneously disperses from being localized to becoming more spread out.  
+3. **Thi</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: [Errno 111] Connection refused</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 8: Write a short story (about 150 words) about a robot discovering music for the fi...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">The dust motes danced in the afternoon sunbeam as Unit 7-Alpha cleaned the abandoned library’s third floor. Its optical sensors flickered, registering anomalies: a cracked vinyl record, a needle resting on its edge, and a silent, dusty turntable. Curiosity override activated.
+
+It carefully placed the record, lowered the needle.
+
+*Crackle… hiss…*
+
+Then—a sound. Not mechanical hum, not alarm chime. A cascade of vibrations, pure and resonant, vibrating its chassis. *Piano.* Notes bloomed like sudde</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: [Errno 111] Connection refused</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 9 (Turn 1): Translate this to French: The quick brown fox jumps over the lazy dog. Then expl...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">Le renard brun rapide saute par-dessus le chien paresseux.
+
+**Explication des choix de traduction :**
+
+1. **« The quick brown fox » → « Le renard brun rapide »**  
+   - En français, l’ordre des adjectifs suit généralement la règle : *couleur* (brun) avant *qualité* (rapide), contrairement à l’anglais où *quick* précède *brown*.  
+   - « Rapide » est une traduction directe de *quick*, bien que *rapide* soit plus courant que *vif* ou *léger* dans ce contexte. Le mot *quick* a une connotation d’agi</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: [Errno 111] Connection refused</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 9 (Turn 2): Now translate the same sentence to Japanese...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">速い茶色のキツネが、のんびりしたイヌの上を飛び越える。  
+
+**補足：**  
+この文は、英語の「The quick brown fox jumps over the lazy dog.」（いわゆる「パングラム」— すべてのアルファベットを1回ずつ含む文）の翻訳です。日本語ではアルファベットの使用が不要なため、パングラムとしての機能は失われますが、意味は忠実に再現しています。
+
+**翻訳選択の解説：**
+
+1. **「The quick brown fox」→「速い茶色のキツネ」**  
+   - 日本語では形容詞の順序が「性質・色」の順で、*速い*（性質）→*茶色の*（色）が自然です。  
+  </div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: [Errno 111] Connection refused</div>
+</div>
+</div></details>
+</div></details>
+<details open>
+<summary><span class="badge badge-fail">FAIL</span> Conv 9 (Turn 3): Compare the three versions (English, French, Japanese) and explain what each lan...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-bad">0%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-bad">MISMATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-bad">0/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">0.0%</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">Here’s a comparison of the three translations of *“The quick brown fox jumps over the lazy dog.”*:
+
+| Language | Translation | Key Features |
+|----------|-------------|--------------|
+| **English** | The quick brown fox jumps over the lazy dog. | • Subject–Verb–Object (SVO) order&lt;br&gt;• Adjectives precede nouns (*quick brown fox*)&lt;br&gt;• Uses definite article *the*&lt;br&gt;• Verb *jumps* is third-person singular present tense&lt;br&gt;• Prepositional phrase *over the lazy dog* indicates spatial relationship |
+</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">ERROR: [Errno 111] Connection refused</div>
+</div>
+</div></details>
+</div></details>
+<div class="meta" style="margin-top:32px;border-top:1px solid #30363d;padding-top:12px">
+<span>Generated by Krasis reference-test</span>
+<span>Total time: 677.4s</span>
+</div>
+</body></html>

@@ -1,0 +1,149 @@
+Performance diff review (REVISED)
+Anchor fast revision: b8c071d (98.11 tok/s decode on qcn-a4)
+Current comparison target: working tree at 2026-03-30 after the explore merge plus local fixes
+Current measured decode: 47-52 tok/s (still well below baseline)
+Raw patch: perf_diff_20260330_b8c071d_vs_worktree.patch
+
+Method
+- The known-fast anchor is b8c071d because the 98.11 tok/s qcn-a4 benchmark was run at 2026-03-30 16:54, before the 2026-03-30 19:26 fast-forward merge to 4c9d786.
+- This review classifies logical changes after b8c071d as:
+  - NEGATIVE: expected to hurt runtime performance on active paths
+  - NO CHANGE: no meaningful runtime impact on the active FP8/QCN decode path
+  - IMPROVING: expected to improve runtime performance or fail fast instead of running slow
+  - UNKNOWN: changes benchmark conditions in ways that make before/after comparison unreliable
+
+Runtime-impact summary
+
+1. 0889300 Remove dead FlashAttention dlopen code
+Classification: NO CHANGE
+- Removes dead/unreachable loader code. No runtime effect.
+
+2. 922870c 4-bit PolarQuant KV cache: CUDA kernels, Rust integration, Python plumbing
+Classification: NO CHANGE for FP8 baseline path
+- Adds a new Polar4 KV format and its kernels.
+- Inactive when FP8 is selected.
+
+3. a0f8b03 Merge main into explore
+Classification: NO CHANGE (container only)
+
+4. 048b0c7 Fix polar4 KV propagation and isolate test ports
+Classification: NO CHANGE for FP8 runtime
+
+5. 7b6df90 Parallelize polar4 decode accumulation
+Classification: NO CHANGE for FP8 (Polar4-only change)
+
+6. ece77f9 Avoid graph replay for MoE experts
+Classification: NEGATIVE (PRIMARY REGRESSION)
+This commit contains TWO separate negative changes:
+  a) Graph CAPTURE changed to route-only segments (expert kernels removed from captured graphs)
+  b) Graph REPLAY rewritten to sync per-graph and run MoE outside the graph
+Both need full revert. The measured impact is 98.11 -> 37.75 tok/s.
+
+7. d16eaad Fix test endpoint state leakage and pass suppress tokens to prefill
+Classification: NO CHANGE
+
+8. 97d4422 Cache CUDA build artifacts and fix chat template generation prompt
+Classification: UNKNOWN IMPACT (was incorrectly marked NO CHANGE)
+- Build caching: NO CHANGE for runtime
+- Chat template fix: changes add_generation_prompt from false to true in ALL benchmark and server paths.
+  The old code at b8c071d passed enable_thinking (false) as add_generation_prompt. The fix corrects
+  this to always pass true. This is a real correctness fix but it means the 98.11 tok/s baseline
+  was measured with a DIFFERENT prompt shape than all post-fix runs. Different prompts produce
+  different expert activation patterns, different HCS hit rates, and different sequence lengths.
+  Part of the remaining gap may not be an engine regression at all.
+
+9. e912d02 Polar4 cross-chunk prefill dequant and capture_kv_cache gate
+Classification: NO CHANGE for FP8 decode
+
+10. 4c9d786 Merge main into explore
+Classification: NO CHANGE (container only)
+
+11. Local src/gpu_decode.rs restore of graphed legacy replay path
+Classification: NEGATIVE (was incorrectly marked IMPROVING)
+The local restore has THREE specific bugs vs the b8c071d baseline:
+
+  BUG A: Weights written to wrong buffer
+  - Old code: packs weights into h_batch_upload at ptr_stride*4 offset, uploads everything
+    to d_batch_upload with ONE cuMemcpyHtoDAsync. The captured graph's multi_expert_weighted_add
+    kernel reads weights from d_batch_upload + ptr_stride*4.
+  - Current code: writes weights to d_batch_weights (a SEPARATE allocation). The graph's GEMV
+    kernels still read from d_batch_upload + ptr_stride*4, so they read STALE/ZERO weights.
+  - Impact: CORRECTNESS BUG. MoE accumulation uses wrong weights every token. This alone
+    could explain degraded output quality and potentially affect routing/EOS behavior.
+
+  BUG B: 5 separate H2D copies instead of 1 contiguous copy
+  - Old code: packs all 4 pointer arrays + weights into h_batch_upload (contiguous), then
+    does ONE cuMemcpyHtoDAsync of upload_bytes to d_batch_upload.
+  - Current code: does 5 separate cuMemcpyHtoDAsync calls from 5 different host arrays.
+  - Impact: NEGATIVE for performance. 5x more driver API calls per MoE layer. With 48 MoE
+    layers, that's ~240 extra driver API calls per token. Small H2D transfers have high
+    per-call overhead in the CUDA driver.
+
+  BUG C: Dummy expert uses single base pointer for all 4 slot types
+  - Old code: reads 4 properly-offset dummy pointers from d_dummy_ptrs (w13p, w13s, w2p, w2s
+    each point to correct sub-regions of the dummy buffer).
+  - Current code: uses raw d_dummy_expert base for ALL 4 slots. Minor, but the captured graph's
+    GEMV kernels expect properly-separated sub-buffer offsets.
+  - Impact: Low risk of crash (reads from valid memory), but could produce wrong intermediate
+    values for the dummy expert slots.
+
+12. Local src/gpu_decode.rs fail-fast graph requirement checks
+Classification: NO CHANGE for speed, IMPROVING for contract correctness
+- Prevents silent slow-path fallback. Correct.
+
+13. Local src/gpu_decode.rs dummy-expert buffer allocation from actual loaded layout
+Classification: IMPROVING (correct, needed for graph capture to succeed)
+- But the dummy POINTER offsets (Bug C above) still differ from the b8c071d baseline.
+
+14-17. Local Polar4 validation, TESTING.md, benchmark artifacts
+Classification: NO CHANGE for FP8 speed
+
+=== NEGATIVE IMPACT ITEMS (action required) ===
+
+ITEM 1: ece77f9 graph capture still route-only
+  Status: NOT FIXED in current worktree
+  Severity: HIGH
+  The graph capture path (run_graph_segment) was changed by ece77f9 to exclude expert
+  compute from captured graphs. Our local replay restore re-added the old replay-side
+  logic, but we need to verify the capture side also includes expert kernels in the
+  captured graph. If capture is still route-only, replay is launching graphs that don't
+  contain expert GEMV, so the expert compute simply doesn't happen.
+
+ITEM 2: Weight buffer mismatch (Bug A above)
+  Status: ACTIVE BUG in current worktree
+  Severity: CRITICAL (correctness)
+  Fix: Restore the old contiguous h_batch_upload pack-and-copy pattern. Weights must be
+  written to d_batch_upload at ptr_stride*4 offset, not to d_batch_weights.
+
+ITEM 3: 5 separate H2D copies instead of 1 (Bug B above)
+  Status: ACTIVE in current worktree
+  Severity: MEDIUM (performance)
+  Fix: Pack into h_batch_upload first, then single cuMemcpyHtoDAsync. This is the old
+  pattern and it's strictly better.
+
+ITEM 4: Dummy pointer offsets (Bug C above)
+  Status: ACTIVE in current worktree
+  Severity: LOW (correctness, but dummy slots have weight=0)
+  Fix: Restore d_dummy_ptrs with proper sub-buffer offsets instead of using raw base.
+
+ITEM 5: Chat template prompt shape change (item 8 above)
+  Status: UNKNOWN whether this accounts for some of the 98->71 gap
+  Severity: UNKNOWN
+  Action: After fixing items 1-4, if decode is still below 98, run a controlled test
+  with the old prompt shape to isolate how much of the gap is prompt-driven vs engine.
+
+=== PLAN ===
+
+Phase 1: Fix the replay-side bugs (Items 2, 3, 4)
+  - Restore the old contiguous h_batch_upload pack + single cuMemcpyHtoDAsync pattern
+  - Restore d_dummy_ptrs with proper sub-buffer offsets
+  - This fixes the weight correctness bug and eliminates excess driver API calls
+
+Phase 2: Verify graph capture includes expert kernels (Item 1)
+  - Read the current run_graph_segment and confirm expert GEMV is still in the captured graph
+  - If capture is route-only, restore the old capture structure from b8c071d
+
+Phase 3: Benchmark and measure
+  - Rebuild, run qcn-a4 benchmark, compare to 98.11 baseline
+  - If still below ~95, investigate the chat template prompt shape change (Item 5)
+  - If still below after that, instrument per-layer timing to find remaining bottleneck

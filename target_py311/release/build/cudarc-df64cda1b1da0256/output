@@ -1,0 +1,6 @@
+cargo:rerun-if-changed=build.rs
+cargo:rerun-if-env-changed=CUDA_ROOT
+cargo:rerun-if-env-changed=CUDA_PATH
+cargo:rerun-if-env-changed=CUDA_TOOLKIT_ROOT_DIR
+cargo:rustc-env=CUDA_MAJOR_VERSION=12
+cargo:rustc-env=CUDA_MINOR_VERSION=6

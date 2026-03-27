@@ -143,6 +143,9 @@ const KERNEL_NAMES: &[&str] = &[
     // relu2 expert activation (Nemotron LatentMoE)
     "relu2_w2_batched",
     "relu2_w2_int8_batched",
+    // 4-bit PolarQuant kernels
+    "kv_cache_write_polar4",
+    "gqa_attention_polar4",
 ];
 
 const MODULE_NAME: &str = "decode_kernels";
@@ -1384,6 +1387,9 @@ struct CachedKernels {
     mla_split_q: cudarc::driver::CudaFunction,
     mla_absorb_wkc: cudarc::driver::CudaFunction,
     mla_apply_wvc: cudarc::driver::CudaFunction,
+    // 4-bit PolarQuant kernels
+    kv_cache_write_polar4: cudarc::driver::CudaFunction,
+    gqa_attention_polar4: cudarc::driver::CudaFunction,
     // Mamba2 SSM kernels (Nemotron-H)
     mamba2_conv1d: cudarc::driver::CudaFunction,
     mamba2_ssm_step: cudarc::driver::CudaFunction,
@@ -1599,6 +1605,15 @@ struct GpuDecodeGraph {
     kv_v_ptrs: Vec<u64>,
     kv_max_seq: usize,
     kv_current_pos: usize,
+    /// KV cache format: 0=bf16, 1=fp8, 2=polar4
+    kv_format: u32,
+    /// Polar4 KV cache pointers (only used when kv_format==2)
+    kv_k_radius_ptrs: Vec<u64>,
+    kv_v_radius_ptrs: Vec<u64>,
+    kv_k_angles_ptrs: Vec<u64>,
+    kv_v_angles_ptrs: Vec<u64>,
+    /// Number of 16-element blocks per KV stride (for polar4)
+    kv_num_blocks: usize,
 
     /// RoPE tables in VRAM: cos[max_seq * half_dim], sin[max_seq * half_dim]
     d_rope_cos: Option<cudarc::driver::CudaSlice<f32>>,
@@ -2540,6 +2555,12 @@ impl GpuDecodeStore {
             kv_v_ptrs: Vec::new(),
             kv_max_seq: 0,
             kv_current_pos: 0,
+            kv_format: 1, // default FP8
+            kv_k_radius_ptrs: Vec::new(),
+            kv_v_radius_ptrs: Vec::new(),
+            kv_k_angles_ptrs: Vec::new(),
+            kv_v_angles_ptrs: Vec::new(),
+            kv_num_blocks: 0,
             d_rope_cos: None,
             d_rope_sin: None,
             rope_half_dim: 0,
@@ -2714,6 +2735,9 @@ impl GpuDecodeStore {
                 mla_split_q: get("mla_split_q")?,
                 mla_absorb_wkc: get("mla_absorb_wkc")?,
                 mla_apply_wvc: get("mla_apply_wvc")?,
+                // 4-bit PolarQuant kernels
+                kv_cache_write_polar4: get("kv_cache_write_polar4")?,
+                gqa_attention_polar4: get("gqa_attention_polar4")?,
                 // Mamba2 SSM kernels
                 mamba2_conv1d: get("mamba2_conv1d")?,
                 mamba2_ssm_step: get("mamba2_ssm_step")?,
@@ -5310,6 +5334,70 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    /// Register Polar4 KV cache pointers from Python's PagedKVCache.
+    /// polar4_ptrs: list of (layer_idx, k_radius_ptr, v_radius_ptr, k_angles_ptr, v_angles_ptr)
+    #[pyo3(signature = (polar4_ptrs, max_seq, num_blocks))]
+    fn set_kv_cache_ptrs_polar4(
+        &mut self,
+        polar4_ptrs: Vec<(usize, usize, usize, usize, usize)>,
+        max_seq: usize,
+        num_blocks: usize,
+    ) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let num_layers = graph.layers.len();
+        graph.kv_k_radius_ptrs = vec![0u64; num_layers];
+        graph.kv_v_radius_ptrs = vec![0u64; num_layers];
+        graph.kv_k_angles_ptrs = vec![0u64; num_layers];
+        graph.kv_v_angles_ptrs = vec![0u64; num_layers];
+        graph.kv_k_ptrs = vec![0u64; num_layers]; // clear FP8 ptrs
+        graph.kv_v_ptrs = vec![0u64; num_layers];
+        graph.kv_max_seq = max_seq;
+        graph.kv_format = 2;
+        graph.kv_num_blocks = num_blocks;
+        let mut registered = 0usize;
+        for (layer_idx, kr_ptr, vr_ptr, ka_ptr, va_ptr) in polar4_ptrs {
+            if layer_idx >= num_layers {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Layer {} out of range ({})", layer_idx, num_layers)));
+            }
+            graph.kv_k_radius_ptrs[layer_idx] = kr_ptr as u64;
+            graph.kv_v_radius_ptrs[layer_idx] = vr_ptr as u64;
+            graph.kv_k_angles_ptrs[layer_idx] = ka_ptr as u64;
+            graph.kv_v_angles_ptrs[layer_idx] = va_ptr as u64;
+            registered += 1;
+        }
+        log::info!("GpuDecodeStore: Polar4 KV cache pointers set ({} GQA layers, max_seq={}, blocks={})",
+            registered, max_seq, num_blocks);
+
+        // Allocate FlashDecoding tiled attention buffers (same as FP8 path).
+        let mut max_nh: usize = 0;
+        let mut max_hd: usize = 0;
+        for layer in &graph.layers {
+            if let GpuAttnConfig::GQA { num_heads, head_dim, .. } = &layer.attn {
+                max_nh = max_nh.max(*num_heads);
+                max_hd = max_hd.max(*head_dim);
+            }
+        }
+        if max_nh > 0 && max_hd > 0 {
+            let tile_size: usize = 256;
+            let max_tiles = (max_seq + tile_size - 1) / tile_size;
+            let partial_o_size = max_nh * max_tiles * max_hd;
+            let partial_lse_size = max_nh * max_tiles * 2;
+            let d_tiled_o = self.device.alloc_zeros::<f32>(partial_o_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            let d_tiled_lse = self.device.alloc_zeros::<f32>(partial_lse_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            graph.d_gqa_tiled_o = Some(d_tiled_o);
+            graph.d_gqa_tiled_lse = Some(d_tiled_lse);
+            graph.gqa_tile_size = tile_size;
+            graph.gqa_max_tiles = max_tiles;
+            graph.gqa_num_q_heads = max_nh;
+            graph.gqa_head_dim = max_hd;
+        }
+        Ok(())
+    }
+
     /// Set KV cache position after prefill. Called once per request.
     /// No data copy needed — prefill already wrote into the shared buffer.
     #[pyo3(signature = (seq_len))]
@@ -5973,6 +6061,79 @@ impl GpuDecodeStore {
         }
 
         hcs_hits
+    }
+
+    /// Test KV cache kernels in isolation.
+    #[pyo3(signature = (q_ptr, k_ptr, v_ptr, out_ptr, cache_k_ptr, cache_v_ptr, cache_k_angles_ptr=0, cache_v_angles_ptr=0, nh=0, nkv=0, hd=0, pos=0, max_seq=0, kv_stride=0, sm_sc=0.0, format=0))]
+    fn test_kv_cache(
+        &self,
+        q_ptr: u64,
+        k_ptr: u64,
+        v_ptr: u64,
+        out_ptr: u64,
+        cache_k_ptr: u64,
+        cache_v_ptr: u64,
+        cache_k_angles_ptr: u64,
+        cache_v_angles_ptr: u64,
+        nh: i32,
+        nkv: i32,
+        hd: i32,
+        pos: i32,
+        max_seq: i32,
+        kv_stride: i32,
+        sm_sc: f32,
+        format: i32, // 0=FP16, 1=FP8, 2=POLAR4
+    ) -> PyResult<()> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let k = graph.kernels.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Kernels not loaded (check configure)"))?;
+
+        let threads = 256u32;
+        let blocks_write = ((kv_stride as u32) + threads - 1) / threads;
+
+        unsafe {
+            // 1. Write to cache
+            if format == 2 {
+                // Polar4 uses different packing: radius and angles
+                k.kv_cache_write_polar4.clone().launch(
+                    LaunchConfig { grid_dim: (blocks_write, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                    (cache_k_ptr, cache_v_ptr, cache_k_angles_ptr, cache_v_angles_ptr, k_ptr, v_ptr, pos, kv_stride),
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("kv_cache_write_polar4 failed: {:?}", e)))?;
+            } else {
+                k.kv_cache_write.clone().launch(
+                    LaunchConfig { grid_dim: (blocks_write, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                    (cache_k_ptr, cache_v_ptr, k_ptr, v_ptr, pos, kv_stride),
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("kv_cache_write failed: {:?}", e)))?;
+            }
+
+            // 2. Run attention
+            let seq_len = pos + 1;
+            let q_smem = (hd as u32) * 4;
+            let shared_mem_bytes = q_smem + (seq_len as u32) * 4 + 128;
+
+            if format == 2 {
+                k.gqa_attention_polar4.clone().launch(
+                    LaunchConfig {
+                        grid_dim: (nh as u32, 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes,
+                    },
+                    (out_ptr, q_ptr, cache_k_ptr, cache_v_ptr, cache_k_angles_ptr, cache_v_angles_ptr, sm_sc, nh, nkv, hd, seq_len, max_seq),
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("gqa_attention_polar4 failed: {:?}", e)))?;
+            } else {
+                k.gqa_attention.clone().launch(
+                    LaunchConfig {
+                        grid_dim: (nh as u32, 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes,
+                    },
+                    (out_ptr, q_ptr, cache_k_ptr, cache_v_ptr, sm_sc, nh, nkv, hd, seq_len, max_seq, 1i32),
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("gqa_attention failed: {:?}", e)))?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Set the decode segment for this store (which layers it handles during multi-GPU decode).
@@ -6803,6 +6964,12 @@ impl GpuDecodeStore {
             kv_k_ptrs: graph.kv_k_ptrs.clone(),
             kv_v_ptrs: graph.kv_v_ptrs.clone(),
             kv_max_seq: graph.kv_max_seq,
+            kv_format: graph.kv_format,
+            kv_k_radius_ptrs: graph.kv_k_radius_ptrs.clone(),
+            kv_v_radius_ptrs: graph.kv_v_radius_ptrs.clone(),
+            kv_k_angles_ptrs: graph.kv_k_angles_ptrs.clone(),
+            kv_v_angles_ptrs: graph.kv_v_angles_ptrs.clone(),
+            kv_num_blocks: graph.kv_num_blocks,
             stream: prefill_stream,
             copy_stream,
             cublas_handle,
@@ -10305,7 +10472,33 @@ impl GpuDecodeStore {
                     }
 
                     // ── GQA: KV cache write ──
-                    {
+                    if graph.kv_format == 2 {
+                        // Polar4: structured rotation + 4-bit quantization
+                        let num_blocks = graph.kv_num_blocks;
+                        let threads = 256u32;
+                        let blocks = ((num_blocks as u32) + threads - 1) / threads;
+                        let cfg = LaunchConfig {
+                            grid_dim: (blocks, 1, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        if graph.kv_k_radius_ptrs[layer_idx] == 0 {
+                            return Err(format!(
+                                "kv_cache_write_polar4[{}]: null polar4 pointer", layer_idx));
+                        }
+                        unsafe {
+                            k.kv_cache_write_polar4.clone().launch(cfg, (
+                                graph.kv_k_radius_ptrs[layer_idx],
+                                graph.kv_v_radius_ptrs[layer_idx],
+                                graph.kv_k_angles_ptrs[layer_idx],
+                                graph.kv_v_angles_ptrs[layer_idx],
+                                *graph.d_gqa_k.device_ptr(),
+                                *graph.d_gqa_v.device_ptr(),
+                                position as i32,
+                                kv_stride as i32,
+                            )).map_err(|e| format!("kv_cache_write_polar4[{}]: {:?}", layer_idx, e))?;
+                        }
+                    } else {
                         let threads = 256u32;
                         let blocks = ((kv_stride as u32) + threads - 1) / threads;
                         let cfg = LaunchConfig {
@@ -10336,6 +10529,35 @@ impl GpuDecodeStore {
                         graph.t_gqa_proj += (Instant::now() - t_gqa_s1).as_secs_f64();
                     }
                     let t_gqa_attn_start = Instant::now();
+                    if graph.kv_format == 2 {
+                        // Polar4 attention: single-block-per-head kernel
+                        let threads = 256u32;
+                        let seq_len = (position + 1) as u32;
+                        let num_blocks = graph.kv_num_blocks;
+                        // Shared memory: head_dim floats for Q + warp reduce
+                        let shared_mem_bytes = (hd as u32) * 4 + (threads / 32) * 4 + 128;
+                        let cfg = LaunchConfig {
+                            grid_dim: (nh as u32, 1, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes,
+                        };
+                        unsafe {
+                            k.gqa_attention_polar4.clone().launch(cfg, (
+                                *graph.d_gqa_out.device_ptr(),
+                                *graph.d_gqa_q.device_ptr(),
+                                graph.kv_k_radius_ptrs[layer_idx],
+                                graph.kv_v_radius_ptrs[layer_idx],
+                                graph.kv_k_angles_ptrs[layer_idx],
+                                graph.kv_v_angles_ptrs[layer_idx],
+                                *sm_scale,
+                                nh as i32,
+                                nkv as i32,
+                                hd as i32,
+                                seq_len as i32,
+                                graph.kv_max_seq as i32,
+                            )).map_err(|e| format!("gqa_attention_polar4[{}]: {:?}", layer_idx, e))?;
+                        }
+                    } else {
                     // For long sequences: FlashDecoding tiled kernel (splits seq across blocks)
                     //   + lightweight reduce kernel. Threshold: use tiled when seq_len > tile_size.
                     {
@@ -10429,6 +10651,7 @@ impl GpuDecodeStore {
                             }
                         }
                     }
+                    } // end else (non-polar4)
 
                     if timing {
                         self.device.synchronize().map_err(|e| format!("gqa attn sync: {:?}", e))?;
@@ -11568,7 +11791,9 @@ impl GpuDecodeStore {
         }
 
         // Initialize CUDA graph buffers on all stores
-        let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
+        // Polar4 KV cache doesn't have graph-compatible kernels yet, disable graphs
+        let polar4_active = self.graph.as_ref().map(|g| g.kv_format == 2).unwrap_or(false);
+        let no_graph = polar4_active || std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
         {
             // GPU0 graph buffers
             if let Err(e) = self.device.bind_to_thread() {

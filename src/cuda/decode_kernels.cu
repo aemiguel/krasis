@@ -5617,3 +5617,258 @@ extern "C" __global__ void relu2_w2_int8_batched(
         out[n] = *reinterpret_cast<unsigned short*>(&result);
     }
 }
+
+// ── 4-bit PolarQuant KV Cache ──────────────────────────────────────────
+
+// 16-level codebook for quantized angles (normalized components).
+// Computed via Lloyd-Max quantization of a Gaussian distribution, scaled by 1/4.
+__device__ __constant__ float polar4_codebook[16] = {
+    -0.6892f, -0.5241f, -0.4115f, -0.3206f, -0.2412f, -0.1685f, -0.0997f, -0.0330f,
+     0.0330f,  0.0997f,  0.1685f,  0.2412f,  0.3206f,  0.4115f,  0.5241f,  0.6892f
+};
+
+// Fixed sign flip for SRR (16 elements)
+__device__ __constant__ float polar4_signs[16] = {
+    1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f,
+    1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f
+};
+
+// Fast Hadamard Transform for 16 elements (in-place)
+__device__ inline void fht16(float* x) {
+    float a, b;
+    // Stage 1
+    #pragma unroll
+    for (int i = 0; i < 8; i++) { a = x[i]; b = x[i+8]; x[i] = a + b; x[i+8] = a - b; }
+    // Stage 2
+    #pragma unroll
+    for (int i = 0; i < 4; i++) { a = x[i]; b = x[i+4]; x[i] = a + b; x[i+4] = a - b; }
+    #pragma unroll
+    for (int i = 8; i < 12; i++) { a = x[i]; b = x[i+4]; x[i] = a + b; x[i+4] = a - b; }
+    // Stage 3
+    #pragma unroll
+    for (int i = 0; i < 16; i += 4) {
+        a = x[i]; b = x[i+2]; x[i] = a + b; x[i+2] = a - b;
+        a = x[i+1]; b = x[i+3]; x[i+1] = a + b; x[i+3] = a - b;
+    }
+    // Stage 4
+    #pragma unroll
+    for (int i = 0; i < 16; i += 2) {
+        a = x[i]; b = x[i+1]; x[i] = a + b; x[i+1] = a - b;
+    }
+}
+
+// Find nearest codebook index for a value
+__device__ inline int quantize_polar4(float val) {
+    int best_idx = 0;
+    float min_diff = fabsf(val - polar4_codebook[0]);
+    #pragma unroll
+    for (int i = 1; i < 16; i++) {
+        float diff = fabsf(val - polar4_codebook[i]);
+        if (diff < min_diff) {
+            min_diff = diff;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+// Write K,V to Polar 4-bit cache
+extern "C" __global__ void kv_cache_write_polar4(
+    unsigned short* __restrict__ k_radius_cache,
+    unsigned short* __restrict__ v_radius_cache,
+    unsigned char* __restrict__ k_angles_cache,
+    unsigned char* __restrict__ v_angles_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int position,
+    int kv_stride
+) {
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = kv_stride / 16;
+    if (block_idx >= num_blocks) return;
+
+    int offset = block_idx * 16;
+    float k_local[16];
+    float v_local[16];
+
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_local[i] = k[offset + i] * polar4_signs[i];
+        v_local[i] = v[offset + i] * polar4_signs[i];
+    }
+
+    fht16(k_local);
+    fht16(v_local);
+
+    // Normalize FHT (scale 1/4)
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_local[i] *= 0.25f;
+        v_local[i] *= 0.25f;
+    }
+
+    // Compute Radii
+    float k_r = 0.0f, v_r = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_r += k_local[i] * k_local[i];
+        v_r += v_local[i] * v_local[i];
+    }
+    k_r = sqrtf(k_r + 1e-12f);
+    v_r = sqrtf(v_r + 1e-12f);
+
+    // Store Radii (BF16)
+    __nv_bfloat16 k_rb = __float2bfloat16(k_r);
+    __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+    k_radius_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_rb);
+    v_radius_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+
+    // Quantize and Store Angles (4-bit)
+    float inv_k_r = 1.0f / k_r;
+    float inv_v_r = 1.0f / v_r;
+    unsigned char* k_ang = k_angles_cache + (position * num_blocks + block_idx) * 8;
+    unsigned char* v_ang = v_angles_cache + (position * num_blocks + block_idx) * 8;
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int k0 = quantize_polar4(k_local[i*2] * inv_k_r);
+        int k1 = quantize_polar4(k_local[i*2+1] * inv_k_r);
+        k_ang[i] = (unsigned char)((k1 << 4) | k0);
+
+        int v0 = quantize_polar4(v_local[i*2] * inv_v_r);
+        int v1 = quantize_polar4(v_local[i*2+1] * inv_v_r);
+        v_ang[i] = (unsigned char)((v1 << 4) | v0);
+    }
+}
+
+// Simple GQA attention with Polar 4-bit KV cache
+extern "C" __global__ void gqa_attention_polar4(
+    float* __restrict__ output,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_radius_cache,
+    const unsigned short* __restrict__ v_radius_cache,
+    const unsigned char* __restrict__ k_angles_cache,
+    const unsigned char* __restrict__ v_angles_cache,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int max_seq
+) {
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int num_blocks = (num_kv_heads * head_dim) / 16;
+    int block_offset_in_head = (kv_head * head_dim) / 16;
+
+    const float* q_head = q + qh * head_dim;
+
+    extern __shared__ float smem[];
+    float* s_q = smem; // head_dim
+    float* smem_reduce = smem + head_dim;
+
+    // Load Q
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    // Rotate Q in shared memory (Hadamard-16 blocks)
+    for (int b = 0; b < head_dim / 16; b++) {
+        // Simple sequential rotation per block in shared memory
+        if (tid == b) {
+            float q_local[16];
+            for (int i = 0; i < 16; i++) q_local[i] = s_q[b*16+i] * polar4_signs[i];
+            fht16(q_local);
+            for (int i = 0; i < 16; i++) s_q[b*16+i] = q_local[i] * 0.25f;
+        }
+    }
+    __syncthreads();
+
+    // Pass 1: max score
+    float local_max = -1e30f;
+    for (int pos = tid; pos < seq_len; pos += num_threads) {
+        float score = 0.0f;
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&k_radius_cache[pos * num_blocks + block_idx]));
+            const unsigned char* angs = k_angles_cache + (pos * num_blocks + block_idx) * 8;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                unsigned char p = angs[i];
+                score += s_q[b*16 + i*2] * r * polar4_codebook[p & 0xF];
+                score += s_q[b*16 + i*2+1] * r * polar4_codebook[p >> 4];
+            }
+        }
+        local_max = fmaxf(local_max, score * sm_scale);
+    }
+    // Simple block reduction
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if ((tid % 32) == 0) smem_reduce[tid/32] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = smem_reduce[0];
+        for (int i = 1; i < num_threads/32; i++) m = fmaxf(m, smem_reduce[i]);
+        smem_reduce[0] = m;
+    }
+    __syncthreads();
+    float global_max = smem_reduce[0];
+
+    // Pass 2: sum exp and weighted V sum
+    float sum_exp = 0.0f;
+    float v_acc[256]; // Enough for head_dim up to 256
+    for (int i = 0; i < head_dim; i++) v_acc[i] = 0.0f;
+
+    for (int pos = 0; pos < seq_len; pos++) {
+        float score = 0.0f;
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&k_radius_cache[pos * num_blocks + block_idx]));
+            const unsigned char* angs = k_angles_cache + (pos * num_blocks + block_idx) * 8;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                unsigned char p = angs[i];
+                score += s_q[b*16 + i*2] * r * polar4_codebook[p & 0xF];
+                score += s_q[b*16 + i*2+1] * r * polar4_codebook[p >> 4];
+            }
+        }
+        float w = expf(score * sm_scale - global_max);
+        sum_exp += w;
+
+        // Weighted V sum (rotated V)
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&v_radius_cache[pos * num_blocks + block_idx]));
+            const unsigned char* angs = v_angles_cache + (pos * num_blocks + block_idx) * 8;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                unsigned char p = angs[i];
+                v_acc[b*16 + i*2] += w * r * polar4_codebook[p & 0xF];
+                v_acc[b*16 + i*2+1] += w * r * polar4_codebook[p >> 4];
+            }
+        }
+    }
+
+    float inv_sum = 1.0f / (sum_exp + 1e-12f);
+
+    // Apply inverse SRR to final sum and write back
+    // Use one thread per block to un-rotate
+    for (int b = 0; b < head_dim / 16; b++) {
+        if (tid == b) {
+            float o_local[16];
+            for (int i = 0; i < 16; i++) o_local[i] = v_acc[b*16+i] * inv_sum;
+            fht16(o_local);
+            for (int i = 0; i < 16; i++) {
+                output[qh * head_dim + b*16 + i] = o_local[i] * 0.25f * polar4_signs[i];
+            }
+        }
+    }
+}

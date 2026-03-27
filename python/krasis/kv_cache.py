@@ -45,6 +45,7 @@ class PagedKVCache:
         page_size: int = PAGE_SIZE,
         combined: bool = False,
         max_mb: Optional[int] = None,
+        kv_format: str = "fp8",
     ):
         self.cfg = cfg
         self.num_layers = num_layers
@@ -53,6 +54,12 @@ class PagedKVCache:
         self.kv_dtype = kv_dtype
         self.combined = combined
         self.attention_type = cfg.attention_type  # "mla" or "gqa"
+        self.kv_format_str = kv_format
+        self.kv_format = 0  # bf16
+        if kv_format == "fp8" or kv_format == "fp8_e4m3":
+            self.kv_format = 1
+        elif kv_format == "polar4":
+            self.kv_format = 2
 
         # Compute cache dimensions based on attention type
         if cfg.is_mla:
@@ -122,23 +129,51 @@ class PagedKVCache:
         # GQA caches (separate K and V)
         self.k_cache = None
         self.v_cache = None
+        # Polar4 caches
+        self.k_radius_cache = None
+        self.v_radius_cache = None
+        self.k_angles_cache = None
+        self.v_angles_cache = None
         # MLA caches
         self.ckv_cache = None
         self.kpe_cache = None
         self.kv_cache = None
 
         if cfg.is_gqa:
-            # GQA: separate K and V caches [layers, pages, page_size, heads, head_dim]
-            self.k_cache = torch.zeros(
-                num_layers, max_pages, page_size, self.num_kv_heads, self.gqa_head_dim,
-                dtype=kv_dtype, device=device,
-            )
-            self.v_cache = torch.zeros(
-                num_layers, max_pages, page_size, self.num_kv_heads, self.gqa_head_dim,
-                dtype=kv_dtype, device=device,
-            )
-            alloc_mb = (self.k_cache.nbytes + self.v_cache.nbytes) / (1024**2)
-            layout_str = "gqa-split"
+            if self.kv_format == 2:
+                # Polar4: radius (BF16) + angles (4-bit uint8)
+                num_blocks = (self.num_kv_heads * self.gqa_head_dim) // 16
+                self.k_radius_cache = torch.zeros(
+                    num_layers, max_pages, page_size, num_blocks,
+                    dtype=torch.bfloat16, device=device
+                )
+                self.v_radius_cache = torch.zeros(
+                    num_layers, max_pages, page_size, num_blocks,
+                    dtype=torch.bfloat16, device=device
+                )
+                self.k_angles_cache = torch.zeros(
+                    num_layers, max_pages, page_size, num_blocks * 8,
+                    dtype=torch.uint8, device=device
+                )
+                self.v_angles_cache = torch.zeros(
+                    num_layers, max_pages, page_size, num_blocks * 8,
+                    dtype=torch.uint8, device=device
+                )
+                alloc_mb = (self.k_radius_cache.nbytes + self.v_radius_cache.nbytes +
+                            self.k_angles_cache.nbytes + self.v_angles_cache.nbytes) / (1024**2)
+                layout_str = "gqa-polar4"
+            else:
+                # GQA: separate K and V caches [layers, pages, page_size, heads, head_dim]
+                self.k_cache = torch.zeros(
+                    num_layers, max_pages, page_size, self.num_kv_heads, self.gqa_head_dim,
+                    dtype=kv_dtype, device=device,
+                )
+                self.v_cache = torch.zeros(
+                    num_layers, max_pages, page_size, self.num_kv_heads, self.gqa_head_dim,
+                    dtype=kv_dtype, device=device,
+                )
+                alloc_mb = (self.k_cache.nbytes + self.v_cache.nbytes) / (1024**2)
+                layout_str = "gqa-split"
         elif combined:
             # TRTLLM MLA format: single combined cache
             self.kv_cache = torch.zeros(
@@ -171,6 +206,11 @@ class PagedKVCache:
         self._free_pages.reverse()  # pop from end
 
     def _bytes_per_page(self) -> int:
+        if self.kv_format == 2:
+            # Polar4: 10 bytes per 16 elements
+            # num_blocks = kv_cache_dim // 16
+            return self.page_size * (self.kv_cache_dim // 16) * 10 * self.num_layers
+
         elem_size = 1 if self.kv_dtype == torch.float8_e4m3fn else 2
         return self.page_size * self.kv_cache_dim * elem_size * self.num_layers
 

@@ -1,0 +1,148 @@
+src/cuda/decode_kernels.cu(1163): warning #177-D: variable "val_dim" was declared but never referenced
+      int val_dim = nk * ratio * dv;
+          ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/prefill_kernels.cu(690): warning #177-D: variable "smem" was declared but never referenced
+      int smem = (num_experts * 2 + 1) * sizeof(int);
+          ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/prefill_kernels.cu(2135): warning #177-D: variable "attn_h" was declared but never referenced
+      const float* attn_h = attn + (int64_t)head * cs * cs;
+                   ^
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+src/cuda/flash_attn/fa2/flash_fwd_launch_template.h(389): warning #549-D: variable "status_" is used before its value is set
+        do { cudaError_t status_ = (status_); if (status_ != cudaSuccess) { fprintf(
+                                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+

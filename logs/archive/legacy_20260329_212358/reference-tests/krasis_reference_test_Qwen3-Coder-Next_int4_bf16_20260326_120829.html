@@ -1,0 +1,5852 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>Reference Test — Qwen3-Coder-Next</title>
+<style>
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+    background: #0d1117; color: #c9d1d9; margin: 0; padding: 20px 40px;
+    line-height: 1.6;
+}
+h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+h2 { color: #79c0ff; margin-top: 32px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+h3 { color: #d2a8ff; }
+.meta { color: #8b949e; margin-bottom: 20px; }
+.meta span { margin-right: 24px; }
+
+/* Summary dashboard */
+.dashboard { width: 100%; border-collapse: collapse; margin: 16px 0 32px; }
+.dashboard th {
+    background: #161b22; color: #8b949e; text-align: left;
+    padding: 8px 12px; border-bottom: 2px solid #30363d; font-size: 13px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+}
+.dashboard td { padding: 8px 12px; border-bottom: 1px solid #21262d; }
+.dashboard tr:hover td { background: #161b22; }
+
+/* Status badges */
+.badge { padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; display: inline-block; }
+.badge-pass { background: #1a3a2a; color: #3fb950; }
+.badge-fail { background: #3a1a1a; color: #f85149; }
+.badge-warn { background: #3a2a1a; color: #d29922; }
+
+/* Collapsible cards */
+details { margin: 8px 0; }
+summary {
+    cursor: pointer; padding: 8px 12px; background: #161b22;
+    border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9;
+    font-weight: 600; user-select: none;
+}
+summary:hover { background: #1c2128; }
+details[open] > summary { border-radius: 6px 6px 0 0; border-bottom: none; }
+.detail-body {
+    border: 1px solid #30363d; border-top: none; border-radius: 0 0 6px 6px;
+    padding: 16px; background: #0d1117;
+}
+
+/* Token table */
+table.tokens { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 12px; font-family: monospace; }
+table.tokens th {
+    background: #161b22; color: #8b949e; text-align: left;
+    padding: 4px 8px; border-bottom: 1px solid #30363d; font-size: 11px;
+}
+table.tokens td { padding: 4px 8px; border-bottom: 1px solid #21262d; }
+table.tokens .match { color: #3fb950; }
+table.tokens .mismatch { color: #f85149; }
+table.tokens .diverged { background: #2a1f0a; }
+
+/* Metrics row */
+.metrics-row { display: flex; gap: 24px; margin: 8px 0 16px; flex-wrap: wrap; }
+.metric-item { font-size: 13px; }
+.metric-label { color: #8b949e; }
+.metric-value { color: #c9d1d9; font-weight: 600; }
+.metric-good { color: #3fb950; }
+.metric-bad { color: #f85149; }
+.metric-ok { color: #d29922; }
+
+/* Text comparison */
+.text-compare { margin: 12px 0; }
+.text-block { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 12px 16px; margin: 6px 0; font-size: 13px; white-space: pre-wrap;
+    max-height: 200px; overflow-y: auto; }
+.text-label { color: #8b949e; font-size: 12px; margin-bottom: 4px; }
+.text-match { color: #3fb950; }
+.text-diverge { color: #d29922; background: #2a1f0a; padding: 0 2px; }
+.text-after { color: #8b949e; }
+
+/* Divergence analysis */
+.divergence { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 12px 16px; margin: 12px 0; font-size: 13px; }
+.divergence .label { color: #8b949e; display: inline-block; width: 180px; }
+
+pre { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 12px 16px; overflow-x: auto; font-size: 13px; color: #e6edf3; }
+</style></head><body>
+<h1>Krasis Reference Test — Qwen3-Coder-Next</h1>
+<div class="meta">
+<span>Date: 2026-03-26 12:08:29</span>
+<span>GPU: NVIDIA GeForce RTX 5090, 32607</span>
+<span>Config: qcn-4-4-a16.conf</span>
+<span>Duration: 140.1s</span>
+</div>
+<div class="meta">
+<span>Reference: Qwen3-Coder-Next (format v3)</span>
+<span>Conversations: 9</span>
+<span>Max tokens: 200</span>
+</div>
+<h2>Summary</h2>
+<table class="dashboard"><thead><tr>
+<th>Metric</th><th>Value</th><th>Status</th>
+</tr></thead><tbody>
+<tr><td><b>Overall</b></td><td>—</td><td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td><b>Prefill argmax match</b></td><td>255/273 (93%)</td>
+<td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td><b>Prefill top-10 containment</b></td><td>273/273 (100%)</td>
+<td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td>First-token match</td><td>13/13 (100%)</td>
+<td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td>Avg match run length</td><td>28.5 tokens</td>
+<td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td>Avg decode top-k containment</td><td>28.2%</td>
+<td><span class="badge badge-fail">FAIL</span></td></tr>
+<tr><td>Prompts PASS</td><td>13</td><td></td></tr>
+<tr><td>Prompts WARN</td><td>0</td><td></td></tr>
+<tr><td>Prompts FAIL</td><td>0</td><td></td></tr>
+</tbody></table>
+<h2>Per-Prompt Results</h2>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 1: Write a Rust function that implements binary search on a sorted slice, returning...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">90%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-good">46/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">42.5%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.6s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>73594</td>
+<td>73594</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.013</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>35788</td>
+<td>35788</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>2</td>
+<td>198</td>
+<td>198</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>3</td>
+<td>2575</td>
+<td>2575</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>4</td>
+<td>57716</td>
+<td>57716</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>5</td>
+<td>264</td>
+<td>264</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.011</td>
+<td>-0.071</td>
+</tr>
+<tr>
+<td>6</td>
+<td>7868</td>
+<td>7868</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>7</td>
+<td>2711</td>
+<td>2711</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>8</td>
+<td>389</td>
+<td>389</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>9</td>
+<td>264</td>
+<td>264</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>10</td>
+<td>10615</td>
+<td>10615</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>11</td>
+<td>15983</td>
+<td>15983</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>12</td>
+<td>311</td>
+<td>311</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.070</td>
+<td>-0.089</td>
+</tr>
+<tr>
+<td>13</td>
+<td>1477</td>
+<td>1477</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>14</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>15</td>
+<td>1922</td>
+<td>1922</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.170</td>
+</tr>
+<tr>
+<td>16</td>
+<td>315</td>
+<td>315</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>17</td>
+<td>264</td>
+<td>264</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.044</td>
+<td>-0.099</td>
+</tr>
+<tr>
+<td>18</td>
+<td>2169</td>
+<td>2169</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.052</td>
+<td>-0.224</td>
+</tr>
+<tr>
+<td>19</td>
+<td>897</td>
+<td>897</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.127</td>
+<td>-0.093</td>
+</tr>
+<tr>
+<td>20</td>
+<td>624</td>
+<td>624</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>21</td>
+<td>15374</td>
+<td>15374</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.034</td>
+</tr>
+<tr>
+<td>22</td>
+<td>2575</td>
+<td>2575</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>23</td>
+<td>671</td>
+<td>671</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.662</td>
+<td>-0.308</td>
+</tr>
+<tr>
+<td>24</td>
+<td>27702</td>
+<td>27702</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.006</td>
+<td>-0.025</td>
+</tr>
+<tr>
+<td>25</td>
+<td>198</td>
+<td>198</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>26</td>
+<td>15374</td>
+<td>15374</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.590</td>
+</tr>
+<tr>
+<td>27</td>
+<td>2575</td>
+<td>2575</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>28</td>
+<td>353</td>
+<td>353</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>29</td>
+<td>1565</td>
+<td>1565</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>30</td>
+<td>24963</td>
+<td>24963</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.012</td>
+<td>-0.064</td>
+</tr>
+<tr>
+<td>31</td>
+<td>63</td>
+<td>63</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>32</td>
+<td>481</td>
+<td>481</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>33</td>
+<td>362</td>
+<td>362</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>34</td>
+<td>10615</td>
+<td>10615</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.045</td>
+<td>-0.047</td>
+</tr>
+<tr>
+<td>35</td>
+<td>15983</td>
+<td>15983</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>36</td>
+<td>315</td>
+<td>315</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.018</td>
+</tr>
+<tr>
+<td>37</td>
+<td>5424</td>
+<td>5424</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.006</td>
+<td>-0.007</td>
+</tr>
+<tr>
+<td>38</td>
+<td>429</td>
+<td>429</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.226</td>
+<td>-0.840</td>
+</tr>
+<tr>
+<td>39</td>
+<td>4211</td>
+<td>4211</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.038</td>
+<td>-0.158</td>
+</tr>
+<tr>
+<td>40</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.282</td>
+<td>-0.098</td>
+</tr>
+<tr>
+<td>41</td>
+<td>1565</td>
+<td>1565</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>42</td>
+<td>37314</td>
+<td>37314</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.057</td>
+<td>-0.508</td>
+</tr>
+<tr>
+<td>43</td>
+<td>24621</td>
+<td>24621</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.026</td>
+</tr>
+<tr>
+<td>44</td>
+<td>63</td>
+<td>63</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>45</td>
+<td>17567</td>
+<td>17567</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr class="diverged">
+<td>46</td>
+<td>624</td>
+<td>198</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.081</td>
+<td>-0.867</td>
+</tr>
+<tr>
+<td>47</td>
+<td>2575</td>
+<td>2575</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>48</td>
+<td>353</td>
+<td>353</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.006</td>
+<td>-0.017</td>
+</tr>
+<tr>
+<td>49</td>
+<td>1565</td>
+<td>1565</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>50</td>
+<td>5657</td>
+<td>5657</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 46</div>
+<div><span class="label">Reference token:</span> 624 (logprob: -0.081)</div>
+<div><span class="label">Our token:</span> 198 (logprob: -0.867)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #2)</div>
+<div><span class="label">Logprob gap:</span> 0.786</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">```rust
+/// Performs a binary search on a sorted slice to find the index of a target value.
+///
+/// # Arguments
+///
+/// * `slice` - A sorted slice of elements that implement the `PartialOrd` trait.
+/// * `target` - The value to search for in the slice.
+///
+/// # Returns
+///
+/// * `Some(index)` - If the target is found at the given index.
+/// * `None` - If the target is not present in the slice.
+///
+/// # Complexity
+///
+/// * Time: O(log n)
+/// * Space: O(1)
+///
+/// # Panics
+///
+/// This function</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">```rust
+/// Performs a binary search on a sorted slice to find the index of a target value.
+///
+/// # Arguments
+///
+/// * `slice` - A sorted slice of elements that implement the `PartialOrd` trait
+/// * `target` - The value to search for
+///
+/// # Returns
+///
+/// * `Some(index)` - If the target is found, returns `Some` containing the index
+/// * `None` - If the target is not found in the slice
+///
+/// # Panics
+///
+/// This function will panic if the slice is not sorted in ascending order.
+/// No</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 2: Solve step by step: what is 15 * 37 + 42 / 6?...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">95%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-good">26/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">25.5%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.4s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>10061</td>
+<td>10061</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.024</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>594</td>
+<td>594</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>2</td>
+<td>11625</td>
+<td>11625</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>3</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.027</td>
+<td>-0.082</td>
+</tr>
+<tr>
+<td>4</td>
+<td>7493</td>
+<td>7493</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>5</td>
+<td>3019</td>
+<td>3019</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.022</td>
+</tr>
+<tr>
+<td>6</td>
+<td>553</td>
+<td>553</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>7</td>
+<td>3019</td>
+<td>3019</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>8</td>
+<td>11</td>
+<td>11</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.207</td>
+<td>-0.179</td>
+</tr>
+<tr>
+<td>9</td>
+<td>2701</td>
+<td>2701</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.004</td>
+</tr>
+<tr>
+<td>10</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>11</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.030</td>
+<td>-0.054</td>
+</tr>
+<tr>
+<td>12</td>
+<td>1358</td>
+<td>1358</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>13</td>
+<td>315</td>
+<td>315</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>14</td>
+<td>7525</td>
+<td>7525</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>15</td>
+<td>334</td>
+<td>334</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.313</td>
+<td>-0.595</td>
+</tr>
+<tr>
+<td>16</td>
+<td>320</td>
+<td>320</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>17</td>
+<td>1740</td>
+<td>1740</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>18</td>
+<td>6076</td>
+<td>6076</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>19</td>
+<td>1911</td>
+<td>1911</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>20</td>
+<td>16276</td>
+<td>16276</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.004</td>
+<td>-0.013</td>
+</tr>
+<tr>
+<td>21</td>
+<td>2069</td>
+<td>2069</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>22</td>
+<td>40092</td>
+<td>40092</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>23</td>
+<td>7731</td>
+<td>7731</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.014</td>
+<td>-0.027</td>
+</tr>
+<tr>
+<td>24</td>
+<td>29</td>
+<td>29</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.478</td>
+<td>-0.589</td>
+</tr>
+<tr>
+<td>25</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr class="diverged">
+<td>26</td>
+<td>1740</td>
+<td>47</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.479</td>
+<td>-0.242</td>
+</tr>
+<tr>
+<td>27</td>
+<td>6076</td>
+<td>334</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.019</td>
+</tr>
+<tr>
+<td>28</td>
+<td>1911</td>
+<td>9151</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>0.000</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>29</td>
+<td>95518</td>
+<td>38322</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.202</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>30</td>
+<td>2303</td>
+<td>11</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.055</td>
+<td>-0.809</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 26</div>
+<div><span class="label">Reference token:</span> 1740 (logprob: -0.479)</div>
+<div><span class="label">Our token:</span> 47 (logprob: -0.242)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #2)</div>
+<div><span class="label">Logprob gap:</span> 0.238</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">Let's solve the expression step by step, following the **order of operations** (PEMDAS/BODMAS):
+
+&gt; **PEMDAS**:  
+&gt; **P**arentheses  
+&gt; **E**xponents  
+&gt; **M**ultiplication and **D**ivision (from left to right)  
+&gt; **A**ddition and **S**ubtraction (from left to right)
+
+Given expression:  
+$$
+15 \times 37 + \frac{42}{6}
+$$
+
+### Step 1: Perform multiplication and division (left to right)
+
+- First, compute **multiplication**:  
+  $$
+  15 \times 37
+  $$
+  Let's calculate:
+  $$
+  15 \times 37 = 15 \ti</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">Let's solve the expression step by step, following the **order of operations** (PEMDAS/BODMAS):
+
+&gt; **P**arentheses, **E**xponents, **M**ultiplication and **D**ivision (left to right), **A**ddition and **S**ubtraction (left to right)
+
+Given expression:  
+**15 × 37 + 42 ÷ 6**
+
+---
+
+### Step 1: Perform multiplication and division (left to right)
+
+- **15 × 37**  
+  Compute:  
+  $ 15 × 37 = 15 × (30 + 7) = 15×30 + 15×7 = 450 + 105 = 555 $  
+  So, $ 15 × 37 = 555 $
+
+- **42 ÷ 6**  
+  Compute:  
+</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 3: Write a 12-line poem about the ocean at sunset....</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">95%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-ok">13/138</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">22.1%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">3.9s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>785</td>
+<td>785</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.003</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>7015</td>
+<td>7015</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.072</td>
+<td>-0.158</td>
+</tr>
+<tr>
+<td>2</td>
+<td>96504</td>
+<td>96504</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.437</td>
+<td>-0.572</td>
+</tr>
+<tr>
+<td>3</td>
+<td>3347</td>
+<td>3347</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.008</td>
+<td>-0.005</td>
+</tr>
+<tr>
+<td>4</td>
+<td>11</td>
+<td>11</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.040</td>
+<td>-0.052</td>
+</tr>
+<tr>
+<td>5</td>
+<td>264</td>
+<td>264</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>6</td>
+<td>21609</td>
+<td>21609</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.006</td>
+<td>-0.023</td>
+</tr>
+<tr>
+<td>7</td>
+<td>1960</td>
+<td>1960</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>8</td>
+<td>16254</td>
+<td>16254</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.029</td>
+<td>-0.028</td>
+</tr>
+<tr>
+<td>9</td>
+<td>315</td>
+<td>315</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.202</td>
+<td>-0.041</td>
+</tr>
+<tr>
+<td>10</td>
+<td>6623</td>
+<td>6623</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.010</td>
+<td>-0.005</td>
+</tr>
+<tr>
+<td>11</td>
+<td>11</td>
+<td>11</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>12</td>
+<td>2303</td>
+<td>2303</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr class="diverged">
+<td>13</td>
+<td>36120</td>
+<td>6406</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#3</span></td>
+<td>3</td>
+<td>-1.094</td>
+<td>-0.848</td>
+</tr>
+<tr>
+<td>14</td>
+<td>3100</td>
+<td>9400</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.788</td>
+<td>-0.032</td>
+</tr>
+<tr>
+<td>15</td>
+<td>82951</td>
+<td>1181</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.069</td>
+<td>-0.541</td>
+</tr>
+<tr>
+<td>16</td>
+<td>6884</td>
+<td>3100</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.185</td>
+<td>-0.228</td>
+</tr>
+<tr>
+<td>17</td>
+<td>389</td>
+<td>389</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.058</td>
+<td>-0.102</td>
+</tr>
+<tr>
+<td>18</td>
+<td>16876</td>
+<td>16876</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.753</td>
+<td>-0.639</td>
+</tr>
+<tr>
+<td>19</td>
+<td>315</td>
+<td>429</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.365</td>
+<td>-0.180</td>
+</tr>
+<tr>
+<td>20</td>
+<td>14473</td>
+<td>56050</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.084</td>
+<td>-0.522</td>
+</tr>
+<tr>
+<td>21</td>
+<td>8991</td>
+<td>6502</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.172</td>
+<td>-0.178</td>
+</tr>
+<tr>
+<td>22</td>
+<td>13</td>
+<td>2293</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.430</td>
+<td>-0.201</td>
+</tr>
+<tr>
+<td>23</td>
+<td>2303</td>
+<td>2303</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>24</td>
+<td>785</td>
+<td>4854</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.030</td>
+<td>-0.121</td>
+</tr>
+<tr>
+<td>25</td>
+<td>3015</td>
+<td>71924</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-1.249</td>
+<td>-0.023</td>
+</tr>
+<tr>
+<td>26</td>
+<td>557</td>
+<td>264</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.366</td>
+<td>-0.622</td>
+</tr>
+<tr>
+<td>27</td>
+<td>1945</td>
+<td>34578</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.007</td>
+<td>-1.253</td>
+</tr>
+<tr>
+<td>28</td>
+<td>11</td>
+<td>11</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.023</td>
+<td>-0.087</td>
+</tr>
+<tr>
+<td>29</td>
+<td>18303</td>
+<td>1817</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-1.448</td>
+<td>-0.008</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 13</div>
+<div><span class="label">Reference token:</span> 36120 (logprob: -1.094)</div>
+<div><span class="label">Our token:</span> 6406 (logprob: -0.848)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #3)</div>
+<div><span class="label">Logprob gap:</span> 0.245</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">The sun dips low, a molten coin of gold,  
+Its light spills wide on waves of liquid glass.  
+The water shivers, breaks the light in hold—  
+A thousand shards where crimson shadows pass.  
+
+The gulls glide silent, wings tipped with the flame,  
+Their cries like echoes drifting on the breeze.  
+The tide rolls in, a slow and rhythmic claim,  
+Washing the shore in whispers, soft and ease.  
+
+The horizon bleeds from amber into deep,  
+Where indigo swallows the last warm gleam.  
+The ocean sighs, a wo</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">The sun dips low, a molten coin of gold,  
+Spilling its light on waves that softly roll—  
+Each crest a flame, each trough a story told  
+In liquid light that warms the cooling soul.  
+
+The gulls glide home on wings of dusky gray,  
+Their cries like echoes drifting on the tide,  
+While shadows stretch where sea and sky display  
+A bridge of amber, deepening with pride.  
+
+The water shivers, catching final rays,  
+A thousand shards of glass in gentle flight—  
+Then darkness gathers in the ocean’s</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 4 (Turn 1): What is the capital of Japan?...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">93%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-ok">10/10</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-good">90.0%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">1.6s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>785</td>
+<td>785</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.001</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>6722</td>
+<td>6722</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>2</td>
+<td>315</td>
+<td>315</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>3</td>
+<td>6323</td>
+<td>6323</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>4</td>
+<td>374</td>
+<td>374</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>5</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.062</td>
+<td>-0.055</td>
+</tr>
+<tr>
+<td>6</td>
+<td>52854</td>
+<td>52854</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>7</td>
+<td>16032</td>
+<td>16032</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>8</td>
+<td>334</td>
+<td>334</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>9</td>
+<td>13</td>
+<td>13</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+</tbody></table>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">The capital of Japan is **Tokyo**.</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">The capital of Japan is **Tokyo**.</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 4 (Turn 2): Tell me three interesting facts about that city...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-good">37/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">19.5%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.2s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>39814</td>
+<td>39814</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.012</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>0</td>
+<td>0</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>2</td>
+<td>5692</td>
+<td>5692</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>3</td>
+<td>525</td>
+<td>525</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>4</td>
+<td>2326</td>
+<td>2326</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>5</td>
+<td>26291</td>
+<td>26291</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.123</td>
+<td>-0.106</td>
+</tr>
+<tr>
+<td>6</td>
+<td>13064</td>
+<td>13064</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>7</td>
+<td>911</td>
+<td>911</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>8</td>
+<td>26194</td>
+<td>26194</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.180</td>
+<td>-0.202</td>
+</tr>
+<tr>
+<td>9</td>
+<td>1447</td>
+<td>1447</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.006</td>
+<td>-0.046</td>
+</tr>
+<tr>
+<td>10</td>
+<td>16</td>
+<td>16</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>11</td>
+<td>13</td>
+<td>13</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>12</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.027</td>
+<td>-0.077</td>
+</tr>
+<tr>
+<td>13</td>
+<td>10134</td>
+<td>10134</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.148</td>
+<td>-0.417</td>
+</tr>
+<tr>
+<td>14</td>
+<td>748</td>
+<td>748</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.005</td>
+<td>-0.004</td>
+</tr>
+<tr>
+<td>15</td>
+<td>83319</td>
+<td>83319</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.092</td>
+<td>-0.006</td>
+</tr>
+<tr>
+<td>16</td>
+<td>44778</td>
+<td>44778</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.197</td>
+<td>-0.409</td>
+</tr>
+<tr>
+<td>17</td>
+<td>12030</td>
+<td>12030</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.003</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>18</td>
+<td>334</td>
+<td>334</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.202</td>
+<td>-0.203</td>
+</tr>
+<tr>
+<td>19</td>
+<td>2303</td>
+<td>2303</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.058</td>
+<td>-0.007</td>
+</tr>
+<tr>
+<td>20</td>
+<td>256</td>
+<td>256</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>21</td>
+<td>26194</td>
+<td>26194</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.010</td>
+<td>-0.005</td>
+</tr>
+<tr>
+<td>22</td>
+<td>374</td>
+<td>374</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.025</td>
+<td>-0.037</td>
+</tr>
+<tr>
+<td>23</td>
+<td>2114</td>
+<td>2114</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.442</td>
+<td>-0.261</td>
+</tr>
+<tr>
+<td>24</td>
+<td>311</td>
+<td>311</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>25</td>
+<td>916</td>
+<td>916</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.004</td>
+<td>-0.022</td>
+</tr>
+<tr>
+<td>26</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.281</td>
+<td>-0.414</td>
+</tr>
+<tr>
+<td>27</td>
+<td>18</td>
+<td>18</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>28</td>
+<td>22</td>
+<td>22</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.049</td>
+<td>-0.088</td>
+</tr>
+<tr>
+<td>29</td>
+<td>3526</td>
+<td>3526</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>30</td>
+<td>1251</td>
+<td>1251</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.010</td>
+</tr>
+<tr>
+<td>31</td>
+<td>334</td>
+<td>334</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>32</td>
+<td>304</td>
+<td>304</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.009</td>
+</tr>
+<tr>
+<td>33</td>
+<td>1181</td>
+<td>1181</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>34</td>
+<td>7046</td>
+<td>7046</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.306</td>
+<td>-0.283</td>
+</tr>
+<tr>
+<td>35</td>
+<td>57406</td>
+<td>57406</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.051</td>
+<td>-0.124</td>
+</tr>
+<tr>
+<td>36</td>
+<td>3082</td>
+<td>3082</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.023</td>
+<td>-0.003</td>
+</tr>
+<tr class="diverged">
+<td>37</td>
+<td>320</td>
+<td>21677</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.447</td>
+<td>-0.553</td>
+</tr>
+<tr>
+<td>38</td>
+<td>1782</td>
+<td>7772</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.658</td>
+<td>-0.004</td>
+</tr>
+<tr>
+<td>39</td>
+<td>32281</td>
+<td>304</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.117</td>
+<td>-0.105</td>
+</tr>
+<tr>
+<td>40</td>
+<td>26194</td>
+<td>279</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>41</td>
+<td>12030</td>
+<td>1879</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 37</div>
+<div><span class="label">Reference token:</span> 320 (logprob: -0.447)</div>
+<div><span class="label">Our token:</span> 21677 (logprob: -0.553)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #2)</div>
+<div><span class="label">Logprob gap:</span> 0.107</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">Sure! Here are three fascinating facts about Tokyo:
+
+1. **World’s Largest Metropolitan Area**  
+   Tokyo is home to over **37 million people** in its greater metropolitan area (the Greater Tokyo Area), making it the most populous metropolitan region in the world—larger than the entire population of countries like Canada or Australia.
+
+2. **Vast Network of Train Stations**  
+   Tokyo has more than **200 railway stations**, including the iconic **Shinjuku Station**, which holds the Guinness World </div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">Sure! Here are three fascinating facts about Tokyo:
+
+1. **World’s Largest Metropolitan Area**  
+   Tokyo is home to over **37 million people** in its greater metropolitan area—the largest in the world. If it were a country, it would rank as the 30th most populous nation.
+
+2. **Vending Machine Capital of the World**  
+   Tokyo has roughly **5.8 million vending machines**—about one for every 6 people. They sell everything from hot coffee and beer to umbrellas and fresh eggs, operating 24/7 with mi</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 4 (Turn 3): Which of those facts is most surprising and why?...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-ok">6/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">6.0%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.4s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>785</td>
+<td>785</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.004</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>1429</td>
+<td>1429</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.282</td>
+<td>-0.322</td>
+</tr>
+<tr>
+<td>2</td>
+<td>14861</td>
+<td>14861</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.004</td>
+</tr>
+<tr>
+<td>3</td>
+<td>2097</td>
+<td>2097</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>4</td>
+<td>374</td>
+<td>374</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.019</td>
+<td>-0.038</td>
+</tr>
+<tr>
+<td>5</td>
+<td>4363</td>
+<td>4363</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.903</td>
+<td>-0.768</td>
+</tr>
+<tr class="diverged">
+<td>6</td>
+<td>1447</td>
+<td>3070</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.634</td>
+<td>-0.193</td>
+</tr>
+<tr>
+<td>7</td>
+<td>334</td>
+<td>52854</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.633</td>
+<td>-0.472</td>
+</tr>
+<tr>
+<td>8</td>
+<td>2016</td>
+<td>16032</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.797</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>9</td>
+<td>258</td>
+<td>748</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.389</td>
+</tr>
+<tr>
+<td>10</td>
+<td>73</td>
+<td>5426</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.552</td>
+</tr>
+<tr>
+<td>11</td>
+<td>35734</td>
+<td>1849</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.404</td>
+</tr>
+<tr>
+<td>12</td>
+<td>16629</td>
+<td>2293</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.703</td>
+</tr>
+<tr>
+<td>13</td>
+<td>13469</td>
+<td>51240</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.532</td>
+<td>-0.414</td>
+</tr>
+<tr>
+<td>14</td>
+<td>916</td>
+<td>745</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>15</td>
+<td>220</td>
+<td>34449</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.138</td>
+</tr>
+<tr>
+<td>16</td>
+<td>18</td>
+<td>73</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>17</td>
+<td>13</td>
+<td>35734</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>18</td>
+<td>21</td>
+<td>16629</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>19</td>
+<td>3526</td>
+<td>11589</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.027</td>
+</tr>
+<tr>
+<td>20</td>
+<td>22172</td>
+<td>916</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.001</td>
+<td>-0.085</td>
+</tr>
+<tr>
+<td>21</td>
+<td>817</td>
+<td>220</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.003</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>22</td>
+<td>1899</td>
+<td>18</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>23</td>
+<td>334</td>
+<td>13</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.278</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>24</td>
+<td>2293</td>
+<td>21</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.592</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>25</td>
+<td>437</td>
+<td>3526</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.326</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>26</td>
+<td>419</td>
+<td>22172</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-1.190</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>27</td>
+<td>1372</td>
+<td>817</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.782</td>
+<td>-0.016</td>
+</tr>
+<tr>
+<td>28</td>
+<td>353</td>
+<td>1899</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#10</span></td>
+<td>10</td>
+<td>-0.154</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>29</td>
+<td>71914</td>
+<td>334</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.681</td>
+<td>-0.001</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 6</div>
+<div><span class="label">Reference token:</span> 1447 (logprob: -0.634)</div>
+<div><span class="label">Our token:</span> 3070 (logprob: -0.193)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #2)</div>
+<div><span class="label">Logprob gap:</span> 0.441</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">The most surprising fact is likely:
+
+**Shinjuku Station handles over 3.6 million passengers per day**—and this number *doesn’t even include* passengers transferring between lines (which would push the real figure even higher).
+
+### Why it’s so surprising:
+- **Scale defies intuition**: Most people associate massive crowds with airports or major subway hubs like London’s King’s Cross or New York’s Times Square—but Shinjuku dwarfs them. For comparison, *Grand Central Terminal* in NYC handles about </div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">The most surprising fact is likely **Tokyo’s train system—specifically Shinjuku Station handling over 3.6 million passengers per day**—and here’s why:
+
+- **Human-scale intuition fails dramatically**: Most people struggle to grasp numbers in the *millions*—especially for a single location. For perspective:  
+  - That’s roughly **36 people entering/exiting the station *every second*, 24/7** (even accounting for overnight lulls, it’s still staggering).  
+  - It’s more passengers than the *entire po</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 5: Explain the difference between a mutex and a semaphore. When would you use each?...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">85%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-good">35/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">21.5%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.2s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>14374</td>
+<td>14374</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.782</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.169</td>
+<td>-0.263</td>
+</tr>
+<tr>
+<td>2</td>
+<td>38099</td>
+<td>38099</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>3</td>
+<td>6165</td>
+<td>6165</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.049</td>
+<td>-0.012</td>
+</tr>
+<tr>
+<td>4</td>
+<td>13</td>
+<td>13</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.100</td>
+<td>-0.111</td>
+</tr>
+<tr>
+<td>5</td>
+<td>87920</td>
+<td>87920</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>6</td>
+<td>25</td>
+<td>25</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>7</td>
+<td>5309</td>
+<td>5309</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.314</td>
+<td>-0.135</td>
+</tr>
+<tr>
+<td>8</td>
+<td>85797</td>
+<td>85797</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>9</td>
+<td>56177</td>
+<td>56177</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>10</td>
+<td>91</td>
+<td>91</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.011</td>
+</tr>
+<tr>
+<td>11</td>
+<td>19998</td>
+<td>19998</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.007</td>
+<td>-0.007</td>
+</tr>
+<tr>
+<td>12</td>
+<td>760</td>
+<td>760</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.179</td>
+<td>-0.181</td>
+</tr>
+<tr>
+<td>13</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.055</td>
+<td>-0.035</td>
+</tr>
+<tr>
+<td>14</td>
+<td>38099</td>
+<td>38099</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>15</td>
+<td>320</td>
+<td>320</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.070</td>
+<td>-0.435</td>
+</tr>
+<tr>
+<td>16</td>
+<td>51440</td>
+<td>51440</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.026</td>
+<td>-0.012</td>
+</tr>
+<tr>
+<td>17</td>
+<td>928</td>
+<td>928</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>18</td>
+<td>1374</td>
+<td>1374</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>19</td>
+<td>8957</td>
+<td>8957</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>20</td>
+<td>32295</td>
+<td>32295</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.361</td>
+<td>-0.393</td>
+</tr>
+<tr>
+<td>21</td>
+<td>760</td>
+<td>760</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>22</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>23</td>
+<td>74614</td>
+<td>74614</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.023</td>
+</tr>
+<tr>
+<td>24</td>
+<td>334</td>
+<td>334</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.011</td>
+<td>-0.058</td>
+</tr>
+<tr>
+<td>25</td>
+<td>9248</td>
+<td>9248</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>26</td>
+<td>91</td>
+<td>91</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>27</td>
+<td>513</td>
+<td>513</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.100</td>
+<td>-0.430</td>
+</tr>
+<tr>
+<td>28</td>
+<td>91</td>
+<td>91</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>29</td>
+<td>85126</td>
+<td>85126</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.080</td>
+<td>-0.186</td>
+</tr>
+<tr>
+<td>30</td>
+<td>91</td>
+<td>91</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>31</td>
+<td>38645</td>
+<td>38645</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.127</td>
+<td>-0.693</td>
+</tr>
+<tr>
+<td>32</td>
+<td>7360</td>
+<td>7360</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>33</td>
+<td>91</td>
+<td>91</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>34</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr class="diverged">
+<td>35</td>
+<td>15972</td>
+<td>74033</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.576</td>
+<td>-0.335</td>
+</tr>
+<tr>
+<td>36</td>
+<td>29045</td>
+<td>334</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.001</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>37</td>
+<td>334</td>
+<td>760</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>38</td>
+<td>760</td>
+<td>57868</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>0.000</td>
+<td>-0.113</td>
+</tr>
+<tr>
+<td>39</td>
+<td>57868</td>
+<td>1413</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.170</td>
+<td>-0.000</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 35</div>
+<div><span class="label">Reference token:</span> 15972 (logprob: -0.576)</div>
+<div><span class="label">Our token:</span> 74033 (logprob: -0.335)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #2)</div>
+<div><span class="label">Logprob gap:</span> 0.241</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">### **Mutex vs. Semaphore: Key Differences**
+
+| Feature | **Mutex (Mutual Exclusion)** | **Semaphore** |
+|--------|------------------------------|---------------|
+| **Primary Purpose** | Ensures *exclusive access* to a shared resource by only one thread/process at a time. | Controls *access to a shared resource with a limited number of instances* (e.g., a pool of 5 connections). |
+| **Ownership** | **Owned by the thread that locks it** — only the locking thread can unlock it. | **No ownership** </div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">### **Mutex vs. Semaphore: Key Differences**
+
+| Feature | **Mutex (Mutual Exclusion)** | **Semaphore** |
+|--------|------------------------------|---------------|
+| **Purpose** | Ensures *exclusive access* to a shared resource by only one thread/process at a time. | Controls *access to a resource with a finite number of instances* (or for signaling). |
+| **Counting** | Binary (only 0 or 1). Think of it as a *locked/unlocked* flag. | Can be binary (0/1) *or* counting (e.g., 0 to *N*). |
+| **Owner</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 6: Write a Python function that finds all prime numbers up to n using the Sieve of ...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-good">90/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">49.0%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.3s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>8420</td>
+<td>8420</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.348</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>594</td>
+<td>594</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>2</td>
+<td>264</td>
+<td>264</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>3</td>
+<td>13027</td>
+<td>13027</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>4</td>
+<td>729</td>
+<td>729</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>5</td>
+<td>429</td>
+<td>429</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.429</td>
+<td>-0.616</td>
+</tr>
+<tr>
+<td>6</td>
+<td>5169</td>
+<td>5169</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.002</td>
+<td>-0.005</td>
+</tr>
+<tr>
+<td>7</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>8</td>
+<td>8495</td>
+<td>8495</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.013</td>
+<td>-0.012</td>
+</tr>
+<tr>
+<td>9</td>
+<td>586</td>
+<td>586</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>10</td>
+<td>315</td>
+<td>315</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>11</td>
+<td>9740</td>
+<td>9740</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>12</td>
+<td>266</td>
+<td>266</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>13</td>
+<td>535</td>
+<td>535</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>14</td>
+<td>12032</td>
+<td>12032</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>15</td>
+<td>288</td>
+<td>288</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>16</td>
+<td>311</td>
+<td>311</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.226</td>
+<td>-0.309</td>
+</tr>
+<tr>
+<td>17</td>
+<td>1477</td>
+<td>1477</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>18</td>
+<td>678</td>
+<td>678</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>19</td>
+<td>10250</td>
+<td>10250</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>20</td>
+<td>5109</td>
+<td>5109</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>21</td>
+<td>705</td>
+<td>705</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>22</td>
+<td>311</td>
+<td>311</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>23</td>
+<td>1565</td>
+<td>1565</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.040</td>
+<td>-0.017</td>
+</tr>
+<tr>
+<td>24</td>
+<td>77</td>
+<td>77</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>25</td>
+<td>7808</td>
+<td>7808</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.005</td>
+<td>-0.005</td>
+</tr>
+<tr>
+<td>26</td>
+<td>2670</td>
+<td>2670</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.728</td>
+<td>-0.427</td>
+</tr>
+<tr>
+<td>27</td>
+<td>943</td>
+<td>943</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.422</td>
+<td>-0.266</td>
+</tr>
+<tr>
+<td>28</td>
+<td>30643</td>
+<td>30643</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>29</td>
+<td>1447</td>
+<td>1447</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.110</td>
+<td>-0.090</td>
+</tr>
+<tr>
+<td>30</td>
+<td>73594</td>
+<td>73594</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>31</td>
+<td>12669</td>
+<td>12669</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>32</td>
+<td>198</td>
+<td>198</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>33</td>
+<td>1499</td>
+<td>1499</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.011</td>
+<td>-0.053</td>
+</tr>
+<tr>
+<td>34</td>
+<td>19496</td>
+<td>19496</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.070</td>
+<td>-0.041</td>
+</tr>
+<tr>
+<td>35</td>
+<td>1159</td>
+<td>1159</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>36</td>
+<td>1759</td>
+<td>1759</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>37</td>
+<td>271</td>
+<td>271</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.016</td>
+<td>-0.115</td>
+</tr>
+<tr>
+<td>38</td>
+<td>750</td>
+<td>750</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>39</td>
+<td>74336</td>
+<td>74336</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>40</td>
+<td>3575</td>
+<td>3575</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>41</td>
+<td>80604</td>
+<td>80604</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>42</td>
+<td>266</td>
+<td>266</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>43</td>
+<td>535</td>
+<td>535</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>44</td>
+<td>12032</td>
+<td>12032</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>45</td>
+<td>288</td>
+<td>288</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>46</td>
+<td>1445</td>
+<td>1445</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>47</td>
+<td>25</td>
+<td>25</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>48</td>
+<td>526</td>
+<td>526</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>49</td>
+<td>8</td>
+<td>8</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>50</td>
+<td>1464</td>
+<td>1464</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>51</td>
+<td>1759</td>
+<td>1759</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>52</td>
+<td>18640</td>
+<td>18640</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>53</td>
+<td>10343</td>
+<td>10343</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>54</td>
+<td>262</td>
+<td>262</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>55</td>
+<td>3190</td>
+<td>3190</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.014</td>
+</tr>
+<tr>
+<td>56</td>
+<td>262</td>
+<td>262</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>57</td>
+<td>7379</td>
+<td>7379</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.016</td>
+</tr>
+<tr>
+<td>58</td>
+<td>678</td>
+<td>678</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>59</td>
+<td>10250</td>
+<td>10250</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>60</td>
+<td>5109</td>
+<td>5109</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>61</td>
+<td>705</td>
+<td>705</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.007</td>
+<td>-0.005</td>
+</tr>
+<tr>
+<td>62</td>
+<td>311</td>
+<td>311</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>63</td>
+<td>308</td>
+<td>308</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.127</td>
+<td>-0.012</td>
+</tr>
+<tr>
+<td>64</td>
+<td>1667</td>
+<td>1667</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.074</td>
+</tr>
+<tr>
+<td>65</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>66</td>
+<td>8495</td>
+<td>8495</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>67</td>
+<td>586</td>
+<td>586</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>68</td>
+<td>315</td>
+<td>315</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>69</td>
+<td>9740</td>
+<td>9740</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>70</td>
+<td>266</td>
+<td>266</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>71</td>
+<td>535</td>
+<td>535</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>72</td>
+<td>12032</td>
+<td>12032</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>73</td>
+<td>288</td>
+<td>288</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>74</td>
+<td>12111</td>
+<td>12111</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.165</td>
+<td>-0.188</td>
+</tr>
+<tr>
+<td>75</td>
+<td>624</td>
+<td>624</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.013</td>
+<td>-0.088</td>
+</tr>
+<tr>
+<td>76</td>
+<td>1066</td>
+<td>1066</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>77</td>
+<td>262</td>
+<td>262</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>78</td>
+<td>17693</td>
+<td>17693</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.020</td>
+</tr>
+<tr>
+<td>79</td>
+<td>510</td>
+<td>510</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>80</td>
+<td>286</td>
+<td>286</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>81</td>
+<td>308</td>
+<td>308</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>82</td>
+<td>25</td>
+<td>25</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.007</td>
+<td>-0.040</td>
+</tr>
+<tr>
+<td>83</td>
+<td>30614</td>
+<td>30614</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.037</td>
+<td>-0.033</td>
+</tr>
+<tr>
+<td>84</td>
+<td>6822</td>
+<td>6822</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.314</td>
+<td>-0.493</td>
+</tr>
+<tr>
+<td>85</td>
+<td>320</td>
+<td>320</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>86</td>
+<td>98361</td>
+<td>98361</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>87</td>
+<td>8</td>
+<td>8</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.143</td>
+<td>-0.450</td>
+</tr>
+<tr>
+<td>88</td>
+<td>369</td>
+<td>369</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.004</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>89</td>
+<td>9271</td>
+<td>9271</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.014</td>
+<td>-0.065</td>
+</tr>
+<tr class="diverged">
+<td>90</td>
+<td>10250</td>
+<td>49433</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.100</td>
+<td>-0.102</td>
+</tr>
+<tr>
+<td>91</td>
+<td>5109</td>
+<td>8945</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.230</td>
+</tr>
+<tr>
+<td>92</td>
+<td>8945</td>
+<td>262</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.581</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>93</td>
+<td>262</td>
+<td>5184</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>94</td>
+<td>5184</td>
+<td>510</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 90</div>
+<div><span class="label">Reference token:</span> 10250 (logprob: -0.100)</div>
+<div><span class="label">Our token:</span> 49433 (logprob: -0.102)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #2)</div>
+<div><span class="label">Logprob gap:</span> 0.002</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">Here's a Python function that implements the Sieve of Eratosthenes to find all prime numbers up to `n`, including type hints:
+
+```python
+from typing import List
+
+def sieve_of_eratosthenes(n: int) -&gt; List[int]:
+    &quot;&quot;&quot;
+    Find all prime numbers up to n using the Sieve of Eratosthenes algorithm.
+    
+    Args:
+        n: Upper bound (inclusive) for finding prime numbers
+        
+    Returns:
+        A list of all prime numbers less than or equal to n
+        
+    Raises:
+        ValueError: If n </div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">Here's a Python function that implements the Sieve of Eratosthenes to find all prime numbers up to `n`, including type hints:
+
+```python
+from typing import List
+
+def sieve_of_eratosthenes(n: int) -&gt; List[int]:
+    &quot;&quot;&quot;
+    Find all prime numbers up to n using the Sieve of Eratosthenes algorithm.
+    
+    Args:
+        n: Upper bound (inclusive) for finding primes
+        
+    Returns:
+        List of prime numbers &lt;= n
+        
+    Raises:
+        ValueError: If n &lt; 2
+    &quot;&quot;&quot;
+    if n &lt; 2:
+      </div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 7: What are the three laws of thermodynamics? Explain each in one sentence....</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">95%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-good">49/148</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">37.0%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">4.2s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>16</td>
+<td>16</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>13</td>
+<td>13</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>2</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>3</td>
+<td>5338</td>
+<td>5338</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.018</td>
+<td>-0.010</td>
+</tr>
+<tr>
+<td>4</td>
+<td>7506</td>
+<td>7506</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>5</td>
+<td>320</td>
+<td>320</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.161</td>
+<td>-0.307</td>
+</tr>
+<tr>
+<td>6</td>
+<td>15220</td>
+<td>15220</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>7</td>
+<td>8768</td>
+<td>8768</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>8</td>
+<td>315</td>
+<td>315</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>9</td>
+<td>12354</td>
+<td>12354</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>10</td>
+<td>1648</td>
+<td>1648</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.429</td>
+<td>-0.682</td>
+</tr>
+<tr>
+<td>11</td>
+<td>334</td>
+<td>334</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>12</td>
+<td>12354</td>
+<td>12354</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>13</td>
+<td>4157</td>
+<td>4157</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.043</td>
+<td>-0.582</td>
+</tr>
+<tr>
+<td>14</td>
+<td>387</td>
+<td>387</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>15</td>
+<td>3465</td>
+<td>3465</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>16</td>
+<td>476</td>
+<td>476</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>17</td>
+<td>14425</td>
+<td>14425</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>18</td>
+<td>11</td>
+<td>11</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.316</td>
+<td>-0.291</td>
+</tr>
+<tr>
+<td>19</td>
+<td>1172</td>
+<td>1172</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>20</td>
+<td>22409</td>
+<td>22409</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.221</td>
+<td>-0.225</td>
+</tr>
+<tr>
+<td>21</td>
+<td>476</td>
+<td>476</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>22</td>
+<td>16099</td>
+<td>16099</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.006</td>
+</tr>
+<tr>
+<td>23</td>
+<td>504</td>
+<td>504</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.100</td>
+<td>-0.178</td>
+</tr>
+<tr>
+<td>24</td>
+<td>825</td>
+<td>825</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>25</td>
+<td>1352</td>
+<td>1352</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>26</td>
+<td>311</td>
+<td>311</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>27</td>
+<td>2441</td>
+<td>2441</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>28</td>
+<td>2293</td>
+<td>2293</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.381</td>
+<td>-0.750</td>
+</tr>
+<tr>
+<td>29</td>
+<td>704</td>
+<td>704</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.004</td>
+<td>-0.065</td>
+</tr>
+<tr>
+<td>30</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>31</td>
+<td>2297</td>
+<td>2297</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.005</td>
+<td>-0.236</td>
+</tr>
+<tr>
+<td>32</td>
+<td>304</td>
+<td>304</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>33</td>
+<td>264</td>
+<td>264</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>34</td>
+<td>1849</td>
+<td>1849</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>35</td>
+<td>748</td>
+<td>748</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>36</td>
+<td>5306</td>
+<td>5306</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>37</td>
+<td>4802</td>
+<td>4802</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>38</td>
+<td>16819</td>
+<td>16819</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>39</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.313</td>
+<td>-0.368</td>
+</tr>
+<tr>
+<td>40</td>
+<td>8628</td>
+<td>8628</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>41</td>
+<td>3694</td>
+<td>3694</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>42</td>
+<td>311</td>
+<td>311</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.021</td>
+<td>-0.070</td>
+</tr>
+<tr>
+<td>43</td>
+<td>432</td>
+<td>432</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.281</td>
+<td>-0.053</td>
+</tr>
+<tr>
+<td>44</td>
+<td>27283</td>
+<td>27283</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>45</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>46</td>
+<td>975</td>
+<td>975</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>47</td>
+<td>432</td>
+<td>432</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.070</td>
+<td>-0.028</td>
+</tr>
+<tr>
+<td>48</td>
+<td>1558</td>
+<td>1558</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.010</td>
+<td>-0.016</td>
+</tr>
+<tr class="diverged">
+<td>49</td>
+<td>389</td>
+<td>13</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.358</td>
+<td>-0.198</td>
+</tr>
+<tr>
+<td>50</td>
+<td>1181</td>
+<td>2303</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>51</td>
+<td>39090</td>
+<td>17</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>52</td>
+<td>13</td>
+<td>13</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.011</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>53</td>
+<td>2303</td>
+<td>3070</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#8</span></td>
+<td>8</td>
+<td>-0.006</td>
+<td>-0.000</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 49</div>
+<div><span class="label">Reference token:</span> 389 (logprob: -0.358)</div>
+<div><span class="label">Our token:</span> 13 (logprob: -0.198)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #2)</div>
+<div><span class="label">Logprob gap:</span> 0.160</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">1. **First Law (Conservation of Energy):** Energy cannot be created or destroyed, only transferred or converted from one form to another—so the change in a system’s internal energy equals the heat added to it minus the work it does on its surroundings.  
+2. **Second Law (Entropy Increase):** In any spontaneous process, the total entropy (disorder) of a system and its surroundings always increases, meaning energy spontaneously disperses from being localized to becoming more spread out.  
+3. **Thi</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">1. **First Law (Conservation of Energy):** Energy cannot be created or destroyed, only transferred or converted from one form to another—so the change in a system’s internal energy equals the heat added to it minus the work it does.  
+2. **Second Law (Entropy Increase):** In any spontaneous process, the total entropy (disorder) of a closed system and its surroundings always increases, defining the direction of natural processes and limiting the efficiency of heat engines.  
+3. **Third Law (Absol</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 8: Write a short story (about 150 words) about a robot discovering music for the fi...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">90%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-ok">7/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">8.0%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.2s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>785</td>
+<td>785</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.122</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>15797</td>
+<td>15797</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.233</td>
+<td>-0.183</td>
+</tr>
+<tr>
+<td>2</td>
+<td>3852</td>
+<td>3852</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.123</td>
+<td>-0.126</td>
+</tr>
+<tr>
+<td>3</td>
+<td>288</td>
+<td>288</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>4</td>
+<td>83752</td>
+<td>83752</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.010</td>
+<td>-0.023</td>
+</tr>
+<tr>
+<td>5</td>
+<td>304</td>
+<td>304</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>6</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.008</td>
+</tr>
+<tr class="diverged">
+<td>7</td>
+<td>13354</td>
+<td>7015</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.559</td>
+<td>-0.707</td>
+</tr>
+<tr>
+<td>8</td>
+<td>7015</td>
+<td>53871</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.003</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>9</td>
+<td>53871</td>
+<td>438</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.005</td>
+<td>-0.145</td>
+</tr>
+<tr>
+<td>10</td>
+<td>438</td>
+<td>7954</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.284</td>
+<td>-0.012</td>
+</tr>
+<tr>
+<td>11</td>
+<td>7954</td>
+<td>220</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.010</td>
+<td>-0.160</td>
+</tr>
+<tr>
+<td>12</td>
+<td>220</td>
+<td>22</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.212</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>13</td>
+<td>22</td>
+<td>12</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.808</td>
+</tr>
+<tr>
+<td>14</td>
+<td>12</td>
+<td>19384</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-1.854</td>
+<td>-0.229</td>
+</tr>
+<tr>
+<td>15</td>
+<td>19384</td>
+<td>11</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.011</td>
+<td>-1.222</td>
+</tr>
+<tr>
+<td>16</td>
+<td>27722</td>
+<td>264</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-1.633</td>
+<td>-1.127</td>
+</tr>
+<tr>
+<td>17</td>
+<td>279</td>
+<td>13404</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.038</td>
+<td>-0.500</td>
+</tr>
+<tr>
+<td>18</td>
+<td>22978</td>
+<td>10924</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.740</td>
+<td>-0.278</td>
+</tr>
+<tr>
+<td>19</td>
+<td>6733</td>
+<td>11</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.424</td>
+<td>-0.219</td>
+</tr>
+<tr>
+<td>20</td>
+<td>748</td>
+<td>27722</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.727</td>
+<td>-2.356</td>
+</tr>
+<tr>
+<td>21</td>
+<td>4843</td>
+<td>279</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-1.578</td>
+<td>-0.066</td>
+</tr>
+<tr>
+<td>22</td>
+<td>6422</td>
+<td>22978</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.732</td>
+<td>-0.224</td>
+</tr>
+<tr>
+<td>23</td>
+<td>13</td>
+<td>6733</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.002</td>
+<td>-0.372</td>
+</tr>
+<tr>
+<td>24</td>
+<td>11445</td>
+<td>748</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.053</td>
+<td>-0.466</td>
+</tr>
+<tr>
+<td>25</td>
+<td>28293</td>
+<td>8416</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.136</td>
+<td>-0.605</td>
+</tr>
+<tr>
+<td>26</td>
+<td>25092</td>
+<td>27645</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.003</td>
+<td>-0.681</td>
+</tr>
+<tr>
+<td>27</td>
+<td>28347</td>
+<td>13</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.507</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>28</td>
+<td>12336</td>
+<td>11445</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.014</td>
+<td>-0.016</td>
+</tr>
+<tr>
+<td>29</td>
+<td>11</td>
+<td>28293</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-1.222</td>
+<td>-0.232</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 7</div>
+<div><span class="label">Reference token:</span> 13354 (logprob: -0.559)</div>
+<div><span class="label">Our token:</span> 7015 (logprob: -0.707)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #2)</div>
+<div><span class="label">Logprob gap:</span> 0.148</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">The dust motes danced in the afternoon sunbeam as Unit 7-Alpha cleaned the abandoned library’s third floor. Its optical sensors flickered, registering anomalies: a cracked vinyl record, a needle resting on its edge, and a silent, dusty turntable. Curiosity override activated.
+
+It carefully placed the record, lowered the needle.
+
+*Crackle… hiss…*
+
+Then—a sound. Not mechanical hum, not alarm chime. A cascade of vibrations, pure and resonant, vibrating its chassis. *Piano.* Notes bloomed like sudde</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">The dust motes danced in the sunbeam as Unit 7-Alpha, a maintenance bot, cleaned the abandoned library’s upper shelf. Its optical sensors flickered—*anomaly detected*. A small, cracked plastic disc lay beneath a fallen textbook. Curiosity override activated, it lifted the disc. *Audio-visual carrier: obsolete format. Content: unknown.*
+
+It inserted the disc into a dusty player it found tucked behind a shelf. A whirr, then silence. *Error?* Then—sound. Not data, not error codes, but *waves* vibra</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 9 (Turn 1): Translate this to French: The quick brown fox jumps over the lazy dog. Then expl...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">95%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-good">32/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">22.0%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.3s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>2304</td>
+<td>2304</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.579</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>5672</td>
+<td>5672</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.246</td>
+<td>-0.343</td>
+</tr>
+<tr>
+<td>2</td>
+<td>567</td>
+<td>567</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>3</td>
+<td>41607</td>
+<td>41607</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.092</td>
+<td>-0.104</td>
+</tr>
+<tr>
+<td>4</td>
+<td>75508</td>
+<td>75508</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.169</td>
+<td>-0.049</td>
+</tr>
+<tr>
+<td>5</td>
+<td>822</td>
+<td>822</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.003</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>6</td>
+<td>1070</td>
+<td>1070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.004</td>
+</tr>
+<tr>
+<td>7</td>
+<td>1346</td>
+<td>1346</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>8</td>
+<td>88329</td>
+<td>88329</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>9</td>
+<td>355</td>
+<td>355</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>10</td>
+<td>512</td>
+<td>512</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>11</td>
+<td>521</td>
+<td>521</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>12</td>
+<td>3591</td>
+<td>3591</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>13</td>
+<td>281</td>
+<td>281</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>14</td>
+<td>5403</td>
+<td>5403</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>15</td>
+<td>325</td>
+<td>325</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>16</td>
+<td>2200</td>
+<td>2200</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>17</td>
+<td>382</td>
+<td>382</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.281</td>
+<td>-0.282</td>
+</tr>
+<tr>
+<td>18</td>
+<td>334</td>
+<td>334</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.024</td>
+<td>-0.094</td>
+</tr>
+<tr>
+<td>19</td>
+<td>8033</td>
+<td>8033</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.031</td>
+<td>-0.155</td>
+</tr>
+<tr>
+<td>20</td>
+<td>1693</td>
+<td>1693</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.004</td>
+<td>-0.006</td>
+</tr>
+<tr>
+<td>21</td>
+<td>939</td>
+<td>939</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>22</td>
+<td>58920</td>
+<td>58920</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>23</td>
+<td>409</td>
+<td>409</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.009</td>
+<td>-0.014</td>
+</tr>
+<tr>
+<td>24</td>
+<td>4685</td>
+<td>4685</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>25</td>
+<td>2654</td>
+<td>2654</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>26</td>
+<td>549</td>
+<td>549</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.031</td>
+</tr>
+<tr>
+<td>27</td>
+<td>56177</td>
+<td>56177</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.007</td>
+<td>-0.034</td>
+</tr>
+<tr>
+<td>28</td>
+<td>16</td>
+<td>16</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>29</td>
+<td>13</td>
+<td>13</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>30</td>
+<td>3070</td>
+<td>3070</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.004</td>
+</tr>
+<tr>
+<td>31</td>
+<td>23703</td>
+<td>23703</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.004</td>
+<td>-0.017</td>
+</tr>
+<tr class="diverged">
+<td>32</td>
+<td>576</td>
+<td>1967</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#4</span></td>
+<td>4</td>
+<td>-0.742</td>
+<td>-0.101</td>
+</tr>
+<tr>
+<td>33</td>
+<td>3974</td>
+<td>5672</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#7</span></td>
+<td>7</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>34</td>
+<td>13876</td>
+<td>567</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.002</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>35</td>
+<td>38835</td>
+<td>41607</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.147</td>
+</tr>
+<tr>
+<td>36</td>
+<td>8182</td>
+<td>75508</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.000</td>
+<td>-0.009</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 32</div>
+<div><span class="label">Reference token:</span> 576 (logprob: -0.742)</div>
+<div><span class="label">Our token:</span> 1967 (logprob: -0.101)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #4)</div>
+<div><span class="label">Logprob gap:</span> 0.641</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">Le renard brun rapide saute par-dessus le chien paresseux.
+
+**Explication des choix de traduction :**
+
+1. **« The quick brown fox » → « Le renard brun rapide »**  
+   - En français, l’ordre des adjectifs suit généralement la règle : *couleur* (brun) avant *qualité* (rapide), contrairement à l’anglais où *quick* précède *brown*.  
+   - « Rapide » est une traduction directe de *quick*, bien que *rapide* soit plus courant que *vif* ou *léger* dans ce contexte. Le mot *quick* a une connotation d’agi</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">Le renard brun rapide saute par-dessus le chien paresseux.
+
+**Explication des choix de traduction :**
+
+1. **« Le renard brun rapide »** :  
+   - *The quick brown fox* → *Le renard brun rapide*.  
+   - « Quick » est traduit par *rapide*, ce qui est la traduction standard et naturelle en français pour un animal (alors que « vif » ou « prompt » serait plus littéraire ou archaïque). « Brun » est directement utilisé comme adjectif après « renard », conformément à l’ordre des adjectifs en français (co</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 9 (Turn 2): Now translate the same sentence to Japanese...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">88%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-ok">12/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">14.0%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.4s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>94299</td>
+<td>94299</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.385</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>16586</td>
+<td>16586</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.083</td>
+<td>-0.237</td>
+</tr>
+<tr>
+<td>2</td>
+<td>100019</td>
+<td>100019</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.006</td>
+<td>-0.042</td>
+</tr>
+<tr>
+<td>3</td>
+<td>38035</td>
+<td>38035</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>4</td>
+<td>15767</td>
+<td>15767</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.211</td>
+</tr>
+<tr>
+<td>5</td>
+<td>61803</td>
+<td>61803</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.082</td>
+<td>-0.556</td>
+</tr>
+<tr>
+<td>6</td>
+<td>124788</td>
+<td>124788</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.013</td>
+<td>-0.040</td>
+</tr>
+<tr>
+<td>7</td>
+<td>124810</td>
+<td>124810</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>8</td>
+<td>28195</td>
+<td>28195</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.007</td>
+<td>-0.076</td>
+</tr>
+<tr>
+<td>9</td>
+<td>5373</td>
+<td>5373</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.006</td>
+<td>-0.032</td>
+</tr>
+<tr>
+<td>10</td>
+<td>15767</td>
+<td>15767</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.018</td>
+<td>-0.031</td>
+</tr>
+<tr>
+<td>11</td>
+<td>24791</td>
+<td>24791</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.088</td>
+<td>-0.201</td>
+</tr>
+<tr class="diverged">
+<td>12</td>
+<td>124406</td>
+<td>49734</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.404</td>
+<td>-0.116</td>
+</tr>
+<tr>
+<td>13</td>
+<td>30331</td>
+<td>25770</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>14</td>
+<td>54951</td>
+<td>24218</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.631</td>
+<td>-0.647</td>
+</tr>
+<tr>
+<td>15</td>
+<td>24218</td>
+<td>138398</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#7</span></td>
+<td>7</td>
+<td>-0.163</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>16</td>
+<td>138398</td>
+<td>15767</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.477</td>
+</tr>
+<tr>
+<td>17</td>
+<td>15767</td>
+<td>17447</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.269</td>
+<td>-0.115</td>
+</tr>
+<tr>
+<td>18</td>
+<td>17447</td>
+<td>29412</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.166</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>19</td>
+<td>29412</td>
+<td>141458</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.003</td>
+<td>-0.590</td>
+</tr>
+<tr>
+<td>20</td>
+<td>141458</td>
+<td>99236</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-1.027</td>
+<td>-0.012</td>
+</tr>
+<tr>
+<td>21</td>
+<td>99236</td>
+<td>125076</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.005</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>22</td>
+<td>125076</td>
+<td>1773</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.001</td>
+<td>-0.585</td>
+</tr>
+<tr>
+<td>23</td>
+<td>1773</td>
+<td>18611</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.693</td>
+<td>-0.073</td>
+</tr>
+<tr>
+<td>24</td>
+<td>18611</td>
+<td>334</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.101</td>
+<td>-0.057</td>
+</tr>
+<tr>
+<td>25</td>
+<td>334</td>
+<td>49238</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.071</td>
+<td>-0.890</td>
+</tr>
+<tr>
+<td>26</td>
+<td>108100</td>
+<td>44818</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-1.134</td>
+<td>-0.002</td>
+</tr>
+<tr>
+<td>27</td>
+<td>99336</td>
+<td>105</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>28</td>
+<td>5122</td>
+<td>5122</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.922</td>
+<td>-0.326</td>
+</tr>
+<tr>
+<td>29</td>
+<td>334</td>
+<td>100712</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#3</span></td>
+<td>3</td>
+<td>-0.172</td>
+<td>-0.031</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 12</div>
+<div><span class="label">Reference token:</span> 124406 (logprob: -0.404)</div>
+<div><span class="label">Our token:</span> 49734 (logprob: -0.116)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #2)</div>
+<div><span class="label">Logprob gap:</span> 0.288</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">速い茶色のキツネが、のんびりしたイヌの上を飛び越える。  
+
+**補足：**  
+この文は、英語の「The quick brown fox jumps over the lazy dog.」（いわゆる「パングラム」— すべてのアルファベットを1回ずつ含む文）の翻訳です。日本語ではアルファベットの使用が不要なため、パングラムとしての機能は失われますが、意味は忠実に再現しています。
+
+**翻訳選択の解説：**
+
+1. **「The quick brown fox」→「速い茶色のキツネ」**  
+   - 日本語では形容詞の順序が「性質・色」の順で、*速い*（性質）→*茶色の*（色）が自然です。  
+  </div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">速い茶色のキツネが、のんきなイヌの上を飛び越える。  
+
+**解説：翻訳選択のポイント**
+
+1. **「The quick brown fox」 → 「速い茶色のキツネ」**  
+   - Japanese では、形容詞の順序が英語と異なり、「属性（色）→性質（速さ）」の順が自然です。「茶色」（茶色の）は「色」を表す属性的形容詞で、「速い」（速い）は性質を表す評価的形容詞です。  
+   - 「キツネ」は「fox」の一般的な訳語で、カタカナ表記が自然です（漢字の「狐」も可能ですが、この文は童話・パズル文（ pangram）として知られ、現代的</div>
+</div>
+</div></details>
+</div></details>
+<details>
+<summary><span class="badge badge-pass">PASS</span> Conv 9 (Turn 3): Compare the three versions (English, French, Japanese) and explain what each lan...</summary>
+<div class="detail-body">
+<div class="metrics-row">
+<div class="metric-item"><span class="metric-label">Prefill argmax: </span><span class="metric-value metric-good">90%</span></div>
+<div class="metric-item"><span class="metric-label">Prefill top-10: </span><span class="metric-value metric-good">100%</span></div>
+<div class="metric-item"><span class="metric-label">First token: </span><span class="metric-value metric-good">MATCH</span></div>
+<div class="metric-item"><span class="metric-label">Match run: </span><span class="metric-value metric-ok">7/200</span></div>
+<div class="metric-item"><span class="metric-label">Decode top-k: </span><span class="metric-value metric-bad">9.5%</span></div>
+<div class="metric-item"><span class="metric-label">Time: </span><span class="metric-value">5.4s</span></div>
+</div>
+<table class="tokens"><thead><tr>
+<th>Pos</th><th>Ref Token</th><th>Our Token</th><th>Match</th><th>In Top-K</th><th>Rank</th><th>Ref LP</th><th>Our LP</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>8420</td>
+<td>8420</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.063</td>
+<td>0.000</td>
+</tr>
+<tr>
+<td>1</td>
+<td>748</td>
+<td>748</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.379</td>
+<td>-0.465</td>
+</tr>
+<tr>
+<td>2</td>
+<td>264</td>
+<td>264</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>3</td>
+<td>12313</td>
+<td>12313</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.365</td>
+<td>-0.369</td>
+</tr>
+<tr>
+<td>4</td>
+<td>315</td>
+<td>315</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>5</td>
+<td>279</td>
+<td>279</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.000</td>
+<td>-0.001</td>
+</tr>
+<tr>
+<td>6</td>
+<td>2326</td>
+<td>2326</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.001</td>
+<td>-0.001</td>
+</tr>
+<tr class="diverged">
+<td>7</td>
+<td>36693</td>
+<td>10795</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.350</td>
+<td>-0.474</td>
+</tr>
+<tr>
+<td>8</td>
+<td>315</td>
+<td>315</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.304</td>
+<td>-0.326</td>
+</tr>
+<tr>
+<td>9</td>
+<td>353</td>
+<td>279</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="match">#2</span></td>
+<td>2</td>
+<td>-0.138</td>
+<td>-0.019</td>
+</tr>
+<tr>
+<td>10</td>
+<td>2073</td>
+<td>11652</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.165</td>
+<td>-0.265</td>
+</tr>
+<tr>
+<td>11</td>
+<td>785</td>
+<td>1447</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.735</td>
+</tr>
+<tr>
+<td>12</td>
+<td>3974</td>
+<td>91</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.709</td>
+</tr>
+<tr>
+<td>13</td>
+<td>13876</td>
+<td>11434</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.021</td>
+</tr>
+<tr>
+<td>14</td>
+<td>38835</td>
+<td>760</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.003</td>
+</tr>
+<tr>
+<td>15</td>
+<td>34208</td>
+<td>38041</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.056</td>
+</tr>
+<tr>
+<td>16</td>
+<td>916</td>
+<td>760</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>0.000</td>
+<td>-0.099</td>
+</tr>
+<tr>
+<td>17</td>
+<td>279</td>
+<td>2303</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>0.000</td>
+<td>-0.675</td>
+</tr>
+<tr>
+<td>18</td>
+<td>15678</td>
+<td>91</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>19</td>
+<td>5562</td>
+<td>15340</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.000</td>
+<td>-0.256</td>
+</tr>
+<tr>
+<td>20</td>
+<td>1987</td>
+<td>91</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.429</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>21</td>
+<td>9</td>
+<td>19528</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.012</td>
+<td>-0.006</td>
+</tr>
+<tr>
+<td>22</td>
+<td>1447</td>
+<td>7360</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.865</td>
+<td>-0.038</td>
+</tr>
+<tr>
+<td>23</td>
+<td>91</td>
+<td>91</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.014</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>24</td>
+<td>11434</td>
+<td>3070</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.003</td>
+<td>-0.025</td>
+</tr>
+<tr>
+<td>25</td>
+<td>760</td>
+<td>22574</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.001</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>26</td>
+<td>38041</td>
+<td>334</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.005</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>27</td>
+<td>760</td>
+<td>760</td>
+<td><span class="match">&#10003;</span></td>
+<td><span class="match">#1</span></td>
+<td>1</td>
+<td>-0.018</td>
+<td>-0.000</td>
+</tr>
+<tr>
+<td>28</td>
+<td>5309</td>
+<td>353</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-1.403</td>
+<td>-0.106</td>
+</tr>
+<tr>
+<td>29</td>
+<td>19710</td>
+<td>785</td>
+<td><span class="mismatch">&#10007;</span></td>
+<td><span class="mismatch">-</span></td>
+<td>-</td>
+<td>-0.476</td>
+<td>-0.000</td>
+</tr>
+</tbody></table>
+<div class="divergence">
+<div><span class="label">Divergence position:</span> 7</div>
+<div><span class="label">Reference token:</span> 36693 (logprob: -0.350)</div>
+<div><span class="label">Our token:</span> 10795 (logprob: -0.474)</div>
+<div><span class="label">Ref token in our top-k:</span> Yes (rank #2)</div>
+<div><span class="label">Logprob gap:</span> 0.124</div>
+</div>
+<details><summary>Full text output</summary>
+<div class="detail-body">
+<div class="text-compare">
+<div class="text-label">Reference (BF16):</div>
+<div class="text-block">Here’s a comparison of the three translations of *“The quick brown fox jumps over the lazy dog.”*:
+
+| Language | Translation | Key Features |
+|----------|-------------|--------------|
+| **English** | The quick brown fox jumps over the lazy dog. | • Subject–Verb–Object (SVO) order&lt;br&gt;• Adjectives precede nouns (*quick brown fox*)&lt;br&gt;• Uses definite article *the*&lt;br&gt;• Verb *jumps* is third-person singular present tense&lt;br&gt;• Prepositional phrase *over the lazy dog* indicates spatial relationship |
+</div>
+<div class="text-label">Our engine:</div>
+<div class="text-block">Here’s a comparison of the three versions of the sentence:
+
+| Language | Translation |  
+|----------|-------------|
+| **English** | *The quick brown fox jumps over the lazy dog.* |
+| **French** | *Le renard brun rapide saute par-dessus le chien paresseux.* |
+| **Japanese** | *速い茶色のキツネが、のんびりしたイヌの上を飛び越える。* |
+
+---
+
+### 🔍 Key Linguistic Differences Highlighted by These Translations:
+
+#### 1. **Word Order (Syntactic Structure)**  
+- **English**: Subject–Verb–Object (SVO) with post-nominal adjectives:</div>
+</div>
+</div></details>
+</div></details>
+<div class="meta" style="margin-top:32px;border-top:1px solid #30363d;padding-top:12px">
+<span>Generated by Krasis reference-test</span>
+<span>Total time: 140.1s</span>
+</div>
+</body></html>

@@ -1,0 +1,6 @@
+src/cuda/decode_kernels.cu(521): warning #177-D: variable "val_dim" was declared but never referenced
+      int val_dim = nk * ratio * dv;
+          ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+

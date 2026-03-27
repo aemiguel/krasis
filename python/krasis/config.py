@@ -227,6 +227,7 @@ class QuantConfig:
     dense_mlp: str = "int8"        # "bf16" or "int8"
     gpu_expert_bits: int = 4       # 4, 8 (Marlin), or 16 (BF16 validation)
     cpu_expert_bits: int = 4       # 4 or 8 for CPU expert quantization
+    kv_cache_format: str = "fp8"   # "bf16", "fp8", or "polar4"
 
     def __post_init__(self):
         if self.attention in ("int4", "int8"):

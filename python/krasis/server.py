@@ -636,7 +636,8 @@ def main():
     parser.add_argument("--krasis-threads", type=int, default=40,
                         help="CPU threads for expert computation")
     parser.add_argument("--kv-dtype", default="fp8_e4m3",
-                        choices=["fp8_e4m3", "bf16"])
+                        choices=["bf16", "fp8_e4m3", "polar4"],
+                        help="KV cache format: bf16 (uncompressed), fp8_e4m3 (standard), polar4 (4-bit PolarQuant)")
     parser.add_argument("--kv-cache-mb", type=int, default=1000,
                         help="KV cache size in MB (default: 1000)")
     parser.add_argument("--heatmap-path", default=None,
@@ -793,7 +794,13 @@ def main():
     global _model, _model_name
     import torch
 
-    kv_dtype = torch.float8_e4m3fn if args.kv_dtype == "fp8_e4m3" else torch.bfloat16
+    kv_format_str = args.kv_dtype  # "fp8_e4m3", "bf16", or "polar4"
+    if args.kv_dtype == "fp8_e4m3":
+        kv_dtype = torch.float8_e4m3fn
+    elif args.kv_dtype == "polar4":
+        kv_dtype = torch.float8_e4m3fn  # base dtype for size calc; polar4 allocates its own tensors
+    else:
+        kv_dtype = torch.bfloat16
 
     quant_cfg = QuantConfig(
         lm_head=args.lm_head_quant,
@@ -802,6 +809,7 @@ def main():
         dense_mlp=args.dense_mlp_quant,
         gpu_expert_bits=args.gpu_expert_bits,
         cpu_expert_bits=args.cpu_expert_bits,
+        kv_cache_format=args.kv_dtype,
     )
 
     # Expand ~ in paths (config files use ~/.krasis/...)

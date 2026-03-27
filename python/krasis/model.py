@@ -2153,6 +2153,8 @@ class KrasisModel:
             num_kv_layers = kv_offset
 
             if num_kv_layers > 0:
+                logger.info("[DEBUG] Creating KV cache: kv_format=%r, kv_dtype=%r, quant_cfg=%r",
+                    self.quant_cfg.kv_cache_format, self.kv_dtype, self.quant_cfg)
                 cache = PagedKVCache(
                     self.cfg,
                     num_layers=num_kv_layers,
@@ -2160,6 +2162,7 @@ class KrasisModel:
                     kv_dtype=self.kv_dtype,
                     combined=use_combined,
                     max_mb=kv_mb,
+                    kv_format=self.quant_cfg.kv_cache_format,
                 )
             else:
                 cache = None
@@ -4557,11 +4560,31 @@ class KrasisModel:
                 logger.info("Registered shared_expert_gate for layer %d: wid=%d shape=%s",
                             layer_idx, sg_wid, sg.shape)
 
-        # Register shared FP8 KV cache pointers — Rust decode reads/writes the
+        # Register shared KV cache pointers — Rust decode reads/writes the
         # same GPU buffers that Rust prefill writes. No separate
         # allocation, no D2D export copy between prefill and decode.
         cache = self.kv_caches[0]
-        if cache is not None and cache.k_cache is not None:
+        if cache is not None and cache.kv_format == 2 and cache.k_radius_cache is not None:
+            # Polar4 KV cache: 4 pointer sets (radius + angles for K and V)
+            polar4_ptrs = []
+            gqa_cache_idx = 0
+            for layer_idx, layer in enumerate(self.layers):
+                if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
+                    and not hasattr(layer.attention, 'kv_a_proj')):
+                    kr = cache.k_radius_cache[gqa_cache_idx]
+                    vr = cache.v_radius_cache[gqa_cache_idx]
+                    ka = cache.k_angles_cache[gqa_cache_idx]
+                    va = cache.v_angles_cache[gqa_cache_idx]
+                    gqa_cache_idx += 1
+                    polar4_ptrs.append((layer_idx,
+                                        kr.data_ptr(), vr.data_ptr(),
+                                        ka.data_ptr(), va.data_ptr()))
+            max_seq = cache.max_pages * cache.page_size
+            num_blocks = (cache.num_kv_heads * cache.gqa_head_dim) // 16
+            store.set_kv_cache_ptrs_polar4(polar4_ptrs, max_seq, num_blocks)
+            logger.info("Shared Polar4 KV cache: %d GQA layers, max_seq=%d (%d pages × %d), %d blocks",
+                        len(polar4_ptrs), max_seq, cache.max_pages, cache.page_size, num_blocks)
+        elif cache is not None and cache.k_cache is not None:
             kv_ptrs = []
             gqa_cache_idx = 0
             for layer_idx, layer in enumerate(self.layers):

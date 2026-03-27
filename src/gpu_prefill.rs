@@ -193,6 +193,7 @@ pub struct PrefillKernels {
     gqa_prefill: RawCuFunc,
     kv_cache_append: RawCuFunc,
     kv_dequant_concat: RawCuFunc,
+    kv_cache_append_polar4: RawCuFunc,
     causal_conv1d: RawCuFunc,
     mamba2_ssd: RawCuFunc,
     mamba2_extract: RawCuFunc,
@@ -683,6 +684,14 @@ pub struct PrefillEngine {
     pub kv_k_ptrs: Vec<u64>,       // per-layer K cache pointers (FP8)
     pub kv_v_ptrs: Vec<u64>,       // per-layer V cache pointers (FP8)
     pub kv_max_seq: usize,
+    /// KV cache format: 0=bf16, 1=fp8, 2=polar4
+    pub kv_format: u32,
+    /// Polar4 KV cache pointers (only used when kv_format==2)
+    pub kv_k_radius_ptrs: Vec<u64>,
+    pub kv_v_radius_ptrs: Vec<u64>,
+    pub kv_k_angles_ptrs: Vec<u64>,
+    pub kv_v_angles_ptrs: Vec<u64>,
+    pub kv_num_blocks: usize,
     pub stream: cuda_sys::CUstream,
     pub copy_stream: cuda_sys::CUstream,
     pub cublas_handle: cudarc::cublas::sys::cublasHandle_t,
@@ -2890,9 +2899,40 @@ impl PrefillEngine {
             )?;
         }
 
-        // KV cache append: BF16 K,V -> FP8 E4M3 into separate per-layer caches
+        // KV cache append: BF16 K,V -> cache format into separate per-layer caches
         // Skip if FP8 cross-chunk path already stored K/V before attention.
-        if layer_k_ptr != 0 && layer_v_ptr != 0 && !kv_cache_already_stored {
+        if self.kv_format == 2 && layer_idx < self.kv_k_radius_ptrs.len()
+            && self.kv_k_radius_ptrs[layer_idx] != 0
+        {
+            // Polar4: BF16 K,V -> 4-bit rotated polar format
+            let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
+            let num_blocks = (kv_stride / 16) as u32;
+            let mut p0 = self.kv_k_radius_ptrs[layer_idx];
+            let mut p1 = self.kv_v_radius_ptrs[layer_idx];
+            let mut p2 = self.kv_k_angles_ptrs[layer_idx];
+            let mut p3 = self.kv_v_angles_ptrs[layer_idx];
+            let mut p4 = k; let mut p5 = v;
+            let mut p6 = m as i32; let mut p7 = kv_stride;
+            let mut p8 = self.kv_max_seq as i32; let mut p9 = start_pos as i32;
+            unsafe {
+                launch(self.kernels.kv_cache_append_polar4,
+                    (m as u32, 1, 1), (num_blocks, 1, 1), 0, self.stream,
+                    &mut [
+                        &mut p0 as *mut _ as *mut std::ffi::c_void,
+                        &mut p1 as *mut _ as *mut std::ffi::c_void,
+                        &mut p2 as *mut _ as *mut std::ffi::c_void,
+                        &mut p3 as *mut _ as *mut std::ffi::c_void,
+                        &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        &mut p5 as *mut _ as *mut std::ffi::c_void,
+                        &mut p6 as *mut _ as *mut std::ffi::c_void,
+                        &mut p7 as *mut _ as *mut std::ffi::c_void,
+                        &mut p8 as *mut _ as *mut std::ffi::c_void,
+                        &mut p9 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+        } else if layer_k_ptr != 0 && layer_v_ptr != 0 && !kv_cache_already_stored {
+            // FP8 E4M3: standard path
             let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
             let kt = std::cmp::max(32, ((std::cmp::min(256, kv_stride as usize) + 31) / 32) * 32) as u32;
             let mut k0 = layer_k_ptr; let mut k1 = layer_v_ptr;
@@ -7526,6 +7566,7 @@ impl PrefillKernels {
                 "moe_accum_to_bf16_kernel",
                 "kv_cache_append_fp8_kernel",
                 "kv_cache_dequant_concat_kernel",
+                "kv_cache_append_polar4_kernel",
                 // Optimized LA kernels (BF16 pipeline)
                 "la_fused_conv1d_silu_bf16_kernel",
                 "la_update_conv_state_kernel",
@@ -7587,6 +7628,7 @@ impl PrefillKernels {
             gqa_prefill: get("gqa_prefill_kernel")?,
             kv_cache_append: get("kv_cache_append_kernel")?,
             kv_dequant_concat: get("kv_cache_dequant_concat_kernel")?,
+            kv_cache_append_polar4: get("kv_cache_append_polar4_kernel")?,
             causal_conv1d: get("causal_conv1d_fwd_kernel")?,
             mamba2_ssd: get("mamba2_ssd_sequential_kernel")?,
             mamba2_extract: get("mamba2_extract_kernel")?,

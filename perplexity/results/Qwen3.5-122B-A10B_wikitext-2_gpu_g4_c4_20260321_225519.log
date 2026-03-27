@@ -1,0 +1,21 @@
+Krasis Perplexity Measurement
+==================================================
+Date:          2026-03-21T22:55:19.535256
+Model:         /home/main/.krasis/models/Qwen3.5-122B-A10B
+Dataset:       wikitext-2
+Mode:          GPU prefill (Marlin)
+GPUs:          1
+GPU bits:      4
+CPU bits:      4
+Window size:   2048
+Stride:        1024
+
+Results
+--------------------------------------------------
+Perplexity:    10.4531
+BPC:           3.3859
+Mean loss:     2.346895
+Tokens scored: 19999 / 20000
+Windows:       20
+Elapsed:       209.2s
+Throughput:    96 tok/s

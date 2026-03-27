@@ -1,0 +1,16 @@
+{
+  "Qwen3-Coder-Next": {
+    "INT4/INT4 BF16": {
+      "perplexity": 5.26,
+      "bpc": 2.39,
+      "date": "2026-03-21"
+    }
+  },
+  "Qwen3.5-35B-A3B": {
+    "INT4/INT4 BF16": {
+      "perplexity": 23.64,
+      "bpc": 4.56,
+      "date": "2026-03-21"
+    }
+  }
+}

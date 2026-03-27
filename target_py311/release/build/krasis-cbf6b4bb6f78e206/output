@@ -1,0 +1,6 @@
+cargo::rustc-check-cfg=cfg(no_numa)
+cargo::rustc-check-cfg=cfg(has_decode_kernels)
+cargo:rustc-link-lib=numa
+cargo:rustc-cfg=has_decode_kernels
+cargo:warning=Compiled GPU decode kernels to PTX (/home/main/Documents/Claude/krasis/target_py311/release/build/krasis-cbf6b4bb6f78e206/out/decode_kernels.ptx)
+cargo:rerun-if-changed=src/cuda/decode_kernels.cu
