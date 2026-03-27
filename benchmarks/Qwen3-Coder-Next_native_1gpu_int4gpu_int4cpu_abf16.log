@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-26 22:26:26
+Krasis Benchmark — 2026-03-27 02:22:37
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -26,25 +26,25 @@ Strategy:
   Mode:           gpu_decode (layer_grouped(2))
 
 Prefill (internal) — 6 runs at different lengths:
-  Run 1:  669.3 tok/s (1,000 tokens in 1494.1ms)
-  Run 2:  3,089.3 tok/s (5,000 tokens in 1618.5ms)
-  Run 3:  3,080.1 tok/s (10,000 tokens in 3246.7ms)
-  Run 4:  3,070.8 tok/s (20,000 tokens in 6513.0ms)
-  Run 5:  3,063.0 tok/s (35,000 tokens in 11426.7ms)
-  Run 6:  3,071.3 tok/s (50,000 tokens in 16279.6ms)
-  Best:   3,089.3 tok/s (5,000 tokens)
+  Run 1:  1,083.1 tok/s (1,000 tokens in 923.3ms)
+  Run 2:  4,049.6 tok/s (5,000 tokens in 1234.7ms)
+  Run 3:  4,008.6 tok/s (10,000 tokens in 2494.7ms)
+  Run 4:  3,952.1 tok/s (20,000 tokens in 5060.6ms)
+  Run 5:  3,897.1 tok/s (35,000 tokens in 8981.1ms)
+  Run 6:  3,840.2 tok/s (50,000 tokens in 13020.2ms)
+  Best:   4,049.6 tok/s (5,000 tokens)
 
 Decode (internal) — 50/100/250 tokens, 3 separate prompts:
-   50 tokens: 58.92 tok/s (17.0ms/tok)
-  100 tokens: 59.60 tok/s (16.8ms/tok)
-  250 tokens: 56.67 tok/s (17.6ms/tok)
-  Best:    59.60 tok/s
+   50 tokens: 58.87 tok/s (17.0ms/tok)
+  100 tokens: 57.81 tok/s (17.3ms/tok)
+  250 tokens: 58.69 tok/s (17.0ms/tok)
+  Best:    58.87 tok/s
   HCS:     12213/24576 experts (49.7%)
   Min free VRAM: 562 MB
 
 Round trip (network) — 50/100/250 tokens via HTTP:
-   50 tokens: 98.90 tok/s (2.32s total)
-  100 tokens: 73.48 tok/s (3.15s total)
-  250 tokens: 61.50 tok/s (5.86s total)
-  Best:    98.90 tok/s
+   50 tokens: 98.31 tok/s (1.31s total)
+  100 tokens: 73.03 tok/s (2.19s total)
+  250 tokens: 61.09 tok/s (4.90s total)
+  Best:    98.31 tok/s
 ================================================================
