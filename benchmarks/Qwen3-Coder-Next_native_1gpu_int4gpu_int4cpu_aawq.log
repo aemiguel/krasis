@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-27 23:37:11
+Krasis Benchmark — 2026-03-28 08:32:46
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -26,25 +26,25 @@ Strategy:
   Mode:           gpu_decode (layer_grouped(2))
 
 Prefill (internal) — 6 runs at different lengths:
-  Run 1:  665.3 tok/s (1,000 tokens in 1503.0ms)
-  Run 2:  2,899.2 tok/s (5,000 tokens in 1724.6ms)
-  Run 3:  5,096.0 tok/s (10,000 tokens in 1962.3ms)
-  Run 4:  7,707.0 tok/s (20,000 tokens in 2595.0ms)
-  Run 5:  9,578.6 tok/s (35,000 tokens in 3654.0ms)
-  Run 6:  10,009.9 tok/s (50,000 tokens in 4995.0ms)
-  Best:   10,009.9 tok/s (50,000 tokens)
+  Run 1:  653.3 tok/s (1,000 tokens in 1530.6ms)
+  Run 2:  2,806.9 tok/s (5,000 tokens in 1781.3ms)
+  Run 3:  4,994.4 tok/s (10,000 tokens in 2002.2ms)
+  Run 4:  7,620.8 tok/s (20,000 tokens in 2624.4ms)
+  Run 5:  9,546.0 tok/s (35,000 tokens in 3666.5ms)
+  Run 6:  9,921.0 tok/s (50,000 tokens in 5039.8ms)
+  Best:   9,921.0 tok/s (50,000 tokens)
 
 Decode (internal) — 50/100/250 tokens, 3 separate prompts:
-   50 tokens: 59.04 tok/s (16.9ms/tok)
-  100 tokens: FAILED (EOS at 29 tokens) -> -1 tok/s
-  250 tokens: 63.47 tok/s (15.8ms/tok)
-  Best:    63.47 tok/s
-  HCS:     16068/24576 experts (65.4%)
-  Min free VRAM: 532 MB
+   50 tokens: 59.65 tok/s (16.8ms/tok)
+  100 tokens: FAILED (EOS at 18 tokens) -> -1 tok/s
+  250 tokens: 63.09 tok/s (15.9ms/tok)
+  Best:    63.09 tok/s
+  HCS:     14881/24576 experts (60.6%)
+  Min free VRAM: 2388 MB
 
 Round trip (network) — 50/100/250 tokens via HTTP:
-   50 tokens: FAILED (EOS at 8 tokens) -> -1 tok/s
-  100 tokens: 84.07 tok/s (3.39s total)
-  250 tokens: FAILED (EOS at 23 tokens) -> -1 tok/s
-  Best:    84.07 tok/s
+   50 tokens: 105.16 tok/s (1.24s total)
+  100 tokens: FAILED (EOS at 2 tokens) -> -1 tok/s
+  250 tokens: FAILED (EOS at 41 tokens) -> -1 tok/s
+  Best:    105.16 tok/s
 ================================================================

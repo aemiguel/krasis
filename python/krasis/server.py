@@ -1168,9 +1168,16 @@ def main():
     # Hard tier = survives even worst-case prefill (small, permanent).
     # Soft tier = evicted when large prompts need scratch VRAM, reloaded for decode.
     # Hard must fit alongside the max scratch allocation + safety.
-    # Soft covers the rest — during decode (scratch freed), all of it reloads.
+    # Soft fills remaining VRAM MINUS headroom for minimum scratch allocation.
+    # This headroom allows small prompts (<= min_scratch) to skip soft eviction
+    # entirely, avoiding the expensive ~950ms evict/reload cycle.
     hard_budget = max(0, _free_mb - max_scratch_mb - SAFETY_MARGIN_MB)
-    soft_budget = max(0, _free_mb - hard_budget - SAFETY_MARGIN_MB)  # Everything else
+    # Reserve headroom so small prompts fit without evicting soft.
+    # min_scratch is at 1000 tokens (the minimum chunk size in prepare_for_prefill).
+    min_scratch_tokens = 1000
+    min_scratch_mb = gpu_store.prefill_scratch_reservation_mb(min_scratch_tokens)
+    soft_headroom = min_scratch_mb + SAFETY_MARGIN_MB
+    soft_budget = max(0, _free_mb - hard_budget - soft_headroom)
 
     # Pass calibration to Rust. Hard budget is small (permanent). Soft is the scratch area.
     short_tokens = 500
@@ -1187,7 +1194,7 @@ def main():
     vram_monitor.report_event("calibration_end")
     _status("VRAM budget complete")
     _detail(f"Hard HCS budget: {hard_budget:,} MB (free={_free_mb}, max_scratch={max_scratch_mb}, safety={SAFETY_MARGIN_MB})")
-    _detail(f"Soft HCS budget: {soft_budget:,} MB (evicted for large prompts, reloaded for decode)")
+    _detail(f"Soft HCS budget: {soft_budget:,} MB (headroom={soft_headroom:,} MB for skip-eviction at {min_scratch_tokens} tokens)")
     logger.info("VRAM budget: hard=%d MB, soft=%d MB, free=%d MB", hard_budget, soft_budget, _free_mb)
 
     # ── Pre-compute multi-GPU layer splits (before HCS, so we can filter rankings) ──

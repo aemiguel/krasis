@@ -514,10 +514,11 @@ fn handle_request(
 
 /// Overhead timings collected during request setup (before decode).
 struct RequestOverhead {
-    parse_ms: f64,       // HTTP parse + JSON parse + tokenization
-    evict_ms: f64,       // HCS soft-tier eviction
-    prefill_ms: f64,     // GIL acquire + Python prefill
-    reload_ms: f64,      // HCS soft-tier reload
+    parse_ms: f64,           // HTTP parse + JSON parse + tokenization
+    evict_ms: f64,           // HCS soft-tier eviction
+    prefill_ms: f64,         // GIL acquire + Python prefill
+    reload_ms: f64,          // HCS soft-tier reload (wall-clock, includes sync if enabled)
+    real_reload_dma_ms: f64, // Actual DMA time when sync is on (0.0 if async)
 }
 
 /// Handle /v1/chat/completions request.
@@ -803,7 +804,7 @@ fn handle_chat_completion(
 
     let tokenizer = &state.tokenizer;
 
-    // ── Reload soft HCS after prefill (async — DMA overlaps with decode) ──
+    // ── Reload soft HCS after prefill ──
     // Always attempt reload — soft pool may have been cancelled by a prior operation
     // even if we didn't evict anything this time.
     crate::vram_monitor::report_event("reload_start");
@@ -815,6 +816,21 @@ fn handle_chat_completion(
             log::info!("Request {}: HCS soft async reload queued {} experts ({} tokens)",
                 request_id, queued, prompt_len);
         }
+    }
+    // Sync mode: wait for reload DMA to complete before decode starts.
+    // Gives clean decode measurement (no PCIe contention from reload).
+    // Toggle via KRASIS_SYNC_HCS_RELOAD=1 env var.
+    let sync_reload = std::env::var("KRASIS_SYNC_HCS_RELOAD").is_ok();
+    let real_reload_ms;
+    if sync_reload {
+        let (activated, dma_ms) = store.hcs_sync_soft_reload();
+        real_reload_ms = dma_ms;
+        if activated > 0 {
+            log::info!("Request {}: sync HCS reload: {} experts, {:.1}ms real DMA",
+                request_id, activated, dma_ms);
+        }
+    } else {
+        real_reload_ms = 0.0; // async — will be measured by hcs_check_soft_reload_complete
     }
     // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
     // ── Multi-GPU: copy KV cache from primary to all aux GPUs after prefill ──
@@ -839,7 +855,8 @@ fn handle_chat_completion(
         parse_ms,
         evict_ms,
         prefill_ms: prefill_gil_ms,
-        reload_ms,
+        reload_ms: if sync_reload { reload_ms } else { reload_ms }, // total elapsed either way
+        real_reload_dma_ms: real_reload_ms, // actual DMA time (0 if async)
     };
 
     // ── Thinking suppression: prevent EOS before </think> ──
@@ -1545,13 +1562,14 @@ fn handle_gpu_decode(
         };
         let overhead_total_ms = overhead.parse_ms + overhead.evict_ms + overhead.prefill_ms + overhead.reload_ms;
         let timing_chunk = format!(
-            r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[],"krasis_timing":{{"decode_tokens":{},"decode_time_ms":{:.1},"decode_tok_s":{:.2},"thinking_tokens":{},"answer_tokens":{},"total_generated":{},"prompt_tokens":{},"prefill_tok_s":{:.1},"overhead_ms":{:.1},"overhead":{{"parse_ms":{:.1},"evict_ms":{:.1},"prefill_ms":{:.1},"reload_ms":{:.1}}}}}}}"#,
+            r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[],"krasis_timing":{{"decode_tokens":{},"decode_time_ms":{:.1},"decode_tok_s":{:.2},"thinking_tokens":{},"answer_tokens":{},"total_generated":{},"prompt_tokens":{},"prefill_tok_s":{:.1},"overhead_ms":{:.1},"overhead":{{"parse_ms":{:.1},"evict_ms":{:.1},"prefill_ms":{:.1},"reload_ms":{:.1},"real_reload_dma_ms":{:.1}}}}}}}"#,
             request_id, created, model_name,
             decode_token_count, decode_ms, decode_tok_s,
             thinking_token_count, answer_token_count,
             total_gen, prompt_len, prefill_tok_s,
             overhead_total_ms,
-            overhead.parse_ms, overhead.evict_ms, overhead.prefill_ms, overhead.reload_ms
+            overhead.parse_ms, overhead.evict_ms, overhead.prefill_ms, overhead.reload_ms,
+            overhead.real_reload_dma_ms
         );
         let _ = tx.send(format!("data: {}\n\n", timing_chunk));
         let _ = tx.send("data: [DONE]\n\n".to_string());
@@ -2144,15 +2162,26 @@ impl RustServer {
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         crate::vram_monitor::report_event("prefill_end");
 
-        // Reload soft HCS after prefill — ASYNC, matching production behavior.
-        // Production starts async reload BEFORE KV copy so DMA overlaps with
-        // KV copy time, giving soft experts a head start. We match that order.
+        // Reload soft HCS after prefill
         crate::vram_monitor::report_event("hcs_soft_load_start");
         let t_reload = Instant::now();
         let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async(prompt_len);
         if queued > 0 {
             log::info!("Benchmark: HCS soft async reload queued {} experts ({} tokens)",
                 queued, prompt_len);
+        }
+        // Sync mode: wait for reload DMA to complete before decode starts
+        let sync_reload = std::env::var("KRASIS_SYNC_HCS_RELOAD").is_ok();
+        let real_reload_dma_ms;
+        if sync_reload {
+            let (activated, dma_ms) = store.hcs_sync_soft_reload();
+            real_reload_dma_ms = dma_ms;
+            if activated > 0 {
+                log::info!("Benchmark: sync HCS reload: {} experts, {:.1}ms real DMA",
+                    activated, dma_ms);
+            }
+        } else {
+            real_reload_dma_ms = 0.0;
         }
         // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
         let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
@@ -2260,10 +2289,10 @@ impl RustServer {
         let hcs_pct = if hcs_total > 0 { hcs_loaded as f64 / hcs_total as f64 * 100.0 } else { 0.0 };
 
         Ok(format!(
-            r#"{{"prefill_ms":{:.1},"prefill_tok_s":{:.1},"prompt_tokens":{},"decode_ms":{:.1},"decode_tok_s":{:.2},"decode_tokens":{},"evict_ms":{:.1},"reload_ms":{:.1},"min_free_vram_mb":{},"hcs_loaded":{},"hcs_total":{},"hcs_pct":{:.1},"safety_margin_mb":{}}}"#,
+            r#"{{"prefill_ms":{:.1},"prefill_tok_s":{:.1},"prompt_tokens":{},"decode_ms":{:.1},"decode_tok_s":{:.2},"decode_tokens":{},"evict_ms":{:.1},"reload_ms":{:.1},"real_reload_dma_ms":{:.1},"min_free_vram_mb":{},"hcs_loaded":{},"hcs_total":{},"hcs_pct":{:.1},"safety_margin_mb":{}}}"#,
             prefill_ms, prefill_tok_s, prompt_len,
             decode_ms, decode_tok_s, decode_tokens,
-            evict_ms, reload_ms,
+            evict_ms, reload_ms, real_reload_dma_ms,
             min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct,
             safety_margin_mb
         ))

@@ -758,14 +758,6 @@ pub struct PrefillEngine {
     pub t_moe_w2: Cell<f64>,         // fused w2 GEMM
     pub t_moe_scatter: Cell<f64>,    // scatter-add + accum_to_bf16
     pub t_moe_shared: Cell<f64>,     // shared expert (wait + add)
-    // Pin-as-you-go prefill expert cache: experts loaded during prefill are retained in VRAM.
-    // Key: (moe_layer_idx, expert_id), Value: (w13_packed_ptr, w13_scales_ptr, w2_packed_ptr, w2_scales_ptr).
-    // Managed via raw cuMemAlloc per expert. After prefill, exported to HCS decode cache.
-    pub prefill_cache: std::collections::HashMap<(usize, usize), [u64; 4]>,
-    // GPU buffers backing the prefill cache (kept alive so cuMemFree happens on clear)
-    pub prefill_cache_bufs: Vec<CudaSlice<u8>>,
-    // Total bytes pinned in prefill cache (for VRAM budget tracking)
-    pub prefill_cache_bytes: usize,
     // FLA (Flash Linear Attention) vendored kernels — replaces custom LA chunk recurrence
     pub fla: Option<FlaKernels>,
     // FLA intermediate buffers (allocated once at engine init if FLA available)
@@ -803,20 +795,11 @@ impl PrefillEngine {
         self.hcs_num_experts_per_layer = num_experts_per_layer;
     }
 
-    /// Check if an expert is GPU-resident (prefill cache first, then HCS).
+    /// Check if an expert is GPU-resident in HCS.
     /// Returns Some((w13_packed, w13_scales, w2_packed, w2_scales)) if resident.
+    /// During prefill, surviving HCS experts (not evicted for scratch) are used
+    /// opportunistically — no separate prefill cache needed.
     fn expert_lookup(&self, moe_layer_idx: usize, expert_idx: usize) -> Option<(u64, u64, u64, u64)> {
-        // Tier 0: prefill pin-as-you-go cache (experts loaded during this prefill)
-        if let Some(ptrs) = self.prefill_cache.get(&(moe_layer_idx, expert_idx)) {
-            return Some((ptrs[0], ptrs[1], ptrs[2], ptrs[3]));
-        }
-        // Tier 1: HCS hard pool (experts from decode)
-        self.hcs_lookup(moe_layer_idx, expert_idx)
-    }
-
-    /// Check if an expert is GPU-resident in HCS only (no prefill cache check).
-    /// Returns Some((w13_packed, w13_scales, w2_packed, w2_scales)) if resident.
-    fn hcs_lookup(&self, moe_layer_idx: usize, expert_idx: usize) -> Option<(u64, u64, u64, u64)> {
         if self.hcs_num_experts_per_layer == 0 { return None; }
         let idx = moe_layer_idx * self.hcs_num_experts_per_layer + expert_idx;
         if idx < self.hcs_cache_fast.len() {
@@ -829,78 +812,6 @@ impl PrefillEngine {
         } else {
             None
         }
-    }
-
-    /// Pin a cold expert in the prefill cache after it has been loaded to GPU.
-    /// Allocates a persistent VRAM buffer and copies from the staging slot.
-    /// Returns true if pinned successfully, false if VRAM is too tight.
-    fn pin_expert(&mut self, moe_layer_idx: usize, expert_idx: usize,
-                  w13p_src: u64, w13p_bytes: usize,
-                  w13s_src: u64, w13s_bytes: usize,
-                  w2p_src: u64, w2p_bytes: usize,
-                  w2s_src: u64, w2s_bytes: usize) -> bool {
-        // Skip if already pinned
-        if self.prefill_cache.contains_key(&(moe_layer_idx, expert_idx)) {
-            return true;
-        }
-
-        let total_bytes = w13p_bytes + w13s_bytes + w2p_bytes + w2s_bytes;
-
-        // Check VRAM headroom before allocating
-        let mut free: usize = 0;
-        let mut total: usize = 0;
-        unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut total); }
-        let safety = std::cmp::max(400 * 1024 * 1024, total / 20); // 5% or 400MB min
-        if free < total_bytes + safety {
-            return false; // not enough VRAM headroom
-        }
-
-        // Allocate persistent buffer
-        let buf = match unsafe { self.device.alloc::<u8>(total_bytes) } {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
-        let base = *buf.device_ptr();
-
-        // Copy from staging to persistent buffer (D2D, fast)
-        let w13p_off = 0u64;
-        let w13s_off = w13p_bytes as u64;
-        let w2p_off = w13s_off + w13s_bytes as u64;
-        let w2s_off = w2p_off + w2p_bytes as u64;
-        unsafe {
-            cuda_sys::lib().cuMemcpyDtoDAsync_v2(base + w13p_off, w13p_src, w13p_bytes, self.stream);
-            cuda_sys::lib().cuMemcpyDtoDAsync_v2(base + w13s_off, w13s_src, w13s_bytes, self.stream);
-            cuda_sys::lib().cuMemcpyDtoDAsync_v2(base + w2p_off, w2p_src, w2p_bytes, self.stream);
-            cuda_sys::lib().cuMemcpyDtoDAsync_v2(base + w2s_off, w2s_src, w2s_bytes, self.stream);
-        }
-
-        self.prefill_cache.insert(
-            (moe_layer_idx, expert_idx),
-            [base + w13p_off, base + w13s_off, base + w2p_off, base + w2s_off],
-        );
-        self.prefill_cache_bufs.push(buf);
-        self.prefill_cache_bytes += total_bytes;
-        true
-    }
-
-    /// Clear prefill cache, freeing all pinned expert VRAM.
-    fn clear_prefill_cache(&mut self) {
-        if !self.prefill_cache.is_empty() {
-            let count = self.prefill_cache.len();
-            let mb = self.prefill_cache_bytes as f64 / (1024.0 * 1024.0);
-            eprintln!("[PREFILL-CACHE] Clearing {} pinned experts ({:.1} MB)", count, mb);
-        }
-        self.prefill_cache.clear();
-        self.prefill_cache_bufs.clear();
-        self.prefill_cache_bytes = 0;
-    }
-
-    /// Export prefill cache as flat (layer, expert, [4 ptrs]) entries for HCS import.
-    /// The returned Vec borrows nothing — caller can consume it after engine is unlocked.
-    pub fn export_prefill_cache(&self) -> Vec<(usize, usize, [u64; 4])> {
-        self.prefill_cache.iter()
-            .map(|(&(l, e), ptrs)| (l, e, *ptrs))
-            .collect()
     }
 
     /// Run the full prefill pipeline with token chunking.
@@ -1050,9 +961,6 @@ impl PrefillEngine {
     pub fn prepare_for_prefill(&mut self, prompt_tokens: usize) -> Result<(), String> {
         self.bind_cuda_context()?;
 
-        // 0. Clear prefill cache from previous request (frees pinned expert VRAM)
-        self.clear_prefill_cache();
-
         // 1. Synchronize all GPU work (ensures pending cuMemFreeAsync from HCS
         //    soft eviction have completed on cudarc's internal stream).
         unsafe { cuda_sys::lib().cuCtxSynchronize(); }
@@ -1095,22 +1003,13 @@ impl PrefillEngine {
         let mut free_bytes: usize = 0;
         let mut total_bytes: usize = 0;
         unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free_bytes, &mut total_bytes); }
-        let safety_mb = std::cmp::max(600, total_bytes / (1024 * 1024) * 75 / 1000);
-        let reserved = safety_mb * 1024 * 1024;
+        // Safety margin covers CUDA context overhead, allocator fragmentation, and
+        // FLA Triton kernel temporaries. 600 MB is sufficient based on runtime measurements.
+        // NOTE: cold_staging is already allocated (reflected in free_bytes), do NOT
+        // double-count it here.
+        let safety_bytes: usize = PREFILL_SAFETY_MARGIN_MB * 1024 * 1024;
 
-        // Reserve for cold staging + pointer tables
-        let cold_reserve = if self.config.n_routed_experts > 0 {
-            let h = self.config.hidden_size;
-            let moe_inter = self.config.moe_intermediate_size;
-            let bits = self.config.expert_bits as usize;
-            let gs = self.config.group_size;
-            let w13_n = if self.config.moe_gated { 2 * moe_inter } else { moe_inter };
-            let packed = h * w13_n * bits / 8 + moe_inter * h * bits / 8;
-            let scales = if gs > 0 { (h / gs) * w13_n * 2 + (moe_inter / gs) * h * 2 } else { 0 };
-            self.config.n_routed_experts * (packed + scales)
-        } else { 0 };
-
-        let usable = free_bytes.saturating_sub(reserved).saturating_sub(fixed_bytes).saturating_sub(cold_reserve);
+        let usable = free_bytes.saturating_sub(safety_bytes).saturating_sub(fixed_bytes);
         let max_by_vram = if per_token_bytes > 0 { usable / per_token_bytes } else { 50000 };
 
         // Size for this prompt: cap at prompt_tokens (no point allocating more),
@@ -1125,7 +1024,7 @@ impl PrefillEngine {
         let scratch_mb = (fixed_bytes + per_token_bytes * scratch_tokens) as f64 / (1024.0 * 1024.0);
         if scratch_tokens != old_tokens {
             eprintln!("[PREFILL] Dynamic scratch: {} tokens ({:.0} MB) for {}-token prompt ({} MB safety, {:.0} MB free)",
-                scratch_tokens, scratch_mb, prompt_tokens, safety_mb,
+                scratch_tokens, scratch_mb, prompt_tokens, PREFILL_SAFETY_MARGIN_MB,
                 free_bytes as f64 / (1024.0 * 1024.0));
         }
 
@@ -1151,8 +1050,6 @@ impl PrefillEngine {
         self.bind_cuda_context()?;
         // Synchronize to ensure all prefill GPU work is done before freeing buffers.
         unsafe { cuda_sys::lib().cuCtxSynchronize(); }
-        // Clear prefill cache first — frees pinned expert VRAM so decode HCS can reclaim it
-        self.clear_prefill_cache();
         // Replace scratch with zero-capacity (drops old, frees VRAM immediately).
         self.scratch = allocate_scratch(&self.device, &self.config, 0)
             .map_err(|e| format!("alloc empty scratch: {e}"))?;
@@ -7273,6 +7170,11 @@ impl PrefillKernels {
 //  Scratch allocation
 // ════════════════════════════════════════════════════════════════════════
 
+/// Safety margin (MB) reserved during scratch allocation to cover CUDA context overhead,
+/// allocator fragmentation, cuBLAS workspace, and FLA Triton kernel temporaries.
+/// Used by both `prepare_for_prefill` and `hcs_evict_for_prefill` to ensure consistency.
+pub const PREFILL_SAFETY_MARGIN_MB: usize = 600;
+
 /// Compute total VRAM bytes needed for prefill buffers as a function of max_tokens.
 /// Returns (fixed_bytes, per_token_bytes) including both scratch AND fused MoE buffers.
 /// This is used to dynamically compute the largest chunk size that fits in available VRAM.
@@ -7387,7 +7289,15 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
         per_token += nv * dv * 4 * 2;
         // d_la_g_cum: nv * max_tokens * 4 (approx -- actual is nv * num_chunks * chunk_size)
         per_token += nv * 4;
+        // d_la_proj_buf: max_tokens * qkvz_dim * 2 (BF16)
+        let hr = config.la_head_ratio.max(1);
+        let group_dim_proj = 2 * dk + 2 * hr * dv;
+        per_token += config.la_num_k_heads * group_dim_proj * 2;
         // d_la_chunk_out, d_la_q_contig: nv * chunk_size * dk * 4 -- fixed, not per-token
+    }
+    // d_fa2_lse: num_q_heads * max_tokens * 4 (FP32)
+    if config.num_q_heads > 0 {
+        per_token += config.num_q_heads * 4;
     }
     // Mamba2 buffers: mostly fixed-size, ignore for per-token estimate
 

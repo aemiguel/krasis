@@ -1534,6 +1534,10 @@ pub struct GpuDecodeStore {
     /// Pre-allocated Rust prefill engine.
     /// Created early (before HCS) to claim scratch VRAM while it's still available.
     prefill_engine_slot: Option<crate::gpu_prefill::PrefillEngine>,
+    /// Cached scratch VRAM computation: (fixed_bytes, per_token_bytes).
+    /// Stored when the prefill engine is created so it's available for eviction checks
+    /// even after the engine is taken by the RustServer.
+    prefill_scratch_info: Option<(usize, usize)>,
 }
 
 #[pymethods]
@@ -1780,6 +1784,7 @@ impl GpuDecodeStore {
             #[cfg(feature = "gpu-debug")]
             debug_layer_captures: Vec::new(),
             prefill_engine_slot: None,
+            prefill_scratch_info: None,
         })
     }
 
@@ -1792,6 +1797,8 @@ impl GpuDecodeStore {
         match self.create_prefill_engine(max_context_tokens) {
             Ok(engine) => {
                 log::info!("Prefill engine pre-allocated (max_tokens={})", max_context_tokens);
+                // Cache scratch VRAM computation for eviction checks (survives take_prefill_engine)
+                self.prefill_scratch_info = Some(crate::gpu_prefill::compute_scratch_vram(&engine.config));
                 self.prefill_engine_slot = Some(engine);
                 Ok(())
             }
@@ -6165,9 +6172,6 @@ impl GpuDecodeStore {
             t_moe_w2: std::cell::Cell::new(0.0),
             t_moe_scatter: std::cell::Cell::new(0.0),
             t_moe_shared: std::cell::Cell::new(0.0),
-            prefill_cache: std::collections::HashMap::new(),
-            prefill_cache_bufs: Vec::new(),
-            prefill_cache_bytes: 0,
             fla: crate::gpu_prefill::load_fla(),
             d_fla_g_cumsum: None,
             d_fla_a: None,
@@ -12527,13 +12531,14 @@ impl GpuDecodeStore {
         }
 
         // Check if scratch fits in free VRAM without eviction.
-        // If so, skip the expensive evict/reload cycle entirely.
-        if let Some(ref engine) = self.prefill_engine_slot {
-            let (fixed_bytes, per_token_bytes) = crate::gpu_prefill::compute_scratch_vram(&engine.config);
-            let scratch_bytes = fixed_bytes + per_token_bytes * estimated_tokens;
+        // Uses the same safety margin as prepare_for_prefill to ensure consistency.
+        if let Some((fixed_bytes, per_token_bytes)) = self.prefill_scratch_info {
+            let capped_tokens = estimated_tokens.min(50000); // same cap as prepare_for_prefill
+            let scratch_bytes = fixed_bytes + per_token_bytes * capped_tokens;
             let scratch_mb = scratch_bytes / (1024 * 1024);
+            let safety_mb = crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB;
 
-            // Measure actual free VRAM (cudarc allocation)
+            // Measure actual free VRAM
             let free_mb = unsafe {
                 let mut free: usize = 0;
                 let mut total: usize = 0;
@@ -12547,7 +12552,6 @@ impl GpuDecodeStore {
                 }
             };
 
-            let safety_mb = 600; // same safety margin used in budget calculation
             if free_mb > scratch_mb + safety_mb {
                 eprintln!("  \x1b[32mHCS soft: skip eviction — {} MB free > {} MB scratch + {} MB safety\x1b[0m",
                     free_mb, scratch_mb, safety_mb);
@@ -12976,6 +12980,58 @@ impl GpuDecodeStore {
         log::info!("HCS soft: async reload complete — {} experts activated", activated);
 
         true
+    }
+
+    /// Synchronize pending soft-tier reload: wait for all DMA to complete,
+    /// activate cache entries, and return the real DMA wall-clock time in ms.
+    /// Used by --sync-hcs-reload to get clean decode measurements.
+    /// Returns (activated_count, real_dma_ms). Returns (0, 0.0) if no reload pending.
+    pub fn hcs_sync_soft_reload(&mut self) -> (usize, f64) {
+        let graph = match self.graph.as_mut() {
+            Some(g) => g,
+            None => return (0, 0.0),
+        };
+        let hcs = match graph.hcs.as_mut() {
+            Some(h) => h,
+            None => return (0, 0.0),
+        };
+
+        if !hcs.soft_reload_pending {
+            return (0, 0.0);
+        }
+
+        let stream = match hcs.soft_reload_stream {
+            Some(ref s) => s.0,
+            None => return (0, 0.0),
+        };
+
+        // Synchronize: wait for all DMA on the reload stream to finish
+        let t0 = std::time::Instant::now();
+        unsafe {
+            let err = cuda_sys::lib().cuStreamSynchronize(stream);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                log::warn!("HCS sync reload: cuStreamSynchronize failed: {:?}", err);
+            }
+        }
+        let real_dma_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // Activate all cache entries (same as hcs_check_soft_reload_complete)
+        let entries = std::mem::take(&mut hcs.soft_reload_entries);
+        let activated = entries.len();
+        for (layer_idx, expert_idx, entry) in entries {
+            hcs.cache_fast_set(layer_idx, expert_idx, &entry);
+            hcs.cache.insert((layer_idx, expert_idx), entry);
+        }
+        hcs.soft_loaded = true;
+        hcs.soft_reload_pending = false;
+        hcs.num_cached += activated;
+
+        eprintln!("  \x1b[32mHCS soft: sync reload complete — {} experts in {:.1}ms real DMA\x1b[0m",
+            activated, real_dma_ms);
+        log::info!("HCS soft: sync reload complete — {} experts in {:.1}ms real DMA",
+            activated, real_dma_ms);
+
+        (activated, real_dma_ms)
     }
 
     /// Generate tokens in a tight Rust loop via GPU decode.
