@@ -694,8 +694,11 @@ fn handle_chat_completion(
             }
         }
 
+        engine.set_prefill_hcs_guard_store_addr(state.gpu_store_addr);
+
         // Dynamically allocate scratch sized for this prompt
         if let Err(e) = engine.prepare_for_prefill(token_ids.len()) {
+            engine.clear_prefill_hcs_guard_store_addr();
             let _ = send_json(stream, 500, &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e));
             return;
         }
@@ -710,6 +713,7 @@ fn handle_chat_completion(
         if let Err(e) = engine.release_scratch() {
             log::error!("Failed to release scratch: {}", e);
         }
+        engine.clear_prefill_hcs_guard_store_addr();
 
         // Convert stop token strings to IDs, and always include model's EOS tokens
         let mut stop_ids: Vec<usize> = state.eos_stop_ids.clone();
@@ -2122,22 +2126,30 @@ impl RustServer {
             log::error!("Failed to swap to Marlin for prefill: {}", e);
         }
 
+        engine.set_prefill_hcs_guard_store_addr(self.gpu_store_addr);
+
         // Dynamically allocate scratch for this prompt
-        engine.prepare_for_prefill(token_ids.len())
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("Scratch alloc failed: {}", e)))?;
+        if let Err(e) = engine.prepare_for_prefill(token_ids.len()) {
+            engine.clear_prefill_hcs_guard_store_addr();
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Scratch alloc failed: {}", e)));
+        }
 
         let prefill_result = engine.run_prefill(
             &token_ids,
             temperature,
             &[],
-        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-            format!("Rust prefill failed: {}", e)))?;
+        ).map_err(|e| {
+            engine.clear_prefill_hcs_guard_store_addr();
+            pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Rust prefill failed: {}", e))
+        })?;
 
         // Release scratch to free VRAM for decode/HCS
         if let Err(e) = engine.release_scratch() {
             log::error!("Failed to release scratch: {}", e);
         }
+        engine.clear_prefill_hcs_guard_store_addr();
 
         let first_token = prefill_result.first_token as usize;
         let prompt_len = prefill_result.prompt_len;

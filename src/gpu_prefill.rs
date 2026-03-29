@@ -780,6 +780,9 @@ pub struct PrefillEngine {
     pub d_fla_o: Option<CudaSlice<u16>>,          // [B, T, H, V] BF16 output
     /// Runtime-configured VRAM reserve for dynamic prefill scratch sizing.
     pub safety_margin_mb: usize,
+    /// Temporary pointer back to the decode store for chunk-boundary HCS guardrails.
+    /// Set only for the lifetime of an active prefill request.
+    pub prefill_hcs_store_addr: usize,
 }
 
 /// Double-buffer BF16 attention weight streaming buffers.
@@ -809,6 +812,14 @@ impl PrefillEngine {
         self.hcs_num_experts_per_layer = num_experts_per_layer;
     }
 
+    pub fn set_prefill_hcs_guard_store_addr(&mut self, store_addr: usize) {
+        self.prefill_hcs_store_addr = store_addr;
+    }
+
+    pub fn clear_prefill_hcs_guard_store_addr(&mut self) {
+        self.prefill_hcs_store_addr = 0;
+    }
+
     /// Check if an expert is GPU-resident in HCS.
     /// Returns Some((w13_packed, w13_scales, w2_packed, w2_scales)) if resident.
     /// During prefill, surviving HCS experts (not evicted for scratch) are used
@@ -826,6 +837,38 @@ impl PrefillEngine {
         } else {
             None
         }
+    }
+
+    fn run_prefill_chunk_hcs_guard(
+        &mut self,
+        chunk_tokens: usize,
+        chunk_idx: usize,
+        total_chunks: usize,
+    ) -> Result<(), String> {
+        if self.prefill_hcs_store_addr == 0 {
+            return Ok(());
+        }
+
+        let (evicted, freed_mb, cache_fast_snapshot, num_experts_per_layer) = unsafe {
+            let store = &mut *(self.prefill_hcs_store_addr as *mut crate::gpu_decode::GpuDecodeStore);
+            let (evicted, freed_mb) = store.hcs_evict_for_prefill(chunk_tokens);
+            let (cache_fast, ne) = store.export_hcs_snapshot();
+            (evicted, freed_mb, cache_fast.to_vec(), ne)
+        };
+        self.update_hcs_snapshot(&cache_fast_snapshot, num_experts_per_layer);
+
+        if evicted > 0 && stderr_debug_enabled() {
+            eprintln!(
+                "[PREFILL] Chunk guard {}/{}: evicted {} HCS experts ({:.1} MB) for {}-token chunk",
+                chunk_idx + 1,
+                total_chunks,
+                evicted,
+                freed_mb,
+                chunk_tokens,
+            );
+        }
+
+        Ok(())
     }
 
     /// Run the full prefill pipeline with token chunking.
@@ -1380,6 +1423,8 @@ impl PrefillEngine {
             if m > self.scratch.max_tokens {
                 return Err(format!("Chunk {} tokens > scratch {}", m, self.scratch.max_tokens));
             }
+
+            self.run_prefill_chunk_hcs_guard(m, chunk_idx, num_chunks)?;
 
             // 1. Upload token IDs and positions for this chunk
             let tc0 = Instant::now();

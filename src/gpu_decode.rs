@@ -2197,14 +2197,17 @@ impl GpuDecodeStore {
 
             let kv_overflow = prompt_len > engine.kv_max_seq;
             engine.update_hcs_snapshot(&cache_fast_snapshot, ne);
+            engine.set_prefill_hcs_guard_store_addr(self as *mut Self as usize);
 
-            engine
-                .prepare_for_prefill(prompt_len)
-                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            if let Err(e) = engine.prepare_for_prefill(prompt_len) {
+                engine.clear_prefill_hcs_guard_store_addr();
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
+            }
 
             let prefill_result = match engine.run_prefill(&token_ids, temperature, &[]) {
                 Ok(r) => r,
                 Err(e) => {
+                    engine.clear_prefill_hcs_guard_store_addr();
                     let _ = engine.release_scratch();
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
                 }
@@ -2213,6 +2216,7 @@ impl GpuDecodeStore {
             if let Err(e) = engine.release_scratch() {
                 log::error!("rust_prefill_tokens: failed to release scratch: {}", e);
             }
+            engine.clear_prefill_hcs_guard_store_addr();
 
             (
                 prefill_result.first_token as usize,
@@ -6852,6 +6856,7 @@ impl GpuDecodeStore {
                 .as_ref()
                 .map(|cal| cal.safety_margin_mb as usize)
                 .unwrap_or(crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB),
+            prefill_hcs_store_addr: 0,
         })
     }
 
