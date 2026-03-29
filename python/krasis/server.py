@@ -522,10 +522,11 @@ def main():
                             config_defaults[dest] = float(val)
                         except ValueError:
                             config_defaults[dest] = val
-        # Migrate legacy naive int4/int8 attention to AWQ
         if config_defaults.get("attention_quant") in ("int4", "int8"):
-            print(f"Migrating attention_quant={config_defaults['attention_quant']} → awq (naive int4/int8 removed)")
-            config_defaults["attention_quant"] = "awq"
+            raise ValueError(
+                f"Unsupported attention_quant={config_defaults['attention_quant']} in {config_path}. "
+                "Naive int4/int8 attention has been removed; use 'awq' or 'bf16'."
+            )
         # Expand ~ in model_path
         if "model_path" in config_defaults and isinstance(config_defaults["model_path"], str):
             config_defaults["model_path"] = os.path.expanduser(config_defaults["model_path"])

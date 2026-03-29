@@ -944,6 +944,11 @@ fn handle_prefill_logits(
 
     log::info!("prefill_logits: {} tokens, top_k={}, sample_every={}", token_ids.len(), top_k, sample_every);
 
+    // Evict soft HCS before diagnostic prefill so this endpoint uses the same
+    // conservative VRAM budget as the production and reference-test paths.
+    let store_for_evict = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+    let (_evicted, _freed_mb) = store_for_evict.hcs_evict_for_prefill(token_ids.len());
+
     // Run prefill logits extraction
     let mut engine_guard = state.rust_prefill.lock().unwrap();
     let engine = match engine_guard.as_mut() {
@@ -981,6 +986,9 @@ fn handle_prefill_logits(
         Err(e) => {
             // Release scratch even on error
             let _ = engine.release_scratch();
+            let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+            let _ = store.hcs_reload_after_prefill_async(token_ids.len());
+            let _ = store.hcs_sync_soft_reload();
             let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill logits: {}"}}"#, e));
             return;
         }
@@ -990,6 +998,12 @@ fn handle_prefill_logits(
     if let Err(e) = engine.release_scratch() {
         log::error!("Failed to release scratch after prefill_logits: {}", e);
     }
+
+    // Restore evicted soft HCS so the next decode/reference request starts
+    // from the normal steady-state cache residency.
+    let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+    let _ = store.hcs_reload_after_prefill_async(token_ids.len());
+    let _ = store.hcs_sync_soft_reload();
 
     // Format response: {positions: [{position, top_k: [{token_id, logprob}]}]}
     let mut pos_json = Vec::new();

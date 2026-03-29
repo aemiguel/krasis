@@ -229,13 +229,11 @@ class QuantConfig:
     cpu_expert_bits: int = 4       # 4 or 8 for CPU expert quantization
 
     def __post_init__(self):
-        # Migrate legacy naive int4/int8 attention to AWQ
         if self.attention in ("int4", "int8"):
-            import warnings
-            warnings.warn(
-                f"Naive attention quant '{self.attention}' is deprecated, migrating to 'awq'",
-                DeprecationWarning, stacklevel=2)
-            self.attention = "awq"
+            raise ValueError(
+                f"Unsupported attention quant '{self.attention}'. "
+                "Naive int4/int8 attention has been removed; use 'awq' or 'bf16'."
+            )
 
 
 @dataclass

@@ -456,9 +456,11 @@ class LauncherConfig:
                 pass
         if "CFG_ATTENTION_QUANT" in saved:
             val = saved["CFG_ATTENTION_QUANT"]
-            # Migrate legacy naive int4/int8 to AWQ (calibrated per-tensor)
             if val in ("int4", "int8"):
-                val = "awq"
+                raise ValueError(
+                    f"Unsupported saved CFG_ATTENTION_QUANT={val}. "
+                    "Naive int4/int8 attention has been removed; use awq or bf16."
+                )
             self.attention_quant = val
             self._attention_quant_explicit = True
         if "CFG_SHARED_EXPERT_QUANT" in saved:
@@ -633,7 +635,7 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
 
     if config_key in ("attention_quant", "shared_expert_quant",
                       "dense_mlp_quant", "lm_head_quant"):
-        current = str(current_val)  # "int8", "int4", "bf16", or "awq"
+        current = str(current_val)  # "int8"/"int4" for experts, "bf16" or "awq" for attention
         if current == native_label or current == native_dtype:
             return f"{DIM}{native_label} \u2192 {current} \u2014 lossless{NC}"
         elif current == "int8":
@@ -1674,7 +1676,10 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
     if args.attention_quant is not None:
         val = args.attention_quant
         if val in ("int4", "int8"):
-            val = "awq"
+            raise ValueError(
+                f"Unsupported --attention-quant {val}. "
+                "Naive int4/int8 attention has been removed; use awq or bf16."
+            )
         cfg.attention_quant = val
         cfg._attention_quant_explicit = True
     if args.shared_expert_quant is not None:
