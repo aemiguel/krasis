@@ -40,8 +40,10 @@ jobs:
 
       - name: Inject vendored sidecars into wheels
         run: |
-          MARLIN_SO=$(find target/release/build -path '*/out/libkrasis_marlin.so' | head -n 1)
-          FLASH_ATTN_SO=$(find target/release/build -path '*/out/libkrasis_flash_attn.so' | head -n 1)
+          MARLIN_SO=$(find . -path '*/libkrasis_marlin.so' | grep -v '/dist/' | head -n 1)
+          FLASH_ATTN_SO=$(find . -path '*/libkrasis_flash_attn.so' | grep -v '/dist/' | head -n 1)
+          test -n "$MARLIN_SO"
+          test -n "$FLASH_ATTN_SO"
           python3 scripts/inject_wheel_sidecars.py \
             --wheel-dir dist \
             --marlin "$MARLIN_SO" \
