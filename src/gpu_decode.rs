@@ -202,6 +202,7 @@ impl PrefetchSlot {
 
 /// Four-point VRAM calibration data from startup measurements.
 /// Used to interpolate expected free VRAM at any prompt length.
+#[derive(Clone, Copy)]
 struct VramCalibration {
     short_tokens: usize,
     long_tokens: usize,
@@ -583,6 +584,46 @@ impl HcsState {
         let offset = slot % spc;
         let base = *self.soft_chunks[chunk_idx].device_ptr();
         base + (offset as u64 * self.soft_slot_size as u64)
+    }
+
+    /// Drop loaded soft chunks down to target_chunks, freeing VRAM and clearing cache entries.
+    fn trim_soft_chunks_to(&mut self, target_chunks: usize) -> (usize, usize) {
+        if target_chunks >= self.soft_chunks_loaded {
+            return (0, 0);
+        }
+
+        let spc = self.soft_slots_per_chunk;
+        let mut evicted = 0usize;
+        let mut freed_bytes = 0usize;
+
+        for drop_idx in target_chunks..self.soft_chunks_loaded {
+            let slots_this = if drop_idx == self.soft_total_chunks.saturating_sub(1) {
+                self.soft_num_slots.saturating_sub(drop_idx * spc)
+            } else {
+                spc
+            };
+            freed_bytes += slots_this * self.soft_slot_size;
+
+            let slot_start = drop_idx * spc;
+            let slot_end = std::cmp::min(slot_start + spc, self.soft_num_slots);
+            for slot in slot_start..slot_end {
+                if let Some((layer_idx, expert_idx)) = self.soft_slot_to_expert[slot].take() {
+                    self.cache_fast_clear(layer_idx, expert_idx);
+                    if self.cache.remove(&(layer_idx, expert_idx)).is_some() {
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+
+        self.soft_chunks.truncate(target_chunks);
+        self.soft_chunks_loaded = target_chunks;
+        self.soft_num_cached = self.soft_num_cached.saturating_sub(evicted);
+        self.num_cached = self.num_cached.saturating_sub(evicted);
+        self.vram_bytes = self.vram_bytes.saturating_sub(freed_bytes);
+        self.soft_loaded = self.soft_chunks_loaded == self.soft_total_chunks;
+
+        (evicted, freed_bytes)
     }
 
     /// Check if a specific (layer, expert) is cached in VRAM.
@@ -5240,6 +5281,11 @@ impl GpuDecodeStore {
         self.device.ordinal()
     }
 
+    /// Return the min free VRAM (MB) recorded by the most recent batch/stream decode run.
+    fn get_last_min_free_vram_mb(&self) -> usize {
+        self.last_min_free_vram_mb
+    }
+
     /// Run a single GPU decode step (for testing). Fills d_hidden and h_logits.
     fn py_gpu_decode_step(&mut self, token_id: usize, position: usize) -> PyResult<()> {
         self.gpu_decode_step(token_id, position)
@@ -5285,12 +5331,29 @@ impl GpuDecodeStore {
         seen_tokens.insert(first_token);
 
         let decode_start = std::time::Instant::now();
+        let mut min_vram_free_bytes: usize = usize::MAX;
+
+        {
+            let mut free: usize = 0;
+            let mut _total: usize = 0;
+            unsafe { let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
+            if free < min_vram_free_bytes {
+                min_vram_free_bytes = free;
+            }
+        }
 
         for step in 0..max_tokens {
             let pos = start_position + step;
             self.gpu_decode_step(next_token, pos)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("gpu_decode_step error: {}", e)))?;
+
+            let mut free: usize = 0;
+            let mut _total: usize = 0;
+            unsafe { let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
+            if free < min_vram_free_bytes {
+                min_vram_free_bytes = free;
+            }
 
             let logits = &mut self.graph.as_mut().unwrap().h_logits;
             if presence_penalty != 0.0 {
@@ -5340,6 +5403,9 @@ impl GpuDecodeStore {
             let tps = tokens.len() as f64 / elapsed;
             log::info!("gpu_generate_batch: {} tokens in {:.2}s ({:.1} tok/s)",
                 tokens.len(), elapsed, tps);
+        }
+        if min_vram_free_bytes < usize::MAX {
+            self.last_min_free_vram_mb = min_vram_free_bytes / (1024 * 1024);
         }
         self.last_decode_elapsed = elapsed;
 
@@ -13348,6 +13414,7 @@ impl GpuDecodeStore {
     /// instead of 4 calls per expert (e.g. 22 calls instead of 55,000).
     /// Returns (loaded_count, reload_ms).
     pub fn hcs_reload_after_prefill(&mut self, actual_tokens: usize) -> (usize, f64) {
+        let cal = self.vram_calibration;
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
@@ -13357,7 +13424,7 @@ impl GpuDecodeStore {
             None => return (0, 0.0),
         };
 
-        if hcs.soft_loaded || hcs.soft_ranking.is_empty() {
+        if hcs.soft_ranking.is_empty() {
             return (0, 0.0);
         }
 
@@ -13367,11 +13434,36 @@ impl GpuDecodeStore {
         }
 
         let spc = hcs.soft_slots_per_chunk;
-        let target_chunks = hcs.soft_total_chunks;
-        let already_loaded = hcs.soft_chunks_loaded;
+        let decode_budget_mb = cal.map(|cal| cal.decode_hcs_budget_mb(actual_tokens) as usize)
+            .unwrap_or(hcs.hard_budget_mb + hcs.soft_max_mb);
+        let target_soft_mb = decode_budget_mb
+            .saturating_sub(hcs.hard_budget_mb)
+            .min(hcs.soft_max_mb);
+        let target_soft_bytes = target_soft_mb.saturating_mul(1024 * 1024);
+        let target_soft_slots = (target_soft_bytes / slot_size).min(hcs.soft_num_slots);
+        let target_chunks = if target_soft_slots >= hcs.soft_num_slots {
+            hcs.soft_total_chunks
+        } else {
+            target_soft_slots / spc
+        };
 
+        if hcs.soft_chunks_loaded > target_chunks {
+            let (evicted, freed_bytes) = hcs.trim_soft_chunks_to(target_chunks);
+            if evicted > 0 || freed_bytes > 0 {
+                log::info!(
+                    "HCS soft reload: trimmed to {} chunks for {} tokens (budget={} MB, evicted {} experts, freed {:.1} MB)",
+                    target_chunks,
+                    actual_tokens,
+                    target_soft_mb,
+                    evicted,
+                    freed_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+        }
+
+        let already_loaded = hcs.soft_chunks_loaded;
         if already_loaded >= target_chunks {
-            hcs.soft_loaded = true;
+            hcs.soft_loaded = hcs.soft_chunks_loaded == hcs.soft_total_chunks;
             return (0, 0.0);
         }
 
@@ -13462,7 +13554,7 @@ impl GpuDecodeStore {
         }
 
         hcs.soft_num_cached += loaded;
-        hcs.soft_loaded = hcs.soft_chunks_loaded == target_chunks;
+        hcs.soft_loaded = hcs.soft_chunks_loaded == hcs.soft_total_chunks;
         hcs.num_cached += loaded;
         hcs.vram_bytes += alloc_bytes;
 
@@ -13488,6 +13580,7 @@ impl GpuDecodeStore {
     /// the soft tier once all DMA finishes.
     /// Returns (num_experts_queued, alloc_mb).
     pub fn hcs_reload_after_prefill_async(&mut self, actual_tokens: usize) -> (usize, f64) {
+        let cal = self.vram_calibration;
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
@@ -13497,7 +13590,7 @@ impl GpuDecodeStore {
             None => return (0, 0.0),
         };
 
-        if hcs.soft_loaded || hcs.soft_ranking.is_empty() || hcs.soft_reload_pending {
+        if hcs.soft_ranking.is_empty() || hcs.soft_reload_pending {
             return (0, 0.0);
         }
 
@@ -13507,11 +13600,36 @@ impl GpuDecodeStore {
         }
 
         let spc = hcs.soft_slots_per_chunk;
-        let target_chunks = hcs.soft_total_chunks;
-        let already_loaded = hcs.soft_chunks_loaded;
+        let decode_budget_mb = cal.map(|cal| cal.decode_hcs_budget_mb(actual_tokens) as usize)
+            .unwrap_or(hcs.hard_budget_mb + hcs.soft_max_mb);
+        let target_soft_mb = decode_budget_mb
+            .saturating_sub(hcs.hard_budget_mb)
+            .min(hcs.soft_max_mb);
+        let target_soft_bytes = target_soft_mb.saturating_mul(1024 * 1024);
+        let target_soft_slots = (target_soft_bytes / slot_size).min(hcs.soft_num_slots);
+        let target_chunks = if target_soft_slots >= hcs.soft_num_slots {
+            hcs.soft_total_chunks
+        } else {
+            target_soft_slots / spc
+        };
 
+        if hcs.soft_chunks_loaded > target_chunks {
+            let (evicted, freed_bytes) = hcs.trim_soft_chunks_to(target_chunks);
+            if evicted > 0 || freed_bytes > 0 {
+                log::info!(
+                    "HCS soft async reload: trimmed to {} chunks for {} tokens (budget={} MB, evicted {} experts, freed {:.1} MB)",
+                    target_chunks,
+                    actual_tokens,
+                    target_soft_mb,
+                    evicted,
+                    freed_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+        }
+
+        let already_loaded = hcs.soft_chunks_loaded;
         if already_loaded >= target_chunks {
-            hcs.soft_loaded = true;
+            hcs.soft_loaded = hcs.soft_chunks_loaded == hcs.soft_total_chunks;
             return (0, 0.0);
         }
 

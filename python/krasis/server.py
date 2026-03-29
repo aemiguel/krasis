@@ -77,12 +77,9 @@ def _warn(text: str) -> None:
 _model: Optional[KrasisModel] = None
 _model_name: str = "unknown"
 
-# Additional steady-state decode reserve on top of the configured safety margin.
-# This is not the user-facing safety margin; it is GPU0 HCS budget headroom for
-# decode-time transient state so resident HCS does not drive decode below the
-# requested floor. Current qcn-a4 measurements put the needed gap at roughly
-# half a gigabyte, so reserve 512 MB rather than the earlier over-conservative 1 GB.
-DECODE_RUNTIME_HEADROOM_MB = 512
+STARTUP_CALIBRATION_SHORT_TOKENS = 500
+STARTUP_CALIBRATION_DECODE_TOKENS = 32
+STARTUP_CALIBRATION_LONG_TOKENS_CAP = 50000
 
 def _start_session_bridge(host: str, port: int) -> Optional[subprocess.Popen]:
     """Start the Session messenger bridge as a subprocess.
@@ -295,6 +292,72 @@ def _load_heatmap_prompts() -> list[str]:
         prompts.append(" ".join(current))
     if not prompts:
         raise ValueError(f"No prompts found in {path}")
+    return prompts
+
+
+def _load_prompt_file(filename: str) -> str:
+    prompts_dir = os.path.join(os.path.dirname(__file__), "prompts")
+    path = os.path.join(prompts_dir, filename)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+    with open(path) as f:
+        return f.read().strip()
+
+
+def _discover_prefill_prompt_files() -> list[str]:
+    files = []
+    for i in range(1, 100):
+        filename = f"prefill_prompt_{i}"
+        prompts_dir = os.path.join(os.path.dirname(__file__), "prompts")
+        if os.path.isfile(os.path.join(prompts_dir, filename)):
+            files.append(filename)
+        else:
+            break
+    if not files:
+        raise FileNotFoundError(
+            "No prefill prompt files found. Expected prefill_prompt_1, prefill_prompt_2, etc."
+        )
+    return files
+
+
+def _truncate_content_to_prompt_tokens(model: KrasisModel, content: str, max_tokens: int) -> tuple[str, list[int]]:
+    tokens = _chat_prompt_tokens(model, content)
+    if len(tokens) <= max_tokens:
+        return content, tokens
+
+    lo, hi = 0, len(content)
+    best_content = ""
+    best_tokens: list[int] = []
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        trial = content[:mid]
+        trial_tokens = _chat_prompt_tokens(model, trial)
+        if len(trial_tokens) <= max_tokens:
+            best_content = trial
+            best_tokens = trial_tokens
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best_content, best_tokens
+
+
+def _kv_cache_max_tokens(model: KrasisModel) -> int:
+    for cache in getattr(model, "kv_caches", []):
+        if cache is not None:
+            return cache.max_pages * cache.page_size
+    return model.cfg.max_position_embeddings
+
+
+def _make_startup_calibration_prompts(model: KrasisModel, lengths: list[int]) -> list[list[int]]:
+    files = _discover_prefill_prompt_files()
+    kv_limit = max(1, min(_kv_cache_max_tokens(model), model.cfg.max_position_embeddings) - 100)
+    prompts: list[list[int]] = []
+    for i, target in enumerate(lengths):
+        content = _load_prompt_file(files[i % len(files)])
+        _, tokens = _truncate_content_to_prompt_tokens(model, content, min(target, kv_limit))
+        if not tokens:
+            raise RuntimeError(f"Startup calibration prompt {files[i % len(files)]} produced no tokens")
+        prompts.append(tokens)
     return prompts
 
 
@@ -910,28 +973,86 @@ def main():
             idx, warmup_peak_used, warmup_min_free, total,
         )
 
-    # ── Phase 2: VRAM budget measurement ──
-    # With dynamic per-prompt scratch allocation, scratch is minimal at init and
-    # grows before each prefill (then freed after). GPU0 HCS is now treated as
-    # fully reclaimable during prefill: decode uses as much resident HCS as fits
-    # under the runtime reserve, and prefill evicts from that pool as needed.
-    # The max scratch reservation is still measured for observability and for the
-    # synthetic calibration data passed into Rust, but it no longer carves out a
-    # protected "hard" HCS tier on the primary GPU.
+    # ── Phase 2: VRAM calibration ──
+    # Measure real short/long prefill and decode VRAM minima with no HCS loaded,
+    # then apply those transient deltas to the current post-calibration free VRAM.
+    # This restores the measured decode model and avoids guessed headroom values.
     dev_idx = devices[0].index
     import torch
 
-    _status("VRAM budget measurement")
+    _status("VRAM calibration")
     vram_monitor.report_event("calibration_start")
     _detail(f"Safety margin: {SAFETY_MARGIN_MB:,} MB")
-    _detail(f"Decode runtime reserve: {DECODE_RUNTIME_HEADROOM_MB:,} MB")
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
     _free_mb = torch.cuda.mem_get_info(dev_idx)[0] // (1024 * 1024)
     _total_mb = torch.cuda.mem_get_info(dev_idx)[1] // (1024 * 1024)
     _detail(f"Free VRAM after startup: {_free_mb:,} MB / {_total_mb:,} MB")
-    logger.info("VRAM budget: free=%d MB, total=%d MB", _free_mb, _total_mb)
+    logger.info("VRAM calibration baseline: free=%d MB, total=%d MB", _free_mb, _total_mb)
+
+    max_calibration_tokens = max(1, min(
+        _kv_cache_max_tokens(_model),
+        _model.cfg.max_position_embeddings,
+        STARTUP_CALIBRATION_LONG_TOKENS_CAP,
+    ) - 100)
+    short_target = min(STARTUP_CALIBRATION_SHORT_TOKENS, max_calibration_tokens)
+    long_target = max(short_target, min(max_calibration_tokens, int(max_calibration_tokens * 0.8)))
+    calibration_prompts = _make_startup_calibration_prompts(_model, [short_target, long_target])
+    calibration_stop_ids: list[int] = []
+
+    def _measure_vram_probe(label: str, prompt_tokens: list[int]) -> tuple[int, int, int, int]:
+        _detail(f"{label}: probing {len(prompt_tokens):,} prompt tokens + {STARTUP_CALIBRATION_DECODE_TOKENS} decode tokens")
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        _model.server_cleanup()
+        time.sleep(0.1)
+
+        baseline_free = int(vram_monitor.current_free_mb(dev_idx))
+
+        vram_monitor.reset_min_free()
+        first_token, prompt_len, kv_overflow = gpu_store.rust_prefill_tokens(prompt_tokens, temperature=0.0)
+        torch.cuda.synchronize()
+        time.sleep(0.1)
+        prefill_min_free = int(vram_monitor.min_free_mb(dev_idx))
+        if kv_overflow:
+            _model.server_cleanup()
+            raise RuntimeError(f"{label} VRAM calibration overflowed KV cache at {prompt_len:,} tokens")
+
+        vram_monitor.reset_min_free()
+        gpu_store.gpu_generate_batch(
+            first_token=first_token,
+            start_position=prompt_len,
+            max_tokens=STARTUP_CALIBRATION_DECODE_TOKENS,
+            temperature=0.0,
+            top_k=1,
+            top_p=1.0,
+            stop_ids=calibration_stop_ids,
+            presence_penalty=0.0,
+        )
+        torch.cuda.synchronize()
+        time.sleep(0.1)
+        decode_min_free = int(gpu_store.get_last_min_free_vram_mb())
+
+        _model.server_cleanup()
+        torch.cuda.synchronize()
+        time.sleep(0.1)
+        post_cleanup_free = int(vram_monitor.current_free_mb(dev_idx))
+
+        _detail(
+            f"{label}: baseline={baseline_free:,} MB, "
+            f"prefill min={prefill_min_free:,} MB, decode min={decode_min_free:,} MB, "
+            f"post-cleanup={post_cleanup_free:,} MB"
+        )
+        return prompt_len, baseline_free, prefill_min_free, decode_min_free
+
+    short_tokens, short_baseline_free, short_prefill_min, short_decode_min = _measure_vram_probe(
+        "Short calibration", calibration_prompts[0]
+    )
+    long_tokens, long_baseline_free, long_prefill_min, long_decode_min = _measure_vram_probe(
+        "Long calibration", calibration_prompts[1]
+    )
 
     # Compute max scratch: worst case prompt (50K tokens).
     # This determines how much VRAM prefill can claim via soft eviction.
@@ -939,32 +1060,42 @@ def main():
     max_scratch_mb = gpu_store.prefill_scratch_reservation_mb(max_scratch_tokens)
     _detail(f"Scratch reservation: max={max_scratch_mb:,} MB (at {max_scratch_tokens:,} tokens)")
 
-    # GPU0 steady-state decode budget is free VRAM minus the configured safety
-    # margin and a smaller decode-only transient reserve. Prefill can reclaim
-    # that resident HCS budget dynamically.
-    total_hcs = max(0, _free_mb - SAFETY_MARGIN_MB - DECODE_RUNTIME_HEADROOM_MB)
-    reclaimable_hcs_budget = total_hcs
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    _model.server_cleanup()
+    time.sleep(0.1)
+    post_calibration_free_mb = int(vram_monitor.current_free_mb(dev_idx))
 
-    # Pass synthetic calibration to Rust.
-    short_tokens = 500
-    long_tokens = max_scratch_tokens
-    # Synthetic calibration keeps only the true safety margin as prefill-free
-    # space so Rust's legacy hard/soft diagnostic string resolves to hard=0 on
-    # GPU0.
-    prefill_free = SAFETY_MARGIN_MB
-    # Decode keeps reclaimable HCS resident above the safety margin.
-    decode_free = reclaimable_hcs_budget + SAFETY_MARGIN_MB
-    prefill_short_free = prefill_free
-    prefill_long_free = prefill_free
-    decode_short_free = decode_free
-    decode_long_free = decode_free
+    short_prefill_delta = max(0, short_baseline_free - short_prefill_min)
+    long_prefill_delta = max(0, long_baseline_free - long_prefill_min)
+    short_decode_delta = max(0, short_baseline_free - short_decode_min)
+    long_decode_delta = max(0, long_baseline_free - long_decode_min)
+
+    prefill_short_free = max(0, post_calibration_free_mb - short_prefill_delta)
+    prefill_long_free = max(0, post_calibration_free_mb - long_prefill_delta)
+    decode_short_free = max(0, post_calibration_free_mb - short_decode_delta)
+    decode_long_free = max(0, post_calibration_free_mb - long_decode_delta)
+
+    # GPU0 HCS is fully reclaimable. Load as much as measured short-prompt decode
+    # can hold above the safety margin; longer prompts are handled by measured
+    # per-request soft reload limits in Rust.
+    reclaimable_hcs_budget = max(0, decode_short_free - SAFETY_MARGIN_MB)
 
     vram_monitor.report_event("calibration_end")
-    _status("VRAM budget complete")
+    _status("VRAM calibration complete")
+    _detail(f"Post-calibration free VRAM: {post_calibration_free_mb:,} MB")
+    _detail(
+        f"Transient deltas: short prefill={short_prefill_delta:,} MB, "
+        f"long prefill={long_prefill_delta:,} MB, short decode={short_decode_delta:,} MB, "
+        f"long decode={long_decode_delta:,} MB"
+    )
     _detail(f"GPU0 reclaimable HCS budget: {reclaimable_hcs_budget:,} MB")
     _detail(f"Worst-case prefill scratch reservation: {max_scratch_mb:,} MB at {max_scratch_tokens:,} tokens")
-    logger.info("VRAM budget: gpu0_reclaimable=%d MB, free=%d MB, max_scratch=%d MB",
-                reclaimable_hcs_budget, _free_mb, max_scratch_mb)
+    logger.info(
+        "VRAM calibration: post_free=%d MB, short=%dtok, long=%dtok, gpu0_reclaimable=%d MB, max_scratch=%d MB",
+        post_calibration_free_mb, short_tokens, long_tokens, reclaimable_hcs_budget, max_scratch_mb,
+    )
 
     # ── Pre-compute multi-GPU layer splits (before HCS, so we can filter rankings) ──
     # Splits are based on total HCS budget (hard+soft) on each GPU, so layers
