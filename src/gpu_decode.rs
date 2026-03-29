@@ -251,6 +251,13 @@ impl VramCalibration {
         self.prefill_free_mb(tokens).saturating_sub(self.safety_margin_mb)
     }
 
+    /// Minimum idle free VRAM required while HCS is resident so the measured
+    /// prefill transient still leaves the configured safety margin.
+    fn required_prefill_idle_free_mb(&self, tokens: usize) -> u64 {
+        self.baseline_free_mb
+            .saturating_sub(self.prefill_hcs_budget_mb(tokens))
+    }
+
     /// Max HCS budget for decode after prefill of N tokens.
     fn decode_hcs_budget_mb(&self, tokens: usize) -> u64 {
         self.decode_free_mb(tokens).saturating_sub(self.safety_margin_mb)
@@ -4405,22 +4412,32 @@ impl GpuDecodeStore {
                 / (long_tokens - short_tokens) as f64) * 1024.0
         } else { 0.0 };
 
+        let short_prefill_budget = cal.prefill_hcs_budget_mb(short_tokens);
+        let long_prefill_budget = cal.prefill_hcs_budget_mb(long_tokens);
         let short_decode_budget = cal.decode_hcs_budget_mb(short_tokens);
         let long_decode_budget = cal.decode_hcs_budget_mb(long_tokens);
+        let short_prefill_idle_floor = cal.required_prefill_idle_free_mb(short_tokens);
         let short_idle_floor = cal.required_idle_free_mb(short_tokens);
 
         let msg = format!(
             "VRAM calibration: baseline {} MB | prefill {:.1} KB/tok, decode {:.1} KB/tok | \
-             HCS allowance: short {} MB, long {} MB | idle floor: {} MB",
+             HCS allowance prefill: short {} MB, long {} MB | decode: short {} MB, long {} MB | \
+             idle floors prefill={} MB decode={} MB",
             baseline_free_mb,
             prefill_kb_per_tok, decode_kb_per_tok,
-            short_decode_budget, long_decode_budget, short_idle_floor,
+            short_prefill_budget, long_prefill_budget,
+            short_decode_budget, long_decode_budget,
+            short_prefill_idle_floor, short_idle_floor,
         );
         log::info!("{}", msg);
         log::info!("  prefill: short={}tok/{}MB, long={}tok/{}MB",
             short_tokens, prefill_short_free_mb, long_tokens, prefill_long_free_mb);
         log::info!("  decode:  short={}tok/{}MB, long={}tok/{}MB",
             short_tokens, decode_short_free_mb, long_tokens, decode_long_free_mb);
+        log::info!("  prefill HCS allowance: short={}MB, long={}MB",
+            short_prefill_budget, long_prefill_budget);
+        log::info!("  decode HCS allowance: short={}MB, long={}MB",
+            short_decode_budget, long_decode_budget);
         log::info!("  baseline idle free: {}MB, safety margin: {}MB",
             baseline_free_mb, safety_margin_mb);
 
@@ -13367,6 +13384,7 @@ impl GpuDecodeStore {
         self.last_soft_reload_queued = 0;
         self.last_soft_reload_alloc_mb = 0.0;
         self.last_soft_reload_activated = 0;
+        let cal = self.vram_calibration;
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
@@ -13434,18 +13452,9 @@ impl GpuDecodeStore {
             return (0, 0.0);
         }
 
-        // Compute scratch needed for this prompt (must match prepare_for_prefill sizing).
-        let (scratch_bytes, safety_mb) = if let Some((fixed_bytes, per_token_bytes)) = self.prefill_scratch_info {
-            let capped_tokens = estimated_tokens.max(128).min(50000);
-            let scratch = fixed_bytes + per_token_bytes * capped_tokens;
-            let safety_mb = hcs.safety_margin_mb.max(crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB);
-            (scratch, safety_mb)
-        } else {
-            // No scratch info — must evict everything to be safe
-            (usize::MAX, 0)
-        };
+        let capped_tokens = estimated_tokens.max(128).min(50000);
 
-        // Measure actual free VRAM
+        // Measure actual free VRAM.
         let free_bytes = unsafe {
             let mut free: usize = 0;
             let mut total: usize = 0;
@@ -13454,15 +13463,36 @@ impl GpuDecodeStore {
                 &mut total as *mut usize);
             if err == cuda_sys::CUresult::CUDA_SUCCESS { free } else { 0 }
         };
-        let needed_bytes = scratch_bytes + safety_mb * 1024 * 1024;
+
+        // Primary model: no-HCS prefill calibration tells us how much free VRAM
+        // must remain while HCS is resident so the measured prefill transient still
+        // leaves the configured safety margin.
+        //
+        // Fallback: if calibration is unavailable, use the older scratch estimate.
+        let needed_bytes = if let Some(cal) = cal {
+            cal.required_prefill_idle_free_mb(capped_tokens) as usize * 1024 * 1024
+        } else if let Some((fixed_bytes, per_token_bytes)) = self.prefill_scratch_info {
+            let scratch = fixed_bytes + per_token_bytes * capped_tokens;
+            let safety_mb = hcs.safety_margin_mb.max(crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB);
+            scratch + safety_mb * 1024 * 1024
+        } else {
+            usize::MAX
+        };
 
         if free_bytes >= needed_bytes {
             if stderr_debug_enabled() {
-                eprintln!("  \x1b[32mHCS soft: skip eviction — {:.0} MB free >= {:.0} MB needed\x1b[0m",
-                    free_bytes as f64 / (1024.0 * 1024.0), needed_bytes as f64 / (1024.0 * 1024.0));
+                eprintln!(
+                    "  \x1b[32mHCS soft: skip eviction — {:.0} MB free >= {:.0} MB prefill floor\x1b[0m",
+                    free_bytes as f64 / (1024.0 * 1024.0),
+                    needed_bytes as f64 / (1024.0 * 1024.0)
+                );
             }
-            log::info!("HCS soft: skip eviction — {:.0} MB free >= {:.0} MB needed",
-                free_bytes as f64 / (1024.0 * 1024.0), needed_bytes as f64 / (1024.0 * 1024.0));
+            log::info!(
+                "HCS soft: skip eviction — {:.0} MB free >= {:.0} MB prefill floor for ~{} tokens",
+                free_bytes as f64 / (1024.0 * 1024.0),
+                needed_bytes as f64 / (1024.0 * 1024.0),
+                capped_tokens,
+            );
             return (0, 0.0);
         }
 
