@@ -77,6 +77,14 @@ def _warn(text: str) -> None:
 _model: Optional[KrasisModel] = None
 _model_name: str = "unknown"
 
+# Additional VRAM headroom reserved on top of SAFETY_MARGIN_MB before loading HCS.
+# The calibrated safety margin covers allocator fragmentation and kernel workspace,
+# but live qcn-a4 production benchmarks still consume roughly another ~0.9 GB of
+# request-time decode/prefill overhead (CUDA graph replay, transient decode state,
+# and first-request runtime allocations). Reserve 1 GB so HCS does not load right
+# up to the wall and then collapse below the configured margin during requests.
+REQUEST_RUNTIME_HEADROOM_MB = 1024
+
 
 def _start_session_bridge(host: str, port: int) -> Optional[subprocess.Popen]:
     """Start the Session messenger bridge as a subprocess.
@@ -914,6 +922,7 @@ def main():
     _status("VRAM budget measurement")
     vram_monitor.report_event("calibration_start")
     _detail(f"Safety margin: {SAFETY_MARGIN_MB:,} MB")
+    _detail(f"Runtime request headroom: {REQUEST_RUNTIME_HEADROOM_MB:,} MB")
 
     torch.cuda.synchronize()
     gc.collect()
@@ -930,23 +939,26 @@ def main():
     _detail(f"Scratch reservation: max={max_scratch_mb:,} MB (at {max_scratch_tokens:,} tokens)")
 
     # Two constraints determine the budget:
-    # 1. Decode needs SAFETY_MARGIN_MB free (CUDA overhead, kernel intermediates)
-    # 2. Worst-case prefill needs max_scratch + safety free, sourced from evicting soft
-    #    => hard must survive alongside max_scratch + safety
-    # Total HCS = free - safety (maximize expert coverage during decode).
-    # Hard = free - max_scratch - safety (permanent, survives worst-case prefill).
+    # 1. Live requests need SAFETY_MARGIN_MB plus additional request-time headroom
+    #    for decode/prefill transients (CUDA graphs, replay scratch, runtime growth)
+    # 2. Worst-case prefill needs max_scratch plus that same reserved headroom,
+    #    sourced from evicting soft HCS before prefill
+    #    => hard must survive alongside max_scratch + reserve
+    # Total HCS = free - reserve.
+    # Hard = free - max_scratch - reserve (permanent, survives worst-case prefill).
     # Soft = total - hard (evictable proportionally via chunked pool).
-    total_hcs = max(0, _free_mb - SAFETY_MARGIN_MB)
-    hard_budget = max(0, _free_mb - max_scratch_mb - SAFETY_MARGIN_MB)
+    runtime_reserve_mb = SAFETY_MARGIN_MB + REQUEST_RUNTIME_HEADROOM_MB
+    total_hcs = max(0, _free_mb - runtime_reserve_mb)
+    hard_budget = max(0, _free_mb - max_scratch_mb - runtime_reserve_mb)
     soft_budget = total_hcs - hard_budget
 
     # Pass calibration to Rust. Hard budget is small (permanent). Soft is the scratch area.
     short_tokens = 500
     long_tokens = max_scratch_tokens
     # During prefill: free VRAM = hard_budget + safety (soft evicted, scratch allocated)
-    prefill_free = hard_budget + SAFETY_MARGIN_MB
-    # During decode: free VRAM = hard_budget + soft_budget + safety (scratch released)
-    decode_free = _free_mb
+    prefill_free = hard_budget + runtime_reserve_mb
+    # During decode: free VRAM = hard_budget + soft_budget + runtime reserve
+    decode_free = hard_budget + soft_budget + runtime_reserve_mb
     prefill_short_free = prefill_free
     prefill_long_free = prefill_free
     decode_short_free = decode_free

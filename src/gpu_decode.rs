@@ -4368,6 +4368,9 @@ impl GpuDecodeStore {
         log::info!("  decode:  short={}tok/{}MB, long={}tok/{}MB",
             short_tokens, decode_short_free_mb, long_tokens, decode_long_free_mb);
 
+        if let Some(engine) = self.prefill_engine_slot.as_mut() {
+            engine.set_safety_margin_mb(safety_margin_mb as usize);
+        }
         self.vram_calibration = Some(cal);
         Ok(msg)
     }
@@ -6631,6 +6634,10 @@ impl GpuDecodeStore {
             d_fla_final_state: None,
             d_fla_v_new: None,
             d_fla_o: None,
+            safety_margin_mb: self.vram_calibration
+                .as_ref()
+                .map(|cal| cal.safety_margin_mb as usize)
+                .unwrap_or(crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB),
         })
     }
 
@@ -13234,7 +13241,8 @@ impl GpuDecodeStore {
         let (scratch_bytes, safety_mb) = if let Some((fixed_bytes, per_token_bytes)) = self.prefill_scratch_info {
             let capped_tokens = estimated_tokens.max(128).min(50000);
             let scratch = fixed_bytes + per_token_bytes * capped_tokens;
-            (scratch, crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB)
+            let safety_mb = hcs.safety_margin_mb.max(crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB);
+            (scratch, safety_mb)
         } else {
             // No scratch info — must evict everything to be safe
             (usize::MAX, 0)

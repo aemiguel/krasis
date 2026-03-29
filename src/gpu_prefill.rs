@@ -778,6 +778,8 @@ pub struct PrefillEngine {
     pub d_fla_final_state: Option<CudaSlice<f32>>,  // [B, H, K, V] FP32 final state
     pub d_fla_v_new: Option<CudaSlice<u16>>,      // [B, T, H, V] BF16 corrected values
     pub d_fla_o: Option<CudaSlice<u16>>,          // [B, T, H, V] BF16 output
+    /// Runtime-configured VRAM reserve for dynamic prefill scratch sizing.
+    pub safety_margin_mb: usize,
 }
 
 /// Double-buffer BF16 attention weight streaming buffers.
@@ -796,6 +798,10 @@ unsafe impl Send for PrefillEngine {}
 unsafe impl Sync for PrefillEngine {}
 
 impl PrefillEngine {
+    pub fn set_safety_margin_mb(&mut self, margin_mb: usize) {
+        self.safety_margin_mb = margin_mb.max(PREFILL_SAFETY_MARGIN_MB);
+    }
+
     /// Update HCS snapshot from the decode store's current HCS state.
     /// Must be called before each prefill so we know which experts are GPU-resident.
     pub fn update_hcs_snapshot(&mut self, cache_fast: &[[u64; 4]], num_experts_per_layer: usize) {
@@ -1022,7 +1028,8 @@ impl PrefillEngine {
         unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free_bytes, &mut total_bytes); }
         // Safety margin covers CUDA context overhead, allocator fragmentation, and
         // FLA Triton kernel temporaries. 600 MB is sufficient based on runtime measurements.
-        let safety_bytes: usize = PREFILL_SAFETY_MARGIN_MB * 1024 * 1024;
+        let safety_margin_mb = self.safety_margin_mb.max(PREFILL_SAFETY_MARGIN_MB);
+        let safety_bytes: usize = safety_margin_mb * 1024 * 1024;
 
         let usable = free_bytes.saturating_sub(safety_bytes).saturating_sub(fixed_bytes);
         let max_by_vram = if per_token_bytes > 0 { usable / per_token_bytes } else { 50000 };
@@ -1092,7 +1099,7 @@ impl PrefillEngine {
         if scratch_tokens != old_tokens {
             if stderr_debug_enabled() {
                 eprintln!("[PREFILL] Dynamic scratch: {} tokens ({:.0} MB) for {}-token prompt ({} MB safety, {:.0} MB free)",
-                    scratch_tokens, scratch_mb, prompt_tokens, PREFILL_SAFETY_MARGIN_MB,
+                    scratch_tokens, scratch_mb, prompt_tokens, safety_margin_mb,
                     free_bytes as f64 / (1024.0 * 1024.0));
             }
         }
