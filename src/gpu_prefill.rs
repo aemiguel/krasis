@@ -1122,6 +1122,15 @@ impl PrefillEngine {
         self.d_cold_staging = None;
         self.d_shared_fp32_scratch = None;
         self.d_shared_workspace = None;
+        self.d_fla_g_cumsum = None;
+        self.d_fla_a = None;
+        self.d_fla_ai = None;
+        self.d_fla_w = None;
+        self.d_fla_u = None;
+        self.d_fla_h = None;
+        self.d_fla_final_state = None;
+        self.d_fla_v_new = None;
+        self.d_fla_o = None;
         // Trim cudarc's memory pool so freed memory returns to the OS immediately.
         // Without this, cudarc holds the freed cold_staging/shared_scratch in its pool,
         // and HCS reload can't use that VRAM.

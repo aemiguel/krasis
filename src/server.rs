@@ -2174,6 +2174,51 @@ impl RustServer {
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         crate::vram_monitor::report_event("prefill_end");
 
+        if kv_overflow || max_new_tokens <= 1 {
+            self.py_model.call_method0(py, "server_cleanup")?;
+
+            let prefill_tok_s = if prefill_ms > 0.0 {
+                prompt_len as f64 / (prefill_ms / 1000.0)
+            } else {
+                0.0
+            };
+            let (min_free_vram_mb, mut hcs_loaded, mut hcs_total, _) = store.benchmark_stats();
+            let safety_margin_mb = store.hcs_safety_margin_mb();
+            if !self.aux_gpu_store_addrs.is_empty() {
+                log::info!("  GPU0: min_free={} MB, HCS {} loaded", min_free_vram_mb, hcs_loaded);
+            }
+            for (i, &aux_addr) in self.aux_gpu_store_addrs.iter().enumerate() {
+                let aux_store = unsafe { &*(aux_addr as *const GpuDecodeStore) };
+                let (aux_min_free, aux_loaded, aux_total, aux_pct) = aux_store.benchmark_stats();
+                hcs_loaded += aux_loaded;
+                hcs_total += aux_total;
+                if !self.aux_gpu_store_addrs.is_empty() {
+                    log::info!("  GPU{}: min_free={} MB, HCS {}/{} ({:.1}%)",
+                        i + 1, aux_min_free, aux_loaded, aux_total, aux_pct);
+                }
+            }
+            let hcs_pct = if hcs_total > 0 { hcs_loaded as f64 / hcs_total as f64 * 100.0 } else { 0.0 };
+
+            let result = serde_json::json!({
+                "prefill_ms": prefill_ms,
+                "prefill_tok_s": prefill_tok_s,
+                "prompt_tokens": prompt_len,
+                "decode_ms": 0.0,
+                "decode_tok_s": 0.0,
+                "decode_tokens": 1,
+                "evict_ms": evict_ms,
+                "reload_ms": 0.0,
+                "real_reload_dma_ms": 0.0,
+                "min_free_vram_mb": min_free_vram_mb,
+                "hcs_loaded": hcs_loaded,
+                "hcs_total": hcs_total,
+                "hcs_pct": hcs_pct,
+                "safety_margin_mb": safety_margin_mb,
+            });
+
+            return Ok(result.to_string());
+        }
+
         // Reload soft HCS after prefill
         crate::vram_monitor::report_event("hcs_soft_load_start");
         let t_reload = Instant::now();
@@ -2223,58 +2268,54 @@ impl RustServer {
 
         // Decode (pure Rust, GIL held but unused by decode loop)
         crate::vram_monitor::report_event("decode_start");
-        let (decode_ms, decode_tokens, decode_tok_s) = if kv_overflow || max_new_tokens <= 1 {
-            (0.0f64, 1usize, 0.0f64)
+        let decode_start = Instant::now();
+        let mut count = 0usize;
+        if !self.aux_gpu_store_addrs.is_empty() {
+            store.gpu_generate_stream_multi(
+                &self.aux_gpu_store_addrs,
+                &self.multi_gpu_split_layers,
+                &self.multi_gpu_gqa_offsets,
+                first_token,
+                prompt_len,
+                max_new_tokens.saturating_sub(1),
+                temperature,
+                50,     // top_k
+                0.95,   // top_p
+                &stop_ids,
+                &tokenizer,
+                0.0,    // presence_penalty
+                0,      // logprobs_top_n
+                |_token_id: usize, _text: &str, _finish_reason: Option<&str>, _logprobs: Option<&[(u32, f32)]>| {
+                    count += 1;
+                    true
+                },
+            );
         } else {
-            let decode_start = Instant::now();
-            let mut count = 0usize;
-            if !self.aux_gpu_store_addrs.is_empty() {
-                store.gpu_generate_stream_multi(
-                    &self.aux_gpu_store_addrs,
-                    &self.multi_gpu_split_layers,
-                    &self.multi_gpu_gqa_offsets,
-                    first_token,
-                    prompt_len,
-                    max_new_tokens.saturating_sub(1),
-                    temperature,
-                    50,     // top_k
-                    0.95,   // top_p
-                    &stop_ids,
-                    &tokenizer,
-                    0.0,    // presence_penalty
-                    0,      // logprobs_top_n
-                    |_token_id: usize, _text: &str, _finish_reason: Option<&str>, _logprobs: Option<&[(u32, f32)]>| {
-                        count += 1;
-                        true
-                    },
-                );
-            } else {
-                store.gpu_generate_stream(
-                    first_token,
-                    prompt_len,
-                    max_new_tokens.saturating_sub(1),
-                    temperature,
-                    50,     // top_k
-                    0.95,   // top_p
-                    &stop_ids,
-                    &tokenizer,
-                    0.0,    // presence_penalty
-                    0,      // logprobs_top_n
-                    |_token_id, _text, _finish_reason, _logprobs: Option<&[(u32, f32)]>| {
-                        count += 1;
-                        true
-                    },
-                );
-            }
-            let elapsed = decode_start.elapsed().as_secs_f64();
-            let total = count + 1; // includes first_token from prefill
-            let tok_s = if elapsed > 0.0 && count > 0 {
-                count as f64 / elapsed
-            } else {
-                0.0
-            };
-            (elapsed * 1000.0, total, tok_s)
+            store.gpu_generate_stream(
+                first_token,
+                prompt_len,
+                max_new_tokens.saturating_sub(1),
+                temperature,
+                50,     // top_k
+                0.95,   // top_p
+                &stop_ids,
+                &tokenizer,
+                0.0,    // presence_penalty
+                0,      // logprobs_top_n
+                |_token_id, _text, _finish_reason, _logprobs: Option<&[(u32, f32)]>| {
+                    count += 1;
+                    true
+                },
+            );
+        }
+        let elapsed = decode_start.elapsed().as_secs_f64();
+        let decode_tokens = count + 1; // includes first_token from prefill
+        let decode_tok_s = if elapsed > 0.0 && count > 0 {
+            count as f64 / elapsed
+        } else {
+            0.0
         };
+        let decode_ms = elapsed * 1000.0;
 
         crate::vram_monitor::report_event("decode_end");
 

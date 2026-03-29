@@ -77,14 +77,12 @@ def _warn(text: str) -> None:
 _model: Optional[KrasisModel] = None
 _model_name: str = "unknown"
 
-# Additional VRAM headroom reserved on top of SAFETY_MARGIN_MB before loading HCS.
-# The calibrated safety margin covers allocator fragmentation and kernel workspace,
-# but live qcn-a4 production benchmarks still consume roughly another ~0.9 GB of
-# request-time decode/prefill overhead (CUDA graph replay, transient decode state,
-# and first-request runtime allocations). Reserve 1 GB so HCS does not load right
-# up to the wall and then collapse below the configured margin during requests.
-REQUEST_RUNTIME_HEADROOM_MB = 1024
-
+# Additional steady-state decode reserve on top of the configured safety margin.
+# This is not the user-facing safety margin; it is GPU0 HCS budget headroom for
+# decode-time transient state so resident HCS does not drive decode below the
+# requested floor. Current qcn-a4 measurements put the needed gap at roughly
+# half a gigabyte, so reserve 512 MB rather than the earlier over-conservative 1 GB.
+DECODE_RUNTIME_HEADROOM_MB = 512
 
 def _start_session_bridge(host: str, port: int) -> Optional[subprocess.Popen]:
     """Start the Session messenger bridge as a subprocess.
@@ -581,9 +579,9 @@ def main():
     parser.add_argument("--multi-gpu-hcs", action="store_true", default=False,
                         help="Pin HCS experts across ALL GPUs (more capacity, but cross-device transfer)")
     # NOTE: --hcs-headroom-mb removed — HCS budget is computed from 4-point VRAM calibration, not a fixed headroom
-    parser.add_argument("--vram-safety-margin", type=int, default=0,
+    parser.add_argument("--vram-safety-margin", type=int, default=600,
                         help="VRAM safety margin in MB — reserved free VRAM for decode kernel intermediates "
-                             "and CUDA allocator headroom (default: auto = 3.5%% of total VRAM, min 600 MB)")
+                             "and CUDA allocator headroom (default: 600 MB)")
     parser.add_argument("--stream-attention", action="store_true",
                         help="Stream attention weights from CPU instead of keeping resident on GPU. "
                              "Use when attention weights don't fit in VRAM (e.g. very large models).")
@@ -851,13 +849,7 @@ def main():
     if args.vram_safety_margin > 0:
         SAFETY_MARGIN_MB = args.vram_safety_margin
     else:
-        # Auto-compute: 3.5% of total VRAM, minimum 600 MB.
-        # Decode needs headroom for kernel intermediates, CUDA allocator fragmentation,
-        # and async HCS reload chunk allocation. Proportional to GPU size so it works
-        # on both 16 GB and 32+ GB cards.
-        import torch
-        _total = torch.cuda.mem_get_info(devices[0].index)[1] // (1024 * 1024)
-        SAFETY_MARGIN_MB = max(600, int(_total * 0.035))
+        SAFETY_MARGIN_MB = 600
     vram_monitor = VramMonitor(device_indices, poll_interval_ms=50, safety_margin_mb=SAFETY_MARGIN_MB)
     vram_monitor.start()
     _dim("VRAM monitor started (tracking warmup)")
@@ -872,16 +864,37 @@ def main():
 
     vram_monitor.report_event("model_loaded")
 
-    # ── Phase 1: Warmup (trigger all lazy CUDA allocations) ──
-    # torch.compile, KV cache, Rust prefill scratch, cuBLAS handles, decode buffers.
-    # These cause a transient VRAM spike that is freed afterwards. The monitor
-    # captures the spike for visibility but is reset before HCS budget measurement.
+    # ── Phase 1: Warmup (trigger lazy Rust prefill allocations before HCS loading) ──
+    # Run one real Rust prefill before budget measurement so first-request allocations
+    # are not charged against the post-HCS steady-state budget.
     _model._hcs_device = None
     _model._multi_gpu_hcs = False
-    _status("Warmup (Rust prefill engine warms up on first request)")
-    _dim("Skipping Python prefill warmup — Rust prefill engine handles warmup lazily")
+    _status("Pre-allocating Rust prefill engine")
+    # Must happen BEFORE VRAM budget measurement and HCS pool loading.
+    # The prefill engine allocates fixed scratch buffers on the GPU.
+    # If we wait until after HCS, there may not be enough VRAM left.
+    try:
+        gpu_store.allocate_prefill_engine(_model.cfg.max_position_embeddings)
+        _detail("Prefill engine scratch buffers allocated")
+    except Exception as e:
+        logger.error("Failed to pre-allocate prefill engine: %s", e)
+        raise
+
+    _status("Warmup (Rust prefill engine)")
     vram_monitor.report_event("warmup_start")
     t_warmup = time.time()
+    try:
+        warmup_token = 0
+        warmup_probe = _model.tokenizer.encode(" hello") if _model.tokenizer is not None else []
+        if warmup_probe:
+            warmup_token = int(warmup_probe[0])
+        warmup_len = min(25000, max(256, int(getattr(args, "gpu_prefill_threshold", 300))))
+        gpu_store.rust_prefill_tokens([warmup_token] * warmup_len, 0.0)
+        _model.server_cleanup()
+        _detail(f"Rust prefill warmed with {warmup_len:,} tokens before HCS budgeting")
+    except Exception as e:
+        logger.warning("Rust prefill warmup failed, continuing without it: %s", e)
+        _warn(f"Rust prefill warmup failed: {e}")
     warmup_elapsed = time.time() - t_warmup
     _detail(f"Warmup complete in {warmup_elapsed:.1f}s")
     vram_monitor.report_event("warmup_end")
@@ -897,33 +910,21 @@ def main():
             idx, warmup_peak_used, warmup_min_free, total,
         )
 
-    # ── Pre-allocate Rust prefill engine ──
-    # Must happen BEFORE VRAM budget measurement and HCS pool loading.
-    # The prefill engine allocates fixed scratch buffers on the GPU.
-    # If we wait until after HCS, there may not be enough VRAM left.
-    _status("Pre-allocating Rust prefill engine")
-    try:
-        gpu_store.allocate_prefill_engine(_model.cfg.max_position_embeddings)
-        _detail("Prefill engine scratch buffers allocated")
-    except Exception as e:
-        logger.error("Failed to pre-allocate prefill engine: %s", e)
-        raise
-
     # ── Phase 2: VRAM budget measurement ──
     # With dynamic per-prompt scratch allocation, scratch is minimal at init and
-    # grows before each prefill (then freed after). HCS gets two tiers:
-    #   hard = experts that survive worst-case prefill (small, permanent)
-    #   soft = experts that fill VRAM during decode, evicted when prefill needs space
-    # The max scratch reservation tells us how much VRAM prefill can claim,
-    # so hard_budget = free - max_scratch - safety.
+    # grows before each prefill (then freed after). GPU0 HCS is now treated as
+    # fully reclaimable during prefill: decode uses as much resident HCS as fits
+    # under the runtime reserve, and prefill evicts from that pool as needed.
+    # The max scratch reservation is still measured for observability and for the
+    # synthetic calibration data passed into Rust, but it no longer carves out a
+    # protected "hard" HCS tier on the primary GPU.
     dev_idx = devices[0].index
     import torch
 
     _status("VRAM budget measurement")
     vram_monitor.report_event("calibration_start")
     _detail(f"Safety margin: {SAFETY_MARGIN_MB:,} MB")
-    _detail(f"Runtime request headroom: {REQUEST_RUNTIME_HEADROOM_MB:,} MB")
-
+    _detail(f"Decode runtime reserve: {DECODE_RUNTIME_HEADROOM_MB:,} MB")
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
@@ -938,27 +939,21 @@ def main():
     max_scratch_mb = gpu_store.prefill_scratch_reservation_mb(max_scratch_tokens)
     _detail(f"Scratch reservation: max={max_scratch_mb:,} MB (at {max_scratch_tokens:,} tokens)")
 
-    # Two constraints determine the budget:
-    # 1. Live requests need SAFETY_MARGIN_MB plus additional request-time headroom
-    #    for decode/prefill transients (CUDA graphs, replay scratch, runtime growth)
-    # 2. Worst-case prefill needs max_scratch plus that same reserved headroom,
-    #    sourced from evicting soft HCS before prefill
-    #    => hard must survive alongside max_scratch + reserve
-    # Total HCS = free - reserve.
-    # Hard = free - max_scratch - reserve (permanent, survives worst-case prefill).
-    # Soft = total - hard (evictable proportionally via chunked pool).
-    runtime_reserve_mb = SAFETY_MARGIN_MB + REQUEST_RUNTIME_HEADROOM_MB
-    total_hcs = max(0, _free_mb - runtime_reserve_mb)
-    hard_budget = max(0, _free_mb - max_scratch_mb - runtime_reserve_mb)
-    soft_budget = total_hcs - hard_budget
+    # GPU0 steady-state decode budget is free VRAM minus the configured safety
+    # margin and a smaller decode-only transient reserve. Prefill can reclaim
+    # that resident HCS budget dynamically.
+    total_hcs = max(0, _free_mb - SAFETY_MARGIN_MB - DECODE_RUNTIME_HEADROOM_MB)
+    reclaimable_hcs_budget = total_hcs
 
-    # Pass calibration to Rust. Hard budget is small (permanent). Soft is the scratch area.
+    # Pass synthetic calibration to Rust.
     short_tokens = 500
     long_tokens = max_scratch_tokens
-    # During prefill: free VRAM = hard_budget + safety (soft evicted, scratch allocated)
-    prefill_free = hard_budget + runtime_reserve_mb
-    # During decode: free VRAM = hard_budget + soft_budget + runtime reserve
-    decode_free = hard_budget + soft_budget + runtime_reserve_mb
+    # Synthetic calibration keeps only the true safety margin as prefill-free
+    # space so Rust's legacy hard/soft diagnostic string resolves to hard=0 on
+    # GPU0.
+    prefill_free = SAFETY_MARGIN_MB
+    # Decode keeps reclaimable HCS resident above the safety margin.
+    decode_free = reclaimable_hcs_budget + SAFETY_MARGIN_MB
     prefill_short_free = prefill_free
     prefill_long_free = prefill_free
     decode_short_free = decode_free
@@ -966,9 +961,10 @@ def main():
 
     vram_monitor.report_event("calibration_end")
     _status("VRAM budget complete")
-    _detail(f"Hard HCS budget: {hard_budget:,} MB (survives worst-case {max_scratch_tokens:,}-token prefill)")
-    _detail(f"Soft HCS budget: {soft_budget:,} MB (evictable chunks, total HCS={total_hcs:,} MB)")
-    logger.info("VRAM budget: hard=%d MB, soft=%d MB, free=%d MB", hard_budget, soft_budget, _free_mb)
+    _detail(f"GPU0 reclaimable HCS budget: {reclaimable_hcs_budget:,} MB")
+    _detail(f"Worst-case prefill scratch reservation: {max_scratch_mb:,} MB at {max_scratch_tokens:,} tokens")
+    logger.info("VRAM budget: gpu0_reclaimable=%d MB, free=%d MB, max_scratch=%d MB",
+                reclaimable_hcs_budget, _free_mb, max_scratch_mb)
 
     # ── Pre-compute multi-GPU layer splits (before HCS, so we can filter rankings) ──
     # Splits are based on total HCS budget (hard+soft) on each GPU, so layers
@@ -1053,11 +1049,11 @@ def main():
         last_gpu_base_overhead = last_gpu_base_overhead_bytes / (1024 * 1024)
 
         # Compute HCS budget for each GPU.
-        # GPU0: from calibration (hard + soft).
+        # GPU0: total reclaimable resident HCS budget.
         # Aux GPUs: total VRAM - attention cost - overhead - safety margin.
         # We iterate to find self-consistent splits where each GPU's layer assignment
         # matches its available HCS budget proportionally.
-        gpu0_hcs_total = hard_budget + soft_budget
+        gpu0_hcs_total = reclaimable_hcs_budget
         num_aux = num_gpus_available - 1
         aux_totals = [vram_monitor.total_mb(device_indices[i + 1]) for i in range(num_aux)]
 
@@ -1208,29 +1204,29 @@ def main():
             if _multi_gpu_split > 0:
                 _model.restrict_to_decode_segment(0, gpu0_layer_end)
 
-            # ── Initialize tiered HCS: hard pool + soft pool ──
+            # ── Initialize GPU0 HCS as fully reclaimable on the primary GPU ──
             # In multi-GPU mode, filter ranking to GPU0's layer segment only
             # and include unranked experts to fill remaining VRAM (better than empty slots).
             gpu0_ranking = ranking
-            gpu0_hard = hard_budget
-            gpu0_soft = soft_budget
+            gpu0_hard = 0
+            gpu0_soft = reclaimable_hcs_budget
             if _multi_gpu_split > 0:
                 gpu0_ranking = _full_ranking_for_layers(ranking, 0, _multi_gpu_split)
                 num_ranked = sum(1 for l, e in gpu0_ranking if (l, e) in set(ranking))
                 _dim(f"GPU0 HCS: {len(gpu0_ranking)} experts for layers [0..{_multi_gpu_split}) "
                      f"({num_ranked} ranked + {len(gpu0_ranking) - num_ranked} unranked), "
-                     f"hard: {gpu0_hard:,} MB, soft: {gpu0_soft:,} MB")
+                     f"reclaimable: {gpu0_soft:,} MB")
             else:
                 # Single GPU: include all unranked experts too
                 gpu0_ranking = _full_ranking_for_layers(ranking, 0, len(_model.layers))
                 num_ranked = len(ranking)
                 _dim(f"GPU0 HCS: {len(gpu0_ranking)} experts "
                      f"({num_ranked} ranked + {len(gpu0_ranking) - num_ranked} unranked), "
-                     f"hard: {gpu0_hard:,} MB, soft: {gpu0_soft:,} MB")
+                     f"reclaimable: {gpu0_soft:,} MB")
 
             t_hcs = time.time()
             vram_monitor.report_event("hcs_init_start")
-            _status("Loading HCS pool (hard + soft tier)")
+            _status("Loading GPU0 HCS pool (fully reclaimable)")
 
             result = store.hcs_pool_init_tiered(
                 gpu0_ranking,
@@ -1247,12 +1243,10 @@ def main():
             logger.info("HCS pool: %s (%.1fs)", result, hcs_elapsed)
 
     # ── Decode validation ──
-    # With Rust prefill, decode warmup happens on the first real request.
-    # The Rust server handles prefill + decode in a single codepath.
-    # No Python-side warmup needed.
+    # Rust prefill warmup already ran before HCS budgeting.
     vram_monitor.report_event("validation_start")
     _status("Decode validation")
-    _detail("Skipped: Rust prefill engine handles warmup on first request")
+    _detail("Skipped: Rust prefill already warmed before HCS budgeting")
     vram_monitor.report_event("validation_end")
 
     # ── Enable VRAM monitor runtime warnings ──
@@ -1530,10 +1524,9 @@ def main():
             seg_attn_mb = sum(_layer_vram_mb[j] for j in range(seg_start, seg_end))
             # HCS info
             if gpu_i == 0:
-                hcs_hard = gpu0_hard
-                hcs_soft = gpu0_soft
-                hcs_total = hcs_hard + hcs_soft
-                hcs_type = f"hard={hcs_hard:,}MB + soft={hcs_soft:,}MB"
+                hcs_reclaimable = gpu0_soft
+                hcs_total = hcs_reclaimable
+                hcs_type = f"reclaimable={hcs_reclaimable:,}MB"
                 # Prefill-only info
                 prefill_only_entries = getattr(_model, '_prefill_only_attn', [])
                 if prefill_only_entries:
