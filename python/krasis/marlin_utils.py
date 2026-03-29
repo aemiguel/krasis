@@ -98,6 +98,7 @@ def _find_vendored_so() -> Optional[str]:
     # 2. Next to the krasis Python package (maturin build output)
     pkg_dir = Path(__file__).parent
     candidates.append(str(pkg_dir / "libkrasis_marlin.so"))
+    candidates.append(str(pkg_dir.parent / "krasis.libs" / "libkrasis_marlin.so"))
 
     # 3. Cargo build output directories
     repo_root = pkg_dir.parent.parent
@@ -117,7 +118,7 @@ def _load_marlin_lib():
     so_path = _find_vendored_so()
     if so_path is None:
         raise RuntimeError(
-            "Cannot find libkrasis_marlin.so. Build with './dev build' first.\n"
+            "Cannot find libkrasis_marlin.so in the installed package or repo build outputs.\n"
             "Set KRASIS_MARLIN_SO=/path/to/libkrasis_marlin.so to override."
         )
 

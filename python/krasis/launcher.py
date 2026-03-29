@@ -443,7 +443,7 @@ class LauncherConfig:
             except ValueError:
                 pass
         if "CFG_KV_DTYPE" in saved:
-            self.kv_dtype = saved["CFG_KV_DTYPE"]
+            self.kv_dtype = "fp8_e4m3"
         if "CFG_GPU_EXPERT_BITS" in saved:
             try:
                 self.gpu_expert_bits = int(saved["CFG_GPU_EXPERT_BITS"])
@@ -570,7 +570,7 @@ OPTIONS = [
     ConfigOption("KV cache (MB)", "kv_cache_mb",
                  opt_type="number", min_val=200, max_val=65500, step=100, affects_budget=True),
     ConfigOption("KV dtype", "kv_dtype",
-                 choices=["fp8_e4m3", "bf16"], affects_budget=True),
+                 choices=["fp8_e4m3"], affects_budget=True),
     ConfigOption("GPU expert bits", "gpu_expert_bits",
                  choices=[4, 8], affects_budget=True),
     ConfigOption("Attention quant", "attention_quant",
@@ -660,8 +660,6 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
         current = str(current_val)
         if current == "fp8_e4m3":
             return f"{DIM}{native_label} \u2192 fp8 \u2014 ~lossless{NC}"
-        elif current == "bf16":
-            return f"{DIM}{native_label} \u2192 bf16 \u2014 lossless{NC}"
         return f"{DIM}{native_label} \u2192 {current}{NC}"
 
     return ""
@@ -904,9 +902,6 @@ class Launcher:
         os.makedirs(self.models_dir, exist_ok=True)
         self.hw = detect_hardware()
         self.cfg = LauncherConfig()
-        # Auto-downgrade KV dtype if GPU lacks FP8 support (needs SM >= 8.9)
-        if not self.hw["has_fp8"]:
-            self.cfg.kv_dtype = "bf16"
         self.model_info: Optional[Dict[str, Any]] = None
         self.budget: Optional[Dict[str, Any]] = None
         self.selected_gpus: List[Dict[str, Any]] = []  # subset of hw["gpus"]
@@ -1209,9 +1204,6 @@ class Launcher:
 
         if opt.opt_type == "cycle" and opt.choices:
             choices = opt.choices
-            # Hide FP8 option if GPU doesn't support it
-            if opt.key == "kv_dtype" and not self.hw.get("has_fp8", False):
-                choices = [c for c in choices if c != "fp8_e4m3"]
             try:
                 idx = choices.index(val)
             except ValueError:
@@ -1607,8 +1599,8 @@ def parse_args() -> argparse.Namespace:
                         help="KV cache size in MB (default: 1000)")
     parser.add_argument("--vram-safety-margin", type=int, default=None,
                         help="VRAM safety margin in MB (default: 600)")
-    parser.add_argument("--kv-dtype", default=None,
-                        help="KV cache dtype: fp8_e4m3 or bf16")
+    parser.add_argument("--kv-dtype", choices=["fp8_e4m3"], default=None,
+                        help="KV cache dtype: fp8_e4m3")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
                         help="GPU Marlin expert bits: 4 or 8")
     parser.add_argument("--attention-quant", default=None,
@@ -1670,7 +1662,7 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
     if args.vram_safety_margin is not None:
         cfg.vram_safety_margin = max(500, args.vram_safety_margin)
     if args.kv_dtype is not None:
-        cfg.kv_dtype = args.kv_dtype
+        cfg.kv_dtype = "fp8_e4m3"
     if args.gpu_expert_bits is not None:
         cfg.gpu_expert_bits = args.gpu_expert_bits
     if args.attention_quant is not None:
@@ -1906,10 +1898,6 @@ def main():
         args.non_interactive = True  # --config implies non-interactive
     # (No auto-load from ~/.krasis/config — TUI always starts with hardcoded defaults.
     #  Use --config or the in-TUI "Load Config" option to load a config file.)
-
-    # Force BF16 KV if GPU doesn't support FP8
-    if not launcher.hw["has_fp8"] and launcher.cfg.kv_dtype == "fp8_e4m3":
-        launcher.cfg.kv_dtype = "bf16"
 
     # Apply CLI overrides (take priority over saved config)
     _apply_cli_overrides(launcher.cfg, args)

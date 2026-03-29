@@ -1,6 +1,33 @@
 """Krasis — hybrid LLM MoE runtime."""
 
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
+import os
+from pathlib import Path
+
+
+def _configure_vendored_sidecars() -> None:
+    pkg_dir = Path(__file__).resolve().parent
+    sidecars = {
+        "KRASIS_MARLIN_SO": "libkrasis_marlin.so",
+        "KRASIS_LIBKRASIS_FLASH_ATTN_SO": "libkrasis_flash_attn.so",
+        "KRASIS_LIBKRASIS_FLA_SO": "libkrasis_fla.so",
+    }
+    search_roots = [
+        pkg_dir,
+        pkg_dir.parent / "krasis.libs",
+    ]
+    for env_key, filename in sidecars.items():
+        if os.environ.get(env_key):
+            continue
+        for root in search_roots:
+            candidate = root / filename
+            if candidate.is_file():
+                os.environ[env_key] = str(candidate)
+                break
+
+
+_configure_vendored_sidecars()
+
 try:
     __version__ = _pkg_version("krasis")
 except PackageNotFoundError:

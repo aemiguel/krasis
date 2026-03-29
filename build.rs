@@ -34,6 +34,45 @@ fn main() {
     compile_flash_attn_kernels();
 }
 
+fn vendor_python_sidecar(so_path: &str) {
+    let src = std::path::Path::new(so_path);
+    if !src.exists() {
+        return;
+    }
+
+    let Some(name) = src.file_name() else {
+        println!("cargo:warning=Skipping vendored sidecar copy for invalid path {so_path}");
+        return;
+    };
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let dst = std::path::Path::new(&manifest_dir).join("python").join("krasis").join(name);
+    if let Some(parent) = dst.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            println!(
+                "cargo:warning=Failed to create vendored sidecar directory {}: {}",
+                parent.display(),
+                e
+            );
+            return;
+        }
+    }
+
+    match std::fs::copy(src, &dst) {
+        Ok(_) => {
+            println!("cargo:warning=Vendored sidecar copied to {}", dst.display());
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=Failed to copy vendored sidecar {} -> {}: {}",
+                src.display(),
+                dst.display(),
+                e
+            );
+        }
+    }
+}
+
 fn compile_cuda_kernels() {
     let cu_src = "src/cuda/decode_kernels.cu";
     println!("cargo:rerun-if-changed={cu_src}");
@@ -223,6 +262,7 @@ fn compile_marlin_kernels() {
         Ok(s) if s.success() => {
             println!("cargo:rustc-cfg=has_marlin_kernels");
             println!("cargo:warning=Compiled vendored Marlin kernels to {so_path}");
+            vendor_python_sidecar(&so_path);
         }
         Ok(s) => {
             println!("cargo:warning=nvcc failed linking Marlin .so with status {s}");
@@ -356,6 +396,7 @@ fn compile_flash_attn_kernels() {
         Ok(s) if s.success() => {
             println!("cargo:rustc-cfg=has_flash_attn_kernels");
             println!("cargo:warning=Compiled vendored FlashAttention-2 kernels to {so_path}");
+            vendor_python_sidecar(&so_path);
         }
         Ok(s) => {
             println!("cargo:warning=nvcc failed linking FlashAttention .so with status {s}");

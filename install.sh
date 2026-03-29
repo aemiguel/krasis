@@ -355,7 +355,11 @@ curl -sSfL -o "$TMPDIR/$FILENAME" "$DOWNLOAD_URL" \
     || err "Download failed. Check your internet connection."
 
 info "Installing Krasis ${VERSION#v}..."
-"$VENV_DIR/bin/pip" install "$TMPDIR/$FILENAME" \
+PIP_INSTALL_ARGS=(install)
+if [[ "$CHANNEL" == "prerelease" ]]; then
+    PIP_INSTALL_ARGS+=(--force-reinstall --no-cache-dir)
+fi
+"$VENV_DIR/bin/pip" "${PIP_INSTALL_ARGS[@]}" "$TMPDIR/$FILENAME" \
     || err "pip install failed. Check the output above for details."
 
 # ── Symlink commands ─────────────────────────────────────────────────

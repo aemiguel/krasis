@@ -13,16 +13,37 @@
 //! Kernels loaded from PTX (simple ops) or dlopen'd from vendored libkrasis_marlin.so (Marlin).
 
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr};
 use cudarc::driver::sys as cuda_sys;
+use pyo3::prelude::*;
 
 fn stderr_debug_enabled() -> bool {
     std::env::var("KRASIS_DEBUG_STDERR")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+fn installed_package_sidecar(name: &str) -> Option<String> {
+    use pyo3::types::PyModule;
+
+    Python::with_gil(|py| {
+        let pkg = PyModule::import(py, "krasis").ok()?;
+        let pkg_file: String = pkg.getattr("__file__").ok()?.extract().ok()?;
+        let pkg_dir = PathBuf::from(pkg_file).parent()?.to_path_buf();
+        for candidate in [
+            pkg_dir.join(name),
+            pkg_dir.parent()?.join("krasis.libs").join(name),
+        ] {
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+        }
+        None
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -8076,6 +8097,10 @@ fn find_vendor_so(name: &str) -> Option<String> {
         if std::path::Path::new(&p).exists() { return Some(p); }
     }
 
+    if let Some(p) = installed_package_sidecar(name) {
+        return Some(p);
+    }
+
     // 2. Look next to the current executable
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -9818,6 +9843,10 @@ fn find_marlin_so() -> Option<String> {
     // 1. Look in KRASIS_MARLIN_SO env var (set by build.rs or wrapper script)
     if let Ok(p) = std::env::var("KRASIS_MARLIN_SO") {
         if std::path::Path::new(&p).exists() { return Some(p); }
+    }
+
+    if let Some(p) = installed_package_sidecar("libkrasis_marlin.so") {
+        return Some(p);
     }
 
     // 2. Look next to the current executable / shared library

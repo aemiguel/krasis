@@ -43,4 +43,7 @@ krasis-setup = "krasis.setup:main"
 features = ["pyo3/extension-module", "cuda"]
 python-source = "python"
 module-name = "krasis.krasis"
-include = [{path = "python/krasis/prompts/*", format = "wheel"}]
+include = [
+    {path = "python/krasis/prompts/*", format = "wheel"},
+    {path = "python/krasis/libkrasis*.so", format = "wheel"},
+]
