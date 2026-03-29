@@ -5761,6 +5761,9 @@ extern "C" __global__ void gqa_attention_polar4(
 
     int tid = threadIdx.x;
     int num_threads = blockDim.x;
+    int lane_id = tid & 31;
+    int warp_id = tid >> 5;
+    int num_warps = num_threads >> 5;
 
     int heads_per_kv = num_q_heads / num_kv_heads;
     int kv_head = qh / heads_per_kv;
@@ -5771,7 +5774,8 @@ extern "C" __global__ void gqa_attention_polar4(
 
     extern __shared__ float smem[];
     float* s_q = smem; // head_dim
-    float* smem_reduce = smem + head_dim;
+    float* smem_reduce = smem + head_dim; // 2 * num_warps
+    float* s_partial_v = smem_reduce + 2 * num_warps; // num_warps * head_dim
 
     // Load Q
     for (int i = tid; i < head_dim; i += num_threads) {
@@ -5822,49 +5826,76 @@ extern "C" __global__ void gqa_attention_polar4(
     __syncthreads();
     float global_max = smem_reduce[0];
 
-    // Pass 2: sum exp and weighted V sum
-    float sum_exp = 0.0f;
-    float v_acc[256]; // Enough for head_dim up to 256
-    for (int i = 0; i < head_dim; i++) v_acc[i] = 0.0f;
+    // Pass 2: shard positions across warps, then reduce per-warp partial V sums.
+    float local_sum_exp = 0.0f;
+    float v_acc_lane[8];
+    int lane_dims[8];
+    int lane_dim_count = 0;
+    for (int d = lane_id; d < head_dim; d += 32) {
+        lane_dims[lane_dim_count] = d;
+        v_acc_lane[lane_dim_count] = 0.0f;
+        lane_dim_count++;
+    }
 
-    for (int pos = 0; pos < seq_len; pos++) {
-        float score = 0.0f;
-        for (int b = 0; b < head_dim / 16; b++) {
+    for (int pos = warp_id; pos < seq_len; pos += num_warps) {
+        float score_partial = 0.0f;
+        for (int b = lane_id; b < head_dim / 16; b += 32) {
             int block_idx = block_offset_in_head + b;
             float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&k_radius_cache[pos * num_blocks + block_idx]));
             const unsigned char* angs = k_angles_cache + (pos * num_blocks + block_idx) * 8;
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 unsigned char p = angs[i];
-                score += s_q[b*16 + i*2] * r * polar4_codebook[p & 0xF];
-                score += s_q[b*16 + i*2+1] * r * polar4_codebook[p >> 4];
+                score_partial += s_q[b*16 + i*2] * r * polar4_codebook[p & 0xF];
+                score_partial += s_q[b*16 + i*2+1] * r * polar4_codebook[p >> 4];
             }
         }
-        float w = expf(score * sm_scale - global_max);
-        sum_exp += w;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
+        }
+        float w = expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
+        local_sum_exp += w;
 
-        // Weighted V sum (rotated V)
-        for (int b = 0; b < head_dim / 16; b++) {
-            int block_idx = block_offset_in_head + b;
+        for (int idx = 0; idx < lane_dim_count; idx++) {
+            int d = lane_dims[idx];
+            int block_idx = block_offset_in_head + (d >> 4);
             float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&v_radius_cache[pos * num_blocks + block_idx]));
             const unsigned char* angs = v_angles_cache + (pos * num_blocks + block_idx) * 8;
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                unsigned char p = angs[i];
-                v_acc[b*16 + i*2] += w * r * polar4_codebook[p & 0xF];
-                v_acc[b*16 + i*2+1] += w * r * polar4_codebook[p >> 4];
-            }
+            unsigned char p = angs[(d & 15) >> 1];
+            float v_val = ((d & 1) == 0)
+                ? r * polar4_codebook[p & 0xF]
+                : r * polar4_codebook[p >> 4];
+            v_acc_lane[idx] += w * v_val;
         }
     }
 
-    float inv_sum = 1.0f / (sum_exp + 1e-12f);
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum_exp;
+    for (int idx = 0; idx < lane_dim_count; idx++) {
+        s_partial_v[warp_id * head_dim + lane_dims[idx]] = v_acc_lane[idx];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+
+    float inv_sum = 1.0f / (smem_reduce[0] + 1e-12f);
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int w = 0; w < num_warps; w++) acc += s_partial_v[w * head_dim + d];
+        s_q[d] = acc * inv_sum;
+    }
+    __syncthreads();
 
     // Apply inverse SRR to final sum and write back
     // Use one thread per block to un-rotate
     for (int b = 0; b < head_dim / 16; b++) {
         if (tid == b) {
             float o_local[16];
-            for (int i = 0; i < 16; i++) o_local[i] = v_acc[b*16+i] * inv_sum;
+            for (int i = 0; i < 16; i++) o_local[i] = s_q[b*16+i];
             fht16(o_local);
             for (int i = 0; i < 16; i++) {
                 output[qh * head_dim + b*16 + i] = o_local[i] * 0.25f * polar4_signs[i];

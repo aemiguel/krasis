@@ -6109,10 +6109,9 @@ impl GpuDecodeStore {
 
             // 2. Run attention
             let seq_len = pos + 1;
-            let q_smem = (hd as u32) * 4;
-            let shared_mem_bytes = q_smem + (seq_len as u32) * 4 + 128;
-
             if format == 2 {
+                let num_warps = threads / 32;
+                let shared_mem_bytes = ((hd as u32) * (num_warps + 1) + 2 * num_warps) * 4 + 128;
                 k.gqa_attention_polar4.clone().launch(
                     LaunchConfig {
                         grid_dim: (nh as u32, 1, 1),
@@ -6122,6 +6121,8 @@ impl GpuDecodeStore {
                     (out_ptr, q_ptr, cache_k_ptr, cache_v_ptr, cache_k_angles_ptr, cache_v_angles_ptr, sm_sc, nh, nkv, hd, seq_len, max_seq),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("gqa_attention_polar4 failed: {:?}", e)))?;
             } else {
+                let q_smem = (hd as u32) * 4;
+                let shared_mem_bytes = q_smem + (seq_len as u32) * 4 + 128;
                 k.gqa_attention.clone().launch(
                     LaunchConfig {
                         grid_dim: (nh as u32, 1, 1),
@@ -10534,8 +10535,9 @@ impl GpuDecodeStore {
                         let threads = 256u32;
                         let seq_len = (position + 1) as u32;
                         let num_blocks = graph.kv_num_blocks;
-                        // Shared memory: head_dim floats for Q + warp reduce
-                        let shared_mem_bytes = (hd as u32) * 4 + (threads / 32) * 4 + 128;
+                        // Shared memory: Q scratch + softmax reduction + per-warp partial V sums
+                        let num_warps = threads / 32;
+                        let shared_mem_bytes = ((hd as u32) * (num_warps + 1) + 2 * num_warps) * 4 + 128;
                         let cfg = LaunchConfig {
                             grid_dim: (nh as u32, 1, 1),
                             block_dim: (threads, 1, 1),
