@@ -979,6 +979,7 @@ def main():
     # This restores the measured decode model and avoids guessed headroom values.
     dev_idx = devices[0].index
     import torch
+    tokenizer_path = os.path.join(args.model_path, "tokenizer.json")
 
     _status("VRAM calibration")
     vram_monitor.report_event("calibration_start")
@@ -1021,7 +1022,8 @@ def main():
             raise RuntimeError(f"{label} VRAM calibration overflowed KV cache at {prompt_len:,} tokens")
 
         vram_monitor.reset_min_free()
-        gpu_store.gpu_generate_batch(
+        gpu_store.gpu_generate_stream_probe(
+            tokenizer_path=tokenizer_path,
             first_token=first_token,
             start_position=prompt_len,
             max_tokens=STARTUP_CALIBRATION_DECODE_TOKENS,
@@ -1323,6 +1325,7 @@ def main():
                 short_tokens, long_tokens,
                 prefill_short_free, prefill_long_free,
                 decode_short_free, decode_long_free,
+                post_calibration_free_mb,
                 SAFETY_MARGIN_MB,
             )
             _dim(cal_msg)
@@ -1576,7 +1579,7 @@ def main():
                     _multi_gpu_gqa_offsets[i], prompt_len)
 
             # Reload soft HCS on GPU0 only (aux GPUs have no soft tier)
-            r0, _ = gpu_store.py_hcs_reload_after_prefill()
+            r0, _ = gpu_store.py_hcs_reload_after_prefill(prompt_len)
             if r0 > 0:
                 _dim(f"  Reloaded {r0} soft experts after validation prefill")
 

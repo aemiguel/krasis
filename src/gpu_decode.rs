@@ -206,6 +206,8 @@ impl PrefetchSlot {
 struct VramCalibration {
     short_tokens: usize,
     long_tokens: usize,
+    /// Post-calibration no-HCS idle free VRAM (MB).
+    baseline_free_mb: u64,
     /// min_free VRAM (MB) during short prompt prefill (no HCS loaded)
     prefill_short_free_mb: u64,
     /// min_free VRAM (MB) during long prompt prefill (no HCS loaded)
@@ -252,6 +254,13 @@ impl VramCalibration {
     /// Max HCS budget for decode after prefill of N tokens.
     fn decode_hcs_budget_mb(&self, tokens: usize) -> u64 {
         self.decode_free_mb(tokens).saturating_sub(self.safety_margin_mb)
+    }
+
+    /// Minimum idle free VRAM required while HCS is resident so the measured
+    /// decode transient still leaves the configured safety margin.
+    fn required_idle_free_mb(&self, tokens: usize) -> u64 {
+        self.baseline_free_mb
+            .saturating_sub(self.decode_hcs_budget_mb(tokens))
     }
 
     /// Decode VRAM consumption per token in KB (linear rate).
@@ -4364,6 +4373,7 @@ impl GpuDecodeStore {
     #[pyo3(signature = (short_tokens, long_tokens,
                         prefill_short_free_mb, prefill_long_free_mb,
                         decode_short_free_mb, decode_long_free_mb,
+                        baseline_free_mb,
                         safety_margin_mb))]
     fn set_vram_calibration(
         &mut self,
@@ -4373,11 +4383,13 @@ impl GpuDecodeStore {
         prefill_long_free_mb: u64,
         decode_short_free_mb: u64,
         decode_long_free_mb: u64,
+        baseline_free_mb: u64,
         safety_margin_mb: u64,
     ) -> PyResult<String> {
         let cal = VramCalibration {
             short_tokens,
             long_tokens,
+            baseline_free_mb,
             prefill_short_free_mb,
             prefill_long_free_mb,
             decode_short_free_mb,
@@ -4393,21 +4405,24 @@ impl GpuDecodeStore {
                 / (long_tokens - short_tokens) as f64) * 1024.0
         } else { 0.0 };
 
-        let hard_budget = cal.prefill_hcs_budget_mb(long_tokens);
-        let max_decode_budget = cal.decode_hcs_budget_mb(short_tokens);
-        let soft_budget = max_decode_budget.saturating_sub(hard_budget);
+        let short_decode_budget = cal.decode_hcs_budget_mb(short_tokens);
+        let long_decode_budget = cal.decode_hcs_budget_mb(long_tokens);
+        let short_idle_floor = cal.required_idle_free_mb(short_tokens);
 
         let msg = format!(
-            "VRAM calibration: prefill {:.1} KB/tok, decode {:.1} KB/tok | \
-             hard HCS: {} MB, soft HCS: {} MB, total: {} MB",
+            "VRAM calibration: baseline {} MB | prefill {:.1} KB/tok, decode {:.1} KB/tok | \
+             HCS allowance: short {} MB, long {} MB | idle floor: {} MB",
+            baseline_free_mb,
             prefill_kb_per_tok, decode_kb_per_tok,
-            hard_budget, soft_budget, hard_budget + soft_budget,
+            short_decode_budget, long_decode_budget, short_idle_floor,
         );
         log::info!("{}", msg);
         log::info!("  prefill: short={}tok/{}MB, long={}tok/{}MB",
             short_tokens, prefill_short_free_mb, long_tokens, prefill_long_free_mb);
         log::info!("  decode:  short={}tok/{}MB, long={}tok/{}MB",
             short_tokens, decode_short_free_mb, long_tokens, decode_long_free_mb);
+        log::info!("  baseline idle free: {}MB, safety margin: {}MB",
+            baseline_free_mb, safety_margin_mb);
 
         if let Some(engine) = self.prefill_engine_slot.as_mut() {
             engine.set_safety_margin_mb(safety_margin_mb as usize);
@@ -4513,40 +4528,79 @@ impl GpuDecodeStore {
             return Ok(format!("{} | soft: 0 experts (insufficient VRAM)", result));
         }
 
-        // Compute chunk size: proportional to total VRAM.
-        // ~1 GB on 32 GB, ~512 MB on 16 GB, scales linearly.
+        // Compute chunk size for granular reclaim and load/reload guardrails.
+        // Target ~128 MB on 32 GB, ~64 MB on 16 GB, clamped to [64 MB, 256 MB].
+        // Smaller chunks let residency stay closer to the decode-derived HCS bound.
         let chunk_target_bytes = {
             let (_, total_vram) = cudarc::driver::result::mem_get_info()
                 .unwrap_or((0, 32 * 1024 * 1024 * 1024));
-            let target = total_vram / 32; // ~1 GB per 32 GB
-            // Clamp to [256 MB, 2 GB]
-            target.max(256 * 1024 * 1024).min(2048 * 1024 * 1024)
+            let target = total_vram / 256;
+            target.max(64 * 1024 * 1024).min(256 * 1024 * 1024)
         };
         let slots_per_chunk = (chunk_target_bytes / slot_size).max(1);
-        let num_chunks = (soft_num_slots + slots_per_chunk - 1) / slots_per_chunk;
+        let planned_num_chunks = (soft_num_slots + slots_per_chunk - 1) / slots_per_chunk;
 
         let soft_alloc_bytes = soft_num_slots * slot_size;
         log::info!("HCS soft tier: allocating {:.1} MB in {} chunks of {:.0} MB ({} slots/chunk, {} slots for {} available experts)",
-            soft_alloc_bytes as f64 / (1024.0 * 1024.0), num_chunks,
+            soft_alloc_bytes as f64 / (1024.0 * 1024.0), planned_num_chunks,
             (slots_per_chunk * slot_size) as f64 / (1024.0 * 1024.0),
             slots_per_chunk, soft_num_slots, soft_experts_available);
 
         // Allocate GPU chunks + pinned host mirrors for batch DMA reload
-        let mut soft_chunks: Vec<cudarc::driver::CudaSlice<u8>> = Vec::with_capacity(num_chunks);
-        let mut soft_host_chunks: Vec<PinnedHostChunk> = Vec::with_capacity(num_chunks);
-        for c in 0..num_chunks {
-            let slots_this_chunk = if c == num_chunks - 1 {
+        let mut soft_chunks: Vec<cudarc::driver::CudaSlice<u8>> = Vec::with_capacity(planned_num_chunks);
+        let mut soft_host_chunks: Vec<PinnedHostChunk> = Vec::with_capacity(planned_num_chunks);
+        let startup_idle_floor_mb = self.vram_calibration
+            .map(|cal| cal.required_idle_free_mb(cal.short_tokens) as usize)
+            .unwrap_or(safety_margin_mb);
+        let mut actual_soft_slots = 0usize;
+        for c in 0..planned_num_chunks {
+            let slots_this_chunk = if c == planned_num_chunks - 1 {
                 soft_num_slots - c * slots_per_chunk
             } else {
                 slots_per_chunk
             };
             let chunk_bytes = slots_this_chunk * slot_size;
+            if let Ok((actual_free, _)) = cudarc::driver::result::mem_get_info() {
+                let actual_free_mb = actual_free / (1024 * 1024);
+                let chunk_mb = (chunk_bytes + (1024 * 1024) - 1) / (1024 * 1024);
+                if actual_free_mb <= startup_idle_floor_mb
+                    || actual_free_mb.saturating_sub(chunk_mb) < startup_idle_floor_mb
+                {
+                    log::warn!(
+                        "HCS soft tier: stopping at chunk {} — free={} MB, chunk={} MB, idle floor={} MB",
+                        c, actual_free_mb, chunk_mb, startup_idle_floor_mb,
+                    );
+                    break;
+                }
+            }
             let chunk_buf = self.device.alloc_zeros::<u8>(chunk_bytes)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("HCS soft chunk {} alloc ({} MB): {:?}",
                         c, chunk_bytes / (1024 * 1024), e)))?;
+            if let Ok((actual_free, _)) = cudarc::driver::result::mem_get_info() {
+                let actual_free_mb = actual_free / (1024 * 1024);
+                if actual_free_mb < startup_idle_floor_mb {
+                    log::warn!(
+                        "HCS soft tier: dropping chunk {} after alloc — free={} MB below idle floor={} MB",
+                        c, actual_free_mb, startup_idle_floor_mb,
+                    );
+                    drop(chunk_buf);
+                    break;
+                }
+            }
             soft_chunks.push(chunk_buf);
             soft_host_chunks.push(PinnedHostChunk::new(chunk_bytes));
+            actual_soft_slots += slots_this_chunk;
+        }
+        soft_num_slots = actual_soft_slots;
+        let num_chunks = soft_chunks.len();
+        if num_chunks == 0 || soft_num_slots == 0 {
+            log::warn!("HCS soft tier: no chunks loaded after decode guardrail");
+            hcs.soft_loaded = true;
+            hcs.soft_num_slots = 0;
+            hcs.soft_num_cached = 0;
+            hcs.soft_max_mb = 0;
+            return Ok(format!("{} | soft: 0 experts (decode guardrail stopped load)", result));
         }
         let pinned_count = soft_host_chunks.iter().filter(|c| c.registered).count();
         log::info!("HCS soft tier: {}/{} host chunks pinned (page-locked for async DMA)",
@@ -4668,6 +4722,7 @@ impl GpuDecodeStore {
         hcs.soft_slots_per_chunk = slots_per_chunk;
         hcs.soft_total_chunks = num_chunks;
         hcs.soft_chunks_loaded = num_chunks;
+        hcs.soft_max_mb = (soft_num_slots * slot_size) / (1024 * 1024);
         hcs.soft_num_slots = soft_num_slots;
         hcs.soft_slot_size = slot_size;
         hcs.soft_slot_to_expert = soft_slot_to_expert;
@@ -5286,6 +5341,43 @@ impl GpuDecodeStore {
         self.last_min_free_vram_mb
     }
 
+    /// Clamp the soft-tier resident budget to a measured target.
+    /// Used by startup decode residency calibration after HCS load.
+    fn hcs_clamp_soft_budget_mb(&mut self, target_soft_mb: usize) -> PyResult<(usize, usize)> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let hcs = graph.hcs.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("HCS not initialized"))?;
+
+        if hcs.soft_slot_size == 0 || hcs.soft_num_slots == 0 || hcs.soft_slots_per_chunk == 0 {
+            hcs.soft_max_mb = 0;
+            return Ok((0, 0));
+        }
+
+        let slot_size = hcs.soft_slot_size;
+        let spc = hcs.soft_slots_per_chunk;
+        let target_soft_bytes = target_soft_mb.saturating_mul(1024 * 1024);
+        let target_soft_slots = (target_soft_bytes / slot_size).min(hcs.soft_num_slots);
+        let target_chunks = if target_soft_slots == 0 {
+            0
+        } else {
+            ((target_soft_slots + spc - 1) / spc).min(hcs.soft_total_chunks)
+        };
+
+        let (_evicted, _freed_bytes) = hcs.trim_soft_chunks_to(target_chunks);
+
+        let loaded_slots = if hcs.soft_chunks_loaded >= hcs.soft_total_chunks {
+            hcs.soft_num_slots
+        } else {
+            (hcs.soft_chunks_loaded * spc).min(hcs.soft_num_slots)
+        };
+        let loaded_soft_mb = (loaded_slots * slot_size) / (1024 * 1024);
+        hcs.soft_max_mb = loaded_soft_mb;
+        hcs.soft_loaded = hcs.soft_chunks_loaded == hcs.soft_total_chunks;
+
+        Ok((hcs.soft_max_mb, loaded_soft_mb))
+    }
+
     /// Run a single GPU decode step (for testing). Fills d_hidden and h_logits.
     fn py_gpu_decode_step(&mut self, token_id: usize, position: usize) -> PyResult<()> {
         self.gpu_decode_step(token_id, position)
@@ -5409,6 +5501,45 @@ impl GpuDecodeStore {
         }
         self.last_decode_elapsed = elapsed;
 
+        Ok(tokens)
+    }
+
+    /// Startup calibration probe: run the production decode stream path
+    /// without Python-side streaming, so CUDA-graph capture and steady-state
+    /// decode allocations are included in VRAM measurement.
+    #[pyo3(signature = (tokenizer_path, first_token, start_position, max_tokens, temperature, top_k, top_p, stop_ids, presence_penalty=0.0))]
+    fn gpu_generate_stream_probe(
+        &mut self,
+        tokenizer_path: String,
+        first_token: usize,
+        start_position: usize,
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        stop_ids: Vec<usize>,
+        presence_penalty: f32,
+    ) -> PyResult<Vec<usize>> {
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to load tokenizer for decode probe: {}", e)))?;
+        let mut tokens = Vec::with_capacity(max_tokens);
+        self.gpu_generate_stream(
+            first_token,
+            start_position,
+            max_tokens,
+            temperature,
+            top_k,
+            top_p,
+            &stop_ids,
+            &tokenizer,
+            presence_penalty,
+            0,
+            |token_id, _text, _finish_reason, _logprobs| {
+                tokens.push(token_id);
+                true
+            },
+        );
         Ok(tokens)
     }
 
@@ -13436,15 +13567,17 @@ impl GpuDecodeStore {
         let spc = hcs.soft_slots_per_chunk;
         let decode_budget_mb = cal.map(|cal| cal.decode_hcs_budget_mb(actual_tokens) as usize)
             .unwrap_or(hcs.hard_budget_mb + hcs.soft_max_mb);
+        let idle_floor_mb = cal.map(|cal| cal.required_idle_free_mb(actual_tokens) as usize)
+            .unwrap_or(hcs.safety_margin_mb);
         let target_soft_mb = decode_budget_mb
             .saturating_sub(hcs.hard_budget_mb)
             .min(hcs.soft_max_mb);
         let target_soft_bytes = target_soft_mb.saturating_mul(1024 * 1024);
         let target_soft_slots = (target_soft_bytes / slot_size).min(hcs.soft_num_slots);
-        let target_chunks = if target_soft_slots >= hcs.soft_num_slots {
-            hcs.soft_total_chunks
+        let target_chunks = if target_soft_slots == 0 {
+            0
         } else {
-            target_soft_slots / spc
+            ((target_soft_slots + spc - 1) / spc).min(hcs.soft_total_chunks)
         };
 
         if hcs.soft_chunks_loaded > target_chunks {
@@ -13479,6 +13612,19 @@ impl GpuDecodeStore {
                 spc
             };
             let chunk_bytes = slots_this_chunk * slot_size;
+            if let Ok((actual_free, _)) = cudarc::driver::result::mem_get_info() {
+                let actual_free_mb = actual_free / (1024 * 1024);
+                let chunk_mb = (chunk_bytes + (1024 * 1024) - 1) / (1024 * 1024);
+                if actual_free_mb <= idle_floor_mb
+                    || actual_free_mb.saturating_sub(chunk_mb) < idle_floor_mb
+                {
+                    log::warn!(
+                        "HCS soft reload: stopping at chunk {} — free={} MB, chunk={} MB, idle floor={} MB",
+                        c, actual_free_mb, chunk_mb, idle_floor_mb,
+                    );
+                    break;
+                }
+            }
 
             let chunk_buf = match self.device.alloc_zeros::<u8>(chunk_bytes) {
                 Ok(buf) => buf,
@@ -13488,6 +13634,17 @@ impl GpuDecodeStore {
                     break;
                 }
             };
+            if let Ok((actual_free, _)) = cudarc::driver::result::mem_get_info() {
+                let actual_free_mb = actual_free / (1024 * 1024);
+                if actual_free_mb < idle_floor_mb {
+                    log::warn!(
+                        "HCS soft reload: dropping chunk {} after alloc — free={} MB below idle floor={} MB",
+                        c, actual_free_mb, idle_floor_mb,
+                    );
+                    drop(chunk_buf);
+                    break;
+                }
+            }
             let chunk_base = *chunk_buf.device_ptr();
 
             // Batch DMA: one call per chunk from pre-packed host buffer
@@ -13602,15 +13759,17 @@ impl GpuDecodeStore {
         let spc = hcs.soft_slots_per_chunk;
         let decode_budget_mb = cal.map(|cal| cal.decode_hcs_budget_mb(actual_tokens) as usize)
             .unwrap_or(hcs.hard_budget_mb + hcs.soft_max_mb);
+        let idle_floor_mb = cal.map(|cal| cal.required_idle_free_mb(actual_tokens) as usize)
+            .unwrap_or(hcs.safety_margin_mb);
         let target_soft_mb = decode_budget_mb
             .saturating_sub(hcs.hard_budget_mb)
             .min(hcs.soft_max_mb);
         let target_soft_bytes = target_soft_mb.saturating_mul(1024 * 1024);
         let target_soft_slots = (target_soft_bytes / slot_size).min(hcs.soft_num_slots);
-        let target_chunks = if target_soft_slots >= hcs.soft_num_slots {
-            hcs.soft_total_chunks
+        let target_chunks = if target_soft_slots == 0 {
+            0
         } else {
-            target_soft_slots / spc
+            ((target_soft_slots + spc - 1) / spc).min(hcs.soft_total_chunks)
         };
 
         if hcs.soft_chunks_loaded > target_chunks {
@@ -13681,6 +13840,19 @@ impl GpuDecodeStore {
                 spc
             };
             let chunk_bytes = slots_this_chunk * slot_size;
+            if let Ok((actual_free, _)) = cudarc::driver::result::mem_get_info() {
+                let actual_free_mb = actual_free / (1024 * 1024);
+                let chunk_mb = (chunk_bytes + (1024 * 1024) - 1) / (1024 * 1024);
+                if actual_free_mb <= idle_floor_mb
+                    || actual_free_mb.saturating_sub(chunk_mb) < idle_floor_mb
+                {
+                    log::warn!(
+                        "HCS soft async reload: stopping at chunk {} — free={} MB, chunk={} MB, idle floor={} MB",
+                        c, actual_free_mb, chunk_mb, idle_floor_mb,
+                    );
+                    break;
+                }
+            }
 
             let chunk_buf = match unsafe { self.device.alloc::<u8>(chunk_bytes) } {
                 Ok(buf) => buf,
@@ -13690,6 +13862,17 @@ impl GpuDecodeStore {
                     break;
                 }
             };
+            if let Ok((actual_free, _)) = cudarc::driver::result::mem_get_info() {
+                let actual_free_mb = actual_free / (1024 * 1024);
+                if actual_free_mb < idle_floor_mb {
+                    log::warn!(
+                        "HCS soft async reload: dropping chunk {} after alloc — free={} MB below idle floor={} MB",
+                        c, actual_free_mb, idle_floor_mb,
+                    );
+                    drop(chunk_buf);
+                    break;
+                }
+            }
             let chunk_base = *chunk_buf.device_ptr();
 
             // Batch async DMA: one call per chunk from pre-packed host buffer
