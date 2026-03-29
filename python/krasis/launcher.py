@@ -570,7 +570,7 @@ OPTIONS = [
     ConfigOption("KV cache (MB)", "kv_cache_mb",
                  opt_type="number", min_val=200, max_val=65500, step=100, affects_budget=True),
     ConfigOption("KV dtype", "kv_dtype",
-                 choices=["fp8_e4m3"], affects_budget=True),
+                 choices=["fp8_e4m3", "polar4", "bf16"], affects_budget=True),
     ConfigOption("GPU expert bits", "gpu_expert_bits",
                  choices=[4, 8], affects_budget=True),
     ConfigOption("Attention quant", "attention_quant",
@@ -660,6 +660,10 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
         current = str(current_val)
         if current == "fp8_e4m3":
             return f"{DIM}{native_label} \u2192 fp8 \u2014 ~lossless{NC}"
+        elif current == "polar4":
+            return f"{DIM}{native_label} \u2192 polar4 \u2014 compact 4-bit{NC}"
+        elif current == "bf16":
+            return f"{DIM}{native_label} \u2192 bf16 \u2014 lossless{NC}"
         return f"{DIM}{native_label} \u2192 {current}{NC}"
 
     return ""
@@ -1063,7 +1067,7 @@ class Launcher:
             # KV allocation (capped to available VRAM)
             free_before_kv = rank.get("free_mb", 0)
             kv_alloc = int(min(self.cfg.kv_cache_mb, max(0, free_before_kv)))
-            kv_label = "fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16"
+            kv_label = "polar4" if self.cfg.kv_dtype == "polar4" else ("fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16")
             kv_alloc_tokens = rank.get("kv_alloc_tokens", rank["kv_tokens"])
 
             total_used = experts_mb + attention_mb + overhead_mb + kv_alloc
@@ -1469,7 +1473,7 @@ class Launcher:
                 rank.get("lm_head_mb", 0) + rank.get("prefill_scratch_mb", 0) +
                 rank.get("prefill_workspace_mb", 0) + rank.get("cuda_overhead_mb", 0)
             )
-            kv_label = "fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16"
+            kv_label = "polar4" if self.cfg.kv_dtype == "polar4" else ("fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16")
             print(f"\n  Experts:     {experts_mb:>8,} MB  (INT{self.cfg.gpu_expert_bits})")
             attn_label = "AWQ" if self.cfg.attention_quant == "awq" else "BF16"
             print(f"  Attention:   {attention_mb:>8,} MB  ({attn_label})")
@@ -1599,8 +1603,8 @@ def parse_args() -> argparse.Namespace:
                         help="KV cache size in MB (default: 1000)")
     parser.add_argument("--vram-safety-margin", type=int, default=None,
                         help="VRAM safety margin in MB (default: 600)")
-    parser.add_argument("--kv-dtype", choices=["fp8_e4m3"], default=None,
-                        help="KV cache dtype: fp8_e4m3")
+    parser.add_argument("--kv-dtype", default=None,
+                        help="KV cache dtype: fp8_e4m3, polar4, or bf16")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
                         help="GPU Marlin expert bits: 4 or 8")
     parser.add_argument("--attention-quant", default=None,

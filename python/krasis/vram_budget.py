@@ -174,9 +174,10 @@ def _lm_head_bytes(cfg: Dict[str, Any]) -> int:
     return cfg["vocab_size"] * cfg["hidden_size"] * 2
 
 
-def _kv_dtype_bytes(kv_cache_dtype: str) -> int:
+def _kv_dtype_bytes(kv_cache_dtype: str) -> float:
     dtypes = {
         "fp8_e4m3": 1, "fp8_e5m2": 1, "fp8": 1,
+        "polar4": 0.625,
         "bf16": 2, "bfloat16": 2, "fp16": 2, "float16": 2,
         "auto": 2,
     }
@@ -850,7 +851,7 @@ def main():
     parser.add_argument("--pp-partition", required=True,
                         help="Comma-separated layer counts per rank (e.g. 20,21,20)")
     parser.add_argument("--kv-cache-dtype", default="auto",
-                        help="KV cache dtype (fp8_e4m3, bf16, etc.)")
+                        help="KV cache dtype (fp8_e4m3, polar4, bf16, etc.)")
     parser.add_argument("--quantization", default="none",
                         help="Non-expert quantization (w8a8_int8 or none)")
     parser.add_argument("--gpu-vram-mb", type=int, default=None,

@@ -2153,8 +2153,6 @@ class KrasisModel:
             num_kv_layers = kv_offset
 
             if num_kv_layers > 0:
-                logger.info("[DEBUG] Creating KV cache: kv_format=%r, kv_dtype=%r, quant_cfg=%r",
-                    self.quant_cfg.kv_cache_format, self.kv_dtype, self.quant_cfg)
                 cache = PagedKVCache(
                     self.cfg,
                     num_layers=num_kv_layers,

@@ -54,11 +54,18 @@ class PagedKVCache:
         self.kv_dtype = kv_dtype
         self.combined = combined
         self.attention_type = cfg.attention_type  # "mla" or "gqa"
-        self.kv_format_str = kv_format
+        kv_aliases = {
+            "fp8": "fp8",
+            "fp8_e4m3": "fp8",
+            "bf16": "bf16",
+            "bfloat16": "bf16",
+            "polar4": "polar4",
+        }
+        self.kv_format_str = kv_aliases.get(kv_format, kv_format)
         self.kv_format = 0  # bf16
-        if kv_format == "fp8" or kv_format == "fp8_e4m3":
+        if self.kv_format_str == "fp8":
             self.kv_format = 1
-        elif kv_format == "polar4":
+        elif self.kv_format_str == "polar4":
             self.kv_format = 2
 
         # Compute cache dimensions based on attention type

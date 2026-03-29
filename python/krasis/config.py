@@ -230,6 +230,20 @@ class QuantConfig:
     kv_cache_format: str = "fp8"   # "bf16", "fp8", or "polar4"
 
     def __post_init__(self):
+        kv_aliases = {
+            "fp8": "fp8",
+            "fp8_e4m3": "fp8",
+            "bf16": "bf16",
+            "bfloat16": "bf16",
+            "polar4": "polar4",
+        }
+        if self.kv_cache_format not in kv_aliases:
+            raise ValueError(
+                f"Unsupported kv_cache_format '{self.kv_cache_format}'. "
+                "Use 'bf16', 'fp8_e4m3', or 'polar4'."
+            )
+        self.kv_cache_format = kv_aliases[self.kv_cache_format]
+
         if self.attention in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported attention quant '{self.attention}'. "
