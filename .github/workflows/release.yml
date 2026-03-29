@@ -40,14 +40,70 @@ jobs:
 
       - name: Inject vendored sidecars into wheels
         run: |
-          MARLIN_SO=$(find . -path '*/libkrasis_marlin.so' | grep -v '/dist/' | head -n 1)
-          FLASH_ATTN_SO=$(find . -path '*/libkrasis_flash_attn.so' | grep -v '/dist/' | head -n 1)
-          test -n "$MARLIN_SO"
-          test -n "$FLASH_ATTN_SO"
-          python3 scripts/inject_wheel_sidecars.py \
-            --wheel-dir dist \
-            --marlin "$MARLIN_SO" \
-            --flash-attn "$FLASH_ATTN_SO"
+          python3 <<'PY'
+          from pathlib import Path
+          import subprocess
+          import zipfile
+
+          wheel_dir = Path("dist")
+          wheels = sorted(wheel_dir.glob("*.whl"))
+          if not wheels:
+              raise SystemExit("no wheels found in dist")
+
+          required = {
+              "krasis/libkrasis_marlin.so",
+              "krasis/libkrasis_flash_attn.so",
+          }
+          missing = []
+          for wheel in wheels:
+              with zipfile.ZipFile(wheel) as zf:
+                  names = set(zf.namelist())
+              absent = sorted(required - names)
+              if absent:
+                  print(f"{wheel.name}: missing {', '.join(absent)}")
+                  missing.append(wheel)
+              else:
+                  print(f"{wheel.name}: vendored sidecars already present")
+
+          if not missing:
+              print("All wheels already contain vendored sidecars; skipping injection.")
+              raise SystemExit(0)
+
+          def find_sidecar(name: str) -> Path | None:
+              for path in Path(".").rglob(name):
+                  path_str = path.as_posix()
+                  if path_str.startswith("dist/") or "/dist/" in path_str:
+                      continue
+                  return path
+              return None
+
+          marlin = find_sidecar("libkrasis_marlin.so")
+          flash_attn = find_sidecar("libkrasis_flash_attn.so")
+          if marlin is None or flash_attn is None:
+              missing_names = []
+              if marlin is None:
+                  missing_names.append("libkrasis_marlin.so")
+              if flash_attn is None:
+                  missing_names.append("libkrasis_flash_attn.so")
+              raise SystemExit(
+                  "wheel sidecars missing and local copies not found: "
+                  + ", ".join(missing_names)
+              )
+
+          subprocess.run(
+              [
+                  "python3",
+                  "scripts/inject_wheel_sidecars.py",
+                  "--wheel-dir",
+                  str(wheel_dir),
+                  "--marlin",
+                  str(marlin),
+                  "--flash-attn",
+                  str(flash_attn),
+              ],
+              check=True,
+          )
+          PY
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
