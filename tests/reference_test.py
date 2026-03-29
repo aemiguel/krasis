@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from krasis.run_paths import get_run_dir
+
 
 # ── Config Matrix for Comparison Mode ─────────────────────────────
 # Maps model short name -> list of (label, relative_config_path) tuples.
@@ -1349,11 +1351,7 @@ def main():
         )
 
         # Save report
-        log_dir = os.path.join(script_dir, "logs", "reference-tests")
-        os.makedirs(log_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_name = f"krasis_reference_compare_{model_name}_{timestamp}.html"
-        report_path = os.path.join(log_dir, report_name)
+        report_path = os.path.join(get_run_dir("reference-test"), "reference_compare.html")
         with open(report_path, "w") as f:
             f.write(html)
 
@@ -1550,13 +1548,7 @@ def main():
         )
 
         # Save report
-        log_dir = os.path.join(script_dir, "logs", "reference-tests")
-        os.makedirs(log_dir, exist_ok=True)
-
-        quant_info = f"int{cfg.get('CFG_GPU_EXPERT_BITS', '4')}_{cfg.get('CFG_ATTENTION_QUANT', 'a16')}"
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_name = f"krasis_reference_test_{model_name}_{quant_info}_{timestamp}.html"
-        report_path = os.path.join(log_dir, report_name)
+        report_path = os.path.join(get_run_dir("reference-test"), "reference_test.html")
 
         with open(report_path, "w") as f:
             f.write(html)

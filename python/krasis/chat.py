@@ -21,6 +21,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+from krasis.run_paths import get_run_dir
+
 # Enable readline for input() — gives arrow keys, history, Ctrl-A/E, etc.
 try:
     import readline  # noqa: F401
@@ -931,13 +933,7 @@ def run_sanity_test(
         print(f"  {RED}No prompts found in {prompts_path}{NC}")
         return []
 
-    # Build output filename: YYYYMMDD-HHMMSS-<model>-sanity.txt
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    # Sanitize model name for filename
-    safe_model = model.replace("/", "-").replace(" ", "_")
-    out_name = f"{ts}-{safe_model}-sanity.txt"
-    out_dir = Path(prompts_path).parent
-    out_path = out_dir / out_name
+    out_path = get_run_dir("sanity") / "sanity.txt"
 
     file_lines = []
     header = f"Sanity Test: {model} @ {url}\nDate: {datetime.now().isoformat()}\n"

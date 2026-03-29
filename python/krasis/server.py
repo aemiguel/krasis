@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from krasis.run_paths import get_run_dir
+
 # Pre-scan config file for CFG_SELECTED_GPUS to set CUDA_VISIBLE_DEVICES
 # BEFORE any torch/CUDA imports, since CUDA init happens at import time.
 def _prescan_selected_gpus():
@@ -689,28 +691,19 @@ def main():
     if config_defaults:
         parser.set_defaults(**config_defaults)
     args = parser.parse_args(remaining_argv)
+    _default_run_type = "server-run"
+    if args.benchmark_only:
+        _default_run_type = "server-benchmark"
+    elif args.benchmark:
+        _default_run_type = "server-run-benchmark"
+    elif getattr(args, "stress_test", False):
+        _default_run_type = "server-stress"
+    _run_dir = get_run_dir(_default_run_type)
 
     log_format = "%(asctime)s %(name)s %(levelname)s %(message)s"
     logging.basicConfig(level=logging.INFO, format=log_format)
 
-    # Archive previous krasis.log into logs/ with timestamp before overwriting
-    _log_file = os.path.join(os.getcwd(), "krasis.log")
-    _logs_dir = os.path.join(os.getcwd(), "logs")
-    os.makedirs(_logs_dir, exist_ok=True)
-    if os.path.isfile(_log_file) and os.path.getsize(_log_file) > 0:
-        from datetime import datetime
-        _mtime = os.path.getmtime(_log_file)
-        _ts = datetime.fromtimestamp(_mtime).strftime("%Y%m%d_%H%M%S")
-        _archive_name = f"krasis_{_ts}.log"
-        _archive_path = os.path.join(_logs_dir, _archive_name)
-        # Avoid overwriting an existing archive (e.g. rapid restarts)
-        _counter = 1
-        while os.path.exists(_archive_path):
-            _archive_path = os.path.join(_logs_dir, f"krasis_{_ts}_{_counter}.log")
-            _counter += 1
-        import shutil
-        shutil.move(_log_file, _archive_path)
-        print(f"Archived previous log → logs/{os.path.basename(_archive_path)}")
+    _log_file = os.path.join(_run_dir, "krasis.log")
 
     _file_handler = logging.FileHandler(_log_file, mode="w")
     _file_handler.setLevel(logging.DEBUG)
@@ -1839,7 +1832,7 @@ def main():
     # ── Write VRAM report if enabled ──
     vram_monitor.report_event("server_shutdown")
     if getattr(args, 'vram_report', False):
-        _report_path = os.path.join(os.getcwd(), "logs", "vram_report.csv")
+        _report_path = os.path.join(_run_dir, "vram_report.csv")
         os.makedirs(os.path.dirname(_report_path), exist_ok=True)
         try:
             vram_monitor.write_report(_report_path)

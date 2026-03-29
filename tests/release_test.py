@@ -29,6 +29,8 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+from krasis.run_paths import create_run_dir, get_run_dir, slugify
+
 # ═══════════════════════════════════════════════════════════════════
 # Constants
 # ═══════════════════════════════════════════════════════════════════
@@ -561,7 +563,7 @@ def find_krasis_command() -> str:
     die("'krasis' command not found. Is Krasis installed? (pip install -e .)")
 
 
-def launch_server(config_path: str, log_file) -> subprocess.Popen:
+def launch_server(config_path: str, log_file, env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
     """Launch krasis --config <path> --benchmark as a background process.
 
     Returns the Popen handle. stdout/stderr go to log_file.
@@ -574,6 +576,7 @@ def launch_server(config_path: str, log_file) -> subprocess.Popen:
         stdout=log_file,
         stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
+        env=env,
     )
     return proc
 
@@ -878,13 +881,13 @@ def extract_benchmark_section(log_path: str) -> str:
     return "(benchmark output not found in log)"
 
 
-def extract_vram_report(script_dir: str) -> Optional[List[Dict]]:
-    """Extract VRAM report events from logs/vram_report.csv.
+def extract_vram_report(run_dir: str) -> Optional[List[Dict]]:
+    """Extract VRAM report events from <run_dir>/vram_report.csv.
 
     Returns list of dicts: [{"event": str, "time_s": float, "gpus": [free_mb, ...]}, ...]
     Only includes event rows (not periodic samples). Returns None if CSV not found.
     """
-    csv_path = os.path.join(script_dir, "logs", "vram_report.csv")
+    csv_path = os.path.join(run_dir, "vram_report.csv")
     if not os.path.isfile(csv_path):
         return None
 
@@ -2170,14 +2173,11 @@ def main():
 
     # Prepare output directory
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    output_dir = os.path.join(script_dir, "logs", "release-tests")
+    output_dir = str(get_run_dir("release-test"))
     os.makedirs(output_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = os.path.join(
-        output_dir,
-        f"krasis_release_test_{model_name}_{timestamp}.html",
-    )
+    report_path = os.path.join(output_dir, "release_test.html")
     info(f"Report: {report_path}")
     print()
 
@@ -2240,7 +2240,9 @@ def main():
         result = {"variant": variant}
         config_path = None
         proc = None
-        log_path = os.path.join(output_dir, f"server_config{i+1}_{timestamp}.log")
+        config_slug = slugify(f"config{i+1}-{variant['name']}")
+        config_dir = str(create_run_dir(config_slug, parent=output_dir))
+        log_path = os.path.join(config_dir, "server_stdout.log")
 
         # Skip multi-GPU configs if only 1 GPU available
         if variant.get("multi_gpu") and len(all_gpus) <= 1:
@@ -2281,7 +2283,10 @@ def main():
             # 2. Launch krasis --config <file> --benchmark
             info(f"Launching: krasis --config ... --benchmark")
             log_file = open(log_path, "w")
-            proc = launch_server(config_path, log_file)
+            child_env = os.environ.copy()
+            child_env["KRASIS_RUN_DIR"] = config_dir
+            child_env["KRASIS_RUN_TYPE"] = "release-test-config"
+            proc = launch_server(config_path, log_file, env=child_env)
             info(f"PID: {proc.pid} | Log: {log_path}")
 
             # 3. Wait for benchmark to complete (this includes model load + warmup)
@@ -2330,37 +2335,50 @@ def main():
 
             # 6. Phase 2: Sanity prompts
             info(f"Phase 2: Sanity test prompts{' (thinking enabled)' if thinking else ''}")
-            result["sanity_results"] = run_sanity_prompts(port=DEFAULT_PORT,
-                                                          enable_thinking=thinking)
-
-            # Run validation on sanity results immediately
-            sanity_fail_count = 0
-            sanity_warn_count = 0
-            sanity_pass_count = 0
-            for sr in result["sanity_results"]:
-                if sr.get("error"):
-                    sanity_fail_count += 1
-                    sr["_validation"] = [("FAIL", sr["error"])]
-                    sr["_validation_status"] = "FAIL"
-                else:
-                    issues = validate_sanity_result(sr.get("prompt", ""), sr.get("text", ""))
-                    sr["_validation"] = issues
-                    status = validation_status(issues)
-                    sr["_validation_status"] = status
-                    if status == "FAIL":
-                        sanity_fail_count += 1
-                    elif status == "WARN":
-                        sanity_warn_count += 1
-                    else:
-                        sanity_pass_count += 1
-            result["sanity_fail_count"] = sanity_fail_count
-            result["sanity_warn_count"] = sanity_warn_count
-            result["sanity_pass_count"] = sanity_pass_count
-
-            # 7. Phase 3: Large prompts
-            info("Phase 3: Large prompt validation")
-            result["large_results"] = run_large_prompt_tests(port=DEFAULT_PORT,
+            prev_run_dir = os.environ.get("KRASIS_RUN_DIR")
+            prev_run_type = os.environ.get("KRASIS_RUN_TYPE")
+            os.environ["KRASIS_RUN_DIR"] = config_dir
+            os.environ["KRASIS_RUN_TYPE"] = "release-test-config"
+            try:
+                result["sanity_results"] = run_sanity_prompts(port=DEFAULT_PORT,
                                                               enable_thinking=thinking)
+                # Run validation on sanity results immediately
+                sanity_fail_count = 0
+                sanity_warn_count = 0
+                sanity_pass_count = 0
+                for sr in result["sanity_results"]:
+                    if sr.get("error"):
+                        sanity_fail_count += 1
+                        sr["_validation"] = [("FAIL", sr["error"])]
+                        sr["_validation_status"] = "FAIL"
+                    else:
+                        issues = validate_sanity_result(sr.get("prompt", ""), sr.get("text", ""))
+                        sr["_validation"] = issues
+                        status = validation_status(issues)
+                        sr["_validation_status"] = status
+                        if status == "FAIL":
+                            sanity_fail_count += 1
+                        elif status == "WARN":
+                            sanity_warn_count += 1
+                        else:
+                            sanity_pass_count += 1
+                result["sanity_fail_count"] = sanity_fail_count
+                result["sanity_warn_count"] = sanity_warn_count
+                result["sanity_pass_count"] = sanity_pass_count
+
+                # 7. Phase 3: Large prompts
+                info("Phase 3: Large prompt validation")
+                result["large_results"] = run_large_prompt_tests(port=DEFAULT_PORT,
+                                                                  enable_thinking=thinking)
+            finally:
+                if prev_run_dir is None:
+                    os.environ.pop("KRASIS_RUN_DIR", None)
+                else:
+                    os.environ["KRASIS_RUN_DIR"] = prev_run_dir
+                if prev_run_type is None:
+                    os.environ.pop("KRASIS_RUN_TYPE", None)
+                else:
+                    os.environ["KRASIS_RUN_TYPE"] = prev_run_type
 
             ok(f"Config {i+1} complete.")
 
@@ -2381,7 +2399,7 @@ def main():
                 pass
 
             # Extract VRAM report (CSV written by server at shutdown)
-            vram_events = extract_vram_report(script_dir)
+            vram_events = extract_vram_report(config_dir)
             if vram_events:
                 result["vram_report"] = vram_events
 

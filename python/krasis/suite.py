@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from krasis.run_paths import create_run_dir
+
 
 # ANSI formatting
 BOLD = "\033[1m"
@@ -98,7 +100,7 @@ class SuiteRunner:
             os.path.abspath(__file__)
         )))
         if not output_dir:
-            output_dir = os.path.join(self.repo_root, "logs", "benchmarks")
+            output_dir = str(create_run_dir("benchmark-suite"))
         self.output_dir = output_dir
         self.krasis_home = os.environ.get(
             "KRASIS_HOME",

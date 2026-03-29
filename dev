@@ -78,6 +78,20 @@ ok()    { echo -e "${GREEN}${BOLD}OK${NC} $*"; }
 warn()  { echo -e "${YELLOW}${BOLD}!!${NC} $*"; }
 err()   { echo -e "${RED}${BOLD}ERROR${NC} $*" >&2; exit 1; }
 
+create_run_dir() {
+    local run_type="$1"
+    local ts dir counter=1
+    mkdir -p "$SCRIPT_DIR/logs"
+    ts=$(date +%Y%m%d_%H%M%S)
+    dir="$SCRIPT_DIR/logs/${run_type}_${ts}"
+    while [[ -e "$dir" ]]; do
+        dir="$SCRIPT_DIR/logs/${run_type}_${ts}_$counter"
+        counter=$((counter + 1))
+    done
+    mkdir -p "$dir"
+    echo "$dir"
+}
+
 # ── Sanity checks ────────────────────────────────────────────────────
 [[ -f "$PYTHON" ]] || err "Python not found at $PYTHON
   See DEV.md for environment setup instructions."
@@ -377,10 +391,15 @@ do_run() {
     local conf
     conf=$(resolve_config "$1")
     shift
+    local run_dir
+    run_dir=$(create_run_dir "dev-run")
     cleanup_gpu "$conf"
     auto_rebuild
     info "Launching from: $conf"
+    info "Run dir: $run_dir"
     verify_repo_imports
+    export KRASIS_RUN_DIR="$run_dir"
+    export KRASIS_RUN_TYPE="dev-run"
     exec_repo_python -m krasis.server --config "$conf" "$@"
 }
 
@@ -392,6 +411,8 @@ do_test() {
     [[ "${2:-}" == "--thorough" ]] && thorough=true
     cleanup_gpu "$conf"
     auto_rebuild
+    local run_dir
+    run_dir=$(create_run_dir "dev-test")
 
     local port
     port=$(conf_port "$conf")
@@ -400,16 +421,16 @@ do_test() {
     info "=== Short Model Test ==="
     info "Config: $conf"
     info "Port: $port"
+    info "Run dir: $run_dir"
 
     # Step 1: Launch server with benchmark
     info "Step 1: Launching server with --benchmark..."
     local logfile
-    mkdir -p "$SCRIPT_DIR/logs/tests"
-    logfile="$SCRIPT_DIR/logs/tests/krasis_test_$(basename "$conf" .conf)_$(date +%Y%m%d_%H%M%S).log"
+    logfile="$run_dir/test_stdout.log"
     info "Log: $logfile"
 
     verify_repo_imports
-    run_repo_python -m krasis.server --config "$conf" --benchmark > >(tee "$logfile") 2>&1 &
+    KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="dev-test" run_repo_python -m krasis.server --config "$conf" --benchmark > >(tee "$logfile") 2>&1 &
     local pid=$!
 
     # Wait for benchmark to complete AND server to be ready.
@@ -473,9 +494,12 @@ do_release_test() {
     local model="$1"
     shift
     cleanup_gpu
+    local run_dir
+    run_dir=$(create_run_dir "release-test")
     info "Starting release test for model: $model"
+    info "Run dir: $run_dir"
     verify_repo_imports
-    KRASIS_DEV_SCRIPT=1 run_repo_python "$SCRIPT_DIR/tests/release_test.py" "$model" "$@"
+    KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="release-test" run_repo_python "$SCRIPT_DIR/tests/release_test.py" "$model" "$@"
 }
 
 do_release_test_all() {
@@ -716,13 +740,15 @@ do_benchmark() {
     shift
     cleanup_gpu "$conf"
     auto_rebuild
+    local run_dir
+    run_dir=$(create_run_dir "dev-benchmark")
     local logfile
-    logfile="$SCRIPT_DIR/logs/benchmarks/krasis_benchmark_$(basename "$conf" .conf)_$(date +%Y%m%d_%H%M%S).log"
-    mkdir -p "$SCRIPT_DIR/logs/benchmarks"
+    logfile="$run_dir/benchmark_stdout.log"
     info "Running standard benchmark: $conf"
+    info "Run dir: $run_dir"
     info "Log: $logfile"
     verify_repo_imports
-    cd "$SCRIPT_DIR" && run_repo_python -m krasis.server --config "$conf" --benchmark-only "$@" 2>&1 | tee "$logfile"
+    cd "$SCRIPT_DIR" && KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="dev-benchmark" run_repo_python -m krasis.server --config "$conf" --benchmark-only "$@" 2>&1 | tee "$logfile"
     info "Benchmark log saved: $logfile"
 }
 
@@ -733,13 +759,15 @@ do_perplexity() {
     shift
     cleanup_gpu "$conf"
     auto_rebuild
+    local run_dir
+    run_dir=$(create_run_dir "dev-perplexity")
     local logfile
-    logfile="$SCRIPT_DIR/logs/perplexity/krasis_perplexity_$(basename "$conf" .conf)_$(date +%Y%m%d_%H%M%S).log"
-    mkdir -p "$SCRIPT_DIR/logs/perplexity"
+    logfile="$run_dir/perplexity_stdout.log"
     info "Running perplexity: $conf"
+    info "Run dir: $run_dir"
     info "Log: $logfile"
     verify_repo_imports
-    cd "$SCRIPT_DIR" && run_repo_python -m perplexity.measure_ppl --config "$conf" "$@" 2>&1 | tee "$logfile"
+    cd "$SCRIPT_DIR" && KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="dev-perplexity" run_repo_python -m perplexity.measure_ppl --config "$conf" "$@" 2>&1 | tee "$logfile"
     info "Perplexity log saved: $logfile"
 }
 
@@ -750,9 +778,12 @@ do_awq_calibrate() {
     shift
     cleanup_gpu "$conf"
     auto_rebuild
+    local run_dir
+    run_dir=$(create_run_dir "dev-awq-calibrate")
     info "Running AWQ calibration: $conf"
+    info "Run dir: $run_dir"
     verify_repo_imports
-    cd "$SCRIPT_DIR" && run_repo_python -m krasis.awq_calibrate --config "$conf" "$@"
+    cd "$SCRIPT_DIR" && KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="dev-awq-calibrate" run_repo_python -m krasis.awq_calibrate --config "$conf" "$@"
 }
 
 do_network() {
@@ -823,18 +854,24 @@ do_reference_test() {
         shift
         cleanup_gpu
         auto_rebuild
+        local run_dir
+        run_dir=$(create_run_dir "reference-test")
         info "Running comparative reference test: $model"
+        info "Run dir: $run_dir"
         verify_repo_imports
-        KRASIS_DEV_SCRIPT=1 run_repo_python "$SCRIPT_DIR/tests/reference_test.py" --compare "$model" "$@"
+        KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="reference-test" run_repo_python "$SCRIPT_DIR/tests/reference_test.py" --compare "$model" "$@"
     else
         local conf
         conf=$(resolve_config "$1")
         shift
         cleanup_gpu "$conf"
         auto_rebuild
+        local run_dir
+        run_dir=$(create_run_dir "reference-test")
         info "Running reference test: $conf"
+        info "Run dir: $run_dir"
         verify_repo_imports
-        KRASIS_DEV_SCRIPT=1 run_repo_python "$SCRIPT_DIR/tests/reference_test.py" "$conf" "$@"
+        KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="reference-test" run_repo_python "$SCRIPT_DIR/tests/reference_test.py" "$conf" "$@"
     fi
 }
 
@@ -1012,7 +1049,12 @@ case "$cmd" in
         ;;
     kill)       do_kill ;;
     chat)       verify_repo_imports; exec_repo_python -m krasis.chat "$@" ;;
-    sanity)     verify_repo_imports; exec_repo_python -m krasis.chat --sanitytest "$@" ;;
+    sanity)
+        verify_repo_imports
+        run_dir=$(create_run_dir "dev-sanity")
+        info "Run dir: $run_dir"
+        KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="dev-sanity" exec_repo_python -m krasis.chat --sanitytest "$@"
+        ;;
     install)
         info "Installing krasis command to ~/.local/bin/krasis..."
         mkdir -p "$HOME/.local/bin"

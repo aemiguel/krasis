@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import torch
+from krasis.run_paths import get_run_dir
 
 logger = logging.getLogger("krasis.benchmark")
 
@@ -713,35 +714,13 @@ class KrasisBenchmark:
     # ──────────────────────────────────────────────────────────
 
     def _archive_benchmark(self, model_info: Dict, report: str) -> Optional[str]:
-        """Write benchmark report to benchmarks/<name>.log for archival."""
-        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)
-        )))
-        benchmarks_dir = os.path.join(repo_root, "benchmarks")
-
-        model_name = model_info["model_name"]
-        gguf_path = getattr(self.model, "gguf_path", None)
-        if gguf_path:
-            gguf_name = os.path.splitext(os.path.basename(gguf_path))[0]
-        else:
-            gguf_name = "native"
-        num_gpus = model_info["num_gpus"]
-        gpu_quant = f"int{model_info['gpu_expert_bits']}gpu"
-        cpu_quant = f"int{model_info['cpu_expert_bits']}cpu"
-        suffix = ""
-        if getattr(self.model, '_stream_attn_enabled', False):
-            lgs = getattr(self.model, 'layer_group_size', 0)
-            suffix = f"_stream_lgs{lgs}"
-        attn_quant = model_info.get("attention_quant", "bf16")
-        filename = f"{model_name}_{gguf_name}_{num_gpus}gpu_{gpu_quant}_{cpu_quant}_a{attn_quant}{suffix}.log"
-        rel_path = f"benchmarks/{filename}"
-
+        """Write benchmark report into the current run directory."""
+        run_dir = get_run_dir("benchmark")
+        archive_path = run_dir / "benchmark_report.log"
         try:
-            os.makedirs(benchmarks_dir, exist_ok=True)
-            archive_path = os.path.join(benchmarks_dir, filename)
             with open(archive_path, "w") as f:
                 f.write(report + "\n")
-            return rel_path
+            return os.path.relpath(archive_path, start=os.getcwd())
         except OSError as e:
             logger.warning("Could not archive benchmark: %s", e)
             return None
