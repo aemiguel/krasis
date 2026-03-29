@@ -1004,6 +1004,15 @@ impl PrefillEngine {
         self.d_cold_staging = None;
         self.d_shared_fp32_scratch = None;
         self.d_shared_workspace = None;
+        self.d_fla_g_cumsum = None;
+        self.d_fla_a = None;
+        self.d_fla_ai = None;
+        self.d_fla_w = None;
+        self.d_fla_u = None;
+        self.d_fla_h = None;
+        self.d_fla_final_state = None;
+        self.d_fla_v_new = None;
+        self.d_fla_o = None;
         // Old scratch + prefill buffers now dropped, VRAM is freed.
 
         // 4. Measure free VRAM and compute optimal chunk_size for this prompt.
@@ -1036,6 +1045,33 @@ impl PrefillEngine {
             }
             self.d_cold_staging = Some(buf);
             self.max_cold_experts = n_routed;
+        }
+
+        if self.fla.is_some() && self.config.layer_types.iter().any(|&t| t == 3) {
+            let nv = self.config.la_num_v_heads;
+            let dk = self.config.la_k_head_dim;
+            let dv = self.config.la_v_head_dim;
+            let fla_bt = 64usize;
+            let fla_total = ((scratch_tokens + fla_bt - 1) / fla_bt) * fla_bt;
+            let fla_nt = fla_total / fla_bt;
+            self.d_fla_g_cumsum = Some(self.device.alloc_zeros::<f32>(fla_total * nv)
+                .map_err(|e| format!("alloc fla_g_cumsum: {e}"))?);
+            self.d_fla_a = Some(self.device.alloc_zeros::<f32>(fla_total * nv * fla_bt)
+                .map_err(|e| format!("alloc fla_a: {e}"))?);
+            self.d_fla_ai = Some(self.device.alloc_zeros::<u16>(fla_total * nv * fla_bt)
+                .map_err(|e| format!("alloc fla_ai: {e}"))?);
+            self.d_fla_w = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dk)
+                .map_err(|e| format!("alloc fla_w: {e}"))?);
+            self.d_fla_u = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
+                .map_err(|e| format!("alloc fla_u: {e}"))?);
+            self.d_fla_h = Some(self.device.alloc_zeros::<u16>(fla_nt * nv * dk * dv)
+                .map_err(|e| format!("alloc fla_h: {e}"))?);
+            self.d_fla_final_state = Some(self.device.alloc_zeros::<f32>(nv * dk * dv)
+                .map_err(|e| format!("alloc fla_final_state: {e}"))?);
+            self.d_fla_v_new = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
+                .map_err(|e| format!("alloc fla_v_new: {e}"))?);
+            self.d_fla_o = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
+                .map_err(|e| format!("alloc fla_o: {e}"))?);
         }
 
         // Shared expert Marlin workspace: sized for actual chunk, not max possible.
@@ -3073,18 +3109,17 @@ impl PrefillEngine {
                 // All FLA intermediate dtypes match what compile_kernels.py compiled:
                 //   BF16: q, k, v, beta, gate, w, u, h, h0, v_new, o, Ai
                 //   FP32: g_cumsum, A, ht
-                let la_conv_out_ptr = *self.scratch.d_la_conv_out.as_ref().ok_or("no la_conv_out")?.device_ptr();
-                let a_fla = la_conv_out_ptr;        // A: [NT*H, 64, 64] FP32
-                let ai_fla = la_k_beta;             // Ai: [NT*H, 64, 64] BF16
-                let w_fla = la_v_beta;              // w: [T, H, K] BF16
-                let u_fla = la_conv_out_ptr;        // u: [T, H, V] BF16 (reuses A after step 3)
-                let h_fla = fp32_scratch;           // h: [NT, H, K, V] BF16
-                let h_size_bytes = (fla_nt * nv * dk * dv * 2) as u64;
-                let v_new_fla = fp32_scratch + h_size_bytes; // v_new: [T, H, V] BF16
-                let v_new_size_bytes = (fla_total * nv * dv * 2) as u64;
-                let h0_fla = fp32_scratch + h_size_bytes + v_new_size_bytes; // h0: [H, K, V] BF16 (zeroed)
-                let ht_fla = la_state;              // ht: [H, K, V] FP32 (final state output)
-                let o_fla = la_v_beta;              // o: [T, H, V] BF16 (reuses w after step 5)
+                let a_fla = *self.d_fla_a.as_ref().ok_or("no fla_a")?.device_ptr();
+                let ai_fla = *self.d_fla_ai.as_ref().ok_or("no fla_ai")?.device_ptr();
+                let w_fla = *self.d_fla_w.as_ref().ok_or("no fla_w")?.device_ptr();
+                let u_fla = *self.d_fla_u.as_ref().ok_or("no fla_u")?.device_ptr();
+                let h_fla = *self.d_fla_h.as_ref().ok_or("no fla_h")?.device_ptr();
+                // h0 is only read by step 5, so reuse the output buffer as a zeroed
+                // BF16 initial state and let step 6 overwrite it later.
+                let h0_fla = *self.d_fla_o.as_ref().ok_or("no fla_o")?.device_ptr();
+                let ht_fla = *self.d_fla_final_state.as_ref().ok_or("no fla_final_state")?.device_ptr();
+                let v_new_fla = *self.d_fla_v_new.as_ref().ok_or("no fla_v_new")?.device_ptr();
+                let o_fla = *self.d_fla_o.as_ref().ok_or("no fla_o")?.device_ptr();
 
                 let fla = self.fla.as_ref().unwrap();
                 let t_arg = fla_total as i32;
@@ -3099,10 +3134,12 @@ impl PrefillEngine {
 
                 let stream_ptr = self.stream as *mut std::ffi::c_void;
 
+                let g_cum_fla = *self.d_fla_g_cumsum.as_ref().ok_or("no fla_g_cumsum")?.device_ptr();
+
                 // Step 1: cumsum — gate(BF16) → g_cumsum(FP32)
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 let rc = unsafe {
-                    (fla.cumsum)(fla_gate_bf16, la_g_cum, t_arg,
+                    (fla.cumsum)(fla_gate_bf16, g_cum_fla, t_arg,
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA cumsum failed: {}", rc)); }
@@ -3110,7 +3147,7 @@ impl PrefillEngine {
                 // Step 2: kkt — k, g_cumsum, beta → A
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 let rc = unsafe {
-                    (fla.kkt)(fla_k_bf16, la_g_cum, fla_beta_bf16, a_fla, t_arg,
+                    (fla.kkt)(fla_k_bf16, g_cum_fla, fla_beta_bf16, a_fla, t_arg,
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA kkt failed: {}", rc)); }
@@ -3127,7 +3164,7 @@ impl PrefillEngine {
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 // Note: after step 3, A (la_conv_out) is dead, so u can reuse that space
                 let rc = unsafe {
-                    (fla.wy_repr)(fla_k_bf16, fla_v_bf16, fla_beta_bf16, w_fla, u_fla, ai_fla, la_g_cum, t_arg,
+                    (fla.wy_repr)(fla_k_bf16, fla_v_bf16, fla_beta_bf16, w_fla, u_fla, ai_fla, g_cum_fla, t_arg,
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA wy_repr failed: {}", rc)); }
@@ -3144,7 +3181,7 @@ impl PrefillEngine {
                         u_fla,      // v (kernel param) = Python's u (BF16)
                         w_fla,      // w (kernel param) = Python's w (BF16)
                         v_new_fla,  // v_new output (BF16)
-                        la_g_cum,   // g (cumsum gate, FP32)
+                        g_cum_fla,   // g (cumsum gate, FP32)
                         h_fla,      // h output (BF16, per-chunk states)
                         h0_fla,     // h0 (BF16, zeroed initial state)
                         ht_fla,     // ht (FP32, final state output)
@@ -3168,7 +3205,7 @@ impl PrefillEngine {
                         fla_k_bf16,     // k
                         v_new_fla,  // v (kernel param) = v_new from step 5
                         h_fla,      // h (per-chunk states from step 5)
-                        la_g_cum,   // g (cumsum gate, FP32)
+                        g_cum_fla,   // g (cumsum gate, FP32)
                         o_fla,      // o (output, BF16)
                         1.0f32,     // scale=1.0 since q is already pre-scaled
                         t_arg,
@@ -3181,26 +3218,44 @@ impl PrefillEngine {
 
                 // Copy final state to decode state buffer (FP32, unchanged)
                 if lw.la_recur_state_ptr != 0 {
-                    self.memcpy_d2d(lw.la_recur_state_ptr, la_state, (nv * dk * dv * 4) as u64)?;
+                    self.memcpy_d2d(lw.la_recur_state_ptr, ht_fla, (nv * dk * dv * 4) as u64)?;
                 }
 
                 if lt { self.stream_sync()?; self.t_la_postfla.set(self.t_la_postfla.get() + lt5.elapsed().as_secs_f64() * 1000.0); }
 
-                // Gated RMSNorm with BF16 input (reads FLA output directly, no BF16->FP32 conversion)
-                // Output is [M, nv*dv] BF16 -> rmsnorm_out (la_v, free after FLA)
+                // Gated RMSNorm after FLA. Default stays on the direct BF16-input kernel,
+                // but a debug switch can force BF16->FP32 conversion and reuse the
+                // fallback FP32 RMSNorm kernel to isolate fast-path norm issues.
                 let lt6 = Instant::now();
-                {
+                if std::env::var("KRASIS_LA_FLA_FP32_NORM").is_ok() {
+                    let fp32_norm_in = fp32_scratch;
+                    {
+                        let nt = std::cmp::max(32, ((std::cmp::min(1024, value_dim) + 31) / 32) * 32) as u32;
+                        let mut c0 = fp32_norm_in;
+                        let mut c1 = o_fla;
+                        let mut c2 = value_dim as i32;
+                        unsafe {
+                            launch(self.kernels.la_bf16_to_fp32,
+                                (m as u32, 1, 1), (nt, 1, 1), 0, self.stream,
+                                &mut [
+                                    &mut c0 as *mut _ as *mut std::ffi::c_void,
+                                    &mut c1 as *mut _ as *mut std::ffi::c_void,
+                                    &mut c2 as *mut _ as *mut std::ffi::c_void,
+                                ],
+                            )?;
+                        }
+                    }
                     let nt = std::cmp::max(32, ((std::cmp::min(256, dv) + 31) / 32) * 32) as u32;
                     let smem = nt * 4;
-                    let mut n0 = rmsnorm_out;  // BF16 output [M, nv*dv] into la_v
-                    let mut n1 = o_fla;      // BF16 input (FLA output, in la_v_beta)
-                    let mut n2 = la_z;       // BF16 gate [M, nv, dv]
-                    let mut n3 = lw.la_norm_weight_ptr; // FP32 weight [dv]
+                    let mut n0 = rmsnorm_out;
+                    let mut n1 = fp32_norm_in;
+                    let mut n2 = la_z;
+                    let mut n3 = lw.la_norm_weight_ptr;
                     let mut n4 = nv as i32;
                     let mut n5 = dv as i32;
                     let mut n6 = cfg.rms_norm_eps;
                     unsafe {
-                        launch(self.kernels.la_gated_rmsnorm_bf16in,
+                        launch(self.kernels.la_gated_rmsnorm,
                             (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
                             &mut [
                                 &mut n0 as *mut _ as *mut std::ffi::c_void,
@@ -3212,6 +3267,32 @@ impl PrefillEngine {
                                 &mut n6 as *mut _ as *mut std::ffi::c_void,
                             ],
                         )?;
+                    }
+                } else {
+                    {
+                        let nt = std::cmp::max(32, ((std::cmp::min(256, dv) + 31) / 32) * 32) as u32;
+                        let smem = nt * 4;
+                        let mut n0 = rmsnorm_out;  // BF16 output [M, nv*dv] into la_v
+                        let mut n1 = o_fla;      // BF16 input (FLA output, in la_v_beta)
+                        let mut n2 = la_z;       // BF16 gate [M, nv, dv]
+                        let mut n3 = lw.la_norm_weight_ptr; // FP32 weight [dv]
+                        let mut n4 = nv as i32;
+                        let mut n5 = dv as i32;
+                        let mut n6 = cfg.rms_norm_eps;
+                        unsafe {
+                            launch(self.kernels.la_gated_rmsnorm_bf16in,
+                                (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
+                                &mut [
+                                    &mut n0 as *mut _ as *mut std::ffi::c_void,
+                                    &mut n1 as *mut _ as *mut std::ffi::c_void,
+                                    &mut n2 as *mut _ as *mut std::ffi::c_void,
+                                    &mut n3 as *mut _ as *mut std::ffi::c_void,
+                                    &mut n4 as *mut _ as *mut std::ffi::c_void,
+                                    &mut n5 as *mut _ as *mut std::ffi::c_void,
+                                    &mut n6 as *mut _ as *mut std::ffi::c_void,
+                                ],
+                            )?;
+                        }
                     }
                 }
                 if lt { self.stream_sync()?; self.t_la_norm.set(self.t_la_norm.get() + lt6.elapsed().as_secs_f64() * 1000.0); }
@@ -7362,6 +7443,14 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
         let group_dim_proj = 2 * dk + 2 * hr * dv;
         per_token += config.la_num_k_heads * group_dim_proj * 2;
         // d_la_chunk_out, d_la_q_contig: nv * chunk_size * dk * 4 -- fixed, not per-token
+        // Dedicated FLA buffers allocated dynamically in prepare_for_prefill.
+        // Most scale linearly with padded T; h scales as T/64 chunks.
+        per_token += nv * 4;              // d_fla_g_cumsum
+        per_token += nv * 64 * 4;         // d_fla_a
+        per_token += nv * 64 * 2;         // d_fla_ai
+        per_token += nv * dk * 2;         // d_fla_w
+        per_token += nv * dv * 2 * 3;     // d_fla_u + d_fla_v_new + d_fla_o
+        per_token += nv * dk * dv * 2 / 64; // d_fla_h averaged over 64-token chunks
     }
     // d_fa2_lse: num_q_heads * max_tokens * 4 (FP32)
     if config.num_q_heads > 0 {
@@ -7379,6 +7468,9 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     }
     // d_logits: vocab_size * 4
     fixed += config.vocab_size * 4;
+    if has_la {
+        fixed += config.la_num_v_heads * config.la_k_head_dim * config.la_v_head_dim * 4; // d_fla_final_state
+    }
     // d_expert_counts, offsets, write_offsets: n_routed * 4 each
     fixed += config.n_routed_experts.max(1) * 4 * 3;
     // Expert DMA double-buffers (A+B for w13, w13s, w2, w2s -- 8 buffers total, each one expert)
@@ -7865,6 +7957,10 @@ fn find_vendor_so(name: &str) -> Option<String> {
 /// Load vendored FLA (Flash Linear Attention) kernels from libkrasis_fla.so.
 /// Returns None if the .so is not found or any symbol is missing.
 pub fn load_fla() -> Option<FlaKernels> {
+    if std::env::var("KRASIS_NO_FLA").is_ok() {
+        log::info!("KRASIS_NO_FLA set — FLA disabled, using custom LA kernels");
+        return None;
+    }
     let path = match find_vendor_so("libkrasis_fla.so") {
         Some(p) => p,
         None => {
