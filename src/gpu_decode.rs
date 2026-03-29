@@ -2188,6 +2188,7 @@ impl GpuDecodeStore {
         };
         self.swap_to_marlin_rust().map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
+        let prefill_hcs_guard_store_addr = self as *mut Self as usize;
         let (first_token, prompt_len, kv_overflow) = {
             let engine = self.prefill_engine_slot.as_mut().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err(
@@ -2197,7 +2198,7 @@ impl GpuDecodeStore {
 
             let kv_overflow = prompt_len > engine.kv_max_seq;
             engine.update_hcs_snapshot(&cache_fast_snapshot, ne);
-            engine.set_prefill_hcs_guard_store_addr(self as *mut Self as usize);
+            engine.set_prefill_hcs_guard_store_addr(prefill_hcs_guard_store_addr);
 
             if let Err(e) = engine.prepare_for_prefill(prompt_len) {
                 engine.clear_prefill_hcs_guard_store_addr();
