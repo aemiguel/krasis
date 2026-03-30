@@ -59,9 +59,9 @@ PYTHON="/home/main/miniconda3/envs/ktransformers/bin/python"
 export PYTHONUNBUFFERED=1
 # WSL2: add CUDA driver path so Rust cudarc can find libcuda.so
 [[ -d /usr/lib/wsl/lib ]] && export LD_LIBRARY_PATH="/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+[[ -d /usr/lib/wsl/lib ]] && export PATH="/usr/lib/wsl/lib${PATH:+:$PATH}"
 PIP="/home/main/miniconda3/envs/ktransformers/bin/pip"
 MATURIN="/home/main/.local/bin/maturin"
-SO_FILE="$SCRIPT_DIR/python/krasis/krasis.cpython-311-x86_64-linux-gnu.so"
 WHEEL_DIR="$SCRIPT_DIR/target/dev-wheels"
 REPO_PYTHONPATH="$SCRIPT_DIR/python"
 REPO_LIBPATH="$SCRIPT_DIR/python/krasis.libs"
@@ -77,6 +77,17 @@ info()  { echo -e "${CYAN}${BOLD}=>${NC} $*"; }
 ok()    { echo -e "${GREEN}${BOLD}OK${NC} $*"; }
 warn()  { echo -e "${YELLOW}${BOLD}!!${NC} $*"; }
 err()   { echo -e "${RED}${BOLD}ERROR${NC} $*" >&2; exit 1; }
+
+resolve_so_file() {
+    local matches=("$SCRIPT_DIR/python/krasis"/krasis*.so)
+    if [[ -e "${matches[0]}" ]]; then
+        printf '%s\n' "${matches[0]}"
+    else
+        printf '%s\n' "$SCRIPT_DIR/python/krasis/krasis.cpython-311-x86_64-linux-gnu.so"
+    fi
+}
+
+SO_FILE="$(resolve_so_file)"
 
 create_run_dir() {
     local run_type="$1"
@@ -382,6 +393,7 @@ with zipfile.ZipFile(wheel) as zf:
             shutil.copyfileobj(src, dst)
         print(dest)
 PY
+    SO_FILE="$(resolve_so_file)"
     ok "Build complete. Extension at: $SO_FILE"
     verify_repo_imports
 }
