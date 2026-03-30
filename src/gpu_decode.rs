@@ -1575,11 +1575,6 @@ struct GpuDecodeGraph {
     // Pinned mapped memory for zero-copy topk (replaces d_topk_indices/weights + D2H)
     pinned_topk_ids: Option<PinnedMapped>,
     pinned_topk_weights: Option<PinnedMapped>,
-    /// Whether routing kernels should write top-k outputs directly into pinned
-    /// host-mapped buffers. Keep this enabled for normal ungraphed decode, but
-    /// disable it while per-layer CUDA graphs are active because graph replay on
-    /// some CUDA stacks can fault when kernels write into mapped host memory.
-    route_topk_to_pinned: bool,
 
     // GPU-side route sync: mapped memory for cold expert communication
     // Layout: [cold_count(i32), ready_flag(i32), cold_ids[topk](i32), cold_slots[topk](i32)]
@@ -2555,7 +2550,6 @@ impl GpuDecodeStore {
             h_logits: vec![0.0f32; vocab_size],
             pinned_topk_ids: PinnedMapped::new(max_experts_per_tok * 4).ok(),
             pinned_topk_weights: PinnedMapped::new(max_experts_per_tok * 4).ok(),
-            route_topk_to_pinned: true,
             // GPU-side route sync: [cold_count, ready_flag, cold_ids[topk], cold_slots[topk]]
             mapped_cold_buf: PinnedMapped::new((2 + max_experts_per_tok * 2) * 4).ok(),
             gpu_route_sync: false,
@@ -7876,7 +7870,6 @@ impl GpuDecodeStore {
                 unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
             }
             graph.per_layer_graphs_valid = false;
-            graph.route_topk_to_pinned = true;
             // NOTE: graphs_ever_captured stays true -- we keep the snapshot for diagnostics
         }
     }
@@ -8040,7 +8033,6 @@ impl GpuDecodeStore {
             unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
         }
         graph.per_layer_graphs_valid = false;
-        graph.route_topk_to_pinned = false;
 
         // Identify which layers have MoE data (within our range)
         let num_layers = graph.layers.len();
@@ -8230,7 +8222,6 @@ impl GpuDecodeStore {
             for exec in captured_graphs {
                 unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
             }
-            graph.route_topk_to_pinned = true;
             self.graph = Some(graph);
             return Err(format!("Per-layer graph capture failed: {}", e));
         }
@@ -9390,16 +9381,13 @@ impl GpuDecodeStore {
                     }
 
                     // TopK routing
-                    let use_pinned_topk = graph.route_topk_to_pinned
-                        && graph.pinned_topk_ids.is_some()
-                        && graph.pinned_topk_weights.is_some();
-                    let topk_ids_dptr = if use_pinned_topk {
-                        graph.pinned_topk_ids.as_ref().unwrap().device_ptr
+                    let topk_ids_dptr = if let Some(ref pm) = graph.pinned_topk_ids {
+                        pm.device_ptr
                     } else {
                         *graph.d_topk_indices.device_ptr()
                     };
-                    let topk_wts_dptr = if use_pinned_topk {
-                        graph.pinned_topk_weights.as_ref().unwrap().device_ptr
+                    let topk_wts_dptr = if let Some(ref pm) = graph.pinned_topk_weights {
+                        pm.device_ptr
                     } else {
                         *graph.d_topk_weights.device_ptr()
                     };
@@ -9577,9 +9565,7 @@ impl GpuDecodeStore {
 
         let hs = graph.hidden_size;
         let max_ept = graph.max_experts_per_tok;
-        let use_pinned = graph.route_topk_to_pinned
-            && graph.pinned_topk_ids.is_some()
-            && graph.pinned_topk_weights.is_some();
+        let use_pinned = graph.pinned_topk_ids.is_some() && graph.pinned_topk_weights.is_some();
         let mapped_reads = graph.mapped_reads_active;
 
         // Double-buffer base pointers for cold expert DMA
@@ -9982,46 +9968,6 @@ impl GpuDecodeStore {
                             h as *const std::ffi::c_void,
                             upload_bytes, replay_stream);
                     }
-
-                    if std::env::var("KRASIS_GRAPH_DEBUG").is_ok() && graph_idx <= 2 {
-                        unsafe {
-                            let err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
-                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                                return Err(format!("graph_debug sync before upload dump[{}]: {:?}", graph_idx, err));
-                            }
-                        }
-
-                        let mut dbg_ptrs = vec![0u64; fill_count * 4];
-                        let mut dbg_weights = vec![0f32; fill_count];
-                        unsafe {
-                            cuda_sys::lib().cuMemcpyDtoH_v2(
-                                dbg_ptrs.as_mut_ptr() as *mut std::ffi::c_void,
-                                *graph.d_batch_upload.device_ptr(),
-                                fill_count * 8 * 4,
-                            );
-                            cuda_sys::lib().cuMemcpyDtoH_v2(
-                                dbg_weights.as_mut_ptr() as *mut std::ffi::c_void,
-                                *graph.d_batch_upload.device_ptr() + (ptr_stride * 4) as u64,
-                                fill_count * 4,
-                            );
-                        }
-
-                        let zero_ptrs = dbg_ptrs.iter().filter(|&&p| p == 0).count();
-                        let sample = dbg_ptrs.iter()
-                            .take(8)
-                            .map(|p| format!("{:#x}", p))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        log::error!(
-                            "graph_debug upload[{}]: moe_layer={} fill_count={} zero_ptrs={} sample_ptrs=[{}] sample_wts={:?}",
-                            graph_idx,
-                            moe_layer_idx,
-                            fill_count,
-                            zero_ptrs,
-                            sample,
-                            &dbg_weights[..dbg_weights.len().min(4)],
-                        );
-                    }
                 }
             }
 
@@ -10040,13 +9986,6 @@ impl GpuDecodeStore {
             let err = unsafe { cuda_sys::lib().cuGraphLaunch(exec.0, replay_stream) };
             if err != cuda_sys::CUresult::CUDA_SUCCESS {
                 return Err(format!("cuGraphLaunch[{}]: {:?}", graph_idx, err));
-            }
-            // DEBUG: sync after each graph to pinpoint crashes
-            if std::env::var("KRASIS_GRAPH_DEBUG").is_ok() {
-                let sync_err = unsafe { cuda_sys::lib().cuStreamSynchronize(replay_stream) };
-                if sync_err != cuda_sys::CUresult::CUDA_SUCCESS {
-                    return Err(format!("graph[{}] post-launch sync: {:?}", graph_idx, sync_err));
-                }
             }
         }
 
@@ -16742,9 +16681,7 @@ impl GpuDecodeStore {
         // ── Step 3: TopK routing ──
         // Use pinned mapped memory if available — GPU writes directly to host-visible
         // memory, eliminating 2 cuMemcpyDtoH_v2 calls per layer (96/token → 0).
-        let use_pinned = graph.route_topk_to_pinned
-            && graph.pinned_topk_ids.is_some()
-            && graph.pinned_topk_weights.is_some();
+        let use_pinned = graph.pinned_topk_ids.is_some() && graph.pinned_topk_weights.is_some();
         let topk_ids_dptr = if use_pinned {
             graph.pinned_topk_ids.as_ref().unwrap().device_ptr
         } else {
