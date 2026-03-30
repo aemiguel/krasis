@@ -83,6 +83,28 @@ STARTUP_CALIBRATION_SHORT_TOKENS = 500
 STARTUP_CALIBRATION_DECODE_TOKENS = 32
 STARTUP_CALIBRATION_LONG_TOKENS_CAP = 50000
 
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        _warn(f"Ignoring invalid {name}={raw!r}; using {default}")
+        return default
+
+
+def _startup_diag_enabled() -> bool:
+    return os.environ.get("KRASIS_STARTUP_DIAG", "") == "1"
+
+
+def _env_flag(name: str) -> Optional[bool]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    return raw.strip() not in ("", "0", "false", "False")
+
 def _start_session_bridge(host: str, port: int) -> Optional[subprocess.Popen]:
     """Start the Session messenger bridge as a subprocess.
 
@@ -944,7 +966,43 @@ def main():
         warmup_probe = _model.tokenizer.encode(" hello") if _model.tokenizer is not None else []
         if warmup_probe:
             warmup_token = int(warmup_probe[0])
-        warmup_len = min(25000, max(256, int(getattr(args, "gpu_prefill_threshold", 300))))
+        warmup_len_default = min(25000, max(256, int(getattr(args, "gpu_prefill_threshold", 300))))
+        startup_diag = _startup_diag_enabled()
+        warmup_len = (
+            _env_int("KRASIS_STARTUP_WARMUP_TOKENS", warmup_len_default, minimum=1)
+            if startup_diag else warmup_len_default
+        )
+        if startup_diag:
+            prefill_debug_enabled = os.environ.get("KRASIS_PREFILL_DEBUG", "") == "1"
+            prefill_timing_enabled = _env_flag("KRASIS_PREFILL_TIMING")
+            exit_after_calibration = _env_flag("KRASIS_STARTUP_EXIT_AFTER_CALIBRATION")
+            _detail(
+                f"Startup diag: warmup tokens={warmup_len:,} "
+                f"(default {warmup_len_default:,}, token={warmup_token})"
+            )
+            logger.info(
+                "Startup diag warmup: tokens=%d default_tokens=%d token_id=%d",
+                warmup_len, warmup_len_default, warmup_token,
+            )
+            no_graph = _env_flag("KRASIS_NO_GRAPH")
+            mapped_reads = _env_flag("KRASIS_MAPPED_READS")
+            _detail(
+                "Startup diag env: "
+                f"no_graph={no_graph if no_graph is not None else 'unset'}, "
+                f"mapped_reads={mapped_reads if mapped_reads is not None else 'unset'}, "
+                f"prefill_debug={prefill_debug_enabled}, "
+                f"prefill_timing={prefill_timing_enabled if prefill_timing_enabled is not None else 'unset'}, "
+                f"exit_after_calibration={exit_after_calibration if exit_after_calibration is not None else 'unset'}"
+            )
+            logger.info(
+                "Startup diag env: no_graph=%s mapped_reads=%s prefill_debug=%s "
+                "prefill_timing=%s exit_after_calibration=%s",
+                "unset" if no_graph is None else int(no_graph),
+                "unset" if mapped_reads is None else int(mapped_reads),
+                int(prefill_debug_enabled),
+                "unset" if prefill_timing_enabled is None else int(prefill_timing_enabled),
+                "unset" if exit_after_calibration is None else int(exit_after_calibration),
+            )
         gpu_store.rust_prefill_tokens([warmup_token] * warmup_len, 0.0)
         _model.server_cleanup()
         _detail(f"Rust prefill warmed with {warmup_len:,} tokens before HCS budgeting")
@@ -990,8 +1048,32 @@ def main():
         _model.cfg.max_position_embeddings,
         STARTUP_CALIBRATION_LONG_TOKENS_CAP,
     ) - 100)
-    short_target = min(STARTUP_CALIBRATION_SHORT_TOKENS, max_calibration_tokens)
-    long_target = max(short_target, min(max_calibration_tokens, int(max_calibration_tokens * 0.8)))
+    short_target_default = min(STARTUP_CALIBRATION_SHORT_TOKENS, max_calibration_tokens)
+    long_target_default = max(short_target_default, min(max_calibration_tokens, int(max_calibration_tokens * 0.8)))
+    startup_diag = _startup_diag_enabled()
+    short_target = short_target_default
+    long_target = long_target_default
+    if startup_diag:
+        short_target = min(max_calibration_tokens, _env_int(
+            "KRASIS_STARTUP_CAL_SHORT_TOKENS", short_target_default, minimum=1
+        ))
+        long_target = min(max_calibration_tokens, _env_int(
+            "KRASIS_STARTUP_CAL_LONG_TOKENS", long_target_default, minimum=1
+        ))
+    long_target = max(short_target, long_target)
+    if startup_diag:
+        _detail(
+            "Startup diag: calibration tokens "
+            f"short={short_target:,} (default {short_target_default:,}), "
+            f"long={long_target:,} (default {long_target_default:,}), "
+            f"cap={max_calibration_tokens:,}"
+        )
+        logger.info(
+            "Startup diag calibration: short_tokens=%d default_short=%d long_tokens=%d "
+            "default_long=%d cap=%d decode_tokens=%d",
+            short_target, short_target_default, long_target, long_target_default,
+            max_calibration_tokens, STARTUP_CALIBRATION_DECODE_TOKENS,
+        )
     calibration_prompts = _make_startup_calibration_prompts(_model, [short_target, long_target])
     calibration_stop_ids: list[int] = []
 
@@ -1006,15 +1088,18 @@ def main():
         baseline_free = int(vram_monitor.current_free_mb(dev_idx))
 
         vram_monitor.reset_min_free()
+        t_prefill = time.time()
         first_token, prompt_len, kv_overflow = gpu_store.rust_prefill_tokens(prompt_tokens, temperature=0.0)
         torch.cuda.synchronize()
         time.sleep(0.1)
+        prefill_elapsed = time.time() - t_prefill
         prefill_min_free = int(vram_monitor.min_free_mb(dev_idx))
         if kv_overflow:
             _model.server_cleanup()
             raise RuntimeError(f"{label} VRAM calibration overflowed KV cache at {prompt_len:,} tokens")
 
         vram_monitor.reset_min_free()
+        t_decode = time.time()
         gpu_store.gpu_generate_stream_probe(
             tokenizer_path=tokenizer_path,
             first_token=first_token,
@@ -1028,6 +1113,7 @@ def main():
         )
         torch.cuda.synchronize()
         time.sleep(0.1)
+        decode_elapsed = time.time() - t_decode
         decode_min_free = int(gpu_store.get_last_min_free_vram_mb())
 
         _model.server_cleanup()
@@ -1040,6 +1126,20 @@ def main():
             f"prefill min={prefill_min_free:,} MB, decode min={decode_min_free:,} MB, "
             f"post-cleanup={post_cleanup_free:,} MB"
         )
+        if startup_diag:
+            prefill_tps = prompt_len / prefill_elapsed if prefill_elapsed > 0 else 0.0
+            decode_tps = STARTUP_CALIBRATION_DECODE_TOKENS / decode_elapsed if decode_elapsed > 0 else 0.0
+            _detail(
+                f"{label}: prefill {prefill_elapsed:.2f}s ({prefill_tps:.1f} tok/s), "
+                f"decode {decode_elapsed:.2f}s ({decode_tps:.1f} tok/s)"
+            )
+            logger.info(
+                "Startup diag probe %s: prompt_len=%d baseline_free=%d prefill_min=%d "
+                "decode_min=%d post_cleanup=%d prefill_s=%.3f prefill_tps=%.2f "
+                "decode_s=%.3f decode_tps=%.2f",
+                label, prompt_len, baseline_free, prefill_min_free, decode_min_free,
+                post_cleanup_free, prefill_elapsed, prefill_tps, decode_elapsed, decode_tps,
+            )
         return prompt_len, baseline_free, prefill_min_free, decode_min_free
 
     short_tokens, short_baseline_free, short_prefill_min, short_decode_min = _measure_vram_probe(
@@ -1091,6 +1191,11 @@ def main():
         "VRAM calibration: post_free=%d MB, short=%dtok, long=%dtok, gpu0_reclaimable=%d MB, max_scratch=%d MB",
         post_calibration_free_mb, short_tokens, long_tokens, reclaimable_hcs_budget, max_scratch_mb,
     )
+    if startup_diag and _env_flag("KRASIS_STARTUP_EXIT_AFTER_CALIBRATION"):
+        _status("Startup diagnostic exit")
+        _detail("Exiting after VRAM calibration by request")
+        logger.info("Startup diagnostic exit after VRAM calibration requested")
+        return
 
     # ── Pre-compute multi-GPU layer splits (before HCS, so we can filter rankings) ──
     # Splits are based on total HCS budget (hard+soft) on each GPU, so layers

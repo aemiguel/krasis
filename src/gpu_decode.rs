@@ -27,6 +27,12 @@ fn stderr_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn prefill_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 // PTX compiled from src/cuda/decode_kernels.cu at build time.
 #[cfg(has_decode_kernels)]
 const DECODE_KERNELS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/decode_kernels.ptx"));
@@ -2216,6 +2222,7 @@ impl GpuDecodeStore {
         temperature: f32,
     ) -> PyResult<(usize, usize, bool)> {
         let prompt_len = token_ids.len();
+        let prefill_debug = prefill_debug_enabled();
         let (cache_fast_snapshot, ne) = {
             let (cache_fast, ne) = self.export_hcs_snapshot();
             (cache_fast.to_vec(), ne)
@@ -2247,6 +2254,15 @@ impl GpuDecodeStore {
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
                 }
             };
+            if prefill_debug {
+                eprintln!(
+                    "[PREFILL-DEBUG] bridge prompt_tokens={} prefill_ms={:.1} chunk_size={} scratch_tokens={}",
+                    prompt_len,
+                    prefill_result.prefill_time_ms,
+                    engine.config.prefill_chunk_size,
+                    engine.scratch.max_tokens,
+                );
+            }
 
             if let Err(e) = engine.release_scratch() {
                 log::error!("rust_prefill_tokens: failed to release scratch: {}", e);
@@ -14176,6 +14192,7 @@ impl GpuDecodeStore {
         }
 
         let decode_diag = std::env::var("KRASIS_DECODE_DIAG").map(|v| v == "1").unwrap_or(false);
+        let prefill_debug = prefill_debug_enabled();
 
         // Bind CUDA context to this thread. Required when called from
         // the server thread (which differs from the setup thread).
@@ -14188,6 +14205,38 @@ impl GpuDecodeStore {
             Some(g) => g.vocab_size,
             None => { log::error!("gpu_generate_stream: graph not configured"); return 0; }
         };
+
+        if prefill_debug {
+            let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
+            if let Some(graph) = self.graph.as_ref() {
+                let (mapped_reads_available, hcs_cached, hcs_soft_cached, hcs_soft_loaded) =
+                    if let Some(hcs) = graph.hcs.as_ref() {
+                        (
+                            hcs.mapped_reads_available,
+                            hcs.num_cached,
+                            hcs.soft_num_cached,
+                            hcs.soft_loaded,
+                        )
+                    } else {
+                        (false, 0, 0, false)
+                    };
+                eprintln!(
+                    "[PREFILL-DEBUG] decode request start_pos={} max_tokens={} no_graph={} graphs_valid={} graphs_ever_captured={} gpu_route_sync={} mapped_reads_active={} mapped_reads_available={} hcs_cached={} hcs_soft_cached={} hcs_soft_loaded={} timing={}",
+                    start_position,
+                    max_tokens,
+                    no_graph,
+                    graph.per_layer_graphs_valid,
+                    graph.graphs_ever_captured,
+                    graph.gpu_route_sync,
+                    graph.mapped_reads_active,
+                    mapped_reads_available,
+                    hcs_cached,
+                    hcs_soft_cached,
+                    hcs_soft_loaded,
+                    graph.timing_enabled,
+                );
+            }
+        }
 
         // Decode diagnostic: check LA recur state and conv state at decode start
         if decode_diag {

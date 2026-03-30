@@ -27,6 +27,12 @@ fn stderr_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn prefill_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 fn installed_package_sidecar(name: &str) -> Option<String> {
     use pyo3::types::PyModule;
 
@@ -833,6 +839,12 @@ impl PrefillEngine {
         self.hcs_num_experts_per_layer = num_experts_per_layer;
     }
 
+    fn hcs_cached_expert_count(&self) -> usize {
+        self.hcs_cache_fast.iter()
+            .filter(|ptrs| ptrs[0] != 0 || ptrs[1] != 0 || ptrs[2] != 0 || ptrs[3] != 0)
+            .count()
+    }
+
     pub fn set_prefill_hcs_guard_store_addr(&mut self, store_addr: usize) {
         self.prefill_hcs_store_addr = store_addr;
     }
@@ -1103,6 +1115,8 @@ impl PrefillEngine {
         // tokens for stable sorted dispatch. 128 adds ~57 MB scratch overhead.
         let target = prompt_tokens.min(50000);
         let mut scratch_tokens = max_by_vram.min(target).max(128);
+        let debug_prefill = prefill_debug_enabled();
+        let mut measured_cap_debug: Option<usize> = None;
 
         // If decode store calibration is available for this live request, further cap
         // scratch/chunk size using the measured no-HCS prefill model. This handles
@@ -1114,8 +1128,25 @@ impl PrefillEngine {
                 store.max_safe_prefill_chunk_tokens(target, free_mb)
             };
             if let Some(measured_cap) = measured_cap {
+                measured_cap_debug = Some(measured_cap);
                 scratch_tokens = scratch_tokens.min(measured_cap.max(128));
             }
+        }
+        if debug_prefill {
+            eprintln!(
+                "[PREFILL-DEBUG] prepare prompt_tokens={} free_mb={} total_mb={} safety_mb={} fixed_mb={:.1} per_tok_kb={:.1} usable_mb={:.1} target={} max_by_vram={} measured_cap={} initial_scratch={}",
+                prompt_tokens,
+                free_bytes / (1024 * 1024),
+                total_bytes / (1024 * 1024),
+                safety_margin_mb,
+                fixed_bytes as f64 / (1024.0 * 1024.0),
+                per_token_bytes as f64 / 1024.0,
+                usable as f64 / (1024.0 * 1024.0),
+                target,
+                max_by_vram,
+                measured_cap_debug.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
+                scratch_tokens,
+            );
         }
 
         // 5. Allocate prefill-only GPU buffers and scratch. If live post-allocation
@@ -1179,6 +1210,17 @@ impl PrefillEngine {
 
             unsafe { cuda_sys::lib().cuCtxSynchronize(); }
             unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut post_alloc_free_bytes, &mut total_bytes); }
+            if debug_prefill {
+                eprintln!(
+                    "[PREFILL-DEBUG] alloc attempt={} scratch_tokens={} post_alloc_free_mb={} safety_mb={} cold_staging_mb={} shared_fp32_mb={:.1}",
+                    attempt,
+                    scratch_tokens,
+                    post_alloc_free_bytes / (1024 * 1024),
+                    safety_margin_mb,
+                    (n_routed * self.cold_expert_bytes) / (1024 * 1024),
+                    (shared_scratch_elems * std::mem::size_of::<f32>()) as f64 / (1024.0 * 1024.0),
+                );
+            }
             if post_alloc_free_bytes >= safety_bytes || scratch_tokens <= 128 {
                 self.config.prefill_chunk_size = scratch_tokens;
                 break;
@@ -1239,6 +1281,16 @@ impl PrefillEngine {
         }
 
         let scratch_mb = (fixed_bytes + per_token_bytes * scratch_tokens) as f64 / (1024.0 * 1024.0);
+        if debug_prefill {
+            eprintln!(
+                "[PREFILL-DEBUG] ready scratch_tokens={} scratch_mb={:.1} prompt_tokens={} post_alloc_free_mb={} safety_mb={}",
+                scratch_tokens,
+                scratch_mb,
+                prompt_tokens,
+                post_alloc_free_bytes / (1024 * 1024),
+                safety_margin_mb,
+            );
+        }
         if scratch_tokens != old_tokens {
             if stderr_debug_enabled() {
                 eprintln!("[PREFILL] Dynamic scratch: {} tokens ({:.0} MB) for {}-token prompt ({} MB safety, {:.0} MB free)",
@@ -1322,6 +1374,7 @@ impl PrefillEngine {
         let diag_positions = if diag { Self::diag_positions(total_m) } else { vec![] };
         let diag_layer_limit = if diag { Self::diag_layer_limit() } else { 0 };
         let diag_moe_detail = std::env::var("KRASIS_PREFILL_DIAG_MOE_DETAIL").is_ok();
+        let debug_prefill = prefill_debug_enabled();
 
         // Dynamic chunk sizing: use largest clean divisor that fits in scratch buffers.
         // This minimises the number of chunk passes (and therefore MoE DMA repetitions).
@@ -1344,6 +1397,27 @@ impl PrefillEngine {
                 eprintln!("[PREFILL] Dynamic chunking: {} tokens -> {} chunks of {} (max_chunk={})",
                     total_m, num_chunks, chunk_size, max_chunk);
             }
+        }
+        if debug_prefill {
+            let has_linear_attn = self.config.la_num_k_heads > 0 || self.config.la_num_v_heads > 0
+                || self.config.layer_types.iter().any(|&t| t == 3);
+            let has_mamba = self.config.layer_types.iter().any(|&t| t == 1);
+            eprintln!(
+                "[PREFILL-DEBUG] run total_tokens={} scratch_max_tokens={} max_chunk={} chunk_size={} num_chunks={} marlin={} fused_moe={} flash_attn={} flash_attn_fp8kv={} linear_attn={} mamba={} gqa_heads={} kv_heads={}",
+                total_m,
+                self.scratch.max_tokens,
+                max_chunk,
+                chunk_size,
+                num_chunks,
+                self.kernels.marlin_mm.is_some(),
+                self.kernels.fused_moe_fn.is_some(),
+                self.kernels.flash_attn_fwd.is_some(),
+                self.kernels.flash_attn_fwd_fp8kv.is_some(),
+                has_linear_attn,
+                has_mamba,
+                self.config.num_q_heads,
+                self.config.num_kv_heads,
+            );
         }
 
         // Zero LA recurrent + conv state for fresh prefill (each prefill processes full prompt)
@@ -1391,6 +1465,20 @@ impl PrefillEngine {
         let pinning_enabled = use_fused
             && self.config.n_routed_experts > 0
             && std::env::var("KRASIS_NO_PINNING").is_err();
+        if debug_prefill {
+            let hcs_cached_experts = self.hcs_cached_expert_count();
+            eprintln!(
+                "[PREFILL-DEBUG] moe setup fused={} pointer_table={} pinning_enabled={} pinning_active={} pinning_pool_mb={:.1} prescan_layers={} hcs_cached_experts={} hcs_stride={}",
+                use_fused,
+                self.d_expert_w1_ptrs.is_some(),
+                pinning_enabled,
+                self.pinning_active,
+                self.pinning_pool_bytes as f64 / (1024.0 * 1024.0),
+                self.prescan_active_experts.len(),
+                hcs_cached_experts,
+                self.hcs_num_experts_per_layer,
+            );
+        }
 
         if pinning_enabled {
             // Embed the full prompt (or chunk-by-chunk for pre-scan)
@@ -1406,9 +1494,29 @@ impl PrefillEngine {
 
             // Run gate pre-scan on embedded tokens (routing info used by pointer table DMA)
             match self.gate_prescan(prescan_m, chunk_size, num_chunks) {
-                Ok(_prescan_counts) => {
-                    // Pinning pool is disabled — cold staging + pointer table handles
-                    // all expert DMA (HCS zero-copy + cold H2D staging).
+                Ok(prescan_counts) => {
+                    let pinned_per_layer = self.allocate_pinning_pool(&prescan_counts)
+                        .map_err(|e| format!("pinning pool allocation: {}", e))?;
+                    if debug_prefill {
+                        let active_layers = prescan_counts.len();
+                        let total_active: usize = prescan_counts.iter()
+                            .map(|layer| layer.iter().filter(|&&cnt| cnt > 0).count())
+                            .sum();
+                        let avg_active = if active_layers > 0 {
+                            total_active as f64 / active_layers as f64
+                        } else {
+                            0.0
+                        };
+                        eprintln!(
+                            "[PREFILL-DEBUG] prescan tokens={} active_layers={} avg_active_experts_per_layer={:.1} pinned_per_layer={} pinning_active={} pinning_pool_mb={:.1}",
+                            prescan_m,
+                            active_layers,
+                            avg_active,
+                            pinned_per_layer,
+                            self.pinning_active,
+                            self.pinning_pool_bytes as f64 / (1024.0 * 1024.0),
+                        );
+                    }
                 }
                 Err(e) => {
                     if stderr_debug_enabled() {
@@ -1453,9 +1561,17 @@ impl PrefillEngine {
                                         moe_data, i, mi,
                                         w1_base, w1s_base, w2_base, w2s_base,
                                         &active)?;
-                                    if stderr_debug_enabled() {
-                                        eprintln!("[PREFILL] First MoE layer {} selective DMA: {} hcs + {} pinned + {} cold",
-                                            i, h, p, c);
+                                    if stderr_debug_enabled() || debug_prefill {
+                                        eprintln!(
+                                            "[PREFILL-DEBUG] first_moe_layer={} active_experts={} selective_dma hcs={} pinned={} cold={} pinning_active={} pointer_table={}",
+                                            i,
+                                            active.len(),
+                                            h,
+                                            p,
+                                            c,
+                                            self.pinning_active,
+                                            self.d_expert_w1_ptrs.is_some(),
+                                        );
                                     }
                                 } else {
                                     self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
@@ -1526,6 +1642,7 @@ impl PrefillEngine {
             let chunk_end = std::cmp::min(chunk_start + chunk_size, total_m);
             let m = chunk_end - chunk_start;
             let chunk_tokens = &token_ids[chunk_start..chunk_end];
+            let chunk_t0 = if debug_prefill { Some(Instant::now()) } else { None };
 
             if m > self.scratch.max_tokens {
                 return Err(format!("Chunk {} tokens > scratch {}", m, self.scratch.max_tokens));
@@ -1713,6 +1830,18 @@ impl PrefillEngine {
                         layer_idx, lt_name, has_moe, last_pos_norm);
                 }
 
+            }
+            if let Some(chunk_t0) = chunk_t0 {
+                let chunk_ms = chunk_t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[PREFILL-DEBUG] chunk idx={} start={} end={} tokens={} ms={:.1} tok_per_s={:.1}",
+                    chunk_idx,
+                    chunk_start,
+                    chunk_end,
+                    m,
+                    chunk_ms,
+                    m as f64 / (chunk_ms / 1000.0),
+                );
             }
         }
 
@@ -4115,6 +4244,7 @@ impl PrefillEngine {
     /// One kernel launch handles ALL active experts per GEMM (w1, w2).
     fn forward_moe_fused(&mut self, layer_idx: usize, m: usize) -> Result<(), String> {
         let diag_moe = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
+        let debug_prefill = prefill_debug_enabled();
         let mt = self.gqa_timing_enabled.get(); // MoE timing flag (reuses same env var)
         let mt0 = if mt { self.stream_sync()?; Some(Instant::now()) } else { None };
         // Extract all needed fields from layer_weights up front so the borrow
@@ -4377,6 +4507,7 @@ impl PrefillEngine {
 
             let mi = moe_layer_idx.unwrap_or(0);
             let mut hcs_count = 0usize;
+            let mut pinned_count = 0usize;
             let mut cold_count = 0usize;
             let mut cold_slot = 0usize; // next available slot in cold staging
 
@@ -4400,7 +4531,33 @@ impl PrefillEngine {
                     self.h_expert_w2_ptrs[eid] = hw2p;
                     self.h_expert_w2s_ptrs[eid] = hw2s;
                     hcs_count += 1;
-                } else if let Some(md) = moe_data {
+                    continue;
+                }
+
+                let pin_offset = if self.pinning_active
+                    && mi < self.pinned_expert_offsets.len()
+                    && eid < self.pinned_expert_offsets[mi].len()
+                {
+                    self.pinned_expert_offsets[mi][eid]
+                } else {
+                    None
+                };
+
+                if let Some(pool_off) = pin_offset {
+                    let src = self.pinning_pool_ptr + pool_off as u64;
+                    let mut off = 0u64;
+                    self.h_expert_w1_ptrs[eid] = src + off;
+                    off += self.w1_packed_per_expert as u64;
+                    self.h_expert_w1s_ptrs[eid] = src + off;
+                    off += self.w1_scales_per_expert as u64;
+                    self.h_expert_w2_ptrs[eid] = src + off;
+                    off += self.w2_packed_per_expert as u64;
+                    self.h_expert_w2s_ptrs[eid] = src + off;
+                    pinned_count += 1;
+                    continue;
+                }
+
+                if let Some(md) = moe_data {
                     // Cold expert: H2D to staging slot.
                     // If cold staging is full, fall back to the contiguous fused buffer.
                     if eid < md.experts.len() && cold_slot >= self.max_cold_experts {
@@ -4504,9 +4661,9 @@ impl PrefillEngine {
             if layer_idx == 0 {
                 // Dump host-side pointer table to verify correctness
                 let first_active = active.first().copied().unwrap_or(0);
-                if stderr_debug_enabled() {
-                    eprintln!("[PTR-TABLE] layer0: {} hcs (zero-copy) + {} cold (H2D staged), active={}/{}",
-                        hcs_count, cold_count, active.len(), n_experts);
+                if stderr_debug_enabled() || debug_prefill {
+                    eprintln!("[PTR-TABLE] layer0: {} hcs + {} pinned + {} cold, active={}/{} pinning_active={}",
+                        hcs_count, pinned_count, cold_count, active.len(), n_experts, self.pinning_active);
                     eprintln!("[PTR-TABLE] host ptrs[0..4] = [{:#x}, {:#x}, {:#x}, {:#x}]",
                         self.h_expert_w1_ptrs[0], self.h_expert_w1_ptrs[1],
                         self.h_expert_w1_ptrs[2], self.h_expert_w1_ptrs[3]);
@@ -6583,7 +6740,7 @@ impl PrefillEngine {
         self.prescan_active_experts = per_chunk;
         let ms = t_prescan.elapsed().as_secs_f64() * 1000.0;
         let total_active: usize = counts.iter().map(|c| c.iter().filter(|&&v| v > 0).count()).sum();
-        if stderr_debug_enabled() {
+        if stderr_debug_enabled() || prefill_debug_enabled() {
             eprintln!("[PREFILL] Gate pre-scan: {} MoE layers in {:.1}ms, avg {:.0} active experts/layer",
                 num_moe_layers, ms, total_active as f64 / num_moe_layers as f64);
         }
@@ -6628,12 +6785,25 @@ impl PrefillEngine {
             return Ok(0);
         }
 
-        let total_pinned = experts_per_layer * num_moe_layers;
+        let active_counts: Vec<usize> = prescan_counts.iter()
+            .map(|layer| layer.iter().filter(|&&cnt| cnt > 0).count())
+            .collect();
+        let pin_counts: Vec<usize> = active_counts.iter()
+            .map(|&active| std::cmp::min(active, experts_per_layer))
+            .collect();
+        let total_pinned: usize = pin_counts.iter().sum();
+        if total_pinned == 0 {
+            if stderr_debug_enabled() || prefill_debug_enabled() {
+                eprintln!("[PREFILL] Pinning pool: no active experts in prescan, skipping");
+            }
+            return Ok(0);
+        }
         let pool_bytes = total_pinned * expert_bytes;
 
         if stderr_debug_enabled() {
-            eprintln!("[PREFILL] Pinning pool: {:.0} MB free, pinning {}/{} experts/layer ({} total, {:.0} MB)",
-                free as f64 / 1e6, experts_per_layer, n_experts, total_pinned, pool_bytes as f64 / 1e6);
+            let avg_pinned = total_pinned as f64 / num_moe_layers as f64;
+            eprintln!("[PREFILL] Pinning pool: {:.0} MB free, cap {}/{} experts/layer, pinning {} total ({:.1} avg/layer, {:.0} MB)",
+                free as f64 / 1e6, experts_per_layer, n_experts, total_pinned, avg_pinned, pool_bytes as f64 / 1e6);
         }
 
         // Allocate the pool using raw CUDA driver API
@@ -6657,6 +6827,7 @@ impl PrefillEngine {
 
         let t_pin = Instant::now();
 
+        let mut layer_base_offset = 0usize;
         for (mi, &layer_idx) in moe_layer_indices.iter().enumerate() {
             if mi >= num_moe_layers { break; }
 
@@ -6673,9 +6844,9 @@ impl PrefillEngine {
             };
 
             // Pin top experts
-            for rank in 0..experts_per_layer {
+            for rank in 0..pin_counts[mi] {
                 let (eid, _cnt) = ranked[rank];
-                let pool_offset = (mi * experts_per_layer + rank) * expert_bytes;
+                let pool_offset = layer_base_offset + rank * expert_bytes;
                 offsets[mi][eid] = Some(pool_offset);
 
                 // DMA expert weights from CPU to pinning pool
@@ -6700,6 +6871,7 @@ impl PrefillEngine {
                     }
                 }
             }
+            layer_base_offset += pin_counts[mi] * expert_bytes;
         }
 
         // Wait for all DMA to complete
@@ -6708,9 +6880,10 @@ impl PrefillEngine {
         }
 
         let pin_ms = t_pin.elapsed().as_secs_f64() * 1000.0;
-        if stderr_debug_enabled() {
-            eprintln!("[PREFILL] Pinned {} experts/layer across {} layers in {:.0}ms ({:.0} MB @ {:.1} GB/s)",
-                experts_per_layer, num_moe_layers, pin_ms,
+        if stderr_debug_enabled() || prefill_debug_enabled() {
+            let avg_pinned = total_pinned as f64 / num_moe_layers as f64;
+            eprintln!("[PREFILL] Pinned {} total experts across {} layers ({:.1} avg/layer) in {:.0}ms ({:.0} MB @ {:.1} GB/s)",
+                total_pinned, num_moe_layers, avg_pinned, pin_ms,
                 pool_bytes as f64 / 1e6,
                 pool_bytes as f64 / 1e9 / (pin_ms / 1000.0));
         }
@@ -6720,7 +6893,7 @@ impl PrefillEngine {
         self.pinned_expert_offsets = offsets;
         self.pinning_active = true;
 
-        Ok(experts_per_layer)
+        Ok(pin_counts.iter().copied().max().unwrap_or(0))
     }
 
     /// Selective DMA: copy only specific experts to fused buffer.

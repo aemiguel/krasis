@@ -870,12 +870,31 @@ class KrasisModel:
                 from krasis.linear_attention import warmup_compiled_chunk_step
                 primary = devices[0]
                 torch.cuda.set_device(primary)
+                la_warmup_chunk = 64
+                startup_diag = os.environ.get("KRASIS_STARTUP_DIAG", "") == "1"
+                la_t0 = time.perf_counter() if startup_diag else 0.0
+                if startup_diag:
+                    logger.info(
+                        "Linear attention compile warmup starting on %s: nv=%d dk=%d dv=%d chunk=%d",
+                        primary,
+                        self.cfg.linear_num_value_heads,
+                        self.cfg.linear_key_head_dim,
+                        self.cfg.linear_value_head_dim,
+                        la_warmup_chunk,
+                    )
                 warmup_compiled_chunk_step(
                     primary,
                     nv=self.cfg.linear_num_value_heads,
                     dk=self.cfg.linear_key_head_dim,
                     dv=self.cfg.linear_value_head_dim,
+                    chunk_size=la_warmup_chunk,
                 )
+                if startup_diag:
+                    logger.info(
+                        "Linear attention compile warmup finished on %s in %.3fs",
+                        primary,
+                        time.perf_counter() - la_t0,
+                    )
             except Exception as e:
                 raise RuntimeError(
                     f"Linear attention torch.compile warmup failed: {e}\n"
