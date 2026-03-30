@@ -194,6 +194,7 @@ pub struct PrefillKernels {
     kv_cache_append: RawCuFunc,
     kv_dequant_concat: RawCuFunc,
     kv_cache_append_polar4: RawCuFunc,
+    kv_dequant_concat_polar4: RawCuFunc,
     causal_conv1d: RawCuFunc,
     mamba2_ssd: RawCuFunc,
     mamba2_extract: RawCuFunc,
@@ -1734,7 +1735,7 @@ impl PrefillEngine {
                 // Mixer
                 let ta0 = Instant::now();
                 match layer_type {
-                    0 => self.forward_gqa_chunked(layer_idx, m, chunk_start)
+                    0 => self.forward_gqa_chunked(layer_idx, m, chunk_start, true)
                         .map_err(|e| format!("gqa layer {}: {}", layer_idx, e))?,
                     1 => self.forward_mamba2(layer_idx, m)
                         .map_err(|e| format!("mamba2 layer {}: {}", layer_idx, e))?,
@@ -2089,7 +2090,7 @@ impl PrefillEngine {
             }
 
             match layer_type {
-                0 => self.forward_gqa_chunked(layer_idx, m, 0)?,
+                0 => self.forward_gqa_chunked(layer_idx, m, 0, false)?,
                 1 => self.forward_mamba2(layer_idx, m)?,
                 2 => {
                     self.memcpy_d2d(
@@ -2552,11 +2553,11 @@ impl PrefillEngine {
     fn forward_gqa(
         &self, layer_idx: usize, m: usize,
     ) -> Result<(), String> {
-        self.forward_gqa_chunked(layer_idx, m, 0)
+        self.forward_gqa_chunked(layer_idx, m, 0, true)
     }
 
     fn forward_gqa_chunked(
-        &self, layer_idx: usize, m: usize, start_pos: usize,
+        &self, layer_idx: usize, m: usize, start_pos: usize, capture_kv_cache: bool,
     ) -> Result<(), String> {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
@@ -2705,6 +2706,116 @@ impl PrefillEngine {
                     self.gqa_fa2_calls.set(self.gqa_fa2_calls.get() + 1);
                     self.gqa_bf16_calls.set(self.gqa_bf16_calls.get() + 1);
                 }
+            } else if self.kv_format == 2
+                && layer_idx < self.kv_k_radius_ptrs.len()
+                && self.kv_k_radius_ptrs[layer_idx] != 0
+            {
+                // Cross-chunk attention: reconstruct cached Polar4 K/V to BF16,
+                // concat current BF16 chunk, then run standard BF16 FA2.
+                let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+                let total_kv = start_pos + m;
+                let kv_buf_bytes = (total_kv * kv_stride * 2) as u64; // BF16
+                let scratch_bytes =
+                    (self.scratch.d_fp32_scratch.len * std::mem::size_of::<f32>()) as u64;
+                let required_bytes = kv_buf_bytes * 2;
+                if required_bytes > scratch_bytes {
+                    return Err(format!(
+                        "Polar4 cross-chunk KV staging needs {} bytes, fp32 scratch has {}",
+                        required_bytes, scratch_bytes
+                    ));
+                }
+                let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
+                let full_k_bf16 = fp32_scratch;
+                let full_v_bf16 = fp32_scratch + kv_buf_bytes;
+
+                let gt_dequant = Instant::now();
+                let grid = (total_kv as u32, 1, 1);
+                let num_blocks = (kv_stride / 16) as u32;
+                unsafe {
+                    let mut a0 = full_k_bf16;
+                    let mut a1 = self.kv_k_radius_ptrs[layer_idx];
+                    let mut a2 = self.kv_k_angles_ptrs[layer_idx];
+                    let mut a3 = k;
+                    let mut a4 = start_pos as i32;
+                    let mut a5 = m as i32;
+                    let mut a6 = kv_stride as i32;
+                    launch(self.kernels.kv_dequant_concat_polar4,
+                        grid, (num_blocks, 1, 1), 0, self.stream,
+                        &mut [&mut a0 as *mut _ as *mut std::ffi::c_void,
+                              &mut a1 as *mut _ as *mut std::ffi::c_void,
+                              &mut a2 as *mut _ as *mut std::ffi::c_void,
+                              &mut a3 as *mut _ as *mut std::ffi::c_void,
+                              &mut a4 as *mut _ as *mut std::ffi::c_void,
+                              &mut a5 as *mut _ as *mut std::ffi::c_void,
+                              &mut a6 as *mut _ as *mut std::ffi::c_void])?;
+                    let mut b0 = full_v_bf16;
+                    let mut b1 = self.kv_v_radius_ptrs[layer_idx];
+                    let mut b2 = self.kv_v_angles_ptrs[layer_idx];
+                    let mut b3 = v;
+                    launch(self.kernels.kv_dequant_concat_polar4,
+                        grid, (num_blocks, 1, 1), 0, self.stream,
+                        &mut [&mut b0 as *mut _ as *mut std::ffi::c_void,
+                              &mut b1 as *mut _ as *mut std::ffi::c_void,
+                              &mut b2 as *mut _ as *mut std::ffi::c_void,
+                              &mut b3 as *mut _ as *mut std::ffi::c_void,
+                              &mut a4 as *mut _ as *mut std::ffi::c_void,
+                              &mut a5 as *mut _ as *mut std::ffi::c_void,
+                              &mut a6 as *mut _ as *mut std::ffi::c_void])?;
+                }
+
+                if gt {
+                    self.stream_sync()?;
+                    self.t_gqa_kv_prep.set(self.t_gqa_kv_prep.get() + gt_dequant.elapsed().as_secs_f64() * 1000.0);
+                }
+
+                let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+                let lse_ptr = self.scratch.d_fa2_lse.as_ref()
+                    .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
+                    .unwrap_or(std::ptr::null_mut());
+                let cu_q_data: [i32; 2] = [0, m as i32];
+                let cu_k_data: [i32; 2] = [0, total_kv as i32];
+                let cu_ptr = *self.scratch.d_workspace.device_ptr();
+                let cu_k_ptr = cu_ptr + 8;
+                unsafe {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        cu_ptr, cu_q_data.as_ptr() as *const _, 8, self.stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        cu_k_ptr, cu_k_data.as_ptr() as *const _, 8, self.stream);
+                }
+
+                let gt_fa2_bf16 = Instant::now();
+                let ret = unsafe {
+                    fa2_fwd(
+                        q as *const _,
+                        full_k_bf16 as *const _,
+                        full_v_bf16 as *const _,
+                        attn_out as *mut _,
+                        lse_ptr,
+                        cu_ptr as *const _,
+                        cu_k_ptr as *const _,
+                        1,
+                        m as i32,
+                        total_kv as i32,
+                        cfg.num_q_heads as i32,
+                        cfg.num_kv_heads as i32,
+                        cfg.head_dim as i32,
+                        m as i32,
+                        total_kv as i32,
+                        scale,
+                        1,
+                        1,
+                        self.stream as *mut _,
+                    )
+                };
+                if ret != 0 {
+                    return Err(format!("FlashAttention-2 Polar4 cross-chunk forward failed: {}", ret));
+                }
+                if gt {
+                    self.stream_sync()?;
+                    self.t_gqa_fa2.set(self.t_gqa_fa2.get() + gt_fa2_bf16.elapsed().as_secs_f64() * 1000.0);
+                    self.gqa_fa2_calls.set(self.gqa_fa2_calls.get() + 1);
+                    self.gqa_bf16_calls.set(self.gqa_bf16_calls.get() + 1);
+                }
             } else if layer_k_ptr != 0 && layer_v_ptr != 0 {
                 // Cross-chunk attention: Q attends to all K/V (cached FP8 + current BF16)
                 let kv_stride = cfg.num_kv_heads * cfg.head_dim;
@@ -2800,6 +2911,15 @@ impl PrefillEngine {
                 } else {
                     // Fallback: dequant FP8 cache + concat current BF16 K/V, then FA2 BF16
                     let kv_buf_bytes = (total_kv * kv_stride * 2) as u64; // BF16
+                    let scratch_bytes =
+                        (self.scratch.d_fp32_scratch.len * std::mem::size_of::<f32>()) as u64;
+                    let required_bytes = kv_buf_bytes * 2;
+                    if required_bytes > scratch_bytes {
+                        return Err(format!(
+                            "FP8 cross-chunk KV staging needs {} bytes, fp32 scratch has {}",
+                            required_bytes, scratch_bytes
+                        ));
+                    }
                     let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
                     let full_k_bf16 = fp32_scratch;
                     let full_v_bf16 = fp32_scratch + kv_buf_bytes;
@@ -2900,8 +3020,8 @@ impl PrefillEngine {
         }
 
         // KV cache append: BF16 K,V -> cache format into separate per-layer caches
-        // Skip if FP8 cross-chunk path already stored K/V before attention.
-        if self.kv_format == 2 && layer_idx < self.kv_k_radius_ptrs.len()
+        // Skip if cross-chunk path already stored K/V before attention.
+        if capture_kv_cache && self.kv_format == 2 && layer_idx < self.kv_k_radius_ptrs.len()
             && self.kv_k_radius_ptrs[layer_idx] != 0
         {
             // Polar4: BF16 K,V -> 4-bit rotated polar format
@@ -2931,7 +3051,7 @@ impl PrefillEngine {
                     ],
                 )?;
             }
-        } else if layer_k_ptr != 0 && layer_v_ptr != 0 && !kv_cache_already_stored {
+        } else if capture_kv_cache && layer_k_ptr != 0 && layer_v_ptr != 0 && !kv_cache_already_stored {
             // FP8 E4M3: standard path
             let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
             let kt = std::cmp::max(32, ((std::cmp::min(256, kv_stride as usize) + 31) / 32) * 32) as u32;
@@ -7567,6 +7687,7 @@ impl PrefillKernels {
                 "kv_cache_append_fp8_kernel",
                 "kv_cache_dequant_concat_kernel",
                 "kv_cache_append_polar4_kernel",
+                "kv_cache_dequant_concat_polar4_kernel",
                 // Optimized LA kernels (BF16 pipeline)
                 "la_fused_conv1d_silu_bf16_kernel",
                 "la_update_conv_state_kernel",
@@ -7629,6 +7750,7 @@ impl PrefillKernels {
             kv_cache_append: get("kv_cache_append_kernel")?,
             kv_dequant_concat: get("kv_cache_dequant_concat_kernel")?,
             kv_cache_append_polar4: get("kv_cache_append_polar4_kernel")?,
+            kv_dequant_concat_polar4: get("kv_cache_dequant_concat_polar4_kernel")?,
             causal_conv1d: get("causal_conv1d_fwd_kernel")?,
             mamba2_ssd: get("mamba2_ssd_sequential_kernel")?,
             mamba2_extract: get("mamba2_extract_kernel")?,
@@ -8513,6 +8635,8 @@ mod kernel_tests {
                     "concat_3_bf16_kernel",
                     "gated_q_split_kernel",
                     "kv_cache_append_fp8_kernel",
+                    "kv_cache_append_polar4_kernel",
+                    "kv_cache_dequant_concat_polar4_kernel",
                     "flash_attn_tiled_kernel",
                     "la_l2norm_per_head_kernel",
                     "la_compute_gate_beta_kernel",
@@ -8542,6 +8666,15 @@ mod kernel_tests {
                     "moe_scatter_weighted_kernel",
                 ],
             ).expect("Failed to load prefill kernels PTX");
+            #[cfg(has_decode_kernels)]
+            dev.load_ptx(
+                cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/decode_kernels.ptx"))),
+                "decode_kernels",
+                &[
+                    "kv_cache_write_polar4",
+                    "gqa_attention_polar4",
+                ],
+            ).expect("Failed to load decode kernels PTX");
             GpuTestCtx { dev }
         }
 
@@ -8621,6 +8754,13 @@ mod kernel_tests {
         fn get_kernel(&self, name: &str) -> RawCuFunc {
             let func = self.dev.get_func("prefill_kernels", name)
                 .unwrap_or_else(|| panic!("Kernel not found in PTX: {}", name));
+            extract_cu_func(&func)
+        }
+
+        #[cfg(has_decode_kernels)]
+        fn get_decode_kernel(&self, name: &str) -> RawCuFunc {
+            let func = self.dev.get_func("decode_kernels", name)
+                .unwrap_or_else(|| panic!("Decode kernel not found in PTX: {}", name));
             extract_cu_func(&func)
         }
 
@@ -9397,6 +9537,435 @@ mod kernel_tests {
 
         assert_close_bf16(&actual_k, &expected_k, data.meta.atol, data.meta.rtol, "fp8_kv_roundtrip_k");
         assert_close_bf16(&actual_v, &expected_v, data.meta.atol, data.meta.rtol, "fp8_kv_roundtrip_v");
+    }
+
+    #[test]
+    fn test_polar4_kv_roundtrip_smoke() {
+        let ctx = GpuTestCtx::new();
+        let append = ctx.get_kernel("kv_cache_append_polar4_kernel");
+        let dequant = ctx.get_kernel("kv_cache_dequant_concat_polar4_kernel");
+
+        let m = 32usize;
+        let d = 512usize;
+        let max_seq = m;
+        let num_blocks = d / 16;
+
+        let make_input = |phase: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(m * d * 2);
+            for idx in 0..(m * d) {
+                let x = idx as f32;
+                let val = ((x * 0.03125 + phase).sin() * 0.75)
+                    + ((x * 0.0078125 + phase * 1.7).cos() * 0.25);
+                let bf = half::bf16::from_f32(val);
+                bytes.extend_from_slice(&bf.to_bits().to_le_bytes());
+            }
+            bytes
+        };
+
+        let k_bytes = make_input(0.3);
+        let v_bytes = make_input(1.1);
+        let d_k = ctx.upload_bf16(&k_bytes);
+        let d_v = ctx.upload_bf16(&v_bytes);
+
+        let d_k_radius = ctx.alloc_bf16(max_seq * num_blocks);
+        let d_v_radius = ctx.alloc_bf16(max_seq * num_blocks);
+        let d_k_angles = ctx.alloc_u8(max_seq * num_blocks * 8);
+        let d_v_angles = ctx.alloc_u8(max_seq * num_blocks * 8);
+        let d_k_out = ctx.alloc_bf16(m * d);
+        let d_v_out = ctx.alloc_bf16(m * d);
+
+        let mut m_i32 = m as i32;
+        let mut d_i32 = d as i32;
+        let mut max_seq_i32 = max_seq as i32;
+        let mut start_pos_i32: i32 = 0;
+
+        unsafe {
+            let threads = num_blocks as u32;
+            let mut kr_ptr = *d_k_radius.device_ptr() as u64;
+            let mut vr_ptr = *d_v_radius.device_ptr() as u64;
+            let mut ka_ptr = *d_k_angles.device_ptr() as u64;
+            let mut va_ptr = *d_v_angles.device_ptr() as u64;
+            let mut k_ptr = *d_k.device_ptr() as u64;
+            let mut v_ptr = *d_v.device_ptr() as u64;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut kr_ptr as *mut _ as *mut _,
+                &mut vr_ptr as *mut _ as *mut _,
+                &mut ka_ptr as *mut _ as *mut _,
+                &mut va_ptr as *mut _ as *mut _,
+                &mut k_ptr as *mut _ as *mut _,
+                &mut v_ptr as *mut _ as *mut _,
+                &mut m_i32 as *mut _ as *mut _,
+                &mut d_i32 as *mut _ as *mut _,
+                &mut max_seq_i32 as *mut _ as *mut _,
+                &mut start_pos_i32 as *mut _ as *mut _,
+            ];
+            launch(append, (m as u32, 1, 1), (threads, 1, 1), 0, ctx.stream(), &mut params).unwrap();
+        }
+        self::cuda_sync();
+
+        let mut cache_len_i32 = m as i32;
+        let mut cur_m_i32: i32 = 0;
+        unsafe {
+            let threads = num_blocks as u32;
+            let mut out_ptr = *d_k_out.device_ptr() as u64;
+            let mut radius_ptr = *d_k_radius.device_ptr() as u64;
+            let mut angles_ptr = *d_k_angles.device_ptr() as u64;
+            let mut new_ptr = *d_k.device_ptr() as u64;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut out_ptr as *mut _ as *mut _,
+                &mut radius_ptr as *mut _ as *mut _,
+                &mut angles_ptr as *mut _ as *mut _,
+                &mut new_ptr as *mut _ as *mut _,
+                &mut cache_len_i32 as *mut _ as *mut _,
+                &mut cur_m_i32 as *mut _ as *mut _,
+                &mut d_i32 as *mut _ as *mut _,
+            ];
+            launch(dequant, (m as u32, 1, 1), (threads, 1, 1), 0, ctx.stream(), &mut params).unwrap();
+
+            let mut out_v_ptr = *d_v_out.device_ptr() as u64;
+            let mut radius_v_ptr = *d_v_radius.device_ptr() as u64;
+            let mut angles_v_ptr = *d_v_angles.device_ptr() as u64;
+            let mut new_v_ptr = *d_v.device_ptr() as u64;
+            let mut params_v: Vec<*mut std::ffi::c_void> = vec![
+                &mut out_v_ptr as *mut _ as *mut _,
+                &mut radius_v_ptr as *mut _ as *mut _,
+                &mut angles_v_ptr as *mut _ as *mut _,
+                &mut new_v_ptr as *mut _ as *mut _,
+                &mut cache_len_i32 as *mut _ as *mut _,
+                &mut cur_m_i32 as *mut _ as *mut _,
+                &mut d_i32 as *mut _ as *mut _,
+            ];
+            launch(dequant, (m as u32, 1, 1), (threads, 1, 1), 0, ctx.stream(), &mut params_v).unwrap();
+        }
+        self::cuda_sync();
+
+        let actual_k = ctx.download_bf16(&d_k_out);
+        let actual_v = ctx.download_bf16(&d_v_out);
+
+        let max_abs_err = |actual: &[u8], expected: &[u8]| -> f32 {
+            actual.chunks_exact(2)
+                .zip(expected.chunks_exact(2))
+                .map(|(a, e)| {
+                    let av = half::bf16::from_bits(u16::from_le_bytes([a[0], a[1]])).to_f32();
+                    let ev = half::bf16::from_bits(u16::from_le_bytes([e[0], e[1]])).to_f32();
+                    (av - ev).abs()
+                })
+                .fold(0.0f32, f32::max)
+        };
+
+        let avg_abs_err = |actual: &[u8], expected: &[u8]| -> f32 {
+            let mut sum = 0.0f32;
+            let mut n = 0usize;
+            for (a, e) in actual.chunks_exact(2).zip(expected.chunks_exact(2)) {
+                let av = half::bf16::from_bits(u16::from_le_bytes([a[0], a[1]])).to_f32();
+                let ev = half::bf16::from_bits(u16::from_le_bytes([e[0], e[1]])).to_f32();
+                sum += (av - ev).abs();
+                n += 1;
+            }
+            sum / n as f32
+        };
+
+        let k_max = max_abs_err(&actual_k, &k_bytes);
+        let v_max = max_abs_err(&actual_v, &v_bytes);
+        let k_avg = avg_abs_err(&actual_k, &k_bytes);
+        let v_avg = avg_abs_err(&actual_v, &v_bytes);
+        eprintln!(
+            "  polar4_kv_roundtrip_smoke stats: k(max={:.6}, avg={:.6}) v(max={:.6}, avg={:.6})",
+            k_max, k_avg, v_max, v_avg
+        );
+
+        assert!(k_max < 0.40 && v_max < 0.40, "polar4 roundtrip too lossy: k_max={k_max:.6} v_max={v_max:.6}");
+        assert!(k_avg < 0.10 && v_avg < 0.10, "polar4 roundtrip avg too lossy: k_avg={k_avg:.6} v_avg={v_avg:.6}");
+    }
+
+    #[test]
+    fn test_polar4_kv_append_bounds_smoke() {
+        let ctx = GpuTestCtx::new();
+        let append = ctx.get_kernel("kv_cache_append_polar4_kernel");
+
+        let m = 32usize;
+        let d = 512usize;
+        let max_seq = m;
+        let num_blocks = d / 16;
+        let guard_bf16 = 64usize;
+        let guard_u8 = 128usize;
+
+        let make_input = |phase: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(m * d * 2);
+            for idx in 0..(m * d) {
+                let x = idx as f32;
+                let val = ((x * 0.03125 + phase).sin() * 0.75)
+                    + ((x * 0.0078125 + phase * 1.7).cos() * 0.25);
+                let bf = half::bf16::from_f32(val);
+                bytes.extend_from_slice(&bf.to_bits().to_le_bytes());
+            }
+            bytes
+        };
+
+        let k_bytes = make_input(0.3);
+        let v_bytes = make_input(1.1);
+        let d_k = ctx.upload_bf16(&k_bytes);
+        let d_v = ctx.upload_bf16(&v_bytes);
+
+        let radius_elems = max_seq * num_blocks;
+        let angle_elems = max_seq * num_blocks * 8;
+        let radius_guard_val: u16 = 0x7E5A;
+        let angle_guard_val: u8 = 0xA5;
+
+        let radius_init: Vec<u16> = vec![radius_guard_val; radius_elems + 2 * guard_bf16];
+        let angles_init: Vec<u8> = vec![angle_guard_val; angle_elems + 2 * guard_u8];
+        let d_k_radius = ctx.dev.htod_copy(radius_init.clone()).unwrap();
+        let d_v_radius = ctx.dev.htod_copy(radius_init.clone()).unwrap();
+        let d_k_angles = ctx.dev.htod_copy(angles_init.clone()).unwrap();
+        let d_v_angles = ctx.dev.htod_copy(angles_init.clone()).unwrap();
+
+        let mut m_i32 = m as i32;
+        let mut d_i32 = d as i32;
+        let mut max_seq_i32 = max_seq as i32;
+        let mut start_pos_i32: i32 = 0;
+
+        unsafe {
+            let threads = num_blocks as u32;
+            let mut kr_ptr = (*d_k_radius.device_ptr() as u64) + (guard_bf16 as u64 * 2);
+            let mut vr_ptr = (*d_v_radius.device_ptr() as u64) + (guard_bf16 as u64 * 2);
+            let mut ka_ptr = (*d_k_angles.device_ptr() as u64) + guard_u8 as u64;
+            let mut va_ptr = (*d_v_angles.device_ptr() as u64) + guard_u8 as u64;
+            let mut k_ptr = *d_k.device_ptr() as u64;
+            let mut v_ptr = *d_v.device_ptr() as u64;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut kr_ptr as *mut _ as *mut _,
+                &mut vr_ptr as *mut _ as *mut _,
+                &mut ka_ptr as *mut _ as *mut _,
+                &mut va_ptr as *mut _ as *mut _,
+                &mut k_ptr as *mut _ as *mut _,
+                &mut v_ptr as *mut _ as *mut _,
+                &mut m_i32 as *mut _ as *mut _,
+                &mut d_i32 as *mut _ as *mut _,
+                &mut max_seq_i32 as *mut _ as *mut _,
+                &mut start_pos_i32 as *mut _ as *mut _,
+            ];
+            launch(append, (m as u32, 1, 1), (threads, 1, 1), 0, ctx.stream(), &mut params).unwrap();
+        }
+        self::cuda_sync();
+
+        let k_radius_all = ctx.dev.dtoh_sync_copy(&d_k_radius).unwrap();
+        let v_radius_all = ctx.dev.dtoh_sync_copy(&d_v_radius).unwrap();
+        let k_angles_all = ctx.download_u8(&d_k_angles);
+        let v_angles_all = ctx.download_u8(&d_v_angles);
+
+        let check_u16_guards = |name: &str, data: &[u16]| {
+            assert!(data[..guard_bf16].iter().all(|&x| x == radius_guard_val),
+                "{name}: prefix guard overwritten");
+            assert!(data[guard_bf16 + radius_elems..].iter().all(|&x| x == radius_guard_val),
+                "{name}: suffix guard overwritten");
+        };
+        let check_u8_guards = |name: &str, data: &[u8]| {
+            assert!(data[..guard_u8].iter().all(|&x| x == angle_guard_val),
+                "{name}: prefix guard overwritten");
+            assert!(data[guard_u8 + angle_elems..].iter().all(|&x| x == angle_guard_val),
+                "{name}: suffix guard overwritten");
+        };
+
+        check_u16_guards("k_radius", &k_radius_all);
+        check_u16_guards("v_radius", &v_radius_all);
+        check_u8_guards("k_angles", &k_angles_all);
+        check_u8_guards("v_angles", &v_angles_all);
+    }
+
+    #[test]
+    fn test_polar4_prefill_append_matches_decode_read_path() {
+        let ctx = GpuTestCtx::new();
+        let append = ctx.get_kernel("kv_cache_append_polar4_kernel");
+        let write_decode = ctx.get_decode_kernel("kv_cache_write_polar4");
+        let attn_decode = ctx.get_decode_kernel("gqa_attention_polar4");
+
+        let nh = 32usize;
+        let nkv = 8usize;
+        let hd = 128usize;
+        let seq_len = 12usize;
+        let kv_stride = nkv * hd;
+        let num_blocks = kv_stride / 16;
+        let max_seq = seq_len;
+        let sm_sc = 1.0f32 / (hd as f32).sqrt();
+
+        let make_bf16 = |phase: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for idx in 0..len {
+                let x = idx as f32;
+                let val = ((x * 0.017 + phase).sin() * 0.70)
+                    + ((x * 0.005 + phase * 1.9).cos() * 0.20);
+                let bf = half::bf16::from_f32(val);
+                bytes.extend_from_slice(&bf.to_bits().to_le_bytes());
+            }
+            bytes
+        };
+        let bf16_bytes_to_f32 = |bytes: &[u8]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(bytes.len() * 2);
+            for chunk in bytes.chunks_exact(2) {
+                let bf = half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
+                out.extend_from_slice(&bf.to_f32().to_le_bytes());
+            }
+            out
+        };
+
+        let k_bf16 = make_bf16(0.25, seq_len * kv_stride);
+        let v_bf16 = make_bf16(1.05, seq_len * kv_stride);
+        let q_bf16 = make_bf16(0.65, nh * hd);
+        let k_f32 = bf16_bytes_to_f32(&k_bf16);
+        let v_f32 = bf16_bytes_to_f32(&v_bf16);
+        let q_f32 = bf16_bytes_to_f32(&q_bf16);
+
+        let d_k_bf16 = ctx.upload_bf16(&k_bf16);
+        let d_v_bf16 = ctx.upload_bf16(&v_bf16);
+        let d_k_f32 = ctx.upload_f32(&k_f32);
+        let d_v_f32 = ctx.upload_f32(&v_f32);
+        let d_q_f32 = ctx.upload_f32(&q_f32);
+
+        let d_prefill_k_radius = ctx.alloc_bf16(max_seq * num_blocks);
+        let d_prefill_v_radius = ctx.alloc_bf16(max_seq * num_blocks);
+        let d_prefill_k_angles = ctx.alloc_u8(max_seq * num_blocks * 8);
+        let d_prefill_v_angles = ctx.alloc_u8(max_seq * num_blocks * 8);
+        let d_decode_k_radius = ctx.alloc_bf16(max_seq * num_blocks);
+        let d_decode_v_radius = ctx.alloc_bf16(max_seq * num_blocks);
+        let d_decode_k_angles = ctx.alloc_u8(max_seq * num_blocks * 8);
+        let d_decode_v_angles = ctx.alloc_u8(max_seq * num_blocks * 8);
+        let d_out_prefill = ctx.alloc_f32(nh * hd);
+        let d_out_decode = ctx.alloc_f32(nh * hd);
+
+        let mut m_i32 = seq_len as i32;
+        let mut kv_stride_i32 = kv_stride as i32;
+        let mut max_seq_i32 = max_seq as i32;
+        let mut start_pos_i32 = 0i32;
+        unsafe {
+            let mut kr_ptr = *d_prefill_k_radius.device_ptr() as u64;
+            let mut vr_ptr = *d_prefill_v_radius.device_ptr() as u64;
+            let mut ka_ptr = *d_prefill_k_angles.device_ptr() as u64;
+            let mut va_ptr = *d_prefill_v_angles.device_ptr() as u64;
+            let mut k_ptr = *d_k_bf16.device_ptr() as u64;
+            let mut v_ptr = *d_v_bf16.device_ptr() as u64;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut kr_ptr as *mut _ as *mut _,
+                &mut vr_ptr as *mut _ as *mut _,
+                &mut ka_ptr as *mut _ as *mut _,
+                &mut va_ptr as *mut _ as *mut _,
+                &mut k_ptr as *mut _ as *mut _,
+                &mut v_ptr as *mut _ as *mut _,
+                &mut m_i32 as *mut _ as *mut _,
+                &mut kv_stride_i32 as *mut _ as *mut _,
+                &mut max_seq_i32 as *mut _ as *mut _,
+                &mut start_pos_i32 as *mut _ as *mut _,
+            ];
+            launch(append, (seq_len as u32, 1, 1), (num_blocks as u32, 1, 1), 0, ctx.stream(), &mut params).unwrap();
+        }
+        self::cuda_sync();
+
+        let base_k_f32 = *d_k_f32.device_ptr() as u64;
+        let base_v_f32 = *d_v_f32.device_ptr() as u64;
+        let token_bytes_f32 = (kv_stride * std::mem::size_of::<f32>()) as u64;
+        for pos in 0..seq_len {
+            let mut kr_ptr = *d_decode_k_radius.device_ptr() as u64;
+            let mut vr_ptr = *d_decode_v_radius.device_ptr() as u64;
+            let mut ka_ptr = *d_decode_k_angles.device_ptr() as u64;
+            let mut va_ptr = *d_decode_v_angles.device_ptr() as u64;
+            let mut k_ptr = base_k_f32 + pos as u64 * token_bytes_f32;
+            let mut v_ptr = base_v_f32 + pos as u64 * token_bytes_f32;
+            let mut pos_i32 = pos as i32;
+            unsafe {
+                let mut params: Vec<*mut std::ffi::c_void> = vec![
+                    &mut kr_ptr as *mut _ as *mut _,
+                    &mut vr_ptr as *mut _ as *mut _,
+                    &mut ka_ptr as *mut _ as *mut _,
+                    &mut va_ptr as *mut _ as *mut _,
+                    &mut k_ptr as *mut _ as *mut _,
+                    &mut v_ptr as *mut _ as *mut _,
+                    &mut pos_i32 as *mut _ as *mut _,
+                    &mut kv_stride_i32 as *mut _ as *mut _,
+                ];
+                launch(
+                    write_decode,
+                    (((num_blocks as u32) + 255) / 256, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    ctx.stream(),
+                    &mut params,
+                ).unwrap();
+            }
+        }
+        self::cuda_sync();
+
+        let run_attn = |out: &CudaSlice<f32>, k_radius: &CudaSlice<u16>, v_radius: &CudaSlice<u16>,
+                        k_angles: &CudaSlice<u8>, v_angles: &CudaSlice<u8>| {
+            let threads = 256u32;
+            let num_warps = threads / 32;
+            let shared_mem_bytes = ((hd as u32) * (num_warps + 1) + 2 * num_warps) * 4 + 128;
+            let mut out_ptr = *out.device_ptr() as u64;
+            let mut q_ptr = *d_q_f32.device_ptr() as u64;
+            let mut kr_ptr = *k_radius.device_ptr() as u64;
+            let mut vr_ptr = *v_radius.device_ptr() as u64;
+            let mut ka_ptr = *k_angles.device_ptr() as u64;
+            let mut va_ptr = *v_angles.device_ptr() as u64;
+            let mut sm_sc_val = sm_sc;
+            let mut nh_i32 = nh as i32;
+            let mut nkv_i32 = nkv as i32;
+            let mut hd_i32 = hd as i32;
+            let mut seq_len_i32 = seq_len as i32;
+            let mut max_seq_attn_i32 = max_seq as i32;
+            unsafe {
+                let mut params: Vec<*mut std::ffi::c_void> = vec![
+                    &mut out_ptr as *mut _ as *mut _,
+                    &mut q_ptr as *mut _ as *mut _,
+                    &mut kr_ptr as *mut _ as *mut _,
+                    &mut vr_ptr as *mut _ as *mut _,
+                    &mut ka_ptr as *mut _ as *mut _,
+                    &mut va_ptr as *mut _ as *mut _,
+                    &mut sm_sc_val as *mut _ as *mut _,
+                    &mut nh_i32 as *mut _ as *mut _,
+                    &mut nkv_i32 as *mut _ as *mut _,
+                    &mut hd_i32 as *mut _ as *mut _,
+                    &mut seq_len_i32 as *mut _ as *mut _,
+                    &mut max_seq_attn_i32 as *mut _ as *mut _,
+                ];
+                launch(
+                    attn_decode,
+                    (nh as u32, 1, 1),
+                    (threads, 1, 1),
+                    shared_mem_bytes,
+                    ctx.stream(),
+                    &mut params,
+                ).unwrap();
+            }
+        };
+
+        run_attn(&d_out_prefill, &d_prefill_k_radius, &d_prefill_v_radius, &d_prefill_k_angles, &d_prefill_v_angles);
+        run_attn(&d_out_decode, &d_decode_k_radius, &d_decode_v_radius, &d_decode_k_angles, &d_decode_v_angles);
+        self::cuda_sync();
+
+        let out_prefill = ctx.dev.dtoh_sync_copy(&d_out_prefill).unwrap();
+        let out_decode = ctx.dev.dtoh_sync_copy(&d_out_decode).unwrap();
+
+        let mut max_abs = 0.0f32;
+        let mut avg_abs = 0.0f32;
+        let mut dot = 0.0f64;
+        let mut norm_a = 0.0f64;
+        let mut norm_b = 0.0f64;
+        for (a, b) in out_prefill.iter().zip(out_decode.iter()) {
+            let diff = (a - b).abs();
+            max_abs = max_abs.max(diff);
+            avg_abs += diff;
+            dot += (*a as f64) * (*b as f64);
+            norm_a += (*a as f64) * (*a as f64);
+            norm_b += (*b as f64) * (*b as f64);
+        }
+        avg_abs /= out_prefill.len() as f32;
+        let cosine = dot / ((norm_a.sqrt() * norm_b.sqrt()).max(1e-12));
+        eprintln!(
+            "  polar4_prefill_vs_decode stats: cosine={:.6} max_abs={:.6} avg_abs={:.6}",
+            cosine, max_abs, avg_abs
+        );
+
+        assert!(cosine > 0.995, "prefill append vs decode write cosine too low: {cosine:.6}");
+        assert!(max_abs < 0.12, "prefill append vs decode write max abs too high: {max_abs:.6}");
+        assert!(avg_abs < 0.01, "prefill append vs decode write avg abs too high: {avg_abs:.6}");
     }
 
     /// Dequantize FP8 E4M3 byte to f32.

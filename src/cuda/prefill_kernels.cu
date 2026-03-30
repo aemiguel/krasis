@@ -3429,3 +3429,60 @@ extern "C" __global__ void kv_cache_append_polar4_kernel(
         v_ang[i] = (unsigned char)((v1 << 4) | v0);
     }
 }
+
+/* ── Polar4 KV Cache Dequant + Concat for Cross-Chunk FA2 ───────────────
+ * Reconstructs Polar4 cache [0..cache_len] back to BF16 K/V in the original
+ * domain, then copies current-chunk BF16 K/V [0..m] into [cache_len..cache_len+m].
+ *
+ * Grid: (cache_len + m, 1, 1), Block: (num_blocks, 1, 1)
+ * One thread handles one 16-value block within the KV stride.
+ */
+extern "C" __global__ void kv_cache_dequant_concat_polar4_kernel(
+    __nv_bfloat16* __restrict__ out,                /* [cache_len+m, kv_stride] BF16 output */
+    const unsigned short* __restrict__ radius_cache,/* [max_seq, num_blocks] BF16 radii */
+    const unsigned char* __restrict__ angles_cache, /* [max_seq, num_blocks * 8] packed 4-bit */
+    const __nv_bfloat16* __restrict__ kv_new,       /* [m, kv_stride] BF16 current chunk */
+    int cache_len,                                  /* number of cached tokens */
+    int m,                                          /* current chunk size */
+    int kv_stride)                                  /* num_kv_heads * head_dim */
+{
+    int ti = blockIdx.x;
+    int block_idx = threadIdx.x;
+    int num_blocks = kv_stride / 16;
+    if (block_idx >= num_blocks) return;
+
+    int base = block_idx * 16;
+
+    if (ti < cache_len) {
+        float local[16];
+        float r = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&radius_cache[ti * num_blocks + block_idx])
+        );
+        const unsigned char* ang = angles_cache + (ti * num_blocks + block_idx) * 8;
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            unsigned char p = ang[i];
+            local[i * 2] = r * polar4_codebook_p[p & 0xF];
+            local[i * 2 + 1] = r * polar4_codebook_p[p >> 4];
+        }
+
+        // Inverse SRR: x = S * H(y) / 4
+        fht16_p(local);
+        int64_t dst_off = (int64_t)ti * kv_stride + base;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            out[dst_off + i] = __float2bfloat16(local[i] * 0.25f * polar4_signs_p[i]);
+        }
+    } else {
+        int ci = ti - cache_len;
+        if (ci < m) {
+            int64_t src_off = (int64_t)ci * kv_stride + base;
+            int64_t dst_off = (int64_t)ti * kv_stride + base;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                out[dst_off + i] = kv_new[src_off + i];
+            }
+        }
+    }
+}
