@@ -34,6 +34,30 @@ fn main() {
     compile_flash_attn_kernels();
 }
 
+fn is_output_fresh(inputs: &[&str], outputs: &[&str]) -> bool {
+    if outputs.is_empty() || outputs.iter().any(|path| !std::path::Path::new(path).exists()) {
+        return false;
+    }
+
+    let newest_input = inputs
+        .iter()
+        .filter_map(|path| file_mtime(path))
+        .max()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    let oldest_output = outputs
+        .iter()
+        .filter_map(|path| file_mtime(path))
+        .min()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    oldest_output >= newest_input
+}
+
+fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 fn vendor_python_sidecar(so_path: &str) {
     let src = std::path::Path::new(so_path);
     if !src.exists() {
@@ -56,6 +80,27 @@ fn vendor_python_sidecar(so_path: &str) {
             );
             return;
         }
+    }
+
+    let should_copy = match (std::fs::metadata(src), std::fs::metadata(&dst)) {
+        (Ok(src_meta), Ok(dst_meta)) => {
+            let src_len = src_meta.len();
+            let dst_len = dst_meta.len();
+            let src_mtime = src_meta.modified().ok();
+            let dst_mtime = dst_meta.modified().ok();
+            src_len != dst_len
+                || match (src_mtime, dst_mtime) {
+                    (Some(src_time), Some(dst_time)) => dst_time < src_time,
+                    _ => true,
+                }
+        }
+        (Ok(_), Err(_)) => true,
+        _ => false,
+    };
+
+    if !should_copy {
+        println!("cargo:warning=Vendored sidecar already current at {}", dst.display());
+        return;
     }
 
     match std::fs::copy(src, &dst) {
@@ -91,6 +136,12 @@ fn compile_cuda_kernels() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let ptx_path = format!("{out_dir}/decode_kernels.ptx");
 
+    if is_output_fresh(&[cu_src], &[&ptx_path]) {
+        println!("cargo:rustc-cfg=has_decode_kernels");
+        println!("cargo:warning=Reusing cached GPU decode kernels at {ptx_path}");
+        return;
+    }
+
     // Compile .cu to .ptx targeting sm_80 (works on Ampere, Ada, Hopper)
     let status = std::process::Command::new(&nvcc)
         .args([
@@ -121,7 +172,9 @@ fn compile_cuda_kernels() {
 
 fn compile_prefill_kernels() {
     let cu_src = "src/cuda/prefill_kernels.cu";
+    let shim_header = "src/cuda/prefill_shim.h";
     println!("cargo:rerun-if-changed={cu_src}");
+    println!("cargo:rerun-if-changed={shim_header}");
     if !std::path::Path::new(cu_src).exists() {
         println!("cargo:warning=prefill_kernels.cu not found — GPU prefill kernels disabled");
         return;
@@ -135,6 +188,12 @@ fn compile_prefill_kernels() {
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let ptx_path = format!("{out_dir}/prefill_kernels.ptx");
+
+    if is_output_fresh(&[cu_src, shim_header], &[&ptx_path]) {
+        println!("cargo:rustc-cfg=has_prefill_kernels");
+        println!("cargo:warning=Reusing cached GPU prefill kernels at {ptx_path}");
+        return;
+    }
 
     let status = std::process::Command::new(&nvcc)
         .args([
@@ -159,28 +218,27 @@ fn compile_prefill_kernels() {
             println!("cargo:warning=nvcc execution error: {e} — GPU prefill kernels disabled");
         }
     }
-
-    println!("cargo:rerun-if-changed={cu_src}");
-    println!("cargo:rerun-if-changed=src/cuda/prefill_shim.h");
 }
 
 fn compile_marlin_kernels() {
     let marlin_dir = "src/cuda/marlin";
     let src_regular = format!("{marlin_dir}/marlin_vendor.cu");
     let src_moe = format!("{marlin_dir}/marlin_moe_vendor.cu");
+    let tracked_inputs = [
+        src_regular.as_str(),
+        src_moe.as_str(),
+        "src/cuda/marlin/marlin_vendor_common.h",
+        "src/cuda/marlin/kernel.h",
+        "src/cuda/marlin/marlin_template.h",
+        "src/cuda/marlin/marlin_dtypes.cuh",
+        "src/cuda/marlin/dequant.h",
+        "src/cuda/marlin/scalar_type.hpp",
+        "src/cuda/marlin/moe/kernel.h",
+        "src/cuda/marlin/moe/marlin_template.h",
+    ];
 
     // Track all Marlin source files for incremental rebuilds
-    for f in [
-        &src_regular, &src_moe,
-        &format!("{marlin_dir}/marlin_vendor_common.h"),
-        &format!("{marlin_dir}/kernel.h"),
-        &format!("{marlin_dir}/marlin_template.h"),
-        &format!("{marlin_dir}/marlin_dtypes.cuh"),
-        &format!("{marlin_dir}/dequant.h"),
-        &format!("{marlin_dir}/scalar_type.hpp"),
-        &format!("{marlin_dir}/moe/kernel.h"),
-        &format!("{marlin_dir}/moe/marlin_template.h"),
-    ] {
+    for f in tracked_inputs {
         println!("cargo:rerun-if-changed={f}");
     }
 
@@ -199,6 +257,13 @@ fn compile_marlin_kernels() {
     let obj_regular = format!("{out_dir}/marlin_vendor.o");
     let obj_moe = format!("{out_dir}/marlin_moe_vendor.o");
     let so_path = format!("{out_dir}/libkrasis_marlin.so");
+
+    if is_output_fresh(tracked_inputs.as_slice(), &[&obj_regular, &obj_moe, &so_path]) {
+        println!("cargo:rustc-cfg=has_marlin_kernels");
+        println!("cargo:warning=Reusing cached vendored Marlin kernels at {so_path}");
+        vendor_python_sidecar(&so_path);
+        return;
+    }
 
     let common_args = [
         "--expt-relaxed-constexpr",
@@ -277,19 +342,20 @@ fn compile_flash_attn_kernels() {
     let fa_dir = "src/cuda/flash_attn/fa2";
     let cutlass_dir = "src/cuda/flash_attn/cutlass";
     let vendor_src = format!("{fa_dir}/flash_attn_vendor.cu");
+    let tracked_inputs = [
+        vendor_src.as_str(),
+        "src/cuda/flash_attn/fa2/flash_attn_vendor.h",
+        "src/cuda/flash_attn/fa2/flash.h",
+        "src/cuda/flash_attn/fa2/flash_fwd_kernel.h",
+        "src/cuda/flash_attn/fa2/flash_fwd_launch_template.h",
+        "src/cuda/flash_attn/fa2/kernel_traits.h",
+        "src/cuda/flash_attn/fa2/softmax.h",
+        "src/cuda/flash_attn/fa2/mask.h",
+        "src/cuda/flash_attn/fa2/utils.h",
+    ];
 
     // Track key source files for incremental rebuilds
-    for f in [
-        &vendor_src,
-        &format!("{fa_dir}/flash_attn_vendor.h"),
-        &format!("{fa_dir}/flash.h"),
-        &format!("{fa_dir}/flash_fwd_kernel.h"),
-        &format!("{fa_dir}/flash_fwd_launch_template.h"),
-        &format!("{fa_dir}/kernel_traits.h"),
-        &format!("{fa_dir}/softmax.h"),
-        &format!("{fa_dir}/mask.h"),
-        &format!("{fa_dir}/utils.h"),
-    ] {
+    for f in tracked_inputs {
         println!("cargo:rerun-if-changed={f}");
     }
 
@@ -349,6 +415,26 @@ fn compile_flash_attn_kernels() {
         "flash_fwd_hdim256_bf16q_fp8kv_causal_sm80.cu",
         "flash_fwd_hdim256_bf16q_fp8kv_sm80.cu",
     ];
+
+    let source_paths: Vec<String> = cu_files
+        .iter()
+        .map(|cu_file| format!("{fa_dir}/{cu_file}"))
+        .collect();
+    let mut freshness_inputs: Vec<&str> = tracked_inputs.to_vec();
+    freshness_inputs.extend(source_paths.iter().map(|s| s.as_str()));
+    let obj_paths: Vec<String> = cu_files
+        .iter()
+        .map(|cu_file| format!("{out_dir}/fa2_{}", cu_file.replace(".cu", ".o")))
+        .collect();
+    let mut freshness_outputs: Vec<&str> = obj_paths.iter().map(|s| s.as_str()).collect();
+    freshness_outputs.push(so_path.as_str());
+
+    if is_output_fresh(freshness_inputs.as_slice(), freshness_outputs.as_slice()) {
+        println!("cargo:rustc-cfg=has_flash_attn_kernels");
+        println!("cargo:warning=Reusing cached vendored FlashAttention-2 kernels at {so_path}");
+        vendor_python_sidecar(&so_path);
+        return;
+    }
 
     // Compile each .cu to .o
     let mut obj_files = Vec::new();
