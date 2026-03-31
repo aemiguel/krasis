@@ -4632,12 +4632,30 @@ impl GpuDecodeStore {
             }
         }
 
+        // Also cap based on available host RAM — each soft slot needs a pinned
+        // host mirror for async DMA reload.  On systems where the Marlin expert
+        // cache already consumes most of RAM, this prevents OOM kills.
+        // Use 8% of total RAM as safety floor (RAM watchdog triggers at 5%).
+        let total_ram_mb = (crate::syscheck::get_total_gib() * 1024.0) as usize;
+        let host_safety_mb: usize = (total_ram_mb * 8 / 100).max(6 * 1024);
+        let host_avail_mb = (crate::syscheck::get_available_gib() * 1024.0) as usize;
+        let host_usable_mb = host_avail_mb.saturating_sub(host_safety_mb);
+        let host_usable_bytes = host_usable_mb * 1024 * 1024;
+        let host_max_slots = host_usable_bytes / slot_size;
+        if host_max_slots < soft_num_slots {
+            log::warn!(
+                "HCS soft tier: capping from {} to {} slots due to host RAM ({} MB available, {} MB safety)",
+                soft_num_slots, host_max_slots, host_avail_mb, host_safety_mb,
+            );
+            soft_num_slots = host_max_slots;
+        }
+
         if soft_num_slots == 0 {
-            log::warn!("HCS soft tier: no VRAM available for soft experts after safety margin");
+            log::warn!("HCS soft tier: no VRAM or host RAM available for soft experts after safety margins");
             hcs.soft_loaded = true;
             hcs.soft_num_slots = 0;
             hcs.soft_num_cached = 0;
-            return Ok(format!("{} | soft: 0 experts (insufficient VRAM)", result));
+            return Ok(format!("{} | soft: 0 experts (insufficient VRAM or host RAM)", result));
         }
 
         // Compute chunk size for granular reclaim and load/reload guardrails.
@@ -4701,6 +4719,23 @@ impl GpuDecodeStore {
                 }
             }
             soft_chunks.push(chunk_buf);
+            // Check host RAM before allocating pinned host mirror — the Marlin
+            // expert cache already occupies tens of GB of pinned RAM and the
+            // host chunk allocation can push the process past system limits.
+            let host_avail_mb = (crate::syscheck::get_available_gib() * 1024.0) as usize;
+            let chunk_mb = chunk_bytes / (1024 * 1024);
+            let total_ram_mb = (crate::syscheck::get_total_gib() * 1024.0) as usize;
+            let host_safety_mb = (total_ram_mb * 8 / 100).max(6 * 1024);
+            if host_avail_mb < chunk_mb.saturating_add(host_safety_mb) {
+                log::warn!(
+                    "HCS soft tier: stopping host allocation at chunk {} — host RAM available={} MB, \
+                     chunk={} MB, host safety={} MB",
+                    c, host_avail_mb, chunk_mb, host_safety_mb,
+                );
+                // Drop the GPU chunk we already allocated since we can't mirror it
+                soft_chunks.pop();
+                break;
+            }
             soft_host_chunks.push(PinnedHostChunk::new(chunk_bytes));
             actual_soft_slots += slots_this_chunk;
         }
