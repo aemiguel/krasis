@@ -5290,12 +5290,11 @@ impl GpuDecodeStore {
     ///
     /// kv_ptrs: list of (layer_idx, k_data_ptr, v_data_ptr) device pointers.
     /// max_seq: maximum sequence length the buffers can hold.
-    #[pyo3(signature = (kv_ptrs, max_seq, kv_format=1))]
+    #[pyo3(signature = (kv_ptrs, max_seq))]
     fn set_kv_cache_ptrs(
         &mut self,
         kv_ptrs: Vec<(usize, usize, usize)>,
         max_seq: usize,
-        kv_format: u32,
     ) -> PyResult<()> {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
@@ -5303,7 +5302,6 @@ impl GpuDecodeStore {
         graph.kv_k_ptrs = vec![0u64; num_layers];
         graph.kv_v_ptrs = vec![0u64; num_layers];
         graph.kv_max_seq = max_seq;
-        graph.kv_format = kv_format;
         let mut registered = 0usize;
         for (layer_idx, k_ptr, v_ptr) in kv_ptrs {
             if layer_idx >= num_layers {
@@ -5314,9 +5312,8 @@ impl GpuDecodeStore {
             graph.kv_v_ptrs[layer_idx] = v_ptr as u64;
             registered += 1;
         }
-        let fmt_name = match kv_format { 0 => "BF16", 1 => "FP8", 2 => "Polar4", _ => "?" };
-        log::info!("GpuDecodeStore: KV cache {} pointers set ({} GQA layers, max_seq={})",
-            fmt_name, registered, max_seq);
+        log::info!("GpuDecodeStore: KV cache shared FP8 pointers set ({} GQA layers, max_seq={})",
+            registered, max_seq);
 
         // Allocate FlashDecoding tiled attention buffers.
         // Find max num_q_heads and head_dim across all GQA layers.

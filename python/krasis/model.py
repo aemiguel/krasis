@@ -4595,10 +4595,9 @@ class KrasisModel:
                     gqa_cache_idx += 1
                     kv_ptrs.append((layer_idx, k_layer.data_ptr(), v_layer.data_ptr()))
             max_seq = cache.max_pages * cache.page_size
-            store.set_kv_cache_ptrs(kv_ptrs, max_seq, kv_format=cache.kv_format)
-            fmt_name = {0: "BF16", 1: "FP8", 2: "Polar4"}.get(cache.kv_format, "?")
-            logger.info("Shared %s KV cache: %d GQA layers, max_seq=%d (%d pages × %d)",
-                        fmt_name, len(kv_ptrs), max_seq, cache.max_pages, cache.page_size)
+            store.set_kv_cache_ptrs(kv_ptrs, max_seq)
+            logger.info("Shared FP8 KV cache: %d GQA layers, max_seq=%d (%d pages × %d)",
+                        len(kv_ptrs), max_seq, cache.max_pages, cache.page_size)
         elif cache is not None and cache.ckv_cache is not None:
             # MLA-only model (no GQA layers): still need to set max_seq for Rust decode
             max_seq = cache.max_pages * cache.page_size
