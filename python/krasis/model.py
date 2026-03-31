@@ -4488,8 +4488,8 @@ class KrasisModel:
                         torch.arange(0, rope_half * 2, 2, dtype=torch.float32) / (rope_half * 2)))
                     t = torch.arange(max_seq, dtype=torch.float32)
                     freqs = torch.outer(t, inv_freq)
-                    cos_f32 = freqs.cos().contiguous()
-                    sin_f32 = freqs.sin().contiguous()
+                    cos_f32 = freqs.cos().contiguous().to(device)
+                    sin_f32 = freqs.sin().contiguous().to(device)
                     self._rust_rope_cos = cos_f32
                     self._rust_rope_sin = sin_f32
                     store.set_rope_tables(

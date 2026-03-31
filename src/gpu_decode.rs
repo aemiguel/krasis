@@ -9921,24 +9921,36 @@ impl GpuDecodeStore {
                     }
 
                     if batch_count < topk {
-                        let dummy_base = graph.d_dummy_expert.as_ref()
-                            .map(|b| *b.device_ptr()).unwrap_or(buf_base[0]);
-                        let dummy_ptrs = if let Some(ref dp) = graph.d_dummy_ptrs {
-                            let mut ptrs = [0u64; 4];
-                            unsafe {
-                                cuda_sys::lib().cuMemcpyDtoH_v2(
-                                    ptrs.as_mut_ptr() as *mut std::ffi::c_void,
-                                    *dp.device_ptr(), 32);
-                            }
-                            ptrs
+                        // Zero-weight padding only needs pointers that are safe to dereference.
+                        // Reuse the first real expert when available so graph replay never
+                        // depends on synthetic dummy layout details (safer across architectures).
+                        let fill_ptrs = if batch_count > 0 {
+                            [
+                                graph.h_batch_w13_packed_ptrs[0],
+                                graph.h_batch_w13_scales_ptrs[0],
+                                graph.h_batch_w2_packed_ptrs[0],
+                                graph.h_batch_w2_scales_ptrs[0],
+                            ]
                         } else {
-                            [dummy_base, dummy_base, dummy_base, dummy_base]
+                            let dummy_base = graph.d_dummy_expert.as_ref()
+                                .map(|b| *b.device_ptr()).unwrap_or(buf_base[0]);
+                            if let Some(ref dp) = graph.d_dummy_ptrs {
+                                let mut ptrs = [0u64; 4];
+                                unsafe {
+                                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                                        ptrs.as_mut_ptr() as *mut std::ffi::c_void,
+                                        *dp.device_ptr(), 32);
+                                }
+                                ptrs
+                            } else {
+                                [dummy_base, dummy_base, dummy_base, dummy_base]
+                            }
                         };
                         for i in batch_count..topk.min(max_ept) {
-                            graph.h_batch_w13_packed_ptrs[i] = dummy_ptrs[0];
-                            graph.h_batch_w13_scales_ptrs[i] = dummy_ptrs[1];
-                            graph.h_batch_w2_packed_ptrs[i] = dummy_ptrs[2];
-                            graph.h_batch_w2_scales_ptrs[i] = dummy_ptrs[3];
+                            graph.h_batch_w13_packed_ptrs[i] = fill_ptrs[0];
+                            graph.h_batch_w13_scales_ptrs[i] = fill_ptrs[1];
+                            graph.h_batch_w2_packed_ptrs[i] = fill_ptrs[2];
+                            graph.h_batch_w2_scales_ptrs[i] = fill_ptrs[3];
                             graph.h_batch_weights[i] = 0.0;
                         }
                     }
