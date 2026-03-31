@@ -501,6 +501,8 @@ pub struct PrefillLayerWeights {
     pub gqa_gated: bool,        // QCN: q_proj outputs [query, gate], apply sigmoid(gate) before o_proj
     pub mamba2_in_proj: Option<MarlinWeight>,
     pub mamba2_out_proj: Option<MarlinWeight>,
+    pub mamba2_in_proj_bf16: Option<Bf16Weight>,
+    pub mamba2_out_proj_bf16: Option<Bf16Weight>,
     pub mamba2_conv_weight: u64,    // 0 = None
     pub mamba2_conv_bias: u64,
     #[allow(non_snake_case)]
@@ -1734,6 +1736,7 @@ impl PrefillEngine {
 
                 // Mixer
                 let ta0 = Instant::now();
+
                 match layer_type {
                     0 => self.forward_gqa_chunked(layer_idx, m, chunk_start, true)
                         .map_err(|e| format!("gqa layer {}: {}", layer_idx, e))?,
@@ -3113,8 +3116,12 @@ impl PrefillEngine {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
 
-        let in_proj = lw.mamba2_in_proj.as_ref().ok_or("missing in_proj")?;
-        let out_proj = lw.mamba2_out_proj.as_ref().ok_or("missing out_proj")?;
+        if lw.mamba2_in_proj.is_none() && lw.mamba2_in_proj_bf16.is_none() {
+            return Err("missing mamba2 in_proj (no Marlin or BF16)".to_string());
+        }
+        if lw.mamba2_out_proj.is_none() && lw.mamba2_out_proj_bf16.is_none() {
+            return Err("missing mamba2 out_proj (no Marlin or BF16)".to_string());
+        }
 
         let hidden = *self.scratch.d_hidden.device_ptr();
         let attn_out = *self.scratch.d_attn_out.device_ptr();
@@ -3131,7 +3138,7 @@ impl PrefillEngine {
         let in_proj_dim = 2 * d_inner + 2 * bc_size + n_heads;
 
         // 1. in_proj GEMM
-        self.marlin_gemm(hidden, in_proj, in_buf, m)?;
+        self.la_gemm(hidden, &lw.mamba2_in_proj, &lw.mamba2_in_proj_bf16, in_buf, m)?;
 
         // 2. Zero SSM state
         unsafe {
@@ -3211,7 +3218,7 @@ impl PrefillEngine {
         }
 
         // 5. out_proj GEMM
-        self.marlin_gemm(ssd_out, out_proj, attn_out, m)?;
+        self.la_gemm(ssd_out, &lw.mamba2_out_proj, &lw.mamba2_out_proj_bf16, attn_out, m)?;
 
         Ok(())
     }

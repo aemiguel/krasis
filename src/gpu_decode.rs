@@ -5290,11 +5290,12 @@ impl GpuDecodeStore {
     ///
     /// kv_ptrs: list of (layer_idx, k_data_ptr, v_data_ptr) device pointers.
     /// max_seq: maximum sequence length the buffers can hold.
-    #[pyo3(signature = (kv_ptrs, max_seq))]
+    #[pyo3(signature = (kv_ptrs, max_seq, kv_format=1))]
     fn set_kv_cache_ptrs(
         &mut self,
         kv_ptrs: Vec<(usize, usize, usize)>,
         max_seq: usize,
+        kv_format: u32,
     ) -> PyResult<()> {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
@@ -5302,6 +5303,7 @@ impl GpuDecodeStore {
         graph.kv_k_ptrs = vec![0u64; num_layers];
         graph.kv_v_ptrs = vec![0u64; num_layers];
         graph.kv_max_seq = max_seq;
+        graph.kv_format = kv_format;
         let mut registered = 0usize;
         for (layer_idx, k_ptr, v_ptr) in kv_ptrs {
             if layer_idx >= num_layers {
@@ -5312,8 +5314,9 @@ impl GpuDecodeStore {
             graph.kv_v_ptrs[layer_idx] = v_ptr as u64;
             registered += 1;
         }
-        log::info!("GpuDecodeStore: KV cache shared FP8 pointers set ({} GQA layers, max_seq={})",
-            registered, max_seq);
+        let fmt_name = match kv_format { 0 => "BF16", 1 => "FP8", 2 => "Polar4", _ => "?" };
+        log::info!("GpuDecodeStore: KV cache {} pointers set ({} GQA layers, max_seq={})",
+            fmt_name, registered, max_seq);
 
         // Allocate FlashDecoding tiled attention buffers.
         // Find max num_q_heads and head_dim across all GQA layers.
@@ -6387,10 +6390,12 @@ impl GpuDecodeStore {
         let mut num_kv_heads = 0usize;
         let mut head_dim = 0usize;
 
-        // Detect dimensions from first GQA layer
+        // Detect dimensions from first real GQA layer (skip MoE-only layers with 0 heads)
         for l in &graph.layers {
             match &l.attn {
-                GpuAttnConfig::GQA { num_heads, num_kv_heads: nkv, head_dim: hd, .. } => {
+                GpuAttnConfig::GQA { num_heads, num_kv_heads: nkv, head_dim: hd, .. }
+                    if *num_heads > 0 =>
+                {
                     num_q_heads = *num_heads;
                     num_kv_heads = *nkv;
                     head_dim = *hd;
@@ -6417,7 +6422,11 @@ impl GpuDecodeStore {
 
         for (i, l) in graph.layers.iter().enumerate() {
             match &l.attn {
-                GpuAttnConfig::GQA { .. } => { layer_types[i] = 0; }
+                GpuAttnConfig::GQA { num_heads, .. } => {
+                    // MoE-only layers (Nemotron) are registered as GQA with 0 heads;
+                    // assign type 2 (passthrough) so prefill skips attention.
+                    layer_types[i] = if *num_heads == 0 { 2 } else { 0 };
+                }
                 GpuAttnConfig::Mamba2 { num_heads, head_dim: hd, state_size,
                                         expand, conv_kernel, conv_dim, .. } => {
                     layer_types[i] = 1;
@@ -6555,6 +6564,7 @@ impl GpuDecodeStore {
                 q_proj_bf16: None, k_proj_bf16: None, v_proj_bf16: None, o_proj_bf16: None,
                 gqa_gated: false,
                 mamba2_in_proj: None, mamba2_out_proj: None,
+                mamba2_in_proj_bf16: None, mamba2_out_proj_bf16: None,
                 mamba2_conv_weight: 0, mamba2_conv_bias: 0,
                 mamba2_A: 0, mamba2_D: 0, mamba2_dt_bias: 0, mamba2_norm: 0,
                 moe_gate_ptr: 0, moe_gate_rows: 0, moe_gate_cols: 0,
@@ -6596,6 +6606,9 @@ impl GpuDecodeStore {
                 {
                     lw.mamba2_in_proj = extract_marlin(*in_proj);
                     lw.mamba2_out_proj = extract_marlin(*out_proj);
+                    // BF16 fallback for attention_quant="bf16"
+                    if lw.mamba2_in_proj.is_none() { lw.mamba2_in_proj_bf16 = extract_bf16(*in_proj); }
+                    if lw.mamba2_out_proj.is_none() { lw.mamba2_out_proj_bf16 = extract_bf16(*out_proj); }
                     lw.mamba2_conv_weight = *conv_weight_ptr;
                     lw.mamba2_A = *a_ptr;
                     lw.mamba2_D = *d_ptr;
@@ -8608,12 +8621,12 @@ impl GpuDecodeStore {
         let mut first_residual = include_embedding && seg_start == 0;
         let mut gqa_cache_idx = seg_gqa_offset;
 
-        // Count GQA layers before our routing range start (from segment start, not 0)
+        // Count real GQA layers (num_heads > 0) before our routing range start
         if let Some((start, _)) = routing_range {
             gqa_cache_idx = seg_gqa_offset;
             for i in seg_start..start {
-                if let GpuAttnConfig::GQA { .. } = &graph.layers[i].attn {
-                    gqa_cache_idx += 1;
+                if let GpuAttnConfig::GQA { num_heads, .. } = &graph.layers[i].attn {
+                    if *num_heads > 0 { gqa_cache_idx += 1; }
                 }
             }
             if !include_embedding || start > 0 {
@@ -10824,9 +10837,9 @@ impl GpuDecodeStore {
                         graph.t_gqa_out += (Instant::now() - t_gqa_out_start).as_secs_f64();
                     }
 
-                    gqa_cache_idx += 1;
+                    gqa_cache_idx += 1;  // only for real GQA layers (nh > 0)
 
-                    } // end of `if nh > 0` else block (skip MoE-only layers)
+                    } // end of `if nh > 0` block (skip MoE-only layers with 0 heads)
                 }
 
                 GpuAttnConfig::MLA {
