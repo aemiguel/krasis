@@ -8800,6 +8800,12 @@ impl GpuDecodeStore {
                     } => {
                         let nh = *num_heads; let nkv = *num_kv_heads;
                         let hd = *head_dim; let half_dim = graph.rope_half_dim;
+
+                        // MoE-only layers (Nemotron): 0 heads means skip attention entirely.
+                        if nh == 0 {
+                            // Skip: hidden state passes through norm → MoE without attention.
+                        } else {
+
                         let kv_stride = nkv * hd;
 
                         // QKV projection
@@ -9073,6 +9079,8 @@ impl GpuDecodeStore {
                             *graph.d_hidden.device_ptr())?;
 
                         gqa_cache_idx += 1;
+
+                        } // end of `if nh > 0` block (skip MoE-only layers with 0 heads)
                     }
 
                     GpuAttnConfig::MLA {
@@ -12772,6 +12780,12 @@ impl GpuDecodeStore {
                     q_norm_ptr, k_norm_ptr, gated,
                 } => {
                     let nh = *num_heads;
+
+                    // MoE-only layers (Nemotron): 0 heads means skip attention entirely.
+                    if nh == 0 {
+                        // Skip: hidden state passes through norm → MoE without attention.
+                    } else {
+
                     let nkv = *num_kv_heads;
                     let hd = *head_dim;
                     let kv_stride = nkv * hd;
@@ -13141,6 +13155,8 @@ impl GpuDecodeStore {
                             }
                         } // end per-token non-fused GQA loop
                     }
+
+                    } // end of `if nh > 0` block (skip MoE-only layers with 0 heads)
                 }
 
                 GpuAttnConfig::MLA { .. } => {
