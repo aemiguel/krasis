@@ -34,7 +34,7 @@ except PackageNotFoundError:
     __version__ = "dev"
 
 try:
-    from krasis.krasis import KrasisEngine, WeightStore, RustServer, system_check, bench_decode_synthetic
+    from krasis.krasis import KrasisEngine, WeightStore, RustServer, system_check
     try:
         from krasis.krasis import GpuDecodeStore
     except ImportError:

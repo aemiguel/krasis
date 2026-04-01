@@ -1657,6 +1657,7 @@ struct GpuDecodeGraph {
     t_moe_gate_gemv: f64,    // gate GEMV + topk kernel launch (pre-sync)
     t_moe_d2h_topk: f64,     // D2H copy of topk indices/weights
     t_moe_apfl: f64,         // APFL speculative routing for next layer
+    t_moe_padding_setup: f64, // replay batch pointer/weight padding + upload staging
     t_moe_d2d_copy: f64,     // D2D moe_out -> hidden copy
     t_moe_accum: f64,        // weighted accumulation into moe_out
     // Attention breakdown
@@ -2597,6 +2598,7 @@ impl GpuDecodeStore {
             t_moe_gate_gemv: 0.0,
             t_moe_d2h_topk: 0.0,
             t_moe_apfl: 0.0,
+            t_moe_padding_setup: 0.0,
             t_moe_d2d_copy: 0.0,
             t_moe_accum: 0.0,
             t_attn_la: 0.0,
@@ -3273,6 +3275,39 @@ impl GpuDecodeStore {
         })
     }
 
+    /// Quantize a CPU BF16 weight to Marlin INT4 format without producing decode-side
+    /// simple-INT4 state. Use this for synthetic/offline packing where we only need
+    /// the Marlin-format bytes and must not grow pending_simple_int4.
+    fn repack_marlin_int4_cpu_no_simple(
+        &self, cpu_bf16_ptr: usize, rows: usize, cols: usize, group_size: usize,
+    ) -> PyResult<(pyo3::Py<pyo3::types::PyBytes>, pyo3::Py<pyo3::types::PyBytes>, usize, usize)> {
+        use crate::weights::marlin::{quantize_int4, marlin_repack};
+
+        let n = rows;
+        let k = cols;
+        let total_elements = n * k;
+
+        let bf16_data: Vec<u16> = unsafe {
+            std::slice::from_raw_parts(cpu_bf16_ptr as *const u16, total_elements).to_vec()
+        };
+
+        let q = quantize_int4(&bf16_data, n, k, group_size);
+        let m = marlin_repack(&q);
+
+        let packed_bytes: Vec<u8> = m.packed.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let scales_bytes: Vec<u8> = m.scales.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+
+        pyo3::Python::with_gil(|py| {
+            let pb = pyo3::types::PyBytes::new(py, &packed_bytes);
+            let sb = pyo3::types::PyBytes::new(py, &scales_bytes);
+            Ok((pb.into(), sb.into(), n, k))
+        })
+    }
+
     /// Quantize a CPU BF16 weight to Marlin INT8 format using Rust repack.
     /// Returns (packed_bytes, scales_bytes, n, k) — caller uploads to GPU and registers.
     fn repack_marlin_int8_cpu(
@@ -3481,6 +3516,7 @@ impl GpuDecodeStore {
                 graph.t_moe_gate_gemv = 0.0;
                 graph.t_moe_d2h_topk = 0.0;
                 graph.t_moe_apfl = 0.0;
+                graph.t_moe_padding_setup = 0.0;
                 graph.t_moe_d2d_copy = 0.0;
                 graph.t_moe_accum = 0.0;
                 graph.t_attn_la = 0.0;
@@ -5523,6 +5559,11 @@ impl GpuDecodeStore {
     /// Return the min free VRAM (MB) recorded by the most recent batch/stream decode run.
     fn get_last_min_free_vram_mb(&self) -> usize {
         self.last_min_free_vram_mb
+    }
+
+    /// Return benchmark stats: (min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct)
+    fn get_benchmark_stats(&self) -> (usize, usize, usize, f64) {
+        self.benchmark_stats()
     }
 
     /// Clamp the soft-tier resident budget to a measured target.
@@ -9813,6 +9854,11 @@ impl GpuDecodeStore {
                     let mut batch_count = 0usize;
                     let mut cold_experts: Vec<(usize, usize, f32)> = Vec::new();
                     let moe_data = graph.moe_layers[moe_layer_idx].as_ref().unwrap();
+                    let t_padding_setup = if graph.timing_enabled {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
 
                     for i in 0..topk {
                         let eid = graph.h_topk_ids[i];
@@ -9927,7 +9973,8 @@ impl GpuDecodeStore {
                     if batch_count < topk {
                         // Zero-weight padding should not alias real experts in the replayed batch.
                         // Use the prevalidated dummy expert layout cached at graph init so replay
-                        // stays deterministic without any per-step DtoH traffic.
+                        // stays deterministic and keeps the replayed expert mix stable across
+                        // decode steps without any per-step DtoH traffic.
                         let fill_ptrs = if graph.h_dummy_ptrs[0] != 0 {
                             graph.h_dummy_ptrs
                         } else {
@@ -9964,6 +10011,9 @@ impl GpuDecodeStore {
                             *graph.d_batch_upload.device_ptr(),
                             h as *const std::ffi::c_void,
                             upload_bytes, replay_stream);
+                    }
+                    if let Some(t_padding_setup) = t_padding_setup {
+                        graph.t_moe_padding_setup += t_padding_setup.elapsed().as_secs_f64();
                     }
                 }
             }
@@ -14743,7 +14793,7 @@ impl GpuDecodeStore {
                 g.t_moe_route_sync = 0.0; g.t_moe_expert_loop = 0.0;
                 g.t_moe_shared = 0.0; g.t_moe_overhead = 0.0;
                 g.t_moe_gate_gemv = 0.0; g.t_moe_d2h_topk = 0.0;
-                g.t_moe_apfl = 0.0; g.t_moe_d2d_copy = 0.0;
+                g.t_moe_apfl = 0.0; g.t_moe_padding_setup = 0.0; g.t_moe_d2d_copy = 0.0;
                 g.t_moe_accum = 0.0;
                 g.t_attn_la = 0.0; g.t_attn_gqa = 0.0;
                 g.t_la_proj = 0.0; g.t_la_conv = 0.0;
@@ -15504,12 +15554,14 @@ impl GpuDecodeStore {
                 let avg_gate = graph.t_moe_gate_gemv / n * 1000.0;
                 let avg_d2h = graph.t_moe_d2h_topk / n * 1000.0;
                 let avg_apfl = graph.t_moe_apfl / n * 1000.0;
+                let avg_padding_setup = graph.t_moe_padding_setup / n * 1000.0;
                 let avg_d2d = graph.t_moe_d2d_copy / n * 1000.0;
-                let avg_rest = avg_moe_other - avg_gate - avg_d2h - avg_apfl - avg_d2d;
+                let avg_rest = avg_moe_other - avg_gate - avg_d2h - avg_apfl - avg_padding_setup - avg_d2d;
                 eprintln!("  \x1b[36m│\x1b[0m  MoE other detail:                               \x1b[36m│\x1b[0m");
                 eprintln!("  \x1b[36m│\x1b[0m    Gate GEMV:   {:7.2} ms                        \x1b[36m│\x1b[0m", avg_gate);
                 eprintln!("  \x1b[36m│\x1b[0m    D2H topk:   {:7.2} ms                        \x1b[36m│\x1b[0m", avg_d2h);
                 eprintln!("  \x1b[36m│\x1b[0m    APFL+setup: {:7.2} ms                        \x1b[36m│\x1b[0m", avg_apfl);
+                eprintln!("  \x1b[36m│\x1b[0m    Replay pad:  {:7.2} ms                        \x1b[36m│\x1b[0m", avg_padding_setup);
                 eprintln!("  \x1b[36m│\x1b[0m    D2D copy:   {:7.2} ms                        \x1b[36m│\x1b[0m", avg_d2d);
                 eprintln!("  \x1b[36m│\x1b[0m    Remainder:  {:7.2} ms                        \x1b[36m│\x1b[0m", avg_rest);
                 } // end !graph_mode per-component section
