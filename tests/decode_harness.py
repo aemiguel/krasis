@@ -90,6 +90,7 @@ class SyntheticDecodeHarness:
         prompt_len: int,
         steps: int,
         max_experts: int,
+        topk: int,
         expert_bits: int,
         attn_mode: str,
         kv_format: str,
@@ -107,11 +108,13 @@ class SyntheticDecodeHarness:
         self.prompt_len = prompt_len
         self.steps = steps
         self.max_experts = max_experts
+        self.topk = min(topk, max_experts) if max_experts > 0 else topk
         self.expert_bits = expert_bits
         self.attn_mode = attn_mode
         self.kv_format = kv_format
         self.vocab_size = vocab_size
         self.use_timing = use_timing
+        self.resident_experts = max(1, min(self.max_experts, max(self.topk * 2, 16)))
 
         self.keepalive: List[object] = []
         self.state_tensors: List[torch.Tensor] = []
@@ -277,14 +280,19 @@ class SyntheticDecodeHarness:
 
     def _make_moe(self, layer_idx: int) -> None:
         n_experts = self.max_experts
-        topk = min(self.cfg.num_experts_per_tok, n_experts)
+        topk = min(self.topk, n_experts)
         gate_shape = (n_experts, self.cfg.hidden_size)
         gate_wid = self.cached_gate_wids.get(gate_shape)
         if gate_wid is None:
-            gate = self._rand_fp32(gate_shape, device=self.device)
+            gate = torch.zeros(gate_shape, dtype=torch.float32, device=self.device)
             self.keepalive.append(gate)
             gate_wid = self.store.register_weight(gate.data_ptr(), gate.shape[0], gate.shape[1], 1)
             self.cached_gate_wids[gate_shape] = gate_wid
+
+        gate_bias = torch.full((n_experts,), -1000.0, dtype=torch.float32, device=self.device)
+        for expert_idx in range(self.resident_experts):
+            gate_bias[expert_idx] = float(self.resident_experts - expert_idx)
+        self.keepalive.append(gate_bias)
 
         expert_ptrs = []
         shared_w13 = self._rand_bf16(
@@ -324,7 +332,7 @@ class SyntheticDecodeHarness:
             self.cfg.norm_topk_prob,
             self.cfg.routed_scaling_factor,
             gate_wid,
-            0,
+            gate_bias.data_ptr(),
             0,
             None,
         )
@@ -514,7 +522,7 @@ class SyntheticDecodeHarness:
             num_layers=self.cfg.num_hidden_layers,
             vocab_size=self.vocab_size,
             eps=self.cfg.rms_norm_eps,
-            max_experts_per_tok=max(1, min(self.cfg.num_experts_per_tok, self.max_experts)),
+            max_experts_per_tok=max(1, min(self.topk, self.max_experts)),
             max_intermediate_size=max_inter,
             max_qkv_size=max_qkv,
             group_size=GROUP_SIZE,
@@ -565,12 +573,20 @@ class SyntheticDecodeHarness:
         free_mb = int(torch.cuda.mem_get_info(self.device)[0] // (1024 * 1024))
         hcs_budget_mb = max(256, free_mb - 512)
         self.store.init_hcs(hcs_budget_mb, 0)
-        self.store.hcs_pin_all()
+        moe_layers = [
+            idx for idx in range(self.cfg.num_hidden_layers)
+            if self.cfg.is_moe_layer(idx)
+        ]
+        for layer_idx in moe_layers:
+            for expert_idx in range(self.resident_experts):
+                self.store.hcs_pin_expert(layer_idx, expert_idx)
         _, hcs_loaded, hcs_total, _ = self.store.get_benchmark_stats()
-        if hcs_total > 0 and hcs_loaded < hcs_total:
+        required_hcs = len(moe_layers) * self.resident_experts
+        if hcs_loaded < required_hcs:
             raise RuntimeError(
-                f"Synthetic harness requires full HCS residency for compute-only decode, "
-                f"but only pinned {hcs_loaded}/{hcs_total} experts."
+                f"Synthetic harness requires routed experts to be resident for compute-only decode, "
+                f"but only pinned {hcs_loaded}/{required_hcs} required experts "
+                f"(total synthetic experts {hcs_total})."
             )
         if self.use_timing:
             self.store.set_timing(True)
@@ -637,6 +653,8 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--max-experts", type=int, default=0,
                         help="Synthetic experts per MoE layer (0 = auto)")
+    parser.add_argument("--topk", type=int, default=0,
+                        help="Synthetic routed experts per token (0 = model default)")
     parser.add_argument("--expert-bits", type=int, choices=[4, 8, 16], default=None)
     parser.add_argument("--attn-mode", choices=["bf16", "int4", "int8"], default=None)
     parser.add_argument("--kv-format", choices=["fp8", "bf16", "polar4"], default=None)
@@ -656,7 +674,9 @@ def main() -> None:
 
     if args.no_graph:
         os.environ["KRASIS_NO_GRAPH"] = "1"
-    if args.timing:
+    env_timing = os.environ.get("KRASIS_DECODE_TIMING", "") == "1"
+    use_timing = args.timing or env_timing
+    if use_timing:
         os.environ["KRASIS_DECODE_TIMING"] = "1"
 
     torch.manual_seed(1234)
@@ -667,6 +687,7 @@ def main() -> None:
     max_experts = args.max_experts if args.max_experts > 0 else _default_max_experts(cfg)
     if cfg.n_routed_experts > 0 and max_experts <= 0:
         raise SystemExit("Synthetic harness needs at least one expert for MoE layers.")
+    topk = args.topk if args.topk > 0 else cfg.num_experts_per_tok
     expert_bits = args.expert_bits
     if expert_bits is None:
         expert_bits = int(conf.get("CFG_GPU_EXPERT_BITS", "4"))
@@ -686,8 +707,10 @@ def main() -> None:
     print(f"  expert_bits: {expert_bits}")
     print(f"  kv_format: {kv_format}")
     print(f"  max_experts: {max_experts}")
+    print(f"  topk: {topk}")
+    print(f"  resident_experts: {min(max_experts, max(topk * 2, 16))}")
     print(f"  synthetic_vocab: {args.vocab_size}")
-    print(f"  timing: {'on' if args.timing else 'off'}")
+    print(f"  timing: {'on' if use_timing else 'off'}")
     print(f"  graphs: {'off' if args.no_graph else 'on'}")
     print("", flush=True)
 
@@ -697,11 +720,12 @@ def main() -> None:
         prompt_len=args.prompt_len,
         steps=args.steps,
         max_experts=max_experts,
+        topk=topk,
         expert_bits=expert_bits,
         attn_mode=attn_mode,
         kv_format=kv_format,
         vocab_size=args.vocab_size,
-        use_timing=args.timing,
+        use_timing=use_timing,
     )
 
     for i in range(args.warmup):
@@ -735,7 +759,7 @@ def main() -> None:
     print("Notes")
     print("  Synthetic harness uses config-derived layer schedule and real Rust decode kernels.")
     print("  Attention INT4 mode uses synthetic Marlin/simple-INT4 registration, not AWQ calibration.")
-    print("  HCS pins all synthetic experts so the default path measures steady-state decode compute, not cold DMA.")
+    print("  The gate still scales with total synthetic experts, but routing is biased into a resident subset so this measures decode compute rather than cold DMA.")
 
 
 if __name__ == "__main__":

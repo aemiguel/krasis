@@ -5725,6 +5725,7 @@ impl GpuDecodeStore {
             self.last_min_free_vram_mb = min_vram_free_bytes / (1024 * 1024);
         }
         self.last_decode_elapsed = elapsed;
+        self.emit_batch_decode_timing_summary();
 
         Ok(tokens)
     }
@@ -15622,6 +15623,84 @@ impl GpuDecodeStore {
 // ── Marlin perm table computation + GPU decode internals ──────────────
 
 impl GpuDecodeStore {
+    fn emit_batch_decode_timing_summary(&self) {
+        let graph = match self.graph.as_ref() {
+            Some(g) if g.timing_enabled && g.timing_step_count > 0 => g,
+            _ => return,
+        };
+
+        let n = graph.timing_step_count as f64;
+        let avg_total = graph.t_total / n * 1000.0;
+        let avg_attn = graph.t_attn / n * 1000.0;
+        let avg_moe = graph.t_route / n * 1000.0;
+        let avg_norm = graph.t_norm / n * 1000.0;
+        let avg_dense = graph.t_dense_mlp / n * 1000.0;
+        let avg_lm = graph.t_lm_head / n * 1000.0;
+        let graph_mode = avg_attn < 0.001 && avg_moe < 0.001 && avg_lm < 0.001;
+
+        eprintln!("  \x1b[36m┌─────────────────────────────────────────────────┐\x1b[0m");
+        if graph_mode {
+            eprintln!("  \x1b[36m│\x1b[0m  GPU DECODE TIMING ({} tokens, graph mode)     \x1b[36m│\x1b[0m", graph.timing_step_count);
+        } else {
+            eprintln!("  \x1b[36m│\x1b[0m  GPU DECODE TIMING ({} tokens avg)             \x1b[36m│\x1b[0m", graph.timing_step_count);
+        }
+        eprintln!("  \x1b[36m├─────────────────────────────────────────────────┤\x1b[0m");
+        eprintln!("  \x1b[36m│\x1b[0m  Total:       {:7.2} ms/tok  ({:5.1} tok/s)    \x1b[36m│\x1b[0m", avg_total, 1000.0 / avg_total);
+        if graph_mode {
+            eprintln!("  \x1b[36m│\x1b[0m  Graph replay hides per-component kernels.      \x1b[36m│\x1b[0m");
+        } else {
+            let avg_attn_la = graph.t_attn_la / n * 1000.0;
+            let avg_attn_gqa = graph.t_attn_gqa / n * 1000.0;
+            let avg_route_sync = graph.t_moe_route_sync / n * 1000.0;
+            let avg_expert_loop = graph.t_moe_expert_loop / n * 1000.0;
+            let avg_shared = graph.t_moe_shared / n * 1000.0;
+            let avg_gate = graph.t_moe_gate_gemv / n * 1000.0;
+            let avg_d2h = graph.t_moe_d2h_topk / n * 1000.0;
+            let avg_apfl = graph.t_moe_apfl / n * 1000.0;
+            let avg_padding = graph.t_moe_padding_setup / n * 1000.0;
+            let avg_d2d = graph.t_moe_d2d_copy / n * 1000.0;
+            let avg_exp_w13 = graph.t_expert_w13 / n * 1000.0;
+            let avg_exp_silu = graph.t_expert_silu_w2 / n * 1000.0;
+            eprintln!("  \x1b[36m│\x1b[0m  Attention:   {:7.2} ms  (LA {:6.2} | GQA {:6.2}) \x1b[36m│\x1b[0m", avg_attn, avg_attn_la, avg_attn_gqa);
+            eprintln!("  \x1b[36m│\x1b[0m  MoE:         {:7.2} ms  (sync {:5.2} loop {:5.2}) \x1b[36m│\x1b[0m", avg_moe, avg_route_sync, avg_expert_loop);
+            eprintln!("  \x1b[36m│\x1b[0m    w13:       {:7.2} ms  | silu+w2 {:7.2} ms   \x1b[36m│\x1b[0m", avg_exp_w13, avg_exp_silu);
+            eprintln!("  \x1b[36m│\x1b[0m    shared:    {:7.2} ms  | gate    {:7.2} ms   \x1b[36m│\x1b[0m", avg_shared, avg_gate);
+            eprintln!("  \x1b[36m│\x1b[0m    D2H topk:  {:7.2} ms  | APFL    {:7.2} ms   \x1b[36m│\x1b[0m", avg_d2h, avg_apfl);
+            eprintln!("  \x1b[36m│\x1b[0m    Replay pad:{:7.2} ms  | D2D     {:7.2} ms   \x1b[36m│\x1b[0m", avg_padding, avg_d2d);
+            eprintln!("  \x1b[36m│\x1b[0m  Norms+Emb:   {:7.2} ms  | Dense   {:7.2} ms   \x1b[36m│\x1b[0m", avg_norm, avg_dense);
+            eprintln!("  \x1b[36m│\x1b[0m  LM Head:     {:7.2} ms                         \x1b[36m│\x1b[0m", avg_lm);
+        }
+
+        let (hcs_cached, hcs_hits, hcs_misses) = if let Some(ref hcs) = graph.hcs {
+            (hcs.num_cached, hcs.total_hits, hcs.total_misses)
+        } else {
+            (0, 0, 0)
+        };
+        let avg_dma_bytes = graph.dma_bytes_total as f64 / n;
+        let avg_dma_calls = graph.dma_call_count as f64 / n;
+        let avg_cold = graph.dma_cold_experts as f64 / n;
+        let avg_hcs = graph.dma_hcs_experts as f64 / n;
+        eprintln!("  \x1b[36m├─────────────────────────────────────────────────┤\x1b[0m");
+        eprintln!("  \x1b[36m│\x1b[0m  PCIe: cold {:5.1}/tok | HCS {:5.1}/tok | {:5.2} MB/tok \x1b[36m│\x1b[0m",
+            avg_cold, avg_hcs, avg_dma_bytes / (1024.0 * 1024.0));
+        eprintln!("  \x1b[36m│\x1b[0m  DMA calls: {:5.1}/tok | HCS cache {} | hit/miss {}/{} \x1b[36m│\x1b[0m",
+            avg_dma_calls, hcs_cached, hcs_hits, hcs_misses);
+        eprintln!("  \x1b[36m└─────────────────────────────────────────────────┘\x1b[0m");
+
+        log::info!(
+            "BATCH DECODE TIMING SUMMARY ({} tokens, {}): total {:.2} ms/tok ({:.1} tok/s), attn {:.2} ms, moe {:.2} ms, replay_pad {:.2} ms, cold {:.1}/tok, hcs {:.1}/tok",
+            graph.timing_step_count,
+            if graph_mode { "graph mode" } else { "ungraphed" },
+            avg_total,
+            1000.0 / avg_total,
+            avg_attn,
+            avg_moe,
+            graph.t_moe_padding_setup / n * 1000.0,
+            avg_cold,
+            avg_hcs,
+        );
+    }
+
     /// Compute inverse Marlin INT4 + INT8 weight perm and scale perm tables,
     /// upload all to GPU device memory.
     fn upload_marlin_perm_tables(
@@ -18903,9 +18982,18 @@ impl GpuDecodeStore {
             .filter_map(|m| m.as_ref())
             .map(|m| m.num_experts)
             .sum();
+        let num_layers = graph.moe_layers.len();
+        let num_experts_per_layer = graph.moe_layers.iter()
+            .filter_map(|m| m.as_ref())
+            .map(|m| m.num_experts)
+            .max()
+            .unwrap_or(0);
 
         let mut hcs = HcsState::new();
         hcs.expert_vram_bytes = expert_vram_bytes;
+        hcs.num_experts_per_layer = num_experts_per_layer;
+        hcs.init_cache_fast(num_layers);
+        hcs.init_gpu_expert_ptrs(&self.device, num_layers, num_experts_per_layer);
 
         graph.hcs = Some(hcs);
 
