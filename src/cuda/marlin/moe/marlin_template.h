@@ -516,16 +516,23 @@ __global__ void Marlin(
     old_expert_id = expert_id;
     if (num_invalid_blocks > 0) {
       int skip_count = block_id == -1 ? par_id : 0;
+      bool found_valid_block = false;
       block_id++;
       for (int i = block_id; i < num_tokens_past_padded / moe_block_size; i++) {
         expert_id = expert_ids_ptr[i];
         if (expert_id != -1) {
           if (skip_count == 0) {
             block_id = i;
+            found_valid_block = true;
             break;
           };
           skip_count--;
         };
+      }
+      if (!found_valid_block) {
+        block_id = num_moe_blocks;
+        block_num_valid_tokens = 0;
+        return;
       }
     } else {
       block_id = par_id;

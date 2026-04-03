@@ -111,6 +111,7 @@ Config: Qwen3-Coder-Next, INT4 experts, AWQ attention, Polar4 KV, standard comma
 | 2026-04-03 19:38 | 83dd3b0 + local BF-01 + BF-03 cache | Post-reboot rerun with BF-03 one-time `C_tmp` cache reapplied | 7,844.1 | 99.29 | 182.51 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_193344_qcn_polar4_awq_5090_bf03_reapplied_post_reboot.log) |
 | 2026-04-03 19:51 | 3b36240 + local BF-04 clean import | Replace drifting ptr-table fused-MoE `B` progression with explicit expert base + signed slice rebasing on expert/block transitions | 7,513.1 | 98.68 | 127.13 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_195132_qcn_polar4_awq_5090_bf04_clean_rebase.log) |
 | 2026-04-03 20:11 | fb49b0f + local BF-05 clean import | Keep ptr-table `B` fetch source indices signed through slice rewinds and guard the hazard path with `cp_async4_pred` | 7,515.0 | 97.82 | 128.37 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_201155_qcn_polar4_awq_5090_bf05_signed_fetch_guard.log) |
+| 2026-04-03 20:36 | 4aa3bee + local no-valid-block guard | Exit `update_next_moe_block_data()` cleanly when invalid-block scanning reaches the padded tail without finding another valid expert block | 7,606.7 | 99.88 | 137.25 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_203640_qcn_polar4_awq_5090_no_valid_block_guard.log) |
 
 Notes:
 - The BF-03 cache edit built cleanly through `./dev build`.
@@ -120,6 +121,7 @@ Notes:
 - After reboot, the same BF-03 cache state completed the full standard benchmark cleanly and produced the best prefill result in this local series.
 - The BF-04 clean import also completed the full standard benchmark cleanly on the same branch state, but did not improve throughput versus the earlier post-reboot BF-03 pass.
 - The BF-05 clean import also completed the full standard benchmark cleanly; throughput stayed effectively flat versus BF-04 while preserving the signed rewind-safe pointer-table fetch path.
+- The no-valid-block guard also completed the full standard benchmark cleanly; it is a cheap control-flow correctness fix and did not regress standard prefill or decode throughput.
 
 ## Standard Benchmarks — 2026-02-25 (NUMA-optimized, 1 GPU)
 
