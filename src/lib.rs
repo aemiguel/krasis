@@ -1,4 +1,5 @@
 pub mod chat_template;
+pub mod cuda_debug;
 pub mod decode;
 pub mod draft_model;
 pub mod gguf;

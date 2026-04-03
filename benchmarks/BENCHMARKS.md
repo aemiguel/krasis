@@ -1,5 +1,43 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-02 (Q35B INT8 release-like after pointer-table W1 fix)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run, 2 GPUs present.
+
+Config: Qwen3.5-35B-A3B, 1 GPU, INT8 GPU experts, INT8 CPU experts, AWQ attention, Polar4 KV,
+layer group size 2, timing off, release-like 3000 MB safety margin.
+
+| Model | GPUs | GPU/CPU bits | Attention | KV | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|-------|-----:|-------------:|----------:|---:|----------------:|---------------:|----:|--------------:|-----|
+| Qwen3.5-35B-A3B | 1 | INT8/INT8 | AWQ | Polar4 | 449.1 | 95.46 | 7585/10240 (74.1%) | 3154 MB | [log](20260402_221959_q35b_int8_awq_polar4_5090.log) |
+
+Notes:
+- This is the exact release-like Q35B INT8/AWQ/Polar4 benchmark shape with the 3000 MB safety margin that had been failing on the first 25K prefill warmup.
+- After restoring pointer-table fused-W1 B-pointer progression, the run completes warmup, calibration, heatmap, HCS load, timed prefill, timed decode, and network round trip cleanly.
+- Internal prefill peaks at 449.1 tok/s on the 20K prompt; internal decode peaks at 95.46 tok/s on the 50-token pass.
+
+---
+
+## Standard Benchmarks — 2026-04-02 (Q35B release-base after cold-staging raw-allocation fix)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-35B-A3B, 1 GPU, INT4 GPU experts, INT4 CPU experts, AWQ attention, Polar4 KV,
+layer group size 2, timing off.
+
+| Model | GPUs | GPU/CPU bits | Attention | KV | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|-------|-----:|-------------:|----------:|---:|----------------:|---------------:|----:|--------------:|-----|
+| Qwen3.5-35B-A3B | 1 | INT4/INT4 | AWQ | Polar4 | 10217.6 | 132.08 | 10240/10240 (100.0%) | 10714 MB | [log](20260402_063215_q35b_release_base_5090.log) |
+
+Notes:
+- This run is the first clean uninstrumented Q35B standard benchmark after switching
+  `cold_staging` off the pooled zeroed allocator and onto raw `cuMemAlloc_v2`.
+- The old 39,920-token long-calibration / layer-39 fused prefill crash did not reproduce.
+- Internal decode hit EOS at 3 tokens on the 100-token prompt, so the recorded internal decode best
+  is the 50-token run at 132.08 tok/s.
+
+---
+
 ## Standard Benchmarks — 2026-04-01 (QCN Polar4 AWQ padding rewrite)
 
 Hardware: EPYC 7742, 995 GB RAM, 1x RTX 5090 32 GB used for benchmark, 2x RTX 5090 present.

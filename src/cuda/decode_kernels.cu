@@ -315,7 +315,7 @@ extern "C" __global__ void expert_classify_prepare(
     int num_experts,
     int topk,
     int max_ept,
-    unsigned long long dummy_ptr,  // dummy expert pointer for unfilled slots (same for all 4)
+    const unsigned long long* __restrict__ dummy_ptrs,  // [4] dummy expert pointer layout
     volatile int* __restrict__ mapped_activations, // [num_moe * topk] for post-hoc recording (NULL to skip)
     int moe_seq_idx   // sequential index of this MoE layer (0, 1, 2, ...)
 ) {
@@ -360,10 +360,10 @@ extern "C" __global__ void expert_classify_prepare(
 
     // Fill remaining slots with dummy expert (zero weight)
     for (int i = batch_count; i < topk && i < max_ept; i++) {
-        w13p_arr[i] = dummy_ptr;
-        w13s_arr[i] = dummy_ptr;
-        w2p_arr[i]  = dummy_ptr;
-        w2s_arr[i]  = dummy_ptr;
+        w13p_arr[i] = dummy_ptrs[0];
+        w13s_arr[i] = dummy_ptrs[1];
+        w2p_arr[i]  = dummy_ptrs[2];
+        w2s_arr[i]  = dummy_ptrs[3];
         wts_arr[i]  = 0.0f;
     }
 

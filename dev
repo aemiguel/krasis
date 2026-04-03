@@ -78,6 +78,19 @@ ok()    { echo -e "${GREEN}${BOLD}OK${NC} $*"; }
 warn()  { echo -e "${YELLOW}${BOLD}!!${NC} $*"; }
 err()   { echo -e "${RED}${BOLD}ERROR${NC} $*" >&2; exit 1; }
 
+is_cuda_debug_enabled() {
+    [[ -n "${KRASIS_CUDA_DEBUG:-}" && "${KRASIS_CUDA_DEBUG}" != "off" ]]
+}
+
+ensure_benchmark_debug_allowed() {
+    local label="$1"
+    if is_cuda_debug_enabled && [[ "${ALLOW_DEBUG_BENCHMARK:-false}" != "true" ]]; then
+        err "CUDA debug mode (${KRASIS_CUDA_DEBUG}) is enabled for $label.
+  Speed benchmarks must run with KRASIS_CUDA_DEBUG=off.
+  If you intentionally want a debug benchmark, re-run with --allow-debug-benchmark."
+    fi
+}
+
 create_run_dir() {
     local run_type="$1"
     local ts dir counter=1
@@ -397,6 +410,13 @@ do_run() {
     auto_rebuild
     info "Launching from: $conf"
     info "Run dir: $run_dir"
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == "--benchmark" || "$arg" == "--benchmark-only" ]]; then
+            ensure_benchmark_debug_allowed "run --benchmark"
+            break
+        fi
+    done
     verify_repo_imports
     export KRASIS_RUN_DIR="$run_dir"
     export KRASIS_RUN_TYPE="dev-run"
@@ -738,6 +758,7 @@ do_benchmark() {
     local conf
     conf=$(resolve_config "$1")
     shift
+    ensure_benchmark_debug_allowed "benchmark"
     cleanup_gpu "$conf"
     auto_rebuild
     local run_dir
@@ -854,7 +875,7 @@ do_validate() {
     do_build
     info "Running model validation: $conf_path"
     verify_repo_imports
-    exec_repo_python "$SCRIPT_DIR/tests/validate_model.py" "$conf_path" "$@"
+    KRASIS_DEV_SCRIPT=1 exec_repo_python "$SCRIPT_DIR/tests/validate_model.py" "$conf_path" "$@"
 }
 
 do_reference_test() {
@@ -972,22 +993,52 @@ do_verify_imports() {
     verify_repo_imports
 }
 
-# ── Extract --timing flag ────────────────────────────────────────
-# Can appear anywhere in args. Removes it and sets KRASIS_DECODE_TIMING=1.
+# ── Extract global flags ─────────────────────────────────────────
+# Can appear anywhere in args. Removes them before dispatch.
 TIMING_FLAG=false
+ALLOW_DEBUG_BENCHMARK=false
+CUDA_DEBUG_MODE="${KRASIS_CUDA_DEBUG:-}"
 args=()
-for arg in "$@"; do
-    if [[ "$arg" == "--timing" ]]; then
-        TIMING_FLAG=true
-    else
-        args+=("$arg")
-    fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --timing)
+            TIMING_FLAG=true
+            shift
+            ;;
+        --cuda-debug)
+            [[ $# -lt 2 ]] && err "Usage: --cuda-debug <off|stage|alloc|kernel>"
+            CUDA_DEBUG_MODE="$2"
+            shift 2
+            ;;
+        --allow-debug-benchmark)
+            ALLOW_DEBUG_BENCHMARK=true
+            shift
+            ;;
+        *)
+            args+=("$1")
+            shift
+            ;;
+    esac
 done
 set -- "${args[@]}"
 
 if $TIMING_FLAG; then
     export KRASIS_DECODE_TIMING=1
     info "Decode timing ENABLED (adds ~30-50% overhead — not for speed benchmarks)"
+fi
+
+if [[ -n "$CUDA_DEBUG_MODE" ]]; then
+    case "$CUDA_DEBUG_MODE" in
+        off|stage|alloc|kernel) ;;
+        *)
+            err "Invalid --cuda-debug mode: $CUDA_DEBUG_MODE
+  Expected one of: off, stage, alloc, kernel"
+            ;;
+    esac
+    export KRASIS_CUDA_DEBUG="$CUDA_DEBUG_MODE"
+    if [[ "$CUDA_DEBUG_MODE" != "off" ]]; then
+        info "CUDA debug ENABLED via KRASIS_CUDA_DEBUG=$CUDA_DEBUG_MODE"
+    fi
 fi
 
 #── Dispatch ─────────────────────────────────────────────────────────
@@ -1049,12 +1100,16 @@ case "$cmd" in
         echo "  --timing    Enable per-component decode timing (adds ~30-50% overhead)"
         echo "              Prints detailed breakdown of where decode time is spent."
         echo "              NOT for speed benchmarks — only for profiling."
+        echo "  --cuda-debug <mode>   Set KRASIS_CUDA_DEBUG to off|stage|alloc|kernel"
+        echo "  --allow-debug-benchmark  Allow benchmark commands while CUDA debug is enabled"
         echo ""
         echo "Configs: qcn, qcn-a4, q235, q235-a4, v2lite, deepseek-vl, qwen35, qwen35-a4"
         echo "         (or path to .conf file)"
         echo ""
         echo "Examples:"
         echo "  ./dev build"
+        echo "  ./dev --cuda-debug stage run qwen35-a4"
+        echo "  ./dev --cuda-debug kernel run qwen35-a4"
         echo "  ./dev run qcn"
         echo "  ./dev run qcn --benchmark"
         echo "  ./dev benchmark qcn --timing    Profile decode components"

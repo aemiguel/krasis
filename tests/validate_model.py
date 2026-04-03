@@ -307,6 +307,38 @@ def send_chat_greedy(messages: List[Dict[str, str]], port: int,
         return {"text": "", "logprobs_data": [], "error": str(e)}
 
 
+def send_reference_greedy(input_token_ids: List[int], port: int,
+                          max_tokens: int = 200,
+                          stop_token_ids: Optional[List[int]] = None,
+                          top_logprobs: int = 10) -> Dict[str, Any]:
+    """Call the raw reference-test endpoint with pre-tokenized input IDs."""
+    payload = {
+        "input_token_ids": input_token_ids,
+        "max_tokens": max_tokens,
+        "top_logprobs": top_logprobs,
+        "stop_token_ids": stop_token_ids or [],
+    }
+    body = json.dumps(payload).encode()
+
+    try:
+        conn = http.client.HTTPConnection(DEFAULT_HOST, port, timeout=GENERATE_TIMEOUT)
+        conn.request("POST", "/v1/internal/reference_test", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp_body = resp.read().decode("utf-8", errors="replace")
+        conn.close()
+
+        if resp.status != 200:
+            return {"text": "", "token_ids": [], "per_token_data": [],
+                    "error": f"HTTP {resp.status}: {resp_body[:200]}"}
+
+        data = json.loads(resp_body)
+        data["error"] = None
+        return data
+    except Exception as e:
+        return {"text": "", "token_ids": [], "per_token_data": [], "error": str(e)}
+
+
 def send_prefill_logits(messages: List[Dict[str, str]], port: int,
                         top_k: int = 10, sample_every: int = 50) -> Dict[str, Any]:
     """Call the test-only /v1/internal/prefill_logits endpoint.
@@ -473,9 +505,44 @@ def compare_tokens(ref_ids: List[int], krasis_ids: List[int],
     }
 
 
+def reference_has_visible_reasoning(turn: Dict[str, Any]) -> bool:
+    """True when stored reference text includes visible reasoning prose.
+
+    Non-thinking release configs should not be graded against visible
+    chain-of-thought text. Those references need a separate thinking-aware
+    validation path or regenerated non-thinking reference outputs.
+    """
+    text = (turn.get("text") or "").lstrip()
+    if not text:
+        return False
+
+    first_line = text.splitlines()[0].strip().lower()
+    if first_line.startswith("thinking process:") or first_line.startswith("<think>"):
+        return True
+
+    # Some stored references expose reasoning without an explicit "Thinking Process"
+    # header. Treat these meta-analysis openings as visible reasoning too so
+    # non-thinking configs are not graded against hidden-thought text.
+    reasoning_prefixes = (
+        "the user wants me to",
+        "the user is asking",
+        "this is a great question",
+        "let me explain",
+        "let me think",
+        "i need to",
+        "i should",
+        "to answer this",
+        "the request is",
+        "the prompt asks",
+    )
+    return first_line.startswith(reasoning_prefixes)
+
+
 def validate_model(config_path: str, no_server: bool = False, port: Optional[int] = None,
                     enable_logprobs: bool = True, enable_prefill: bool = True,
                     max_prompts: Optional[int] = None,
+                    use_reference_endpoint: bool = False,
+                    skip_visible_reasoning_reference: bool = False,
                     return_summary: bool = False):
     """Run multi-layer validation against reference outputs.
 
@@ -483,7 +550,7 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     Layer 2: Decode logprobs comparison (when enable_logprobs=True)
     Layer 3: Prefill logit comparison (when enable_prefill=True, requires --test-endpoints)
     """
-    from transformers import AutoTokenizer
+    from krasis.tokenizer import Tokenizer
 
     model_name = extract_model_name(config_path)
     config_port = port if port else extract_port(config_path)
@@ -501,17 +568,59 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     info(f"Validation layers: {', '.join(layers_active)}")
     if max_prompts is not None:
         info(f"Prompt cap: {max_prompts}")
+    if use_reference_endpoint:
+        info("Decode path: raw /v1/internal/reference_test")
+    if skip_visible_reasoning_reference:
+        info("Reference filter: skipping turns with visible reasoning text")
 
     # Load reference
     reference = load_reference(model_name)
     ref_conversations = reference["conversations"]
+    eos_token_ids = reference.get("eos_token_ids", [])
     total_reference_prompts = sum(len(c["turns"]) for c in ref_conversations)
+    reasoning_reference_prompts = sum(
+        1 for conv in ref_conversations for turn in conv["turns"]
+        if reference_has_visible_reasoning(turn)
+    )
+    eligible_reference_prompts = (
+        total_reference_prompts - reasoning_reference_prompts
+        if skip_visible_reasoning_reference else total_reference_prompts
+    )
     if max_prompts is not None:
-        total_prompts = min(total_reference_prompts, max_prompts)
+        total_prompts = min(eligible_reference_prompts, max_prompts)
     else:
-        total_prompts = total_reference_prompts
-    info(f"Reference: {total_prompts} prompts from {reference['generated_at']}")
+        total_prompts = eligible_reference_prompts
+    info(f"Reference: {total_prompts} eligible prompts from {reference['generated_at']}")
     info(f"Reference runtime: {reference['runtime']} {reference.get('runtime_version', '')}")
+    if skip_visible_reasoning_reference:
+        info(f"Reasoning-style references skipped: {reasoning_reference_prompts}")
+
+    if total_prompts == 0:
+        warn("No eligible reference prompts remain after filtering")
+        summary = {
+            "model_name": model_name,
+            "config_path": config_path,
+            "is_quantized": is_quant,
+            "min_match_threshold": min_match,
+            "layers_active": layers_active,
+            "max_prompts": max_prompts,
+            "skip_visible_reasoning_reference": skip_visible_reasoning_reference,
+            "reference_prompts_total": total_reference_prompts,
+            "reference_prompts_eligible": eligible_reference_prompts,
+            "reference_prompts_reasoning_skipped": reasoning_reference_prompts,
+            "prompts_run": 0,
+            "match_count": 0,
+            "warn_count": 0,
+            "fail_count": 0,
+            "skip_count": reasoning_reference_prompts,
+            "skipped": True,
+            "passed": True,
+            "results": [],
+        }
+        print(f"\n  {YELLOW}{BOLD}VALIDATION SKIPPED (no eligible non-thinking reference prompts){NC}")
+        if return_summary:
+            return summary
+        return 0
 
     # Check if reference has prefill logits
     has_ref_prefill = any(
@@ -527,7 +636,10 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     proc = None
     if not no_server:
         info(f"Starting Krasis server on port {config_port}...")
-        proc, log_path = launch_server(config_path, test_endpoints=enable_prefill)
+        proc, log_path = launch_server(
+            config_path,
+            test_endpoints=(enable_prefill or use_reference_endpoint),
+        )
         info(f"Server log: {log_path}")
 
         if not wait_for_health(config_port):
@@ -537,10 +649,11 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     else:
         info(f"Using existing server on port {config_port}")
 
-    # Load tokenizer AFTER server is healthy (server has released CPU RAM by now)
+    # Load the same tokenizer wrapper the server uses AFTER server is healthy
+    # so prompt-template validation exercises the actual Krasis tokenization path.
     model_path = os.path.join(os.path.expanduser("~/.krasis/models"), model_name)
     info(f"Loading tokenizer from {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = Tokenizer(model_path)
 
     # Run validation
     results: List[Dict[str, Any]] = []
@@ -558,8 +671,17 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
                 print(f"\n  {BOLD}--- Conversation {conv_idx + 1} ({len(conv['turns'])} turns) ---{NC}")
 
             for turn_idx, turn in enumerate(conv["turns"]):
-                if max_prompts is not None and prompt_num >= max_prompts:
+                if prompt_num >= total_prompts:
                     break
+                if skip_visible_reasoning_reference and reference_has_visible_reasoning(turn):
+                    print(f"\n  {YELLOW}SKIP reference turn with visible reasoning text{NC}")
+                    print(f"    {DIM}{turn['prompt'][:120]}{NC}")
+                    results.append({
+                        "prompt": turn["prompt"],
+                        "status": "SKIP",
+                        "error": "reference contains visible reasoning text",
+                    })
+                    continue
                 prompt_num += 1
                 prompt = turn["prompt"]
                 ref_token_ids = turn["token_ids"]
@@ -574,22 +696,15 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
 
                 messages.append({"role": "user", "content": prompt})
 
-                # Verify tokenizer agreement if input_token_ids available
+                # Verify tokenizer agreement if input_token_ids are stored in the
+                # reference. Match the current Rust request path exactly:
+                # generation prompt on, but no enable_thinking template arg.
+                # The server handles thinking budgets/suppression separately.
                 if ref_input_ids:
-                    try:
-                        template_out = tokenizer.apply_chat_template(
-                            messages, return_tensors="pt",
-                            add_generation_prompt=True, enable_thinking=False)
-                    except TypeError:
-                        template_out = tokenizer.apply_chat_template(
-                            messages, return_tensors="pt", add_generation_prompt=True)
-                    import torch
-                    if hasattr(template_out, "input_ids"):
-                        local_ids = template_out.input_ids[0].tolist()
-                    elif isinstance(template_out, torch.Tensor):
-                        local_ids = template_out[0].tolist()
-                    else:
-                        local_ids = list(template_out)
+                    local_ids = tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                    )
 
                     if local_ids != ref_input_ids:
                         # Multi-turn tokenizer mismatch is expected when prior turns
@@ -611,6 +726,10 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
                                 if local_ids[ti] != ref_input_ids[ti]:
                                     print(f"    {DIM}First diff at position {ti}: "
                                           f"local={local_ids[ti]} ref={ref_input_ids[ti]}{NC}")
+                                    local_window = local_ids[max(0, ti - 4):ti + 4]
+                                    ref_window = ref_input_ids[max(0, ti - 4):ti + 4]
+                                    print(f"    {DIM}Local window: {local_window}{NC}")
+                                    print(f"    {DIM}Ref window:   {ref_window}{NC}")
                                     break
                             results.append({"prompt": prompt, "status": "FAIL",
                                             "error": "tokenizer mismatch"})
@@ -643,8 +762,24 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
                               f"mean delta {mean_delta:.2f}, max delta {max_delta:.2f}{NC}")
 
                 # ── Layer 1+2: Decode token matching + logprobs ──
-                resp = send_chat_greedy(messages, config_port, max_tokens=ref_num + 50,
-                                        logprobs=enable_logprobs)
+                if use_reference_endpoint:
+                    if not ref_input_ids:
+                        print(f"    {RED}REFERENCE INPUT MISSING: input_token_ids required for raw reference test{NC}")
+                        results.append({"prompt": prompt, "status": "FAIL",
+                                        "error": "missing input_token_ids for raw reference test"})
+                        fail_count += 1
+                        messages.pop()
+                        continue
+                    resp = send_reference_greedy(
+                        ref_input_ids,
+                        config_port,
+                        max_tokens=ref_num + 50,
+                        stop_token_ids=eos_token_ids,
+                        top_logprobs=10,
+                    )
+                else:
+                    resp = send_chat_greedy(messages, config_port, max_tokens=ref_num + 50,
+                                            logprobs=enable_logprobs)
 
                 if resp["error"]:
                     print(f"    {RED}ERROR: {resp['error']}{NC}")
@@ -654,10 +789,15 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
                     continue
 
                 krasis_text = resp["text"]
-                krasis_token_ids = tokenize_text(krasis_text, tokenizer)
+                if use_reference_endpoint:
+                    krasis_token_ids = resp.get("token_ids", [])
+                    compare_topk = resp.get("per_token_data", [])
+                else:
+                    krasis_token_ids = tokenize_text(krasis_text, tokenizer)
+                    compare_topk = per_token_data
 
                 # Layer 1: Compare tokens (pass per_token_data for top-k divergence analysis)
-                cmp = compare_tokens(ref_token_ids, krasis_token_ids, per_token_data)
+                cmp = compare_tokens(ref_token_ids, krasis_token_ids, compare_topk)
 
                 # Layer 2: Logprobs summary
                 logprobs_summary = ""
@@ -752,7 +892,7 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
                 # Add to message history for multi-turn
                 messages.append({"role": "assistant", "content": krasis_text})
 
-            if max_prompts is not None and prompt_num >= max_prompts:
+            if prompt_num >= total_prompts:
                 break
 
     finally:
@@ -779,17 +919,23 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
         "min_match_threshold": min_match,
         "layers_active": layers_active,
         "max_prompts": max_prompts,
+        "skip_visible_reasoning_reference": skip_visible_reasoning_reference,
         "reference_prompts_total": total_reference_prompts,
+        "reference_prompts_eligible": eligible_reference_prompts,
+        "reference_prompts_reasoning_skipped": reasoning_reference_prompts,
         "prompts_run": total,
         "match_count": pass_count,
         "warn_count": warn_count,
         "fail_count": fail_count,
         "skip_count": skip_count,
+        "skipped": total == 0 and skip_count > 0,
         "passed": fail_count == 0,
         "results": results,
     }
 
-    if fail_count == 0:
+    if summary["skipped"]:
+        print(f"\n  {YELLOW}{BOLD}VALIDATION SKIPPED (no eligible non-thinking reference prompts){NC}")
+    elif fail_count == 0:
         print(f"\n  {GREEN}{BOLD}VALIDATION PASSED{NC}")
     else:
         print(f"\n  {RED}{BOLD}VALIDATION FAILED ({fail_count} failures){NC}")
@@ -814,6 +960,10 @@ def main():
                         help="Only run Layer 1 (token matching)")
     parser.add_argument("--max-prompts", type=int, default=None,
                         help="Stop after this many reference prompts")
+    parser.add_argument("--use-reference-endpoint", action="store_true",
+                        help="Use /v1/internal/reference_test with stored input_token_ids")
+    parser.add_argument("--skip-visible-reasoning-reference", action="store_true",
+                        help="Skip stored reference turns that begin with visible reasoning text")
     args = parser.parse_args()
 
     enable_logprobs = not args.no_logprobs and not args.l1_only
@@ -822,7 +972,9 @@ def main():
     sys.exit(validate_model(args.config, args.no_server, args.port,
                             enable_logprobs=enable_logprobs,
                             enable_prefill=enable_prefill,
-                            max_prompts=args.max_prompts))
+                            max_prompts=args.max_prompts,
+                            use_reference_endpoint=args.use_reference_endpoint,
+                            skip_visible_reasoning_reference=args.skip_visible_reasoning_reference))
 
 
 if __name__ == "__main__":

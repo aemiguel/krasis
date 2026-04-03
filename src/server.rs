@@ -7,6 +7,7 @@
 //! Single-request at a time (matches our hardware constraint).
 
 use crate::gpu_decode::GpuDecodeStore;
+use std::borrow::Cow;
 
 /// Streaming detokenizer that buffers incomplete UTF-8 sequences.
 ///
@@ -266,6 +267,13 @@ fn format_completion(
     )
 }
 
+fn debug_rendered_prompt_enabled() -> bool {
+    matches!(
+        std::env::var("KRASIS_DEBUG_RENDERED_PROMPT").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+    )
+}
+
 // ── Tool use support ──────────────────────────────────────────────
 
 /// A parsed tool call extracted from model output.
@@ -401,6 +409,13 @@ fn format_sse_tool_call_args(
         r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{},"function":{{"arguments":"{}"}}}}]}},"finish_reason":null}}]}}"#,
         request_id, created, model_name, call_index, escaped
     )
+}
+
+fn strip_think_markup<'a>(text: &'a str) -> Cow<'a, str> {
+    if !text.contains("<think>") && !text.contains("</think>") {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace("<think>", "").replace("</think>", ""))
 }
 
 /// Format non-streaming response with tool calls.
@@ -618,7 +633,9 @@ fn handle_chat_completion(
     let has_tools = !tools_json.is_empty();
 
     // ── Render chat template (reused for both token estimation and Rust prefill) ──
-    let rendered = match state.chat_template.apply_with_tools(&messages_json, &tools_json, true) {
+    // Honor the request/template contract here so token estimation, prefill,
+    // and decode all see the same prompt shape.
+    let rendered = match state.chat_template.apply_with_tools(&messages_json, &tools_json, true, enable_thinking) {
         Ok(r) => r,
         Err(e) => {
             log::error!("Chat template failed: {}", e);
@@ -630,6 +647,14 @@ fn handle_chat_completion(
             return;
         }
     };
+    if debug_rendered_prompt_enabled() {
+        log::info!(
+            "[PROMPT-DIAG] enable_thinking={} messages_json={} rendered={:?}",
+            enable_thinking,
+            messages_json,
+            rendered,
+        );
+    }
     let estimated_tokens = {
         let token_count = match state.tokenizer.encode(rendered.as_str(), false) {
             Ok(e) => e.len(),
@@ -653,6 +678,10 @@ fn handle_chat_completion(
     let t_evict = Instant::now();
     let store_for_evict = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
     let (evicted, _freed_mb) = store_for_evict.hcs_evict_for_prefill(estimated_tokens);
+    store_for_evict.cuda_debug_note_boundary_external(
+        "server.chat.after_hcs_evict",
+        format!("estimated_tokens={} evicted={}", estimated_tokens, evicted),
+    );
     // NOTE: aux GPU never does prefill, so no eviction needed there
     let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
     crate::vram_monitor::report_event("evict_end");
@@ -702,6 +731,10 @@ fn handle_chat_completion(
             let _ = send_json(stream, 500, &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e));
             return;
         }
+        store_for_evict.cuda_debug_note_boundary_external(
+            "server.chat.after_prepare_for_prefill",
+            format!("token_ids={}", token_ids.len()),
+        );
 
         let suppress_tokens = {
             let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
@@ -718,6 +751,10 @@ fn handle_chat_completion(
             log::error!("Failed to release scratch: {}", e);
         }
         engine.clear_prefill_hcs_guard_store_addr();
+        store_for_evict.cuda_debug_note_boundary_external(
+            "server.chat.after_release_scratch",
+            format!("token_ids={}", token_ids.len()),
+        );
 
         // Convert stop token strings to IDs, and always include model's EOS tokens
         let mut stop_ids: Vec<usize> = state.eos_stop_ids.clone();
@@ -931,14 +968,21 @@ fn handle_prefill_logits(
     } else if let Some(messages) = req.get("messages") {
         let messages_json = messages.to_string();
         let enable_thinking = req.get("enable_thinking").and_then(|v| v.as_bool()).unwrap_or(false);
-        // Always add generation prompt — enable_thinking controls suppression, not template
-        let rendered = match state.chat_template.apply(&messages_json, true) {
+        let rendered = match state.chat_template.apply(&messages_json, true, enable_thinking) {
             Ok(r) => r,
             Err(e) => {
                 let _ = send_json(stream, 500, &format!(r#"{{"error":"Chat template: {}"}}"#, e));
                 return;
             }
         };
+        if debug_rendered_prompt_enabled() {
+            log::info!(
+                "[PROMPT-DIAG] prefill_logits enable_thinking={} messages_json={} rendered={:?}",
+                enable_thinking,
+                messages_json,
+                rendered,
+            );
+        }
         match state.tokenizer.encode(rendered.as_str(), true) {
             Ok(e) => e.get_ids().to_vec(),
             Err(e) => {
@@ -1059,15 +1103,37 @@ fn handle_reference_test(
         }
     };
 
-    // Required: input_token_ids (raw token IDs, no tokenization or template applied)
-    let input_token_ids: Vec<u32> = match req.get("input_token_ids") {
-        Some(serde_json::Value::Array(arr)) => {
-            arr.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect()
+    // Accept either raw input_token_ids or messages (with chat template + tokenization)
+    let input_token_ids: Vec<u32> = if let Some(serde_json::Value::Array(arr)) = req.get("input_token_ids") {
+        arr.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect()
+    } else if let Some(messages) = req.get("messages") {
+        let messages_json = messages.to_string();
+        let enable_thinking = req.get("enable_thinking").and_then(|v| v.as_bool()).unwrap_or(false);
+        let rendered = match state.chat_template.apply(&messages_json, true, enable_thinking) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = send_json(stream, 500, &format!(r#"{{"error":"Chat template: {}"}}"#, e));
+                return;
+            }
+        };
+        if debug_rendered_prompt_enabled() {
+            log::info!(
+                "[PROMPT-DIAG] reference_test enable_thinking={} messages_json={} rendered={:?}",
+                enable_thinking,
+                messages_json,
+                rendered,
+            );
         }
-        _ => {
-            let _ = send_json(stream, 400, r#"{"error":"Missing or invalid input_token_ids array"}"#);
-            return;
+        match state.tokenizer.encode(rendered.as_str(), true) {
+            Ok(e) => e.get_ids().to_vec(),
+            Err(e) => {
+                let _ = send_json(stream, 500, &format!(r#"{{"error":"Tokenize: {}"}}"#, e));
+                return;
+            }
         }
+    } else {
+        let _ = send_json(stream, 400, r#"{"error":"Missing input_token_ids or messages"}"#);
+        return;
     };
 
     let max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
@@ -1119,6 +1185,10 @@ fn handle_reference_test(
         return;
     }
 
+    // Match the production prefill contract: allow chunk-level HCS guard refreshes
+    // during run_prefill so reference_test exercises the same prefill/HCS interaction.
+    engine.set_prefill_hcs_guard_store_addr(state.gpu_store_addr);
+
     // Run prefill with temperature=0 (greedy)
     let suppress_tokens = {
         let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
@@ -1134,6 +1204,7 @@ fn handle_reference_test(
     if let Err(e) = engine.release_scratch() {
         log::error!("reference_test: Failed to release scratch: {}", e);
     }
+    engine.clear_prefill_hcs_guard_store_addr();
 
     let (first_token, prompt_len) = match prefill_result {
         Ok(r) => (r.first_token as usize, r.prompt_len),
@@ -1298,7 +1369,12 @@ fn handle_gpu_decode(
             return;
         }
 
-        let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
+        let first_text_raw = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
+        let first_text = if enable_thinking {
+            Cow::Owned(first_text_raw)
+        } else {
+            strip_think_markup(&first_text_raw)
+        };
 
         // When thinking is enabled, inject <think> at start of stream.
         // The prompt already includes <think>, but the client needs it in the
@@ -1311,7 +1387,7 @@ fn handle_gpu_decode(
         // When tool use is active, buffer first token (might need tool call parsing).
         // Otherwise send immediately for lowest latency.
         if !has_tools {
-            let chunk = format_sse_token(request_id, model_name, &first_text, None, created, None);
+            let chunk = format_sse_token(request_id, model_name, first_text.as_ref(), None, created, None);
             let _ = send_sse_chunk(stream, &chunk);
         }
 
@@ -1385,6 +1461,8 @@ fn handle_gpu_decode(
             in_thinking = false;
         } else if in_thinking {
             thinking_token_count += 1;
+        } else {
+            answer_token_count += 1;
         }
 
         // ── Tool call detection state ──
@@ -1397,7 +1475,7 @@ fn handle_gpu_decode(
         let mut tc_finish = String::new();
 
         if has_tools {
-            tc_all_text.push_str(&first_text);
+            tc_all_text.push_str(first_text.as_ref());
             // Send first token if it's safe (doesn't contain tool call marker)
             if first_text.contains("<tool_call>") {
                 tc_in_tool_call = true;
@@ -1419,6 +1497,11 @@ fn handle_gpu_decode(
         // Shared callback for both single-GPU and multi-GPU decode
         let mut on_token = |token_id: usize, text: &str, finish_reason: Option<&str>, token_logprobs: Option<&[(u32, f32)]>| -> bool {
             decode_token_count += 1;
+            let visible_text = if enable_thinking {
+                Cow::Borrowed(text)
+            } else {
+                strip_think_markup(text)
+            };
 
             // ── Track thinking state ──
             // Tokens before </think> are "thinking" and don't count against max_tokens.
@@ -1432,6 +1515,8 @@ fn handle_gpu_decode(
                 } else {
                     answer_token_count += 1;
                 }
+            } else {
+                answer_token_count += 1;
             }
 
             // Override finish_reason if answer token limit reached
@@ -1444,20 +1529,20 @@ fn handle_gpu_decode(
             };
 
             if has_tools {
-                tc_all_text.push_str(text);
+                tc_all_text.push_str(visible_text.as_ref());
                 if let Some(fr) = effective_finish {
                     tc_finish = fr.to_string();
                 }
 
                 if tc_in_tool_call {
                     // Inside a tool call block — buffer silently
-                } else if text.contains("<tool_call>") {
+                } else if visible_text.contains("<tool_call>") {
                     // Entering tool call territory
                     tc_in_tool_call = true;
                     tc_found = true;
                     // Send any content before the marker in this text
-                    if let Some(idx) = text.find("<tool_call>") {
-                        let before = &text[..idx];
+                    if let Some(idx) = visible_text.find("<tool_call>") {
+                        let before = &visible_text[..idx];
                         if !before.is_empty() {
                             let chunk = format_sse_token(
                                 request_id, model_name, before, None, created, None,
@@ -1467,9 +1552,9 @@ fn handle_gpu_decode(
                     }
                 } else {
                     // Normal content — stream it (no finish_reason; handled post-generation)
-                    if !text.is_empty() {
+                    if !visible_text.is_empty() {
                         let chunk = format_sse_token(
-                            request_id, model_name, text, None, created, token_logprobs,
+                            request_id, model_name, visible_text.as_ref(), None, created, token_logprobs,
                         );
                         let _ = tx.send(format!("data: {}\n\n", chunk));
                     }
@@ -1485,7 +1570,7 @@ fn handle_gpu_decode(
             } else {
                 // Original non-tool path
                 let chunk = format_sse_token(
-                    request_id, model_name, text, effective_finish, created, token_logprobs,
+                    request_id, model_name, visible_text.as_ref(), effective_finish, created, token_logprobs,
                 );
                 let formatted = format!("data: {}\n\n", chunk);
                 if tx.send(formatted).is_err()
@@ -1622,8 +1707,13 @@ fn handle_gpu_decode(
         if enable_thinking && state.thinking_end_token.is_some() {
             all_text.push_str("<think>");
         }
-        let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
-        all_text.push_str(&first_text);
+        let first_text_raw = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
+        let first_text = if enable_thinking {
+            Cow::Owned(first_text_raw)
+        } else {
+            strip_think_markup(&first_text_raw)
+        };
+        all_text.push_str(first_text.as_ref());
         let mut total_tokens = 1usize;
         let mut finish = "length".to_string();
 
@@ -1633,6 +1723,8 @@ fn handle_gpu_decode(
         let mut ns_answer_tokens = 0usize;
         if ns_in_thinking && Some(first_token) == ns_think_end_id {
             ns_in_thinking = false;
+        } else if !ns_in_thinking {
+            ns_answer_tokens += 1;
         }
 
         let ns_decode_budget = if ns_think_end_id.is_some() {
@@ -1643,7 +1735,12 @@ fn handle_gpu_decode(
 
         {
             let mut on_token = |token_id: usize, text: &str, finish_reason: Option<&str>, _logprobs: Option<&[(u32, f32)]>| -> bool {
-                all_text.push_str(text);
+                let visible_text = if enable_thinking {
+                    Cow::Borrowed(text)
+                } else {
+                    strip_think_markup(text)
+                };
+                all_text.push_str(visible_text.as_ref());
                 total_tokens += 1;
 
                 // Track thinking state
@@ -1655,6 +1752,8 @@ fn handle_gpu_decode(
                     } else {
                         ns_answer_tokens += 1;
                     }
+                } else {
+                    ns_answer_tokens += 1;
                 }
 
                 if let Some(fr) = finish_reason {
@@ -2090,11 +2189,9 @@ impl RustServer {
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
             format!("Failed to load chat template: {}", e)))?;
 
-        // Estimate tokens by applying actual chat template and tokenizing
-        // Always add the generation prompt (assistant turn prefix) — enable_thinking
-        // controls thinking suppression later, not template rendering.
+        // Estimate tokens by applying the actual chat template and tokenizing.
         let estimated_tokens = {
-            let rendered = chat_template.apply(&messages_json, true)
+            let rendered = chat_template.apply(&messages_json, true, enable_thinking)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("Chat template failed: {}", e)))?;
             tokenizer.encode(rendered.as_str(), false)
@@ -2107,6 +2204,10 @@ impl RustServer {
         let store = unsafe { &mut *(self.gpu_store_addr as *mut GpuDecodeStore) };
         let t_evict = Instant::now();
         let (evicted, _) = store.hcs_evict_for_prefill(estimated_tokens);
+        store.cuda_debug_note_boundary_external(
+            "server.benchmark.after_hcs_evict",
+            format!("estimated_tokens={} evicted={}", estimated_tokens, evicted),
+        );
         // NOTE: aux GPU never does prefill, so no eviction needed there
         let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
 
@@ -2130,7 +2231,7 @@ impl RustServer {
 
         // Tokenize using Rust tokenizer (always with generation prompt)
         let token_ids: Vec<u32> = {
-            let rendered = chat_template.apply(&messages_json, true)
+            let rendered = chat_template.apply(&messages_json, true, enable_thinking)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("Chat template failed: {}", e)))?;
             let encoding = tokenizer.encode(rendered.as_str(), true)
@@ -2154,6 +2255,10 @@ impl RustServer {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 format!("Scratch alloc failed: {}", e)));
         }
+        store.cuda_debug_note_boundary_external(
+            "server.benchmark.after_prepare_for_prefill",
+            format!("token_ids={}", token_ids.len()),
+        );
 
         let suppress_tokens = store.suppress_tokens_clone();
         let prefill_result = engine.run_prefill(
@@ -2171,6 +2276,10 @@ impl RustServer {
             log::error!("Failed to release scratch: {}", e);
         }
         engine.clear_prefill_hcs_guard_store_addr();
+        store.cuda_debug_note_boundary_external(
+            "server.benchmark.after_release_scratch",
+            format!("token_ids={}", token_ids.len()),
+        );
 
         let first_token = prefill_result.first_token as usize;
         let prompt_len = prefill_result.prompt_len;
@@ -2207,7 +2316,7 @@ impl RustServer {
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         crate::vram_monitor::report_event("prefill_end");
 
-        if kv_overflow || max_new_tokens <= 1 {
+        if kv_overflow {
             self.py_model.call_method0(py, "server_cleanup")?;
 
             let prefill_tok_s = if prefill_ms > 0.0 {
@@ -2252,7 +2361,10 @@ impl RustServer {
             return Ok(result.to_string());
         }
 
-        // Reload soft HCS after prefill
+        // Reload soft HCS after prefill, even for prefill-only benchmark requests.
+        // The live HTTP path always restores HCS after prefill, so benchmark
+        // warmups must do the same or they leave the next request in a state that
+        // serving never uses.
         crate::vram_monitor::report_event("hcs_soft_load_start");
         let t_reload = Instant::now();
         let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async(prompt_len);
@@ -2267,9 +2379,76 @@ impl RustServer {
                 activated, real_reload_dma_ms);
         }
         let reload_pending_at_decode_start = store.hcs_soft_reload_pending();
+        store.cuda_debug_note_boundary_external(
+            "server.benchmark.before_decode",
+            format!(
+                "prompt_len={} reload_queued={} reload_activated={} reload_pending_at_decode_start={} real_reload_dma_ms={:.1}",
+                prompt_len,
+                queued,
+                activated,
+                reload_pending_at_decode_start,
+                real_reload_dma_ms,
+            ),
+        );
+        store.cuda_debug_note_boundary_external(
+            "server.chat.before_decode",
+            format!(
+                "prompt_len={} reload_queued={} reload_activated={} reload_pending_at_decode_start={} real_reload_dma_ms={:.1}",
+                prompt_len,
+                queued,
+                activated,
+                reload_pending_at_decode_start,
+                real_reload_dma_ms,
+            ),
+        );
         // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
         let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
         crate::vram_monitor::report_event("hcs_soft_load_end");
+
+        if max_new_tokens <= 1 {
+            self.py_model.call_method0(py, "server_cleanup")?;
+
+            let prefill_tok_s = if prefill_ms > 0.0 {
+                prompt_len as f64 / (prefill_ms / 1000.0)
+            } else {
+                0.0
+            };
+            let (min_free_vram_mb, mut hcs_loaded, mut hcs_total, _) = store.benchmark_stats();
+            let safety_margin_mb = store.hcs_safety_margin_mb();
+            if !self.aux_gpu_store_addrs.is_empty() {
+                log::info!("  GPU0: min_free={} MB, HCS {} loaded", min_free_vram_mb, hcs_loaded);
+            }
+            for (i, &aux_addr) in self.aux_gpu_store_addrs.iter().enumerate() {
+                let aux_store = unsafe { &*(aux_addr as *const GpuDecodeStore) };
+                let (aux_min_free, aux_loaded, aux_total, aux_pct) = aux_store.benchmark_stats();
+                hcs_loaded += aux_loaded;
+                hcs_total += aux_total;
+                if !self.aux_gpu_store_addrs.is_empty() {
+                    log::info!("  GPU{}: min_free={} MB, HCS {}/{} ({:.1}%)",
+                        i + 1, aux_min_free, aux_loaded, aux_total, aux_pct);
+                }
+            }
+            let hcs_pct = if hcs_total > 0 { hcs_loaded as f64 / hcs_total as f64 * 100.0 } else { 0.0 };
+
+            let result = serde_json::json!({
+                "prefill_ms": prefill_ms,
+                "prefill_tok_s": prefill_tok_s,
+                "prompt_tokens": prompt_len,
+                "decode_ms": 0.0,
+                "decode_tok_s": 0.0,
+                "decode_tokens": 1,
+                "evict_ms": evict_ms,
+                "reload_ms": reload_ms,
+                "real_reload_dma_ms": real_reload_dma_ms,
+                "min_free_vram_mb": min_free_vram_mb,
+                "hcs_loaded": hcs_loaded,
+                "hcs_total": hcs_total,
+                "hcs_pct": hcs_pct,
+                "safety_margin_mb": safety_margin_mb,
+            });
+
+            return Ok(result.to_string());
+        }
 
         // Match the live request path's per-request decode suppression setup.
         if enable_thinking {

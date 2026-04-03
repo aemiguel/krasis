@@ -82,8 +82,9 @@ __global__ void Marlin(
     bool use_atomic_add,                                     // whether to use atomic add to reduce
     bool use_fp32_reduce,                                    // whether to use fp32 global reduce
     int max_shared_mem,
-    const int64_t* __restrict__ B_expert_ptrs,               // per-expert B pointer table (or nullptr)
-    const int64_t* __restrict__ S_expert_ptrs) {}            // per-expert scales pointer table (or nullptr)
+    const int4* const* __restrict__ B_expert_ptrs,           // per-expert B pointer table (or nullptr)
+    const int4* const* __restrict__ S_expert_ptrs,           // per-expert scales pointer table (or nullptr)
+    bool debug_bounds_check) {}                              // debug-only pointer/bounds validation
 
 }  // namespace device::marlin_moe
 
@@ -329,8 +330,9 @@ __global__ void Marlin(
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
     int max_shared_mem,
-    const int64_t* __restrict__ B_expert_ptrs,   // per-expert B pointer table (or nullptr for contiguous)
-    const int64_t* __restrict__ S_expert_ptrs) { // per-expert scales pointer table (or nullptr)
+    const int4* const* __restrict__ B_expert_ptrs,   // per-expert B pointer table (or nullptr for contiguous)
+    const int4* const* __restrict__ S_expert_ptrs,   // per-expert scales pointer table (or nullptr)
+    bool debug_bounds_check) {                       // debug-only pointer/bounds validation
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -374,6 +376,7 @@ __global__ void Marlin(
   constexpr bool has_act_order = group_blocks == 0;
 
   constexpr int pack_factor = 32 / w_type.size_bits();
+  const int64_t expert_b_elems = static_cast<int64_t>(prob_n) * static_cast<int64_t>(prob_k) / (pack_factor * 4);
   static_assert(thread_m_blocks == 1 || !m_block_size_8);
   constexpr int moe_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
   const int group_size = (!has_act_order && group_blocks == -1) ? prob_k : prob_k / num_groups;
@@ -420,7 +423,7 @@ __global__ void Marlin(
   int block_id = -1;
   int64_t expert_id = 0;  // use int64 to avoid computation result overflow
   int old_expert_id = 0;
-  int64_t B_expert_off = 0;
+  const int4* active_B_base = B;
   bool advanced_moe_block = false;
 
   int4* sh_block_sorted_ids_int4 = sh;
@@ -514,6 +517,7 @@ __global__ void Marlin(
 
     old_expert_id = expert_id;
     if (num_invalid_blocks > 0) {
+      bool found_valid_block = false;
       int skip_count = block_id == -1 ? par_id : 0;
       block_id++;
       for (int i = block_id; i < num_tokens_past_padded / moe_block_size; i++) {
@@ -521,10 +525,16 @@ __global__ void Marlin(
         if (expert_id != -1) {
           if (skip_count == 0) {
             block_id = i;
+            found_valid_block = true;
             break;
           };
           skip_count--;
         };
+      }
+      if (!found_valid_block) {
+        block_id = num_moe_blocks;
+        block_num_valid_tokens = 0;
+        return;
       }
     } else {
       block_id = par_id;
@@ -541,20 +551,33 @@ __global__ void Marlin(
     }
 
     if (B_expert_ptrs != nullptr) {
-      // Pointer table mode: compute B offset from per-expert pointer
-      // B_ptr[i] was initialized relative to B (which may be an arbitrary base).
-      // Do address math explicitly in bytes here instead of subtracting unrelated
-      // pointers directly: the latter is undefined behavior in C++ and can miscompile
-      // for mixed HCS / pinning / cold-staging allocations.
-      const long long expert_addr =
-          reinterpret_cast<long long>(reinterpret_cast<const char*>(reinterpret_cast<const int4*>(B_expert_ptrs[expert_id])));
-      const long long base_addr =
-          reinterpret_cast<long long>(reinterpret_cast<const char*>(B));
-      B_expert_off = (expert_addr - base_addr) / static_cast<long long>(sizeof(int4));
-      scales_ptr = reinterpret_cast<const int4*>(S_expert_ptrs[expert_id]);
+      const int4* expert_B_ptr = B_expert_ptrs[expert_id];
+      scales_ptr = S_expert_ptrs[expert_id];
+      if (debug_bounds_check && threadIdx.x == 0) {
+        if (expert_B_ptr == nullptr || scales_ptr == nullptr) {
+          printf(
+              "[KRASIS fused_moe_debug] null ptr_table entry block=%d expert=%lld prob_n=%d prob_k=%d\n",
+              block_id,
+              static_cast<long long>(expert_id),
+              prob_n,
+              prob_k);
+          asm volatile("trap;");
+        }
+        if ((reinterpret_cast<uintptr_t>(expert_B_ptr) & 0xf) != 0 ||
+            (reinterpret_cast<uintptr_t>(scales_ptr) & 0xf) != 0) {
+          printf(
+              "[KRASIS fused_moe_debug] misaligned ptr_table entry block=%d expert=%lld B=0x%llx S=0x%llx\n",
+              block_id,
+              static_cast<long long>(expert_id),
+              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(expert_B_ptr)),
+              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(scales_ptr)));
+          asm volatile("trap;");
+        }
+      }
+      active_B_base = expert_B_ptr;
     } else {
-      // Contiguous buffer mode: arithmetic offset
-      B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
+      // Contiguous buffer mode: use the expert slice within the fused base buffer.
+      active_B_base = B + expert_id * prob_n * prob_k / (pack_factor * 4);
       scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
     }
     if constexpr (has_zp) {
@@ -701,9 +724,10 @@ __global__ void Marlin(
                 (threadIdx.x % 32) / (16 / (m_block_size_8 ? 2 : 1));
   a_sh_rd += 2 * ((threadIdx.x / 32) / (thread_n_blocks / 4));
 
-  int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads) * b_thread_vecs;
-  b_gl_rd += b_sh_stride * slice_col;
-  b_gl_rd += b_gl_rd_delta_o * slice_row;
+  int b_gl_rd_base = b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads) * b_thread_vecs;
+  auto current_b_gl_rd = [&]() {
+    return b_gl_rd_base + b_sh_stride * slice_col + b_gl_rd_delta_o * slice_row;
+  };
   auto b_sh_wr = threadIdx.x * b_thread_vecs;
   auto b_sh_rd = threadIdx.x * b_thread_vecs;
 
@@ -814,13 +838,17 @@ __global__ void Marlin(
   // runtime; we break dependencies between subsequent accesses with a tile by
   // maintining multiple pointers (we have enough registers), a tiny
   // optimization.
-  int64_t b_elem_idx[b_sh_wr_iters];
-  auto reset_b_elem_idx = [&]() {
+  const int4* B_ptr[b_sh_wr_iters];
+  int64_t B_elem_base[b_sh_wr_iters];
+  auto reset_b_ptr = [&]() {
+    int b_gl_rd = current_b_gl_rd();
 #pragma unroll
-    for (int i = 0; i < b_sh_wr_iters; i++)
-      b_elem_idx[i] = b_gl_rd_delta_i * i + b_gl_rd;
+    for (int i = 0; i < b_sh_wr_iters; i++) {
+      B_ptr[i] = active_B_base + b_gl_rd_delta_i * i + b_gl_rd;
+      B_elem_base[i] = static_cast<int64_t>(b_gl_rd_delta_i) * i + b_gl_rd;
+    }
   };
-  reset_b_elem_idx();
+  reset_b_ptr();
   advanced_moe_block = false;
 
   // Shared memory storage for global fetch pipelines.
@@ -937,22 +965,37 @@ __global__ void Marlin(
       for (int i = 0; i < b_sh_wr_iters; i++) {
 #pragma unroll
         for (int j = 0; j < b_thread_vecs; j++) {
+          const int64_t elem = B_elem_base[i] + j;
           if (B_expert_ptrs != nullptr) {
-            const long long expert_addr =
-                static_cast<long long>(reinterpret_cast<intptr_t>(reinterpret_cast<const void*>(B_expert_ptrs[expert_id])));
-            const long long src_addr =
-                expert_addr + static_cast<long long>(b_elem_idx[i] + j) * static_cast<long long>(sizeof(int4));
-            cp_async4(
+            const bool elem_in_bounds = elem >= 0 && elem < expert_b_elems;
+            if (debug_bounds_check && !elem_in_bounds) {
+              printf(
+                  "[KRASIS fused_moe_debug] B OOB block=%d expert=%lld tid=%d elem=%lld limit=%lld slice_row=%d slice_col=%d pipe=%d i=%d j=%d\n",
+                  block_id,
+                  static_cast<long long>(expert_id),
+                  threadIdx.x,
+                  static_cast<long long>(elem),
+                  static_cast<long long>(expert_b_elems),
+                  slice_row,
+                  slice_col,
+                  pipe,
+                  i,
+                  j);
+              asm volatile("trap;");
+            }
+            cp_async4_pred(
                 &sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j],
-                reinterpret_cast<const int4*>(static_cast<uintptr_t>(src_addr)));
+                B_ptr[i] + j,
+                elem_in_bounds);
           } else {
             cp_async4(
                 &sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j],
-                B + b_elem_idx[i] + j + B_expert_off);
+                B_ptr[i] + j);
           }
         }
 
-        b_elem_idx[i] += b_gl_rd_delta_o;
+        B_ptr[i] += b_gl_rd_delta_o;
+        B_elem_base[i] += b_gl_rd_delta_o;
       }
 
       if constexpr (has_act_order) {
@@ -1930,16 +1973,20 @@ __global__ void Marlin(
       if (slice_iters) {
         a_gl_rd_col = (threadIdx.x % a_gl_rd_delta_o);
         if (advanced_moe_block) {
-          reset_b_elem_idx();
+          reset_b_ptr();
           advanced_moe_block = false;
         } else {
 #pragma unroll
-          for (int i = 0; i < b_sh_wr_iters; i++)
-            b_elem_idx[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
+          for (int i = 0; i < b_sh_wr_iters; i++) {
+            B_ptr[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
+            B_elem_base[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
+          }
           if (slice_col == 0) {
 #pragma unroll
-            for (int i = 0; i < b_sh_wr_iters; i++)
-              b_elem_idx[i] -= b_gl_stride;
+            for (int i = 0; i < b_sh_wr_iters; i++) {
+              B_ptr[i] -= b_gl_stride;
+              B_elem_base[i] -= b_gl_stride;
+            }
           }
         }
 

@@ -13,7 +13,8 @@
       const int32_t *__restrict__ num_tokens_past_padded_ptr, const float *__restrict__ topk_weights_ptr, int top_k, \
       bool mul_topk_weights, bool is_ep, int num_groups, int prob_m, int prob_n, int prob_k, int *locks,             \
       bool has_bias, bool use_atomic_add, bool use_fp32_reduce, int max_shared_mem,                                   \
-      const int64_t *__restrict__ B_expert_ptrs, const int64_t *__restrict__ S_expert_ptrs
+      const int4 *const *__restrict__ B_expert_ptrs, const int4 *const *__restrict__ S_expert_ptrs,                  \
+      bool debug_bounds_check
 
 namespace device::marlin_moe {
 template <

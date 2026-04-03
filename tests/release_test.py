@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from krasis.run_paths import create_run_dir, get_run_dir, slugify
@@ -66,6 +67,25 @@ CONFIG_VARIANTS = [
 ]
 
 REFERENCE_VALIDATE_MAX_PROMPTS = 4
+
+# Release-test reference validation should run only on the config that matches
+# the reference data we actually have for the model. Do not assume every
+# release config is comparable to a single stored reference set.
+REFERENCE_VALIDATION_VARIANT_BY_MODEL = {
+    "Qwen3-Coder-Next": "INT4/AWQ/Polar4",
+    "Qwen3.5-35B-A3B": "INT4/BF16/Polar4",
+    "Qwen3.5-122B-A10B": "INT4/BF16/Polar4",
+    "Qwen3-235B-A22B": "INT4/BF16/Polar4",
+    "Qwen3.5-397B-A17B": "INT4/BF16/Polar4",
+}
+
+RELEASE_BASE_CONFIG_BY_MODEL = {
+    "Qwen3-Coder-Next": "tests/qcn-polar4-awq.conf",
+    "Qwen3.5-35B-A3B": "tests/q35b-release-base.conf",
+    "Qwen3.5-122B-A10B": "tests/q122b-4-4-awq.conf",
+    "Qwen3-235B-A22B": "tests/q235-bf16.conf",
+    "Qwen3.5-397B-A17B": "testconfigs/qwen397-4-awq.conf",
+}
 
 # ANSI codes (for terminal output only — stripped from report)
 BOLD = "\033[1m"
@@ -232,35 +252,82 @@ def generate_config(model_name: str, variant: Dict, gpu_idx: int,
     """Generate a temporary config file. Returns path to temp file.
 
     For multi-GPU variants, all_gpu_indices is used for CFG_SELECTED_GPUS.
+    Write all launcher-sensitive booleans explicitly so the installed `krasis`
+    wrapper cannot change the intended test matrix via its own defaults.
     """
     model_path = os.path.join(MODELS_DIR, model_name)
 
     if variant.get("multi_gpu") and all_gpu_indices and len(all_gpu_indices) > 1:
         gpu_str = ",".join(str(i) for i in all_gpu_indices)
+        num_gpus = len(all_gpu_indices)
     else:
         gpu_str = str(gpu_idx)
+        num_gpus = 1
 
-    lines = [
-        f"# Release test config — {variant['name']}",
-        f'MODEL_PATH="{model_path}"',
-        f'CFG_SELECTED_GPUS="{gpu_str}"',
-        f'CFG_PP_PARTITION="{num_layers}"',
-        f'CFG_LAYER_GROUP_SIZE="2"',
-        f'CFG_KV_DTYPE="polar4"',
-        f'CFG_GPU_EXPERT_BITS="{variant["gpu_bits"]}"',
-        f'CFG_CPU_EXPERT_BITS="{variant["cpu_bits"]}"',
-        f'CFG_ATTENTION_QUANT="{variant["attention"]}"',
-        f'CFG_SHARED_EXPERT_QUANT="int8"',
-        f'CFG_DENSE_MLP_QUANT="int8"',
-        f'CFG_LM_HEAD_QUANT="int8"',
-        f'CFG_HOST="0.0.0.0"',
-        f'CFG_PORT="{DEFAULT_PORT}"',
-        f'CFG_GPU_PREFILL_THRESHOLD="300"',
-    ]
+    script_dir = Path(__file__).resolve().parent.parent
+    base_rel = RELEASE_BASE_CONFIG_BY_MODEL.get(model_name)
+    if not base_rel:
+        die(f"No release base config registered for model: {model_name}")
+    base_path = script_dir / base_rel
+    if not base_path.is_file():
+        die(f"Release base config not found for {model_name}: {base_path}")
+
+    lines = []
+    config_values: Dict[str, str] = {}
+    with open(base_path) as f:
+        for raw_line in f:
+            line = raw_line.rstrip("\n")
+            lines.append(line)
+            stripped = line.strip()
+            if (not stripped or stripped.startswith("#") or "=" not in stripped):
+                continue
+            key, value = stripped.split("=", 1)
+            config_values[key] = value.strip().strip('"')
+
+    config_values.update({
+        "MODEL_PATH": model_path,
+        "CFG_SELECTED_GPUS": gpu_str,
+        "CFG_PP_PARTITION": config_values.get("CFG_PP_PARTITION", str(num_layers)),
+        "CFG_LAYER_GROUP_SIZE": config_values.get("CFG_LAYER_GROUP_SIZE", "2"),
+        "CFG_KV_DTYPE": "polar4",
+        "CFG_GPU_EXPERT_BITS": str(variant["gpu_bits"]),
+        "CFG_CPU_EXPERT_BITS": str(variant["cpu_bits"]),
+        "CFG_ATTENTION_QUANT": variant["attention"],
+        "CFG_SHARED_EXPERT_QUANT": config_values.get("CFG_SHARED_EXPERT_QUANT", "int8"),
+        "CFG_DENSE_MLP_QUANT": config_values.get("CFG_DENSE_MLP_QUANT", "int8"),
+        "CFG_LM_HEAD_QUANT": config_values.get("CFG_LM_HEAD_QUANT", "int8"),
+        "CFG_HOST": "0.0.0.0",
+        "CFG_PORT": str(DEFAULT_PORT),
+        "CFG_GPU_PREFILL_THRESHOLD": config_values.get("CFG_GPU_PREFILL_THRESHOLD", "300"),
+        "CFG_KV_CACHE_MB": config_values.get("CFG_KV_CACHE_MB", "1000"),
+        "CFG_KRASIS_THREADS": config_values.get("CFG_KRASIS_THREADS", "40"),
+        "CFG_GGUF_PATH": config_values.get("CFG_GGUF_PATH", ""),
+        "CFG_VRAM_SAFETY_MARGIN": config_values.get("CFG_VRAM_SAFETY_MARGIN", "600"),
+        "CFG_FORCE_LOAD": config_values.get("CFG_FORCE_LOAD", ""),
+        "CFG_FORCE_REBUILD_CACHE": "",
+        "CFG_BUILD_CACHE": "",
+        "CFG_ENABLE_THINKING": "0",
+        "CFG_SESSION_ENABLED": "0",
+        "CFG_NUM_GPUS": str(num_gpus),
+    })
+
+    output_lines = [f"# Release test config — {variant['name']}"]
+    seen_keys = set()
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _ = stripped.split("=", 1)
+        if key in config_values:
+            output_lines.append(f'{key}="{config_values[key]}"')
+            seen_keys.add(key)
+    for key, value in config_values.items():
+        if key not in seen_keys:
+            output_lines.append(f'{key}="{value}"')
 
     fd, path = tempfile.mkstemp(prefix="krasis-release-", suffix=".conf")
     with os.fdopen(fd, "w") as f:
-        f.write("\n".join(lines) + "\n")
+        f.write("\n".join(output_lines) + "\n")
     return path
 
 
@@ -329,6 +396,8 @@ def build_caches(model_name: str, gpu_idx: int, num_layers: int,
                 f'CFG_LM_HEAD_QUANT="int8"',
                 f'CFG_HOST="0.0.0.0"',
                 f'CFG_PORT="{DEFAULT_PORT}"',
+                f'CFG_ENABLE_THINKING="0"',
+                f'CFG_SESSION_ENABLED="0"',
                 f'CFG_NUM_GPUS="1"',
             ]
             fd, config_path = tempfile.mkstemp(prefix="krasis-cache-", suffix=".conf")
@@ -465,6 +534,8 @@ def build_awq_template(model_name: str, gpu_idx: int, num_layers: int,
             f'CFG_LM_HEAD_QUANT="int8"',
             f'CFG_HOST="0.0.0.0"',
             f'CFG_PORT="{DEFAULT_PORT}"',
+            f'CFG_ENABLE_THINKING="0"',
+            f'CFG_SESSION_ENABLED="0"',
             f'CFG_NUM_GPUS="1"',
         ]
         fd, config_path = tempfile.mkstemp(prefix="krasis-awq-", suffix=".conf")
@@ -548,14 +619,38 @@ def build_awq_template(model_name: str, gpu_idx: int, num_layers: int,
 def find_krasis_command() -> str:
     """Find the installed krasis command. Fails if not found.
 
-    Prefers the conda env krasis because that's the environment with GPU
-    dependencies (PyTorch, sgl-kernel, etc). The ~/.local/bin/krasis may
-    point to a bare venv without GPU deps.
+    Prefer the repo-installed launcher in ~/.local/bin when present. That path
+    is refreshed by ./dev install and executes the current repo launcher under
+    the intended environment. Conda env entrypoints can be stale pip wrappers
+    whose shebang still points at an older interpreter, which makes release
+    tests validate the wrong runtime.
     """
-    # Prefer the conda env — this is the real production install
+    repo_launcher = os.path.expanduser("~/.local/bin/krasis")
+    if os.path.isfile(repo_launcher) and os.access(repo_launcher, os.X_OK):
+        return repo_launcher
+
+    # Fall back to the conda env install if its shebang matches the env.
     conda_path = os.path.expanduser("~/miniconda3/envs/ktransformers/bin/krasis")
     if os.path.isfile(conda_path):
-        return conda_path
+        try:
+            with open(conda_path, "r", encoding="utf-8") as f:
+                first_line = f.readline().strip()
+            if first_line.startswith("#!"):
+                shebang = os.path.realpath(first_line[2:].split()[0])
+                expected = os.path.realpath(
+                    os.path.expanduser("~/miniconda3/envs/ktransformers/bin/python")
+                )
+                if shebang == expected:
+                    return conda_path
+                warn(
+                    "Skipping stale conda krasis wrapper: "
+                    f"{conda_path} -> {shebang} (expected {expected})"
+                )
+            else:
+                return conda_path
+        except OSError:
+            pass
+
     # Fall back to PATH
     path = shutil.which("krasis")
     if path:
@@ -985,11 +1080,13 @@ def run_sanity_prompts(port: int = DEFAULT_PORT,
     except Exception:
         pass
 
-    # Thinking variant: use explicit enable_thinking=True, bump max_tokens
-    # for longer answers (thinking tokens are exempt from max_tokens on the server,
-    # but code answers like quicksort need more room)
+    # Always pass enable_thinking explicitly so release-test validates the
+    # requested config instead of relying on whatever the server default is.
+    # Thinking variants still get a larger answer budget because thinking tokens
+    # are exempt from max_tokens on the server, but code answers like quicksort
+    # need more visible-room as well.
     max_tokens = 512 if enable_thinking else 256
-    thinking_arg = True if enable_thinking else None  # None = server default (off)
+    thinking_arg = bool(enable_thinking)
 
     return run_sanity_test(server, temperature=0.3, max_tokens=max_tokens,
                            enable_thinking=thinking_arg)
@@ -1067,8 +1164,29 @@ def run_reference_validation(config_path: str, port: int = DEFAULT_PORT) -> Dict
         enable_logprobs=False,
         enable_prefill=False,
         max_prompts=REFERENCE_VALIDATE_MAX_PROMPTS,
+        use_reference_endpoint=True,
+        skip_visible_reasoning_reference=False,
         return_summary=True,
     )
+
+
+def selected_reference_variant_name(model_name: str) -> str:
+    """Return the model-specific release variant used for reference validation."""
+    return REFERENCE_VALIDATION_VARIANT_BY_MODEL.get(model_name, "INT4/AWQ/Polar4")
+
+
+def skipped_reference_validation_summary(reason: str) -> Dict:
+    """Structured skip result for configs that are not the model reference gate."""
+    return {
+        "prompts_run": 0,
+        "match_count": 0,
+        "warn_count": 0,
+        "fail_count": 0,
+        "skipped": True,
+        "passed": True,
+        "skip_reason": reason,
+        "results": [],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1701,15 +1819,24 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
                 ppl_badge = "skip"
             validation = cr.get("reference_validation")
             if validation:
-                if validation.get("fail_count", 0) > 0:
+                if validation.get("skipped"):
+                    validate_badge = "skip"
+                    validate_str = f"SKIP ({validation.get('skip_reason', 'not run')})"
+                elif validation.get("fail_count", 0) > 0:
                     validate_badge = "fail"
+                    validate_str = (f"{validation.get('match_count', 0)} MATCH, "
+                                    f"{validation.get('warn_count', 0)} WARN, "
+                                    f"{validation.get('fail_count', 0)} FAIL")
                 elif validation.get("warn_count", 0) > 0:
                     validate_badge = "warn"
+                    validate_str = (f"{validation.get('match_count', 0)} MATCH, "
+                                    f"{validation.get('warn_count', 0)} WARN, "
+                                    f"{validation.get('fail_count', 0)} FAIL")
                 else:
                     validate_badge = "pass"
-                validate_str = (f"{validation.get('match_count', 0)} MATCH, "
-                                f"{validation.get('warn_count', 0)} WARN, "
-                                f"{validation.get('fail_count', 0)} FAIL")
+                    validate_str = (f"{validation.get('match_count', 0)} MATCH, "
+                                    f"{validation.get('warn_count', 0)} WARN, "
+                                    f"{validation.get('fail_count', 0)} FAIL")
             else:
                 validate_str = "—"
                 validate_badge = "skip"
@@ -2084,7 +2211,7 @@ table.data td.num { text-align: right; font-family: monospace; }
     if has_validation:
         h.append('<h2 id="reference-validation">Reference Validation</h2>')
         h.append(f'<p style="color:#8b949e">Short greedy-output validation against stored reference outputs. '
-                 f'Each config runs Layer 1 token matching only, capped at {REFERENCE_VALIDATE_MAX_PROMPTS} prompts.</p>')
+                 f'Only the model-selected reference gate config is validated, capped at {REFERENCE_VALIDATE_MAX_PROMPTS} prompts.</p>')
         h.append('<table class="data"><thead><tr>')
         h.append('<th>Config</th><th>Prompts</th><th>Match</th><th>Warn</th><th>Fail</th><th>Status</th>')
         h.append('</tr></thead><tbody>')
@@ -2096,7 +2223,9 @@ table.data td.num { text-align: right; font-family: monospace; }
             warn_count = validation.get("warn_count", 0)
             match_count = validation.get("match_count", 0)
             prompts_run = validation.get("prompts_run", 0)
-            if fail_count:
+            if validation.get("skipped"):
+                badge = f'<span class="badge badge-skip">SKIP: {_html_escape(validation.get("skip_reason", "not run"))}</span>'
+            elif fail_count:
                 badge = '<span class="badge badge-fail">FAIL</span>'
             elif warn_count:
                 badge = '<span class="badge badge-warn">WARN</span>'
@@ -2207,6 +2336,7 @@ def main():
 
     total_params_b = estimate_total_params_b(model_config)
     skip_int8 = total_params_b > 200.0
+    reference_variant_name = selected_reference_variant_name(model_name)
 
     # Detect GPUs
     gpu_idx, gpu_name, gpu_vram = detect_best_gpu()
@@ -2224,6 +2354,7 @@ def main():
         gpu_summary = ", ".join(f"{g[1]} ({g[2]} MB)" for g in all_gpus)
         info(f"All GPUs: {gpu_summary}")
     info(f"Krasis: {krasis_cmd}")
+    info(f"Reference gate config: {reference_variant_name}")
     # Count active variants (skip multi-GPU if only 1 GPU, skip INT8 if >200B)
     active_variants = [v for v in CONFIG_VARIANTS
                        if (not v.get("multi_gpu") or len(all_gpus) > 1)
@@ -2435,13 +2566,28 @@ def main():
                 info("Phase 3: Large prompt validation")
                 result["large_results"] = run_large_prompt_tests(port=DEFAULT_PORT,
                                                                   enable_thinking=thinking)
-
-                # 8. Phase 4: Short reference validation
-                info(f"Phase 4: Reference validation ({REFERENCE_VALIDATE_MAX_PROMPTS} prompts)")
-                result["reference_validation"] = run_reference_validation(
-                    config_path,
-                    port=DEFAULT_PORT,
+                result["large_fail_count"] = sum(
+                    1 for lr in result["large_results"] if lr.get("error")
                 )
+
+                # 8. Phase 4: Short reference validation on the model-selected gate config
+                if variant["name"] == reference_variant_name:
+                    info(
+                        f"Phase 4: Reference validation on {variant['name']} "
+                        f"({REFERENCE_VALIDATE_MAX_PROMPTS} prompts)"
+                    )
+                    result["reference_validation"] = run_reference_validation(
+                        config_path,
+                        port=DEFAULT_PORT,
+                    )
+                else:
+                    info(
+                        "Phase 4: Reference validation skipped for this config "
+                        f"(model gate uses {reference_variant_name})"
+                    )
+                    result["reference_validation"] = skipped_reference_validation_summary(
+                        f"model gate uses {reference_variant_name}"
+                    )
             finally:
                 if prev_run_dir is None:
                     os.environ.pop("KRASIS_RUN_DIR", None)
@@ -2510,22 +2656,32 @@ def main():
             sf = result.get("sanity_fail_count", 0)
             sw = result.get("sanity_warn_count", 0)
             sp = result.get("sanity_pass_count", 0)
+            lf = result.get("large_fail_count", 0)
             if sf:
                 parts.append(f"sanity {sp}P/{sw}W/{sf}F")
             elif sw:
                 parts.append(f"sanity {sp}P/{sw}W")
+            if lf:
+                parts.append(f"large {lf}F")
             validation = result.get("reference_validation")
             if validation:
-                vf = validation.get("fail_count", 0)
-                vw = validation.get("warn_count", 0)
-                vm = validation.get("match_count", 0)
-                if vf:
-                    parts.append(f"ref {vm}M/{vw}W/{vf}F")
-                elif vw:
-                    parts.append(f"ref {vm}M/{vw}W")
+                if validation.get("skipped"):
+                    parts.append(f"ref SKIP ({validation.get('skip_reason', 'not run')})")
                 else:
-                    parts.append(f"ref {vm}M")
-            config_status = "FAIL" if sf or (validation and validation.get("fail_count", 0) > 0) else "PASS"
+                    vf = validation.get("fail_count", 0)
+                    vw = validation.get("warn_count", 0)
+                    vm = validation.get("match_count", 0)
+                    if vf:
+                        parts.append(f"ref {vm}M/{vw}W/{vf}F")
+                    elif vw:
+                        parts.append(f"ref {vm}M/{vw}W")
+                    else:
+                        parts.append(f"ref {vm}M")
+            config_status = "FAIL" if (
+                sf
+                or lf
+                or (validation and validation.get("fail_count", 0) > 0)
+            ) else "PASS"
             detail = f" ({', '.join(parts)})" if parts else ""
             session_notify(
                 f"[{model_name}] Config {i+1}/{len(CONFIG_VARIANTS)} "
@@ -2556,6 +2712,10 @@ def main():
         elif cr.get("sanity_fail_count", 0) > 0:
             sf = cr["sanity_fail_count"]
             status = f"{RED}FAILED{NC} ({sf} sanity failures)"
+            any_failed = True
+        elif cr.get("large_fail_count", 0) > 0:
+            lf = cr["large_fail_count"]
+            status = f"{RED}FAILED{NC} ({lf} large-prompt failures)"
             any_failed = True
         elif cr.get("reference_validation", {}).get("fail_count", 0) > 0:
             vf = cr["reference_validation"]["fail_count"]

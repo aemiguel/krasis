@@ -2,6 +2,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(no_numa)");
     println!("cargo::rustc-check-cfg=cfg(has_decode_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_prefill_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_cuda_debug_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_marlin_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_flash_attn_kernels)");
 
@@ -30,6 +31,9 @@ fn main() {
 
     // Compile CUDA prefill kernels to PTX (Rust prefill path).
     compile_prefill_kernels();
+
+    // Compile CUDA debug kernels to PTX (opt-in debug path).
+    compile_cuda_debug_kernels();
 
     // Compile vendored Marlin GEMM kernels into libkrasis_marlin.so
     compile_marlin_kernels();
@@ -218,6 +222,54 @@ fn compile_prefill_kernels() {
         }
         Err(e) => {
             println!("cargo:warning=nvcc execution error: {e} — GPU prefill kernels disabled");
+        }
+    }
+}
+
+fn compile_cuda_debug_kernels() {
+    let cu_src = "src/cuda/cuda_debug_kernels.cu";
+    println!("cargo:rerun-if-changed={cu_src}");
+    if !std::path::Path::new(cu_src).exists() {
+        println!("cargo:warning=cuda_debug_kernels.cu not found — CUDA debug kernels disabled");
+        return;
+    }
+
+    let nvcc = find_nvcc();
+    let Some(nvcc) = nvcc else {
+        println!("cargo:warning=nvcc not found — CUDA debug kernels disabled");
+        return;
+    };
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let ptx_path = format!("{out_dir}/cuda_debug_kernels.ptx");
+
+    if is_output_fresh(&[cu_src], &[&ptx_path]) {
+        println!("cargo:rustc-cfg=has_cuda_debug_kernels");
+        println!("cargo:warning=Reusing cached CUDA debug kernels at {ptx_path}");
+        return;
+    }
+
+    let status = std::process::Command::new(&nvcc)
+        .args([
+            "-ptx",
+            "-arch=sm_80",
+            "-O3",
+            "--use_fast_math",
+            "-o", &ptx_path,
+            cu_src,
+        ])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("cargo:rustc-cfg=has_cuda_debug_kernels");
+            println!("cargo:warning=Compiled CUDA debug kernels to PTX ({ptx_path})");
+        }
+        Ok(s) => {
+            println!("cargo:warning=nvcc failed with status {s} — CUDA debug kernels disabled");
+        }
+        Err(e) => {
+            println!("cargo:warning=nvcc execution error: {e} — CUDA debug kernels disabled");
         }
     }
 }

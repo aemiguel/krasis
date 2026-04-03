@@ -416,6 +416,22 @@ def _build_heatmap(model: KrasisModel, save_path: str) -> str:
     import os, json
 
     prompts = _load_heatmap_prompts()
+    heatmap_prompt_start = int(os.environ.get("KRASIS_HEATMAP_PROMPT_START", "1"))
+    heatmap_prompt_count = int(os.environ.get("KRASIS_HEATMAP_PROMPT_COUNT", str(len(prompts))))
+    start_idx = max(0, heatmap_prompt_start - 1)
+    end_idx = min(len(prompts), start_idx + max(1, heatmap_prompt_count))
+    prompts = prompts[start_idx:end_idx]
+    logger.info(
+        "Heatmap prompt selection: start=%d count=%d actual=%d",
+        heatmap_prompt_start,
+        heatmap_prompt_count,
+        len(prompts),
+    )
+    if not prompts:
+        raise RuntimeError(
+            f"Heatmap prompt selection produced no prompts "
+            f"(start={heatmap_prompt_start}, count={heatmap_prompt_count})"
+        )
 
     gpu_store = getattr(model, '_gpu_decode_store', None)
     if gpu_store is None:
@@ -468,6 +484,10 @@ def _build_heatmap(model: KrasisModel, save_path: str) -> str:
     gpu_store.hcs_reset()
 
     return save_path
+
+
+def _exit_after_heatmap_debug_enabled() -> bool:
+    return os.environ.get("KRASIS_EXIT_AFTER_HEATMAP_DEBUG", "") == "1"
 
 
 _registry_file: Optional[Path] = None
@@ -1396,6 +1416,9 @@ def main():
         else:
             _status("Building expert heatmap (decode-weighted calibration)")
             heatmap_path = _build_heatmap(_model, heatmap_path)
+            if _exit_after_heatmap_debug_enabled():
+                logger.info("KRASIS_EXIT_AFTER_HEATMAP_DEBUG=1 set — exiting after heatmap build")
+                return
 
         # ── Load heatmap and build sorted ranking ──
         with open(heatmap_path) as f:
@@ -1824,14 +1847,20 @@ def main():
     # Models sometimes generate <|im_start|> during multi-turn thinking,
     # creating phantom new turns. Suppressing these prevents the issue.
     _suppress_tokens = []
-    for special_tok in ["<|im_start|>", "<|start_header_id|>", "<|begin_of_text|>"]:
-        _raw_id = _hf_tok.convert_tokens_to_ids(special_tok)
-        if isinstance(_raw_id, int) and _raw_id != _hf_tok.unk_token_id:
-            _suppress_tokens.append(_raw_id)
+    if os.environ.get("KRASIS_DISABLE_SPECIAL_TOKEN_SUPPRESSION", "") == "1":
+        logger.info("KRASIS_DISABLE_SPECIAL_TOKEN_SUPPRESSION=1 set — special-token suppression disabled")
+    else:
+        for special_tok in ["<|im_start|>", "<|start_header_id|>", "<|begin_of_text|>"]:
+            _raw_id = _hf_tok.convert_tokens_to_ids(special_tok)
+            if isinstance(_raw_id, int) and _raw_id != _hf_tok.unk_token_id:
+                _suppress_tokens.append(_raw_id)
     if _suppress_tokens:
         _model._gpu_decode_store.set_suppress_tokens(_suppress_tokens)
         _model._suppress_tokens = _suppress_tokens
         logger.info("Suppress tokens: %s", {tok: _hf_tok.convert_ids_to_tokens(tok) for tok in _suppress_tokens})
+    else:
+        _model._gpu_decode_store.set_suppress_tokens([])
+        _model._suppress_tokens = []
 
     logger.info(
         "Model loaded, starting server on %s:%d (max context: %d, decode: GPU%s)",
@@ -1880,7 +1909,7 @@ def main():
     time.sleep(1.0)
     _decode_mode = f"{len(all_aux_gpu_store_addrs)+1}-GPU" if all_aux_gpu_store_addrs else "GPU"
     _hcs_str = "on" if args.hcs else "off"
-    _think_str = "on" if think_end_id else "off"
+    _think_str = "on" if args.enable_thinking else "off"
     print(flush=True)
     print(f"  {_BOLD}{_GREEN}{'━' * 54}{_NC}", flush=True)
     vram_monitor.report_event("server_ready")

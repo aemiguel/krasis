@@ -59,10 +59,58 @@ class KrasisBenchmark:
         self.timing = timing
 
         self.decode_tokens = 64  # legacy, kept for compatibility
-        self.n_runs = len(self.DECODE_LENGTHS)  # 3 runs = 3 decode lengths
+        self.decode_lengths = self._load_lengths_override(
+            "KRASIS_BENCH_DECODE_LENGTHS",
+            self.DECODE_LENGTHS,
+            minimum=1,
+        )
+        self.n_runs = len(self.decode_lengths)
+        self.prefill_lengths = self._load_prefill_lengths_override()
+        self.prefill_file_offset = self._load_int_env("KRASIS_BENCH_PREFILL_FILE_OFFSET")
 
         if not timing:
             os.environ.pop("KRASIS_DECODE_TIMING", None)
+
+    def _load_int_env(self, name: str) -> Optional[int]:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r (expected integer)", name, raw)
+            return None
+        if value < 0:
+            logger.warning("Ignoring invalid %s=%r (must be >= 0)", name, raw)
+            return None
+        return value
+
+    def _load_lengths_override(self, name: str, default: List[int], minimum: int = 1) -> List[int]:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return list(default)
+        lengths = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                value = int(part)
+            except ValueError:
+                logger.warning("Ignoring invalid %s entry %r (expected integer)", name, part)
+                continue
+            if value < minimum:
+                logger.warning("Ignoring invalid %s entry %r (must be >= %d)", name, part, minimum)
+                continue
+            lengths.append(value)
+        return lengths or list(default)
+
+    def _load_prefill_lengths_override(self) -> List[int]:
+        return self._load_lengths_override(
+            "KRASIS_BENCH_PREFILL_LENGTHS",
+            self.PREFILL_LENGTHS,
+            minimum=1,
+        )
 
     # ──────────────────────────────────────────────────────────
     # System info collection
@@ -488,8 +536,10 @@ class KrasisBenchmark:
                                   prompt_texts: List[str]) -> Dict:
         """Engine prefill benchmark — Rust Instant timing, no HTTP."""
         runs = []
-        for tokens, text in zip(prompt_tokens, prompt_texts):
+        total_runs = len(prompt_tokens)
+        for idx, (tokens, text) in enumerate(zip(prompt_tokens, prompt_texts), start=1):
             n_tokens = len(tokens)
+            print(f"  Prefill run {idx}/{total_runs}: requesting {n_tokens:,} tokens")
             r = self._engine_request(text, max_new_tokens=1)
 
             tok_s = r["prefill_tok_s"]
@@ -752,28 +802,29 @@ class KrasisBenchmark:
         print(f"  Strategy: {model_info['decode_mode']}")
 
         # 2. Build prompts
-        n_timed_prefill = len(self.PREFILL_LENGTHS)
-        lengths_str = "/".join(f"{l//1000}K" for l in self.PREFILL_LENGTHS)
+        n_timed_prefill = len(self.prefill_lengths)
+        lengths_str = "/".join(f"{l//1000}K" for l in self.prefill_lengths)
         print(_section(f"Loading benchmark prompts (warmup + timed at {lengths_str})"))
 
         warmup_prefill_tokens, warmup_prefill_texts = self._make_prefill_prompts(self.n_runs, max_tokens_override=25000)
+        timed_file_offset = self.prefill_file_offset if self.prefill_file_offset is not None else self.n_runs
         timed_prefill_tokens, timed_prefill_texts = self._make_prefill_prompts_at_lengths(
-            self.PREFILL_LENGTHS, file_offset=self.n_runs)
-        n_decode_prompts = len(self.DECODE_LENGTHS) * 2  # warmup + timed
+            self.prefill_lengths, file_offset=timed_file_offset)
+        n_decode_prompts = len(self.decode_lengths) * 2  # warmup + timed
         decode_tokens_all, decode_texts_all = self._make_decode_prompts(n_decode_prompts)
 
-        decode_len_str = "/".join(str(l) for l in self.DECODE_LENGTHS)
+        decode_len_str = "/".join(str(l) for l in self.decode_lengths)
         print(f"  Warmup prefill:  {self.n_runs} prompts, ~{len(warmup_prefill_tokens[0]):,} tokens each")
         print(f"  Timed prefill:   {n_timed_prefill} prompts at {lengths_str} tokens")
         for i, p in enumerate(timed_prefill_tokens):
             print(f"    [{i+1}] {len(p):,} tokens")
         print(f"  Decode:          {n_decode_prompts} prompts ({decode_len_str} tokens, warmup + timed)")
 
-        warmup_decode_texts = decode_texts_all[:len(self.DECODE_LENGTHS)]
-        timed_decode_texts = decode_texts_all[len(self.DECODE_LENGTHS):]
+        warmup_decode_texts = decode_texts_all[:len(self.decode_lengths)]
+        timed_decode_texts = decode_texts_all[len(self.decode_lengths):]
 
         # 3. Warmup — compile kernels + warm caches (engine path)
-        print(_section(f"Warmup ({self.n_runs} prefill + {len(self.DECODE_LENGTHS)} decode via engine)"))
+        print(_section(f"Warmup ({self.n_runs} prefill + {len(self.decode_lengths)} decode via engine)"))
         self._warmup_engine()
         t0 = time.perf_counter()
         print(f"  Prefill warmup ({self.n_runs} runs, ~25K tokens each)...")
@@ -781,7 +832,7 @@ class KrasisBenchmark:
             self._engine_request(text, max_new_tokens=1)
             print(f"    [{i+1}/{self.n_runs}] {len(tokens):,} tokens")
         print(f"  Decode warmup ({decode_len_str} tokens, 3 separate prompts)...")
-        for text, length in zip(warmup_decode_texts, self.DECODE_LENGTHS):
+        for text, length in zip(warmup_decode_texts, self.decode_lengths):
             self._engine_request(text, max_new_tokens=length)
             print(f"    {length} tokens done")
         warmup_s = time.perf_counter() - t0
@@ -795,8 +846,8 @@ class KrasisBenchmark:
         print(f"  {BOLD}Best: {prefill_result['best_tok_s']:,.1f} tok/s ({prefill_result['best_num_tokens']:,} tokens){NC}")
 
         # 5. Decode (internal)
-        print(_section(f"Decode (internal) — {decode_len_str} tokens, 3 separate prompts"))
-        decode_result = self._benchmark_decode_engine(timed_decode_texts, self.DECODE_LENGTHS)
+        print(_section(f"Decode (internal) — {decode_len_str} tokens, {len(self.decode_lengths)} separate prompts"))
+        decode_result = self._benchmark_decode_engine(timed_decode_texts, self.decode_lengths)
         for run in decode_result["runs"]:
             if run["failed"]:
                 print(f"  {run['target_tokens']:>3} tokens: {YELLOW}FAILED (EOS at {run['actual_tokens']} tokens){NC}")
@@ -817,7 +868,7 @@ class KrasisBenchmark:
         if self._wait_for_server():
             # HTTP warmup
             self._http_round_trip("warmup", 8)
-            round_trip_result = self._benchmark_round_trip(timed_decode_texts, self.DECODE_LENGTHS)
+            round_trip_result = self._benchmark_round_trip(timed_decode_texts, self.decode_lengths)
             for run in round_trip_result["runs"]:
                 if run["failed"]:
                     print(f"  {run['target_tokens']:>3} tokens: {YELLOW}FAILED (EOS at {run['tokens']} tokens){NC}")

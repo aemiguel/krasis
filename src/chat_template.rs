@@ -95,12 +95,23 @@ impl ChatTemplateEngine {
     /// `messages_json` is a JSON array of {role, content} objects.
     /// `tools_json` is an optional JSON array of tool definitions (OpenAI format).
     /// Returns the rendered text string ready for tokenization.
-    pub fn apply(&self, messages_json: &str, add_generation_prompt: bool) -> Result<String, String> {
-        self.apply_with_tools(messages_json, "", add_generation_prompt)
+    pub fn apply(
+        &self,
+        messages_json: &str,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+    ) -> Result<String, String> {
+        self.apply_with_tools(messages_json, "", add_generation_prompt, enable_thinking)
     }
 
     /// Apply with optional tools array for accurate token estimation.
-    pub fn apply_with_tools(&self, messages_json: &str, tools_json: &str, add_generation_prompt: bool) -> Result<String, String> {
+    pub fn apply_with_tools(
+        &self,
+        messages_json: &str,
+        tools_json: &str,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+    ) -> Result<String, String> {
         let mut messages: serde_json::Value = serde_json::from_str(messages_json)
             .map_err(|e| format!("Failed to parse messages JSON: {}", e))?;
         let tools: serde_json::Value = if tools_json.is_empty() {
@@ -231,6 +242,7 @@ impl ChatTemplateEngine {
             bos_token => &self.bos_token,
             eos_token => &self.eos_token,
             add_generation_prompt => add_generation_prompt,
+            enable_thinking => enable_thinking,
         };
 
         tmpl.render(ctx)

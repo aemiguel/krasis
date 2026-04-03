@@ -33,6 +33,103 @@ __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS) {};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
+static bool fused_moe_launch_debug_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char* env = std::getenv("KRASIS_FUSED_MOE_LAUNCH_DEBUG");
+        enabled = (env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0')) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool fused_moe_bounds_debug_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char* env = std::getenv("KRASIS_FUSED_MOE_BOUNDS_DEBUG");
+        enabled = (env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0')) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static int fused_moe_env_override_int(const char* name) {
+    const char* env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return -1;
+    }
+    char* end = nullptr;
+    long val = std::strtol(env, &end, 10);
+    if (end == env || (end != nullptr && *end != '\0') || val <= 0 || val > INT_MAX) {
+        fprintf(stderr, "[KRASIS fused_moe_debug] ignoring invalid %s=%s\n", name, env);
+        return -1;
+    }
+    return static_cast<int>(val);
+}
+
+static int fused_moe_sync_stage_mode() {
+    static int mode = -1;
+    if (mode != -1) {
+        return mode;
+    }
+    const char* env = std::getenv("KRASIS_FUSED_MOE_SYNC_STAGE");
+    if (env == nullptr || env[0] == '\0') {
+        mode = 0;
+        return mode;
+    }
+    if (strcmp(env, "w1") == 0) {
+        mode = 1;
+    } else if (strcmp(env, "w2") == 0) {
+        mode = 2;
+    } else {
+        mode = 3;
+    }
+    return mode;
+}
+
+static bool fused_moe_should_sync_stage(int prob_n, int prob_k) {
+    if (fused_moe_launch_debug_enabled()) {
+        return true;
+    }
+    const int mode = fused_moe_sync_stage_mode();
+    if (mode == 0) {
+        return false;
+    }
+    // MoE W1 expands hidden -> intermediate, while W2 contracts intermediate -> hidden.
+    // Use the prob_n/prob_k relation as a debug-only stage discriminator.
+    const bool looks_like_w1 = prob_n > prob_k;
+    if (mode == 1) {
+        return looks_like_w1;
+    }
+    if (mode == 2) {
+        return !looks_like_w1;
+    }
+    return true;
+}
+
+static bool fused_moe_check_cuda(
+    const char* stage,
+    cudaError_t err,
+    cudaStream_t stream,
+    bool do_sync = false) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[KRASIS fused_moe_debug] %s failed: %s\n", stage, cudaGetErrorString(err));
+        return false;
+    }
+    if (!do_sync) {
+        return true;
+    }
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[KRASIS fused_moe_debug] %s launch error: %s\n", stage, cudaGetErrorString(err));
+        return false;
+    }
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[KRASIS fused_moe_debug] %s stream sync error: %s\n", stage, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 // sm < 80 not supported
 #else
@@ -315,7 +412,8 @@ void moe_marlin_mm_impl(
     int num_groups, int group_size, int dev, cudaStream_t stream,
     int thread_k, int thread_n, int sms,
     bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float,
-    const void* B_expert_ptrs, const void* S_expert_ptrs) {
+    const void* B_expert_ptrs, const void* S_expert_ptrs,
+    bool debug_bounds_check) {
 
     int thread_m_blocks = div_ceil(moe_block_size, 16);
     bool m_block_size_8 = moe_block_size == 8;
@@ -359,6 +457,7 @@ void moe_marlin_mm_impl(
         perm_kernel<<<sms, default_threads, 0, stream>>>(
             A_ptr, perm_ptr, a_tmp_ptr, sorted_token_ids_ptr, expert_ids_ptr,
             num_tokens_past_padded_ptr, prob_m, prob_k, top_k);
+        if (!fused_moe_check_cuda("permute_cols_kernel", cudaSuccess, stream, fused_moe_launch_debug_enabled())) return;
         A_ptr = a_tmp_ptr;
         prob_m = prob_m * top_k;
         top_k = 1;
@@ -366,13 +465,46 @@ void moe_marlin_mm_impl(
     }
 
     int max_shared_mem = 0;
-    cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if (!fused_moe_check_cuda(
+            "cudaDeviceGetAttribute",
+            cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev),
+            stream)) return;
     if (max_shared_mem <= 0) return;
+
+    const int env_thread_k = fused_moe_env_override_int("KRASIS_FUSED_MOE_THREAD_K");
+    const int env_thread_n = fused_moe_env_override_int("KRASIS_FUSED_MOE_THREAD_N");
+    if (env_thread_k != -1 || env_thread_n != -1) {
+        if (env_thread_k == -1 || env_thread_n == -1) {
+            fprintf(
+                stderr,
+                "[KRASIS fused_moe_debug] ignoring partial thread override thread_k=%d thread_n=%d\n",
+                env_thread_k,
+                env_thread_n);
+        } else {
+            thread_k = env_thread_k;
+            thread_n = env_thread_n;
+        }
+    }
 
     moe_exec_config_t exec_cfg;
     moe_thread_config_t thread_tfg;
     if (thread_k != -1 && thread_n != -1) {
         thread_tfg = moe_thread_config_t{thread_k, thread_n, default_threads};
+        if (!moe_is_valid_config(
+                thread_tfg, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k, num_bits,
+                group_size, has_act_order, is_k_full, has_zp, is_zp_float, max_shared_mem)) {
+            fprintf(
+                stderr,
+                "[KRASIS fused_moe_debug] invalid thread override thread_k=%d thread_n=%d "
+                "for prob_m=%d prob_n=%d prob_k=%d block_size=%d\n",
+                thread_k,
+                thread_n,
+                prob_m,
+                prob_n,
+                prob_k,
+                moe_block_size);
+            return;
+        }
         exec_cfg = moe_exec_config_t{1, thread_tfg};
     } else {
         exec_cfg = moe_determine_exec_config<scalar_t>(
@@ -414,14 +546,38 @@ void moe_marlin_mm_impl(
         return;
     }
 
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kernel_shared_mem);
+    if (fused_moe_launch_debug_enabled() || env_thread_k != -1 || env_thread_n != -1) {
+        fprintf(
+            stderr,
+            "[KRASIS fused_moe_debug] config prob_m=%d prob_n=%d prob_k=%d block_size=%d "
+            "thread_k=%d thread_n=%d num_threads=%d blocks_per_sm=%d blocks=%d shared=%d ptr_table=%d\n",
+            prob_m,
+            prob_n,
+            prob_k,
+            moe_block_size,
+            thread_k,
+            thread_n,
+            num_threads,
+            exec_cfg.blocks_per_sm,
+            blocks,
+            kernel_shared_mem,
+            B_expert_ptrs != nullptr ? 1 : 0);
+    }
 
+    if (!fused_moe_check_cuda(
+            "cudaFuncSetAttribute",
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kernel_shared_mem),
+            stream)) return;
+
+    const bool sync_kernel = fused_moe_should_sync_stage(prob_n, prob_k);
     kernel<<<blocks, num_threads, kernel_shared_mem, stream>>>(
         A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
         sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
         topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
         prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, kernel_shared_mem,
-        (const int64_t*)B_expert_ptrs, (const int64_t*)S_expert_ptrs);
+        (const int4* const*)B_expert_ptrs, (const int4* const*)S_expert_ptrs,
+        debug_bounds_check);
+    if (!fused_moe_check_cuda("moe_marlin_kernel", cudaSuccess, stream, sync_kernel)) return;
 }
 
 #endif  // __CUDA_ARCH__ >= 800
@@ -444,7 +600,8 @@ extern "C" void krasis_marlin_moe_mm_bf16(
     int num_groups, int group_size, int dev, void* stream_ptr,
     int thread_k, int thread_n, int sms,
     bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float,
-    const void* B_expert_ptrs, const void* S_expert_ptrs) {
+    const void* B_expert_ptrs, const void* S_expert_ptrs,
+    bool debug_bounds_check) {
 
     const sglang::ScalarType& q_type = *reinterpret_cast<const sglang::ScalarType*>(q_type_ptr);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -458,5 +615,10 @@ extern "C" void krasis_marlin_moe_mm_bf16(
         num_groups, group_size, dev, stream,
         thread_k, thread_n, sms,
         use_atomic_add, use_fp32_reduce, is_zp_float,
-        B_expert_ptrs, S_expert_ptrs);
+        B_expert_ptrs, S_expert_ptrs, debug_bounds_check);
+}
+
+extern "C" int krasis_cuda_runtime_stream_sync(void* stream_ptr) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    return static_cast<int>(cudaStreamSynchronize(stream));
 }

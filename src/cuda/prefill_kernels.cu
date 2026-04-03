@@ -3175,12 +3175,10 @@ extern "C" __global__ void moe_padded_prefix_sum_kernel(
  */
 extern "C" __global__ void moe_scatter_sorted_kernel(
     int* __restrict__ sorted_token_ids,
-    int* __restrict__ expert_ids_out,
     int* __restrict__ write_offsets,       // [E] atomically incremented
     const int* __restrict__ topk_ids,      // [M, topk]
-    const int* __restrict__ expert_offsets, // [E+1]
-    const int* __restrict__ expert_counts, // [E]
-    int M, int topk, int E, int block_size
+    const int* __restrict__ expert_offsets, // [E]
+    int M, int topk, int E
 ) {
     int t = blockIdx.x;
     if (t >= M) return;
@@ -3192,23 +3190,36 @@ extern "C" __global__ void moe_scatter_sorted_kernel(
             sorted_token_ids[base + slot] = t * topk + k;  // vLLM format: token*topk+slot
         }
     }
-    // Fill expert_ids and padding (done by first thread only)
-    if (t == 0) {
-        for (int e = 0; e < E; e++) {
-            int base = expert_offsets[e];
-            int count = expert_counts[e];
-            int padded = expert_offsets[e + 1] - base;
-            int num_blocks = padded / block_size;
-            // Fill padding slots with M*topk (Marlin kernel checks >= prob_m * top_k)
-            for (int p = count; p < padded; p++) {
-                sorted_token_ids[base + p] = M * topk; // padding sentinel
-            }
-            // Fill expert_ids for each block
-            int block_start = base / block_size;
-            for (int b = 0; b < num_blocks; b++) {
-                expert_ids_out[block_start + b] = e;
-            }
-        }
+}
+
+/* Phase 4: Fill padding sentinels and expert_ids after scatter is complete.
+ * Must be a separate kernel from moe_scatter_sorted_kernel because CUDA provides
+ * no grid-wide synchronization inside a normal kernel launch.
+ */
+extern "C" __global__ void moe_finalize_sorted_kernel(
+    int* __restrict__ sorted_token_ids,
+    int* __restrict__ expert_ids_out,
+    const int* __restrict__ expert_offsets, // [E+1]
+    const int* __restrict__ expert_counts,  // [E]
+    int M, int topk, int E, int block_size
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E) return;
+
+    int base = expert_offsets[e];
+    int count = expert_counts[e];
+    int padded = expert_offsets[e + 1] - base;
+    int num_blocks = padded / block_size;
+
+    // Fill padding slots with M*topk (Marlin kernel checks >= prob_m * top_k).
+    for (int p = count; p < padded; p++) {
+        sorted_token_ids[base + p] = M * topk;
+    }
+
+    // Fill expert_ids for each block.
+    int block_start = base / block_size;
+    for (int b = 0; b < num_blocks; b++) {
+        expert_ids_out[block_start + b] = e;
     }
 }
 
@@ -3298,6 +3309,35 @@ extern "C" __global__ void moe_scatter_weighted_kernel(
     for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
         float val = bf16_to_float(src[sorted_id * hidden + i]) * w;
         atomicAdd(&accum[token * hidden + i], val);
+    }
+}
+
+/* Debug-only deterministic variant of moe_scatter_weighted_kernel.
+ * One block owns one token row and sums its top-k slots in fixed order,
+ * avoiding FP32 atomicAdd reordering noise during diagnosis.
+ *
+ * Grid: (M, 1, 1), Block: (threads, 1, 1)
+ */
+extern "C" __global__ void moe_scatter_weighted_deterministic_kernel(
+    float* __restrict__ accum,              // [M, hidden] FP32 accumulator (pre-zeroed)
+    const __nv_bfloat16* __restrict__ src,  // [M*topk, hidden] fused w2 output (indexed by sorted_id)
+    const float* __restrict__ topk_weights, // [M * topk] routing weights
+    int hidden, int M, int topk, float scale_factor
+) {
+    int token = blockIdx.x;
+    if (token >= M) return;
+    float* dst = accum + (int64_t)token * hidden;
+    int base = token * topk;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float sum = 0.0f;
+        for (int k = 0; k < topk; k++) {
+            int sorted_id = base + k;
+            float w = topk_weights[sorted_id] * scale_factor;
+            if (w != 0.0f) {
+                sum += bf16_to_float(src[(int64_t)sorted_id * hidden + i]) * w;
+            }
+        }
+        dst[i] = sum;
     }
 }
 

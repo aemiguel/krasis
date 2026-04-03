@@ -12,8 +12,9 @@
 //! All memory managed via cudarc (CUDA driver API).
 //! Kernels loaded from PTX (simple ops) or dlopen'd from vendored libkrasis_marlin.so (Marlin).
 
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,11 +34,200 @@ fn prefill_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn prefill_fused_sync_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_FUSED_SYNC_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_fused_moe_bounds_debug_enabled() -> bool {
+    std::env::var("KRASIS_FUSED_MOE_BOUNDS_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_fused_sync_stage_debug() -> Option<String> {
+    std::env::var("KRASIS_PREFILL_FUSED_SYNC_STAGE_DEBUG")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+}
+
+fn prefill_fused_sync_stage_matches(label: &str) -> bool {
+    prefill_fused_sync_stage_debug()
+        .as_deref()
+        .map(|filter| filter == "all" || label.to_ascii_lowercase().contains(filter))
+        .unwrap_or(false)
+}
+
+fn prefill_shared_sync_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_SHARED_SYNC_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_shared_sync_stage_debug() -> Option<String> {
+    std::env::var("KRASIS_PREFILL_SHARED_SYNC_STAGE_DEBUG")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+}
+
+fn prefill_disable_shared_overlap_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_DISABLE_SHARED_OVERLAP_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_force_fused_shared_main_stream_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_FORCE_FUSED_SHARED_MAIN_STREAM_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_pre_moe_sync_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_PRE_MOE_SYNC_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_post_moe_shared_sync_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_POST_MOE_SHARED_SYNC_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_shared_consume_wait_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_SHARED_CONSUME_WAIT_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_deterministic_scatter_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_DETERMINISTIC_SCATTER_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_validate_active_ptrs_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_VALIDATE_ACTIVE_PTRS_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_gqa_force_custom_attn_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_GQA_FORCE_CUSTOM_ATTN_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_gqa_repeat_attn_debug_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_GQA_REPEAT_ATTN_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_full_surface_diag_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_FULL_SURFACE_DIAG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_position_hash_diag_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_POSITION_HASH_DIAG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+static PREFILL_DIAG_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn prefill_diag_ptr_table_regular_enabled() -> bool {
+    std::env::var("KRASIS_PREFILL_DIAG_PTR_TABLE_REGULAR")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn prefill_debug_layers() -> Option<Vec<String>> {
+    std::env::var("KRASIS_PREFILL_DEBUG_LAYERS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+}
+
+fn prefill_debug_layer_selected(layer_idx: usize) -> bool {
+    let Some(selectors) = prefill_debug_layers() else {
+        return false;
+    };
+    for selector in selectors {
+        if selector == "all" {
+            return true;
+        }
+        if let Ok(single) = selector.parse::<usize>() {
+            if layer_idx == single {
+                return true;
+            }
+            continue;
+        }
+        if let Some((start, end)) = selector.split_once('-') {
+            if let (Ok(start), Ok(end)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>()) {
+                if start <= layer_idx && layer_idx <= end {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn prefill_debug_chunks() -> Option<Vec<String>> {
+    std::env::var("KRASIS_PREFILL_DEBUG_CHUNKS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+}
+
+fn prefill_debug_chunk_selected(chunk_idx: usize) -> bool {
+    let Some(selectors) = prefill_debug_chunks() else {
+        return false;
+    };
+    for selector in selectors {
+        if selector == "all" {
+            return true;
+        }
+        if let Ok(single) = selector.parse::<usize>() {
+            if chunk_idx == single {
+                return true;
+            }
+            continue;
+        }
+        if let Some((start, end)) = selector.split_once('-') {
+            if let (Ok(start), Ok(end)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>()) {
+                if chunk_idx >= start && chunk_idx <= end {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 const MARLIN_PIPE_STAGES: usize = 4;
 const MARLIN_MIN_THREAD_N: usize = 64;
 const MARLIN_MIN_THREAD_K: usize = 64;
 const MARLIN_MAX_BLOCKS_PER_SM: usize = 4;
 const MARLIN_MAX_LOCK_SLOTS_PER_SM: usize = 4;
+const CUBLAS_ALPHA_F32: f32 = 1.0;
+const CUBLAS_BETA_F32: f32 = 0.0;
 
 fn marlin_moe_scales_cache_size(
     thread_n: usize,
@@ -220,6 +410,7 @@ pub struct GpuBuf<T: Copy> {
     ptr: u64,       // CUdeviceptr
     len: usize,     // element count (not bytes)
     device_ordinal: i32,
+    cuda_debug: Option<Arc<crate::cuda_debug::CudaDebugController>>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -227,29 +418,118 @@ unsafe impl<T: Copy + Send> Send for GpuBuf<T> {}
 unsafe impl<T: Copy + Sync> Sync for GpuBuf<T> {}
 
 impl<T: Copy> GpuBuf<T> {
-    pub fn alloc_zeroed(count: usize) -> Result<Self, String> {
+    pub fn alloc_uninit_dbg(
+        count: usize,
+        tag: &str,
+        cuda_debug: Option<Arc<crate::cuda_debug::CudaDebugController>>,
+    ) -> Result<Self, String> {
         let bytes = count * std::mem::size_of::<T>();
         if bytes == 0 {
-            return Ok(Self { ptr: 0, len: 0, device_ordinal: 0, _phantom: std::marker::PhantomData });
+            return Ok(Self {
+                ptr: 0,
+                len: 0,
+                device_ordinal: 0,
+                cuda_debug,
+                _phantom: std::marker::PhantomData,
+            });
+        }
+        let mut dev: i32 = 0;
+        unsafe { cuda_sys::lib().cuCtxGetDevice(&mut dev); }
+        let ptr = if let Some(debug) = cuda_debug.as_ref() {
+            if debug.alloc_debug_enabled() {
+                let alloc = debug.alloc_zeroed_owned(bytes, dev, tag, file!(), line!())?;
+                alloc.payload_ptr
+            } else {
+                let mut ptr: u64 = 0;
+                let err = unsafe { cuda_sys::lib().cuMemAlloc_v2(&mut ptr, bytes) };
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("cuMemAlloc_v2({} bytes) failed: {:?}", bytes, err));
+                }
+                ptr
+            }
+        } else {
+            let mut ptr: u64 = 0;
+            let err = unsafe { cuda_sys::lib().cuMemAlloc_v2(&mut ptr, bytes) };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuMemAlloc_v2({} bytes) failed: {:?}", bytes, err));
+            }
+            ptr
+        };
+        Ok(Self {
+            ptr,
+            len: count,
+            device_ordinal: dev,
+            cuda_debug,
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
+    pub fn alloc_zeroed(count: usize) -> Result<Self, String> {
+        Self::alloc_zeroed_dbg(count, "gpu_buf", None)
+    }
+
+    pub fn alloc_zeroed_dbg(
+        count: usize,
+        tag: &str,
+        cuda_debug: Option<Arc<crate::cuda_debug::CudaDebugController>>,
+    ) -> Result<Self, String> {
+        let bytes = count * std::mem::size_of::<T>();
+        if bytes == 0 {
+            return Ok(Self {
+                ptr: 0,
+                len: 0,
+                device_ordinal: 0,
+                cuda_debug,
+                _phantom: std::marker::PhantomData,
+            });
         }
         // Get current device ordinal for drop
         let mut dev: i32 = 0;
         unsafe { cuda_sys::lib().cuCtxGetDevice(&mut dev); }
-        let mut ptr: u64 = 0;
-        let err = unsafe { cuda_sys::lib().cuMemAlloc_v2(&mut ptr, bytes) };
-        if err != cuda_sys::CUresult::CUDA_SUCCESS {
-            return Err(format!("cuMemAlloc_v2({} bytes) failed: {:?}", bytes, err));
-        }
-        let err = unsafe { cuda_sys::lib().cuMemsetD8_v2(ptr, 0, bytes) };
-        if err != cuda_sys::CUresult::CUDA_SUCCESS {
-            unsafe { cuda_sys::lib().cuMemFree_v2(ptr); }
-            return Err(format!("cuMemsetD8({} bytes) failed: {:?}", bytes, err));
-        }
-        Ok(Self { ptr, len: count, device_ordinal: dev, _phantom: std::marker::PhantomData })
+        let ptr = if let Some(debug) = cuda_debug.as_ref() {
+            if debug.alloc_debug_enabled() {
+                let alloc = debug.alloc_zeroed_owned(bytes, dev, tag, file!(), line!())?;
+                alloc.payload_ptr
+            } else {
+                let mut ptr: u64 = 0;
+                let err = unsafe { cuda_sys::lib().cuMemAlloc_v2(&mut ptr, bytes) };
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("cuMemAlloc_v2({} bytes) failed: {:?}", bytes, err));
+                }
+                let err = unsafe { cuda_sys::lib().cuMemsetD8_v2(ptr, 0, bytes) };
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    unsafe { cuda_sys::lib().cuMemFree_v2(ptr); }
+                    return Err(format!("cuMemsetD8({} bytes) failed: {:?}", bytes, err));
+                }
+                ptr
+            }
+        } else {
+            let mut ptr: u64 = 0;
+            let err = unsafe { cuda_sys::lib().cuMemAlloc_v2(&mut ptr, bytes) };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuMemAlloc_v2({} bytes) failed: {:?}", bytes, err));
+            }
+            let err = unsafe { cuda_sys::lib().cuMemsetD8_v2(ptr, 0, bytes) };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                unsafe { cuda_sys::lib().cuMemFree_v2(ptr); }
+                return Err(format!("cuMemsetD8({} bytes) failed: {:?}", bytes, err));
+            }
+            ptr
+        };
+        Ok(Self {
+            ptr,
+            len: count,
+            device_ordinal: dev,
+            cuda_debug,
+            _phantom: std::marker::PhantomData,
+        })
     }
 
     /// Compatible with CudaSlice::device_ptr() — returns &u64 so *buf.device_ptr() works.
     pub fn device_ptr(&self) -> &u64 {
+        if let Some(debug) = self.cuda_debug.as_ref() {
+            debug.note_allocation_use(self.ptr, "device_ptr");
+        }
         &self.ptr
     }
 }
@@ -257,6 +537,15 @@ impl<T: Copy> GpuBuf<T> {
 impl<T: Copy> Drop for GpuBuf<T> {
     fn drop(&mut self) {
         if self.ptr != 0 {
+            if let Some(debug) = self.cuda_debug.as_ref() {
+                if debug.alloc_debug_enabled() {
+                    if let Err(err) = debug.free_owned_allocation(self.ptr) {
+                        log::error!("Cuda debug free failed for GpuBuf ptr=0x{:x}: {}", self.ptr, err);
+                    }
+                    self.ptr = 0;
+                    return;
+                }
+            }
             unsafe {
                 // Retain the primary context for this device and make it current,
                 // so cuMemFree_v2 works regardless of which thread we're on.
@@ -402,15 +691,18 @@ pub struct PrefillKernels {
     // Fused MoE support kernels (for MarlinDefault integration)
     moe_padded_prefix_sum: RawCuFunc,
     moe_scatter_sorted: RawCuFunc,
+    moe_finalize_sorted: RawCuFunc,
     moe_gather_sorted: RawCuFunc,
     moe_replicate_hidden: RawCuFunc,
     moe_scatter_fused: RawCuFunc,
     moe_scatter_weighted: RawCuFunc,
+    moe_scatter_weighted_deterministic: RawCuFunc,
 
     // Marlin GEMM functions (loaded via dlopen from vendored libkrasis_marlin.so)
     marlin_mm: Option<MarlinMmFn>,
     // Fused MoE: vendored MarlinDefault (dlopen from libkrasis_marlin.so)
     pub fused_moe_fn: Option<FusedMoeFn>,
+    runtime_stream_sync: Option<RuntimeStreamSyncFn>,
     // FlashAttention-2: vendored (dlopen from libkrasis_flash_attn.so)
     pub flash_attn_fwd: Option<FlashAttnFwdFn>,
     // FlashAttention-2 FP8 KV: BF16 Q with FP8 E4M3 K/V (for cross-chunk FP8 KV cache)
@@ -433,7 +725,7 @@ type MarlinMmFn = unsafe extern "C" fn(
 
 /// Function pointer for vendored krasis_marlin_moe_mm_bf16.
 /// Host function that handles template dispatch internally.
-/// 40 parameters matching the extern "C" entry point.
+/// 41 parameters matching the extern "C" entry point.
 type FusedMoeFn = unsafe extern "C" fn(
     /*A*/            *const std::ffi::c_void,
     /*B*/            *const std::ffi::c_void,
@@ -475,7 +767,12 @@ type FusedMoeFn = unsafe extern "C" fn(
     /*is_zp_float*/  bool,
     /*B_expert_ptrs*/ *const std::ffi::c_void,
     /*S_expert_ptrs*/ *const std::ffi::c_void,
+    /*debug_bounds_check is read from env in C++ entry point; reserved ABI slot*/ bool,
 );
+
+type RuntimeStreamSyncFn = unsafe extern "C" fn(
+    /*stream_ptr*/ *mut std::ffi::c_void,
+) -> i32;
 
 /// Function pointer for vendored krasis_flash_attn_fwd_bf16.
 /// Calls FlashAttention-2 forward pass from libkrasis_flash_attn.so.
@@ -622,6 +919,7 @@ pub struct PrefillModelConfig {
     pub layer_group_size: usize,    // how many MoE layers per group for expert DMA (0 = no grouping)
 }
 
+#[derive(Clone, Copy)]
 pub struct MarlinWeight {
     pub packed: u64,
     pub scales: u64,
@@ -633,6 +931,7 @@ pub struct MarlinWeight {
 }
 
 /// BF16 weight for cuBLAS GEMM (used when attention_quant="bf16").
+#[derive(Clone, Copy)]
 pub struct Bf16Weight {
     pub ptr: u64,    // BF16 data on GPU [n, k] column-major (transposed)
     pub n: usize,    // output dim
@@ -727,6 +1026,47 @@ pub struct PrefillMoeLayerData {
     pub bulk_w13s: (usize, usize),  // w13_scales
     pub bulk_w2p: (usize, usize),   // w2_packed
     pub bulk_w2s: (usize, usize),   // w2_scales
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExpertSlotLayout {
+    pub w1_packed_off: usize,
+    pub w1_scales_off: usize,
+    pub w2_packed_off: usize,
+    pub w2_scales_off: usize,
+    pub total_bytes: usize,
+}
+
+pub(crate) fn compute_expert_slot_layout(
+    w1_packed_bytes: usize,
+    w1_scales_bytes: usize,
+    w2_packed_bytes: usize,
+    w2_scales_bytes: usize,
+) -> ExpertSlotLayout {
+    const ALIGN: usize = 256;
+
+    #[inline]
+    fn align_up(v: usize, align: usize) -> usize {
+        if v == 0 {
+            0
+        } else {
+            (v + align - 1) & !(align - 1)
+        }
+    }
+
+    let w1_packed_off = 0usize;
+    let w1_scales_off = align_up(w1_packed_bytes, ALIGN);
+    let w2_packed_off = w1_scales_off + align_up(w1_scales_bytes, ALIGN);
+    let w2_scales_off = w2_packed_off + align_up(w2_packed_bytes, ALIGN);
+    let total_bytes = w2_scales_off + align_up(w2_scales_bytes, ALIGN);
+
+    ExpertSlotLayout {
+        w1_packed_off,
+        w1_scales_off,
+        w2_packed_off,
+        w2_scales_off,
+        total_bytes,
+    }
 }
 
 pub struct PrefillScratch {
@@ -848,6 +1188,7 @@ pub struct PrefillEngine {
     pub stream: cuda_sys::CUstream,
     pub copy_stream: cuda_sys::CUstream,
     pub cublas_handle: cudarc::cublas::sys::cublasHandle_t,
+    pub shared_cublas_handle: cudarc::cublas::sys::cublasHandle_t,
     pub h_logits: Vec<f32>,
     // Host staging buffers for routing results
     pub h_topk_ids: Vec<i32>,
@@ -860,7 +1201,12 @@ pub struct PrefillEngine {
     pub hcs_num_experts_per_layer: usize,
     // CUDA events for double-buffer expert DMA synchronization
     pub dma_event: cuda_sys::CUevent,
+    pub ptr_payload_reuse_event: cuda_sys::CUevent,
     pub compute_event: cuda_sys::CUevent,
+    pub shared_compute_event: cuda_sys::CUevent,
+    pub shared_consume_event: cuda_sys::CUevent,
+    pub compute_event_generation: u64,
+    pub compute_event_layer: Option<usize>,
     // BF16 attention weight streaming: double-buffer for q/k/v/o proj weights
     // These are only used when attention weights are BF16 (not AWQ/INT4).
     // For AWQ attention, weights are small and permanently GPU-resident.
@@ -868,9 +1214,15 @@ pub struct PrefillEngine {
     // Dedicated stream for shared expert (gap 4: always async regardless of cold DMA)
     pub shared_stream: cuda_sys::CUstream,
     pub shared_event: cuda_sys::CUevent,
-    // Separate Marlin workspace for shared_stream (avoids d_fp32_scratch conflict)
+    pub shared_event_generation: u64,
+    pub shared_event_layer: Option<usize>,
+    pub fused_expert_buf_ready_events: [cuda_sys::CUevent; 2],
+    // Separate Marlin workspace and BF16 activations for shared_stream.
+    // Shared expert overlap must never alias the main stream's d_scratch1/d_scratch2.
     // These are allocated dynamically in prepare_for_prefill and freed in release_scratch
     // to maximize VRAM available for HCS during decode.
+    pub d_shared_bf16_scratch1: Option<CudaSlice<u16>>,
+    pub d_shared_bf16_scratch2: Option<CudaSlice<u16>>,
     pub d_shared_fp32_scratch: Option<CudaSlice<f32>>,
     pub d_shared_workspace: Option<CudaSlice<i32>>,
     // Contiguous expert weight buffers for fused MoE (gap 1)
@@ -884,6 +1236,8 @@ pub struct PrefillEngine {
     pub d_fused_expert_w2_b: Option<CudaSlice<u8>>,
     pub d_fused_expert_w2s_b: Option<CudaSlice<u8>>,
     pub fused_expert_buf_cur: usize,  // 0 = A, 1 = B
+    pub fused_expert_buf_generation: [u64; 2],
+    pub fused_expert_buf_loaded_layer: [Option<usize>; 2],
     // Per-expert byte sizes (computed from config)
     pub w1_packed_per_expert: usize,
     pub w1_scales_per_expert: usize,
@@ -908,17 +1262,19 @@ pub struct PrefillEngine {
     // GPU-side arrays: each entry is a raw GPU pointer to that expert's weights/scales.
     // For HCS-resident experts, points directly into HCS VRAM (zero copy).
     // For cold experts, points into cold_staging buffer after H2D transfer.
-    pub d_expert_w1_ptrs: Option<CudaSlice<u64>>,       // [n_experts] GPU ptrs to packed w1
-    pub d_expert_w1s_ptrs: Option<CudaSlice<u64>>,      // [n_experts] GPU ptrs to w1 scales
-    pub d_expert_w2_ptrs: Option<CudaSlice<u64>>,       // [n_experts] GPU ptrs to packed w2
-    pub d_expert_w2s_ptrs: Option<CudaSlice<u64>>,      // [n_experts] GPU ptrs to w2 scales
+    pub d_expert_w1_ptrs: Option<GpuBuf<u64>>,          // [n_experts] GPU ptrs to packed w1
+    pub d_expert_w1s_ptrs: Option<GpuBuf<u64>>,         // [n_experts] GPU ptrs to w1 scales
+    pub d_expert_w2_ptrs: Option<GpuBuf<u64>>,          // [n_experts] GPU ptrs to packed w2
+    pub d_expert_w2s_ptrs: Option<GpuBuf<u64>>,         // [n_experts] GPU ptrs to w2 scales
     // Host-side staging arrays for building pointer tables
     pub h_expert_w1_ptrs: Vec<u64>,
     pub h_expert_w1s_ptrs: Vec<u64>,
     pub h_expert_w2_ptrs: Vec<u64>,
     pub h_expert_w2s_ptrs: Vec<u64>,
+    pub expert_ptr_table_generation: [u64; 4],
+    pub expert_ptr_table_layer: [Option<usize>; 4],
     // Cold expert staging buffer: small GPU buffer for H2D of non-HCS experts
-    pub d_cold_staging: Option<CudaSlice<u8>>,
+    pub d_cold_staging: Option<GpuBuf<u8>>,
     pub cold_expert_bytes: usize,   // bytes per cold expert slot (w1p + w1s + w2p + w2s)
     pub max_cold_experts: usize,    // max cold experts the staging buffer can hold
     // ScalarType for Marlin GEMM dispatch (matches weight quantization format)
@@ -955,6 +1311,10 @@ pub struct PrefillEngine {
     pub t_moe_w2: Cell<f64>,         // fused w2 GEMM
     pub t_moe_scatter: Cell<f64>,    // scatter-add + accum_to_bf16
     pub t_moe_shared: Cell<f64>,     // shared expert (wait + add)
+    pub shared_output_generation: u64,
+    pub shared_output_layer: Option<usize>,
+    pub shared_consume_generation: u64,
+    pub shared_consume_layer: Option<usize>,
     // FLA (Flash Linear Attention) vendored kernels — replaces custom LA chunk recurrence
     pub fla: Option<FlaKernels>,
     // FLA intermediate buffers (allocated once at engine init if FLA available)
@@ -964,14 +1324,21 @@ pub struct PrefillEngine {
     pub d_fla_w: Option<CudaSlice<u16>>,          // [B, T, H, K] BF16 WY representation w
     pub d_fla_u: Option<CudaSlice<u16>>,          // [B, T, H, V] BF16 WY representation u
     pub d_fla_h: Option<CudaSlice<u16>>,          // [B, NT, H, K, V] BF16 per-chunk states
+    pub d_fla_h0: Option<CudaSlice<u16>>,         // [B, H, K, V] BF16 initial state
     pub d_fla_final_state: Option<CudaSlice<f32>>,  // [B, H, K, V] FP32 final state
     pub d_fla_v_new: Option<CudaSlice<u16>>,      // [B, T, H, V] BF16 corrected values
     pub d_fla_o: Option<CudaSlice<u16>>,          // [B, T, H, V] BF16 output
+    // Stable host-side storage for async FA2 cu_seqlens uploads.
+    // These must outlive the cuMemcpyHtoDAsync call; stack arrays are not valid here.
+    pub fa2_cu_seqlens_q: UnsafeCell<[i32; 2]>,
+    pub fa2_cu_seqlens_k: UnsafeCell<[i32; 2]>,
     /// Runtime-configured VRAM reserve for dynamic prefill scratch sizing.
     pub safety_margin_mb: usize,
     /// Temporary pointer back to the decode store for chunk-boundary HCS guardrails.
     /// Set only for the lifetime of an active prefill request.
     pub prefill_hcs_store_addr: usize,
+    pub cuda_debug: Arc<crate::cuda_debug::CudaDebugController>,
+    pub debug_current_layer: Cell<i32>,
 }
 
 /// Double-buffer BF16 attention weight streaming buffers.
@@ -990,8 +1357,418 @@ unsafe impl Send for PrefillEngine {}
 unsafe impl Sync for PrefillEngine {}
 
 impl PrefillEngine {
+    const DEBUG_TRANSIENT_BUFFERS: [&'static str; 21] = [
+        "prefill.preloaded_moe_layer",
+        "prefill.fused_expert_buf_cur",
+        "prefill.fused_expert_buf0",
+        "prefill.fused_expert_buf1",
+        "prefill.compute_event",
+        "prefill.shared_event",
+        "prefill.shared_output",
+        "prefill.shared_consume",
+        "prefill.pinning_pool",
+        "prefill.pinned_expert_offsets",
+        "prefill.prescan_active_experts",
+        "prefill.cold_staging",
+        "prefill.ptr_table_w1",
+        "prefill.ptr_table_w1s",
+        "prefill.ptr_table_w2",
+        "prefill.ptr_table_w2s",
+        "prefill.shared_bf16_scratch1",
+        "prefill.shared_bf16_scratch2",
+        "prefill.shared_fp32_scratch",
+        "prefill.shared_workspace",
+        "prefill.shared_gate_output",
+    ];
+
+    #[inline]
+    fn expert_slot_layout(&self) -> ExpertSlotLayout {
+        compute_expert_slot_layout(
+            self.w1_packed_per_expert,
+            self.w1_scales_per_expert,
+            self.w2_packed_per_expert,
+            self.w2_scales_per_expert,
+        )
+    }
+
+    fn validate_prefill_buffer(&self, ptr: u64, bytes: usize, label: &str) -> Result<(), String> {
+        self.cuda_debug
+            .validate_device_buffer(ptr, bytes, self.config.device_ordinal as i32, label)
+    }
+
+    fn debug_layer(&self) -> Option<usize> {
+        let layer = self.debug_current_layer.get();
+        if layer >= 0 { Some(layer as usize) } else { None }
+    }
+
+    fn run_cuda_debug_stage<T, F>(
+        &self,
+        stage_name: &str,
+        stream_name: &str,
+        dims: String,
+        stream: cuda_sys::CUstream,
+        f: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce() -> Result<T, String>,
+    {
+        let stage_id = self.cuda_debug.begin_stage(
+            self.debug_layer(),
+            stage_name,
+            stream_name,
+            self.config.device_ordinal as i32,
+            dims,
+        );
+        match f() {
+            Ok(value) => {
+                self.cuda_debug.finish_stage_ok(stage_id, stream)?;
+                Ok(value)
+            }
+            Err(err) => Err(self.cuda_debug.finish_stage_err(stage_id, &err)),
+        }
+    }
+
+    fn debug_request_state_summary(&self) -> String {
+        let transient = self
+            .cuda_debug
+            .transient_buffer_summary(&Self::DEBUG_TRANSIENT_BUFFERS);
+        let base = format!(
+            "preloaded_moe_layer={:?} fused_expert_buf_cur={} fused_buf_gen={:?} fused_buf_loaded_layer={:?} compute_event=({:?},g={}) shared_event=({:?},g={}) shared_output=({:?},g={}) shared_consume=({:?},g={}) ptr_table_layer={:?} ptr_table_gen={:?} pinning_pool_ptr=0x{:x} pinning_active={} pinned_offsets={} prescan_active={} cold_staging={} shared_bf16_scratch1={} shared_bf16_scratch2={} shared_fp32_scratch={} shared_workspace={} fla_buffers={}",
+            self.preloaded_moe_layer,
+            self.fused_expert_buf_cur,
+            self.fused_expert_buf_generation,
+            self.fused_expert_buf_loaded_layer,
+            self.compute_event_layer,
+            self.compute_event_generation,
+            self.shared_event_layer,
+            self.shared_event_generation,
+            self.shared_output_layer,
+            self.shared_output_generation,
+            self.shared_consume_layer,
+            self.shared_consume_generation,
+            self.expert_ptr_table_layer,
+            self.expert_ptr_table_generation,
+            self.pinning_pool_ptr,
+            self.pinning_active,
+            self.pinned_expert_offsets.len(),
+            self.prescan_active_experts.len(),
+            self.d_cold_staging.is_some(),
+            self.d_shared_bf16_scratch1.is_some(),
+            self.d_shared_bf16_scratch2.is_some(),
+            self.d_shared_fp32_scratch.is_some(),
+            self.d_shared_workspace.is_some(),
+            self.d_fla_g_cumsum.is_some()
+                || self.d_fla_a.is_some()
+                || self.d_fla_ai.is_some()
+                || self.d_fla_w.is_some()
+                || self.d_fla_u.is_some()
+                || self.d_fla_h.is_some()
+                || self.d_fla_h0.is_some()
+                || self.d_fla_final_state.is_some()
+                || self.d_fla_v_new.is_some()
+                || self.d_fla_o.is_some(),
+        );
+        if transient.is_empty() {
+            base
+        } else {
+            format!("{} transient={}", base, transient)
+        }
+    }
+
+    fn debug_transient_state_is_clear(&self) -> bool {
+        self.preloaded_moe_layer.is_none()
+            && self.fused_expert_buf_cur == 0
+            && self.fused_expert_buf_generation == [0, 0]
+            && self.fused_expert_buf_loaded_layer == [None, None]
+            && self.compute_event_generation == 0
+            && self.compute_event_layer.is_none()
+            && self.shared_event_generation == 0
+            && self.shared_event_layer.is_none()
+            && self.shared_output_generation == 0
+            && self.shared_output_layer.is_none()
+            && self.shared_consume_generation == 0
+            && self.shared_consume_layer.is_none()
+            && self.expert_ptr_table_generation == [0, 0, 0, 0]
+            && self.expert_ptr_table_layer == [None, None, None, None]
+            && self.pinning_pool_ptr == 0
+            && !self.pinning_active
+            && self.pinned_expert_offsets.is_empty()
+            && self.prescan_active_experts.is_empty()
+            && self.d_cold_staging.is_none()
+            && self.d_shared_bf16_scratch1.is_none()
+            && self.d_shared_bf16_scratch2.is_none()
+            && self.d_shared_fp32_scratch.is_none()
+            && self.d_shared_workspace.is_none()
+            && self.d_fla_g_cumsum.is_none()
+            && self.d_fla_a.is_none()
+            && self.d_fla_ai.is_none()
+            && self.d_fla_w.is_none()
+            && self.d_fla_u.is_none()
+            && self.d_fla_h.is_none()
+            && self.d_fla_h0.is_none()
+            && self.d_fla_final_state.is_none()
+            && self.d_fla_v_new.is_none()
+            && self.d_fla_o.is_none()
+    }
+
+    fn debug_note_boundary(&self, boundary: &str, detail: String) {
+        self.cuda_debug.note_marker(
+            "boundary",
+            boundary,
+            self.debug_layer(),
+            "prefill_request",
+            self.config.device_ordinal as i32,
+            format!("prompt_max_tokens={}", self.scratch.max_tokens),
+            detail,
+        );
+    }
+
+    fn debug_assert_request_state_clear(&self, boundary: &str) -> Result<(), String> {
+        if !self.cuda_debug.enabled() {
+            return Ok(());
+        }
+        if self.preloaded_moe_layer.is_some() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.preloaded_moe_layer",
+                format!("observed at {}", boundary),
+            );
+        }
+        if self.fused_expert_buf_cur != 0 {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.fused_expert_buf_cur",
+                format!("observed at {} value={}", boundary, self.fused_expert_buf_cur),
+            );
+        }
+        for buf_idx in 0..2 {
+            if self.fused_expert_buf_loaded_layer[buf_idx].is_some()
+                || self.fused_expert_buf_generation[buf_idx] != 0
+            {
+                self.cuda_debug.note_transient_buffer_use(
+                    Self::fused_expert_buffer_name(buf_idx),
+                    format!(
+                        "observed at {} generation={} layer={:?}",
+                        boundary,
+                        self.fused_expert_buf_generation[buf_idx],
+                        self.fused_expert_buf_loaded_layer[buf_idx]
+                    ),
+                );
+            }
+        }
+        if self.compute_event_generation != 0 || self.compute_event_layer.is_some() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.compute_event",
+                format!(
+                    "observed at {} generation={} layer={:?}",
+                    boundary, self.compute_event_generation, self.compute_event_layer
+                ),
+            );
+        }
+        if self.shared_event_generation != 0 || self.shared_event_layer.is_some() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.shared_event",
+                format!(
+                    "observed at {} generation={} layer={:?}",
+                    boundary, self.shared_event_generation, self.shared_event_layer
+                ),
+            );
+        }
+        if self.shared_output_generation != 0 || self.shared_output_layer.is_some() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.shared_output",
+                format!(
+                    "observed at {} generation={} layer={:?}",
+                    boundary, self.shared_output_generation, self.shared_output_layer
+                ),
+            );
+        }
+        if self.shared_consume_generation != 0 || self.shared_consume_layer.is_some() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.shared_consume",
+                format!(
+                    "observed at {} generation={} layer={:?}",
+                    boundary, self.shared_consume_generation, self.shared_consume_layer
+                ),
+            );
+        }
+        for table_idx in 0..4 {
+            if self.expert_ptr_table_generation[table_idx] != 0
+                || self.expert_ptr_table_layer[table_idx].is_some()
+            {
+                self.cuda_debug.note_transient_buffer_use(
+                    Self::expert_ptr_table_name(table_idx),
+                    format!(
+                        "observed at {} generation={} layer={:?}",
+                        boundary,
+                        self.expert_ptr_table_generation[table_idx],
+                        self.expert_ptr_table_layer[table_idx]
+                    ),
+                );
+            }
+        }
+        if self.pinning_pool_ptr != 0 {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.pinning_pool",
+                format!("observed at {} ptr=0x{:x}", boundary, self.pinning_pool_ptr),
+            );
+        }
+        if !self.pinned_expert_offsets.is_empty() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.pinned_expert_offsets",
+                format!("observed at {} layers={}", boundary, self.pinned_expert_offsets.len()),
+            );
+        }
+        if !self.prescan_active_experts.is_empty() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.prescan_active_experts",
+                format!("observed at {} layers={}", boundary, self.prescan_active_experts.len()),
+            );
+        }
+        if self.d_cold_staging.is_some() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.cold_staging",
+                format!("observed at {}", boundary),
+            );
+        }
+        if self.d_shared_bf16_scratch1.is_some() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.shared_bf16_scratch1",
+                format!("observed at {}", boundary),
+            );
+        }
+        if self.d_shared_bf16_scratch2.is_some() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.shared_bf16_scratch2",
+                format!("observed at {}", boundary),
+            );
+        }
+        if self.d_shared_fp32_scratch.is_some() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.shared_fp32_scratch",
+                format!("observed at {}", boundary),
+            );
+        }
+        if self.d_shared_workspace.is_some() {
+            self.cuda_debug.note_transient_buffer_use(
+                "prefill.shared_workspace",
+                format!("observed at {}", boundary),
+            );
+        }
+        let detail = self.debug_request_state_summary();
+        self.debug_note_boundary(boundary, detail.clone());
+        if self.debug_transient_state_is_clear() {
+            return Ok(());
+        }
+        self.cuda_debug.note_marker(
+            "assert",
+            boundary,
+            self.debug_layer(),
+            "prefill_request",
+            self.config.device_ordinal as i32,
+            String::new(),
+            detail.clone(),
+        );
+        Err(format!(
+            "[CUDA-DEBUG] request boundary {} found stale prefill transient state: {}",
+            boundary, detail
+        ))
+    }
+
     pub fn set_safety_margin_mb(&mut self, margin_mb: usize) {
         self.safety_margin_mb = margin_mb.max(PREFILL_SAFETY_MARGIN_MB);
+    }
+
+    fn reset_request_moe_state(&mut self) {
+        self.preloaded_moe_layer = None;
+        self.fused_expert_buf_cur = 0;
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.preloaded_moe_layer", "reset_request_moe_state");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.fused_expert_buf_cur", "reset_request_moe_state");
+        self.fused_expert_buf_generation = [0, 0];
+        self.fused_expert_buf_loaded_layer = [None, None];
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.fused_expert_buf0", "reset_request_moe_state");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.fused_expert_buf1", "reset_request_moe_state");
+        self.compute_event_generation = 0;
+        self.compute_event_layer = None;
+        self.shared_event_generation = 0;
+        self.shared_event_layer = None;
+        self.shared_output_generation = 0;
+        self.shared_output_layer = None;
+        self.shared_consume_generation = 0;
+        self.shared_consume_layer = None;
+        self.expert_ptr_table_generation = [0, 0, 0, 0];
+        self.expert_ptr_table_layer = [None, None, None, None];
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.compute_event", "reset_request_moe_state");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.shared_event", "reset_request_moe_state");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.shared_output", "reset_request_moe_state");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.shared_consume", "reset_request_moe_state");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.ptr_table_w1", "reset_request_moe_state");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.ptr_table_w1s", "reset_request_moe_state");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.ptr_table_w2", "reset_request_moe_state");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.ptr_table_w2s", "reset_request_moe_state");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.shared_gate_output", "reset_request_moe_state");
+        if let Err(err) = self.record_cuda_event(
+            self.ptr_payload_reuse_event,
+            self.stream,
+            "reset pointer-table payload reuse event",
+        ) {
+            log::error!("Failed to reset pointer-table payload reuse event: {}", err);
+        }
+        for (buf_idx, event) in self.fused_expert_buf_ready_events.iter().enumerate() {
+            if let Err(err) = self.record_cuda_event(
+                *event,
+                self.stream,
+                &format!("reset fused expert buffer {} ready event", buf_idx),
+            ) {
+                log::error!(
+                    "Failed to reset fused expert buffer {} ready event: {}",
+                    buf_idx,
+                    err
+                );
+            }
+        }
+
+        if self.pinning_pool_ptr != 0 {
+            if self.cuda_debug.alloc_debug_enabled() {
+                if let Err(err) = self.cuda_debug.free_owned_allocation(self.pinning_pool_ptr) {
+                    log::error!(
+                        "Cuda debug free failed for pinning pool ptr=0x{:x}: {}",
+                        self.pinning_pool_ptr,
+                        err
+                    );
+                }
+            } else {
+                unsafe {
+                    cuda_sys::lib().cuMemFree_v2(self.pinning_pool_ptr);
+                }
+            }
+            self.pinning_pool_ptr = 0;
+        }
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.pinning_pool", "reset_request_moe_state");
+        self.pinning_pool_bytes = 0;
+        self.pinned_expert_offsets.clear();
+        self.cuda_debug.note_transient_buffer_clear(
+            "prefill.pinned_expert_offsets",
+            "reset_request_moe_state",
+        );
+        self.pinning_active = false;
+        self.prescan_active_experts.clear();
+        self.cuda_debug.note_transient_buffer_clear(
+            "prefill.prescan_active_experts",
+            "reset_request_moe_state",
+        );
     }
 
     /// Update HCS snapshot from the decode store's current HCS state.
@@ -1020,6 +1797,9 @@ impl PrefillEngine {
     /// During prefill, surviving HCS experts (not evicted for scratch) are used
     /// opportunistically — no separate prefill cache needed.
     fn expert_lookup(&self, moe_layer_idx: usize, expert_idx: usize) -> Option<(u64, u64, u64, u64)> {
+        if std::env::var("KRASIS_PREFILL_DISABLE_HCS_LOOKUP").ok().as_deref() == Some("1") {
+            return None;
+        }
         if self.hcs_num_experts_per_layer == 0 { return None; }
         let idx = moe_layer_idx * self.hcs_num_experts_per_layer + expert_idx;
         if idx < self.hcs_cache_fast.len() {
@@ -1111,6 +1891,84 @@ impl PrefillEngine {
         (sum.sqrt()) as f32
     }
 
+    /// Download BF16 data from GPU and compute a stable row fingerprint.
+    /// This is diagnostic-only and is used to detect row differences that are
+    /// too small to show up in rounded norm prints.
+    fn diag_row_hash_bf16(&self, ptr: u64, pos: usize, stride: usize, dim: usize) -> u64 {
+        let offset_bytes = pos * stride * 2; // BF16 = 2 bytes
+        let mut buf = vec![0u16; dim];
+        unsafe {
+            cuda_sys::lib().cuStreamSynchronize(self.stream);
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr + offset_bytes as u64,
+                (dim * 2) as usize,
+            );
+        }
+        let mut hash = 0xcbf29ce484222325u64;
+        for &bits in &buf {
+            hash ^= bits as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    /// Download a contiguous BF16 span from GPU and compute a stable fingerprint.
+    /// Used for diagnostic-only full-surface comparisons when a single row is
+    /// insufficient to explain a downstream attention difference.
+    fn diag_span_hash_bf16(&self, ptr: u64, count: usize) -> u64 {
+        let mut buf = vec![0u16; count];
+        unsafe {
+            cuda_sys::lib().cuStreamSynchronize(self.stream);
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr,
+                (count * 2) as usize,
+            );
+        }
+        let mut hash = 0xcbf29ce484222325u64;
+        for &bits in &buf {
+            hash ^= bits as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    /// Download selected BF16 rows from GPU and format stable fingerprints for
+    /// each requested position. This is diagnostic-only and helps distinguish
+    /// "last row is stable" from "earlier rows are drifting".
+    fn diag_position_hashes_bf16(
+        &self,
+        ptr: u64,
+        positions: &[usize],
+        stride: usize,
+        dim: usize,
+    ) -> String {
+        if positions.is_empty() {
+            return String::new();
+        }
+        let mut buf = vec![0u16; dim];
+        let mut parts = Vec::with_capacity(positions.len());
+        unsafe { cuda_sys::lib().cuStreamSynchronize(self.stream); }
+        for &pos in positions {
+            let offset_bytes = pos * stride * 2;
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    ptr + offset_bytes as u64,
+                    (dim * 2) as usize,
+                );
+            }
+            let mut hash = 0xcbf29ce484222325u64;
+            for &bits in &buf {
+                hash ^= bits as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            parts.push(format!("{}:{:016x}", pos, hash));
+        }
+        parts.join(",")
+    }
+
     /// Download FP32 data from GPU and compute L2 norm of a single row.
     fn diag_l2_norm_f32(&self, ptr: u64, pos: usize, stride: usize, dim: usize) -> f32 {
         let offset_bytes = pos * stride * 4; // FP32 = 4 bytes
@@ -1128,6 +1986,27 @@ impl PrefillEngine {
             sum += (v as f64) * (v as f64);
         }
         (sum.sqrt()) as f32
+    }
+
+    /// Download a contiguous FP32 span from GPU and compute a stable fingerprint.
+    fn diag_span_hash_f32(&self, ptr: u64, count: usize) -> u64 {
+        let mut buf = vec![0.0f32; count];
+        unsafe {
+            cuda_sys::lib().cuStreamSynchronize(self.stream);
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr,
+                (count * 4) as usize,
+            );
+        }
+        let mut hash = 0xcbf29ce484222325u64;
+        for &v in &buf {
+            for b in v.to_bits().to_le_bytes() {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        hash
     }
 
     /// Download FP32 values from GPU and return them.
@@ -1204,6 +2083,22 @@ impl PrefillEngine {
             .unwrap_or(9999)
     }
 
+    /// Get the diagnostic layer start from KRASIS_PREFILL_DIAG_LAYER_START env var.
+    /// Default: 0. Set together with KRASIS_PREFILL_DIAG_LAYERS to focus diagnostics
+    /// on a later window without flooding startup output from earlier layers.
+    fn diag_layer_start() -> usize {
+        std::env::var("KRASIS_PREFILL_DIAG_LAYER_START")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn diag_layer_enabled(layer_idx: usize) -> bool {
+        let start = Self::diag_layer_start();
+        let end = Self::diag_layer_limit();
+        layer_idx >= start && layer_idx < end
+    }
+
     /// Dynamically allocate scratch buffers sized for this prompt.
     /// Called before each prefill. GpuBuf uses raw cuMemAlloc_v2 (synchronous,
     /// no pool) so alloc/free is immediate — no cudarc pool interaction.
@@ -1212,10 +2107,14 @@ impl PrefillEngine {
     /// VRAM → compute chunk_size → drop old scratch → allocate new scratch.
     pub fn prepare_for_prefill(&mut self, prompt_tokens: usize) -> Result<(), String> {
         self.bind_cuda_context()?;
+        self.cuda_debug.begin_request("prefill", prompt_tokens);
+        self.debug_assert_request_state_clear("prefill.prepare.enter")?;
 
         // 1. Synchronize all GPU work (ensures pending cuMemFreeAsync from HCS
         //    soft eviction have completed on cudarc's internal stream).
         unsafe { cuda_sys::lib().cuCtxSynchronize(); }
+        self.reset_request_moe_state();
+        self.debug_note_boundary("prefill.prepare.after_reset", self.debug_request_state_summary());
 
         // 2. Trim cudarc's default memory pool to release HCS soft VRAM back to OS.
         //    This only releases UNUSED (freed) pool memory — HCS hard pool is still
@@ -1243,17 +2142,42 @@ impl PrefillEngine {
         // 3. Drop old scratch to free its VRAM (GpuBuf::drop = cuMemFree_v2, immediate).
         //    Also free prefill-only GPU buffers from previous request.
         let old_tokens = self.scratch.max_tokens;
-        self.scratch = allocate_scratch(&self.device, &self.config, 0)
+        self.scratch = allocate_scratch(&self.device, &self.config, 0, &self.cuda_debug)
             .map_err(|e| format!("alloc empty scratch: {e}"))?;
         self.d_cold_staging = None;
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.cold_staging", "prepare_for_prefill drop old buffers");
+        self.d_shared_bf16_scratch1 = None;
+        self.cuda_debug.note_transient_buffer_clear(
+            "prefill.shared_bf16_scratch1",
+            "prepare_for_prefill drop old buffers",
+        );
+        self.d_shared_bf16_scratch2 = None;
+        self.cuda_debug.note_transient_buffer_clear(
+            "prefill.shared_bf16_scratch2",
+            "prepare_for_prefill drop old buffers",
+        );
         self.d_shared_fp32_scratch = None;
+        self.cuda_debug.note_transient_buffer_clear(
+            "prefill.shared_fp32_scratch",
+            "prepare_for_prefill drop old buffers",
+        );
         self.d_shared_workspace = None;
+        self.cuda_debug.note_transient_buffer_clear(
+            "prefill.shared_workspace",
+            "prepare_for_prefill drop old buffers",
+        );
+        self.cuda_debug.note_transient_buffer_clear(
+            "prefill.shared_gate_output",
+            "prepare_for_prefill drop old buffers",
+        );
         self.d_fla_g_cumsum = None;
         self.d_fla_a = None;
         self.d_fla_ai = None;
         self.d_fla_w = None;
         self.d_fla_u = None;
         self.d_fla_h = None;
+        self.d_fla_h0 = None;
         self.d_fla_final_state = None;
         self.d_fla_v_new = None;
         self.d_fla_o = None;
@@ -1310,6 +2234,20 @@ impl PrefillEngine {
                 scratch_tokens,
             );
         }
+        self.debug_note_boundary(
+            "prefill.prepare.sizing",
+            format!(
+                "prompt_tokens={} free_mb={} total_mb={} safety_mb={} target={} max_by_vram={} measured_cap={} scratch_tokens={}",
+                prompt_tokens,
+                free_bytes / (1024 * 1024),
+                total_bytes / (1024 * 1024),
+                safety_margin_mb,
+                target,
+                max_by_vram,
+                measured_cap_debug.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
+                scratch_tokens,
+            ),
+        );
 
         // 5. Allocate prefill-only GPU buffers and scratch. If live post-allocation
         //    free VRAM still lands below the configured floor, shrink the chunk and
@@ -1322,12 +2260,20 @@ impl PrefillEngine {
             let n_routed = self.config.n_routed_experts;
             if n_routed > 0 {
                 let total_cold = n_routed * self.cold_expert_bytes;
-                let buf = self.device.alloc_zeros::<u8>(total_cold)
-                    .map_err(|e| format!("alloc cold_staging: {e}"))?;
+                let buf = GpuBuf::<u8>::alloc_uninit_dbg(
+                    total_cold,
+                    "cold_staging",
+                    Some(self.cuda_debug.clone()),
+                )
+                .map_err(|e| format!("alloc cold_staging: {e}"))?;
                 if stderr_debug_enabled() && attempt == 1 {
                     eprintln!("[PREFILL] Cold staging: {} MB ({} experts)", total_cold / (1024 * 1024), n_routed);
                 }
                 self.d_cold_staging = Some(buf);
+                self.cuda_debug.note_transient_buffer_write(
+                    "prefill.cold_staging",
+                    format!("prepare_for_prefill attempt={} bytes={}", attempt, total_cold),
+                );
                 self.max_cold_experts = n_routed;
             }
 
@@ -1350,6 +2296,8 @@ impl PrefillEngine {
                     .map_err(|e| format!("alloc fla_u: {e}"))?);
                 self.d_fla_h = Some(self.device.alloc_zeros::<u16>(fla_nt * nv * dk * dv)
                     .map_err(|e| format!("alloc fla_h: {e}"))?);
+                self.d_fla_h0 = Some(self.device.alloc_zeros::<u16>(nv * dk * dv)
+                    .map_err(|e| format!("alloc fla_h0: {e}"))?);
                 self.d_fla_final_state = Some(self.device.alloc_zeros::<f32>(nv * dk * dv)
                     .map_err(|e| format!("alloc fla_final_state: {e}"))?);
                 self.d_fla_v_new = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
@@ -1362,13 +2310,53 @@ impl PrefillEngine {
             let shared_scratch_n = std::cmp::max(self.config.hidden_size, self.config.moe_intermediate_size);
             let shared_scratch_elems = scratch_tokens * shared_scratch_n;
             if shared_scratch_elems > 0 {
+                self.d_shared_bf16_scratch1 = Some(self.device.alloc_zeros::<u16>(shared_scratch_elems)
+                    .map_err(|e| format!("alloc shared_bf16_scratch1: {e}"))?);
+                self.cuda_debug.note_transient_buffer_write(
+                    "prefill.shared_bf16_scratch1",
+                    format!(
+                        "prepare_for_prefill attempt={} elems={} bytes={}",
+                        attempt,
+                        shared_scratch_elems,
+                        shared_scratch_elems * std::mem::size_of::<u16>()
+                    ),
+                );
+                self.d_shared_bf16_scratch2 = Some(self.device.alloc_zeros::<u16>(shared_scratch_elems)
+                    .map_err(|e| format!("alloc shared_bf16_scratch2: {e}"))?);
+                self.cuda_debug.note_transient_buffer_write(
+                    "prefill.shared_bf16_scratch2",
+                    format!(
+                        "prepare_for_prefill attempt={} elems={} bytes={}",
+                        attempt,
+                        shared_scratch_elems,
+                        shared_scratch_elems * std::mem::size_of::<u16>()
+                    ),
+                );
                 self.d_shared_fp32_scratch = Some(self.device.alloc_zeros::<f32>(shared_scratch_elems)
                     .map_err(|e| format!("alloc shared_fp32_scratch: {e}"))?);
+                self.cuda_debug.note_transient_buffer_write(
+                    "prefill.shared_fp32_scratch",
+                    format!(
+                        "prepare_for_prefill attempt={} elems={} bytes={}",
+                        attempt,
+                        shared_scratch_elems,
+                        shared_scratch_elems * std::mem::size_of::<f32>()
+                    ),
+                );
                 self.d_shared_workspace = Some(self.device.alloc_zeros::<i32>(self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM)
                     .map_err(|e| format!("alloc shared_workspace: {e}"))?);
+                self.cuda_debug.note_transient_buffer_write(
+                    "prefill.shared_workspace",
+                    format!(
+                        "prepare_for_prefill attempt={} elems={} bytes={}",
+                        attempt,
+                        self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM,
+                        self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM * std::mem::size_of::<i32>()
+                    ),
+                );
             }
 
-            self.scratch = allocate_scratch(&self.device, &self.config, scratch_tokens)?;
+            self.scratch = allocate_scratch(&self.device, &self.config, scratch_tokens, &self.cuda_debug)?;
 
             unsafe { cuda_sys::lib().cuCtxSynchronize(); }
             unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut post_alloc_free_bytes, &mut total_bytes); }
@@ -1410,11 +2398,35 @@ impl PrefillEngine {
                 );
             }
 
-            self.scratch = allocate_scratch(&self.device, &self.config, 0)
+            self.scratch = allocate_scratch(&self.device, &self.config, 0, &self.cuda_debug)
                 .map_err(|e| format!("alloc empty scratch: {e}"))?;
             self.d_cold_staging = None;
+            self.cuda_debug
+                .note_transient_buffer_clear("prefill.cold_staging", "prepare_for_prefill retry");
+            self.d_shared_bf16_scratch1 = None;
+            self.cuda_debug.note_transient_buffer_clear(
+                "prefill.shared_bf16_scratch1",
+                "prepare_for_prefill retry",
+            );
+            self.d_shared_bf16_scratch2 = None;
+            self.cuda_debug.note_transient_buffer_clear(
+                "prefill.shared_bf16_scratch2",
+                "prepare_for_prefill retry",
+            );
             self.d_shared_fp32_scratch = None;
+            self.cuda_debug.note_transient_buffer_clear(
+                "prefill.shared_fp32_scratch",
+                "prepare_for_prefill retry",
+            );
             self.d_shared_workspace = None;
+            self.cuda_debug.note_transient_buffer_clear(
+                "prefill.shared_workspace",
+                "prepare_for_prefill retry",
+            );
+            self.cuda_debug.note_transient_buffer_clear(
+                "prefill.shared_gate_output",
+                "prepare_for_prefill retry",
+            );
             self.d_fla_g_cumsum = None;
             self.d_fla_a = None;
             self.d_fla_ai = None;
@@ -1468,6 +2480,8 @@ impl PrefillEngine {
             );
         }
 
+        self.debug_note_boundary("prefill.prepare.ready", self.debug_request_state_summary());
+
         Ok(())
     }
 
@@ -1475,17 +2489,36 @@ impl PrefillEngine {
     /// GpuBuf::drop calls cuMemFree_v2 (synchronous, immediate release).
     pub fn release_scratch(&mut self) -> Result<(), String> {
         self.bind_cuda_context()?;
+        self.debug_note_boundary("prefill.release.enter", self.debug_request_state_summary());
         // Synchronize to ensure all prefill GPU work is done before freeing buffers.
-        unsafe { cuda_sys::lib().cuCtxSynchronize(); }
+        let ctx_sync = unsafe { cuda_sys::lib().cuCtxSynchronize() };
+        if ctx_sync != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!("release_scratch cuCtxSynchronize: {:?}", ctx_sync));
+        }
+        self.reset_request_moe_state();
         // Replace scratch with zero-capacity (drops old, frees VRAM immediately).
-        self.scratch = allocate_scratch(&self.device, &self.config, 0)
+        self.scratch = allocate_scratch(&self.device, &self.config, 0, &self.cuda_debug)
             .map_err(|e| format!("alloc empty scratch: {e}"))?;
         self.config.prefill_chunk_size = 0;
         // Free prefill-only GPU buffers: cold staging + shared expert scratch.
         // These are only needed during prefill and waste ~1.2 GB of HCS space if kept.
         self.d_cold_staging = None;
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.cold_staging", "release_scratch");
+        self.d_shared_bf16_scratch1 = None;
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.shared_bf16_scratch1", "release_scratch");
+        self.d_shared_bf16_scratch2 = None;
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.shared_bf16_scratch2", "release_scratch");
         self.d_shared_fp32_scratch = None;
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.shared_fp32_scratch", "release_scratch");
         self.d_shared_workspace = None;
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.shared_workspace", "release_scratch");
+        self.cuda_debug
+            .note_transient_buffer_clear("prefill.shared_gate_output", "release_scratch");
         self.d_fla_g_cumsum = None;
         self.d_fla_a = None;
         self.d_fla_ai = None;
@@ -1507,6 +2540,8 @@ impl PrefillEngine {
                 cuda_sys::lib().cuMemPoolTrimTo(pool, 0);
             }
         }
+        self.debug_assert_request_state_clear("prefill.release.exit")?;
+        self.cuda_debug.end_request("release_scratch");
         Ok(())
     }
 
@@ -1594,6 +2629,7 @@ impl PrefillEngine {
             }
         }
         for layer_idx in 0..num_hidden_layers {
+            self.debug_current_layer.set(layer_idx as i32);
             let lw = &self.layer_weights[layer_idx];
             if lw.la_conv_state_ptr != 0 {
                 let conv_dim = self.config.la_conv_dim;
@@ -1613,6 +2649,7 @@ impl PrefillEngine {
                 }
             }
         }
+        self.debug_current_layer.set(-1);
 
         let use_fused = self.kernels.fused_moe_fn.is_some()
             && (self.d_fused_expert_w1_a.is_some() || self.d_expert_w1_ptrs.is_some())
@@ -1753,6 +2790,15 @@ impl PrefillEngine {
                             }
                             self.preloaded_moe_layer = Some(i);
                             self.fused_expert_buf_cur = 0;
+                            self.mark_fused_expert_buffer_loaded(0, i, "initial preload");
+                            self.cuda_debug.note_transient_buffer_write(
+                                "prefill.preloaded_moe_layer",
+                                format!("initial preload layer={}", i),
+                            );
+                            self.cuda_debug.note_transient_buffer_write(
+                                "prefill.fused_expert_buf_cur",
+                                "initial preload buffer=0",
+                            );
                         }
                     }
                     break;
@@ -1798,6 +2844,11 @@ impl PrefillEngine {
         let mut t_moe_ms = 0.0f64;
         let mut t_embed_ms = 0.0f64;
         let mut t_other_ms = 0.0f64;
+        let diag_request_id = if diag {
+            Some(PREFILL_DIAG_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+        } else {
+            None
+        };
 
         for chunk_idx in 0..num_chunks {
             let chunk_start = chunk_idx * chunk_size;
@@ -1805,6 +2856,7 @@ impl PrefillEngine {
             let m = chunk_end - chunk_start;
             let chunk_tokens = &token_ids[chunk_start..chunk_end];
             let chunk_t0 = if debug_prefill { Some(Instant::now()) } else { None };
+            let debug_chunk_sync = prefill_debug_chunk_selected(chunk_idx);
 
             if m > self.scratch.max_tokens {
                 return Err(format!("Chunk {} tokens > scratch {}", m, self.scratch.max_tokens));
@@ -1816,18 +2868,31 @@ impl PrefillEngine {
             let tc0 = Instant::now();
             self.upload_tokens_with_offset(chunk_tokens, chunk_start)
                 .map_err(|e| format!("upload_tokens chunk {}: {}", chunk_idx, e))?;
+            if debug_chunk_sync {
+                self.stream_sync()
+                    .map_err(|e| format!("debug sync chunk {} after upload: {}", chunk_idx, e))?;
+            }
 
             // 2. Embedding lookup
             self.launch_embedding(m)
                 .map_err(|e| format!("embedding chunk {} m={}: {}", chunk_idx, m, e))?;
+            if debug_chunk_sync {
+                self.stream_sync()
+                    .map_err(|e| format!("debug sync chunk {} after embedding: {}", chunk_idx, e))?;
+            }
             if timing {
                 self.stream_sync()?;
                 t_embed_ms += tc0.elapsed().as_secs_f64() * 1000.0;
             }
 
             if diag && chunk_idx == 0 {
-                eprintln!("[DIAG] === Prefill diagnostic: m={} positions={:?} layers=0..{} ===",
-                    m, diag_positions, diag_layer_limit);
+                eprintln!(
+                    "[DIAG] === Prefill diagnostic req={} m={} positions={:?} layers=0..{} ===",
+                    diag_request_id.unwrap_or(0),
+                    m,
+                    diag_positions,
+                    diag_layer_limit,
+                );
                 // Log input token IDs for verification against reference
                 let id_str: Vec<String> = chunk_tokens.iter().map(|t| t.to_string()).collect();
                 eprintln!("[DIAG] input_token_ids [{}]: {}", chunk_tokens.len(), id_str.join(", "));
@@ -1860,6 +2925,78 @@ impl PrefillEngine {
 
                 // Pre-attention RMSNorm
                 let tn0 = Instant::now();
+                if diag && chunk_idx == 0 && Self::diag_layer_enabled(layer_idx) {
+                    let hidden_last_pre_norm =
+                        self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                    let residual_last_pre_norm =
+                        self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let hidden_last_pre_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                    let residual_last_pre_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let full_surface_diag =
+                        prefill_full_surface_diag_enabled()
+                            || (layer_type == 0 && prefill_gqa_force_custom_attn_debug_enabled());
+                    let position_hashes = if prefill_position_hash_diag_enabled() {
+                        let positions = Self::diag_positions(m);
+                        let hidden = self.diag_position_hashes_bf16(
+                            *self.scratch.d_hidden.device_ptr(),
+                            &positions,
+                            h,
+                            h,
+                        );
+                        let residual = if has_residual {
+                            self.diag_position_hashes_bf16(
+                                *self.scratch.d_residual.device_ptr(),
+                                &positions,
+                                h,
+                                h,
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let hidden_part = if hidden.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" hidden_pos_hashes={}", hidden)
+                        };
+                        let residual_part = if residual.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" residual_pos_hashes={}", residual)
+                        };
+                        format!("{}{}", hidden_part, residual_part)
+                    } else {
+                        String::new()
+                    };
+                    let hidden_all_pre_hash = if full_surface_diag {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_hidden.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    let residual_all_pre_hash = if full_surface_diag && has_residual {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_residual.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    eprintln!(
+                        "[DIAG PRE-ATTN L{:02}] before_norm last: hidden={:.6} residual={:.6} hidden_hash={:016x} residual_hash={:016x} has_residual={}{}{}{}",
+                        layer_idx,
+                        hidden_last_pre_norm,
+                        residual_last_pre_norm,
+                        hidden_last_pre_hash,
+                        residual_last_pre_hash,
+                        has_residual,
+                        hidden_all_pre_hash
+                            .map(|h| format!(" hidden_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        residual_all_pre_hash
+                            .map(|h| format!(" residual_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        position_hashes,
+                    );
+                }
+
                 if !has_residual {
                     self.memcpy_d2d(
                         *self.scratch.d_residual.device_ptr(),
@@ -1882,6 +3019,66 @@ impl PrefillEngine {
                     ).map_err(|e| format!("fused_add_rmsnorm layer {}: {}", layer_idx, e))?;
                 }
                 if timing { self.stream_sync()?; t_norm_ms += tn0.elapsed().as_secs_f64() * 1000.0; }
+                if diag && chunk_idx == 0 && Self::diag_layer_enabled(layer_idx) {
+                    let hidden_last_post_norm =
+                        self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                    let residual_last_post_norm =
+                        self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let hidden_last_post_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                    let residual_last_post_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let full_surface_diag =
+                        prefill_full_surface_diag_enabled()
+                            || (layer_type == 0 && prefill_gqa_force_custom_attn_debug_enabled());
+                    let position_hashes = if prefill_position_hash_diag_enabled() {
+                        let positions = Self::diag_positions(m);
+                        let hidden = self.diag_position_hashes_bf16(
+                            *self.scratch.d_hidden.device_ptr(),
+                            &positions,
+                            h,
+                            h,
+                        );
+                        let residual = self.diag_position_hashes_bf16(
+                            *self.scratch.d_residual.device_ptr(),
+                            &positions,
+                            h,
+                            h,
+                        );
+                        format!(
+                            " hidden_pos_hashes={} residual_pos_hashes={}",
+                            hidden,
+                            residual,
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let hidden_all_post_hash = if full_surface_diag {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_hidden.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    let residual_all_post_hash = if full_surface_diag {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_residual.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    eprintln!(
+                        "[DIAG PRE-ATTN L{:02}] after_norm last: hidden={:.6} residual={:.6} hidden_hash={:016x} residual_hash={:016x}{}{}{}",
+                        layer_idx,
+                        hidden_last_post_norm,
+                        residual_last_post_norm,
+                        hidden_last_post_hash,
+                        residual_last_post_hash,
+                        hidden_all_post_hash
+                            .map(|h| format!(" hidden_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        residual_all_post_hash
+                            .map(|h| format!(" residual_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        position_hashes,
+                    );
+                }
 
 
                 // Mixer
@@ -1915,7 +3112,39 @@ impl PrefillEngine {
                     match layer_type { 0 => t_gqa_ms += attn_elapsed, 3 => t_la_ms += attn_elapsed, _ => {} }
                 }
 
-                if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
+                if diag && chunk_idx == 0 && Self::diag_layer_enabled(layer_idx) {
+                    let attn_out_last_pre_post_norm =
+                        self.diag_l2_norm(*self.scratch.d_attn_out.device_ptr(), m.saturating_sub(1), h, h);
+                    let residual_last_pre_post_norm =
+                        self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let attn_out_last_pre_post_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_attn_out.device_ptr(), m.saturating_sub(1), h, h);
+                    let residual_last_pre_post_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let attn_out_all_pre_post_hash = if prefill_full_surface_diag_enabled() {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_attn_out.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    let residual_all_pre_post_hash = if prefill_full_surface_diag_enabled() {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_residual.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    eprintln!(
+                        "[DIAG POST-ATTN L{:02}] before_norm last: attn_out={:.6} residual={:.6} attn_hash={:016x} residual_hash={:016x}{}{}",
+                        layer_idx,
+                        attn_out_last_pre_post_norm,
+                        residual_last_pre_post_norm,
+                        attn_out_last_pre_post_hash,
+                        residual_last_pre_post_hash,
+                        attn_out_all_pre_post_hash
+                            .map(|h| format!(" attn_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        residual_all_pre_post_hash
+                            .map(|h| format!(" residual_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                    );
                     let lt_name = match layer_type { 0 => "gqa", 1 => "mamba2", 3 => "la", _ => "?" };
                     self.diag_print_norms(
                         &format!("layer{:02}_{}_mixer", layer_idx, lt_name),
@@ -1947,7 +3176,67 @@ impl PrefillEngine {
                 if timing { self.stream_sync()?; t_norm_ms += tn1.elapsed().as_secs_f64() * 1000.0; }
 
                 // DIAG: d_hidden before MLP (after post-attn-norm = MoE input)
-                if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
+                if diag && chunk_idx == 0 && Self::diag_layer_enabled(layer_idx) {
+                    let attn_out_last_post_post_norm =
+                        self.diag_l2_norm(*self.scratch.d_attn_out.device_ptr(), m.saturating_sub(1), h, h);
+                    let hidden_last_pre_mlp =
+                        self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                    let residual_last_pre_mlp =
+                        self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let attn_out_last_post_post_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_attn_out.device_ptr(), m.saturating_sub(1), h, h);
+                    let hidden_last_pre_mlp_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                    let residual_last_pre_mlp_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let attn_out_all_post_post_hash = if prefill_full_surface_diag_enabled() {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_attn_out.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    let hidden_all_pre_mlp_hash = if prefill_full_surface_diag_enabled() {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_hidden.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    let residual_all_pre_mlp_hash = if prefill_full_surface_diag_enabled() {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_residual.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    eprintln!(
+                        "[DIAG POST-ATTN L{:02}] after_norm last: attn_out={:.6} hidden={:.6} residual={:.6} attn_hash={:016x} hidden_hash={:016x} residual_hash={:016x}{}{}{}",
+                        layer_idx,
+                        attn_out_last_post_post_norm,
+                        hidden_last_pre_mlp,
+                        residual_last_pre_mlp,
+                        attn_out_last_post_post_hash,
+                        hidden_last_pre_mlp_hash,
+                        residual_last_pre_mlp_hash,
+                        attn_out_all_post_post_hash
+                            .map(|h| format!(" attn_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        hidden_all_pre_mlp_hash
+                            .map(|h| format!(" hidden_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        residual_all_pre_mlp_hash
+                            .map(|h| format!(" residual_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                    );
+                    eprintln!(
+                        "[DIAG PRE-MLP L{:02}] last: hidden={:.6} residual={:.6} hidden_hash={:016x} residual_hash={:016x}{}{}",
+                        layer_idx,
+                        hidden_last_pre_mlp,
+                        residual_last_pre_mlp,
+                        hidden_last_pre_mlp_hash,
+                        residual_last_pre_mlp_hash,
+                        hidden_all_pre_mlp_hash
+                            .map(|h| format!(" hidden_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        residual_all_pre_mlp_hash
+                            .map(|h| format!(" residual_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                    );
                     self.diag_print_norms(
                         &format!("layer{:02}_pre_mlp", layer_idx),
                         *self.scratch.d_hidden.device_ptr(), &diag_positions, h);
@@ -1956,25 +3245,81 @@ impl PrefillEngine {
                 // MLP (dense or MoE)
                 let tm0 = Instant::now();
                 if self.layer_weights[layer_idx].moe_gate_ptr != 0 {
-                    if diag && layer_idx < diag_layer_limit {
+                    if prefill_pre_moe_sync_debug_enabled() {
+                        self.run_cuda_debug_stage(
+                            "prefill.debug_sync.pre_moe",
+                            "prefill_compute",
+                            format!("layer={} m={}", layer_idx, m),
+                            self.stream,
+                            || {
+                                let err = unsafe { cuda_sys::lib().cuStreamSynchronize(self.stream) };
+                                if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                                    Ok(())
+                                } else {
+                                    Err(format!("pre-moe stream sync: {:?}", err))
+                                }
+                            },
+                        )?;
+                    }
+                    if diag && Self::diag_layer_enabled(layer_idx) {
                         eprintln!("[DIAG] layer{:02} -> forward_moe (gate_ptr=0x{:x})",
                             layer_idx, self.layer_weights[layer_idx].moe_gate_ptr);
                     }
                     self.forward_moe(layer_idx, m)
                         .map_err(|e| format!("moe layer {}: {}", layer_idx, e))?;
+                    if prefill_post_moe_shared_sync_debug_enabled() {
+                        self.shared_stream_sync("post-moe shared-stream sync failed")?;
+                    }
                     // Double-buffer preload is now inside forward_moe_fused itself,
                     // so DMA(N+1) overlaps with compute(N) on the GPU.
                 } else if self.layer_weights[layer_idx].shared_w1.is_some() {
-                    if diag && layer_idx < diag_layer_limit {
+                    if diag && Self::diag_layer_enabled(layer_idx) {
                         eprintln!("[DIAG] layer{:02} -> forward_dense_mlp", layer_idx);
                     }
                     self.forward_dense_mlp(layer_idx, m)?;
-                } else if diag && layer_idx < diag_layer_limit {
+                } else if diag && Self::diag_layer_enabled(layer_idx) {
                     eprintln!("[DIAG] layer{:02} -> NO MLP (no gate, no shared_w1)", layer_idx);
                 }
                 if timing { self.stream_sync()?; t_moe_ms += tm0.elapsed().as_secs_f64() * 1000.0; }
+                if debug_chunk_sync {
+                    self.stream_sync().map_err(|e| {
+                        format!("debug sync chunk {} layer {} end: {}", chunk_idx, layer_idx, e)
+                    })?;
+                }
 
-                if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
+                if diag && chunk_idx == 0 && Self::diag_layer_enabled(layer_idx) {
+                    let hidden_last_post_mlp =
+                        self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                    let residual_last_post_mlp =
+                        self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let hidden_last_post_mlp_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                    let residual_last_post_mlp_hash =
+                        self.diag_row_hash_bf16(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let hidden_all_post_mlp_hash = if prefill_full_surface_diag_enabled() {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_hidden.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    let residual_all_post_mlp_hash = if prefill_full_surface_diag_enabled() {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_residual.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    eprintln!(
+                        "[DIAG POST-MLP L{:02}] last: hidden={:.6} residual={:.6} hidden_hash={:016x} residual_hash={:016x}{}{}",
+                        layer_idx,
+                        hidden_last_post_mlp,
+                        residual_last_post_mlp,
+                        hidden_last_post_mlp_hash,
+                        residual_last_post_mlp_hash,
+                        hidden_all_post_mlp_hash
+                            .map(|h| format!(" hidden_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        residual_all_post_mlp_hash
+                            .map(|h| format!(" residual_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                    );
                     self.diag_print_norms(
                         &format!("layer{:02}_mlp", layer_idx),
                         *self.scratch.d_hidden.device_ptr(), &diag_positions, h);
@@ -2017,6 +3362,7 @@ impl PrefillEngine {
             self.final_norm_ptr,
             m, h,
         )?;
+        self.debug_sync_fused("prefill final norm")?;
 
         if diag {
             let final_norm = self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m - 1, h, h);
@@ -2032,13 +3378,29 @@ impl PrefillEngine {
         // Free pinning pool — VRAM is released for decode HCS allocation
         if self.pinning_active {
             if self.pinning_pool_ptr != 0 {
-                unsafe { cuda_sys::lib().cuMemFree_v2(self.pinning_pool_ptr); }
+                if self.cuda_debug.alloc_debug_enabled() {
+                    self.cuda_debug
+                        .free_owned_allocation(self.pinning_pool_ptr)
+                        .map_err(|e| format!("free pinning pool: {e}"))?;
+                } else {
+                    unsafe { cuda_sys::lib().cuMemFree_v2(self.pinning_pool_ptr); }
+                }
                 self.pinning_pool_ptr = 0;
                 self.pinning_pool_bytes = 0;
+                self.cuda_debug
+                    .note_transient_buffer_clear("prefill.pinning_pool", "run_prefill free pinning pool");
             }
             self.pinned_expert_offsets.clear();
             self.pinning_active = false;
             self.prescan_active_experts.clear();
+            self.cuda_debug.note_transient_buffer_clear(
+                "prefill.pinned_expert_offsets",
+                "run_prefill clear pinned offsets",
+            );
+            self.cuda_debug.note_transient_buffer_clear(
+                "prefill.prescan_active_experts",
+                "run_prefill clear prescan",
+            );
         }
 
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -2207,6 +3569,15 @@ impl PrefillEngine {
                             }
                             self.preloaded_moe_layer = Some(i);
                             self.fused_expert_buf_cur = 0;
+                            self.mark_fused_expert_buffer_loaded(0, i, "run_prefill preload");
+                            self.cuda_debug.note_transient_buffer_write(
+                                "prefill.preloaded_moe_layer",
+                                format!("run_prefill preload layer={}", i),
+                            );
+                            self.cuda_debug.note_transient_buffer_write(
+                                "prefill.fused_expert_buf_cur",
+                                "run_prefill preload buffer=0",
+                            );
                         }
                     }
                     break;
@@ -2217,7 +3588,82 @@ impl PrefillEngine {
         // 3. Layer-by-layer forward pass
         let mut has_residual = false;
         for layer_idx in 0..num_hidden_layers {
+            self.debug_current_layer.set(layer_idx as i32);
             let layer_type = self.layer_weights[layer_idx].layer_type;
+
+            if std::env::var("KRASIS_PREFILL_DIAG").is_ok()
+                && Self::diag_layer_enabled(layer_idx)
+            {
+                let hidden_last_pre_norm =
+                    self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                let residual_last_pre_norm =
+                    self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                let hidden_last_pre_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                let residual_last_pre_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                let full_surface_diag =
+                    prefill_full_surface_diag_enabled()
+                        || (layer_type == 0 && prefill_gqa_force_custom_attn_debug_enabled());
+                let position_hashes = if prefill_position_hash_diag_enabled() {
+                    let positions = Self::diag_positions(m);
+                    let hidden = self.diag_position_hashes_bf16(
+                        *self.scratch.d_hidden.device_ptr(),
+                        &positions,
+                        h,
+                        h,
+                    );
+                    let residual = if has_residual {
+                        self.diag_position_hashes_bf16(
+                            *self.scratch.d_residual.device_ptr(),
+                            &positions,
+                            h,
+                            h,
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let hidden_part = if hidden.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" hidden_pos_hashes={}", hidden)
+                    };
+                    let residual_part = if residual.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" residual_pos_hashes={}", residual)
+                    };
+                    format!("{}{}", hidden_part, residual_part)
+                } else {
+                    String::new()
+                };
+                let hidden_all_pre_hash = if full_surface_diag {
+                    Some(self.diag_span_hash_bf16(*self.scratch.d_hidden.device_ptr(), m * h))
+                } else {
+                    None
+                };
+                let residual_all_pre_hash = if full_surface_diag && has_residual {
+                    Some(self.diag_span_hash_bf16(*self.scratch.d_residual.device_ptr(), m * h))
+                } else {
+                    None
+                };
+                eprintln!(
+                    "[DIAG PRE-ATTN L{:02}] before_norm last: hidden={:.6} residual={:.6} hidden_hash={:016x} residual_hash={:016x} has_residual={}{}{}{}",
+                    layer_idx,
+                    hidden_last_pre_norm,
+                    residual_last_pre_norm,
+                    hidden_last_pre_hash,
+                    residual_last_pre_hash,
+                    has_residual,
+                    hidden_all_pre_hash
+                        .map(|h| format!(" hidden_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                    residual_all_pre_hash
+                        .map(|h| format!(" residual_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                    position_hashes,
+                );
+            }
 
             if !has_residual {
                 self.memcpy_d2d(
@@ -2240,6 +3686,68 @@ impl PrefillEngine {
                     m, h,
                 )?;
             }
+            if std::env::var("KRASIS_PREFILL_DIAG").is_ok()
+                && Self::diag_layer_enabled(layer_idx)
+            {
+                let hidden_last_post_norm =
+                    self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                let residual_last_post_norm =
+                    self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                let hidden_last_post_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                let residual_last_post_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                let full_surface_diag =
+                    prefill_full_surface_diag_enabled()
+                        || (layer_type == 0 && prefill_gqa_force_custom_attn_debug_enabled());
+                let position_hashes = if prefill_position_hash_diag_enabled() {
+                    let positions = Self::diag_positions(m);
+                    let hidden = self.diag_position_hashes_bf16(
+                        *self.scratch.d_hidden.device_ptr(),
+                        &positions,
+                        h,
+                        h,
+                    );
+                    let residual = self.diag_position_hashes_bf16(
+                        *self.scratch.d_residual.device_ptr(),
+                        &positions,
+                        h,
+                        h,
+                    );
+                    format!(
+                        " hidden_pos_hashes={} residual_pos_hashes={}",
+                        hidden,
+                        residual,
+                    )
+                } else {
+                    String::new()
+                };
+                let hidden_all_post_hash = if full_surface_diag {
+                    Some(self.diag_span_hash_bf16(*self.scratch.d_hidden.device_ptr(), m * h))
+                } else {
+                    None
+                };
+                let residual_all_post_hash = if full_surface_diag {
+                    Some(self.diag_span_hash_bf16(*self.scratch.d_residual.device_ptr(), m * h))
+                } else {
+                    None
+                };
+                eprintln!(
+                    "[DIAG PRE-ATTN L{:02}] after_norm last: hidden={:.6} residual={:.6} hidden_hash={:016x} residual_hash={:016x}{}{}{}",
+                    layer_idx,
+                    hidden_last_post_norm,
+                    residual_last_post_norm,
+                    hidden_last_post_hash,
+                    residual_last_post_hash,
+                    hidden_all_post_hash
+                        .map(|h| format!(" hidden_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                    residual_all_post_hash
+                        .map(|h| format!(" residual_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                    position_hashes,
+                );
+            }
 
             match layer_type {
                 0 => self.forward_gqa_chunked(layer_idx, m, 0, false)?,
@@ -2259,6 +3767,43 @@ impl PrefillEngine {
                         (m * h * 2) as u64,
                     )?;
                 }
+            }
+
+            if std::env::var("KRASIS_PREFILL_DIAG").is_ok()
+                && Self::diag_layer_enabled(layer_idx)
+            {
+                let attn_out_last_pre_post_norm =
+                    self.diag_l2_norm(*self.scratch.d_attn_out.device_ptr(), m.saturating_sub(1), h, h);
+                let residual_last_pre_post_norm =
+                    self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                let attn_out_last_pre_post_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_attn_out.device_ptr(), m.saturating_sub(1), h, h);
+                let residual_last_pre_post_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                let attn_out_all_pre_post_hash = if prefill_full_surface_diag_enabled() {
+                    Some(self.diag_span_hash_bf16(*self.scratch.d_attn_out.device_ptr(), m * h))
+                } else {
+                    None
+                };
+                let residual_all_pre_post_hash = if prefill_full_surface_diag_enabled() {
+                    Some(self.diag_span_hash_bf16(*self.scratch.d_residual.device_ptr(), m * h))
+                } else {
+                    None
+                };
+                eprintln!(
+                    "[DIAG POST-ATTN L{:02}] before_norm last: attn_out={:.6} residual={:.6} attn_hash={:016x} residual_hash={:016x}{}{}",
+                    layer_idx,
+                    attn_out_last_pre_post_norm,
+                    residual_last_pre_post_norm,
+                    attn_out_last_pre_post_hash,
+                    residual_last_pre_post_hash,
+                    attn_out_all_pre_post_hash
+                        .map(|h| format!(" attn_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                    residual_all_pre_post_hash
+                        .map(|h| format!(" residual_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                );
             }
 
             let post_norm = self.layer_weights[layer_idx].post_attn_norm;
@@ -2281,9 +3826,99 @@ impl PrefillEngine {
                     (m * h * 2) as u64,
                 )?;
             }
+            if std::env::var("KRASIS_PREFILL_DIAG").is_ok()
+                && Self::diag_layer_enabled(layer_idx)
+            {
+                let attn_out_last_post_post_norm =
+                    self.diag_l2_norm(*self.scratch.d_attn_out.device_ptr(), m.saturating_sub(1), h, h);
+                let hidden_last_pre_mlp =
+                    self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                let residual_last_pre_mlp =
+                    self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                let attn_out_last_post_post_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_attn_out.device_ptr(), m.saturating_sub(1), h, h);
+                let hidden_last_pre_mlp_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                let residual_last_pre_mlp_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                let attn_out_all_post_post_hash = if prefill_full_surface_diag_enabled() {
+                    Some(self.diag_span_hash_bf16(*self.scratch.d_attn_out.device_ptr(), m * h))
+                } else {
+                    None
+                };
+                let hidden_all_pre_mlp_hash = if prefill_full_surface_diag_enabled() {
+                    Some(self.diag_span_hash_bf16(*self.scratch.d_hidden.device_ptr(), m * h))
+                } else {
+                    None
+                };
+                let residual_all_pre_mlp_hash = if prefill_full_surface_diag_enabled() {
+                    Some(self.diag_span_hash_bf16(*self.scratch.d_residual.device_ptr(), m * h))
+                } else {
+                    None
+                };
+                let position_hashes = if prefill_position_hash_diag_enabled() {
+                    let positions = Self::diag_positions(m);
+                    let hidden = self.diag_position_hashes_bf16(
+                        *self.scratch.d_hidden.device_ptr(),
+                        &positions,
+                        h,
+                        h,
+                    );
+                    let residual = self.diag_position_hashes_bf16(
+                        *self.scratch.d_residual.device_ptr(),
+                        &positions,
+                        h,
+                        h,
+                    );
+                    format!(
+                        " hidden_pos_hashes={} residual_pos_hashes={}",
+                        hidden,
+                        residual,
+                    )
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "[DIAG POST-ATTN L{:02}] after_norm last: attn_out={:.6} hidden={:.6} residual={:.6} attn_hash={:016x} hidden_hash={:016x} residual_hash={:016x}{}{}{}",
+                    layer_idx,
+                    attn_out_last_post_post_norm,
+                    hidden_last_pre_mlp,
+                    residual_last_pre_mlp,
+                    attn_out_last_post_post_hash,
+                    hidden_last_pre_mlp_hash,
+                    residual_last_pre_mlp_hash,
+                    attn_out_all_post_post_hash
+                        .map(|h| format!(" attn_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                    hidden_all_pre_mlp_hash
+                        .map(|h| format!(" hidden_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                    residual_all_pre_mlp_hash
+                        .map(|h| format!(" residual_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                );
+                eprintln!(
+                    "[DIAG PRE-MLP L{:02}] last: hidden={:.6} residual={:.6} hidden_hash={:016x} residual_hash={:016x}{}{}{}",
+                    layer_idx,
+                    hidden_last_pre_mlp,
+                    residual_last_pre_mlp,
+                    hidden_last_pre_mlp_hash,
+                    residual_last_pre_mlp_hash,
+                    hidden_all_pre_mlp_hash
+                        .map(|h| format!(" hidden_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                    residual_all_pre_mlp_hash
+                        .map(|h| format!(" residual_all_hash={:016x}", h))
+                        .unwrap_or_default(),
+                    position_hashes,
+                );
+            }
 
             if self.layer_weights[layer_idx].moe_gate_ptr != 0 {
                 self.forward_moe(layer_idx, m)?;
+                if prefill_post_moe_shared_sync_debug_enabled() {
+                    self.shared_stream_sync("post-moe shared-stream sync failed")?;
+                }
                 if self.kernels.fused_moe_fn.is_some()
                     && self.d_fused_expert_w1_a.is_some()
                     && self.d_expert_w1_ptrs.is_none()  // skip preload in pointer table mode
@@ -2293,6 +3928,65 @@ impl PrefillEngine {
             } else if self.layer_weights[layer_idx].shared_w1.is_some() {
                 self.forward_dense_mlp(layer_idx, m)?;
             }
+            if std::env::var("KRASIS_PREFILL_DIAG").is_ok()
+                && Self::diag_layer_enabled(layer_idx)
+            {
+                let hidden_last_post_mlp =
+                    self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                let residual_last_post_mlp =
+                    self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                let hidden_last_post_mlp_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_hidden.device_ptr(), m.saturating_sub(1), h, h);
+                let residual_last_post_mlp_hash =
+                    self.diag_row_hash_bf16(*self.scratch.d_residual.device_ptr(), m.saturating_sub(1), h, h);
+                    let hidden_all_post_mlp_hash = if prefill_full_surface_diag_enabled() {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_hidden.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    let residual_all_post_mlp_hash = if prefill_full_surface_diag_enabled() {
+                        Some(self.diag_span_hash_bf16(*self.scratch.d_residual.device_ptr(), m * h))
+                    } else {
+                        None
+                    };
+                    let position_hashes = if prefill_position_hash_diag_enabled() {
+                        let positions = Self::diag_positions(m);
+                        let hidden = self.diag_position_hashes_bf16(
+                            *self.scratch.d_hidden.device_ptr(),
+                            &positions,
+                            h,
+                            h,
+                        );
+                        let residual = self.diag_position_hashes_bf16(
+                            *self.scratch.d_residual.device_ptr(),
+                            &positions,
+                            h,
+                            h,
+                        );
+                        format!(
+                            " hidden_pos_hashes={} residual_pos_hashes={}",
+                            hidden,
+                            residual,
+                        )
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "[DIAG POST-MLP L{:02}] last: hidden={:.6} residual={:.6} hidden_hash={:016x} residual_hash={:016x}{}{}{}",
+                        layer_idx,
+                        hidden_last_post_mlp,
+                        residual_last_post_mlp,
+                        hidden_last_post_mlp_hash,
+                        residual_last_post_mlp_hash,
+                        hidden_all_post_mlp_hash
+                            .map(|h| format!(" hidden_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        residual_all_post_mlp_hash
+                            .map(|h| format!(" residual_all_hash={:016x}", h))
+                            .unwrap_or_default(),
+                        position_hashes,
+                    );
+                }
 
             // DIAG: per-layer hidden state norm at last position
             if std::env::var("KRASIS_PREFILL_DIAG").is_ok() {
@@ -2311,6 +4005,7 @@ impl PrefillEngine {
                     layer_idx, lt_name, has_moe, has_mlp, last_pos_norm);
             }
         }
+        self.debug_current_layer.set(-1);
 
         // 4. Final RMSNorm
         self.launch_fused_add_rmsnorm(
@@ -2337,8 +4032,6 @@ impl PrefillEngine {
                 // BF16 LM head via cuBLAS GEMM
                 use cudarc::cublas::sys as cublas_sys;
                 use cudarc::cublas::result as cublas_result;
-                let alpha: f32 = 1.0;
-                let beta: f32 = 0.0;
                 unsafe {
                     cublas_result::set_stream(
                         self.cublas_handle,
@@ -2349,12 +4042,12 @@ impl PrefillEngine {
                         cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                         cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                         self.lm_head_bf16_rows as i32, 1, self.lm_head_bf16_cols as i32,
-                        &alpha as *const f32 as *const std::ffi::c_void,
+                        &CUBLAS_ALPHA_F32 as *const f32 as *const std::ffi::c_void,
                         self.lm_head_bf16_ptr as *const std::ffi::c_void,
                         cublas_sys::cudaDataType::CUDA_R_16BF, self.lm_head_bf16_cols as i32,
                         pos_hidden as *const std::ffi::c_void,
                         cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
-                        &beta as *const f32 as *const std::ffi::c_void,
+                        &CUBLAS_BETA_F32 as *const f32 as *const std::ffi::c_void,
                         *self.scratch.d_logits.device_ptr() as *mut std::ffi::c_void,
                         cublas_sys::cudaDataType::CUDA_R_32F, self.lm_head_bf16_rows as i32,
                         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -2381,6 +4074,16 @@ impl PrefillEngine {
 
             // Extract top-k logprobs
             let top = crate::decode::extract_top_logprobs(&self.h_logits, v, top_k);
+            if std::env::var("KRASIS_PREFILL_SAMPLE_DIAG").is_ok() && pos + sample_every >= m {
+                let top_str = top.iter()
+                    .map(|&(tid, lp)| format!("{}:{:.4}", tid, lp))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "[PREFILL-LOGITS-DIAG] position={} m={} top=[{}]",
+                    pos, m, top_str
+                );
+            }
             results.push(PrefillLogitPosition {
                 position: pos,
                 top_k: top.iter().map(|&(tid, lp)| (tid as usize, lp)).collect(),
@@ -2403,6 +4106,16 @@ impl PrefillEngine {
         let m = token_ids.len();
         let ids: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
         let positions: Vec<i32> = (offset..offset + m).map(|p| p as i32).collect();
+        self.validate_prefill_buffer(
+            *self.scratch.d_token_ids.device_ptr(),
+            m * std::mem::size_of::<i32>(),
+            "prefill.upload_tokens.token_ids",
+        )?;
+        self.validate_prefill_buffer(
+            *self.scratch.d_positions.device_ptr(),
+            m * std::mem::size_of::<i32>(),
+            "prefill.upload_tokens.positions",
+        )?;
 
         // Use synchronous copies (cuMemcpyHtoD_v2) because the source Vec is unpinned
         // stack memory. Async copies require page-locked host memory, otherwise the
@@ -2428,78 +4141,144 @@ impl PrefillEngine {
         Ok(())
     }
 
+    fn upload_fa2_cu_seqlens(&self, q_len: i32, k_len: i32) -> Result<(u64, u64), String> {
+        let cu_ptr = *self.scratch.d_workspace.device_ptr();
+        let cu_k_ptr = cu_ptr + 8;
+        unsafe {
+            let q_host = self.fa2_cu_seqlens_q.get();
+            (*q_host)[0] = 0;
+            (*q_host)[1] = q_len;
+            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                cu_ptr,
+                (&*q_host).as_ptr() as *const _,
+                8,
+                self.stream,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Upload FA2 cu_seqlens_q: {:?}", err));
+            }
+
+            let k_host = self.fa2_cu_seqlens_k.get();
+            (*k_host)[0] = 0;
+            (*k_host)[1] = k_len;
+            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                cu_k_ptr,
+                (&*k_host).as_ptr() as *const _,
+                8,
+                self.stream,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Upload FA2 cu_seqlens_k: {:?}", err));
+            }
+        }
+        Ok((cu_ptr, cu_k_ptr))
+    }
+
     // ── Kernel launchers ──
 
     fn launch_embedding(&self, m: usize) -> Result<(), String> {
         let d = self.config.hidden_size;
         let t = std::cmp::max(32, ((std::cmp::min(1024, d) + 31) / 32) * 32) as u32;
+        self.validate_prefill_buffer(*self.scratch.d_hidden.device_ptr(), m * d * std::mem::size_of::<u16>(), "prefill.embedding.out")?;
+        self.validate_prefill_buffer(self.embedding_ptr, self.config.vocab_size * d * std::mem::size_of::<u16>(), "prefill.embedding.table")?;
+        self.validate_prefill_buffer(*self.scratch.d_token_ids.device_ptr(), m * std::mem::size_of::<i32>(), "prefill.embedding.token_ids")?;
         let mut p0 = *self.scratch.d_hidden.device_ptr();
         let mut p1 = self.embedding_ptr;
         let mut p2 = *self.scratch.d_token_ids.device_ptr();
         let mut p3 = d as i32;
-        unsafe {
-            launch(self.kernels.embedding,
-                (m as u32, 1, 1), (t, 1, 1), 0, self.stream,
-                &mut [
-                    &mut p0 as *mut _ as *mut std::ffi::c_void,
-                    &mut p1 as *mut _ as *mut std::ffi::c_void,
-                    &mut p2 as *mut _ as *mut std::ffi::c_void,
-                    &mut p3 as *mut _ as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-        Ok(())
+        self.run_cuda_debug_stage(
+            "prefill.embedding_lookup",
+            "prefill_compute",
+            format!("m={} hidden={}", m, d),
+            self.stream,
+            || unsafe {
+                launch(self.kernels.embedding,
+                    (m as u32, 1, 1), (t, 1, 1), 0, self.stream,
+                    &mut [
+                        &mut p0 as *mut _ as *mut std::ffi::c_void,
+                        &mut p1 as *mut _ as *mut std::ffi::c_void,
+                        &mut p2 as *mut _ as *mut std::ffi::c_void,
+                        &mut p3 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )
+            },
+        )
     }
 
     fn launch_rmsnorm(&self, out: u64, x: u64, w: u64, m: usize, d: usize) -> Result<(), String> {
         let t = std::cmp::max(32, ((std::cmp::min(1024, d) + 31) / 32) * 32) as u32;
+        self.validate_prefill_buffer(out, m * d * std::mem::size_of::<u16>(), "prefill.rmsnorm.out")?;
+        self.validate_prefill_buffer(x, m * d * std::mem::size_of::<u16>(), "prefill.rmsnorm.x")?;
+        self.validate_prefill_buffer(w, d * std::mem::size_of::<u16>(), "prefill.rmsnorm.weight")?;
         let mut p0 = out; let mut p1 = x; let mut p2 = w;
         let mut p3 = d as i32; let mut p4 = self.config.rms_norm_eps;
-        unsafe {
-            launch(self.kernels.rmsnorm,
-                (m as u32, 1, 1), (t, 1, 1), t * 4, self.stream,
-                &mut [
-                    &mut p0 as *mut _ as *mut std::ffi::c_void,
-                    &mut p1 as *mut _ as *mut std::ffi::c_void,
-                    &mut p2 as *mut _ as *mut std::ffi::c_void,
-                    &mut p3 as *mut _ as *mut std::ffi::c_void,
-                    &mut p4 as *mut _ as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-        Ok(())
+        self.run_cuda_debug_stage(
+            "prefill.rmsnorm",
+            "prefill_compute",
+            format!("m={} d={}", m, d),
+            self.stream,
+            || unsafe {
+                launch(self.kernels.rmsnorm,
+                    (m as u32, 1, 1), (t, 1, 1), t * 4, self.stream,
+                    &mut [
+                        &mut p0 as *mut _ as *mut std::ffi::c_void,
+                        &mut p1 as *mut _ as *mut std::ffi::c_void,
+                        &mut p2 as *mut _ as *mut std::ffi::c_void,
+                        &mut p3 as *mut _ as *mut std::ffi::c_void,
+                        &mut p4 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )
+            },
+        )
     }
 
     fn launch_fused_add_rmsnorm(
         &self, residual: u64, x: u64, w: u64, m: usize, d: usize,
     ) -> Result<(), String> {
         let t = std::cmp::max(32, ((std::cmp::min(1024, d) + 31) / 32) * 32) as u32;
+        self.validate_prefill_buffer(residual, m * d * std::mem::size_of::<u16>(), "prefill.fused_add_rmsnorm.residual")?;
+        self.validate_prefill_buffer(x, m * d * std::mem::size_of::<u16>(), "prefill.fused_add_rmsnorm.x")?;
+        self.validate_prefill_buffer(w, d * std::mem::size_of::<u16>(), "prefill.fused_add_rmsnorm.weight")?;
         let mut p0 = residual; let mut p1 = x; let mut p2 = x;
         let mut p3 = w; let mut p4 = d as i32; let mut p5 = self.config.rms_norm_eps;
-        unsafe {
-            launch(self.kernels.fused_add_rmsnorm,
-                (m as u32, 1, 1), (t, 1, 1), t * 4, self.stream,
-                &mut [
-                    &mut p0 as *mut _ as *mut std::ffi::c_void,
-                    &mut p1 as *mut _ as *mut std::ffi::c_void,
-                    &mut p2 as *mut _ as *mut std::ffi::c_void,
-                    &mut p3 as *mut _ as *mut std::ffi::c_void,
-                    &mut p4 as *mut _ as *mut std::ffi::c_void,
-                    &mut p5 as *mut _ as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-        Ok(())
+        self.run_cuda_debug_stage(
+            "prefill.fused_add_rmsnorm",
+            "prefill_compute",
+            format!("m={} d={}", m, d),
+            self.stream,
+            || unsafe {
+                launch(self.kernels.fused_add_rmsnorm,
+                    (m as u32, 1, 1), (t, 1, 1), t * 4, self.stream,
+                    &mut [
+                        &mut p0 as *mut _ as *mut std::ffi::c_void,
+                        &mut p1 as *mut _ as *mut std::ffi::c_void,
+                        &mut p2 as *mut _ as *mut std::ffi::c_void,
+                        &mut p3 as *mut _ as *mut std::ffi::c_void,
+                        &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        &mut p5 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )
+            },
+        )
     }
 
     fn memcpy_d2d(&self, dst: u64, src: u64, bytes: u64) -> Result<(), String> {
-        unsafe {
-            let err = cuda_sys::lib().cuMemcpyDtoDAsync_v2(dst, src, bytes as usize, self.stream);
-            if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                return Err(format!("memcpy_d2d: {:?}", err));
-            }
-        }
-        Ok(())
+        self.validate_prefill_buffer(dst, bytes as usize, "prefill.memcpy_d2d.dst")?;
+        self.validate_prefill_buffer(src, bytes as usize, "prefill.memcpy_d2d.src")?;
+        self.run_cuda_debug_stage(
+            "prefill.memcpy_d2d",
+            "prefill_compute",
+            format!("bytes={}", bytes),
+            self.stream,
+            || unsafe {
+                let err = cuda_sys::lib().cuMemcpyDtoDAsync_v2(dst, src, bytes as usize, self.stream);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    Err(format!("memcpy_d2d: {:?}", err))
+                } else {
+                    Ok(())
+                }
+            },
+        )
     }
 
     /// Transpose 3D FP32 array: [A, B, C] -> [B, A, C] in a single kernel launch.
@@ -2512,19 +4291,24 @@ impl PrefillEngine {
         let mut p2 = a as i32;
         let mut p3 = b as i32;
         let mut p4 = c as i32;
-        unsafe {
-            launch(self.kernels.transpose_3d_021,
-                (b as u32, a as u32, 1), (threads, 1, 1), 0, self.stream,
-                &mut [
-                    &mut p0 as *mut _ as *mut std::ffi::c_void,
-                    &mut p1 as *mut _ as *mut std::ffi::c_void,
-                    &mut p2 as *mut _ as *mut std::ffi::c_void,
-                    &mut p3 as *mut _ as *mut std::ffi::c_void,
-                    &mut p4 as *mut _ as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-        Ok(())
+        self.run_cuda_debug_stage(
+            "prefill.transpose_3d_f32",
+            "prefill_compute",
+            format!("a={} b={} c={}", a, b, c),
+            self.stream,
+            || unsafe {
+                launch(self.kernels.transpose_3d_021,
+                    (b as u32, a as u32, 1), (threads, 1, 1), 0, self.stream,
+                    &mut [
+                        &mut p0 as *mut _ as *mut std::ffi::c_void,
+                        &mut p1 as *mut _ as *mut std::ffi::c_void,
+                        &mut p2 as *mut _ as *mut std::ffi::c_void,
+                        &mut p3 as *mut _ as *mut std::ffi::c_void,
+                        &mut p4 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )
+            },
+        )
     }
 
     fn launch_transpose_f32(&self, out: u64, inp: u64, rows: usize, cols: usize) -> Result<(), String> {
@@ -2533,108 +4317,1163 @@ impl PrefillEngine {
         let mut p1 = inp;
         let mut p2 = rows as i32;
         let mut p3 = cols as i32;
-        unsafe {
-            launch(self.kernels.la_transpose_f32,
-                (cols as u32, 1, 1), (t, 1, 1), 0, self.stream,
-                &mut [
-                    &mut p0 as *mut _ as *mut std::ffi::c_void,
-                    &mut p1 as *mut _ as *mut std::ffi::c_void,
-                    &mut p2 as *mut _ as *mut std::ffi::c_void,
-                    &mut p3 as *mut _ as *mut std::ffi::c_void,
-                ],
+        self.run_cuda_debug_stage(
+            "prefill.transpose_f32",
+            "prefill_compute",
+            format!("rows={} cols={}", rows, cols),
+            self.stream,
+            || unsafe {
+                launch(self.kernels.la_transpose_f32,
+                    (cols as u32, 1, 1), (t, 1, 1), 0, self.stream,
+                    &mut [
+                        &mut p0 as *mut _ as *mut std::ffi::c_void,
+                        &mut p1 as *mut _ as *mut std::ffi::c_void,
+                        &mut p2 as *mut _ as *mut std::ffi::c_void,
+                        &mut p3 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )
+            },
+        )
+    }
+
+    fn stream_sync(&self) -> Result<(), String> {
+        self.run_cuda_debug_stage(
+            "prefill.stream_sync",
+            "prefill_compute",
+            String::new(),
+            self.stream,
+            || {
+                let err = unsafe { cuda_sys::lib().cuStreamSynchronize(self.stream) };
+                if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                    Ok(())
+                } else {
+                    Err(format!("stream sync: {:?}", err))
+                }
+            },
+        )
+    }
+
+    fn runtime_stream_sync(&self, label: &str) -> Result<(), String> {
+        let Some(sync_fn) = self.kernels.runtime_stream_sync else {
+            return self
+                .stream_sync()
+                .map_err(|e| format!("{label}: fallback driver stream sync: {e}"));
+        };
+        self.run_cuda_debug_stage(
+            "prefill.runtime_stream_sync",
+            "prefill_compute",
+            label.to_string(),
+            self.stream,
+            || {
+                let err = unsafe { sync_fn(self.stream as *mut std::ffi::c_void) };
+                if err == 0 {
+                    Ok(())
+                } else {
+                    Err(format!("runtime stream sync: CUDA runtime error {}", err))
+                }
+            },
+        )
+        .map_err(|e| format!("{label}: {e}"))
+    }
+
+    fn named_stream_sync(
+        &self,
+        stream: cuda_sys::CUstream,
+        stage_name: &str,
+        category: &str,
+        label: &str,
+    ) -> Result<(), String> {
+        self.run_cuda_debug_stage(
+            stage_name,
+            category,
+            label.to_string(),
+            stream,
+            || {
+                let err = unsafe { cuda_sys::lib().cuStreamSynchronize(stream) };
+                if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                    Ok(())
+                } else {
+                    Err(format!("stream sync: {:?}", err))
+                }
+            },
+        )
+        .map_err(|e| format!("{label}: {e}"))
+    }
+
+    fn copy_stream_sync(&self, label: &str) -> Result<(), String> {
+        self.named_stream_sync(
+            self.copy_stream,
+            "prefill.copy_stream_sync",
+            "prefill_copy",
+            label,
+        )
+    }
+
+    fn shared_stream_sync(&self, label: &str) -> Result<(), String> {
+        self.named_stream_sync(
+            self.shared_stream,
+            "prefill.shared_stream_sync",
+            "prefill_shared",
+            label,
+        )
+    }
+
+    fn debug_query_stream_ready(
+        &self,
+        stream: cuda_sys::CUstream,
+        stream_name: &str,
+        context: &str,
+        layer_idx: usize,
+    ) -> Result<(), String> {
+        let query = unsafe { cuda_sys::lib().cuStreamQuery(stream) };
+        match query {
+            cuda_sys::CUresult::CUDA_SUCCESS => {
+                eprintln!(
+                    "[LA-STREAM-QUERY] layer={} {}: {}=ready",
+                    layer_idx, context, stream_name,
+                );
+                Ok(())
+            }
+            cuda_sys::CUresult::CUDA_ERROR_NOT_READY => {
+                eprintln!(
+                    "[LA-STREAM-QUERY] layer={} {}: {}=not_ready",
+                    layer_idx, context, stream_name,
+                );
+                Ok(())
+            }
+            other => Err(format!(
+                "{} stream query failed for {}: {:?}",
+                context, stream_name, other
+            )),
+        }
+    }
+
+    fn cross_chunk_kv_staging_base(&self, required_bytes: u64, label: &str) -> Result<u64, String> {
+        let fp32_scratch_bytes =
+            (self.scratch.d_fp32_scratch.len * std::mem::size_of::<f32>()) as u64;
+        if required_bytes <= fp32_scratch_bytes {
+            return Ok(*self.scratch.d_fp32_scratch.device_ptr());
+        }
+
+        // GQA runs before MoE in each layer, so the MoE accumulator arena is idle here
+        // and can safely back temporary contiguous KV staging without increasing VRAM.
+        let moe_accum_bytes = (self.scratch.d_moe_accum.len * std::mem::size_of::<f32>()) as u64;
+        if required_bytes <= moe_accum_bytes {
+            return Ok(*self.scratch.d_moe_accum.device_ptr());
+        }
+
+        Err(format!(
+            "{label} needs {} bytes, fp32 scratch has {}, moe_accum has {}",
+            required_bytes, fp32_scratch_bytes, moe_accum_bytes
+        ))
+    }
+
+    fn debug_sync_fused(&self, label: &str) -> Result<(), String> {
+        let should_sync = if prefill_fused_sync_debug_enabled() {
+            true
+        } else {
+            prefill_fused_sync_stage_matches(label)
+        };
+        if !should_sync {
+            return Ok(());
+        }
+        if let Some(layer_idx) = self.debug_layer() {
+            let selected = prefill_debug_layers();
+            if selected.is_some() && !prefill_debug_layer_selected(layer_idx) {
+                return Ok(());
+            }
+        }
+        self.stream_sync()
+            .map_err(|e| format!("fused debug sync after {label}: {e}"))
+    }
+
+    fn debug_sync_shared(&self, label: &str) -> Result<(), String> {
+        let stage_filter = prefill_shared_sync_stage_debug();
+        let should_sync = if prefill_shared_sync_debug_enabled() {
+            true
+        } else if let Some(filter) = stage_filter.as_deref() {
+            filter == "all"
+                || label.to_ascii_lowercase().contains(filter)
+        } else {
+            false
+        };
+        if !should_sync {
+            return Ok(());
+        }
+        self.run_cuda_debug_stage(
+            "prefill.shared_stream_sync",
+            "prefill_shared",
+            label.to_string(),
+            self.shared_stream,
+            || Ok(()),
+        )
+        .map_err(|e| format!("shared debug sync after {label}: {e}"))
+    }
+
+    fn fused_expert_buffer_name(buf_idx: usize) -> &'static str {
+        match buf_idx {
+            0 => "prefill.fused_expert_buf0",
+            1 => "prefill.fused_expert_buf1",
+            _ => "prefill.fused_expert_buf_unknown",
+        }
+    }
+
+    fn expert_ptr_table_name(table_idx: usize) -> &'static str {
+        match table_idx {
+            0 => "prefill.ptr_table_w1",
+            1 => "prefill.ptr_table_w1s",
+            2 => "prefill.ptr_table_w2",
+            3 => "prefill.ptr_table_w2s",
+            _ => "prefill.ptr_table_unknown",
+        }
+    }
+
+    fn record_cuda_event(
+        &self,
+        event: cuda_sys::CUevent,
+        stream: cuda_sys::CUstream,
+        label: &str,
+    ) -> Result<(), String> {
+        let err = unsafe { cuda_sys::lib().cuEventRecord(event, stream) };
+        if err == cuda_sys::CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("{}: {:?}", label, err))
+        }
+    }
+
+    fn wait_pointer_table_payload_reusable(
+        &self,
+        layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        self.wait_cuda_event(
+            self.copy_stream,
+            self.ptr_payload_reuse_event,
+            &format!(
+                "{source} wait copy_stream on pointer-table payload reuse before layer {}",
+                layer_idx
+            ),
+        )
+    }
+
+    fn sync_cuda_event(
+        &self,
+        event: cuda_sys::CUevent,
+        label: &str,
+    ) -> Result<(), String> {
+        let err = unsafe { cuda_sys::lib().cuEventSynchronize(event) };
+        if err == cuda_sys::CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("{}: {:?}", label, err))
+        }
+    }
+
+    fn wait_pointer_table_payload_reusable_host(
+        &self,
+        layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        self.sync_cuda_event(
+            self.ptr_payload_reuse_event,
+            &format!(
+                "{source} host wait on pointer-table payload reuse before layer {}",
+                layer_idx
+            ),
+        )
+    }
+
+    fn mark_pointer_table_payload_released(
+        &self,
+        layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        self.record_cuda_event(
+            self.ptr_payload_reuse_event,
+            self.stream,
+            &format!(
+                "{source} record pointer-table payload release for layer {}",
+                layer_idx
+            ),
+        )
+    }
+
+    fn record_compute_ready_for_shared(
+        &mut self,
+        layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        self.record_cuda_event(
+            self.shared_compute_event,
+            self.stream,
+            &format!("{source} record compute->shared handoff"),
+        )?;
+        self.compute_event_generation = self.compute_event_generation.saturating_add(1);
+        self.compute_event_layer = Some(layer_idx);
+        self.cuda_debug.note_transient_buffer_write(
+            "prefill.compute_event",
+            format!(
+                "{} layer={} generation={}",
+                source, layer_idx, self.compute_event_generation
+            ),
+        );
+        Ok(())
+    }
+
+    fn wait_shared_for_compute(
+        &self,
+        layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        if self.compute_event_layer != Some(layer_idx) {
+            return Err(format!(
+                "{}: compute_event expected layer {} but tracked {:?} (generation={})",
+                source, layer_idx, self.compute_event_layer, self.compute_event_generation
+            ));
+        }
+        self.cuda_debug.note_transient_buffer_use(
+            "prefill.compute_event",
+            format!(
+                "{} layer={} generation={}",
+                source, layer_idx, self.compute_event_generation
+            ),
+        );
+        self.wait_cuda_event(
+            self.shared_stream,
+            self.shared_compute_event,
+            &format!("{source} wait shared_stream on compute_event"),
+        )
+    }
+
+    fn mark_pointer_tables_ready(
+        &mut self,
+        layer_idx: usize,
+        active_experts: usize,
+        source: &str,
+    ) {
+        for table_idx in 0..4 {
+            self.expert_ptr_table_generation[table_idx] =
+                self.expert_ptr_table_generation[table_idx].saturating_add(1);
+            self.expert_ptr_table_layer[table_idx] = Some(layer_idx);
+            self.cuda_debug.note_transient_buffer_write(
+                Self::expert_ptr_table_name(table_idx),
+                format!(
+                    "{} layer={} generation={} active_experts={}",
+                    source,
+                    layer_idx,
+                    self.expert_ptr_table_generation[table_idx],
+                    active_experts
+                ),
+            );
+        }
+    }
+
+    fn validate_pointer_tables_ready(
+        &self,
+        layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        for table_idx in 0..4 {
+            if self.expert_ptr_table_layer[table_idx] != Some(layer_idx) {
+                return Err(format!(
+                    "{}: {} expected layer {} but tracked {:?} (generation={})",
+                    source,
+                    Self::expert_ptr_table_name(table_idx),
+                    layer_idx,
+                    self.expert_ptr_table_layer[table_idx],
+                    self.expert_ptr_table_generation[table_idx]
+                ));
+            }
+            self.cuda_debug.note_transient_buffer_use(
+                Self::expert_ptr_table_name(table_idx),
+                format!(
+                    "{} layer={} generation={}",
+                    source,
+                    layer_idx,
+                    self.expert_ptr_table_generation[table_idx]
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_active_expert_pointer_table_entries(
+        &self,
+        layer_idx: usize,
+        active: &[usize],
+        hcs_count: usize,
+        pinned_count: usize,
+        cold_count: usize,
+        cold_overflow_count: usize,
+        cold_slot: usize,
+    ) -> Result<(), String> {
+        let require_int4_alignment = |ptr: u64, label: &str| -> Result<(), String> {
+            if ptr & 0xf != 0 {
+                return Err(format!(
+                    "{}: pointer 0x{:x} is not 16-byte aligned for fused int4 loads",
+                    label, ptr
+                ));
+            }
+            Ok(())
+        };
+        for &eid in active {
+            let w1_ptr = self.h_expert_w1_ptrs[eid];
+            let w1s_ptr = self.h_expert_w1s_ptrs[eid];
+            let w2_ptr = self.h_expert_w2_ptrs[eid];
+            let w2s_ptr = self.h_expert_w2s_ptrs[eid];
+            if w1_ptr == 0 || w1s_ptr == 0 || w2_ptr == 0 || w2s_ptr == 0 {
+                return Err(format!(
+                    "moe layer {} active expert {} has unresolved pointer-table entry: w1=0x{:x} w1s=0x{:x} w2=0x{:x} w2s=0x{:x} active={} hcs={} pinned={} cold={} cold_overflow={} cold_slot={} max_cold={}",
+                    layer_idx,
+                    eid,
+                    w1_ptr,
+                    w1s_ptr,
+                    w2_ptr,
+                    w2s_ptr,
+                    active.len(),
+                    hcs_count,
+                    pinned_count,
+                    cold_count,
+                    cold_overflow_count,
+                    cold_slot,
+                    self.max_cold_experts,
+                ));
+            }
+            require_int4_alignment(
+                w1_ptr,
+                &format!("moe layer {} active expert {} w1", layer_idx, eid),
+            )?;
+            require_int4_alignment(
+                w1s_ptr,
+                &format!("moe layer {} active expert {} w1s", layer_idx, eid),
+            )?;
+            require_int4_alignment(
+                w2_ptr,
+                &format!("moe layer {} active expert {} w2", layer_idx, eid),
+            )?;
+            require_int4_alignment(
+                w2s_ptr,
+                &format!("moe layer {} active expert {} w2s", layer_idx, eid),
+            )?;
+            self.validate_prefill_buffer(
+                w1_ptr,
+                self.w1_packed_per_expert,
+                &format!("prefill.ptr_table.layer{}.expert{}.w1", layer_idx, eid),
+            )?;
+            self.validate_prefill_buffer(
+                w1s_ptr,
+                self.w1_scales_per_expert,
+                &format!("prefill.ptr_table.layer{}.expert{}.w1s", layer_idx, eid),
+            )?;
+            self.validate_prefill_buffer(
+                w2_ptr,
+                self.w2_packed_per_expert,
+                &format!("prefill.ptr_table.layer{}.expert{}.w2", layer_idx, eid),
+            )?;
+            self.validate_prefill_buffer(
+                w2s_ptr,
+                self.w2_scales_per_expert,
+                &format!("prefill.ptr_table.layer{}.expert{}.w2s", layer_idx, eid),
             )?;
         }
         Ok(())
     }
 
-    fn stream_sync(&self) -> Result<(), String> {
+    fn validate_uploaded_expert_pointer_table(
+        &self,
+        layer_idx: usize,
+        gpu_ptr: u64,
+        host_ptrs: &[u64],
+        label: &str,
+    ) -> Result<(), String> {
+        let mut roundtrip = vec![0u64; host_ptrs.len()];
         unsafe {
-            let err = cuda_sys::lib().cuStreamSynchronize(self.stream);
+            let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                roundtrip.as_mut_ptr() as *mut _,
+                gpu_ptr,
+                host_ptrs.len() * std::mem::size_of::<u64>(),
+            );
             if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                return Err(format!("stream sync: {:?}", err));
+                return Err(format!(
+                    "moe layer {} {} roundtrip copy failed: {:?}",
+                    layer_idx, label, err
+                ));
             }
         }
+        if let Some((idx, (expected, actual))) = host_ptrs
+            .iter()
+            .copied()
+            .zip(roundtrip.iter().copied())
+            .enumerate()
+            .find(|(_, (expected, actual))| expected != actual)
+        {
+            return Err(format!(
+                "moe layer {} {} upload mismatch at expert {}: host=0x{:x} device=0x{:x}",
+                layer_idx,
+                label,
+                idx,
+                expected,
+                actual,
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_moe_dispatch_metadata(
+        &self,
+        layer_idx: usize,
+        m: usize,
+        topk: usize,
+        block_size: usize,
+        total_sorted: usize,
+        topk_ids_ptr: u64,
+        num_tokens_post_ptr: u64,
+        sorted_ids_ptr: u64,
+        expert_ids_ptr: u64,
+        h_expert_counts: &[i32],
+    ) -> Result<(), String> {
+        let mut num_tokens_post_padded = 0i32;
+        self.memcpy_dtoh_checked(
+            &mut num_tokens_post_padded as *mut _ as *mut std::ffi::c_void,
+            num_tokens_post_ptr,
+            std::mem::size_of::<i32>(),
+            &format!("moe layer {} num_tokens_post_padded", layer_idx),
+        )?;
+        if num_tokens_post_padded < 0 {
+            return Err(format!(
+                "moe layer {} invalid num_tokens_post_padded {}",
+                layer_idx, num_tokens_post_padded
+            ));
+        }
+        let num_tokens_post_padded = num_tokens_post_padded as usize;
+        if num_tokens_post_padded % block_size != 0 {
+            return Err(format!(
+                "moe layer {} num_tokens_post_padded {} not aligned to block_size {}",
+                layer_idx, num_tokens_post_padded, block_size
+            ));
+        }
+        if num_tokens_post_padded != total_sorted {
+            return Err(format!(
+                "moe layer {} total_sorted mismatch: host={} device={}",
+                layer_idx, total_sorted, num_tokens_post_padded
+            ));
+        }
+
+        let num_blocks = num_tokens_post_padded / block_size;
+        let mut expert_ids = vec![0i32; num_blocks];
+        if !expert_ids.is_empty() {
+            self.memcpy_dtoh_checked(
+                expert_ids.as_mut_ptr() as *mut std::ffi::c_void,
+                expert_ids_ptr,
+                expert_ids.len() * std::mem::size_of::<i32>(),
+                &format!("moe layer {} expert_ids", layer_idx),
+            )?;
+        }
+
+        let mut sorted_ids = vec![0i32; num_tokens_post_padded];
+        if !sorted_ids.is_empty() {
+            self.memcpy_dtoh_checked(
+                sorted_ids.as_mut_ptr() as *mut std::ffi::c_void,
+                sorted_ids_ptr,
+                sorted_ids.len() * std::mem::size_of::<i32>(),
+                &format!("moe layer {} sorted_ids", layer_idx),
+            )?;
+        }
+        let valid_sorted_limit = m
+            .checked_mul(topk)
+            .ok_or_else(|| format!("moe layer {} m*topk overflow: m={} topk={}", layer_idx, m, topk))?;
+        let mut topk_ids = vec![0i32; valid_sorted_limit];
+        if !topk_ids.is_empty() {
+            self.memcpy_dtoh_checked(
+                topk_ids.as_mut_ptr() as *mut std::ffi::c_void,
+                topk_ids_ptr,
+                topk_ids.len() * std::mem::size_of::<i32>(),
+                &format!("moe layer {} topk_ids", layer_idx),
+            )?;
+        }
+        let n_experts = h_expert_counts.len();
+        let mut padded_counts = vec![0usize; n_experts];
+        for (eid, &count) in h_expert_counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let padded = (count as usize).div_ceil(block_size) * block_size;
+            padded_counts[eid] = padded;
+        }
+        let mut block_counts = vec![0usize; n_experts];
+
+        for (block_idx, &expert_id_i32) in expert_ids.iter().enumerate() {
+            if expert_id_i32 < 0 || expert_id_i32 as usize >= n_experts {
+                return Err(format!(
+                    "moe layer {} invalid expert_id {} at block {} (num_blocks={})",
+                    layer_idx, expert_id_i32, block_idx, num_blocks
+                ));
+            }
+            let expert_id = expert_id_i32 as usize;
+            if h_expert_counts[expert_id] == 0 {
+                return Err(format!(
+                    "moe layer {} block {} references inactive expert {}",
+                    layer_idx, block_idx, expert_id
+                ));
+            }
+            if self.h_expert_w1_ptrs[expert_id] == 0
+                || self.h_expert_w1s_ptrs[expert_id] == 0
+                || self.h_expert_w2_ptrs[expert_id] == 0
+                || self.h_expert_w2s_ptrs[expert_id] == 0
+            {
+                return Err(format!(
+                    "moe layer {} block {} expert {} has zero pointer-table entry: w1=0x{:x} w1s=0x{:x} w2=0x{:x} w2s=0x{:x}",
+                    layer_idx,
+                    block_idx,
+                    expert_id,
+                    self.h_expert_w1_ptrs[expert_id],
+                    self.h_expert_w1s_ptrs[expert_id],
+                    self.h_expert_w2_ptrs[expert_id],
+                    self.h_expert_w2s_ptrs[expert_id],
+                ));
+            }
+            block_counts[expert_id] += block_size;
+
+            let block_start = block_idx * block_size;
+            let block_end = block_start + block_size;
+            let mut seen_padding = false;
+            for (row_in_block, &sorted_id) in sorted_ids[block_start..block_end].iter().enumerate() {
+                if sorted_id < 0 || sorted_id as usize >= valid_sorted_limit {
+                    seen_padding = true;
+                    continue;
+                }
+                let sorted_id = sorted_id as usize;
+                if seen_padding {
+                    return Err(format!(
+                        "moe layer {} block {} has non-padding sorted_id {} after padding began",
+                        layer_idx, block_idx, sorted_id
+                    ));
+                }
+                let routed_expert = topk_ids[sorted_id];
+                if routed_expert != expert_id_i32 {
+                    return Err(format!(
+                        "moe layer {} block {} row {} sorted_id {} routes to expert {} but block expert is {}",
+                        layer_idx,
+                        block_idx,
+                        row_in_block,
+                        sorted_id,
+                        routed_expert,
+                        expert_id_i32,
+                    ));
+                }
+            }
+        }
+
+        for (eid, &expected_padded) in padded_counts.iter().enumerate() {
+            if expected_padded == 0 {
+                continue;
+            }
+            let actual = block_counts[eid];
+            if actual != expected_padded {
+                return Err(format!(
+                    "moe layer {} expert {} padded-count mismatch: expected {} got {} (raw_count={})",
+                    layer_idx, eid, expected_padded, actual, h_expert_counts[eid]
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn mark_shared_output_ready(
+        &mut self,
+        layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        if std::env::var("KRASIS_PREFILL_SHARED_EVENT_STRICT_DEBUG").is_ok() {
+            self.shared_stream_sync("strict shared_event producer sync failed")?;
+        }
+        self.record_cuda_event(
+            self.shared_event,
+            self.shared_stream,
+            &format!("{source} record shared output ready"),
+        )?;
+        self.shared_event_generation = self.shared_event_generation.saturating_add(1);
+        self.shared_event_layer = Some(layer_idx);
+        self.shared_output_generation = self.shared_output_generation.saturating_add(1);
+        self.shared_output_layer = Some(layer_idx);
+        self.cuda_debug.note_transient_buffer_write(
+            "prefill.shared_event",
+            format!(
+                "{} layer={} generation={}",
+                source, layer_idx, self.shared_event_generation
+            ),
+        );
+        self.cuda_debug.note_transient_buffer_write(
+            "prefill.shared_output",
+            format!(
+                "{} layer={} generation={}",
+                source, layer_idx, self.shared_output_generation
+            ),
+        );
+        self.cuda_debug.note_transient_buffer_write(
+            "prefill.shared_bf16_scratch1",
+            format!(
+                "{} layer={} generation={}",
+                source, layer_idx, self.shared_output_generation
+            ),
+        );
+        Ok(())
+    }
+
+    fn wait_for_shared_output(
+        &self,
+        layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        if self.shared_output_layer != Some(layer_idx) || self.shared_event_layer != Some(layer_idx) {
+            return Err(format!(
+                "{}: shared output expected layer {} but tracked output={:?} event={:?} (out_gen={} event_gen={})",
+                source,
+                layer_idx,
+                self.shared_output_layer,
+                self.shared_event_layer,
+                self.shared_output_generation,
+                self.shared_event_generation
+            ));
+        }
+        self.cuda_debug.note_transient_buffer_use(
+            "prefill.shared_event",
+            format!(
+                "{} layer={} generation={}",
+                source, layer_idx, self.shared_event_generation
+            ),
+        );
+        self.cuda_debug.note_transient_buffer_use(
+            "prefill.shared_output",
+            format!(
+                "{} layer={} generation={}",
+                source, layer_idx, self.shared_output_generation
+            ),
+        );
+        self.cuda_debug.note_transient_buffer_use(
+            "prefill.shared_bf16_scratch1",
+            format!(
+                "{} layer={} generation={}",
+                source, layer_idx, self.shared_output_generation
+            ),
+        );
+        self.wait_cuda_event(
+            self.stream,
+            self.shared_event,
+            &format!("{source} wait main stream on shared_event"),
+        )
+    }
+
+    fn mark_shared_output_consumed(
+        &mut self,
+        layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        self.record_cuda_event(
+            self.shared_consume_event,
+            self.stream,
+            &format!("{source} record shared output consumed"),
+        )?;
+        self.shared_consume_generation = self.shared_consume_generation.saturating_add(1);
+        self.shared_consume_layer = Some(layer_idx);
+        self.cuda_debug.note_transient_buffer_write(
+            "prefill.shared_consume",
+            format!(
+                "{} layer={} generation={}",
+                source, layer_idx, self.shared_consume_generation
+            ),
+        );
+        Ok(())
+    }
+
+    fn wait_for_shared_output_consumed(
+        &self,
+        source: &str,
+    ) -> Result<(), String> {
+        self.cuda_debug.note_transient_buffer_use(
+            "prefill.shared_consume",
+            format!(
+                "{} generation={} layer={:?}",
+                source, self.shared_consume_generation, self.shared_consume_layer
+            ),
+        );
+        self.wait_cuda_event(
+            self.shared_stream,
+            self.shared_consume_event,
+            &format!("{source} wait shared_stream on shared_consume_event"),
+        )
+    }
+
+    fn wait_cuda_event(
+        &self,
+        stream: cuda_sys::CUstream,
+        event: cuda_sys::CUevent,
+        label: &str,
+    ) -> Result<(), String> {
+        let err = unsafe { cuda_sys::lib().cuStreamWaitEvent(stream, event, 0) };
+        if err == cuda_sys::CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("{}: {:?}", label, err))
+        }
+    }
+
+    fn memset_d8_async_checked(
+        &self,
+        dst: u64,
+        value: u8,
+        bytes: usize,
+        stream: cuda_sys::CUstream,
+        label: &str,
+    ) -> Result<(), String> {
+        let err = unsafe { cuda_sys::lib().cuMemsetD8Async(dst, value, bytes, stream) };
+        if err == cuda_sys::CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("{label}: {:?}", err))
+        }
+    }
+
+    fn memset_d32_async_checked(
+        &self,
+        dst: u64,
+        value: u32,
+        count: usize,
+        stream: cuda_sys::CUstream,
+        label: &str,
+    ) -> Result<(), String> {
+        let err = unsafe { cuda_sys::lib().cuMemsetD32Async(dst, value, count, stream) };
+        if err == cuda_sys::CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("{label}: {:?}", err))
+        }
+    }
+
+    fn memcpy_dtoh_checked(
+        &self,
+        dst: *mut std::ffi::c_void,
+        src: u64,
+        bytes: usize,
+        label: &str,
+    ) -> Result<(), String> {
+        let err = unsafe { cuda_sys::lib().cuMemcpyDtoH_v2(dst, src, bytes) };
+        if err == cuda_sys::CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("{label}: {:?}", err))
+        }
+    }
+
+    fn mark_fused_expert_buffer_loaded(&mut self, buf_idx: usize, layer_idx: usize, source: &str) {
+        self.fused_expert_buf_generation[buf_idx] =
+            self.fused_expert_buf_generation[buf_idx].saturating_add(1);
+        self.fused_expert_buf_loaded_layer[buf_idx] = Some(layer_idx);
+        self.cuda_debug.note_transient_buffer_write(
+            Self::fused_expert_buffer_name(buf_idx),
+            format!(
+                "{} layer={} generation={}",
+                source,
+                layer_idx,
+                self.fused_expert_buf_generation[buf_idx]
+            ),
+        );
+    }
+
+    fn validate_fused_expert_buffer_loaded(
+        &self,
+        buf_idx: usize,
+        expected_layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        let loaded = self.fused_expert_buf_loaded_layer[buf_idx];
+        if loaded == Some(expected_layer_idx) {
+            self.cuda_debug.note_transient_buffer_use(
+                Self::fused_expert_buffer_name(buf_idx),
+                format!(
+                    "{} layer={} generation={}",
+                    source,
+                    expected_layer_idx,
+                    self.fused_expert_buf_generation[buf_idx]
+                ),
+            );
+            Ok(())
+        } else {
+            Err(format!(
+                "{}: fused expert buffer {} expected layer {} but tracked {:?} (generation={})",
+                source,
+                buf_idx,
+                expected_layer_idx,
+                loaded,
+                self.fused_expert_buf_generation[buf_idx]
+            ))
+        }
+    }
+
+    fn wait_fused_expert_buffer_reusable(
+        &self,
+        buf_idx: usize,
+        next_layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        self.cuda_debug.note_transient_buffer_use(
+            Self::fused_expert_buffer_name(buf_idx),
+            format!(
+                "{} wait_to_refill next_layer={} generation={} current_layer={:?}",
+                source,
+                next_layer_idx,
+                self.fused_expert_buf_generation[buf_idx],
+                self.fused_expert_buf_loaded_layer[buf_idx]
+            ),
+        );
+        self.wait_cuda_event(
+            self.copy_stream,
+            self.fused_expert_buf_ready_events[buf_idx],
+            &format!(
+                "{} wait for fused expert buffer {} reusable before layer {} refill",
+                source, buf_idx, next_layer_idx
+            ),
+        )
+    }
+
+    fn mark_fused_expert_buffer_released(
+        &self,
+        buf_idx: usize,
+        layer_idx: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        self.record_cuda_event(
+            self.fused_expert_buf_ready_events[buf_idx],
+            self.stream,
+            &format!(
+                "{} record fused expert buffer {} release for layer {}",
+                source, buf_idx, layer_idx
+            ),
+        )?;
+        self.cuda_debug.note_transient_buffer_use(
+            Self::fused_expert_buffer_name(buf_idx),
+            format!(
+                "{} release layer={} generation={}",
+                source,
+                layer_idx,
+                self.fused_expert_buf_generation[buf_idx]
+            ),
+        );
         Ok(())
     }
 
     // ── Marlin GEMM ──
 
-    fn marlin_gemm(&self, a: u64, w: &MarlinWeight, c: u64, m: usize) -> Result<(), String> {
+    fn marlin_gemm_with_resources(
+        &self,
+        stage_name: &str,
+        stream_name: &str,
+        stream: cuda_sys::CUstream,
+        a: u64,
+        w: &MarlinWeight,
+        c: u64,
+        fp32_scratch: u64,
+        workspace: u64,
+        m: usize,
+    ) -> Result<(), String> {
         let f = self.kernels.marlin_mm.ok_or("Marlin GEMM not loaded")?;
         let st = if w.num_bits == 4 { &ScalarType::U4B8 } else { &ScalarType::U8B128 };
+        let packed_bytes = if w.num_bits == 8 {
+            w.n.checked_mul(w.k)
+                .ok_or_else(|| "prefill.marlin_gemm packed byte overflow".to_string())?
+        } else {
+            w.n.checked_mul(w.k / 2)
+                .ok_or_else(|| "prefill.marlin_gemm packed byte overflow".to_string())?
+        };
+        let scale_rows = w.n.div_ceil(16);
+        let scale_cols = w.k.div_ceil(w.group_size.max(1));
+        let scales_bytes = scale_rows
+            .checked_mul(scale_cols)
+            .and_then(|v| v.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| "prefill.marlin_gemm scales byte overflow".to_string())?;
+        self.validate_prefill_buffer(a, m * w.k * std::mem::size_of::<u16>(), "prefill.marlin_gemm.a")?;
+        self.validate_prefill_buffer(w.packed, packed_bytes, "prefill.marlin_gemm.packed")?;
+        self.validate_prefill_buffer(w.scales, scales_bytes, "prefill.marlin_gemm.scales")?;
+        self.validate_prefill_buffer(c, m * w.n * std::mem::size_of::<u16>(), "prefill.marlin_gemm.c")?;
 
         // Zero the workspace lock array before each call. Marlin uses it for
         // inter-block barrier synchronization (barrier_acquire spins until
         // locks[off] == expected). Stale non-zero values from prior calls cause
         // deadlocks or incorrect sync, producing zeros or garbage.
-        let ws_ptr = *self.scratch.d_workspace.device_ptr();
         let ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
-        unsafe {
-            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
-        }
+        self.validate_prefill_buffer(
+            workspace,
+            ws_len * std::mem::size_of::<u32>(),
+            "prefill.marlin_gemm.workspace",
+        )?;
+        self.memset_d32_async_checked(
+            workspace,
+            0,
+            ws_len,
+            stream,
+            "prefill.marlin_gemm.workspace memset",
+        )?;
 
         // Zero the C_tmp (FP32 scratch) region used by this GEMM call.
         // When use_fp32_reduce=true and use_atomic_add=true, the Marlin kernel
         // atomicAdds partial results to C_tmp. Stale values from prior GEMM calls
         // accumulate, inflating output norms. This is critical for sequential
         // expert GEMM dispatch where hundreds of calls share the same C_tmp buffer.
-        let ctmp_ptr = *self.scratch.d_fp32_scratch.device_ptr();
         let ctmp_len = m * w.n;  // FP32 elements needed for this call
-        unsafe {
-            cuda_sys::lib().cuMemsetD32Async(ctmp_ptr, 0, ctmp_len, self.stream);
-        }
+        self.validate_prefill_buffer(
+            fp32_scratch,
+            ctmp_len * std::mem::size_of::<f32>(),
+            "prefill.marlin_gemm.fp32_scratch",
+        )?;
+        self.memset_d32_async_checked(
+            fp32_scratch,
+            0,
+            ctmp_len,
+            stream,
+            "prefill.marlin_gemm.fp32_scratch memset",
+        )?;
 
-        unsafe {
-            f(
-                a as *const _, w.packed as *const _,
-                c as *mut _, *self.scratch.d_fp32_scratch.device_ptr() as *mut _,
-                w.scales as *const _, std::ptr::null(), std::ptr::null(),
-                std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
-                m as i32, w.n as i32, w.k as i32, w.k as i32,
-                ws_ptr as *mut _,
-                st, false, true, false,
-                w.num_groups as i32, w.group_size as i32,
-                self.config.device_ordinal as i32,
-                self.stream as u64,
-                -1, -1, self.config.sms as i32,
-                false, true, false,
-            );
-        }
-        Ok(())
+        self.run_cuda_debug_stage(
+            stage_name,
+            stream_name,
+            format!("m={} n={} k={} bits={} groups={}", m, w.n, w.k, w.num_bits, w.num_groups),
+            stream,
+            || {
+                unsafe {
+                    f(
+                        a as *const _, w.packed as *const _,
+                        c as *mut _, fp32_scratch as *mut _,
+                        w.scales as *const _, std::ptr::null(), std::ptr::null(),
+                        std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
+                        m as i32, w.n as i32, w.k as i32, w.k as i32,
+                        workspace as *mut _,
+                        st, false, true, false,
+                        w.num_groups as i32, w.group_size as i32,
+                        self.config.device_ordinal as i32,
+                        stream as u64,
+                        -1, -1, self.config.sms as i32,
+                        false, true, false,
+                    );
+                }
+                Ok(())
+            },
+        )
+    }
+
+    fn marlin_gemm(&self, a: u64, w: &MarlinWeight, c: u64, m: usize) -> Result<(), String> {
+        self.marlin_gemm_with_resources(
+            "prefill.marlin_gemm",
+            "prefill_compute",
+            self.stream,
+            a,
+            w,
+            c,
+            *self.scratch.d_fp32_scratch.device_ptr(),
+            *self.scratch.d_workspace.device_ptr(),
+            m,
+        )
+    }
+
+    fn shared_gate_gemm(
+        &self,
+        stage_name: &str,
+        hidden: u64,
+        gate_weight: u64,
+        gate_rows: usize,
+        gate_cols: usize,
+        gate_out: u64,
+        m: usize,
+        h: usize,
+    ) -> Result<(), String> {
+        self.validate_prefill_buffer(hidden, m * h * std::mem::size_of::<u16>(), "prefill.shared_gate.hidden")?;
+        self.validate_prefill_buffer(gate_weight, gate_rows * gate_cols * std::mem::size_of::<u16>(), "prefill.shared_gate.weight")?;
+        self.validate_prefill_buffer(gate_out, m * gate_rows * std::mem::size_of::<f32>(), "prefill.shared_gate.out")?;
+        self.run_cuda_debug_stage(
+            stage_name,
+            "prefill_compute",
+            format!("m={} h={} gate_rows={} gate_cols={}", m, h, gate_rows, gate_cols),
+            self.stream,
+            || unsafe {
+                use cudarc::cublas::result as cublas_result;
+                use cudarc::cublas::sys as cublas_sys;
+
+                cublas_result::set_stream(
+                    self.cublas_handle,
+                    self.stream as cublas_sys::cudaStream_t,
+                ).map_err(|e| format!("cublas set_stream: {:?}", e))?;
+
+                cublas_result::gemm_ex(
+                    self.cublas_handle,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    gate_rows as i32,
+                    m as i32,
+                    gate_cols as i32,
+                    &CUBLAS_ALPHA_F32 as *const f32 as *const std::ffi::c_void,
+                    gate_weight as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF,
+                    gate_cols as i32,
+                    hidden as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF,
+                    h as i32,
+                    &CUBLAS_BETA_F32 as *const f32 as *const std::ffi::c_void,
+                    gate_out as *mut std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_32F,
+                    gate_rows as i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                ).map_err(|e| format!("shared gate GEMM: {:?}", e))
+            },
+        )
     }
 
     /// cuBLAS BF16 GEMM: C = A @ W^T, all BF16, computed in FP32.
     /// A: [m, k] BF16 row-major, W: [n, k] BF16 row-major, C: [m, n] BF16 row-major
     fn cublas_bf16_gemm(&self, a: u64, w: &Bf16Weight, c: u64, m: usize) -> Result<(), String> {
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-        unsafe {
-            use cudarc::cublas::sys as cublas_sys;
-            use cudarc::cublas::result as cublas_result;
+        self.validate_prefill_buffer(a, m * w.k * std::mem::size_of::<u16>(), "prefill.cublas_bf16_gemm.a")?;
+        self.validate_prefill_buffer(w.ptr, w.n * w.k * std::mem::size_of::<u16>(), "prefill.cublas_bf16_gemm.w")?;
+        self.validate_prefill_buffer(c, m * w.n * std::mem::size_of::<u16>(), "prefill.cublas_bf16_gemm.c")?;
+        self.run_cuda_debug_stage(
+            "prefill.cublas_bf16_gemm",
+            "prefill_compute",
+            format!("m={} n={} k={}", m, w.n, w.k),
+            self.stream,
+            || unsafe {
+                use cudarc::cublas::result as cublas_result;
+                use cudarc::cublas::sys as cublas_sys;
 
-            cublas_result::set_stream(
-                self.cublas_handle,
-                self.stream as cublas_sys::cudaStream_t,
-            ).map_err(|e| format!("cublas set_stream: {:?}", e))?;
+                cublas_result::set_stream(
+                    self.cublas_handle,
+                    self.stream as cublas_sys::cudaStream_t,
+                )
+                .map_err(|e| format!("cublas set_stream: {:?}", e))?;
 
-            cublas_result::gemm_ex(
-                self.cublas_handle,
-                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                w.n as i32, m as i32, w.k as i32,
-                &alpha as *const f32 as *const std::ffi::c_void,
-                w.ptr as *const std::ffi::c_void,
-                cublas_sys::cudaDataType::CUDA_R_16BF, w.k as i32,
-                a as *const std::ffi::c_void,
-                cublas_sys::cudaDataType::CUDA_R_16BF, w.k as i32,
-                &beta as *const f32 as *const std::ffi::c_void,
-                c as *mut std::ffi::c_void,
-                cublas_sys::cudaDataType::CUDA_R_16BF, w.n as i32,
-                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-            ).map_err(|e| format!("cublas bf16 GEMM: {:?}", e))?;
-        }
-        Ok(())
+                cublas_result::gemm_ex(
+                    self.cublas_handle,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    w.n as i32,
+                    m as i32,
+                    w.k as i32,
+                    &CUBLAS_ALPHA_F32 as *const f32 as *const std::ffi::c_void,
+                    w.ptr as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF,
+                    w.k as i32,
+                    a as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF,
+                    w.k as i32,
+                    &CUBLAS_BETA_F32 as *const f32 as *const std::ffi::c_void,
+                    c as *mut std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF,
+                    w.n as i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+                .map_err(|e| format!("cublas bf16 GEMM: {:?}", e))
+            },
+        )
     }
 
     /// Dispatch GEMM: Marlin (INT4/INT8) or cuBLAS BF16 fallback.
@@ -2714,12 +5553,31 @@ impl PrefillEngine {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
         let gt = self.gqa_timing_enabled.get();
+        let gqa_diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok()
+            && Self::diag_layer_enabled(layer_idx);
 
         let hidden = *self.scratch.d_hidden.device_ptr();
         let q = *self.scratch.d_q.device_ptr();
         let k = *self.scratch.d_k.device_ptr();
         let v = *self.scratch.d_v.device_ptr();
         let attn_out = *self.scratch.d_attn_out.device_ptr();
+        let q_dim = cfg.num_q_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let h = cfg.hidden_size;
+        let last_pos = m.saturating_sub(1);
+        let force_custom_attn = prefill_gqa_force_custom_attn_debug_enabled();
+
+        if gqa_diag {
+            let hidden_last = self.diag_l2_norm(hidden, last_pos, h, h);
+            let residual_last =
+                self.diag_l2_norm(*self.scratch.d_residual.device_ptr(), last_pos, h, h);
+            eprintln!(
+                "[DIAG GQA L{:02}] entry last: hidden={:.6} residual={:.6}",
+                layer_idx,
+                hidden_last,
+                residual_last,
+            );
+        }
 
         // Q/K/V projections (Marlin or cuBLAS BF16)
         let gt0 = Instant::now();
@@ -2753,6 +5611,24 @@ impl PrefillEngine {
         }
         self.la_gemm(hidden, &lw.k_proj, &lw.k_proj_bf16, k, m)?;
         self.la_gemm(hidden, &lw.v_proj, &lw.v_proj_bf16, v, m)?;
+        if gqa_diag {
+            let q_last = self.diag_l2_norm(q, last_pos, q_dim, q_dim);
+            let k_last = self.diag_l2_norm(k, last_pos, kv_dim, kv_dim);
+            let v_last = self.diag_l2_norm(v, last_pos, kv_dim, kv_dim);
+            let q_last_hash = self.diag_row_hash_bf16(q, last_pos, q_dim, q_dim);
+            let k_last_hash = self.diag_row_hash_bf16(k, last_pos, kv_dim, kv_dim);
+            let v_last_hash = self.diag_row_hash_bf16(v, last_pos, kv_dim, kv_dim);
+            eprintln!(
+                "[DIAG GQA L{:02}] proj last: q={:.6} k={:.6} v={:.6} q_hash={:016x} k_hash={:016x} v_hash={:016x}",
+                layer_idx,
+                q_last,
+                k_last,
+                v_last,
+                q_last_hash,
+                k_last_hash,
+                v_last_hash,
+            );
+        }
 
         if gt { self.stream_sync()?; self.t_gqa_proj.set(self.t_gqa_proj.get() + gt0.elapsed().as_secs_f64() * 1000.0); }
 
@@ -2765,6 +5641,20 @@ impl PrefillEngine {
         }
         if lw.k_norm_ptr != 0 {
             self.launch_rmsnorm(k, k, lw.k_norm_ptr, m * cfg.num_kv_heads, cfg.head_dim)?;
+        }
+        if gqa_diag {
+            let q_last = self.diag_l2_norm(q, last_pos, q_dim, q_dim);
+            let k_last = self.diag_l2_norm(k, last_pos, kv_dim, kv_dim);
+            let q_last_hash = self.diag_row_hash_bf16(q, last_pos, q_dim, q_dim);
+            let k_last_hash = self.diag_row_hash_bf16(k, last_pos, kv_dim, kv_dim);
+            eprintln!(
+                "[DIAG GQA L{:02}] qk_norm last: q={:.6} k={:.6} q_hash={:016x} k_hash={:016x}",
+                layer_idx,
+                q_last,
+                k_last,
+                q_last_hash,
+                k_last_hash,
+            );
         }
 
         if gt { self.stream_sync()?; self.t_gqa_norm.set(self.t_gqa_norm.get() + gt1.elapsed().as_secs_f64() * 1000.0); }
@@ -2800,13 +5690,40 @@ impl PrefillEngine {
                 )?;
             }
         }
+        if gqa_diag {
+            let q_last = self.diag_l2_norm(q, last_pos, q_dim, q_dim);
+            let k_last = self.diag_l2_norm(k, last_pos, kv_dim, kv_dim);
+            let q_last_hash = self.diag_row_hash_bf16(q, last_pos, q_dim, q_dim);
+            let k_last_hash = self.diag_row_hash_bf16(k, last_pos, kv_dim, kv_dim);
+            eprintln!(
+                "[DIAG GQA L{:02}] rope last: q={:.6} k={:.6} q_hash={:016x} k_hash={:016x}",
+                layer_idx,
+                q_last,
+                k_last,
+                q_last_hash,
+                k_last_hash,
+            );
+        }
+        if gqa_diag && force_custom_attn && start_pos == 0 {
+            let q_all_hash = self.diag_span_hash_bf16(q, m * q_dim);
+            let k_all_hash = self.diag_span_hash_bf16(k, m * kv_dim);
+            let v_all_hash = self.diag_span_hash_bf16(v, m * kv_dim);
+            eprintln!(
+                "[DIAG GQA L{:02}] rope_inputs_all: q_all_hash={:016x} k_all_hash={:016x} v_all_hash={:016x}",
+                layer_idx,
+                q_all_hash,
+                k_all_hash,
+                v_all_hash,
+            );
+        }
 
         if gt { self.stream_sync()?; self.t_gqa_rope.set(self.t_gqa_rope.get() + gt2.elapsed().as_secs_f64() * 1000.0); }
 
         // Attention: use vendored FlashAttention-2 when available (start_pos==0),
         // otherwise fall back to custom tiled kernel for cross-chunk KV cache support.
         let mut kv_cache_already_stored = false; // Set true by FP8 cross-chunk path
-        if let Some(fa2_fwd) = self.kernels.flash_attn_fwd {
+        if !force_custom_attn {
+            if let Some(fa2_fwd) = self.kernels.flash_attn_fwd {
             if start_pos == 0 {
                 // FA2 varlen forward: Q/K/V are [total_q, heads, head_dim] contiguous BF16.
                 // For single-sequence prefill: batch=1, cu_seqlens_q=[0,m], cu_seqlens_k=[0,m].
@@ -2815,14 +5732,8 @@ impl PrefillEngine {
                     .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
                     .unwrap_or(std::ptr::null_mut());
 
-                // Build cu_seqlens on host and upload (2 ints: [0, m])
-                let cu_data: [i32; 2] = [0, m as i32];
-                let cu_ptr = *self.scratch.d_workspace.device_ptr();
-                unsafe {
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        cu_ptr, cu_data.as_ptr() as *const _, 8, self.stream,
-                    );
-                }
+                // Build cu_seqlens on stable host storage and upload asynchronously.
+                let (cu_ptr, _cu_k_ptr) = self.upload_fa2_cu_seqlens(m as i32, m as i32)?;
 
                 if gt { self.stream_sync()?; }
                 let gt_fa2 = Instant::now();
@@ -2867,16 +5778,11 @@ impl PrefillEngine {
                 let kv_stride = cfg.num_kv_heads * cfg.head_dim;
                 let total_kv = start_pos + m;
                 let kv_buf_bytes = (total_kv * kv_stride * 2) as u64; // BF16
-                let scratch_bytes =
-                    (self.scratch.d_fp32_scratch.len * std::mem::size_of::<f32>()) as u64;
                 let required_bytes = kv_buf_bytes * 2;
-                if required_bytes > scratch_bytes {
-                    return Err(format!(
-                        "Polar4 cross-chunk KV staging needs {} bytes, fp32 scratch has {}",
-                        required_bytes, scratch_bytes
-                    ));
-                }
-                let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
+                let fp32_scratch = self.cross_chunk_kv_staging_base(
+                    required_bytes,
+                    "Polar4 cross-chunk KV staging",
+                )?;
                 let full_k_bf16 = fp32_scratch;
                 let full_v_bf16 = fp32_scratch + kv_buf_bytes;
 
@@ -2924,16 +5830,7 @@ impl PrefillEngine {
                 let lse_ptr = self.scratch.d_fa2_lse.as_ref()
                     .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
                     .unwrap_or(std::ptr::null_mut());
-                let cu_q_data: [i32; 2] = [0, m as i32];
-                let cu_k_data: [i32; 2] = [0, total_kv as i32];
-                let cu_ptr = *self.scratch.d_workspace.device_ptr();
-                let cu_k_ptr = cu_ptr + 8;
-                unsafe {
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        cu_ptr, cu_q_data.as_ptr() as *const _, 8, self.stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        cu_k_ptr, cu_k_data.as_ptr() as *const _, 8, self.stream);
-                }
+                let (cu_ptr, cu_k_ptr) = self.upload_fa2_cu_seqlens(m as i32, total_kv as i32)?;
 
                 let gt_fa2_bf16 = Instant::now();
                 let ret = unsafe {
@@ -3014,16 +5911,7 @@ impl PrefillEngine {
                     let lse_ptr = self.scratch.d_fa2_lse.as_ref()
                         .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
                         .unwrap_or(std::ptr::null_mut());
-                    let cu_q_data: [i32; 2] = [0, m as i32];
-                    let cu_k_data: [i32; 2] = [0, total_kv as i32];
-                    let cu_ptr = *self.scratch.d_workspace.device_ptr();
-                    let cu_k_ptr = cu_ptr + 8;
-                    unsafe {
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            cu_ptr, cu_q_data.as_ptr() as *const _, 8, self.stream);
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            cu_k_ptr, cu_k_data.as_ptr() as *const _, 8, self.stream);
-                    }
+                    let (cu_ptr, cu_k_ptr) = self.upload_fa2_cu_seqlens(m as i32, total_kv as i32)?;
 
                     let gt_fa2 = Instant::now();
                     // FP8 KV cache layout: [max_seq, num_kv_heads * head_dim], stride = kv_stride
@@ -3063,16 +5951,11 @@ impl PrefillEngine {
                 } else {
                     // Fallback: dequant FP8 cache + concat current BF16 K/V, then FA2 BF16
                     let kv_buf_bytes = (total_kv * kv_stride * 2) as u64; // BF16
-                    let scratch_bytes =
-                        (self.scratch.d_fp32_scratch.len * std::mem::size_of::<f32>()) as u64;
                     let required_bytes = kv_buf_bytes * 2;
-                    if required_bytes > scratch_bytes {
-                        return Err(format!(
-                            "FP8 cross-chunk KV staging needs {} bytes, fp32 scratch has {}",
-                            required_bytes, scratch_bytes
-                        ));
-                    }
-                    let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
+                    let fp32_scratch = self.cross_chunk_kv_staging_base(
+                        required_bytes,
+                        "FP8 cross-chunk KV staging",
+                    )?;
                     let full_k_bf16 = fp32_scratch;
                     let full_v_bf16 = fp32_scratch + kv_buf_bytes;
 
@@ -3111,16 +5994,7 @@ impl PrefillEngine {
                     let lse_ptr = self.scratch.d_fa2_lse.as_ref()
                         .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
                         .unwrap_or(std::ptr::null_mut());
-                    let cu_q_data: [i32; 2] = [0, m as i32];
-                    let cu_k_data: [i32; 2] = [0, total_kv as i32];
-                    let cu_ptr = *self.scratch.d_workspace.device_ptr();
-                    let cu_k_ptr = cu_ptr + 8;
-                    unsafe {
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            cu_ptr, cu_q_data.as_ptr() as *const _, 8, self.stream);
-                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            cu_k_ptr, cu_k_data.as_ptr() as *const _, 8, self.stream);
-                    }
+                    let (cu_ptr, cu_k_ptr) = self.upload_fa2_cu_seqlens(m as i32, total_kv as i32)?;
 
                     let gt_fa2_bf16 = Instant::now();
                     let ret = unsafe {
@@ -3169,6 +6043,76 @@ impl PrefillEngine {
                 attn_out, q, k, v, layer_k_ptr, layer_v_ptr,
                 m, start_pos, cfg,
             )?;
+        }
+        } else {
+            self.launch_custom_tiled_attn(
+                attn_out, q, k, v, layer_k_ptr, layer_v_ptr,
+                m, start_pos, cfg,
+            )?;
+        }
+        if gqa_diag {
+            let attn_last = self.diag_l2_norm(attn_out, last_pos, q_dim, q_dim);
+            let attn_last_hash = self.diag_row_hash_bf16(attn_out, last_pos, q_dim, q_dim);
+            let attn_all_hash = if force_custom_attn && start_pos == 0 {
+                Some(self.diag_span_hash_bf16(attn_out, m * q_dim))
+            } else {
+                None
+            };
+            eprintln!(
+                "[DIAG GQA L{:02}] attn last: out={:.6} out_hash={:016x}{}",
+                layer_idx,
+                attn_last,
+                attn_last_hash,
+                attn_all_hash
+                    .map(|h| format!(" out_all_hash={:016x}", h))
+                    .unwrap_or_default(),
+            );
+        }
+        if gqa_diag
+            && force_custom_attn
+            && start_pos == 0
+            && prefill_gqa_repeat_attn_debug_enabled()
+        {
+            let attn_repeat_out = *self.scratch.d_scratch1.device_ptr();
+            self.validate_prefill_buffer(
+                attn_repeat_out,
+                m * q_dim * std::mem::size_of::<u16>(),
+                "prefill.gqa.repeat_attn_out",
+            )?;
+            self.memset_d32_async_checked(
+                attn_repeat_out,
+                0,
+                (m * q_dim).div_ceil(2),
+                self.stream,
+                "prefill.gqa.repeat_attn_out memset",
+            )?;
+            self.launch_custom_tiled_attn(
+                attn_repeat_out,
+                q,
+                k,
+                v,
+                layer_k_ptr,
+                layer_v_ptr,
+                m,
+                start_pos,
+                cfg,
+            )?;
+            let repeat_last = self.diag_l2_norm(attn_repeat_out, last_pos, q_dim, q_dim);
+            let repeat_hash = self.diag_row_hash_bf16(attn_repeat_out, last_pos, q_dim, q_dim);
+            let first_hash = self.diag_row_hash_bf16(attn_out, last_pos, q_dim, q_dim);
+            let repeat_all_hash = self.diag_span_hash_bf16(attn_repeat_out, m * q_dim);
+            let first_all_hash = self.diag_span_hash_bf16(attn_out, m * q_dim);
+            eprintln!(
+                "[DIAG GQA L{:02}] repeat_attn last: out={:.6} out_hash={:016x} first_hash={:016x} match={} out_all_hash={:016x} first_all_hash={:016x} all_match={}",
+                layer_idx,
+                repeat_last,
+                repeat_hash,
+                first_hash,
+                repeat_hash == first_hash,
+                repeat_all_hash,
+                first_all_hash,
+                repeat_all_hash == first_all_hash,
+            );
         }
 
         // KV cache append: BF16 K,V -> cache format into separate per-layer caches
@@ -3231,7 +6175,7 @@ impl PrefillEngine {
         // Gated attention: apply sigmoid(gate) to attention output
         let gt_gate = Instant::now();
         if lw.gqa_gated && gate_ptr != 0 {
-            let q_dim = (cfg.num_q_heads * cfg.head_dim) as i32;
+            let q_dim = q_dim as i32;
             let gate_threads = std::cmp::max(32, ((std::cmp::min(1024, q_dim as usize) + 31) / 32) * 32) as u32;
             let mut g0 = attn_out; let mut g1 = attn_out; let mut g2 = gate_ptr;
             let mut g3 = q_dim;
@@ -3247,6 +6191,16 @@ impl PrefillEngine {
                 )?;
             }
         }
+        if gqa_diag {
+            let gated_last = self.diag_l2_norm(attn_out, last_pos, q_dim, q_dim);
+            let gated_last_hash = self.diag_row_hash_bf16(attn_out, last_pos, q_dim, q_dim);
+            eprintln!(
+                "[DIAG GQA L{:02}] gate last: out={:.6} out_hash={:016x}",
+                layer_idx,
+                gated_last,
+                gated_last_hash,
+            );
+        }
         if gt { self.stream_sync()?; self.t_gqa_gate.set(self.t_gqa_gate.get() + gt_gate.elapsed().as_secs_f64() * 1000.0); }
 
         // O projection (use scratch1 as temp to avoid input/output aliasing)
@@ -3254,6 +6208,17 @@ impl PrefillEngine {
         let o_temp = *self.scratch.d_scratch1.device_ptr();
         self.la_gemm(attn_out, &lw.o_proj, &lw.o_proj_bf16, o_temp, m)?;
         self.memcpy_d2d(attn_out, o_temp, (m * cfg.hidden_size * 2) as u64)?;
+        if gqa_diag {
+            let oproj_last = self.diag_l2_norm(attn_out, last_pos, cfg.hidden_size, cfg.hidden_size);
+            let oproj_last_hash =
+                self.diag_row_hash_bf16(attn_out, last_pos, cfg.hidden_size, cfg.hidden_size);
+            eprintln!(
+                "[DIAG GQA L{:02}] o_proj last: out={:.6} out_hash={:016x}",
+                layer_idx,
+                oproj_last,
+                oproj_last_hash,
+            );
+        }
         if gt { self.stream_sync()?; self.t_gqa_oproj.set(self.t_gqa_oproj.get() + gt_oproj.elapsed().as_secs_f64() * 1000.0); }
 
         Ok(())
@@ -3373,6 +6338,19 @@ impl PrefillEngine {
     fn forward_linear_attention(&self, layer_idx: usize, m: usize) -> Result<(), String> {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
+        let la_sync_debug = std::env::var("KRASIS_LA_FLA_SYNC_DEBUG").ok();
+        let la_sync_requested = |name: &str| {
+            la_sync_debug
+                .as_deref()
+                .map(|value| {
+                    value.eq_ignore_ascii_case("1")
+                        || value.eq_ignore_ascii_case("all")
+                        || value
+                            .split(',')
+                            .any(|part| part.trim().eq_ignore_ascii_case(name))
+                })
+                .unwrap_or(false)
+        };
         let nk = cfg.la_num_k_heads;
         let nv = cfg.la_num_v_heads;
         let dk = cfg.la_k_head_dim;
@@ -3429,10 +6407,75 @@ impl PrefillEngine {
 
         let lt = self.gqa_timing_enabled.get(); // reuse same env flag for LA timing
         let lt0 = Instant::now();
+
+        // Debug-only discriminators: either drain the full shared stream or wait only
+        // on the last tracked shared-output event before any LA work starts.
+        if la_sync_requested("entry_shared") {
+            self.shared_stream_sync("la entry shared-stream sync failed")?;
+        }
+        if la_sync_requested("entry_shared_event") && self.shared_event_generation != 0 {
+            self.wait_cuda_event(
+                self.stream,
+                self.shared_event,
+                "la entry wait main stream on shared_event",
+            )?;
+            if std::env::var("KRASIS_LA_FLA_QUERY_SHARED_DEBUG").is_ok() {
+                self.debug_query_stream_ready(
+                    self.shared_stream,
+                    "shared_stream",
+                    "after entry_shared_event wait",
+                    layer_idx,
+                )?;
+                eprintln!(
+                    "[LA-SHARED-EVENT] layer={} event_layer={:?} event_generation={}",
+                    layer_idx,
+                    self.shared_event_layer,
+                    self.shared_event_generation,
+                );
+            }
+            if std::env::var("KRASIS_LA_FLA_QUERY_COPY_DEBUG").is_ok() {
+                self.debug_query_stream_ready(
+                    self.copy_stream,
+                    "copy_stream",
+                    "after entry_shared_event wait",
+                    layer_idx,
+                )?;
+            }
+        }
+        if la_sync_requested("entry_shared_consume_event") && self.shared_consume_generation != 0 {
+            self.wait_cuda_event(
+                self.stream,
+                self.shared_consume_event,
+                "la entry wait main stream on shared_consume_event",
+            )?;
+            if std::env::var("KRASIS_LA_FLA_QUERY_SHARED_DEBUG").is_ok() {
+                self.debug_query_stream_ready(
+                    self.shared_stream,
+                    "shared_stream",
+                    "after entry_shared_consume_event wait",
+                    layer_idx,
+                )?;
+                eprintln!(
+                    "[LA-SHARED-CONSUME] layer={} consume_layer={:?} consume_generation={}",
+                    layer_idx,
+                    self.shared_consume_layer,
+                    self.shared_consume_generation,
+                );
+            }
+            if std::env::var("KRASIS_LA_FLA_QUERY_COPY_DEBUG").is_ok() {
+                self.debug_query_stream_ready(
+                    self.copy_stream,
+                    "copy_stream",
+                    "after entry_shared_consume_event wait",
+                    layer_idx,
+                )?;
+            }
+        }
+
         // 1. in_proj_qkvz GEMM: [M, hidden] -> [M, qkvz_dim] BF16
         self.la_gemm(hidden, &lw.la_in_proj_qkvz, &lw.la_in_proj_qkvz_bf16, proj_buf, m)?;
         let la_diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok()
-            && layer_idx < Self::diag_layer_limit();
+            && Self::diag_layer_enabled(layer_idx);
         if la_diag {
             let gemm_norm = self.diag_l2_norm(proj_buf, 0, qkvz_dim, qkvz_dim);
             eprintln!("[DIAG L{:02}] qkvz_gemm pos0 norm={:.6} (dim={})", layer_idx, gemm_norm, qkvz_dim);
@@ -3696,18 +6739,41 @@ impl PrefillEngine {
 
                 // Zero-pad beyond M (BF16 = 2 bytes per element)
                 if fla_pad > 0 {
-                    unsafe {
-                        let _ = cuda_sys::lib().cuMemsetD8Async(
-                            fla_q_bf16 + (m * nv * dk * 2) as u64, 0, (fla_pad * nv * dk * 2) as usize, self.stream);
-                        let _ = cuda_sys::lib().cuMemsetD8Async(
-                            fla_k_bf16 + (m * nv * dk * 2) as u64, 0, (fla_pad * nv * dk * 2) as usize, self.stream);
-                        let _ = cuda_sys::lib().cuMemsetD8Async(
-                            fla_v_bf16 + (m * nv * dv * 2) as u64, 0, (fla_pad * nv * dv * 2) as usize, self.stream);
-                        let _ = cuda_sys::lib().cuMemsetD8Async(
-                            fla_beta_bf16 + (m * nv * 2) as u64, 0, (fla_pad * nv * 2) as usize, self.stream);
-                        let _ = cuda_sys::lib().cuMemsetD8Async(
-                            fla_gate_bf16 + (m * nv * 2) as u64, 0, (fla_pad * nv * 2) as usize, self.stream);
-                    }
+                    self.memset_d8_async_checked(
+                        fla_q_bf16 + (m * nv * dk * 2) as u64,
+                        0,
+                        (fla_pad * nv * dk * 2) as usize,
+                        self.stream,
+                        "fla pad q",
+                    )?;
+                    self.memset_d8_async_checked(
+                        fla_k_bf16 + (m * nv * dk * 2) as u64,
+                        0,
+                        (fla_pad * nv * dk * 2) as usize,
+                        self.stream,
+                        "fla pad k",
+                    )?;
+                    self.memset_d8_async_checked(
+                        fla_v_bf16 + (m * nv * dv * 2) as u64,
+                        0,
+                        (fla_pad * nv * dv * 2) as usize,
+                        self.stream,
+                        "fla pad v",
+                    )?;
+                    self.memset_d8_async_checked(
+                        fla_beta_bf16 + (m * nv * 2) as u64,
+                        0,
+                        (fla_pad * nv * 2) as usize,
+                        self.stream,
+                        "fla pad beta",
+                    )?;
+                    self.memset_d8_async_checked(
+                        fla_gate_bf16 + (m * nv * 2) as u64,
+                        0,
+                        (fla_pad * nv * 2) as usize,
+                        self.stream,
+                        "fla pad gate",
+                    )?;
                 }
 
                 // No conversion timing — there are no conversions!
@@ -3723,17 +6789,158 @@ impl PrefillEngine {
                 let w_fla = *self.d_fla_w.as_ref().ok_or("no fla_w")?.device_ptr();
                 let u_fla = *self.d_fla_u.as_ref().ok_or("no fla_u")?.device_ptr();
                 let h_fla = *self.d_fla_h.as_ref().ok_or("no fla_h")?.device_ptr();
-                // h0 is only read by step 5, so reuse the output buffer as a zeroed
-                // BF16 initial state and let step 6 overwrite it later.
-                let h0_fla = *self.d_fla_o.as_ref().ok_or("no fla_o")?.device_ptr();
+                let h0_fla = *self.d_fla_h0.as_ref().ok_or("no fla_h0")?.device_ptr();
                 let ht_fla = *self.d_fla_final_state.as_ref().ok_or("no fla_final_state")?.device_ptr();
                 let v_new_fla = *self.d_fla_v_new.as_ref().ok_or("no fla_v_new")?.device_ptr();
                 let o_fla = *self.d_fla_o.as_ref().ok_or("no fla_o")?.device_ptr();
+                if std::env::var("KRASIS_FLA_PTR_DEBUG").is_ok() {
+                    let h0_bytes = nv * dk * dv * std::mem::size_of::<u16>();
+                    let o_bytes = fla_total * nv * dv * std::mem::size_of::<u16>();
+                    let h0_start = h0_fla;
+                    let h0_end = h0_start.saturating_add(h0_bytes as u64);
+                    let o_start = o_fla;
+                    let o_end = o_start.saturating_add(o_bytes as u64);
+                    let overlaps = h0_start < o_end && o_start < h0_end;
+                    eprintln!(
+                        "[FLA-PTR L{:02}] h0=0x{:x}..0x{:x} ({} B) o=0x{:x}..0x{:x} ({} B) overlap={}",
+                        layer_idx,
+                        h0_start,
+                        h0_end,
+                        h0_bytes,
+                        o_start,
+                        o_end,
+                        o_bytes,
+                        overlaps
+                    );
+                }
 
                 let fla = self.fla.as_ref().unwrap();
                 let t_arg = fla_total as i32;
+                let g_cum_fla = *self.d_fla_g_cumsum.as_ref().ok_or("no fla_g_cumsum")?.device_ptr();
 
-                // DEBUG: sync before FLA to catch conv/gate/repeat kernel errors
+                // Debug-only discriminator: force selected reusable FLA intermediates
+                // clean before each LA layer. Empty/"1"/"all" means zero everything;
+                // otherwise accept a comma-separated list such as "g_cumsum,h,o".
+                if let Ok(fla_zero_debug) = std::env::var("KRASIS_LA_FLA_ZERO_DEBUG") {
+                    let zero_all = fla_zero_debug.is_empty()
+                        || fla_zero_debug == "1"
+                        || fla_zero_debug.eq_ignore_ascii_case("all");
+                    let zero_buffer = |name: &str| {
+                        zero_all
+                            || fla_zero_debug
+                                .split(',')
+                                .any(|part| part.trim().eq_ignore_ascii_case(name))
+                    };
+                    if zero_buffer("g_cumsum") {
+                        self.memset_d8_async_checked(
+                            g_cum_fla,
+                            0,
+                            fla_total * nv * std::mem::size_of::<f32>(),
+                            self.stream,
+                            "fla zero g_cumsum",
+                        )?;
+                    }
+                    if zero_buffer("a") {
+                        self.memset_d8_async_checked(
+                            a_fla,
+                            0,
+                            fla_total * nv * fla_bt * std::mem::size_of::<f32>(),
+                            self.stream,
+                            "fla zero a",
+                        )?;
+                    }
+                    if zero_buffer("ai") {
+                        self.memset_d8_async_checked(
+                            ai_fla,
+                            0,
+                            fla_total * nv * fla_bt * std::mem::size_of::<u16>(),
+                            self.stream,
+                            "fla zero ai",
+                        )?;
+                    }
+                    if zero_buffer("w") {
+                        self.memset_d8_async_checked(
+                            w_fla,
+                            0,
+                            fla_total * nv * dk * std::mem::size_of::<u16>(),
+                            self.stream,
+                            "fla zero w",
+                        )?;
+                    }
+                    if zero_buffer("u") {
+                        self.memset_d8_async_checked(
+                            u_fla,
+                            0,
+                            fla_total * nv * dv * std::mem::size_of::<u16>(),
+                            self.stream,
+                            "fla zero u",
+                        )?;
+                    }
+                    if zero_buffer("h") {
+                        self.memset_d8_async_checked(
+                            h_fla,
+                            0,
+                            fla_nt * nv * dk * dv * std::mem::size_of::<u16>(),
+                            self.stream,
+                            "fla zero h",
+                        )?;
+                    }
+                    if zero_buffer("h0") {
+                        self.memset_d8_async_checked(
+                            h0_fla,
+                            0,
+                            nv * dk * dv * std::mem::size_of::<u16>(),
+                            self.stream,
+                            "fla zero h0",
+                        )?;
+                    }
+                    if zero_buffer("ht") {
+                        self.memset_d8_async_checked(
+                            ht_fla,
+                            0,
+                            nv * dk * dv * std::mem::size_of::<f32>(),
+                            self.stream,
+                            "fla zero ht",
+                        )?;
+                    }
+                    if zero_buffer("v_new") {
+                        self.memset_d8_async_checked(
+                            v_new_fla,
+                            0,
+                            fla_total * nv * dv * std::mem::size_of::<u16>(),
+                            self.stream,
+                            "fla zero v_new",
+                        )?;
+                    }
+                    if zero_buffer("o") {
+                        self.memset_d8_async_checked(
+                            o_fla,
+                            0,
+                            fla_total * nv * dv * std::mem::size_of::<u16>(),
+                            self.stream,
+                            "fla zero o",
+                        )?;
+                    }
+                }
+
+                // Debug-only fences to isolate visibility/order issues around FLA.
+                if la_sync_requested("before") {
+                    self.runtime_stream_sync("fla pre sync failed")?;
+                }
+                if la_sync_requested("copy") {
+                    self.copy_stream_sync("fla pre copy-stream sync failed")?;
+                }
+                if la_sync_requested("shared") {
+                    self.shared_stream_sync("fla pre shared-stream sync failed")?;
+                }
+                if std::env::var("KRASIS_LA_FLA_QUERY_COPY_DEBUG").is_ok() {
+                    self.debug_query_stream_ready(
+                        self.copy_stream,
+                        "copy_stream",
+                        "before FLA",
+                        layer_idx,
+                    )?;
+                }
 
                 // Zero h0 (BF16 initial state) — separate from ht (FP32 output)
                 unsafe {
@@ -3742,8 +6949,6 @@ impl PrefillEngine {
                 }
 
                 let stream_ptr = self.stream as *mut std::ffi::c_void;
-
-                let g_cum_fla = *self.d_fla_g_cumsum.as_ref().ok_or("no fla_g_cumsum")?.device_ptr();
 
                 // Step 1: cumsum — gate(BF16) → g_cumsum(FP32)
                 // Grid: (NT, B*H) = (fla_nt, nv)
@@ -3821,7 +7026,13 @@ impl PrefillEngine {
                         o_grid_x, fla_nt as u32, nv as u32, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA output failed: {}", rc)); }
-                if std::env::var("KRASIS_FLA_DEBUG").is_ok() { self.stream_sync().map_err(|e| format!("FLA output sync: {e}"))?; eprintln!("[FLA-DBG] step6 output OK"); }
+                if std::env::var("KRASIS_FLA_DEBUG").is_ok() {
+                    self.stream_sync().map_err(|e| format!("FLA output sync: {e}"))?;
+                    eprintln!("[FLA-DBG] step6 output OK");
+                }
+                if la_sync_requested("output") {
+                    self.runtime_stream_sync("fla output sync failed")?;
+                }
                 if lt { self.stream_sync()?; self.t_la_fla.set(self.t_la_fla.get() + lt4.elapsed().as_secs_f64() * 1000.0); }
                 let lt5 = Instant::now();
 
@@ -3836,6 +7047,9 @@ impl PrefillEngine {
                 // but a debug switch can force BF16->FP32 conversion and reuse the
                 // fallback FP32 RMSNorm kernel to isolate fast-path norm issues.
                 let lt6 = Instant::now();
+                if la_sync_requested("norm") {
+                    self.runtime_stream_sync("fla pre-norm sync failed")?;
+                }
                 if std::env::var("KRASIS_LA_FLA_FP32_NORM").is_ok() {
                     let fp32_norm_in = fp32_scratch;
                     {
@@ -3986,9 +7200,11 @@ impl PrefillEngine {
                               &mut g6 as *mut _ as *mut std::ffi::c_void])?;
                 }
             }
+            let la_q_repeat = if hr > 1 { la_v_beta } else { la_q };
+            let la_k_repeat = if hr > 1 { la_k_beta } else { la_k };
             if hr > 1 {
                 let dt = std::cmp::max(32, ((std::cmp::min(256, dk) + 31) / 32) * 32) as u32;
-                let mut r0 = la_v_beta; let mut r1 = la_q; let mut r2 = nk as i32;
+                let mut r0 = la_q_repeat; let mut r1 = la_q; let mut r2 = nk as i32;
                 let mut r3 = dk as i32; let mut r4 = hr as i32;
                 unsafe {
                     launch(self.kernels.la_repeat_interleave,
@@ -3999,7 +7215,7 @@ impl PrefillEngine {
                               &mut r3 as *mut _ as *mut std::ffi::c_void,
                               &mut r4 as *mut _ as *mut std::ffi::c_void])?;
                 }
-                r0 = la_k_beta; r1 = la_k;
+                r0 = la_k_repeat; r1 = la_k;
                 unsafe {
                     launch(self.kernels.la_repeat_interleave,
                         (m as u32, nv as u32, 1), (dt, 1, 1), 0, self.stream,
@@ -4009,13 +7225,11 @@ impl PrefillEngine {
                               &mut r3 as *mut _ as *mut std::ffi::c_void,
                               &mut r4 as *mut _ as *mut std::ffi::c_void])?;
                 }
-                la_q = la_v_beta;
-                la_k = la_k_beta;
             }
             {
                 let nt = std::cmp::max(32, ((std::cmp::min(256, dk) + 31) / 32) * 32) as u32;
                 let smem = nt * 4;
-                let mut l0 = la_q; let mut l1 = scale; let mut l2 = nv as i32; let mut l3 = dk as i32;
+                let mut l0 = la_q_repeat; let mut l1 = scale; let mut l2 = nv as i32; let mut l3 = dk as i32;
                 unsafe {
                     launch(self.kernels.la_l2norm_per_head,
                         (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
@@ -4024,7 +7238,7 @@ impl PrefillEngine {
                               &mut l2 as *mut _ as *mut std::ffi::c_void,
                               &mut l3 as *mut _ as *mut std::ffi::c_void])?;
                 }
-                l0 = la_k; l1 = 1.0f32;
+                l0 = la_k_repeat; l1 = 1.0f32;
                 unsafe {
                     launch(self.kernels.la_l2norm_per_head,
                         (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
@@ -4043,27 +7257,69 @@ impl PrefillEngine {
 
             if pad_size > 0 {
                 // Zero-pad the tail of q, k, v, beta, gate
-                unsafe {
-                    let _ = cuda_sys::lib().cuMemsetD8Async(
-                        la_q + (m * nv * dk * 4) as u64, 0, (pad_size * nv * dk * 4) as usize, self.stream);
-                    let _ = cuda_sys::lib().cuMemsetD8Async(
-                        la_k + (m * nv * dk * 4) as u64, 0, (pad_size * nv * dk * 4) as usize, self.stream);
-                    let _ = cuda_sys::lib().cuMemsetD8Async(
-                        la_v + (m * nv * dv * 4) as u64, 0, (pad_size * nv * dv * 4) as usize, self.stream);
-                    let _ = cuda_sys::lib().cuMemsetD8Async(
-                        la_beta + (m * nv * 4) as u64, 0, (pad_size * nv * 4) as usize, self.stream);
-                    let _ = cuda_sys::lib().cuMemsetD8Async(
-                        la_gate + (m * nv * 4) as u64, 0, (pad_size * nv * 4) as usize, self.stream);
-                }
+                self.memset_d8_async_checked(
+                    la_q_repeat + (m * nv * dk * 4) as u64,
+                    0,
+                    (pad_size * nv * dk * 4) as usize,
+                    self.stream,
+                    "la pad q",
+                )?;
+                self.memset_d8_async_checked(
+                    la_k_repeat + (m * nv * dk * 4) as u64,
+                    0,
+                    (pad_size * nv * dk * 4) as usize,
+                    self.stream,
+                    "la pad k",
+                )?;
+                self.memset_d8_async_checked(
+                    la_v + (m * nv * dv * 4) as u64,
+                    0,
+                    (pad_size * nv * dv * 4) as usize,
+                    self.stream,
+                    "la pad v",
+                )?;
+                self.memset_d8_async_checked(
+                    la_beta + (m * nv * 4) as u64,
+                    0,
+                    (pad_size * nv * 4) as usize,
+                    self.stream,
+                    "la pad beta",
+                )?;
+                self.memset_d8_async_checked(
+                    la_gate + (m * nv * 4) as u64,
+                    0,
+                    (pad_size * nv * 4) as usize,
+                    self.stream,
+                    "la pad gate",
+                )?;
             }
 
-            // 11. Compute beta-scaled values: v_beta = v * beta, k_beta = k * beta
+            // 11. Move q into canonical [nv, total_len, dk] layout for the chunk kernels.
+            // q is not consumed by la_apply_beta, so it can leave token-major storage early.
+            if hr > 1 {
+                self.launch_transpose_3d_f32(la_q, la_q_repeat, total_len, nv, dk)?;
+            } else {
+                self.memcpy_d2d(fp32_scratch, la_q_repeat, (total_len * nv * dk * 4) as u64)?;
+                self.launch_transpose_3d_f32(la_q, fp32_scratch, total_len, nv, dk)?;
+            }
+
+            // 12. Move raw k into canonical [nv, total_len, dk] layout for the chunk kernels
+            // before la_apply_beta reclaims the repeated token-major buffer as k_beta output.
+            if hr > 1 {
+                self.launch_transpose_3d_f32(la_k, la_k_repeat, total_len, nv, dk)?;
+            } else {
+                self.memcpy_d2d(fp32_scratch, la_k_repeat, (total_len * nv * dk * 4) as u64)?;
+                self.launch_transpose_3d_f32(la_k, fp32_scratch, total_len, nv, dk)?;
+            }
+
+            // 13. Compute beta-scaled values while k is still available in token-major
+            // [M, nv, dk]. la_apply_beta expects token-major inputs.
             {
                 let bt = std::cmp::max(32, ((std::cmp::min(256, std::cmp::max(dk, dv)) + 31) / 32) * 32) as u32;
                 let mut bp0 = la_v_beta;
                 let mut bp1 = la_k_beta;
                 let mut bp2 = la_v;
-                let mut bp3 = la_k;
+                let mut bp3 = la_k_repeat;
                 let mut bp4 = la_beta;
                 let mut bp5 = nv as i32;
                 let mut bp6 = dk as i32;
@@ -4085,17 +7341,8 @@ impl PrefillEngine {
                 }
             }
 
-            // Transpose all arrays from [total_len, nv, dim] to [nv, total_len, dim]
+            // Transpose the remaining arrays from [total_len, nv, dim] to [nv, total_len, dim]
             // via single kernel launch each (replaces millions of memcpy calls)
-
-            // q: [total_len, nv, dk] -> [nv, total_len, dk]
-            self.launch_transpose_3d_f32(fp32_scratch, la_q, total_len, nv, dk)?;
-            self.memcpy_d2d(la_q, fp32_scratch, (nv * total_len * dk * 4) as u64)?;
-
-            // k: [total_len, nv, dk] -> [nv, total_len, dk]
-            self.launch_transpose_3d_f32(fp32_scratch, la_k, total_len, nv, dk)?;
-            self.memcpy_d2d(la_k, fp32_scratch, (nv * total_len * dk * 4) as u64)?;
-
             // v: [total_len, nv, dv] -> [nv, total_len, dv]
             self.launch_transpose_3d_f32(fp32_scratch, la_v, total_len, nv, dv)?;
             self.memcpy_d2d(la_v, fp32_scratch, (nv * total_len * dv * 4) as u64)?;
@@ -4380,6 +7627,33 @@ impl PrefillEngine {
                     }
                     eprintln!("[DIAG L{:02}] chunk0_output_total_pos0: norm={:.6} (across all {} heads)",
                         layer_idx, (total_sq.sqrt()) as f32, nv);
+                    let last_pos = m.saturating_sub(1);
+                    let last_offset = (last_pos * dv) * 4;
+                    let out_last = self.diag_l2_norm_f32(output_buf + last_offset as u64, 0, dv, dv);
+                    let out_last_raw = self.diag_download_f32(output_buf + last_offset as u64, 4);
+                    eprintln!(
+                        "[DIAG L{:02}] chunk0_output_last: h0plast_norm={:.6} raw[0..4]=[{:.6},{:.6},{:.6},{:.6}]",
+                        layer_idx,
+                        out_last,
+                        out_last_raw[0],
+                        out_last_raw[1],
+                        out_last_raw[2],
+                        out_last_raw[3],
+                    );
+                    let mut total_last_sq = 0.0f64;
+                    for h in 0..nv {
+                        let offset = ((h * total_len + last_pos) * dv) * 4;
+                        let head_vals = self.diag_download_f32(output_buf + offset as u64, dv);
+                        for &v in &head_vals {
+                            total_last_sq += (v as f64) * (v as f64);
+                        }
+                    }
+                    eprintln!(
+                        "[DIAG L{:02}] chunk0_output_total_last: norm={:.6} (across all {} heads)",
+                        layer_idx,
+                        (total_last_sq.sqrt()) as f32,
+                        nv
+                    );
                 }
 
                 // 3. state update: reads strided k, g_cum; reads contiguous v_new
@@ -4466,13 +7740,60 @@ impl PrefillEngine {
             // Use scratch1 as temp to avoid Marlin GEMM input/output aliasing.
             if la_diag {
                 self.stream_sync()?;
+                let input_last = self.diag_l2_norm_f32(la_v, m.saturating_sub(1), value_dim, value_dim);
+                let gate_last = self.diag_l2_norm(la_z, m.saturating_sub(1), value_dim, value_dim);
+                eprintln!(
+                    "[DIAG L{:02}] gated_rmsnorm_in last: x={:.9} gate={:.9}",
+                    layer_idx,
+                    input_last,
+                    gate_last
+                );
+                let input_last_vals = self.diag_download_f32(
+                    la_v + (m.saturating_sub(1) * value_dim * 4) as u64,
+                    4,
+                );
+                let gate_last_vals = self.diag_download_bf16(
+                    la_z + (m.saturating_sub(1) * value_dim * 2) as u64,
+                    4,
+                );
+                eprintln!(
+                    "[DIAG L{:02}] gated_rmsnorm_in[last][0:4]: x=[{:.9},{:.9},{:.9},{:.9}] gate=[{:.9},{:.9},{:.9},{:.9}]",
+                    layer_idx,
+                    input_last_vals[0],
+                    input_last_vals[1],
+                    input_last_vals[2],
+                    input_last_vals[3],
+                    gate_last_vals[0],
+                    gate_last_vals[1],
+                    gate_last_vals[2],
+                    gate_last_vals[3]
+                );
                 let pre_oproj_norm = self.diag_l2_norm(rmsnorm_out, 0, value_dim, value_dim);
                 eprintln!("[DIAG L{:02}] pre_out_proj pos0 norm={:.6} (after gated_rmsnorm, dim={})", layer_idx, pre_oproj_norm, value_dim);
+                let pre_oproj_last = self.diag_l2_norm(rmsnorm_out, m.saturating_sub(1), value_dim, value_dim);
+                eprintln!(
+                    "[DIAG L{:02}] pre_out_proj last norm={:.6} (after gated_rmsnorm, dim={})",
+                    layer_idx,
+                    pre_oproj_last,
+                    value_dim
+                );
 
                 // Element-level: actual kernel output [M, nv*dv] BF16, head 0 pos 0
                 let out_vals = self.diag_download_bf16(rmsnorm_out, 4);
                 eprintln!("[DIAG L{:02}] grmsnorm out[h0p0][0:4]=[{:.8},{:.8},{:.8},{:.8}]",
                     layer_idx, out_vals[0], out_vals[1], out_vals[2], out_vals[3]);
+                let out_last_vals = self.diag_download_bf16(
+                    rmsnorm_out + (m.saturating_sub(1) * value_dim * 2) as u64,
+                    4,
+                );
+                eprintln!(
+                    "[DIAG L{:02}] grmsnorm out[last][0:4]=[{:.8},{:.8},{:.8},{:.8}]",
+                    layer_idx,
+                    out_last_vals[0],
+                    out_last_vals[1],
+                    out_last_vals[2],
+                    out_last_vals[3]
+                );
             }
             let o_temp = *self.scratch.d_scratch1.device_ptr();
             self.la_gemm(rmsnorm_out, &lw.la_out_proj, &lw.la_out_proj_bf16, o_temp, m)?;
@@ -4480,6 +7801,14 @@ impl PrefillEngine {
             if la_diag {
                 let post_oproj_norm = self.diag_l2_norm(attn_out, 0, cfg.hidden_size, cfg.hidden_size);
                 eprintln!("[DIAG L{:02}] post_out_proj pos0 norm={:.6} (mixer output, dim={})", layer_idx, post_oproj_norm, cfg.hidden_size);
+                let post_oproj_last =
+                    self.diag_l2_norm(attn_out, m.saturating_sub(1), cfg.hidden_size, cfg.hidden_size);
+                eprintln!(
+                    "[DIAG L{:02}] post_out_proj last norm={:.6} (mixer output, dim={})",
+                    layer_idx,
+                    post_oproj_last,
+                    cfg.hidden_size
+                );
             }
 
             if lt { self.stream_sync()?; self.t_la_oproj.set(self.t_la_oproj.get() + lt7.elapsed().as_secs_f64() * 1000.0); }
@@ -4584,32 +7913,37 @@ impl PrefillEngine {
 
         // 1. Gate GEMM (same as sequential)
         let gate_ptr = self.layer_weights[layer_idx].moe_gate_ptr;
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-        unsafe {
-            use cudarc::cublas::sys as cublas_sys;
-            use cudarc::cublas::result as cublas_result;
-            cublas_result::set_stream(
-                self.cublas_handle,
-                self.stream as cublas_sys::cudaStream_t,
-            ).map_err(|e| format!("cublas set_stream: {:?}", e))?;
-            cublas_result::gemm_ex(
-                self.cublas_handle,
-                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                n_experts as i32, m as i32, h as i32,
-                &alpha as *const f32 as *const std::ffi::c_void,
-                gate_ptr as *const std::ffi::c_void,
-                cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
-                hidden as *const std::ffi::c_void,
-                cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
-                &beta as *const f32 as *const std::ffi::c_void,
-                gate_out as *mut std::ffi::c_void,
-                cublas_sys::cudaDataType::CUDA_R_32F, n_experts as i32,
-                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-            ).map_err(|e| format!("cublas gate GEMM: {:?}", e))?;
-        }
+        self.run_cuda_debug_stage(
+            "prefill.fused_moe.gate_gemm",
+            "prefill_compute",
+            format!("layer={} m={} h={} experts={}", layer_idx, m, h, n_experts),
+            self.stream,
+            || unsafe {
+                use cudarc::cublas::result as cublas_result;
+                use cudarc::cublas::sys as cublas_sys;
+                cublas_result::set_stream(
+                    self.cublas_handle,
+                    self.stream as cublas_sys::cudaStream_t,
+                ).map_err(|e| format!("cublas set_stream: {:?}", e))?;
+                cublas_result::gemm_ex(
+                    self.cublas_handle,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    n_experts as i32, m as i32, h as i32,
+                    &CUBLAS_ALPHA_F32 as *const f32 as *const std::ffi::c_void,
+                    gate_ptr as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
+                    hidden as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
+                    &CUBLAS_BETA_F32 as *const f32 as *const std::ffi::c_void,
+                    gate_out as *mut std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_32F, n_experts as i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                ).map_err(|e| format!("cublas gate GEMM: {:?}", e))
+            },
+        )?;
+        self.debug_sync_fused("moe gate gemm")?;
 
         // 2. Top-K routing
         {
@@ -4621,19 +7955,51 @@ impl PrefillEngine {
             let mut p4 = topk as i32;
             let kernel = if scoring_func == 1 { self.kernels.sigmoid_topk } else { self.kernels.softmax_topk };
             let smem = (n_experts * 4 + topk * 8 + if scoring_func == 0 { 32 * 4 } else { 0 }) as u32;
-            unsafe {
-                launch(kernel,
-                    (m as u32, 1, 1), (t, 1, 1), smem, self.stream,
-                    &mut [
-                        &mut p0 as *mut _ as *mut std::ffi::c_void,
-                        &mut p1 as *mut _ as *mut std::ffi::c_void,
-                        &mut p2 as *mut _ as *mut std::ffi::c_void,
-                        &mut p3 as *mut _ as *mut std::ffi::c_void,
-                        &mut p4 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
+            let dims = format!(
+                "layer={} m={} experts={} topk={} scoring={} smem={}",
+                layer_idx, m, n_experts, topk, scoring_func, smem
+            );
+            self.run_cuda_debug_stage(
+                "prefill.fused_moe.topk_routing",
+                "prefill_compute",
+                dims,
+                self.stream,
+                || unsafe {
+                    if self.cuda_debug.kernel_debug_enabled() && scoring_func == 1 {
+                        let mut p5 = smem as i32;
+                        let mut params: Vec<*mut std::ffi::c_void> = vec![
+                            &mut p0 as *mut _ as *mut std::ffi::c_void,
+                            &mut p1 as *mut _ as *mut std::ffi::c_void,
+                            &mut p2 as *mut _ as *mut std::ffi::c_void,
+                            &mut p3 as *mut _ as *mut std::ffi::c_void,
+                            &mut p4 as *mut _ as *mut std::ffi::c_void,
+                            &mut p5 as *mut _ as *mut std::ffi::c_void,
+                        ];
+                        self.cuda_debug.launch_kernel_debug_variant(
+                            self.config.device_ordinal as i32,
+                            "krasis_sigmoid_topk_debug_kernel",
+                            (m as u32, 1, 1),
+                            (t, 1, 1),
+                            smem,
+                            self.stream,
+                            &mut params,
+                        )
+                    } else {
+                        launch(kernel,
+                            (m as u32, 1, 1), (t, 1, 1), smem, self.stream,
+                            &mut [
+                                &mut p0 as *mut _ as *mut std::ffi::c_void,
+                                &mut p1 as *mut _ as *mut std::ffi::c_void,
+                                &mut p2 as *mut _ as *mut std::ffi::c_void,
+                                &mut p3 as *mut _ as *mut std::ffi::c_void,
+                                &mut p4 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )
+                    }
+                },
+            )?;
         }
+        self.debug_sync_fused("moe topk routing")?;
 
         // 3. moe_align_block_size: padded prefix sum + build sorted token/expert maps
         let block_size = 64i32; // MarlinDefault max thread_m_blocks=4 -> max block_size=64
@@ -4642,10 +8008,20 @@ impl PrefillEngine {
         let write_offsets_ptr = *self.scratch.d_write_offsets.device_ptr();
 
         // Zero counts and write offsets
-        unsafe {
-            cuda_sys::lib().cuMemsetD8Async(expert_counts_ptr, 0, (n_experts * 4) as usize, self.stream);
-            cuda_sys::lib().cuMemsetD8Async(write_offsets_ptr, 0, (n_experts * 4) as usize, self.stream);
-        }
+        self.memset_d8_async_checked(
+            expert_counts_ptr,
+            0,
+            n_experts * 4,
+            self.stream,
+            "forward_moe_fused zero expert_counts",
+        )?;
+        self.memset_d8_async_checked(
+            write_offsets_ptr,
+            0,
+            n_experts * 4,
+            self.stream,
+            "forward_moe_fused zero write_offsets",
+        )?;
 
         // Count tokens per expert
         {
@@ -4654,19 +8030,26 @@ impl PrefillEngine {
             let mut p2 = m as i32;
             let mut p3 = topk as i32;
             let mut p4 = n_experts as i32;
-            unsafe {
-                launch(self.kernels.moe_count_experts,
-                    (m as u32, 1, 1), (1, 1, 1), 0, self.stream,
-                    &mut [
-                        &mut p0 as *mut _ as *mut std::ffi::c_void,
-                        &mut p1 as *mut _ as *mut std::ffi::c_void,
-                        &mut p2 as *mut _ as *mut std::ffi::c_void,
-                        &mut p3 as *mut _ as *mut std::ffi::c_void,
-                        &mut p4 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
+            self.run_cuda_debug_stage(
+                "prefill.fused_moe.count_experts",
+                "prefill_compute",
+                format!("layer={} m={} topk={} experts={}", layer_idx, m, topk, n_experts),
+                self.stream,
+                || unsafe {
+                    launch(self.kernels.moe_count_experts,
+                        (m as u32, 1, 1), (1, 1, 1), 0, self.stream,
+                        &mut [
+                            &mut p0 as *mut _ as *mut std::ffi::c_void,
+                            &mut p1 as *mut _ as *mut std::ffi::c_void,
+                            &mut p2 as *mut _ as *mut std::ffi::c_void,
+                            &mut p3 as *mut _ as *mut std::ffi::c_void,
+                            &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
         }
+        self.debug_sync_fused("moe count experts")?;
 
         // Padded prefix sum (block_size aligned)
         // Dereference device_ptr() immediately to avoid holding borrows on self
@@ -4680,50 +8063,118 @@ impl PrefillEngine {
             let mut p2 = expert_counts_ptr;
             let mut p3 = n_experts as i32;
             let mut p4 = block_size;
-            unsafe {
-                launch(self.kernels.moe_padded_prefix_sum,
-                    (1, 1, 1), (ps_threads, 1, 1), (n_experts * 4) as u32, self.stream,
-                    &mut [
-                        &mut p0 as *mut _ as *mut std::ffi::c_void,
-                        &mut p1 as *mut _ as *mut std::ffi::c_void,
-                        &mut p2 as *mut _ as *mut std::ffi::c_void,
-                        &mut p3 as *mut _ as *mut std::ffi::c_void,
-                        &mut p4 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
+            self.run_cuda_debug_stage(
+                "prefill.fused_moe.padded_prefix_sum",
+                "prefill_compute",
+                format!("layer={} experts={} block_size={}", layer_idx, n_experts, block_size),
+                self.stream,
+                || unsafe {
+                    launch(self.kernels.moe_padded_prefix_sum,
+                        (1, 1, 1), (ps_threads, 1, 1), (ps_threads as usize * 4) as u32, self.stream,
+                        &mut [
+                            &mut p0 as *mut _ as *mut std::ffi::c_void,
+                            &mut p1 as *mut _ as *mut std::ffi::c_void,
+                            &mut p2 as *mut _ as *mut std::ffi::c_void,
+                            &mut p3 as *mut _ as *mut std::ffi::c_void,
+                            &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
         }
 
         // Build sorted token/expert maps
         {
             let mut p0 = sorted_ids_val;
-            let mut p1 = fused_expert_ids_val;
-            let mut p2 = write_offsets_ptr;
-            let mut p3 = topk_ids_ptr;
-            let mut p4 = expert_offsets_ptr;
-            let mut p5 = expert_counts_ptr;
-            let mut p6 = m as i32;
-            let mut p7 = topk as i32;
-            let mut p8 = n_experts as i32;
-            let mut p9 = block_size;
-            unsafe {
-                launch(self.kernels.moe_scatter_sorted,
-                    (m as u32, 1, 1), (1, 1, 1), 0, self.stream,
-                    &mut [
-                        &mut p0 as *mut _ as *mut std::ffi::c_void,
-                        &mut p1 as *mut _ as *mut std::ffi::c_void,
-                        &mut p2 as *mut _ as *mut std::ffi::c_void,
-                        &mut p3 as *mut _ as *mut std::ffi::c_void,
-                        &mut p4 as *mut _ as *mut std::ffi::c_void,
-                        &mut p5 as *mut _ as *mut std::ffi::c_void,
-                        &mut p6 as *mut _ as *mut std::ffi::c_void,
-                        &mut p7 as *mut _ as *mut std::ffi::c_void,
-                        &mut p8 as *mut _ as *mut std::ffi::c_void,
-                        &mut p9 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
+            let mut p1 = write_offsets_ptr;
+            let mut p2 = topk_ids_ptr;
+            let mut p3 = expert_offsets_ptr;
+            let mut p4 = m as i32;
+            let mut p5 = topk as i32;
+            let mut p6 = n_experts as i32;
+            self.run_cuda_debug_stage(
+                "prefill.fused_moe.scatter_sorted",
+                "prefill_compute",
+                format!("layer={} m={} topk={} experts={}", layer_idx, m, topk, n_experts),
+                self.stream,
+                || unsafe {
+                    if self.cuda_debug.kernel_debug_enabled() {
+                        let mut p7 = self.scratch.d_gather_src_map.len as i32;
+                        let mut p8 = self.scratch.d_write_offsets.len as i32;
+                        let mut params: Vec<*mut std::ffi::c_void> = vec![
+                            &mut p0 as *mut _ as *mut std::ffi::c_void,
+                            &mut p1 as *mut _ as *mut std::ffi::c_void,
+                            &mut p2 as *mut _ as *mut std::ffi::c_void,
+                            &mut p3 as *mut _ as *mut std::ffi::c_void,
+                            &mut p4 as *mut _ as *mut std::ffi::c_void,
+                            &mut p5 as *mut _ as *mut std::ffi::c_void,
+                            &mut p6 as *mut _ as *mut std::ffi::c_void,
+                            &mut p7 as *mut _ as *mut std::ffi::c_void,
+                            &mut p8 as *mut _ as *mut std::ffi::c_void,
+                        ];
+                        self.cuda_debug.launch_kernel_debug_variant(
+                            self.config.device_ordinal as i32,
+                            "krasis_moe_scatter_sorted_debug_kernel",
+                            (m as u32, 1, 1),
+                            (1, 1, 1),
+                            0,
+                            self.stream,
+                            &mut params,
+                        )
+                    } else {
+                        launch(self.kernels.moe_scatter_sorted,
+                            (m as u32, 1, 1), (1, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut p0 as *mut _ as *mut std::ffi::c_void,
+                                &mut p1 as *mut _ as *mut std::ffi::c_void,
+                                &mut p2 as *mut _ as *mut std::ffi::c_void,
+                                &mut p3 as *mut _ as *mut std::ffi::c_void,
+                                &mut p4 as *mut _ as *mut std::ffi::c_void,
+                                &mut p5 as *mut _ as *mut std::ffi::c_void,
+                                &mut p6 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )
+                    }
+                },
+            )?;
         }
+        {
+            let finalize_threads = std::cmp::max(32, ((std::cmp::min(1024, n_experts) + 31) / 32) * 32) as u32;
+            let finalize_blocks = ((n_experts as u32) + finalize_threads - 1) / finalize_threads;
+            let mut p0 = sorted_ids_val;
+            let mut p1 = fused_expert_ids_val;
+            let mut p2 = expert_offsets_ptr;
+            let mut p3 = expert_counts_ptr;
+            let mut p4 = m as i32;
+            let mut p5 = topk as i32;
+            let mut p6 = n_experts as i32;
+            let mut p7 = block_size;
+            self.run_cuda_debug_stage(
+                "prefill.fused_moe.finalize_sorted",
+                "prefill_compute",
+                format!(
+                    "layer={} experts={} finalize_blocks={} finalize_threads={} block_size={}",
+                    layer_idx, n_experts, finalize_blocks, finalize_threads, block_size
+                ),
+                self.stream,
+                || unsafe {
+                    launch(self.kernels.moe_finalize_sorted,
+                        (finalize_blocks, 1, 1), (finalize_threads, 1, 1), 0, self.stream,
+                        &mut [
+                            &mut p0 as *mut _ as *mut std::ffi::c_void,
+                            &mut p1 as *mut _ as *mut std::ffi::c_void,
+                            &mut p2 as *mut _ as *mut std::ffi::c_void,
+                            &mut p3 as *mut _ as *mut std::ffi::c_void,
+                            &mut p4 as *mut _ as *mut std::ffi::c_void,
+                            &mut p5 as *mut _ as *mut std::ffi::c_void,
+                            &mut p6 as *mut _ as *mut std::ffi::c_void,
+                            &mut p7 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
+        }
+        self.debug_sync_fused("moe routing finalize")?;
 
         // Sync to get routing results on CPU for selective expert DMA
         self.stream_sync()?;
@@ -4734,19 +8185,21 @@ impl PrefillEngine {
 
         // Download expert counts to determine which experts are active
         let mut h_expert_counts = vec![0i32; n_experts];
-        unsafe {
-            cuda_sys::lib().cuMemcpyDtoH_v2(
-                h_expert_counts.as_mut_ptr() as *mut _,
-                expert_counts_ptr, (n_experts * 4) as usize);
-        }
+        self.memcpy_dtoh_checked(
+            h_expert_counts.as_mut_ptr() as *mut _,
+            expert_counts_ptr,
+            n_experts * 4,
+            "forward_moe_fused download expert_counts",
+        )?;
 
         // Download num_tokens_post_padded for fused kernel
         let mut h_num_post = [0i32; 1];
-        unsafe {
-            cuda_sys::lib().cuMemcpyDtoH_v2(
-                h_num_post.as_mut_ptr() as *mut _,
-                num_tokens_post_val, 4);
-        }
+        self.memcpy_dtoh_checked(
+            h_num_post.as_mut_ptr() as *mut _,
+            num_tokens_post_val,
+            4,
+            "forward_moe_fused download num_tokens_post",
+        )?;
         let total_sorted = h_num_post[0] as usize;
         let active_experts = h_expert_counts.iter().filter(|&&c| c > 0).count();
         if diag_moe && layer_idx == 0 {
@@ -4779,7 +8232,10 @@ impl PrefillEngine {
         //    Instead of copying ALL experts into a contiguous fused buffer, we build
         //    a per-expert pointer table. HCS-resident experts are referenced in-place
         //    (zero copy), cold experts are H2D'd to a small staging buffer.
-        let use_ptr_table = self.d_expert_w1_ptrs.is_some() && self.d_cold_staging.is_some();
+        let force_legacy_fused = std::env::var("KRASIS_FORCE_LEGACY_FUSED_MOE").ok().as_deref() == Some("1");
+        let use_ptr_table = !force_legacy_fused
+            && self.d_expert_w1_ptrs.is_some()
+            && self.d_cold_staging.is_some();
         let cold_staging_base = self.d_cold_staging.as_ref().map_or(0, |s| *s.device_ptr());
 
         // Also keep fused buffer pointers for the B parameter (needed as base reference
@@ -4796,21 +8252,29 @@ impl PrefillEngine {
         let w1s_base = w1s_buf.map_or(0, |b| *b.device_ptr());
         let w2_base = w2_buf.map_or(0, |b| *b.device_ptr());
         let w2s_base = w2s_buf.map_or(0, |b| *b.device_ptr());
+        if w1_base != 0 || w2_base != 0 {
+            self.validate_fused_expert_buffer_loaded(
+                cur,
+                layer_idx,
+                "forward_moe_fused use current buffer",
+            )?;
+        }
 
-        // GPU pointers for the pointer table buffers.
-        // IMPORTANT: Allocate fresh each layer to avoid corruption from cudarc pool
-        // overlapping with HCS raw cuMemAlloc_v2. Only 4 * 4KB = 16KB, negligible.
+        // Reuse the persistent device-side pointer tables allocated with the engine.
+        // The fused kernels consume these asynchronously on self.stream, so they must
+        // outlive the layer launch. Per-layer raw cuMemAlloc/cuMemFree races with the
+        // in-flight fused kernels and can poison later launches.
         let ptrs_bytes = n_experts * 8;
-        let (w1_ptrs_gpu, w1s_ptrs_gpu, w2_ptrs_gpu, w2s_ptrs_gpu) = unsafe {
-            let mut p1: u64 = 0; let mut p2: u64 = 0; let mut p3: u64 = 0; let mut p4: u64 = 0;
-            cuda_sys::lib().cuMemAlloc_v2(&mut p1, ptrs_bytes);
-            cuda_sys::lib().cuMemAlloc_v2(&mut p2, ptrs_bytes);
-            cuda_sys::lib().cuMemAlloc_v2(&mut p3, ptrs_bytes);
-            cuda_sys::lib().cuMemAlloc_v2(&mut p4, ptrs_bytes);
-            (p1, p2, p3, p4)
-        };
+        let w1_ptrs_gpu = self.d_expert_w1_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
+        let w1s_ptrs_gpu = self.d_expert_w1s_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
+        let w2_ptrs_gpu = self.d_expert_w2_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
+        let w2s_ptrs_gpu = self.d_expert_w2s_ptrs.as_ref().map_or(0, |b| *b.device_ptr());
 
         if use_ptr_table {
+            self.wait_pointer_table_payload_reusable_host(
+                layer_idx,
+                "forward_moe_fused pointer-table payload reuse",
+            )?;
             // Build pointer tables for active experts
             let active: Vec<usize> = h_expert_counts.iter().enumerate()
                 .filter_map(|(eid, &cnt)| if cnt > 0 { Some(eid) } else { None })
@@ -4820,7 +8284,12 @@ impl PrefillEngine {
             let mut hcs_count = 0usize;
             let mut pinned_count = 0usize;
             let mut cold_count = 0usize;
+            let mut cold_overflow_count = 0usize;
             let mut cold_slot = 0usize; // next available slot in cold staging
+            let mut max_w13_packed_bytes = 0usize;
+            let mut max_w13_scales_bytes = 0usize;
+            let mut max_w2_packed_bytes = 0usize;
+            let mut max_w2_scales_bytes = 0usize;
 
             // Clear pointer tables (inactive experts get 0 = won't be accessed by kernel)
             for i in 0..n_experts {
@@ -4855,15 +8324,12 @@ impl PrefillEngine {
                 };
 
                 if let Some(pool_off) = pin_offset {
+                    let slot = self.expert_slot_layout();
                     let src = self.pinning_pool_ptr + pool_off as u64;
-                    let mut off = 0u64;
-                    self.h_expert_w1_ptrs[eid] = src + off;
-                    off += self.w1_packed_per_expert as u64;
-                    self.h_expert_w1s_ptrs[eid] = src + off;
-                    off += self.w1_scales_per_expert as u64;
-                    self.h_expert_w2_ptrs[eid] = src + off;
-                    off += self.w2_packed_per_expert as u64;
-                    self.h_expert_w2s_ptrs[eid] = src + off;
+                    self.h_expert_w1_ptrs[eid] = src + slot.w1_packed_off as u64;
+                    self.h_expert_w1s_ptrs[eid] = src + slot.w1_scales_off as u64;
+                    self.h_expert_w2_ptrs[eid] = src + slot.w2_packed_off as u64;
+                    self.h_expert_w2s_ptrs[eid] = src + slot.w2_scales_off as u64;
                     pinned_count += 1;
                     continue;
                 }
@@ -4871,6 +8337,34 @@ impl PrefillEngine {
                 if let Some(md) = moe_data {
                     // Cold expert: H2D to staging slot.
                     // If cold staging is full, fall back to the contiguous fused buffer.
+                    if eid < md.experts.len() {
+                        let e = &md.experts[eid];
+                        max_w13_packed_bytes = max_w13_packed_bytes.max(e.w13_packed_bytes);
+                        max_w13_scales_bytes = max_w13_scales_bytes.max(e.w13_scales_bytes);
+                        max_w2_packed_bytes = max_w2_packed_bytes.max(e.w2_packed_bytes);
+                        max_w2_scales_bytes = max_w2_scales_bytes.max(e.w2_scales_bytes);
+
+                        if e.w13_packed_bytes > self.w1_packed_per_expert
+                            || e.w13_scales_bytes > self.w1_scales_per_expert
+                            || e.w2_packed_bytes > self.w2_packed_per_expert
+                            || e.w2_scales_bytes > self.w2_scales_per_expert
+                        {
+                            return Err(format!(
+                                "moe layer {} expert {} bytes exceed slot: w13p {}>{}, w13s {}>{}, w2p {}>{}, w2s {}>{}",
+                                layer_idx,
+                                eid,
+                                e.w13_packed_bytes,
+                                self.w1_packed_per_expert,
+                                e.w13_scales_bytes,
+                                self.w1_scales_per_expert,
+                                e.w2_packed_bytes,
+                                self.w2_packed_per_expert,
+                                e.w2_scales_bytes,
+                                self.w2_scales_per_expert,
+                            ));
+                        }
+                    }
+
                     if eid < md.experts.len() && cold_slot >= self.max_cold_experts {
                         // Overflow: DMA to contiguous fused buffer slot (if available)
                         let (w1_buf, w1s_buf, w2_buf, w2s_buf) = if self.fused_expert_buf_cur == 0 {
@@ -4887,87 +8381,247 @@ impl PrefillEngine {
                             let w2_off = eid * self.w2_packed_per_expert;
                             let w2s_off = eid * self.w2_scales_per_expert;
                             unsafe {
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    *w1b.device_ptr() + w1_off as u64, e.w13_packed_ptr as *const _,
-                                    e.w13_packed_bytes, self.copy_stream);
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    *w1sb.device_ptr() + w1s_off as u64, e.w13_scales_ptr as *const _,
-                                    e.w13_scales_bytes, self.copy_stream);
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    *w2b.device_ptr() + w2_off as u64, e.w2_packed_ptr as *const _,
-                                    e.w2_packed_bytes, self.copy_stream);
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    *w2sb.device_ptr() + w2s_off as u64, e.w2_scales_ptr as *const _,
-                                    e.w2_scales_bytes, self.copy_stream);
+                                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                    *w1b.device_ptr() + w1_off as u64,
+                                    e.w13_packed_ptr as *const _,
+                                    e.w13_packed_bytes,
+                                );
+                                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                    return Err(format!(
+                                        "cold overflow DMA w13_packed layer {} expert {} (src={:#x} dst={:#x} bytes={}): {:?}",
+                                        layer_idx,
+                                        eid,
+                                        e.w13_packed_ptr,
+                                        *w1b.device_ptr() + w1_off as u64,
+                                        e.w13_packed_bytes,
+                                        err,
+                                    ));
+                                }
+                                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                    *w1sb.device_ptr() + w1s_off as u64,
+                                    e.w13_scales_ptr as *const _,
+                                    e.w13_scales_bytes,
+                                );
+                                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                    return Err(format!(
+                                        "cold overflow DMA w13_scales layer {} expert {} (src={:#x} dst={:#x} bytes={}): {:?}",
+                                        layer_idx,
+                                        eid,
+                                        e.w13_scales_ptr,
+                                        *w1sb.device_ptr() + w1s_off as u64,
+                                        e.w13_scales_bytes,
+                                        err,
+                                    ));
+                                }
+                                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                    *w2b.device_ptr() + w2_off as u64,
+                                    e.w2_packed_ptr as *const _,
+                                    e.w2_packed_bytes,
+                                );
+                                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                    return Err(format!(
+                                        "cold overflow DMA w2_packed layer {} expert {} (src={:#x} dst={:#x} bytes={}): {:?}",
+                                        layer_idx,
+                                        eid,
+                                        e.w2_packed_ptr,
+                                        *w2b.device_ptr() + w2_off as u64,
+                                        e.w2_packed_bytes,
+                                        err,
+                                    ));
+                                }
+                                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                    *w2sb.device_ptr() + w2s_off as u64,
+                                    e.w2_scales_ptr as *const _,
+                                    e.w2_scales_bytes,
+                                );
+                                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                    return Err(format!(
+                                        "cold overflow DMA w2_scales layer {} expert {} (src={:#x} dst={:#x} bytes={}): {:?}",
+                                        layer_idx,
+                                        eid,
+                                        e.w2_scales_ptr,
+                                        *w2sb.device_ptr() + w2s_off as u64,
+                                        e.w2_scales_bytes,
+                                        err,
+                                    ));
+                                }
                             }
                             self.h_expert_w1_ptrs[eid] = *w1b.device_ptr() + w1_off as u64;
                             self.h_expert_w1s_ptrs[eid] = *w1sb.device_ptr() + w1s_off as u64;
                             self.h_expert_w2_ptrs[eid] = *w2b.device_ptr() + w2_off as u64;
                             self.h_expert_w2s_ptrs[eid] = *w2sb.device_ptr() + w2s_off as u64;
                             cold_count += 1;
+                            cold_overflow_count += 1;
                         }
                     } else if eid < md.experts.len() && cold_slot < self.max_cold_experts {
+                        let slot = self.expert_slot_layout();
                         let e = &md.experts[eid];
                         let slot_base = cold_staging_base + (cold_slot * self.cold_expert_bytes) as u64;
-                        let mut off = 0u64;
-                        // w1 packed
+                        // Cold expert sources live in ordinary host memory, so use synchronous
+                        // HtoD copies here. Async HtoD requires page-locked host memory and
+                        // was the root contract violation on this path.
                         unsafe {
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                slot_base + off, e.w13_packed_ptr as *const _,
-                                e.w13_packed_bytes, self.copy_stream);
+                            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                slot_base + slot.w1_packed_off as u64,
+                                e.w13_packed_ptr as *const _,
+                                e.w13_packed_bytes,
+                            );
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(format!(
+                                    "cold staging DMA w13_packed layer {} expert {} (src={:#x} dst={:#x} bytes={}): {:?}",
+                                    layer_idx,
+                                    eid,
+                                    e.w13_packed_ptr,
+                                    slot_base + slot.w1_packed_off as u64,
+                                    e.w13_packed_bytes,
+                                    err,
+                                ));
+                            }
                         }
-                        self.h_expert_w1_ptrs[eid] = slot_base + off;
-                        off += self.w1_packed_per_expert as u64;
-                        // w1 scales
+                        self.h_expert_w1_ptrs[eid] = slot_base + slot.w1_packed_off as u64;
                         unsafe {
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                slot_base + off, e.w13_scales_ptr as *const _,
-                                e.w13_scales_bytes, self.copy_stream);
+                            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                slot_base + slot.w1_scales_off as u64,
+                                e.w13_scales_ptr as *const _,
+                                e.w13_scales_bytes,
+                            );
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(format!(
+                                    "cold staging DMA w13_scales layer {} expert {} (src={:#x} dst={:#x} bytes={}): {:?}",
+                                    layer_idx,
+                                    eid,
+                                    e.w13_scales_ptr,
+                                    slot_base + slot.w1_scales_off as u64,
+                                    e.w13_scales_bytes,
+                                    err,
+                                ));
+                            }
                         }
-                        self.h_expert_w1s_ptrs[eid] = slot_base + off;
-                        off += self.w1_scales_per_expert as u64;
-                        // w2 packed
+                        self.h_expert_w1s_ptrs[eid] = slot_base + slot.w1_scales_off as u64;
                         unsafe {
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                slot_base + off, e.w2_packed_ptr as *const _,
-                                e.w2_packed_bytes, self.copy_stream);
+                            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                slot_base + slot.w2_packed_off as u64,
+                                e.w2_packed_ptr as *const _,
+                                e.w2_packed_bytes,
+                            );
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(format!(
+                                    "cold staging DMA w2_packed layer {} expert {} (src={:#x} dst={:#x} bytes={}): {:?}",
+                                    layer_idx,
+                                    eid,
+                                    e.w2_packed_ptr,
+                                    slot_base + slot.w2_packed_off as u64,
+                                    e.w2_packed_bytes,
+                                    err,
+                                ));
+                            }
                         }
-                        self.h_expert_w2_ptrs[eid] = slot_base + off;
-                        off += self.w2_packed_per_expert as u64;
-                        // w2 scales
+                        self.h_expert_w2_ptrs[eid] = slot_base + slot.w2_packed_off as u64;
                         unsafe {
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                slot_base + off, e.w2_scales_ptr as *const _,
-                                e.w2_scales_bytes, self.copy_stream);
+                            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                slot_base + slot.w2_scales_off as u64,
+                                e.w2_scales_ptr as *const _,
+                                e.w2_scales_bytes,
+                            );
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(format!(
+                                    "cold staging DMA w2_scales layer {} expert {} (src={:#x} dst={:#x} bytes={}): {:?}",
+                                    layer_idx,
+                                    eid,
+                                    e.w2_scales_ptr,
+                                    slot_base + slot.w2_scales_off as u64,
+                                    e.w2_scales_bytes,
+                                    err,
+                                ));
+                            }
                         }
-                        self.h_expert_w2s_ptrs[eid] = slot_base + off;
+                        self.h_expert_w2s_ptrs[eid] = slot_base + slot.w2_scales_off as u64;
                         cold_slot += 1;
                         cold_count += 1;
                     }
                 }
             }
 
-            // Upload pointer tables to GPU using SYNCHRONOUS copy.
-            // cudarc pool allocations can be corrupted by HCS raw cuMemAlloc_v2 allocations,
-            // so we must verify the data reaches the correct GPU address.
-            // Expert H2D staging was already on copy_stream; sync it first.
+            if prefill_validate_active_ptrs_debug_enabled() {
+                self.validate_active_expert_pointer_table_entries(
+                    layer_idx,
+                    &active,
+                    hcs_count,
+                    pinned_count,
+                    cold_count,
+                    cold_overflow_count,
+                    cold_slot,
+                )?;
+            }
+
+            // Pointer tables are ordinary host Vec<u64> storage, so upload them
+            // synchronously as well. dma_event is still recorded afterward so the
+            // compute stream keeps the same ready/consume handoff.
             unsafe {
-                cuda_sys::lib().cuStreamSynchronize(self.copy_stream);
-                // Now use synchronous cuMemcpyHtoD on the default stream
-                cuda_sys::lib().cuMemcpyHtoD_v2(
-                    w1_ptrs_gpu, self.h_expert_w1_ptrs.as_ptr() as *const _,
-                    n_experts * 8);
-                cuda_sys::lib().cuMemcpyHtoD_v2(
-                    w1s_ptrs_gpu, self.h_expert_w1s_ptrs.as_ptr() as *const _,
-                    n_experts * 8);
-                cuda_sys::lib().cuMemcpyHtoD_v2(
-                    w2_ptrs_gpu, self.h_expert_w2_ptrs.as_ptr() as *const _,
-                    n_experts * 8);
-                cuda_sys::lib().cuMemcpyHtoD_v2(
-                    w2s_ptrs_gpu, self.h_expert_w2s_ptrs.as_ptr() as *const _,
-                    n_experts * 8);
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    w1_ptrs_gpu,
+                    self.h_expert_w1_ptrs.as_ptr() as *const _,
+                    n_experts * 8,
+                );
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("pointer table upload w1_ptrs failed: {:?}", err));
+                }
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    w1s_ptrs_gpu,
+                    self.h_expert_w1s_ptrs.as_ptr() as *const _,
+                    n_experts * 8,
+                );
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("pointer table upload w1s_ptrs failed: {:?}", err));
+                }
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    w2_ptrs_gpu,
+                    self.h_expert_w2_ptrs.as_ptr() as *const _,
+                    n_experts * 8,
+                );
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("pointer table upload w2_ptrs failed: {:?}", err));
+                }
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    w2s_ptrs_gpu,
+                    self.h_expert_w2s_ptrs.as_ptr() as *const _,
+                    n_experts * 8,
+                );
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("pointer table upload w2s_ptrs failed: {:?}", err));
+                }
                 cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
             }
+            if prefill_validate_active_ptrs_debug_enabled() {
+                unsafe {
+                    cuda_sys::lib().cuStreamSynchronize(self.copy_stream);
+                }
+                self.validate_uploaded_expert_pointer_table(
+                    layer_idx,
+                    w1_ptrs_gpu,
+                    &self.h_expert_w1_ptrs,
+                    "w1_ptrs",
+                )?;
+                self.validate_uploaded_expert_pointer_table(
+                    layer_idx,
+                    w1s_ptrs_gpu,
+                    &self.h_expert_w1s_ptrs,
+                    "w1s_ptrs",
+                )?;
+                self.validate_uploaded_expert_pointer_table(
+                    layer_idx,
+                    w2_ptrs_gpu,
+                    &self.h_expert_w2_ptrs,
+                    "w2_ptrs",
+                )?;
+                self.validate_uploaded_expert_pointer_table(
+                    layer_idx,
+                    w2s_ptrs_gpu,
+                    &self.h_expert_w2s_ptrs,
+                    "w2s_ptrs",
+                )?;
+            }
+            self.mark_pointer_tables_ready(layer_idx, active.len(), "forward_moe_fused pointer table upload");
 
             if layer_idx == 0 {
                 // Dump host-side pointer table to verify correctness
@@ -4983,6 +8637,32 @@ impl PrefillEngine {
                     eprintln!("[PTR-TABLE] gpu buf addr={:#x}, n_experts={}, upload_bytes={}",
                         w1_ptrs_gpu, n_experts, n_experts * 8);
                 }
+            }
+            if debug_prefill
+                && (bits == 8 || layer_idx == 0 || prefill_debug_layer_selected(layer_idx))
+            {
+                eprintln!(
+                    "[PREFILL-DEBUG] moe layer={} active={} total_sorted={} hcs={} pinned={} cold={} cold_slots={} cold_overflow={} max_bytes=({}/{}/{}/{}) expected=({}/{}/{}/{}) ptr_table={} fused_buf={} cold_staging_mb={}",
+                    layer_idx,
+                    active.len(),
+                    total_sorted,
+                    hcs_count,
+                    pinned_count,
+                    cold_count,
+                    cold_slot,
+                    cold_overflow_count,
+                    max_w13_packed_bytes,
+                    max_w13_scales_bytes,
+                    max_w2_packed_bytes,
+                    max_w2_scales_bytes,
+                    self.w1_packed_per_expert,
+                    self.w1_scales_per_expert,
+                    self.w2_packed_per_expert,
+                    self.w2_scales_per_expert,
+                    use_ptr_table,
+                    w1_base != 0 && w2_base != 0,
+                    (self.max_cold_experts * self.cold_expert_bytes) / (1024 * 1024),
+                );
             }
         } else {
             // Legacy path: contiguous fused buffer DMA
@@ -5008,15 +8688,43 @@ impl PrefillEngine {
                         unsafe {
                             cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
                         }
+                        self.mark_fused_expert_buffer_loaded(
+                            cur,
+                            layer_idx,
+                            "forward_moe_fused immediate DMA",
+                        );
                     }
                 }
             }
         }
 
-        // Wait for DMA/pointer table upload to complete (stream dependency)
-        unsafe {
-            cuda_sys::lib().cuStreamWaitEvent(self.stream, self.dma_event, 0);
+        if use_ptr_table {
+            self.validate_pointer_tables_ready(layer_idx, "forward_moe_fused before pointer-table GEMM")?;
+            if prefill_validate_active_ptrs_debug_enabled()
+                && (layer_idx == 0 || prefill_debug_layer_selected(layer_idx))
+            {
+                self.stream_sync()?;
+                self.validate_moe_dispatch_metadata(
+                    layer_idx,
+                    m,
+                    topk,
+                    block_size as usize,
+                    total_sorted,
+                    topk_ids_ptr,
+                    num_tokens_post_val,
+                    sorted_ids_val,
+                    fused_expert_ids_val,
+                    &h_expert_counts,
+                )?;
+            }
         }
+
+        // Wait for DMA/pointer table upload to complete (stream dependency)
+        self.wait_cuda_event(
+            self.stream,
+            self.dma_event,
+            "forward_moe_fused wait compute on dma_event",
+        )?;
         if let Some(t) = mt1 {
             // Sync to measure actual DMA wait time (timing mode only)
             self.stream_sync()?;
@@ -5046,13 +8754,29 @@ impl PrefillEngine {
             eprintln!("[FUSED-DMA] layer0 w1_base[0..4] = {:?} (zero={})", h_fused, is_zero);
         }
 
+        // Shared-expert overlap is valuable for the main INT4 path, but INT8 routed
+        // fused-MoE has shown timing-sensitive CUDA illegal-address failures that
+        // disappear under launch blocking. Serialize the shared expert only for the
+        // INT8 routed path so production INT4 keeps the overlap fast path.
+        let force_shared_main_stream = prefill_force_fused_shared_main_stream_debug_enabled();
+        let shared_overlap_allowed = has_shared
+            && bits != 8
+            && !prefill_disable_shared_overlap_debug_enabled()
+            && !force_shared_main_stream;
+        let mut shared_launched = false;
+
         // 5. Launch shared expert on dedicated shared_stream (async overlap with fused MoE)
-        if has_shared {
-            unsafe {
-                cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
-                cuda_sys::lib().cuStreamWaitEvent(self.shared_stream, self.compute_event, 0);
-            }
+        if shared_overlap_allowed {
+            self.record_compute_ready_for_shared(
+                layer_idx,
+                "forward_moe_fused shared overlap launch",
+            )?;
+            self.wait_shared_for_compute(
+                layer_idx,
+                "forward_moe_fused shared overlap launch",
+            )?;
             self.launch_shared_expert_on_shared_stream(layer_idx, m)?;
+            shared_launched = true;
         }
 
         // 6. Replicate hidden states: [m, h] -> [m*topk, h]
@@ -5067,17 +8791,120 @@ impl PrefillEngine {
             let mut r2 = h as i32;
             let mut r3 = m as i32;
             let mut r4 = topk as i32;
-            unsafe {
-                launch(self.kernels.moe_replicate_hidden,
-                    (m_topk as u32, 1, 1), (rt, 1, 1), 0, self.stream,
-                    &mut [
-                        &mut r0 as *mut _ as *mut std::ffi::c_void,
-                        &mut r1 as *mut _ as *mut std::ffi::c_void,
-                        &mut r2 as *mut _ as *mut std::ffi::c_void,
-                        &mut r3 as *mut _ as *mut std::ffi::c_void,
-                        &mut r4 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
+            let dims = if self.cuda_debug.enabled() {
+                format!("layer={} m={} topk={} h={}", layer_idx, m, topk, h)
+            } else {
+                String::new()
+            };
+            self.run_cuda_debug_stage(
+                "prefill.fused_moe.replicate_hidden",
+                "prefill_compute",
+                dims,
+                self.stream,
+                || unsafe {
+                    launch(self.kernels.moe_replicate_hidden,
+                        (m_topk as u32, 1, 1), (rt, 1, 1), 0, self.stream,
+                        &mut [
+                            &mut r0 as *mut _ as *mut std::ffi::c_void,
+                            &mut r1 as *mut _ as *mut std::ffi::c_void,
+                            &mut r2 as *mut _ as *mut std::ffi::c_void,
+                            &mut r3 as *mut _ as *mut std::ffi::c_void,
+                            &mut r4 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
+        }
+
+        let mut ptr_table_probe_active = None;
+        let mut ptr_table_probe_active_last = None;
+        let mut ptr_table_probe_pinned = None;
+        let mut ptr_table_probe_cold = None;
+        if use_ptr_table
+            && prefill_diag_ptr_table_regular_enabled()
+            && (layer_idx == 0 || prefill_debug_layer_selected(layer_idx))
+        {
+            let mut probe_regular_w1 = |eid: usize, source: &str| -> Result<(), String> {
+                let ref_w13 = MarlinWeight {
+                    packed: self.h_expert_w1_ptrs[eid],
+                    scales: self.h_expert_w1s_ptrs[eid],
+                    n: if gated { 2 * inter } else { inter },
+                    k: h,
+                    num_groups: h / self.config.group_size,
+                    group_size: self.config.group_size,
+                    num_bits: bits,
+                };
+                let ref_c = *self.scratch.d_scratch2.device_ptr();
+                self.marlin_gemm(fused_input_ptr, &ref_w13, ref_c, 1).map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table regular w1 probe failed for {} expert {}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                self.stream_sync().map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table regular w1 probe sync failed for {} expert {}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                eprintln!(
+                    "[PREFILL-DEBUG] moe layer={} ptr-table regular w1 probe OK source={} expert={} packed=0x{:x} scales=0x{:x}",
+                    layer_idx,
+                    source,
+                    eid,
+                    self.h_expert_w1_ptrs[eid],
+                    self.h_expert_w1s_ptrs[eid],
+                );
+                Ok(())
+            };
+
+            let active_experts: Vec<usize> = h_expert_counts
+                .iter()
+                .enumerate()
+                .filter_map(|(eid, &cnt)| if cnt > 0 { Some(eid) } else { None })
+                .collect();
+            if let Some(first_active) = active_experts.first().copied() {
+                ptr_table_probe_active = Some(first_active);
+                probe_regular_w1(first_active, "active")?;
+            }
+            if let Some(last_active) = active_experts.last().copied() {
+                if Some(last_active) != ptr_table_probe_active {
+                    ptr_table_probe_active_last = Some(last_active);
+                    probe_regular_w1(last_active, "active-last")?;
+                }
+            }
+
+            let mut first_pinned = None;
+            let mut first_cold = None;
+            if let Some(mi) = moe_layer_idx {
+                for &eid in &active_experts {
+                    let pin_offset = if self.pinning_active
+                        && mi < self.pinned_expert_offsets.len()
+                        && eid < self.pinned_expert_offsets[mi].len()
+                    {
+                        self.pinned_expert_offsets[mi][eid]
+                    } else {
+                        None
+                    };
+                    if pin_offset.is_some() {
+                        if first_pinned.is_none() {
+                            first_pinned = Some(eid);
+                        }
+                    } else if first_cold.is_none() {
+                        first_cold = Some(eid);
+                    }
+                    if first_pinned.is_some() && first_cold.is_some() {
+                        break;
+                    }
+                }
+            }
+            if let Some(eid) = first_pinned {
+                ptr_table_probe_pinned = Some(eid);
+                probe_regular_w1(eid, "pinned")?;
+            }
+            if let Some(eid) = first_cold {
+                ptr_table_probe_cold = Some(eid);
+                probe_regular_w1(eid, "cold")?;
             }
         }
 
@@ -5127,71 +8954,257 @@ impl PrefillEngine {
         // Zero the workspace lock array and C_tmp before fused w1 GEMM.
         let ws_ptr = *self.scratch.d_workspace.device_ptr();
         let ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
-        unsafe {
-            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
-            // Zero C_tmp (FP32 scratch) — Marlin uses this for fp32_reduce accumulation
-            cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, w1_ctmp_floats, self.stream);
-        }
+        self.memset_d32_async_checked(
+            ws_ptr,
+            0,
+            ws_len,
+            self.stream,
+            "forward_moe_fused zero w1 workspace",
+        )?;
+        self.memset_d32_async_checked(
+            fused_c_tmp_ptr,
+            0,
+            w1_ctmp_floats,
+            self.stream,
+            "forward_moe_fused zero w1 ctmp",
+        )?;
 
-        let w1_b_param = if use_ptr_table && w1_base == 0 {
-            cold_staging_base
-        } else {
-            w1_base
-        };
-        let w1s_b_param = if use_ptr_table && w1s_base == 0 { cold_staging_base } else { w1s_base };
-        let w2_b_param = if use_ptr_table && w2_base == 0 {
-            cold_staging_base
-        } else {
-            w2_base
-        };
-        let w2s_b_param = if use_ptr_table && w2s_base == 0 { cold_staging_base } else { w2s_base };
+        // Pointer-table mode supplies absolute per-expert addresses for weights/scales.
+        // Pass a null base reference so any residual B + offset arithmetic in the
+        // vendored kernel resolves back to the absolute pointer value instead of a
+        // mixed-source cold-staging base that is wrong for pinned experts.
+        let w1_b_param = if use_ptr_table { 0 } else { w1_base };
+        let w1s_b_param = if use_ptr_table { 0 } else { w1s_base };
+        let w2_b_param = if use_ptr_table { 0 } else { w2_base };
+        let w2s_b_param = if use_ptr_table { 0 } else { w2s_base };
 
         // w1: A = fused_input (replicated [m*topk, h]), top_k=1 so kernel reads A[sorted_id] directly
         //     C written at sorted_id positions (token*topk+slot), range [0, m*topk)
         //     C_tmp also at sorted_id positions (unique, no collision in fp32_reduce)
-        unsafe {
-            fused_fn(
-                fused_input_ptr as *const _,         // A: [m*topk, K=hidden] replicated
-                w1_b_param as *const _,              // B: base ref (ptr table overrides per-expert)
-                fused_inter_ptr as *mut _,           // C: written at sorted_id positions [0..m*topk)
-                fused_c_tmp_ptr as *mut _,           // C_tmp
-                std::ptr::null(),                    // b_bias (none)
-                w1s_b_param as *const _,             // scales: base ref (ptr table overrides)
-                std::ptr::null(),                    // s2 (none)
-                std::ptr::null(),                    // zp (none)
-                std::ptr::null(),                    // g_idx (none)
-                std::ptr::null(),                    // perm (none)
-                std::ptr::null(),                    // a_tmp (none)
-                sorted_ids_val as *const _,         // sorted_ids (vLLM format: token*topk+slot)
-                fused_expert_ids_val as *const _,   // expert_ids
-                num_tokens_post_val as *const _,    // num_tokens_post_padded
-                topk_weights_ptr as *const _,        // topk_weights
-                block_size,                          // moe_block_size
-                1i32,                                // top_k=1: sorted_id/1 = direct index into A
-                false,                               // mul_topk_weights (false for w1)
-                false,                               // is_ep
-                m_topk as i32,                       // size_m = m*topk (padding threshold = m*topk*1)
-                w1_n as i32,                         // size_n
-                h as i32,                            // size_k
-                *self.scratch.d_workspace.device_ptr() as *mut _, // workspace
-                q_type_ptr,                          // q_type_ptr
-                false,                               // has_bias
-                false,                               // has_act_order
-                true,                                // is_k_full
-                false,                               // has_zp
-                num_groups_w1,                       // num_groups
-                gs,                                  // group_size
-                0,                                   // dev
-                stream_ptr,                          // stream_ptr (our compute stream)
-                -1,                                  // thread_k (auto)
-                -1,                                  // thread_n (auto)
-                self.config.sms as i32,              // sms
-                false,                               // use_atomic
-                true,                                // fp32_reduce
-                false,                               // is_zp_float
-                if use_ptr_table { w1_ptrs_gpu as *const _ } else { std::ptr::null() },   // B_expert_ptrs
-                if use_ptr_table { w1s_ptrs_gpu as *const _ } else { std::ptr::null() },  // S_expert_ptrs
-            );
+        self.run_cuda_debug_stage(
+            "prefill.fused_moe.w1",
+            "prefill_compute",
+            format!(
+                "layer={} m_topk={} n={} k={} block_size={} ptr_table={}",
+                layer_idx, m_topk, w1_n, h, block_size, use_ptr_table
+            ),
+            self.stream,
+            || {
+                unsafe {
+                    fused_fn(
+                        fused_input_ptr as *const _,         // A: [m*topk, K=hidden] replicated
+                        w1_b_param as *const _,              // B: base ref (ptr table overrides per-expert)
+                        fused_inter_ptr as *mut _,           // C: written at sorted_id positions [0..m*topk)
+                        fused_c_tmp_ptr as *mut _,           // C_tmp
+                        std::ptr::null(),                    // b_bias (none)
+                        w1s_b_param as *const _,             // scales: base ref (ptr table overrides)
+                        std::ptr::null(),                    // s2 (none)
+                        std::ptr::null(),                    // zp (none)
+                        std::ptr::null(),                    // g_idx (none)
+                        std::ptr::null(),                    // perm (none)
+                        std::ptr::null(),                    // a_tmp (none)
+                        sorted_ids_val as *const _,          // sorted_ids (vLLM format: token*topk+slot)
+                        fused_expert_ids_val as *const _,    // expert_ids
+                        num_tokens_post_val as *const _,     // num_tokens_post_padded
+                        topk_weights_ptr as *const _,        // topk_weights
+                        block_size,                          // moe_block_size
+                        1i32,                                // top_k=1: sorted_id/1 = direct index into A
+                        false,                               // mul_topk_weights (false for w1)
+                        false,                               // is_ep
+                        m_topk as i32,                       // size_m = m*topk (padding threshold = m*topk*1)
+                        w1_n as i32,                         // size_n
+                        h as i32,                            // size_k
+                        *self.scratch.d_workspace.device_ptr() as *mut _, // workspace
+                        q_type_ptr,                          // q_type_ptr
+                        false,                               // has_bias
+                        false,                               // has_act_order
+                        true,                                // is_k_full
+                        false,                               // has_zp
+                        num_groups_w1,                       // num_groups
+                        gs,                                  // group_size
+                        0,                                   // dev
+                        stream_ptr,                          // stream_ptr (our compute stream)
+                        -1,                                  // thread_k (auto)
+                        -1,                                  // thread_n (auto)
+                        self.config.sms as i32,              // sms
+                        false,                               // use_atomic
+                        true,                                // fp32_reduce
+                        false,                               // is_zp_float
+                        if use_ptr_table { w1_ptrs_gpu as *const _ } else { std::ptr::null() },   // B_expert_ptrs
+                        if use_ptr_table { w1s_ptrs_gpu as *const _ } else { std::ptr::null() },  // S_expert_ptrs
+                        prefill_fused_moe_bounds_debug_enabled(), // debug_bounds_check
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        // Same-stream ordering already protects the activation reuse boundary.
+        // Keep the host-side sync only for opt-in debug runs so production does
+        // not stall the CPU after every fused W1 launch.
+        if prefill_fused_sync_debug_enabled()
+            || prefill_fused_sync_stage_matches("moe fused w1")
+            || self.cuda_debug.enabled()
+        {
+            self.runtime_stream_sync("moe fused w1 sync failed")?;
+        }
+        if use_ptr_table
+            && prefill_diag_ptr_table_regular_enabled()
+            && (layer_idx == 0 || prefill_debug_layer_selected(layer_idx))
+        {
+            let mut compare_fused_w1 = |eid: usize, source: &str| -> Result<(), String> {
+                self.stream_sync().map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table fused-vs-regular w1 pre-read sync failed for source={} expert={}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                let expert_blocks = total_sorted.div_ceil(block_size as usize);
+                let mut h_expert_ids = vec![0i32; expert_blocks];
+                let mut h_sorted = vec![0i32; total_sorted];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_expert_ids.as_mut_ptr() as *mut _,
+                        fused_expert_ids_val,
+                        h_expert_ids.len() * std::mem::size_of::<i32>(),
+                    );
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_sorted.as_mut_ptr() as *mut _,
+                        sorted_ids_val,
+                        h_sorted.len() * std::mem::size_of::<i32>(),
+                    );
+                }
+                let Some(block_idx) = h_expert_ids.iter().position(|&v| v == eid as i32) else {
+                    eprintln!(
+                        "[PREFILL-DEBUG] moe layer={} ptr-table fused-vs-regular w1 skipped source={} expert={} block=missing",
+                        layer_idx, source, eid
+                    );
+                    return Ok(());
+                };
+                let row_idx = block_idx * block_size as usize;
+                if row_idx >= h_sorted.len() {
+                    return Err(format!(
+                        "moe layer {} ptr-table fused-vs-regular w1 invalid row_idx {} for source={} expert={}",
+                        layer_idx, row_idx, source, eid
+                    ));
+                }
+                let first_sid = h_sorted[row_idx];
+                if first_sid < 0 || first_sid as usize >= m_topk {
+                    return Err(format!(
+                        "moe layer {} ptr-table fused-vs-regular w1 invalid sorted_id {} for source={} expert={}",
+                        layer_idx, first_sid, source, eid
+                    ));
+                }
+                let first_token = first_sid / topk as i32;
+                let fused_w1_offset = (first_sid as usize) * w1_n * 2;
+                let sample_len = std::cmp::min(8, w1_n);
+                let mut h_fused_w1 = vec![0u16; sample_len];
+                let input_sample_len = std::cmp::min(8, h);
+                let mut h_fused_input = vec![0u16; input_sample_len];
+                let mut h_hidden_input = vec![0u16; input_sample_len];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_fused_w1.as_mut_ptr() as *mut _,
+                        fused_inter_ptr + fused_w1_offset as u64,
+                        sample_len * 2,
+                    );
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_fused_input.as_mut_ptr() as *mut _,
+                        fused_input_ptr + (first_sid as usize * h * 2) as u64,
+                        input_sample_len * 2,
+                    );
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_hidden_input.as_mut_ptr() as *mut _,
+                        hidden + (first_token as usize * h * 2) as u64,
+                        input_sample_len * 2,
+                    );
+                }
+                let fused_vals: Vec<f32> = h_fused_w1
+                    .iter()
+                    .map(|&v| half::bf16::from_bits(v).to_f32())
+                    .collect();
+                let fused_input_vals: Vec<f32> = h_fused_input
+                    .iter()
+                    .map(|&v| half::bf16::from_bits(v).to_f32())
+                    .collect();
+                let hidden_input_vals: Vec<f32> = h_hidden_input
+                    .iter()
+                    .map(|&v| half::bf16::from_bits(v).to_f32())
+                    .collect();
+
+                let ref_w13 = MarlinWeight {
+                    packed: self.h_expert_w1_ptrs[eid],
+                    scales: self.h_expert_w1s_ptrs[eid],
+                    n: w1_n,
+                    k: h,
+                    num_groups: h / self.config.group_size,
+                    group_size: self.config.group_size,
+                    num_bits: bits,
+                };
+                let a_ptr = hidden + (first_token as usize * h * 2) as u64;
+                let ref_c = *self.scratch.d_scratch2.device_ptr();
+                self.marlin_gemm(a_ptr, &ref_w13, ref_c, 1).map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table fused-vs-regular w1 regular probe failed for source={} expert={}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                self.stream_sync().map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table fused-vs-regular w1 regular probe sync failed for source={} expert={}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                let mut h_ref_w1 = vec![0u16; sample_len];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_ref_w1.as_mut_ptr() as *mut _,
+                        ref_c,
+                        sample_len * 2,
+                    );
+                }
+                let ref_vals: Vec<f32> = h_ref_w1
+                    .iter()
+                    .map(|&v| half::bf16::from_bits(v).to_f32())
+                    .collect();
+                let max_abs = fused_vals
+                    .iter()
+                    .zip(ref_vals.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                let input_max_abs = fused_input_vals
+                    .iter()
+                    .zip(hidden_input_vals.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "[PREFILL-DEBUG] moe layer={} ptr-table fused-vs-regular w1 source={} expert={} token={} sorted_id={} input_max_abs={:.6} max_abs={:.6} fused_input={:?} hidden={:?} fused={:?} ref={:?}",
+                    layer_idx,
+                    source,
+                    eid,
+                    first_token,
+                    first_sid,
+                    input_max_abs,
+                    max_abs,
+                    fused_input_vals,
+                    hidden_input_vals,
+                    fused_vals,
+                    ref_vals,
+                );
+                Ok(())
+            };
+
+            if let Some(eid) = ptr_table_probe_active {
+                compare_fused_w1(eid, "active")?;
+            }
+            if let Some(eid) = ptr_table_probe_active_last {
+                compare_fused_w1(eid, "active-last")?;
+            }
+            if let Some(eid) = ptr_table_probe_pinned {
+                compare_fused_w1(eid, "pinned")?;
+            }
+            if let Some(eid) = ptr_table_probe_cold {
+                compare_fused_w1(eid, "cold")?;
+            }
         }
         // DIAG: Compare MoE Marlin vs Regular Marlin for one expert
         // (Skip in pointer table mode -- fused buffer offsets not valid)
@@ -5282,33 +9295,64 @@ impl PrefillEngine {
             let mut ac1 = fused_inter_ptr;
             let mut ac2 = inter as i32;
             let kernel = if activation == 1 { self.kernels.relu2 } else { self.kernels.silu_mul };
-            unsafe {
-                launch(kernel,
-                    (m_topk as u32, 1, 1), (act_t, 1, 1), 0, self.stream,
-                    &mut [
-                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
+            let dims = if self.cuda_debug.enabled() {
+                format!("layer={} m_topk={} inter={}", layer_idx, m_topk, inter)
+            } else {
+                String::new()
+            };
+            self.run_cuda_debug_stage(
+                if activation == 1 {
+                    "prefill.fused_moe.relu2"
+                } else {
+                    "prefill.fused_moe.silu_mul"
+                },
+                "prefill_compute",
+                dims,
+                self.stream,
+                || unsafe {
+                    launch(kernel,
+                        (m_topk as u32, 1, 1), (act_t, 1, 1), 0, self.stream,
+                        &mut [
+                            &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
         } else {
             // Ungated: just apply activation in-place
             let act_t = std::cmp::max(32, ((std::cmp::min(1024, inter) + 31) / 32) * 32) as u32;
             let mut ac0 = fused_inter_ptr; // in-place
             let mut ac1 = fused_inter_ptr;
             let mut ac2 = inter as i32;
-            unsafe {
-                launch(self.kernels.relu2,
-                    (m_topk as u32, 1, 1), (act_t as u32, 1, 1), 0, self.stream,
-                    &mut [
-                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
+            let dims = if self.cuda_debug.enabled() {
+                format!("layer={} m_topk={} inter={}", layer_idx, m_topk, inter)
+            } else {
+                String::new()
+            };
+            self.run_cuda_debug_stage(
+                "prefill.fused_moe.relu2",
+                "prefill_compute",
+                dims,
+                self.stream,
+                || unsafe {
+                    launch(self.kernels.relu2,
+                        (m_topk as u32, 1, 1), (act_t as u32, 1, 1), 0, self.stream,
+                        &mut [
+                            &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
         }
+        // The activation output is consumed immediately by fused W2. Keep the fence at
+        // this reuse boundary; later scatter-stage fences are only for debug isolation.
+        self.stream_sync()
+            .map_err(|e| format!("moe activation sync failed: {e}"))?;
+        self.debug_sync_fused("moe activation")?;
 
         if let Some(t) = mt2 {
             self.stream_sync()?;
@@ -5323,58 +9367,335 @@ impl PrefillEngine {
         let num_groups_w2 = (inter / self.config.group_size) as i32;
         let w2_input = if gated { fused_inter2_ptr } else { fused_inter_ptr };
 
+        if use_ptr_table
+            && prefill_diag_ptr_table_regular_enabled()
+            && (layer_idx == 0 || prefill_debug_layer_selected(layer_idx))
+        {
+            let mut probe_regular_w2 = |eid: usize, source: &str| -> Result<(), String> {
+                self.stream_sync().map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table regular w2 pre-read sync failed for source={} expert={}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                let expert_blocks = total_sorted.div_ceil(block_size as usize);
+                let mut h_expert_ids = vec![0i32; expert_blocks];
+                let mut h_sorted = vec![0i32; total_sorted];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_expert_ids.as_mut_ptr() as *mut _,
+                        fused_expert_ids_val,
+                        h_expert_ids.len() * std::mem::size_of::<i32>(),
+                    );
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_sorted.as_mut_ptr() as *mut _,
+                        sorted_ids_val,
+                        h_sorted.len() * std::mem::size_of::<i32>(),
+                    );
+                }
+                let Some(block_idx) = h_expert_ids.iter().position(|&v| v == eid as i32) else {
+                    eprintln!(
+                        "[PREFILL-DEBUG] moe layer={} ptr-table regular w2 skipped source={} expert={} block=missing",
+                        layer_idx, source, eid
+                    );
+                    return Ok(());
+                };
+                let row_idx = block_idx * block_size as usize;
+                if row_idx >= h_sorted.len() {
+                    return Err(format!(
+                        "moe layer {} ptr-table regular w2 invalid row_idx {} for source={} expert={}",
+                        layer_idx, row_idx, source, eid
+                    ));
+                }
+                let first_sid = h_sorted[row_idx];
+                if first_sid < 0 || first_sid as usize >= m_topk {
+                    return Err(format!(
+                        "moe layer {} ptr-table regular w2 invalid sorted_id {} for source={} expert={}",
+                        layer_idx, first_sid, source, eid
+                    ));
+                }
+                let a_ptr = w2_input + (first_sid as usize * inter * 2) as u64;
+                let ref_w2 = MarlinWeight {
+                    packed: self.h_expert_w2_ptrs[eid],
+                    scales: self.h_expert_w2s_ptrs[eid],
+                    n: h,
+                    k: inter,
+                    num_groups: inter / self.config.group_size,
+                    group_size: self.config.group_size,
+                    num_bits: bits,
+                };
+                let ref_c = *self.scratch.d_scratch2.device_ptr();
+                self.marlin_gemm(a_ptr, &ref_w2, ref_c, 1).map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table regular w2 probe failed for source={} expert={}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                self.stream_sync().map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table regular w2 probe sync failed for source={} expert={}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                let sample_len = std::cmp::min(8, h);
+                let mut h_ref_w2 = vec![0u16; sample_len];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_ref_w2.as_mut_ptr() as *mut _,
+                        ref_c,
+                        sample_len * 2,
+                    );
+                }
+                let ref_vals: Vec<f32> = h_ref_w2
+                    .iter()
+                    .map(|&v| half::bf16::from_bits(v).to_f32())
+                    .collect();
+                eprintln!(
+                    "[PREFILL-DEBUG] moe layer={} ptr-table regular w2 probe OK source={} expert={} sorted_id={} vals={:?}",
+                    layer_idx,
+                    source,
+                    eid,
+                    first_sid,
+                    ref_vals,
+                );
+                Ok(())
+            };
+
+            if let Some(eid) = ptr_table_probe_active {
+                probe_regular_w2(eid, "active")?;
+            }
+            if let Some(eid) = ptr_table_probe_active_last {
+                probe_regular_w2(eid, "active-last")?;
+            }
+            if let Some(eid) = ptr_table_probe_pinned {
+                probe_regular_w2(eid, "pinned")?;
+            }
+            if let Some(eid) = ptr_table_probe_cold {
+                probe_regular_w2(eid, "cold")?;
+            }
+        }
+
         // Zero workspace and C_tmp before fused w2 GEMM
-        unsafe {
-            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
-            cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, w2_ctmp_floats, self.stream);
+        self.memset_d32_async_checked(
+            ws_ptr,
+            0,
+            ws_len,
+            self.stream,
+            "forward_moe_fused zero w2 workspace",
+        )?;
+        self.memset_d32_async_checked(
+            fused_c_tmp_ptr,
+            0,
+            w2_ctmp_floats,
+            self.stream,
+            "forward_moe_fused zero w2 ctmp",
+        )?;
+        self.run_cuda_debug_stage(
+            "prefill.fused_moe.w2",
+            "prefill_compute",
+            format!(
+                "layer={} m_topk={} n={} k={} block_size={} ptr_table={}",
+                layer_idx, m_topk, h, inter, block_size, use_ptr_table
+            ),
+            self.stream,
+            || {
+                unsafe {
+                    fused_fn(
+                        w2_input as *const _,                // A: [m*topk, K=inter] indexed by sorted_id
+                        w2_b_param as *const _,              // B: base ref (ptr table overrides per-expert)
+                        fused_output_ptr as *mut _,          // C: written at sorted_id positions [0..m*topk)
+                        fused_c_tmp_ptr as *mut _,           // C_tmp
+                        std::ptr::null(),                    // b_bias (none)
+                        w2s_b_param as *const _,             // scales: base ref (ptr table overrides)
+                        std::ptr::null(),                    // s2 (none)
+                        std::ptr::null(),                    // zp (none)
+                        std::ptr::null(),                    // g_idx (none)
+                        std::ptr::null(),                    // perm (none)
+                        std::ptr::null(),                    // a_tmp (none)
+                        sorted_ids_val as *const _,          // sorted_ids (vLLM format)
+                        fused_expert_ids_val as *const _,    // expert_ids
+                        num_tokens_post_val as *const _,     // num_tokens_post_padded
+                        topk_weights_ptr as *const _,        // topk_weights
+                        block_size,                          // moe_block_size
+                        1i32,                                // top_k=1: sorted_id/1 = direct index into A
+                        false,                               // mul_topk_weights=false (scatter handles it)
+                        false,                               // is_ep
+                        m_topk as i32,                       // size_m = m*topk (padding threshold = m*topk*1)
+                        h as i32,                            // size_n
+                        inter as i32,                        // size_k
+                        *self.scratch.d_workspace.device_ptr() as *mut _, // workspace
+                        q_type_ptr,                          // q_type_ptr
+                        false,                               // has_bias
+                        false,                               // has_act_order
+                        true,                                // is_k_full
+                        false,                               // has_zp
+                        num_groups_w2,                       // num_groups
+                        gs,                                  // group_size
+                        0,                                   // dev
+                        stream_ptr,                          // stream_ptr
+                        -1,                                  // thread_k (auto)
+                        -1,                                  // thread_n (auto)
+                        self.config.sms as i32,              // sms
+                        false,                               // use_atomic
+                        true,                                // fp32_reduce
+                        false,                               // is_zp_float
+                        if use_ptr_table { w2_ptrs_gpu as *const _ } else { std::ptr::null() },   // B_expert_ptrs
+                        if use_ptr_table { w2s_ptrs_gpu as *const _ } else { std::ptr::null() },  // S_expert_ptrs
+                        prefill_fused_moe_bounds_debug_enabled(), // debug_bounds_check
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        if use_ptr_table {
+            self.mark_pointer_table_payload_released(
+                layer_idx,
+                "forward_moe_fused after w2 launch",
+            )?;
         }
-        unsafe {
-            fused_fn(
-                w2_input as *const _,                // A: [m*topk, K=inter] indexed by sorted_id
-                w2_b_param as *const _,               // B: base ref (ptr table overrides per-expert)
-                fused_output_ptr as *mut _,           // C: written at sorted_id positions [0..m*topk)
-                fused_c_tmp_ptr as *mut _,            // C_tmp
-                std::ptr::null(),                     // b_bias (none)
-                w2s_b_param as *const _,              // scales: base ref (ptr table overrides)
-                std::ptr::null(),                     // s2 (none)
-                std::ptr::null(),                     // zp (none)
-                std::ptr::null(),                     // g_idx (none)
-                std::ptr::null(),                     // perm (none)
-                std::ptr::null(),                     // a_tmp (none)
-                sorted_ids_val as *const _,          // sorted_ids (vLLM format)
-                fused_expert_ids_val as *const _,    // expert_ids
-                num_tokens_post_val as *const _,     // num_tokens_post_padded
-                topk_weights_ptr as *const _,         // topk_weights
-                block_size,                           // moe_block_size
-                1i32,                                 // top_k=1: sorted_id/1 = direct index into A
-                false,                                // mul_topk_weights=false (scatter handles it)
-                false,                                // is_ep
-                m_topk as i32,                        // size_m = m*topk (padding threshold = m*topk*1)
-                h as i32,                             // size_n
-                inter as i32,                         // size_k
-                *self.scratch.d_workspace.device_ptr() as *mut _, // workspace
-                q_type_ptr,                           // q_type_ptr
-                false,                                // has_bias
-                false,                                // has_act_order
-                true,                                 // is_k_full
-                false,                                // has_zp
-                num_groups_w2,                        // num_groups
-                gs,                                   // group_size
-                0,                                    // dev
-                stream_ptr,                           // stream_ptr
-                -1,                                   // thread_k (auto)
-                -1,                                   // thread_n (auto)
-                self.config.sms as i32,               // sms
-                false,                                // use_atomic
-                true,                                 // fp32_reduce
-                false,                                // is_zp_float
-                if use_ptr_table { w2_ptrs_gpu as *const _ } else { std::ptr::null() },   // B_expert_ptrs
-                if use_ptr_table { w2s_ptrs_gpu as *const _ } else { std::ptr::null() },  // S_expert_ptrs
-            );
-        }
+        self.debug_sync_fused("moe fused w2")?;
         if let Some(t) = mt3 {
-            self.stream_sync()?;
             self.t_moe_w2.set(self.t_moe_w2.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
+        if use_ptr_table
+            && prefill_diag_ptr_table_regular_enabled()
+            && (layer_idx == 0 || prefill_debug_layer_selected(layer_idx))
+        {
+            let mut compare_fused_w2 = |eid: usize, source: &str| -> Result<(), String> {
+                self.stream_sync().map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table fused-vs-regular w2 pre-read sync failed for source={} expert={}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                let expert_blocks = total_sorted.div_ceil(block_size as usize);
+                let mut h_expert_ids = vec![0i32; expert_blocks];
+                let mut h_sorted = vec![0i32; total_sorted];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_expert_ids.as_mut_ptr() as *mut _,
+                        fused_expert_ids_val,
+                        h_expert_ids.len() * std::mem::size_of::<i32>(),
+                    );
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_sorted.as_mut_ptr() as *mut _,
+                        sorted_ids_val,
+                        h_sorted.len() * std::mem::size_of::<i32>(),
+                    );
+                }
+                let Some(block_idx) = h_expert_ids.iter().position(|&v| v == eid as i32) else {
+                    eprintln!(
+                        "[PREFILL-DEBUG] moe layer={} ptr-table fused-vs-regular w2 skipped source={} expert={} block=missing",
+                        layer_idx, source, eid
+                    );
+                    return Ok(());
+                };
+                let row_idx = block_idx * block_size as usize;
+                if row_idx >= h_sorted.len() {
+                    return Err(format!(
+                        "moe layer {} ptr-table fused-vs-regular w2 invalid row_idx {} for source={} expert={}",
+                        layer_idx, row_idx, source, eid
+                    ));
+                }
+                let first_sid = h_sorted[row_idx];
+                if first_sid < 0 || first_sid as usize >= m_topk {
+                    return Err(format!(
+                        "moe layer {} ptr-table fused-vs-regular w2 invalid sorted_id {} for source={} expert={}",
+                        layer_idx, first_sid, source, eid
+                    ));
+                }
+                let fused_w2_offset = (first_sid as usize) * h * 2;
+                let sample_len = std::cmp::min(8, h);
+                let mut h_fused_w2 = vec![0u16; sample_len];
+                let input_sample_len = std::cmp::min(8, inter);
+                let mut h_w2_input = vec![0u16; input_sample_len];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_fused_w2.as_mut_ptr() as *mut _,
+                        fused_output_ptr + fused_w2_offset as u64,
+                        sample_len * 2,
+                    );
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_w2_input.as_mut_ptr() as *mut _,
+                        w2_input + (first_sid as usize * inter * 2) as u64,
+                        input_sample_len * 2,
+                    );
+                }
+                let fused_vals: Vec<f32> = h_fused_w2
+                    .iter()
+                    .map(|&v| half::bf16::from_bits(v).to_f32())
+                    .collect();
+                let w2_input_vals: Vec<f32> = h_w2_input
+                    .iter()
+                    .map(|&v| half::bf16::from_bits(v).to_f32())
+                    .collect();
+
+                let ref_w2 = MarlinWeight {
+                    packed: self.h_expert_w2_ptrs[eid],
+                    scales: self.h_expert_w2s_ptrs[eid],
+                    n: h,
+                    k: inter,
+                    num_groups: inter / self.config.group_size,
+                    group_size: self.config.group_size,
+                    num_bits: bits,
+                };
+                let a_ptr = w2_input + (first_sid as usize * inter * 2) as u64;
+                let ref_c = *self.scratch.d_scratch2.device_ptr();
+                self.marlin_gemm(a_ptr, &ref_w2, ref_c, 1).map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table fused-vs-regular w2 regular probe failed for source={} expert={}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                self.stream_sync().map_err(|e| {
+                    format!(
+                        "moe layer {} ptr-table fused-vs-regular w2 regular probe sync failed for source={} expert={}: {}",
+                        layer_idx, source, eid, e
+                    )
+                })?;
+                let mut h_ref_w2 = vec![0u16; sample_len];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        h_ref_w2.as_mut_ptr() as *mut _,
+                        ref_c,
+                        sample_len * 2,
+                    );
+                }
+                let ref_vals: Vec<f32> = h_ref_w2
+                    .iter()
+                    .map(|&v| half::bf16::from_bits(v).to_f32())
+                    .collect();
+                let max_abs = fused_vals
+                    .iter()
+                    .zip(ref_vals.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "[PREFILL-DEBUG] moe layer={} ptr-table fused-vs-regular w2 source={} expert={} sorted_id={} max_abs={:.6} input={:?} fused={:?} ref={:?}",
+                    layer_idx,
+                    source,
+                    eid,
+                    first_sid,
+                    max_abs,
+                    w2_input_vals,
+                    fused_vals,
+                    ref_vals,
+                );
+                Ok(())
+            };
+
+            if let Some(eid) = ptr_table_probe_active {
+                compare_fused_w2(eid, "active")?;
+            }
+            if let Some(eid) = ptr_table_probe_active_last {
+                compare_fused_w2(eid, "active-last")?;
+            }
+            if let Some(eid) = ptr_table_probe_pinned {
+                compare_fused_w2(eid, "pinned")?;
+            }
+            if let Some(eid) = ptr_table_probe_cold {
+                compare_fused_w2(eid, "cold")?;
+            }
         }
         let mt4 = if mt { Some(Instant::now()) } else { None };
 
@@ -5501,17 +9822,29 @@ impl PrefillEngine {
             let mut z0 = moe_accum;
             let mut z1 = m as i32;
             let mut z2 = h as i32;
-            unsafe {
-                launch(self.kernels.moe_zero_accum,
-                    (m as u32, 1, 1), (zt, 1, 1), 0, self.stream,
-                    &mut [
-                        &mut z0 as *mut _ as *mut std::ffi::c_void,
-                        &mut z1 as *mut _ as *mut std::ffi::c_void,
-                        &mut z2 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
+            let dims = if self.cuda_debug.enabled() {
+                format!("layer={} m={} h={}", layer_idx, m, h)
+            } else {
+                String::new()
+            };
+            self.run_cuda_debug_stage(
+                "prefill.fused_moe.zero_accum",
+                "prefill_compute",
+                dims,
+                self.stream,
+                || unsafe {
+                    launch(self.kernels.moe_zero_accum,
+                        (m as u32, 1, 1), (zt, 1, 1), 0, self.stream,
+                        &mut [
+                            &mut z0 as *mut _ as *mut std::ffi::c_void,
+                            &mut z1 as *mut _ as *mut std::ffi::c_void,
+                            &mut z2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
         }
+        self.debug_sync_fused("moe zero accum")?;
         if m_topk > 0 {
             let st = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
             let mut s0 = moe_accum;
@@ -5521,21 +9854,48 @@ impl PrefillEngine {
             let mut s4 = m as i32;
             let mut s5 = topk as i32;
             let mut s6 = scale_factor;
-            unsafe {
-                launch(self.kernels.moe_scatter_weighted,
-                    (m_topk as u32, 1, 1), (st, 1, 1), 0, self.stream,
-                    &mut [
-                        &mut s0 as *mut _ as *mut std::ffi::c_void,
-                        &mut s1 as *mut _ as *mut std::ffi::c_void,
-                        &mut s2 as *mut _ as *mut std::ffi::c_void,
-                        &mut s3 as *mut _ as *mut std::ffi::c_void,
-                        &mut s4 as *mut _ as *mut std::ffi::c_void,
-                        &mut s5 as *mut _ as *mut std::ffi::c_void,
-                        &mut s6 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
+            let dims = if self.cuda_debug.enabled() {
+                format!("layer={} m={} topk={} h={}", layer_idx, m, topk, h)
+            } else {
+                String::new()
+            };
+            self.run_cuda_debug_stage(
+                "prefill.fused_moe.scatter_weighted",
+                "prefill_compute",
+                dims,
+                self.stream,
+                || unsafe {
+                    if prefill_deterministic_scatter_debug_enabled() {
+                        launch(self.kernels.moe_scatter_weighted_deterministic,
+                            (m as u32, 1, 1), (st, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut s0 as *mut _ as *mut std::ffi::c_void,
+                                &mut s1 as *mut _ as *mut std::ffi::c_void,
+                                &mut s2 as *mut _ as *mut std::ffi::c_void,
+                                &mut s3 as *mut _ as *mut std::ffi::c_void,
+                                &mut s4 as *mut _ as *mut std::ffi::c_void,
+                                &mut s5 as *mut _ as *mut std::ffi::c_void,
+                                &mut s6 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )
+                    } else {
+                        launch(self.kernels.moe_scatter_weighted,
+                            (m_topk as u32, 1, 1), (st, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut s0 as *mut _ as *mut std::ffi::c_void,
+                                &mut s1 as *mut _ as *mut std::ffi::c_void,
+                                &mut s2 as *mut _ as *mut std::ffi::c_void,
+                                &mut s3 as *mut _ as *mut std::ffi::c_void,
+                                &mut s4 as *mut _ as *mut std::ffi::c_void,
+                                &mut s5 as *mut _ as *mut std::ffi::c_void,
+                                &mut s6 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )
+                    }
+                },
+            )?;
         }
+        self.debug_sync_fused("moe scatter weighted")?;
 
         // DIAG: check accum after scatter (before shared expert)
         if diag_moe && layer_idx == 0 {
@@ -5563,78 +9923,127 @@ impl PrefillEngine {
 
         // 12. Wait for shared expert on shared_stream, then add to accumulator with sigmoid gate
         if has_shared {
-            // Wait for shared expert to complete on shared_stream
-            unsafe {
-                cuda_sys::lib().cuEventRecord(self.shared_event, self.shared_stream);
-                cuda_sys::lib().cuStreamWaitEvent(self.stream, self.shared_event, 0);
+            if !shared_launched {
+                if force_shared_main_stream {
+                    self.launch_shared_expert_on_main_stream(layer_idx, m)?;
+                } else {
+                    self.launch_shared_expert_on_shared_stream(layer_idx, m)?;
+                }
+                shared_launched = true;
             }
-            let s1_buf = *self.scratch.d_scratch1.device_ptr();
+            if !force_shared_main_stream {
+                self.wait_for_shared_output(layer_idx, "forward_moe_fused consume shared output")?;
+                self.debug_sync_fused("wait for shared output before shared gate gemm")?;
+            }
+            let s1_buf = if force_shared_main_stream {
+                *self.scratch.d_scratch1.device_ptr()
+            } else {
+                *self.d_shared_bf16_scratch1.as_ref()
+                    .ok_or("d_shared_bf16_scratch1 not allocated")?
+                    .device_ptr()
+            };
             let lw_ref = &self.layer_weights[layer_idx];
 
             // Add shared expert to accumulator (with optional sigmoid gate)
             let sg_ptr = lw_ref.shared_gate_ptr;
+            if diag_moe && layer_idx == 0 {
+                let shared_out_last_hash =
+                    self.diag_row_hash_bf16(s1_buf, m.saturating_sub(1), h, h);
+                let shared_out_all_hash = self.diag_span_hash_bf16(s1_buf, m * h);
+                let accum_before_shared_all_hash = self.diag_span_hash_f32(moe_accum, m * h);
+                eprintln!(
+                    "[DIAG FUSED L0] pre_add shared_out_last_hash={:016x} shared_out_all_hash={:016x} accum_before_shared_all_hash={:016x}",
+                    shared_out_last_hash,
+                    shared_out_all_hash,
+                    accum_before_shared_all_hash,
+                );
+            }
             if sg_ptr != 0 {
-                // Compute shared gate: hidden [m, h] @ gate [h, 1] -> gate_out [m, 1] FP32
                 let gate_out = *self.scratch.d_gate_out.device_ptr();
-                let alpha: f32 = 1.0;
-                let beta: f32 = 0.0;
-                unsafe {
-                    use cudarc::cublas::sys as cublas_sys;
-                    use cudarc::cublas::result as cublas_result;
-                    cublas_result::set_stream(
-                        self.cublas_handle,
-                        self.stream as cublas_sys::cudaStream_t,
-                    ).map_err(|e| format!("cublas set_stream: {:?}", e))?;
-                    cublas_result::gemm_ex(
-                        self.cublas_handle,
-                        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                        lw_ref.shared_gate_rows as i32, m as i32, lw_ref.shared_gate_cols as i32,
-                        &alpha as *const f32 as *const std::ffi::c_void,
-                        sg_ptr as *const std::ffi::c_void,
-                        cublas_sys::cudaDataType::CUDA_R_16BF, lw_ref.shared_gate_cols as i32,
-                        hidden as *const std::ffi::c_void,
-                        cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
-                        &beta as *const f32 as *const std::ffi::c_void,
-                        gate_out as *mut std::ffi::c_void,
-                        cublas_sys::cudaDataType::CUDA_R_32F, lw_ref.shared_gate_rows as i32,
-                        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                    ).map_err(|e| format!("shared gate GEMM: {:?}", e))?;
+                self.shared_gate_gemm(
+                    "prefill.shared_gate_gemm.fused",
+                    hidden,
+                    sg_ptr,
+                    lw_ref.shared_gate_rows,
+                    lw_ref.shared_gate_cols,
+                    gate_out,
+                    m,
+                    h,
+                ).map_err(|e| format!("fused shared gate GEMM: {e}"))?;
+                if diag_moe && layer_idx == 0 {
+                    let gate_out_all_hash =
+                        self.diag_span_hash_f32(gate_out, m * lw_ref.shared_gate_rows);
+                    eprintln!(
+                        "[DIAG FUSED L0] pre_add shared_gate_all_hash={:016x}",
+                        gate_out_all_hash,
+                    );
                 }
+                self.cuda_debug.note_transient_buffer_write(
+                    "prefill.shared_gate_output",
+                    format!("forward_moe_fused layer={} generation={}", layer_idx, self.shared_output_generation),
+                );
                 // Add shared expert with sigmoid gating
                 let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
                 let mut as0 = moe_accum; let mut as1 = s1_buf;
                 let mut as2 = gate_out; let mut as3 = m as i32; let mut as4 = h as i32;
-                unsafe {
-                    launch(self.kernels.moe_add_shared_gated,
-                        (m as u32, 1, 1), (ast, 1, 1), 0, self.stream,
-                        &mut [
-                            &mut as0 as *mut _ as *mut std::ffi::c_void,
-                            &mut as1 as *mut _ as *mut std::ffi::c_void,
-                            &mut as2 as *mut _ as *mut std::ffi::c_void,
-                            &mut as3 as *mut _ as *mut std::ffi::c_void,
-                            &mut as4 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
-                }
+                let dims = if self.cuda_debug.enabled() {
+                    format!("layer={} m={} h={}", layer_idx, m, h)
+                } else {
+                    String::new()
+                };
+                self.run_cuda_debug_stage(
+                    "prefill.fused_moe.add_shared_gated",
+                    "prefill_compute",
+                    dims,
+                    self.stream,
+                    || unsafe {
+                        launch(self.kernels.moe_add_shared_gated,
+                            (m as u32, 1, 1), (ast, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut as0 as *mut _ as *mut std::ffi::c_void,
+                                &mut as1 as *mut _ as *mut std::ffi::c_void,
+                                &mut as2 as *mut _ as *mut std::ffi::c_void,
+                                &mut as3 as *mut _ as *mut std::ffi::c_void,
+                                &mut as4 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )
+                    },
+                )?;
             } else {
                 // No gate, add directly
                 let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
                 let mut as0 = moe_accum; let mut as1 = s1_buf;
                 let mut as2 = m as i32; let mut as3 = h as i32;
-                unsafe {
-                    launch(self.kernels.moe_add_shared,
-                        (m as u32, 1, 1), (ast, 1, 1), 0, self.stream,
-                        &mut [
-                            &mut as0 as *mut _ as *mut std::ffi::c_void,
-                            &mut as1 as *mut _ as *mut std::ffi::c_void,
-                            &mut as2 as *mut _ as *mut std::ffi::c_void,
-                            &mut as3 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
-                }
+                let dims = if self.cuda_debug.enabled() {
+                    format!("layer={} m={} h={}", layer_idx, m, h)
+                } else {
+                    String::new()
+                };
+                self.run_cuda_debug_stage(
+                    "prefill.fused_moe.add_shared",
+                    "prefill_compute",
+                    dims,
+                    self.stream,
+                    || unsafe {
+                        launch(self.kernels.moe_add_shared,
+                            (m as u32, 1, 1), (ast, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut as0 as *mut _ as *mut std::ffi::c_void,
+                                &mut as1 as *mut _ as *mut std::ffi::c_void,
+                                &mut as2 as *mut _ as *mut std::ffi::c_void,
+                                &mut as3 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )
+                    },
+                )?;
             }
+        }
+        self.debug_sync_fused("moe add shared")?;
+        if has_shared && !force_shared_main_stream {
+            self.mark_shared_output_consumed(
+                layer_idx,
+                "forward_moe_fused shared output consumed",
+            )?;
         }
 
         // DIAG: accum after shared expert add
@@ -5646,7 +10055,13 @@ impl PrefillEngine {
                     h_acc.as_mut_ptr() as *mut _, moe_accum, (h * 4) as usize);
             }
             let norm: f32 = h_acc.iter().map(|v| v*v).sum::<f32>().sqrt();
-            eprintln!("[DIAG FUSED L0] accum_after_shared[tok0] L2={:.4} first4={:?}", norm, &h_acc[..4]);
+            let accum_after_shared_all_hash = self.diag_span_hash_f32(moe_accum, m * h);
+            eprintln!(
+                "[DIAG FUSED L0] accum_after_shared[tok0] L2={:.4} first4={:?} all_hash={:016x}",
+                norm,
+                &h_acc[..4],
+                accum_after_shared_all_hash,
+            );
         }
 
         // 13. Convert FP32 accum -> BF16 hidden
@@ -5666,10 +10081,18 @@ impl PrefillEngine {
                 )?;
             }
         }
+        self.debug_sync_fused("moe accum to bf16")?;
 
         if let Some(t) = mt5 {
             self.stream_sync()?;
             self.t_moe_shared.set(self.t_moe_shared.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
+        if w1_base != 0 || w2_base != 0 {
+            self.mark_fused_expert_buffer_released(
+                cur,
+                layer_idx,
+                "forward_moe_fused finished using current buffer",
+            )?;
         }
 
         // DIAG: d_hidden after bf16 conversion
@@ -5683,47 +10106,55 @@ impl PrefillEngine {
             let norm: f32 = h_hid.iter().map(|&v| {
                 let f = half::bf16::from_bits(v).to_f32(); f*f
             }).sum::<f32>().sqrt();
-            eprintln!("[DIAG FUSED L0] hidden_after_bf16[tok0] L2={:.4} first4={:?}",
-                norm, h_hid[..4].iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect::<Vec<f32>>());
+            let hidden_after_bf16_all_hash = self.diag_span_hash_bf16(hidden, m * h);
+            eprintln!(
+                "[DIAG FUSED L0] hidden_after_bf16[tok0] L2={:.4} first4={:?} all_hash={:016x}",
+                norm,
+                h_hid[..4].iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect::<Vec<f32>>(),
+                hidden_after_bf16_all_hash,
+            );
         }
 
         // NOTE: Pin-as-you-go caching is deferred to rolling-scan pipeline (multi-chunk only).
         // Single-chunk prompts have no cross-chunk reuse, so pinning wastes VRAM and fragments
         // the allocator. The fused_pin_queue data is available when rolling-scan is implemented.
 
-        // Free per-layer pointer table GPU buffers (allocated with raw cuMemAlloc_v2)
-        if use_ptr_table {
-            unsafe {
-                cuda_sys::lib().cuMemFree_v2(w1_ptrs_gpu);
-                cuda_sys::lib().cuMemFree_v2(w1s_ptrs_gpu);
-                cuda_sys::lib().cuMemFree_v2(w2_ptrs_gpu);
-                cuda_sys::lib().cuMemFree_v2(w2s_ptrs_gpu);
-            }
-        }
-
         Ok(())
     }
 
     fn forward_moe_sequential(&mut self, layer_idx: usize, m: usize) -> Result<(), String> {
-        let lw = &self.layer_weights[layer_idx];
         let h = self.config.hidden_size;
-        let n_experts = lw.moe_num_experts;
-        let topk = lw.moe_topk;
         let inter = self.config.moe_intermediate_size;
-        let scoring_func = lw.moe_scoring_func;
-        let gated = lw.moe_gated;
-        let activation = lw.moe_activation;
-        let _norm_topk = lw.moe_norm_topk_prob;
-        let scale_factor = lw.moe_routed_scaling_factor;
+        let (
+            n_experts,
+            topk,
+            scoring_func,
+            gated,
+            activation,
+            _norm_topk,
+            scale_factor,
+            gate_ptr,
+            moe_layer_idx,
+        ) = {
+            let lw = &self.layer_weights[layer_idx];
+            (
+                lw.moe_num_experts,
+                lw.moe_topk,
+                lw.moe_scoring_func,
+                lw.moe_gated,
+                lw.moe_activation,
+                lw.moe_norm_topk_prob,
+                lw.moe_routed_scaling_factor,
+                lw.moe_gate_ptr,
+                lw.moe_layer_idx,
+            )
+        };
 
         let hidden = *self.scratch.d_hidden.device_ptr();
         let gate_out = *self.scratch.d_gate_out.device_ptr();
         let moe_accum = *self.scratch.d_moe_accum.device_ptr();
 
         // 1. Gate GEMM: [m, hidden] @ [hidden, n_experts] -> [m, n_experts] FP32
-        let gate_ptr = lw.moe_gate_ptr;
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
         unsafe {
             use cudarc::cublas::sys as cublas_sys;
             use cudarc::cublas::result as cublas_result;
@@ -5738,12 +10169,12 @@ impl PrefillEngine {
                 cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                 cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                 n_experts as i32, m as i32, h as i32,
-                &alpha as *const f32 as *const std::ffi::c_void,
+                &CUBLAS_ALPHA_F32 as *const f32 as *const std::ffi::c_void,
                 gate_ptr as *const std::ffi::c_void,
                 cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
                 hidden as *const std::ffi::c_void,
                 cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
-                &beta as *const f32 as *const std::ffi::c_void,
+                &CUBLAS_BETA_F32 as *const f32 as *const std::ffi::c_void,
                 gate_out as *mut std::ffi::c_void,
                 cublas_sys::cudaDataType::CUDA_R_32F, n_experts as i32,
                 cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -5786,10 +10217,20 @@ impl PrefillEngine {
         let gather_wt_ptr = *self.scratch.d_gather_weight_map.device_ptr();
 
         // Zero expert counts and write offsets
-        unsafe {
-            cuda_sys::lib().cuMemsetD8Async(expert_counts_ptr, 0, (n_experts * 4) as usize, self.stream);
-            cuda_sys::lib().cuMemsetD8Async(write_offsets_ptr, 0, (n_experts * 4) as usize, self.stream);
-        }
+        self.memset_d8_async_checked(
+            expert_counts_ptr,
+            0,
+            (n_experts * 4) as usize,
+            self.stream,
+            "moe route zero expert_counts",
+        )?;
+        self.memset_d8_async_checked(
+            write_offsets_ptr,
+            0,
+            (n_experts * 4) as usize,
+            self.stream,
+            "moe route zero write_offsets",
+        )?;
 
         // Phase 1: count tokens per expert
         {
@@ -5820,7 +10261,7 @@ impl PrefillEngine {
             let mut p2 = n_experts as i32;
             unsafe {
                 launch(self.kernels.moe_prefix_sum,
-                    (1, 1, 1), (ps_threads, 1, 1), (n_experts * 4) as u32, self.stream,
+                    (1, 1, 1), (ps_threads, 1, 1), (ps_threads as usize * 4) as u32, self.stream,
                     &mut [
                         &mut p0 as *mut _ as *mut std::ffi::c_void,
                         &mut p1 as *mut _ as *mut std::ffi::c_void,
@@ -5881,7 +10322,7 @@ impl PrefillEngine {
         let diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
         let diag_layer_limit = Self::diag_layer_limit();
         let diag_moe_detail = std::env::var("KRASIS_PREFILL_DIAG_MOE_DETAIL").is_ok();
-        if diag && diag_moe_detail && layer_idx < diag_layer_limit {
+        if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
             // Download top-k weights and ids for token 0
             let mut h_weights = vec![0.0f32; m * topk];
             let mut h_ids = vec![0i32; m * topk];
@@ -5951,7 +10392,7 @@ impl PrefillEngine {
         }
 
         // Diagnostic: check gathered input norms before expert GEMMs
-        if diag && diag_moe_detail && layer_idx < diag_layer_limit && total_active > 0 {
+        if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) && total_active > 0 {
             let diag_positions = Self::diag_positions(m);
             let mut parts = Vec::new();
             for &pos in &diag_positions {
@@ -5970,11 +10411,13 @@ impl PrefillEngine {
         }
 
         // 7-8. Shared expert + routed experts
-        let has_shared = (lw.shared_w1.is_some() && lw.shared_w2.is_some())
-            || (lw.shared_w1_bf16.is_some() && lw.shared_w2_bf16.is_some());
+        let has_shared = {
+            let lw = &self.layer_weights[layer_idx];
+            (lw.shared_w1.is_some() && lw.shared_w2.is_some())
+                || (lw.shared_w1_bf16.is_some() && lw.shared_w2_bf16.is_some())
+        };
 
         // Per-expert Marlin GEMM with HCS-aware dispatch and double-buffered DMA
-        let moe_layer_idx = lw.moe_layer_idx;
         let expert_out = *self.scratch.d_moe_expert_out.device_ptr();
         let gate_up_buf = *self.scratch.d_moe_gate_up.device_ptr();
         let inter_buf = *self.scratch.d_moe_inter.device_ptr();
@@ -6039,13 +10482,16 @@ impl PrefillEngine {
         // Launch shared expert async if all experts are cached (no DMA conflict)
         // Force sync when diagnostics are active so we can add intermediate norm checks
         let all_cached = work.iter().all(|w| w.is_cached);
-        let shared_async = has_shared && all_cached && !(diag && layer_idx < diag_layer_limit);
+        let shared_async = has_shared && all_cached && !(diag && Self::diag_layer_enabled(layer_idx));
         if shared_async {
-            unsafe {
-                cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
-                // shared_stream must wait for main stream's d_hidden to be ready
-                cuda_sys::lib().cuStreamWaitEvent(self.shared_stream, self.compute_event, 0);
-            }
+            self.record_compute_ready_for_shared(
+                layer_idx,
+                "forward_moe_sequential shared async launch",
+            )?;
+            self.wait_shared_for_compute(
+                layer_idx,
+                "forward_moe_sequential shared async launch",
+            )?;
             self.launch_shared_expert_async(layer_idx, m)?;
         }
 
@@ -6074,7 +10520,7 @@ impl PrefillEngine {
                     let mut cur_buf = 0usize;
 
                     // Diagnostic: log first cold expert DMA parameters + buffer sizes
-                    if diag && diag_moe_detail && layer_idx < diag_layer_limit {
+                    if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
                         let fe = &moe_data.experts[cold_work[0].eid];
                         let buf_w13p_bytes = h * w13_n * bits as usize / 8;
                         let buf_w13s_bytes = (h / gs) * w13_n * 2;
@@ -6150,7 +10596,7 @@ impl PrefillEngine {
         // pin_queue data is available when rolling-scan is implemented.
 
         // Diagnostic: dump per-row expert_out norms before scatter to find outliers
-        if diag && diag_moe_detail && layer_idx < diag_layer_limit && total_active > 0 {
+        if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) && total_active > 0 {
             self.stream_sync()?;
             // Download expert_out [total_active, h] BF16 and gather_src_map [total_active] i32
             let mut h_expert_out = vec![0u16; total_active * h];
@@ -6258,7 +10704,7 @@ impl PrefillEngine {
         }
 
         // Diagnostic: routed accum norms at all diagnostic positions
-        if diag && layer_idx < diag_layer_limit {
+        if diag && Self::diag_layer_enabled(layer_idx) {
             let diag_positions = Self::diag_positions(m);
             let mut routed_parts = Vec::new();
             for &pos in &diag_positions {
@@ -6288,19 +10734,18 @@ impl PrefillEngine {
         // 10. Shared expert: add to accumulator
         if has_shared {
             if shared_async {
-                // Wait for async shared expert to finish on shared_stream
-                unsafe {
-                    cuda_sys::lib().cuEventRecord(self.shared_event, self.shared_stream);
-                    cuda_sys::lib().cuStreamWaitEvent(self.stream, self.shared_event, 0);
-                }
-            } else if let (Some(sw1_bf16), Some(sw2_bf16)) = (&lw.shared_w1_bf16, &lw.shared_w2_bf16) {
+                self.wait_for_shared_output(layer_idx, "forward_moe_sequential consume shared output")?;
+            } else if let (Some(sw1_bf16), Some(sw2_bf16)) = {
+                let lw = &self.layer_weights[layer_idx];
+                (lw.shared_w1_bf16, lw.shared_w2_bf16)
+            } {
                 // BF16 shared expert synchronously on main stream via cuBLAS
                 let s1_buf = *self.scratch.d_scratch1.device_ptr();
                 let s2_buf = *self.scratch.d_scratch2.device_ptr();
                 let shared_inter = sw1_bf16.n / (if gated { 2 } else { 1 });
 
                 // w1 GEMM
-                self.cublas_bf16_gemm(hidden, sw1_bf16, s1_buf, m)?;
+                self.cublas_bf16_gemm(hidden, &sw1_bf16, s1_buf, m)?;
 
                 if gated {
                     let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
@@ -6317,7 +10762,7 @@ impl PrefillEngine {
                         )?;
                     }
                     // w2 GEMM
-                    self.cublas_bf16_gemm(s2_buf, sw2_bf16, s1_buf, m)?;
+                    self.cublas_bf16_gemm(s2_buf, &sw2_bf16, s1_buf, m)?;
                 } else {
                     let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
                     let mut ac0 = s1_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
@@ -6331,18 +10776,23 @@ impl PrefillEngine {
                             ],
                         )?;
                     }
-                    self.cublas_bf16_gemm(s1_buf, sw2_bf16, s2_buf, m)?;
+                    self.cublas_bf16_gemm(s1_buf, &sw2_bf16, s2_buf, m)?;
                     self.memcpy_d2d(s1_buf, s2_buf, (m * h * 2) as u64)?;
                 }
             } else {
                 // Run shared expert synchronously on main stream (Marlin)
-                let sw1 = lw.shared_w1.as_ref().ok_or("missing shared w1")?;
-                let sw2 = lw.shared_w2.as_ref().ok_or("missing shared w2")?;
+                let (sw1, sw2) = {
+                    let lw = &self.layer_weights[layer_idx];
+                    (
+                        lw.shared_w1.ok_or("missing shared w1")?,
+                        lw.shared_w2.ok_or("missing shared w2")?,
+                    )
+                };
                 let s1_buf = *self.scratch.d_scratch1.device_ptr();
                 let s2_buf = *self.scratch.d_scratch2.device_ptr();
                 let shared_inter = sw1.n / (if gated { 2 } else { 1 });
 
-                if diag && diag_moe_detail && layer_idx < diag_layer_limit {
+                if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
                     eprintln!("[DIAG] layer{:02}_moe shared_expert sw1: n={} k={} bits={} gs={} groups={}",
                         layer_idx, sw1.n, sw1.k, sw1.num_bits, sw1.group_size, sw1.num_groups);
                     eprintln!("[DIAG] layer{:02}_moe shared_expert sw2: n={} k={} bits={} gs={} groups={}",
@@ -6351,10 +10801,10 @@ impl PrefillEngine {
                         layer_idx, shared_inter, gated, activation);
                 }
 
-                self.marlin_gemm(hidden, sw1, s1_buf, m)?;
+                self.marlin_gemm(hidden, &sw1, s1_buf, m)?;
 
                 if gated {
-                    if diag && diag_moe_detail && layer_idx < diag_layer_limit {
+                    if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
                         let w1_norm = self.diag_l2_norm(s1_buf, 0, sw1.n, sw1.n);
                         eprintln!("[DIAG] layer{:02}_moe shared_w1_out_norm pos0={:.6} (dim={})", layer_idx, w1_norm, sw1.n);
                     }
@@ -6373,12 +10823,12 @@ impl PrefillEngine {
                         )?;
                     }
 
-                    if diag && diag_moe_detail && layer_idx < diag_layer_limit {
+                    if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
                         let act_norm = self.diag_l2_norm(s2_buf, 0, shared_inter, shared_inter);
                         eprintln!("[DIAG] layer{:02}_moe shared_act_out_norm pos0={:.6} (dim={})", layer_idx, act_norm, shared_inter);
                     }
 
-                    self.marlin_gemm(s2_buf, sw2, s1_buf, m)?;
+                    self.marlin_gemm(s2_buf, &sw2, s1_buf, m)?;
                 } else {
                     let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
                     let mut ac0 = s1_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
@@ -6392,43 +10842,35 @@ impl PrefillEngine {
                             ],
                         )?;
                     }
-                    self.marlin_gemm(s1_buf, sw2, s2_buf, m)?;
+                    self.marlin_gemm(s1_buf, &sw2, s2_buf, m)?;
                     self.memcpy_d2d(s1_buf, s2_buf, (m * h * 2) as u64)?;
                 }
             }
 
             // Add shared expert result (in scratch1) to accumulator, with optional sigmoid gate
-            let s1_buf = *self.scratch.d_scratch1.device_ptr();
-            let sg_ptr = lw.shared_gate_ptr;
+            let s1_buf = if shared_async {
+                *self.d_shared_bf16_scratch1.as_ref()
+                    .ok_or("d_shared_bf16_scratch1 not allocated")?
+                    .device_ptr()
+            } else {
+                *self.scratch.d_scratch1.device_ptr()
+            };
+            let (sg_ptr, shared_gate_rows, shared_gate_cols) = {
+                let lw = &self.layer_weights[layer_idx];
+                (lw.shared_gate_ptr, lw.shared_gate_rows, lw.shared_gate_cols)
+            };
             if sg_ptr != 0 {
-                // Compute shared gate: hidden [m, h] @ gate [h, 1] -> gate_out [m, 1] FP32
                 let gate_out = *self.scratch.d_gate_out.device_ptr(); // reuse gate_out buffer (has room for m * n_experts, m*1 is fine)
-                let alpha: f32 = 1.0;
-                let beta: f32 = 0.0;
-                unsafe {
-                    use cudarc::cublas::sys as cublas_sys;
-                    use cudarc::cublas::result as cublas_result;
-                    cublas_result::set_stream(
-                        self.cublas_handle,
-                        self.stream as cublas_sys::cudaStream_t,
-                    ).map_err(|e| format!("cublas set_stream: {:?}", e))?;
-                    cublas_result::gemm_ex(
-                        self.cublas_handle,
-                        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                        lw.shared_gate_rows as i32, m as i32, lw.shared_gate_cols as i32,
-                        &alpha as *const f32 as *const std::ffi::c_void,
-                        sg_ptr as *const std::ffi::c_void,
-                        cublas_sys::cudaDataType::CUDA_R_16BF, lw.shared_gate_cols as i32,
-                        hidden as *const std::ffi::c_void,
-                        cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
-                        &beta as *const f32 as *const std::ffi::c_void,
-                        gate_out as *mut std::ffi::c_void,
-                        cublas_sys::cudaDataType::CUDA_R_32F, lw.shared_gate_rows as i32,
-                        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                    ).map_err(|e| format!("shared gate GEMM: {:?}", e))?;
-                }
+                self.shared_gate_gemm(
+                    "prefill.shared_gate_gemm.sequential",
+                    hidden,
+                    sg_ptr,
+                    shared_gate_rows,
+                    shared_gate_cols,
+                    gate_out,
+                    m,
+                    h,
+                ).map_err(|e| format!("sequential shared gate GEMM: {e}"))?;
                 // Add shared expert with sigmoid gating
                 let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
                 let mut as0 = moe_accum; let mut as1 = s1_buf;
@@ -6462,10 +10904,16 @@ impl PrefillEngine {
                     )?;
                 }
             }
+            if shared_async {
+                self.mark_shared_output_consumed(
+                    layer_idx,
+                    "forward_moe_sequential shared output consumed",
+                )?;
+            }
         }
 
         // Diagnostic: total accum norms + shared expert norms + gate values at all positions
-        if diag && layer_idx < diag_layer_limit {
+        if diag && Self::diag_layer_enabled(layer_idx) {
             let diag_positions = Self::diag_positions(m);
             // Total accum (routed + shared)
             let mut total_parts = Vec::new();
@@ -6483,7 +10931,7 @@ impl PrefillEngine {
             }
             eprintln!("[DIAG] layer{:02}_moe shared_out {}", layer_idx, shared_parts.join(" "));
             // Gate values (if gated)
-            let sg_ptr = lw.shared_gate_ptr;
+            let sg_ptr = self.layer_weights[layer_idx].shared_gate_ptr;
             if sg_ptr != 0 {
                 let gate_out_ptr = *self.scratch.d_gate_out.device_ptr();
                 let gate_vals = self.diag_download_f32(gate_out_ptr, m);
@@ -6522,144 +10970,153 @@ impl PrefillEngine {
 
     /// Launch shared expert computation on copy_stream (async overlap with routed experts).
     /// Result is written to d_scratch1.
-    fn launch_shared_expert_async(&self, layer_idx: usize, m: usize) -> Result<(), String> {
+    fn launch_shared_expert_async(&mut self, layer_idx: usize, m: usize) -> Result<(), String> {
         // Use shared_stream + d_shared_fp32_scratch + d_shared_workspace
         // to avoid data races with the main stream's routed expert dispatch
         // which uses d_fp32_scratch + d_workspace + copy_stream.
-        let lw = &self.layer_weights[layer_idx];
         let h = self.config.hidden_size;
-        let gated = lw.moe_gated;
-        let activation = lw.moe_activation;
+        let (gated, activation, shared_w1_bf16, shared_w2_bf16, shared_w1, shared_w2) = {
+            let lw = &self.layer_weights[layer_idx];
+            (
+                lw.moe_gated,
+                lw.moe_activation,
+                lw.shared_w1_bf16,
+                lw.shared_w2_bf16,
+                lw.shared_w1,
+                lw.shared_w2,
+            )
+        };
         let hidden = *self.scratch.d_hidden.device_ptr();
-        let s1_buf = *self.scratch.d_scratch1.device_ptr();
-        let s2_buf = *self.scratch.d_scratch2.device_ptr();
+        let s1_buf = *self.d_shared_bf16_scratch1.as_ref()
+            .ok_or("d_shared_bf16_scratch1 not allocated (call prepare_for_prefill first)")?
+            .device_ptr();
+        let s2_buf = *self.d_shared_bf16_scratch2.as_ref()
+            .ok_or("d_shared_bf16_scratch2 not allocated (call prepare_for_prefill first)")?
+            .device_ptr();
 
         // BF16 validation mode: use cuBLAS on shared_stream
-        if let (Some(sw1_bf16), Some(sw2_bf16)) = (&lw.shared_w1_bf16, &lw.shared_w2_bf16) {
-            return self.launch_shared_expert_async_bf16(layer_idx, m, sw1_bf16, sw2_bf16);
+        if let (Some(sw1_bf16), Some(sw2_bf16)) = (shared_w1_bf16, shared_w2_bf16) {
+            return self.launch_shared_expert_async_bf16(layer_idx, m, &sw1_bf16, &sw2_bf16);
         }
 
-        let sw1 = lw.shared_w1.as_ref().ok_or("missing shared w1")?;
-        let sw2 = lw.shared_w2.as_ref().ok_or("missing shared w2")?;
+        let sw1 = shared_w1.ok_or("missing shared w1")?;
+        let sw2 = shared_w2.ok_or("missing shared w2")?;
         let shared_inter = sw1.n / (if gated { 2 } else { 1 });
-
-        let st = if sw1.num_bits == 4 { &ScalarType::U4B8 } else { &ScalarType::U8B128 };
-        let f = self.kernels.marlin_mm.ok_or("Marlin GEMM not loaded")?;
 
         let shared_scratch = *self.d_shared_fp32_scratch.as_ref()
             .ok_or("d_shared_fp32_scratch not allocated (call prepare_for_prefill first)")?.device_ptr();
         let shared_ws = *self.d_shared_workspace.as_ref()
             .ok_or("d_shared_workspace not allocated (call prepare_for_prefill first)")?.device_ptr();
-        let shared_ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
-
-        // Zero workspace + C_tmp before w1 GEMM
-        unsafe {
-            cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
-            cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw1.n, self.shared_stream);
-        }
-
-        // w1 GEMM on shared_stream
-        unsafe {
-            f(
-                hidden as *const _, sw1.packed as *const _,
-                s1_buf as *mut _, shared_scratch as *mut _,
-                sw1.scales as *const _, std::ptr::null(), std::ptr::null(),
-                std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
-                m as i32, sw1.n as i32, sw1.k as i32, sw1.k as i32,
-                shared_ws as *mut _,
-                st, false, true, false,
-                sw1.num_groups as i32, sw1.group_size as i32,
-                self.config.device_ordinal as i32,
-                self.shared_stream as u64,
-                -1, -1, self.config.sms as i32,
-                false, true, false,
-            );
-        }
+        self.marlin_gemm_with_resources(
+            "prefill.shared_expert_async.w1",
+            "prefill_shared",
+            self.shared_stream,
+            hidden,
+            &sw1,
+            s1_buf,
+            shared_scratch,
+            shared_ws,
+            m,
+        ).map_err(|e| format!("shared async w1 GEMM: {e}"))?;
+        self.debug_sync_shared("shared expert async w1")?;
 
         // Activation on shared_stream
         if gated {
             let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
             let mut ac0 = s2_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
             let kernel = if activation == 1 { self.kernels.relu2 } else { self.kernels.silu_mul };
-            unsafe {
-                launch(kernel,
-                    (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
-                    &mut [
-                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
-            // Zero workspace + C_tmp before w2 GEMM
-            unsafe {
-                cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
-                cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw2.n, self.shared_stream);
-            }
-            // w2 GEMM on shared_stream
-            unsafe {
-                f(
-                    s2_buf as *const _, sw2.packed as *const _,
-                    s1_buf as *mut _, shared_scratch as *mut _,
-                    sw2.scales as *const _, std::ptr::null(), std::ptr::null(),
-                    std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
-                    m as i32, sw2.n as i32, sw2.k as i32, sw2.k as i32,
-                    shared_ws as *mut _,
-                    st, false, true, false,
-                    sw2.num_groups as i32, sw2.group_size as i32,
-                    self.config.device_ordinal as i32,
-                    self.shared_stream as u64,
-                    -1, -1, self.config.sms as i32,
-                    false, true, false,
-                );
-            }
+            self.run_cuda_debug_stage(
+                if activation == 1 {
+                    "prefill.shared_expert_async.relu"
+                } else {
+                    "prefill.shared_expert_async.silu_mul"
+                },
+                "prefill_shared",
+                format!("m={} shared_inter={}", m, shared_inter),
+                self.shared_stream,
+                || unsafe {
+                    launch(kernel,
+                        (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
+                        &mut [
+                            &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
+            self.debug_sync_shared("shared expert async activation")?;
+            self.marlin_gemm_with_resources(
+                "prefill.shared_expert_async.w2",
+                "prefill_shared",
+                self.shared_stream,
+                s2_buf,
+                &sw2,
+                s1_buf,
+                shared_scratch,
+                shared_ws,
+                m,
+            ).map_err(|e| format!("shared async w2 GEMM: {e}"))?;
         } else {
             let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
             let mut ac0 = s1_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
-            unsafe {
-                launch(self.kernels.relu2,
-                    (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
-                    &mut [
-                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
-            // Zero workspace + C_tmp before w2 GEMM
-            unsafe {
-                cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
-                cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw2.n, self.shared_stream);
-            }
-            unsafe {
-                f(
-                    s1_buf as *const _, sw2.packed as *const _,
-                    s2_buf as *mut _, shared_scratch as *mut _,
-                    sw2.scales as *const _, std::ptr::null(), std::ptr::null(),
-                    std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
-                    m as i32, sw2.n as i32, sw2.k as i32, sw2.k as i32,
-                    shared_ws as *mut _,
-                    st, false, true, false,
-                    sw2.num_groups as i32, sw2.group_size as i32,
-                    self.config.device_ordinal as i32,
-                    self.shared_stream as u64,
-                    -1, -1, self.config.sms as i32,
-                    false, true, false,
-                );
-            }
+            self.run_cuda_debug_stage(
+                "prefill.shared_expert_async.relu",
+                "prefill_shared",
+                format!("m={} shared_inter={}", m, shared_inter),
+                self.shared_stream,
+                || unsafe {
+                    launch(self.kernels.relu2,
+                        (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
+                        &mut [
+                            &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
+            self.debug_sync_shared("shared expert async activation")?;
+            self.marlin_gemm_with_resources(
+                "prefill.shared_expert_async.w2",
+                "prefill_shared",
+                self.shared_stream,
+                s1_buf,
+                &sw2,
+                s2_buf,
+                shared_scratch,
+                shared_ws,
+                m,
+            ).map_err(|e| format!("shared async w2 GEMM: {e}"))?;
             // Copy result from s2 to s1 on shared_stream
-            unsafe {
-                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                    s1_buf, s2_buf, (m * h * 2) as usize, self.shared_stream);
-            }
+            self.run_cuda_debug_stage(
+                "prefill.shared_expert_async.copy_to_s1",
+                "prefill_shared",
+                format!("bytes={}", m * h * 2),
+                self.shared_stream,
+                || {
+                    let err = unsafe {
+                        cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                            s1_buf, s2_buf, (m * h * 2) as usize, self.shared_stream)
+                    };
+                    if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                        Ok(())
+                    } else {
+                        Err(format!("cuMemcpyDtoDAsync_v2 failed: {:?}", err))
+                    }
+                },
+            )?;
         }
 
+        self.debug_sync_shared("shared expert async")?;
+
+        self.mark_shared_output_ready(layer_idx, "launch_shared_expert_async")?;
         Ok(())
     }
 
     /// BF16 shared expert via cuBLAS on shared_stream.
     fn launch_shared_expert_async_bf16(
-        &self, layer_idx: usize, m: usize,
+        &mut self, layer_idx: usize, m: usize,
         sw1: &Bf16Weight, sw2: &Bf16Weight,
     ) -> Result<(), String> {
         let lw = &self.layer_weights[layer_idx];
@@ -6667,32 +11124,33 @@ impl PrefillEngine {
         let gated = lw.moe_gated;
         let activation = lw.moe_activation;
         let hidden = *self.scratch.d_hidden.device_ptr();
-        let s1_buf = *self.scratch.d_scratch1.device_ptr();
-        let s2_buf = *self.scratch.d_scratch2.device_ptr();
+        let s1_buf = *self.d_shared_bf16_scratch1.as_ref()
+            .ok_or("d_shared_bf16_scratch1 not allocated (call prepare_for_prefill first)")?
+            .device_ptr();
+        let s2_buf = *self.d_shared_bf16_scratch2.as_ref()
+            .ok_or("d_shared_bf16_scratch2 not allocated (call prepare_for_prefill first)")?
+            .device_ptr();
         let shared_inter = sw1.n / (if gated { 2 } else { 1 });
+
+        // Use the dedicated shared-stream cuBLAS handle so async shared-expert
+        // BF16 GEMMs never race the main prefill handle.
 
         // w1 GEMM on shared_stream: [m, h] @ [w13_n, h]^T -> [m, w13_n]
         {
-            let alpha: f32 = 1.0;
-            let beta: f32 = 0.0;
             unsafe {
                 use cudarc::cublas::sys as cublas_sys;
                 use cudarc::cublas::result as cublas_result;
-                cublas_result::set_stream(
-                    self.cublas_handle,
-                    self.shared_stream as cublas_sys::cudaStream_t,
-                ).map_err(|e| format!("cublas set_stream shared: {:?}", e))?;
                 cublas_result::gemm_ex(
-                    self.cublas_handle,
+                    self.shared_cublas_handle,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                     sw1.n as i32, m as i32, sw1.k as i32,
-                    &alpha as *const f32 as *const std::ffi::c_void,
+                    &CUBLAS_ALPHA_F32 as *const f32 as *const std::ffi::c_void,
                     sw1.ptr as *const std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, sw1.k as i32,
                     hidden as *const std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, sw1.k as i32,
-                    &beta as *const f32 as *const std::ffi::c_void,
+                    &CUBLAS_BETA_F32 as *const f32 as *const std::ffi::c_void,
                     s1_buf as *mut std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, sw1.n as i32,
                     cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -6706,37 +11164,41 @@ impl PrefillEngine {
             let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
             let mut ac0 = s2_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
             let kernel = if activation == 1 { self.kernels.relu2 } else { self.kernels.silu_mul };
-            unsafe {
-                launch(kernel,
-                    (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
-                    &mut [
-                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
+            self.run_cuda_debug_stage(
+                if activation == 1 {
+                    "prefill.shared_expert_fused.relu"
+                } else {
+                    "prefill.shared_expert_fused.silu_mul"
+                },
+                "prefill_shared",
+                format!("m={} shared_inter={}", m, shared_inter),
+                self.shared_stream,
+                || unsafe {
+                    launch(kernel,
+                        (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
+                        &mut [
+                            &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
             // w2 GEMM on shared_stream
-            let alpha: f32 = 1.0;
-            let beta: f32 = 0.0;
             unsafe {
                 use cudarc::cublas::sys as cublas_sys;
                 use cudarc::cublas::result as cublas_result;
-                cublas_result::set_stream(
-                    self.cublas_handle,
-                    self.shared_stream as cublas_sys::cudaStream_t,
-                ).map_err(|e| format!("cublas set_stream shared: {:?}", e))?;
                 cublas_result::gemm_ex(
-                    self.cublas_handle,
+                    self.shared_cublas_handle,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                     sw2.n as i32, m as i32, sw2.k as i32,
-                    &alpha as *const f32 as *const std::ffi::c_void,
+                    &CUBLAS_ALPHA_F32 as *const f32 as *const std::ffi::c_void,
                     sw2.ptr as *const std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, sw2.k as i32,
                     s2_buf as *const std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, sw2.k as i32,
-                    &beta as *const f32 as *const std::ffi::c_void,
+                    &CUBLAS_BETA_F32 as *const f32 as *const std::ffi::c_void,
                     s1_buf as *mut std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, sw2.n as i32,
                     cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -6746,37 +11208,37 @@ impl PrefillEngine {
         } else {
             let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
             let mut ac0 = s1_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
-            unsafe {
-                launch(self.kernels.relu2,
-                    (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
-                    &mut [
-                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
+            self.run_cuda_debug_stage(
+                "prefill.shared_expert_fused.relu",
+                "prefill_shared",
+                format!("m={} shared_inter={}", m, shared_inter),
+                self.shared_stream,
+                || unsafe {
+                    launch(self.kernels.relu2,
+                        (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
+                        &mut [
+                            &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
             // w2 GEMM
-            let alpha: f32 = 1.0;
-            let beta: f32 = 0.0;
             unsafe {
                 use cudarc::cublas::sys as cublas_sys;
                 use cudarc::cublas::result as cublas_result;
-                cublas_result::set_stream(
-                    self.cublas_handle,
-                    self.shared_stream as cublas_sys::cudaStream_t,
-                ).map_err(|e| format!("cublas set_stream shared: {:?}", e))?;
                 cublas_result::gemm_ex(
-                    self.cublas_handle,
+                    self.shared_cublas_handle,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                     sw2.n as i32, m as i32, sw2.k as i32,
-                    &alpha as *const f32 as *const std::ffi::c_void,
+                    &CUBLAS_ALPHA_F32 as *const f32 as *const std::ffi::c_void,
                     sw2.ptr as *const std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, sw2.k as i32,
                     s1_buf as *const std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, sw2.k as i32,
-                    &beta as *const f32 as *const std::ffi::c_void,
+                    &CUBLAS_BETA_F32 as *const f32 as *const std::ffi::c_void,
                     s2_buf as *mut std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, sw2.n as i32,
                     cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -6784,20 +11246,195 @@ impl PrefillEngine {
                 ).map_err(|e| format!("shared w2 BF16 GEMM: {:?}", e))?;
             }
             // Copy result from s2 to s1 on shared_stream
-            unsafe {
-                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                    s1_buf, s2_buf, (m * h * 2) as usize, self.shared_stream);
-            }
+            self.run_cuda_debug_stage(
+                "prefill.shared_expert_fused.copy_to_s1",
+                "prefill_shared",
+                format!("bytes={}", m * h * 2),
+                self.shared_stream,
+                || {
+                    let err = unsafe {
+                        cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                            s1_buf, s2_buf, (m * h * 2) as usize, self.shared_stream)
+                    };
+                    if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                        Ok(())
+                    } else {
+                        Err(format!("cuMemcpyDtoDAsync_v2 failed: {:?}", err))
+                    }
+                },
+            )?;
         }
 
-        // Restore cuBLAS to main stream
-        unsafe {
-            use cudarc::cublas::sys as cublas_sys;
-            use cudarc::cublas::result as cublas_result;
-            let _ = cublas_result::set_stream(
-                self.cublas_handle,
-                self.stream as cublas_sys::cudaStream_t,
-            );
+        self.debug_sync_shared("shared expert fused")?;
+
+        self.mark_shared_output_ready(layer_idx, "launch_shared_expert_async_bf16")?;
+        Ok(())
+    }
+
+    fn launch_shared_expert_on_main_stream(
+        &mut self,
+        layer_idx: usize,
+        m: usize,
+    ) -> Result<(), String> {
+        let lw = &self.layer_weights[layer_idx];
+        let h = self.config.hidden_size;
+        let gated = lw.moe_gated;
+        let activation = lw.moe_activation;
+
+        if let (Some(sw1_bf16), Some(sw2_bf16)) = (lw.shared_w1_bf16, lw.shared_w2_bf16) {
+            let hidden = *self.scratch.d_hidden.device_ptr();
+            let s1_buf = *self.scratch.d_scratch1.device_ptr();
+            let s2_buf = *self.scratch.d_scratch2.device_ptr();
+            let shared_inter = sw1_bf16.n / (if gated { 2 } else { 1 });
+
+            self.cublas_bf16_gemm(hidden, &sw1_bf16, s1_buf, m)
+                .map_err(|e| format!("shared main-stream w1 BF16 GEMM: {e}"))?;
+
+            if gated {
+                let act_t =
+                    std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
+                let mut ac0 = s2_buf;
+                let mut ac1 = s1_buf;
+                let mut ac2 = shared_inter as i32;
+                let kernel = if activation == 1 {
+                    self.kernels.relu2
+                } else {
+                    self.kernels.silu_mul
+                };
+                self.run_cuda_debug_stage(
+                    if activation == 1 {
+                        "prefill.shared_expert_main_stream.relu"
+                    } else {
+                        "prefill.shared_expert_main_stream.silu_mul"
+                    },
+                    "prefill_compute",
+                    format!("m={} shared_inter={}", m, shared_inter),
+                    self.stream,
+                    || unsafe {
+                        launch(
+                            kernel,
+                            (m as u32, 1, 1),
+                            (act_t as u32, 1, 1),
+                            0,
+                            self.stream,
+                            &mut [
+                                &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                                &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                                &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )
+                    },
+                )?;
+                self.cublas_bf16_gemm(s2_buf, &sw2_bf16, s1_buf, m)
+                    .map_err(|e| format!("shared main-stream w2 BF16 GEMM: {e}"))?;
+            } else {
+                let act_t =
+                    std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
+                let mut ac0 = s1_buf;
+                let mut ac1 = s1_buf;
+                let mut ac2 = shared_inter as i32;
+                self.run_cuda_debug_stage(
+                    "prefill.shared_expert_main_stream.relu",
+                    "prefill_compute",
+                    format!("m={} shared_inter={}", m, shared_inter),
+                    self.stream,
+                    || unsafe {
+                        launch(
+                            self.kernels.relu2,
+                            (m as u32, 1, 1),
+                            (act_t as u32, 1, 1),
+                            0,
+                            self.stream,
+                            &mut [
+                                &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                                &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                                &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )
+                    },
+                )?;
+                self.cublas_bf16_gemm(s1_buf, &sw2_bf16, s2_buf, m)
+                    .map_err(|e| format!("shared main-stream w2 BF16 GEMM: {e}"))?;
+                self.memcpy_d2d(s1_buf, s2_buf, (m * h * 2) as u64)?;
+            }
+
+            return Ok(());
+        }
+
+        let hidden = *self.scratch.d_hidden.device_ptr();
+        let sw1 = lw.shared_w1.ok_or("missing shared w1")?;
+        let sw2 = lw.shared_w2.ok_or("missing shared w2")?;
+        let s1_buf = *self.scratch.d_scratch1.device_ptr();
+        let s2_buf = *self.scratch.d_scratch2.device_ptr();
+        let shared_inter = sw1.n / (if gated { 2 } else { 1 });
+
+        self.marlin_gemm(hidden, &sw1, s1_buf, m)
+            .map_err(|e| format!("shared main-stream w1 GEMM: {e}"))?;
+
+        if gated {
+            let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
+            let mut ac0 = s2_buf;
+            let mut ac1 = s1_buf;
+            let mut ac2 = shared_inter as i32;
+            let kernel = if activation == 1 {
+                self.kernels.relu2
+            } else {
+                self.kernels.silu_mul
+            };
+            self.run_cuda_debug_stage(
+                if activation == 1 {
+                    "prefill.shared_expert_main_stream.relu"
+                } else {
+                    "prefill.shared_expert_main_stream.silu_mul"
+                },
+                "prefill_compute",
+                format!("m={} shared_inter={}", m, shared_inter),
+                self.stream,
+                || unsafe {
+                    launch(
+                        kernel,
+                        (m as u32, 1, 1),
+                        (act_t as u32, 1, 1),
+                        0,
+                        self.stream,
+                        &mut [
+                            &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
+            self.marlin_gemm(s2_buf, &sw2, s1_buf, m)
+                .map_err(|e| format!("shared main-stream w2 GEMM: {e}"))?;
+        } else {
+            let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
+            let mut ac0 = s1_buf;
+            let mut ac1 = s1_buf;
+            let mut ac2 = shared_inter as i32;
+            self.run_cuda_debug_stage(
+                "prefill.shared_expert_main_stream.relu",
+                "prefill_compute",
+                format!("m={} shared_inter={}", m, shared_inter),
+                self.stream,
+                || unsafe {
+                    launch(
+                        self.kernels.relu2,
+                        (m as u32, 1, 1),
+                        (act_t as u32, 1, 1),
+                        0,
+                        self.stream,
+                        &mut [
+                            &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
+            self.marlin_gemm(s1_buf, &sw2, s2_buf, m)
+                .map_err(|e| format!("shared main-stream w2 GEMM: {e}"))?;
+            self.memcpy_d2d(s1_buf, s2_buf, (m * h * 2) as u64)?;
         }
 
         Ok(())
@@ -6836,18 +11473,26 @@ impl PrefillEngine {
                 let w2_off = (eid * self.w2_packed_per_expert) as u64;
                 let w2s_off = (eid * self.w2_scales_per_expert) as u64;
                 unsafe {
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        w1_base + w1_off, e.w13_packed_ptr as *const _,
-                        e.w13_packed_bytes, self.copy_stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        w1s_base + w1s_off, e.w13_scales_ptr as *const _,
-                        e.w13_scales_bytes, self.copy_stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        w2_base + w2_off, e.w2_packed_ptr as *const _,
-                        e.w2_packed_bytes, self.copy_stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        w2s_base + w2s_off, e.w2_scales_ptr as *const _,
-                        e.w2_scales_bytes, self.copy_stream);
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        w1_base + w1_off, e.w13_packed_ptr as *const _, e.w13_packed_bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("bulk DMA fallback w13_packed expert {}: {:?}", eid, err));
+                    }
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        w1s_base + w1s_off, e.w13_scales_ptr as *const _, e.w13_scales_bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("bulk DMA fallback w13_scales expert {}: {:?}", eid, err));
+                    }
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        w2_base + w2_off, e.w2_packed_ptr as *const _, e.w2_packed_bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("bulk DMA fallback w2_packed expert {}: {:?}", eid, err));
+                    }
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        w2s_base + w2s_off, e.w2_scales_ptr as *const _, e.w2_scales_bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("bulk DMA fallback w2_scales expert {}: {:?}", eid, err));
+                    }
                 }
             }
         }
@@ -6892,11 +11537,11 @@ impl PrefillEngine {
         let w2_base = match w2_buf { Some(b) => *b.device_ptr(), None => return Ok(()) };
         let w2s_base = match w2s_buf { Some(b) => *b.device_ptr(), None => return Ok(()) };
 
-        // No need to wait for compute: double-buffer ensures we write to the
-        // OTHER buffer while compute uses the current one.  The copy_stream is
-        // sequential, so DMA(N+1) naturally waits for DMA(N) to finish.
-        // Two full DMA cycles elapse before a buffer is reused, which exceeds
-        // the compute time per layer (26ms DMA >> 4.5ms compute).
+        self.wait_fused_expert_buffer_reusable(
+            next_buf,
+            next_layer,
+            "preload_next_moe_layer",
+        )?;
 
         // DMA experts for next layer into the other buffer.
         // With pinning: selective DMA using pre-scan routing (pinned D2D + cold H2D).
@@ -6935,21 +11580,33 @@ impl PrefillEngine {
                     } else {
                         (0..self.config.n_routed_experts).collect()
                     };
-                    let _ = self.selective_dma_layer(
+                    self.selective_dma_layer(
                         moe_data, next_layer, mi,
                         w1_base, w1s_base, w2_base, w2s_base,
-                        &active);
+                        &active,
+                    ).map_err(|e| format!("preload next moe layer {}: {}", next_layer, e))?;
                 } else {
-                    self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+                    self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)
+                        .map_err(|e| format!("preload next moe layer {}: {}", next_layer, e))?;
                 }
             } else {
-                self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
+                self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)
+                    .map_err(|e| format!("preload next moe layer {}: {}", next_layer, e))?;
             }
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
             }
             self.preloaded_moe_layer = Some(next_layer);
             self.fused_expert_buf_cur = next_buf;
+            self.mark_fused_expert_buffer_loaded(next_buf, next_layer, "preload_next_moe_layer");
+            self.cuda_debug.note_transient_buffer_write(
+                "prefill.preloaded_moe_layer",
+                format!("preload_next_moe_layer layer={}", next_layer),
+            );
+            self.cuda_debug.note_transient_buffer_write(
+                "prefill.fused_expert_buf_cur",
+                format!("preload_next_moe_layer buffer={}", next_buf),
+            );
         }
 
         Ok(())
@@ -6995,8 +11652,6 @@ impl PrefillEngine {
             let gate_ptr = self.layer_weights[layer_idx].moe_gate_ptr;
 
             // Gate GEMM: [total_m, hidden] @ [hidden, n_experts] -> [total_m, n_experts] FP32
-            let alpha: f32 = 1.0;
-            let beta: f32 = 0.0;
             unsafe {
                 use cudarc::cublas::sys as cublas_sys;
                 use cudarc::cublas::result as cublas_result;
@@ -7009,12 +11664,12 @@ impl PrefillEngine {
                     cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                     n_experts as i32, total_m as i32, h as i32,
-                    &alpha as *const f32 as *const std::ffi::c_void,
+                    &CUBLAS_ALPHA_F32 as *const f32 as *const std::ffi::c_void,
                     gate_ptr as *const std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
                     hidden as *const std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
-                    &beta as *const f32 as *const std::ffi::c_void,
+                    &CUBLAS_BETA_F32 as *const f32 as *const std::ffi::c_void,
                     gate_out as *mut std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_32F, n_experts as i32,
                     cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -7080,6 +11735,10 @@ impl PrefillEngine {
         }
 
         self.prescan_active_experts = per_chunk;
+        self.cuda_debug.note_transient_buffer_write(
+            "prefill.prescan_active_experts",
+            format!("prescan layers={} chunks_per_layer={}", num_moe_layers, num_chunks),
+        );
         let ms = t_prescan.elapsed().as_secs_f64() * 1000.0;
         let total_active: usize = counts.iter().map(|c| c.iter().filter(|&&v| v > 0).count()).sum();
         if stderr_debug_enabled() || prefill_debug_enabled() {
@@ -7097,9 +11756,10 @@ impl PrefillEngine {
         let n_experts = self.config.n_routed_experts;
         let num_moe_layers = prescan_counts.len();
 
-        // Compute per-expert byte sizes (same as fused buffer layout)
-        let expert_bytes = self.w1_packed_per_expert + self.w1_scales_per_expert
-            + self.w2_packed_per_expert + self.w2_scales_per_expert;
+        // Use the same 256-byte-aligned component layout as the Marlin-backed expert
+        // cache so pointer-table consumers see identical per-component alignment.
+        let slot = self.expert_slot_layout();
+        let expert_bytes = slot.total_bytes;
         if expert_bytes == 0 { return Ok(0); }
         self.pinning_pool_expert_bytes = expert_bytes;
 
@@ -7111,8 +11771,11 @@ impl PrefillEngine {
             (f, t)
         };
 
-        // Reserve safety margin (proportional to GPU size, min 512 MB)
-        let safety = std::cmp::max(512 * 1024 * 1024, free / 8);
+        // Reserve the same configured safety floor that prefill sizing uses.
+        // Pinning is an optimization, so it must not consume the VRAM headroom
+        // reserved for stable fused-prefill execution on this live request.
+        let safety_margin_mb = self.safety_margin_mb.max(PREFILL_SAFETY_MARGIN_MB);
+        let safety = safety_margin_mb * 1024 * 1024;
         let pool_budget = if free > safety { free - safety } else { 0 };
 
         // Total pinnable experts across all layers
@@ -7144,19 +11807,36 @@ impl PrefillEngine {
 
         if stderr_debug_enabled() {
             let avg_pinned = total_pinned as f64 / num_moe_layers as f64;
-            eprintln!("[PREFILL] Pinning pool: {:.0} MB free, cap {}/{} experts/layer, pinning {} total ({:.1} avg/layer, {:.0} MB)",
-                free as f64 / 1e6, experts_per_layer, n_experts, total_pinned, avg_pinned, pool_bytes as f64 / 1e6);
+            eprintln!(
+                "[PREFILL] Pinning pool: {:.0} MB free, safety {} MB, cap {}/{} experts/layer, pinning {} total ({:.1} avg/layer, {:.0} MB)",
+                free as f64 / 1e6,
+                safety / (1024 * 1024),
+                experts_per_layer,
+                n_experts,
+                total_pinned,
+                avg_pinned,
+                pool_bytes as f64 / 1e6
+            );
         }
 
         // Allocate the pool using raw CUDA driver API
-        let pool_base: u64 = unsafe {
-            let mut dptr: u64 = 0;
-            let err = cuda_sys::lib().cuMemAlloc_v2(&mut dptr, pool_bytes);
-            if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                return Err(format!("cuMemAlloc pinning pool {} bytes: {:?}", pool_bytes, err));
+        let pool_base: u64 = if self.cuda_debug.alloc_debug_enabled() {
+            self.cuda_debug
+                .alloc_zeroed_owned(pool_bytes, self.config.device_ordinal as i32, "pinning_pool", file!(), line!())?
+                .payload_ptr
+        } else {
+            unsafe {
+                let mut dptr: u64 = 0;
+                let err = cuda_sys::lib().cuMemAlloc_v2(&mut dptr, pool_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("cuMemAlloc pinning pool {} bytes: {:?}", pool_bytes, err));
+                }
+                // Do not zero the whole pool asynchronously here. The pinning path
+                // immediately fills each pinned slot with synchronous HtoD copies,
+                // and an unordered memset on self.stream can race those uploads and
+                // clobber freshly-copied expert bytes before the fused W1/W2 reads.
+                dptr
             }
-            cuda_sys::lib().cuMemsetD8Async(dptr, 0, pool_bytes, self.stream);
-            dptr
         };
 
         // For each MoE layer, sort experts by activation count and pin the top N
@@ -7196,19 +11876,27 @@ impl PrefillEngine {
                     if eid < moe_data.experts.len() {
                         let e = &moe_data.experts[eid];
                         let dst = pool_base + pool_offset as u64;
-                        let mut off = 0u64;
                         unsafe {
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                dst + off, e.w13_packed_ptr as *const _, e.w13_packed_bytes, self.copy_stream);
-                            off += self.w1_packed_per_expert as u64;
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                dst + off, e.w13_scales_ptr as *const _, e.w13_scales_bytes, self.copy_stream);
-                            off += self.w1_scales_per_expert as u64;
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                dst + off, e.w2_packed_ptr as *const _, e.w2_packed_bytes, self.copy_stream);
-                            off += self.w2_packed_per_expert as u64;
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                dst + off, e.w2_scales_ptr as *const _, e.w2_scales_bytes, self.copy_stream);
+                            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                dst + slot.w1_packed_off as u64, e.w13_packed_ptr as *const _, e.w13_packed_bytes);
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(format!("pinning pool w13_packed layer {} expert {}: {:?}", layer_idx, eid, err));
+                            }
+                            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                dst + slot.w1_scales_off as u64, e.w13_scales_ptr as *const _, e.w13_scales_bytes);
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(format!("pinning pool w13_scales layer {} expert {}: {:?}", layer_idx, eid, err));
+                            }
+                            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                dst + slot.w2_packed_off as u64, e.w2_packed_ptr as *const _, e.w2_packed_bytes);
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(format!("pinning pool w2_packed layer {} expert {}: {:?}", layer_idx, eid, err));
+                            }
+                            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                                dst + slot.w2_scales_off as u64, e.w2_scales_ptr as *const _, e.w2_scales_bytes);
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(format!("pinning pool w2_scales layer {} expert {}: {:?}", layer_idx, eid, err));
+                            }
                         }
                     }
                 }
@@ -7234,6 +11922,14 @@ impl PrefillEngine {
         self.pinning_pool_bytes = pool_bytes;
         self.pinned_expert_offsets = offsets;
         self.pinning_active = true;
+        self.cuda_debug.note_transient_buffer_write(
+            "prefill.pinning_pool",
+            format!("allocate_pinning_pool ptr=0x{:x} bytes={}", pool_base, pool_bytes),
+        );
+        self.cuda_debug.note_transient_buffer_write(
+            "prefill.pinned_expert_offsets",
+            format!("allocate_pinning_pool layers={} total_pinned={}", num_moe_layers, total_pinned),
+        );
 
         Ok(pin_counts.iter().copied().max().unwrap_or(0))
     }
@@ -7297,23 +11993,20 @@ impl PrefillEngine {
 
             if let Some(pool_off) = pin_offset {
                 // Fast D2D from pinning pool to fused buffer
+                let slot = self.expert_slot_layout();
                 let src = pool_base + pool_off as u64;
-                let mut src_off = 0u64;
                 unsafe {
                     cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                        w1_base + w1_off, src + src_off,
+                        w1_base + w1_off, src + slot.w1_packed_off as u64,
                         self.w1_packed_per_expert, self.copy_stream);
-                    src_off += self.w1_packed_per_expert as u64;
                     cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                        w1s_base + w1s_off, src + src_off,
+                        w1s_base + w1s_off, src + slot.w1_scales_off as u64,
                         self.w1_scales_per_expert, self.copy_stream);
-                    src_off += self.w1_scales_per_expert as u64;
                     cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                        w2_base + w2_off, src + src_off,
+                        w2_base + w2_off, src + slot.w2_packed_off as u64,
                         self.w2_packed_per_expert, self.copy_stream);
-                    src_off += self.w2_packed_per_expert as u64;
                     cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                        w2s_base + w2s_off, src + src_off,
+                        w2s_base + w2s_off, src + slot.w2_scales_off as u64,
                         self.w2_scales_per_expert, self.copy_stream);
                 }
                 pinned += 1;
@@ -7321,18 +12014,26 @@ impl PrefillEngine {
                 // Tier 3: Cold - H2D from CPU via copy_stream
                 let e = &moe_data.experts[eid];
                 unsafe {
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        w1_base + w1_off, e.w13_packed_ptr as *const _,
-                        e.w13_packed_bytes, self.copy_stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        w1s_base + w1s_off, e.w13_scales_ptr as *const _,
-                        e.w13_scales_bytes, self.copy_stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        w2_base + w2_off, e.w2_packed_ptr as *const _,
-                        e.w2_packed_bytes, self.copy_stream);
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        w2s_base + w2s_off, e.w2_scales_ptr as *const _,
-                        e.w2_scales_bytes, self.copy_stream);
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        w1_base + w1_off, e.w13_packed_ptr as *const _, e.w13_packed_bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("selective DMA cold w13_packed layer {} expert {}: {:?}", model_layer_idx, eid, err));
+                    }
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        w1s_base + w1s_off, e.w13_scales_ptr as *const _, e.w13_scales_bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("selective DMA cold w13_scales layer {} expert {}: {:?}", model_layer_idx, eid, err));
+                    }
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        w2_base + w2_off, e.w2_packed_ptr as *const _, e.w2_packed_bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("selective DMA cold w2_packed layer {} expert {}: {:?}", model_layer_idx, eid, err));
+                    }
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        w2s_base + w2s_off, e.w2_scales_ptr as *const _, e.w2_scales_bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("selective DMA cold w2_scales layer {} expert {}: {:?}", model_layer_idx, eid, err));
+                    }
                 }
                 cold += 1;
             }
@@ -7343,27 +12044,39 @@ impl PrefillEngine {
 
     /// Launch shared expert on the dedicated shared_stream (gap 4).
     /// Uses separate workspace/scratch to avoid data races with main stream.
-    fn launch_shared_expert_on_shared_stream(&self, layer_idx: usize, m: usize) -> Result<(), String> {
-        let lw = &self.layer_weights[layer_idx];
+    fn launch_shared_expert_on_shared_stream(&mut self, layer_idx: usize, m: usize) -> Result<(), String> {
         let h = self.config.hidden_size;
-        let gated = lw.moe_gated;
-        let activation = lw.moe_activation;
+        if self.shared_consume_generation != 0 {
+            self.wait_for_shared_output_consumed(
+                "launch_shared_expert_on_shared_stream shared scratch-reuse wait",
+            )?;
+        }
+        let (gated, activation, shared_w1_bf16, shared_w2_bf16, shared_w1, shared_w2) = {
+            let lw = &self.layer_weights[layer_idx];
+            (
+                lw.moe_gated,
+                lw.moe_activation,
+                lw.shared_w1_bf16,
+                lw.shared_w2_bf16,
+                lw.shared_w1,
+                lw.shared_w2,
+            )
+        };
         let hidden = *self.scratch.d_hidden.device_ptr();
-        let s1_buf = *self.scratch.d_scratch1.device_ptr();
-        let s2_buf = *self.scratch.d_scratch2.device_ptr();
-        let shared_ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
-
+        let s1_buf = *self.d_shared_bf16_scratch1.as_ref()
+            .ok_or("d_shared_bf16_scratch1 not allocated")?
+            .device_ptr();
+        let s2_buf = *self.d_shared_bf16_scratch2.as_ref()
+            .ok_or("d_shared_bf16_scratch2 not allocated")?
+            .device_ptr();
         // BF16 validation mode: reuse the async BF16 method
-        if let (Some(sw1_bf16), Some(sw2_bf16)) = (&lw.shared_w1_bf16, &lw.shared_w2_bf16) {
-            return self.launch_shared_expert_async_bf16(layer_idx, m, sw1_bf16, sw2_bf16);
+        if let (Some(sw1_bf16), Some(sw2_bf16)) = (shared_w1_bf16, shared_w2_bf16) {
+            return self.launch_shared_expert_async_bf16(layer_idx, m, &sw1_bf16, &sw2_bf16);
         }
 
-        let sw1 = lw.shared_w1.as_ref().ok_or("missing shared w1")?;
-        let sw2 = lw.shared_w2.as_ref().ok_or("missing shared w2")?;
+        let sw1 = shared_w1.ok_or("missing shared w1")?;
+        let sw2 = shared_w2.ok_or("missing shared w2")?;
         let shared_inter = sw1.n / (if gated { 2 } else { 1 });
-
-        let st = if sw1.num_bits == 4 { &ScalarType::U4B8 } else { &ScalarType::U8B128 };
-        let f = self.kernels.marlin_mm.ok_or("Marlin GEMM not loaded")?;
 
         // Use shared_stream + shared workspace to avoid conflicts
         let shared_scratch = *self.d_shared_fp32_scratch.as_ref()
@@ -7371,98 +12084,109 @@ impl PrefillEngine {
         let shared_ws = *self.d_shared_workspace.as_ref()
             .ok_or("d_shared_workspace not allocated")?.device_ptr();
 
-        // w1 GEMM on shared_stream — zero workspace locks + C_tmp first
-        unsafe {
-            cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
-            cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw1.n, self.shared_stream);
-            f(
-                hidden as *const _, sw1.packed as *const _,
-                s1_buf as *mut _, shared_scratch as *mut _,
-                sw1.scales as *const _, std::ptr::null(), std::ptr::null(),
-                std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
-                m as i32, sw1.n as i32, sw1.k as i32, sw1.k as i32,
-                shared_ws as *mut _,
-                st, false, true, false,
-                sw1.num_groups as i32, sw1.group_size as i32,
-                self.config.device_ordinal as i32,
-                self.shared_stream as u64,
-                -1, -1, self.config.sms as i32,
-                false, true, false,
-            );
-        }
+        self.marlin_gemm_with_resources(
+            "prefill.shared_expert_fused.w1",
+            "prefill_shared",
+            self.shared_stream,
+            hidden,
+            &sw1,
+            s1_buf,
+            shared_scratch,
+            shared_ws,
+            m,
+        ).map_err(|e| format!("shared fused w1 GEMM: {e}"))?;
+        self.debug_sync_shared("shared expert fused w1")?;
 
         // Activation
         if gated {
             let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
             let mut ac0 = s2_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
             let kernel = if activation == 1 { self.kernels.relu2 } else { self.kernels.silu_mul };
-            unsafe {
-                launch(kernel,
-                    (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
-                    &mut [
-                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
-            // w2 GEMM on shared_stream — zero workspace locks + C_tmp first
-            unsafe {
-                cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
-                cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw2.n, self.shared_stream);
-                f(
-                    s2_buf as *const _, sw2.packed as *const _,
-                    s1_buf as *mut _, shared_scratch as *mut _,
-                    sw2.scales as *const _, std::ptr::null(), std::ptr::null(),
-                    std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
-                    m as i32, sw2.n as i32, sw2.k as i32, sw2.k as i32,
-                    shared_ws as *mut _,
-                    st, false, true, false,
-                    sw2.num_groups as i32, sw2.group_size as i32,
-                    self.config.device_ordinal as i32,
-                    self.shared_stream as u64,
-                    -1, -1, self.config.sms as i32,
-                    false, true, false,
-                );
-            }
+            self.run_cuda_debug_stage(
+                if activation == 1 {
+                    "prefill.shared_expert_fused.relu"
+                } else {
+                    "prefill.shared_expert_fused.silu_mul"
+                },
+                "prefill_shared",
+                format!("m={} shared_inter={}", m, shared_inter),
+                self.shared_stream,
+                || unsafe {
+                    launch(kernel,
+                        (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
+                        &mut [
+                            &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
+            self.debug_sync_shared("shared expert fused activation")?;
+            self.marlin_gemm_with_resources(
+                "prefill.shared_expert_fused.w2",
+                "prefill_shared",
+                self.shared_stream,
+                s2_buf,
+                &sw2,
+                s1_buf,
+                shared_scratch,
+                shared_ws,
+                m,
+            ).map_err(|e| format!("shared fused w2 GEMM: {e}"))?;
         } else {
             let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
             let mut ac0 = s1_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
-            unsafe {
-                launch(self.kernels.relu2,
-                    (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
-                    &mut [
-                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
-                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
-            }
-            // w2 GEMM on shared_stream — zero workspace locks + C_tmp first
-            unsafe {
-                cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
-                cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw2.n, self.shared_stream);
-                f(
-                    s1_buf as *const _, sw2.packed as *const _,
-                    s2_buf as *mut _, shared_scratch as *mut _,
-                    sw2.scales as *const _, std::ptr::null(), std::ptr::null(),
-                    std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
-                    m as i32, sw2.n as i32, sw2.k as i32, sw2.k as i32,
-                    shared_ws as *mut _,
-                    st, false, true, false,
-                    sw2.num_groups as i32, sw2.group_size as i32,
-                    self.config.device_ordinal as i32,
-                    self.shared_stream as u64,
-                    -1, -1, self.config.sms as i32,
-                    false, true, false,
-                );
-            }
-            unsafe {
-                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                    s1_buf, s2_buf, (m * h * 2) as usize, self.shared_stream);
-            }
+            self.run_cuda_debug_stage(
+                "prefill.shared_expert_fused.relu",
+                "prefill_shared",
+                format!("m={} shared_inter={}", m, shared_inter),
+                self.shared_stream,
+                || unsafe {
+                    launch(self.kernels.relu2,
+                        (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
+                        &mut [
+                            &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                            &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )
+                },
+            )?;
+            self.debug_sync_shared("shared expert fused activation")?;
+            self.marlin_gemm_with_resources(
+                "prefill.shared_expert_fused.w2",
+                "prefill_shared",
+                self.shared_stream,
+                s1_buf,
+                &sw2,
+                s2_buf,
+                shared_scratch,
+                shared_ws,
+                m,
+            ).map_err(|e| format!("shared fused w2 GEMM: {e}"))?;
+            self.run_cuda_debug_stage(
+                "prefill.shared_expert_fused.copy_to_s1",
+                "prefill_shared",
+                format!("bytes={}", m * h * 2),
+                self.shared_stream,
+                || {
+                    let err = unsafe {
+                        cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                            s1_buf, s2_buf, (m * h * 2) as usize, self.shared_stream)
+                    };
+                    if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                        Ok(())
+                    } else {
+                        Err(format!("cuMemcpyDtoDAsync_v2 failed: {:?}", err))
+                    }
+                },
+            )?;
         }
 
+        self.debug_sync_shared("shared expert fused")?;
+
+        self.mark_shared_output_ready(layer_idx, "launch_shared_expert_on_shared_stream")?;
         Ok(())
     }
 
@@ -7709,8 +12433,6 @@ impl PrefillEngine {
             // BF16 LM head via cuBLAS GEMM
             use cudarc::cublas::sys as cublas_sys;
             use cudarc::cublas::result as cublas_result;
-            let alpha: f32 = 1.0;
-            let beta: f32 = 0.0;
             unsafe {
                 cublas_result::set_stream(
                     self.cublas_handle,
@@ -7721,12 +12443,12 @@ impl PrefillEngine {
                     cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                     self.lm_head_bf16_rows as i32, 1, self.lm_head_bf16_cols as i32,
-                    &alpha as *const f32 as *const std::ffi::c_void,
+                    &CUBLAS_ALPHA_F32 as *const f32 as *const std::ffi::c_void,
                     self.lm_head_bf16_ptr as *const std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, self.lm_head_bf16_cols as i32,
                     last_tok as *const std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
-                    &beta as *const f32 as *const std::ffi::c_void,
+                    &CUBLAS_BETA_F32 as *const f32 as *const std::ffi::c_void,
                     *self.scratch.d_logits.device_ptr() as *mut std::ffi::c_void,
                     cublas_sys::cudaDataType::CUDA_R_32F, self.lm_head_bf16_rows as i32,
                     cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -7736,6 +12458,7 @@ impl PrefillEngine {
         } else {
             return Err("No LM head (neither Marlin nor BF16)".to_string());
         }
+        self.debug_sync_fused("prefill lm head")?;
 
         // Download logits
         self.h_logits.resize(v, 0.0);
@@ -7750,6 +12473,7 @@ impl PrefillEngine {
                 return Err(format!("Download logits: {:?}", err));
             }
         }
+        self.debug_sync_fused("prefill logits download launch")?;
         self.stream_sync()?;
 
         // Suppress tokens
@@ -7757,12 +12481,29 @@ impl PrefillEngine {
             if (t as usize) < v { self.h_logits[t as usize] = f32::NEG_INFINITY; }
         }
 
+        let sample_diag = std::env::var("KRASIS_PREFILL_SAMPLE_DIAG").is_ok();
+        let diag_top = if sample_diag {
+            Some(crate::decode::extract_top_logprobs(&self.h_logits, v, 8))
+        } else {
+            None
+        };
+
         // Sample
         if temperature < 1e-6 {
             // Greedy
             let (best, _) = self.h_logits.iter().enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or((0, &0.0));
+            if let Some(ref top) = diag_top {
+                let top_str = top.iter()
+                    .map(|&(tid, lp)| format!("{}:{:.4}", tid, lp))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "[PREFILL-SAMPLE-DIAG] mode=greedy m={} chosen={} top=[{}]",
+                    m, best, top_str
+                );
+            }
             Ok(best as u32)
         } else {
             // Temperature-scaled softmax sampling
@@ -7786,7 +12527,29 @@ impl PrefillEngine {
             let mut cum = 0.0f64;
             for (i, &p) in self.h_logits.iter().enumerate() {
                 cum += p as f64;
-                if cum >= r { return Ok(i as u32); }
+                if cum >= r {
+                    if let Some(ref top) = diag_top {
+                        let top_str = top.iter()
+                            .map(|&(tid, lp)| format!("{}:{:.4}", tid, lp))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        eprintln!(
+                            "[PREFILL-SAMPLE-DIAG] mode=temp m={} chosen={} r={:.6} top=[{}]",
+                            m, i, r, top_str
+                        );
+                    }
+                    return Ok(i as u32);
+                }
+            }
+            if let Some(ref top) = diag_top {
+                let top_str = top.iter()
+                    .map(|&(tid, lp)| format!("{}:{:.4}", tid, lp))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "[PREFILL-SAMPLE-DIAG] mode=temp m={} chosen={} r={:.6} top=[{}]",
+                    m, v - 1, r, top_str
+                );
             }
             Ok((v - 1) as u32)
         }
@@ -7861,10 +12624,12 @@ impl PrefillKernels {
                 "moe_build_maps_kernel",
                 "moe_padded_prefix_sum_kernel",
                 "moe_scatter_sorted_kernel",
+                "moe_finalize_sorted_kernel",
                 "moe_gather_sorted_kernel",
                 "moe_replicate_hidden_kernel",
                 "moe_scatter_fused_kernel",
                 "moe_scatter_weighted_kernel",
+                "moe_scatter_weighted_deterministic_kernel",
                 "moe_accum_to_bf16_kernel",
                 "kv_cache_append_fp8_kernel",
                 "kv_cache_dequant_concat_kernel",
@@ -7980,12 +12745,15 @@ impl PrefillKernels {
             moe_build_maps: get("moe_build_maps_kernel")?,
             moe_padded_prefix_sum: get("moe_padded_prefix_sum_kernel")?,
             moe_scatter_sorted: get("moe_scatter_sorted_kernel")?,
+            moe_finalize_sorted: get("moe_finalize_sorted_kernel")?,
             moe_gather_sorted: get("moe_gather_sorted_kernel")?,
             moe_replicate_hidden: get("moe_replicate_hidden_kernel")?,
             moe_scatter_fused: get("moe_scatter_fused_kernel")?,
             moe_scatter_weighted: get("moe_scatter_weighted_kernel")?,
+            moe_scatter_weighted_deterministic: get("moe_scatter_weighted_deterministic_kernel")?,
             marlin_mm,
             fused_moe_fn: load_fused_moe(),
+            runtime_stream_sync: load_runtime_stream_sync(),
             flash_attn_fwd: load_flash_attn(),
             flash_attn_fwd_fp8kv: load_flash_attn_fp8kv(),
         })
@@ -8099,9 +12867,11 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     per_token += topk * 4;
     // d_gather_weight_map: max_tokens * topk * 4 (sequential only, small)
     per_token += topk * 4;
+    // d_shared_bf16_scratch1/2: max_tokens * max(h, moe_inter) * 2 each
     // d_shared_fp32_scratch: max_tokens * max(h, moe_inter) * 4 (FP32)
-    // Shared expert Marlin workspace, allocated dynamically in prepare_for_prefill.
+    // Shared expert buffers/workspace, allocated dynamically in prepare_for_prefill.
     if config.n_routed_experts > 0 {
+        per_token += std::cmp::max(h, moe_inter) * 2 * 2;
         per_token += std::cmp::max(h, moe_inter) * 4;
     }
     // LA buffers (scale with la_max_len = max_tokens + la_chunk_size, approx max_tokens)
@@ -8156,6 +12926,7 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     // d_logits: vocab_size * 4
     fixed += config.vocab_size * 4;
     if has_la {
+        fixed += config.la_num_v_heads * config.la_k_head_dim * config.la_v_head_dim * 2; // d_fla_h0
         fixed += config.la_num_v_heads * config.la_k_head_dim * config.la_v_head_dim * 4; // d_fla_final_state
     }
     // d_expert_counts, offsets, write_offsets: n_routed * 4 each
@@ -8167,10 +12938,13 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
         let bits = config.expert_bits as usize;
         let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
         let max_moe_n = std::cmp::max(w13_n, h);
-        let expert_bytes = h * w13_n * bits / 8  // w13 packed
-            + (h / gs) * w13_n * 2               // w13 scales
-            + moe_inter * h * bits / 8           // w2 packed
-            + (moe_inter / gs) * h * 2;          // w2 scales
+        let slot = compute_expert_slot_layout(
+            h * w13_n * bits / 8,
+            (h / gs) * w13_n * 2,
+            moe_inter * h * bits / 8,
+            (moe_inter / gs) * h * 2,
+        );
+        let expert_bytes = slot.total_bytes;
         fixed += expert_bytes * 2; // A + B staging buffers (one expert each)
 
         // Fused MoE: block padding on shared sorted buffers.
@@ -8234,6 +13008,7 @@ pub fn allocate_scratch(
     _device: &Arc<CudaDevice>,
     config: &PrefillModelConfig,
     max_tokens: usize,
+    cuda_debug: &Arc<crate::cuda_debug::CudaDebugController>,
 ) -> Result<PrefillScratch, String> {
     let h = config.hidden_size;
     let inter = config.intermediate_size;           // max of dense + moe for general scratch
@@ -8265,16 +13040,20 @@ pub fn allocate_scratch(
     // GpuBuf uses raw cuMemAlloc_v2 (synchronous, no pool) so alloc/free
     // is immediate and deterministic — no interaction with cudarc's pool.
     let alloc_u16 = |n: usize, name: &str| -> Result<GpuBuf<u16>, String> {
-        GpuBuf::<u16>::alloc_zeroed(n).map_err(|e| format!("alloc {name}: {e}"))
+        GpuBuf::<u16>::alloc_zeroed_dbg(n, name, Some(cuda_debug.clone()))
+            .map_err(|e| format!("alloc {name}: {e}"))
     };
     let alloc_f32 = |n: usize, name: &str| -> Result<GpuBuf<f32>, String> {
-        GpuBuf::<f32>::alloc_zeroed(n).map_err(|e| format!("alloc {name}: {e}"))
+        GpuBuf::<f32>::alloc_zeroed_dbg(n, name, Some(cuda_debug.clone()))
+            .map_err(|e| format!("alloc {name}: {e}"))
     };
     let alloc_i32 = |n: usize, name: &str| -> Result<GpuBuf<i32>, String> {
-        GpuBuf::<i32>::alloc_zeroed(n).map_err(|e| format!("alloc {name}: {e}"))
+        GpuBuf::<i32>::alloc_zeroed_dbg(n, name, Some(cuda_debug.clone()))
+            .map_err(|e| format!("alloc {name}: {e}"))
     };
     let alloc_u8 = |n: usize, name: &str| -> Result<GpuBuf<u8>, String> {
-        GpuBuf::<u8>::alloc_zeroed(n).map_err(|e| format!("alloc {name}: {e}"))
+        GpuBuf::<u8>::alloc_zeroed_dbg(n, name, Some(cuda_debug.clone()))
+            .map_err(|e| format!("alloc {name}: {e}"))
     };
 
     let max_inter = std::cmp::max(
@@ -8584,6 +13363,34 @@ fn load_fused_moe() -> Option<FusedMoeFn> {
     None
 }
 
+fn load_runtime_stream_sync() -> Option<RuntimeStreamSyncFn> {
+    let path = match find_marlin_so() {
+        Some(p) => p,
+        None => {
+            log::debug!("Runtime stream sync unavailable: libkrasis_marlin.so not found");
+            return None;
+        }
+    };
+    unsafe {
+        let lib = libc::dlopen(
+            std::ffi::CString::new(path.as_str()).ok()?.as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL,
+        );
+        if lib.is_null() {
+            log::warn!("Runtime stream sync dlopen({}) failed", path);
+            return None;
+        }
+
+        let sym = libc::dlsym(lib, b"krasis_cuda_runtime_stream_sync\0".as_ptr() as *const _);
+        if !sym.is_null() {
+            log::info!("Loaded runtime stream sync from {}", path);
+            return Some(std::mem::transmute(sym));
+        }
+        log::warn!("Runtime stream sync symbol not found in {}", path);
+    }
+    None
+}
+
 /// Load vendored FlashAttention-2 from libkrasis_flash_attn.so.
 fn load_flash_attn() -> Option<FlashAttnFwdFn> {
     let path = match find_vendor_so("libkrasis_flash_attn.so") {
@@ -8880,6 +13687,7 @@ mod kernel_tests {
                 "moe_replicate_hidden_kernel",
                     "moe_scatter_fused_kernel",
                     "moe_scatter_weighted_kernel",
+                    "moe_scatter_weighted_deterministic_kernel",
                 ],
             ).expect("Failed to load prefill kernels PTX");
             #[cfg(has_decode_kernels)]
