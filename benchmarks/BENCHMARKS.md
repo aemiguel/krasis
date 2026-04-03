@@ -37,6 +37,23 @@ Notes:
 
 ---
 
+## Standard Benchmarks — 2026-04-01 (QCN Polar4 AWQ after decode harness work)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3-Coder-Next, 1 GPU, INT4 GPU experts, INT4 CPU experts, AWQ attention, Polar4 KV, layer group size 2, timing off.
+
+| Model | GPUs | GPU/CPU bits | Attention | KV | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|-------|-----:|-------------:|----------:|---:|----------------:|---------------:|----:|--------------:|-----|
+| Qwen3-Coder-Next | 1 | INT4/INT4 | AWQ | Polar4 | 7645.2 | 96.10 | 17010/24576 (69.2%) | 686 MB | [log](20260401_101548_qcn_polar4_awq_5090_decode_harness.log) |
+
+Notes:
+- Internal decode results were 96.10 tok/s at 50 tokens, 94.35 tok/s at 100 tokens, and 93.84 tok/s at 250 tokens.
+- Internal prefill peaked at 7645.2 tok/s on the 35K-token prompt.
+- This confirms the decode padding rewrite and decode-harness changes did not knock QCN Polar4 AWQ out of its expected mid-90 tok/s decode class.
+
+---
+
 ## GPU Decode Benchmark — 2026-03-02 (5090, 40% HCS, pinned memory)
 
 **Hardware:** EPYC 7742, 995 GB RAM, 1x RTX 5090 32 GB, PCIe 4.0 x16 (27 GB/s peak).

@@ -13,7 +13,7 @@
 #   ./dev benchmark <config>        Run standard benchmark (prefill/decode/round trip) and exit
 #   ./dev speed-test                Run the fixed standard speed benchmark (QCN INT4 AWQ Polar4)
 #   ./dev perplexity <config>       Run perplexity eval (WikiText-2 by default) and exit
-#   ./dev release-test <model>      Run full release test (5 configs, produces report)
+#   ./dev release-test <model>      Run full release test (4 configs, produces report)
 #   ./dev release-test-all [target]  Run release test on all supported models sequentially
 #                                     If a target name is given (e.g. "rc8"), progress is saved
 #                                     to a state file. Re-running with the same target resumes
@@ -760,6 +760,25 @@ do_speed_test() {
     do_benchmark "$STANDARD_SPEED_TEST_CONFIG" "$@"
 }
 
+do_decode_harness() {
+    [[ $# -lt 1 ]] && err "Usage: ./dev decode-harness <config> [extra args...]"
+    local conf
+    conf=$(resolve_config "$1")
+    shift
+    cleanup_gpu "$conf"
+    auto_rebuild
+    local run_dir
+    run_dir=$(create_run_dir "dev-decode-harness")
+    local logfile
+    logfile="$run_dir/decode_harness_stdout.log"
+    info "Running decode harness: $conf"
+    info "Run dir: $run_dir"
+    info "Log: $logfile"
+    verify_repo_imports
+    cd "$SCRIPT_DIR" && KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="dev-decode-harness" KRASIS_DEV_SCRIPT="1" run_repo_python "$SCRIPT_DIR/tests/decode_harness.py" --config "$conf" "$@" 2>&1 | tee "$logfile"
+    info "Decode harness log saved: $logfile"
+}
+
 do_perplexity() {
     [[ $# -lt 1 ]] && err "Usage: ./dev perplexity <config> [--dataset wikitext-2] [--max-tokens N]"
     local conf
@@ -993,6 +1012,7 @@ case "$cmd" in
     test)           do_test "$@" ;;
     benchmark)      do_benchmark "$@" ;;
     speed-test|speedtest) do_speed_test "$@" ;;
+    decode-harness) do_decode_harness "$@" ;;
     release-test)   do_release_test "$@" ;;
     release-test-all) do_release_test_all "$@" ;;
     reference-test) do_reference_test "$@" ;;
@@ -1014,7 +1034,8 @@ case "$cmd" in
         echo "  run <config> [flags]      Launch server (add --benchmark for benchmarks)"
         echo "  benchmark <config>        Run standard benchmark and exit"
         echo "  speed-test                Run the fixed standard speed benchmark"
-        echo "  release-test <model>      Run full release test (5 configs, report)"
+        echo "  decode-harness <config>   Run synthetic GPU decode harness and exit"
+        echo "  release-test <model>      Run full release test (4 configs, report)"
         echo "  reference-test <config>   Compare engine output against BF16 reference data"
         echo "  reference-test --compare <model>  Run 4 quant configs, comparative report"
         echo "  release-test-all [target] Run release test on all supported models sequentially"
@@ -1054,6 +1075,7 @@ case "$cmd" in
         echo "  ./dev speed-test"
         echo "  ./dev benchmark qcn --timing    Profile decode components"
         echo "  ./dev benchmark qcn             Normal speed benchmark"
+        echo "  ./dev decode-harness qcn --prompt-len 8192 --steps 64"
         echo "  ./dev release-test Qwen3-Coder-Next    Full release test"
         echo "  ./dev release-test-all                 Test all models (no resume)"
         echo "  ./dev release-test-all rc8             Test all models (resume on re-run with same target)"

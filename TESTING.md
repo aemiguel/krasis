@@ -142,7 +142,7 @@ These load a real model and verify output is coherent:
 | File | What it measures |
 |------|-----------------|
 | `bench_engine_isolated.py` | Raw Rust MoE throughput (no model load) |
-| `bench_decode_quick.py` | Quick decode speed check |
+| `decode_harness.py` | Synthetic GPU decode compute harness via `./dev decode-harness` |
 | `bench_8k_decode.py` | Decode with 8K context |
 | `bench_combined.py` | Combined prefill + decode timing |
 | `bench_model.py` | Full model benchmark |
@@ -182,8 +182,6 @@ python tests/test_network.py --port 8012 --quick    # known-answer only
 
 `benchmarks/` contains:
 
-- `bench_decode_harness.py` -- Synthetic decode benchmark (fake weights, real memory
-  access patterns). Measures raw engine throughput without model loading.
 - `bench_decode.py` -- Server decode benchmark
 - `bench.py` -- Old MoE throughput benchmark
 - `kt_benchmark.py` -- KTransformers comparison benchmark
@@ -242,12 +240,6 @@ In the root `scripts/` directory:
 
 ```
 python tests/test_v2lite_sanity.py
-```
-
-### Measure decode engine speed (no model load)
-
-```
-python benchmarks/bench_decode_harness.py --steps 100 --timing
 ```
 
 ### Full benchmark run (QCN, 1 GPU, INT4)

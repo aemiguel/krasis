@@ -573,12 +573,6 @@ OPTIONS = [
                  choices=[4, 8], affects_budget=True),
     ConfigOption("Attention quant", "attention_quant",
                  choices=["bf16", "awq"], affects_budget=True),
-    ConfigOption("Shared expert", "shared_expert_quant",
-                 choices=["int8", "bf16"], affects_budget=True),
-    ConfigOption("Dense MLP quant", "dense_mlp_quant",
-                 choices=["int8", "bf16"], affects_budget=True),
-    ConfigOption("LM head quant", "lm_head_quant",
-                 choices=["int8", "bf16"], affects_budget=True),
     ConfigOption("VRAM safety margin", "vram_safety_margin",
                  opt_type="number", min_val=500, max_val=8000, step=100),
     ConfigOption("Host/Port", "host", opt_type="text"),
@@ -1167,6 +1161,9 @@ class Launcher:
                 saved = _load_config(path)
                 if saved:
                     self.cfg.apply_saved(saved)
+                    # Interactive TUI keeps KV on the supported default even if
+                    # an older config file was saved with an internal mode.
+                    self.cfg.kv_dtype = "polar4"
                     # Re-resolve GPUs and PP after loading
                     self._resolve_selected_gpus()
                     if self.model_info:
@@ -1298,6 +1295,10 @@ class Launcher:
         # Keep the interactive launcher on the supported user-facing path:
         # one expert quantization choice, Polar4 KV by default in the TUI.
         self.cfg.cpu_expert_bits = self.cfg.gpu_expert_bits
+        self.cfg.kv_dtype = "polar4"
+
+        # Keep the interactive surface to the supported mainstream path.
+        # Manual configs and CLI flags can still use other internal modes.
         self.cfg.kv_dtype = "polar4"
 
         # Compute initial budget

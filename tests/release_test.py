@@ -64,6 +64,8 @@ CONFIG_VARIANTS = [
     {"name": "INT4 AWQ Multi-GPU", "bits": 4, "attention": "awq", "multi_gpu": True},
 ]
 
+REFERENCE_VALIDATE_MAX_PROMPTS = 4
+
 # ANSI codes (for terminal output only — stripped from report)
 BOLD = "\033[1m"
 CYAN = "\033[0;36m"
@@ -1056,6 +1058,21 @@ def run_large_prompt_tests(port: int = DEFAULT_PORT,
     return results
 
 
+def run_reference_validation(config_path: str, port: int = DEFAULT_PORT) -> Dict:
+    """Run a short reference-output validation pass against the live server."""
+    from validate_model import validate_model
+
+    return validate_model(
+        config_path,
+        no_server=True,
+        port=port,
+        enable_logprobs=False,
+        enable_prefill=False,
+        max_prompts=REFERENCE_VALIDATE_MAX_PROMPTS,
+        return_summary=True,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Sanity Validation
 # ═══════════════════════════════════════════════════════════════════
@@ -1684,6 +1701,20 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
             else:
                 ppl_str = "—"
                 ppl_badge = "skip"
+            validation = cr.get("reference_validation")
+            if validation:
+                if validation.get("fail_count", 0) > 0:
+                    validate_badge = "fail"
+                elif validation.get("warn_count", 0) > 0:
+                    validate_badge = "warn"
+                else:
+                    validate_badge = "pass"
+                validate_str = (f"{validation.get('match_count', 0)} MATCH, "
+                                f"{validation.get('warn_count', 0)} WARN, "
+                                f"{validation.get('fail_count', 0)} FAIL")
+            else:
+                validate_str = "—"
+                validate_badge = "skip"
             summary_rows.append({
                 "idx": i + 1, "name": variant["name"], "status": "PASS",
                 "decode": nums.get("decode", "—"),
@@ -1693,6 +1724,8 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
                 "min_free": nums.get("min_free", "—"),
                 "ppl": ppl_str,
                 "ppl_badge": ppl_badge,
+                "validate": validate_str,
+                "validate_badge": validate_badge,
                 "sanity": sanity_summary,
                 "sanity_badge": sanity_badge,
             })
@@ -1837,6 +1870,9 @@ table.data td.num { text-align: right; font-family: monospace; }
         toc_summary = ", ".join(parts) if parts else f"0/{len(sanity)}"
         h.append(f'<li><a href="#sanity-{i+1}">{_html_escape(variant["name"])} ({toc_summary})</a></li>')
     h.append('</ul></li>')
+    has_validation = any(cr.get("reference_validation") for cr in config_results)
+    if has_validation:
+        h.append('<li><a href="#reference-validation">Reference Validation</a></li>')
     h.append('</ul></div>')
 
     # ── Summary Dashboard ─────────────────────────────────────────
@@ -1844,7 +1880,7 @@ table.data td.num { text-align: right; font-family: monospace; }
     h.append('<table class="dashboard"><thead><tr>')
     h.append('<th>#</th><th>Config</th><th>Status</th><th>Decode</th>'
              '<th>Prefill</th><th>Round Trip</th><th>HCS</th><th>Min Free</th>'
-             '<th>PPL</th><th>Sanity</th>')
+             '<th>PPL</th><th>Reference</th><th>Sanity</th>')
     h.append('</tr></thead><tbody>')
     for row in summary_rows:
         badge_cls = "badge-pass" if row["status"] == "PASS" else "badge-fail"
@@ -1852,7 +1888,7 @@ table.data td.num { text-align: right; font-family: monospace; }
             # Failed/skipped config
             h.append(f'<tr><td>{row["idx"]}</td><td>{_html_escape(row["name"])}</td>')
             h.append(f'<td><span class="badge {badge_cls}">{row["status"]}</span></td>')
-            h.append(f'<td colspan="7" style="color:#8b949e">{_html_escape(row.get("error", ""))}</td></tr>')
+            h.append(f'<td colspan="8" style="color:#8b949e">{_html_escape(row.get("error", ""))}</td></tr>')
         else:
             h.append(f'<tr><td>{row["idx"]}</td><td>{_html_escape(row["name"])}</td>')
             h.append(f'<td><span class="badge {badge_cls}">{row["status"]}</span></td>')
@@ -1863,6 +1899,8 @@ table.data td.num { text-align: right; font-family: monospace; }
             h.append(f'<td class="num">{row["min_free"]} MB</td>')
             pb = row.get("ppl_badge", "skip")
             h.append(f'<td><span class="badge badge-{pb}">{row.get("ppl", "—")}</span></td>')
+            vb = row.get("validate_badge", "skip")
+            h.append(f'<td><span class="badge badge-{vb}">{_html_escape(row.get("validate", "—"))}</span></td>')
             sb = row.get("sanity_badge", "pass")
             h.append(f'<td><span class="badge badge-{sb}">{row["sanity"]}</span></td></tr>')
     h.append('</tbody></table>')
@@ -2043,6 +2081,35 @@ table.data td.num { text-align: right; font-family: monospace; }
             h.append(f'<td class="num">{bl_str}</td>')
             h.append(f'<td>{badge}</td></tr>')
 
+        h.append('</tbody></table>')
+
+    if has_validation:
+        h.append('<h2 id="reference-validation">Reference Validation</h2>')
+        h.append(f'<p style="color:#8b949e">Short greedy-output validation against stored reference outputs. '
+                 f'Each config runs Layer 1 token matching only, capped at {REFERENCE_VALIDATE_MAX_PROMPTS} prompts.</p>')
+        h.append('<table class="data"><thead><tr>')
+        h.append('<th>Config</th><th>Prompts</th><th>Match</th><th>Warn</th><th>Fail</th><th>Status</th>')
+        h.append('</tr></thead><tbody>')
+        for cr in config_results:
+            validation = cr.get("reference_validation")
+            if not validation:
+                continue
+            fail_count = validation.get("fail_count", 0)
+            warn_count = validation.get("warn_count", 0)
+            match_count = validation.get("match_count", 0)
+            prompts_run = validation.get("prompts_run", 0)
+            if fail_count:
+                badge = '<span class="badge badge-fail">FAIL</span>'
+            elif warn_count:
+                badge = '<span class="badge badge-warn">WARN</span>'
+            else:
+                badge = '<span class="badge badge-pass">PASS</span>'
+            h.append(f'<tr><td>{_html_escape(cr["variant"]["name"])}</td>')
+            h.append(f'<td class="num">{prompts_run}</td>')
+            h.append(f'<td class="num">{match_count}</td>')
+            h.append(f'<td class="num">{warn_count}</td>')
+            h.append(f'<td class="num">{fail_count}</td>')
+            h.append(f'<td>{badge}</td></tr>')
         h.append('</tbody></table>')
 
     # ── Sanity Tests ──────────────────────────────────────────────
@@ -2327,13 +2394,13 @@ def main():
             ok("Server healthy. Running HTTP tests.")
 
             # Warmup request (first HTTP request compiles CUDA graphs etc.)
-            thinking = variant.get("thinking", False)
+            thinking = False
             info("Warmup HTTP request...")
             send_chat_streaming("Hi", port=DEFAULT_PORT, max_tokens=8, timeout=60,
                                 enable_thinking=thinking)
 
             # 6. Phase 2: Sanity prompts
-            info(f"Phase 2: Sanity test prompts{' (thinking enabled)' if thinking else ''}")
+            info("Phase 2: Sanity test prompts")
             prev_run_dir = os.environ.get("KRASIS_RUN_DIR")
             prev_run_type = os.environ.get("KRASIS_RUN_TYPE")
             os.environ["KRASIS_RUN_DIR"] = config_dir
@@ -2369,6 +2436,13 @@ def main():
                 info("Phase 3: Large prompt validation")
                 result["large_results"] = run_large_prompt_tests(port=DEFAULT_PORT,
                                                                   enable_thinking=thinking)
+
+                # 8. Phase 4: Short reference validation
+                info(f"Phase 4: Reference validation ({REFERENCE_VALIDATE_MAX_PROMPTS} prompts)")
+                result["reference_validation"] = run_reference_validation(
+                    config_path,
+                    port=DEFAULT_PORT,
+                )
             finally:
                 if prev_run_dir is None:
                     os.environ.pop("KRASIS_RUN_DIR", None)
@@ -2441,7 +2515,18 @@ def main():
                 parts.append(f"sanity {sp}P/{sw}W/{sf}F")
             elif sw:
                 parts.append(f"sanity {sp}P/{sw}W")
-            config_status = "FAIL" if sf else "PASS"
+            validation = result.get("reference_validation")
+            if validation:
+                vf = validation.get("fail_count", 0)
+                vw = validation.get("warn_count", 0)
+                vm = validation.get("match_count", 0)
+                if vf:
+                    parts.append(f"ref {vm}M/{vw}W/{vf}F")
+                elif vw:
+                    parts.append(f"ref {vm}M/{vw}W")
+                else:
+                    parts.append(f"ref {vm}M")
+            config_status = "FAIL" if sf or (validation and validation.get("fail_count", 0) > 0) else "PASS"
             detail = f" ({', '.join(parts)})" if parts else ""
             session_notify(
                 f"[{model_name}] Config {i+1}/{len(CONFIG_VARIANTS)} "
@@ -2472,6 +2557,10 @@ def main():
         elif cr.get("sanity_fail_count", 0) > 0:
             sf = cr["sanity_fail_count"]
             status = f"{RED}FAILED{NC} ({sf} sanity failures)"
+            any_failed = True
+        elif cr.get("reference_validation", {}).get("fail_count", 0) > 0:
+            vf = cr["reference_validation"]["fail_count"]
+            status = f"{RED}FAILED{NC} ({vf} reference failures)"
             any_failed = True
         else:
             status = f"{GREEN}OK{NC}"

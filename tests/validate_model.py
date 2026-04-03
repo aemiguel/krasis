@@ -474,7 +474,9 @@ def compare_tokens(ref_ids: List[int], krasis_ids: List[int],
 
 
 def validate_model(config_path: str, no_server: bool = False, port: Optional[int] = None,
-                    enable_logprobs: bool = True, enable_prefill: bool = True):
+                    enable_logprobs: bool = True, enable_prefill: bool = True,
+                    max_prompts: Optional[int] = None,
+                    return_summary: bool = False):
     """Run multi-layer validation against reference outputs.
 
     Layer 1: Decode token matching (always on)
@@ -497,11 +499,17 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     if enable_prefill:
         layers_active.append("L3:prefill")
     info(f"Validation layers: {', '.join(layers_active)}")
+    if max_prompts is not None:
+        info(f"Prompt cap: {max_prompts}")
 
     # Load reference
     reference = load_reference(model_name)
     ref_conversations = reference["conversations"]
-    total_prompts = sum(len(c["turns"]) for c in ref_conversations)
+    total_reference_prompts = sum(len(c["turns"]) for c in ref_conversations)
+    if max_prompts is not None:
+        total_prompts = min(total_reference_prompts, max_prompts)
+    else:
+        total_prompts = total_reference_prompts
     info(f"Reference: {total_prompts} prompts from {reference['generated_at']}")
     info(f"Reference runtime: {reference['runtime']} {reference.get('runtime_version', '')}")
 
@@ -550,6 +558,8 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
                 print(f"\n  {BOLD}--- Conversation {conv_idx + 1} ({len(conv['turns'])} turns) ---{NC}")
 
             for turn_idx, turn in enumerate(conv["turns"]):
+                if max_prompts is not None and prompt_num >= max_prompts:
+                    break
                 prompt_num += 1
                 prompt = turn["prompt"]
                 ref_token_ids = turn["token_ids"]
@@ -742,6 +752,9 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
                 # Add to message history for multi-turn
                 messages.append({"role": "assistant", "content": krasis_text})
 
+            if max_prompts is not None and prompt_num >= max_prompts:
+                break
+
     finally:
         # Always clean up server
         if proc:
@@ -759,12 +772,31 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     else:
         print(f"  {BOLD}Weights: BF16 | Min match threshold: {min_match} tokens{NC}")
 
+    summary = {
+        "model_name": model_name,
+        "config_path": config_path,
+        "is_quantized": is_quant,
+        "min_match_threshold": min_match,
+        "layers_active": layers_active,
+        "max_prompts": max_prompts,
+        "reference_prompts_total": total_reference_prompts,
+        "prompts_run": total,
+        "match_count": pass_count,
+        "warn_count": warn_count,
+        "fail_count": fail_count,
+        "skip_count": skip_count,
+        "passed": fail_count == 0,
+        "results": results,
+    }
+
     if fail_count == 0:
         print(f"\n  {GREEN}{BOLD}VALIDATION PASSED{NC}")
-        return 0
     else:
         print(f"\n  {RED}{BOLD}VALIDATION FAILED ({fail_count} failures){NC}")
-        return 1
+
+    if return_summary:
+        return summary
+    return 0 if fail_count == 0 else 1
 
 
 def main():
@@ -780,6 +812,8 @@ def main():
                         help="Disable Layer 3 (prefill logit comparison)")
     parser.add_argument("--l1-only", action="store_true",
                         help="Only run Layer 1 (token matching)")
+    parser.add_argument("--max-prompts", type=int, default=None,
+                        help="Stop after this many reference prompts")
     args = parser.parse_args()
 
     enable_logprobs = not args.no_logprobs and not args.l1_only
@@ -787,7 +821,8 @@ def main():
 
     sys.exit(validate_model(args.config, args.no_server, args.port,
                             enable_logprobs=enable_logprobs,
-                            enable_prefill=enable_prefill))
+                            enable_prefill=enable_prefill,
+                            max_prompts=args.max_prompts))
 
 
 if __name__ == "__main__":

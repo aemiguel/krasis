@@ -12,7 +12,7 @@ use crate::kernel::avx2::{
     repack_tiled_int4_packed, repack_tiled_int8_packed, repack_tiled_scales,
     quantize_activation_int16_f32,
 };
-use crate::moe::{ExpertScratch, moe_forward_unified, moe_forward_flattened, PflPrefetch};
+use crate::moe::{ExpertScratch, moe_forward_unified, PflPrefetch};
 use crate::weights::marlin::f32_to_bf16;
 use crate::weights::WeightStore;
 use pyo3::prelude::*;
@@ -5210,18 +5210,8 @@ pub fn extract_top_logprobs(logits: &[f32], vocab_size: usize, top_n: usize) -> 
     top
 }
 
-#[pyfunction]
-#[pyo3(signature = (config_path, num_steps=100, warmup=5, timing=false, num_bits=4, max_experts=0, num_threads=40, tiled=true))]
-pub fn bench_decode_synthetic(
-    config_path: &str,
-    num_steps: usize,
-    warmup: usize,
-    timing: bool,
-    num_bits: u8,
-    max_experts: usize,
-    num_threads: usize,
-    tiled: bool,
-) -> PyResult<()> {
+/* Removed dead CPU synthetic decode benchmark entrypoint.
+ * The active decode path is GPU decode via GpuDecodeStore and supported ./dev commands.
     use std::time::Instant;
     use crate::weights::{ModelConfig, UnifiedExpertWeights};
 
@@ -6236,3 +6226,4 @@ pub fn bench_decode_synthetic(
 
     Ok(())
 }
+*/
