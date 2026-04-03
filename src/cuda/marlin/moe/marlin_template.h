@@ -935,11 +935,14 @@ __global__ void Marlin(
           if (B_expert_ptrs != nullptr) {
             const long long expert_addr =
                 static_cast<long long>(reinterpret_cast<intptr_t>(reinterpret_cast<const void*>(active_B_base)));
+            const long long src_elem = b_elem_base[i] + j;
+            const bool src_valid = src_elem >= 0;
             const long long src_addr =
-                expert_addr + static_cast<long long>(b_elem_base[i] + j) * static_cast<long long>(sizeof(int4));
-            cp_async4(
+                expert_addr + static_cast<long long>(src_valid ? src_elem : 0) * static_cast<long long>(sizeof(int4));
+            cp_async4_pred(
                 &sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j],
-                reinterpret_cast<const int4*>(static_cast<uintptr_t>(src_addr)));
+                reinterpret_cast<const int4*>(static_cast<uintptr_t>(src_addr)),
+                src_valid);
           } else {
             cp_async4(
                 &sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j],
