@@ -114,6 +114,7 @@ Config: Qwen3-Coder-Next, INT4 experts, AWQ attention, Polar4 KV, standard comma
 | 2026-04-03 20:36 | 4aa3bee + local no-valid-block guard | Exit `update_next_moe_block_data()` cleanly when invalid-block scanning reaches the padded tail without finding another valid expert block | 7,606.7 | 99.88 | 137.25 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_203640_qcn_polar4_awq_5090_no_valid_block_guard.log) |
 | 2026-04-03 20:54 | 7d09912 + local BF-09 | Feed the active decode-store CUDA ordinal into `PrefillModelConfig` so fused-MoE shared-memory capability queries stop assuming GPU 0 | 7,745.6 | 95.55 | 120.95 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_205423_qcn_polar4_awq_5090_bf09_device_ordinal.log) |
 | 2026-04-03 21:23 | df6c259 + local BF-13 | Split BF16 shared-expert cuBLAS ownership so `shared_stream` uses a dedicated handle instead of retargeting the main prefill handle across streams | 7,498.6 | 100.62 | 137.97 | 17010/24576 (69.2%) | 682 MB | PASS | [log](20260403_212300_qcn_polar4_awq_5090_bf13_shared_cublas_handle.log) |
+| 2026-04-03 22:03 | 68f1557 + local BF-10 | Split fused-MoE sorted scatter finalization into a second same-stream kernel so padding and `expert_ids` are written only after scatter completion | 7,510.0 | 100.18 | 135.55 | 17010/24576 (69.2%) | 682 MB | PASS | [log](20260403_220350_qcn_polar4_awq_5090_bf10_scatter_finalize_split.log) |
 
 Notes:
 - The BF-03 cache edit built cleanly through `./dev build`.
@@ -127,6 +128,7 @@ Notes:
 - The BF-05 clean import also completed the full standard benchmark cleanly; throughput stayed effectively flat versus BF-04 while preserving the signed rewind-safe pointer-table fetch path.
 - The no-valid-block guard also completed the full standard benchmark cleanly; it is a cheap control-flow correctness fix and did not regress standard prefill or decode throughput.
 - The BF-09 actual-device-ordinal wiring also completed the full standard benchmark cleanly; on this single-GPU path it behaves like a correctness/generalization fix rather than a speed optimization.
+- BF-10 also completed the full standard benchmark cleanly; the extra finalize launch did not materially change throughput on the standard QCN AWQ Polar4 path and removed the grid-wide race from the sorted scatter/finalize step.
 
 ## Standard Benchmarks — 2026-02-25 (NUMA-optimized, 1 GPU)
 

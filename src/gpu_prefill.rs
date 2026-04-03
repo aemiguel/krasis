@@ -446,6 +446,7 @@ pub struct PrefillKernels {
     // Fused MoE support kernels (for MarlinDefault integration)
     moe_padded_prefix_sum: RawCuFunc,
     moe_scatter_sorted: RawCuFunc,
+    moe_finalize_sorted: RawCuFunc,
     moe_gather_sorted: RawCuFunc,
     moe_replicate_hidden: RawCuFunc,
     moe_scatter_fused: RawCuFunc,
@@ -4775,15 +4776,12 @@ impl PrefillEngine {
         // Build sorted token/expert maps
         {
             let mut p0 = sorted_ids_val;
-            let mut p1 = fused_expert_ids_val;
-            let mut p2 = write_offsets_ptr;
-            let mut p3 = topk_ids_ptr;
-            let mut p4 = expert_offsets_ptr;
-            let mut p5 = expert_counts_ptr;
-            let mut p6 = m as i32;
-            let mut p7 = topk as i32;
-            let mut p8 = n_experts as i32;
-            let mut p9 = block_size;
+            let mut p1 = write_offsets_ptr;
+            let mut p2 = topk_ids_ptr;
+            let mut p3 = expert_offsets_ptr;
+            let mut p4 = m as i32;
+            let mut p5 = topk as i32;
+            let mut p6 = n_experts as i32;
             unsafe {
                 launch(self.kernels.moe_scatter_sorted,
                     (m as u32, 1, 1), (1, 1, 1), 0, self.stream,
@@ -4795,9 +4793,31 @@ impl PrefillEngine {
                         &mut p4 as *mut _ as *mut std::ffi::c_void,
                         &mut p5 as *mut _ as *mut std::ffi::c_void,
                         &mut p6 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+        }
+        {
+            let mut p0 = sorted_ids_val;
+            let mut p1 = fused_expert_ids_val;
+            let mut p2 = expert_offsets_ptr;
+            let mut p3 = expert_counts_ptr;
+            let mut p4 = m as i32;
+            let mut p5 = topk as i32;
+            let mut p6 = n_experts as i32;
+            let mut p7 = block_size;
+            unsafe {
+                launch(self.kernels.moe_finalize_sorted,
+                    (n_experts as u32, 1, 1), (1, 1, 1), 0, self.stream,
+                    &mut [
+                        &mut p0 as *mut _ as *mut std::ffi::c_void,
+                        &mut p1 as *mut _ as *mut std::ffi::c_void,
+                        &mut p2 as *mut _ as *mut std::ffi::c_void,
+                        &mut p3 as *mut _ as *mut std::ffi::c_void,
+                        &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        &mut p5 as *mut _ as *mut std::ffi::c_void,
+                        &mut p6 as *mut _ as *mut std::ffi::c_void,
                         &mut p7 as *mut _ as *mut std::ffi::c_void,
-                        &mut p8 as *mut _ as *mut std::ffi::c_void,
-                        &mut p9 as *mut _ as *mut std::ffi::c_void,
                     ],
                 )?;
             }
@@ -7887,6 +7907,7 @@ impl PrefillKernels {
                 "moe_build_maps_kernel",
                 "moe_padded_prefix_sum_kernel",
                 "moe_scatter_sorted_kernel",
+                "moe_finalize_sorted_kernel",
                 "moe_gather_sorted_kernel",
                 "moe_replicate_hidden_kernel",
                 "moe_scatter_fused_kernel",
@@ -8006,6 +8027,7 @@ impl PrefillKernels {
             moe_build_maps: get("moe_build_maps_kernel")?,
             moe_padded_prefix_sum: get("moe_padded_prefix_sum_kernel")?,
             moe_scatter_sorted: get("moe_scatter_sorted_kernel")?,
+            moe_finalize_sorted: get("moe_finalize_sorted_kernel")?,
             moe_gather_sorted: get("moe_gather_sorted_kernel")?,
             moe_replicate_hidden: get("moe_replicate_hidden_kernel")?,
             moe_scatter_fused: get("moe_scatter_fused_kernel")?,

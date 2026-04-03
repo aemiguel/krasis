@@ -3169,18 +3169,16 @@ extern "C" __global__ void moe_padded_prefix_sum_kernel(
     }
 }
 
-/* Phase 3: Scatter tokens into sorted positions + fill expert_ids.
+/* Phase 3: Scatter tokens into sorted positions.
  * Grid: (M, 1, 1), Block: (1, 1, 1)
  * Each thread handles one token, scatters its topk slots.
  */
 extern "C" __global__ void moe_scatter_sorted_kernel(
     int* __restrict__ sorted_token_ids,
-    int* __restrict__ expert_ids_out,
     int* __restrict__ write_offsets,       // [E] atomically incremented
     const int* __restrict__ topk_ids,      // [M, topk]
     const int* __restrict__ expert_offsets, // [E+1]
-    const int* __restrict__ expert_counts, // [E]
-    int M, int topk, int E, int block_size
+    int M, int topk, int E
 ) {
     int t = blockIdx.x;
     if (t >= M) return;
@@ -3192,23 +3190,33 @@ extern "C" __global__ void moe_scatter_sorted_kernel(
             sorted_token_ids[base + slot] = t * topk + k;  // vLLM format: token*topk+slot
         }
     }
-    // Fill expert_ids and padding (done by first thread only)
-    if (t == 0) {
-        for (int e = 0; e < E; e++) {
-            int base = expert_offsets[e];
-            int count = expert_counts[e];
-            int padded = expert_offsets[e + 1] - base;
-            int num_blocks = padded / block_size;
-            // Fill padding slots with M*topk (Marlin kernel checks >= prob_m * top_k)
-            for (int p = count; p < padded; p++) {
-                sorted_token_ids[base + p] = M * topk; // padding sentinel
-            }
-            // Fill expert_ids for each block
-            int block_start = base / block_size;
-            for (int b = 0; b < num_blocks; b++) {
-                expert_ids_out[block_start + b] = e;
-            }
-        }
+}
+
+/* Phase 4: finalize expert_ids and padding after scatter completes.
+ * Grid: (E, 1, 1), Block: (1, 1, 1)
+ * Each block handles one expert after the scatter writes are visible on-stream.
+ */
+extern "C" __global__ void moe_finalize_sorted_kernel(
+    int* __restrict__ sorted_token_ids,
+    int* __restrict__ expert_ids_out,
+    const int* __restrict__ expert_offsets, // [E+1]
+    const int* __restrict__ expert_counts,  // [E]
+    int M, int topk, int E, int block_size
+) {
+    int e = blockIdx.x;
+    if (e >= E) return;
+    int base = expert_offsets[e];
+    int count = expert_counts[e];
+    int padded = expert_offsets[e + 1] - base;
+    int num_blocks = padded / block_size;
+    // Fill padding slots with M*topk (Marlin kernel checks >= prob_m * top_k)
+    for (int p = count; p < padded; p++) {
+        sorted_token_ids[base + p] = M * topk; // padding sentinel
+    }
+    // Fill expert_ids for each block
+    int block_start = base / block_size;
+    for (int b = 0; b < num_blocks; b++) {
+        expert_ids_out[block_start + b] = e;
     }
 }
 
