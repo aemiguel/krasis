@@ -7925,8 +7925,8 @@ impl GpuDecodeStore {
 
         // Allocate persistent cuBLAS workspace (required for CUDA graph capture —
         // cuBLAS must not do internal cudaMalloc during capture).
-        // 32 KB is sufficient for GEMV operations (N=1).
-        let workspace_bytes = 32 * 1024;
+        // 4 MB workspace prevents cuBLAS internal allocation during graph capture.
+        let workspace_bytes = 4 * 1024 * 1024;
         let d_workspace = self.device.alloc_zeros::<u8>(workspace_bytes)
             .map_err(|e| format!("alloc d_cublas_workspace: {:?}", e))?;
         unsafe {
