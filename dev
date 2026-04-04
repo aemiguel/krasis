@@ -866,7 +866,7 @@ do_validate() {
     do_build
     info "Running model validation: $conf_path"
     verify_repo_imports
-    exec_repo_python "$SCRIPT_DIR/tests/validate_model.py" "$conf_path" "$@"
+    KRASIS_DEV_SCRIPT=1 exec_repo_python "$SCRIPT_DIR/tests/validate_model.py" "$conf_path" "$@"
 }
 
 do_reference_test() {

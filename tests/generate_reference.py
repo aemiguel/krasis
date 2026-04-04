@@ -146,6 +146,13 @@ def generate_reference(model_name: str, max_new_tokens: int = 200):
     eos_token_ids = list(set(eos_token_ids))
     info(f"EOS token IDs: {eos_token_ids}")
 
+    capture_settings = {
+        "add_generation_prompt": True,
+        "template_mode": "default",
+        "enable_thinking": None,
+        "source": "local_generate_reference",
+    }
+
     # Generate reference outputs
     result = {
         "model": model_name,
@@ -154,6 +161,7 @@ def generate_reference(model_name: str, max_new_tokens: int = 200):
         "runtime": "transformers",
         "max_new_tokens": max_new_tokens,
         "eos_token_ids": eos_token_ids,
+        "capture_settings": capture_settings,
         "conversations": [],
     }
 
@@ -188,6 +196,8 @@ def generate_reference(model_name: str, max_new_tokens: int = 200):
                     add_generation_prompt=True,
                     enable_thinking=False,
                 )
+                capture_settings["template_mode"] = "enable_thinking_false"
+                capture_settings["enable_thinking"] = False
             except TypeError:
                 # Model doesn't support enable_thinking parameter
                 template_out = tokenizer.apply_chat_template(
@@ -195,6 +205,8 @@ def generate_reference(model_name: str, max_new_tokens: int = 200):
                     return_tensors="pt",
                     add_generation_prompt=True,
                 )
+                capture_settings["template_mode"] = "default"
+                capture_settings["enable_thinking"] = None
 
             # apply_chat_template may return a tensor or a BatchEncoding
             if hasattr(template_out, "input_ids"):

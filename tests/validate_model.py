@@ -177,6 +177,101 @@ def load_reference(model_name: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def _extract_local_token_ids(template_out: Any) -> List[int]:
+    import torch
+
+    if hasattr(template_out, "input_ids"):
+        return template_out.input_ids[0].tolist()
+    if isinstance(template_out, torch.Tensor):
+        return template_out[0].tolist()
+    return list(template_out)
+
+
+def _flatten_reference_turns(reference: Dict[str, Any]) -> List[Dict[str, Any]]:
+    turns: List[Dict[str, Any]] = []
+    for conv in reference.get("conversations", []):
+        turns.extend(conv.get("turns", []))
+    return turns
+
+
+def resolve_reference_capture_settings(reference: Dict[str, Any], tokenizer: Any) -> Dict[str, Any]:
+    stored = reference.get("capture_settings")
+    if isinstance(stored, dict):
+        settings = dict(stored)
+        settings.setdefault("source", "stored_metadata")
+        settings.setdefault("add_generation_prompt", True)
+        return settings
+
+    first_turn = next(
+        (turn for turn in _flatten_reference_turns(reference) if turn.get("input_token_ids")),
+        None,
+    )
+    if first_turn is None:
+        return {
+            "source": "unknown_no_input_token_ids",
+            "add_generation_prompt": True,
+            "template_mode": "default",
+            "enable_thinking": None,
+        }
+
+    messages = [{"role": "user", "content": first_turn["prompt"]}]
+    candidates = [
+        ("enable_thinking_false", False, {"enable_thinking": False}),
+        ("enable_thinking_true", True, {"enable_thinking": True}),
+        ("default", None, {}),
+    ]
+    matches: List[str] = []
+    chosen: Optional[Tuple[str, Optional[bool]]] = None
+    for label, enable_thinking, kwargs in candidates:
+        try:
+            template_out = tokenizer.apply_chat_template(
+                messages,
+                return_tensors="pt",
+                add_generation_prompt=True,
+                **kwargs,
+            )
+        except TypeError:
+            continue
+        if _extract_local_token_ids(template_out) == first_turn["input_token_ids"]:
+            matches.append(label)
+            if chosen is None:
+                chosen = (label, enable_thinking)
+
+    if chosen is None:
+        return {
+            "source": "inferred_from_input_token_ids",
+            "add_generation_prompt": True,
+            "template_mode": "unknown",
+            "enable_thinking": None,
+            "candidate_matches": matches,
+        }
+
+    return {
+        "source": "inferred_from_input_token_ids",
+        "add_generation_prompt": True,
+        "template_mode": chosen[0],
+        "enable_thinking": chosen[1],
+        "candidate_matches": matches,
+    }
+
+
+def apply_reference_chat_template(
+    tokenizer: Any, messages: List[Dict[str, str]], capture_settings: Dict[str, Any]
+) -> List[int]:
+    kwargs: Dict[str, Any] = {
+        "return_tensors": "pt",
+        "add_generation_prompt": bool(capture_settings.get("add_generation_prompt", True)),
+    }
+    if capture_settings.get("template_mode") != "default" and capture_settings.get("enable_thinking") is not None:
+        kwargs["enable_thinking"] = capture_settings["enable_thinking"]
+    try:
+        template_out = tokenizer.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        template_out = tokenizer.apply_chat_template(messages, **kwargs)
+    return _extract_local_token_ids(template_out)
+
+
 def launch_server(config_path: str, test_endpoints: bool = False) -> Tuple[subprocess.Popen, str]:
     """Launch Krasis server, return (process, log_path)."""
     log_dir = REPO_DIR / "logs" / "validate"
@@ -541,6 +636,13 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     model_path = os.path.join(os.path.expanduser("~/.krasis/models"), model_name)
     info(f"Loading tokenizer from {model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    capture_settings = resolve_reference_capture_settings(reference, tokenizer)
+    info(
+        "Reference capture settings: "
+        f"template_mode={capture_settings.get('template_mode', 'unknown')}, "
+        f"enable_thinking={capture_settings.get('enable_thinking')}, "
+        f"source={capture_settings.get('source', 'unknown')}"
+    )
 
     # Run validation
     results: List[Dict[str, Any]] = []
@@ -576,20 +678,7 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
 
                 # Verify tokenizer agreement if input_token_ids available
                 if ref_input_ids:
-                    try:
-                        template_out = tokenizer.apply_chat_template(
-                            messages, return_tensors="pt",
-                            add_generation_prompt=True, enable_thinking=False)
-                    except TypeError:
-                        template_out = tokenizer.apply_chat_template(
-                            messages, return_tensors="pt", add_generation_prompt=True)
-                    import torch
-                    if hasattr(template_out, "input_ids"):
-                        local_ids = template_out.input_ids[0].tolist()
-                    elif isinstance(template_out, torch.Tensor):
-                        local_ids = template_out[0].tolist()
-                    else:
-                        local_ids = list(template_out)
+                    local_ids = apply_reference_chat_template(tokenizer, messages, capture_settings)
 
                     if local_ids != ref_input_ids:
                         # Multi-turn tokenizer mismatch is expected when prior turns
