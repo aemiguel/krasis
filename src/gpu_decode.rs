@@ -763,15 +763,25 @@ impl HcsState {
     fn gpu_expert_ptrs_set(&self, layer: usize, expert: usize, entry: &HcsCacheEntry) {
         if let Some(ref buf) = self.d_expert_ptrs {
             let idx = (layer * self.d_expert_ptrs_ne + expert) * 4;
-            let ptrs = [
-                entry.w13_packed_ptr(), entry.w13_scales_ptr(),
-                entry.w2_packed_ptr(), entry.w2_scales_ptr(),
-            ];
             unsafe {
                 let dst = *buf.device_ptr() + (idx * 8) as u64;
+                // Source must stay alive after this function returns because the
+                // driver copy is async. Use the cache_fast backing storage rather
+                // than a stack-local array so request-boundary HCS updates cannot
+                // race a dead host pointer.
+                let src = if self.num_experts_per_layer > 0 {
+                    let cache_idx = layer * self.num_experts_per_layer + expert;
+                    if cache_idx < self.cache_fast.len() {
+                        self.cache_fast[cache_idx].as_ptr() as *const std::ffi::c_void
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                };
                 let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
                     dst,
-                    ptrs.as_ptr() as *const std::ffi::c_void,
+                    src,
                     32, // 4 * u64
                     std::ptr::null_mut(),
                 );
@@ -788,20 +798,25 @@ impl HcsState {
     fn gpu_expert_ptrs_clear(&self, layer: usize, expert: usize) {
         if let Some(ref buf) = self.d_expert_ptrs {
             let idx = (layer * self.d_expert_ptrs_ne + expert) * 4;
-            // Use mapped fallback pointers if available, otherwise zeros
-            let fallback_idx = if self.num_experts_per_layer > 0 {
-                layer * self.num_experts_per_layer + expert
-            } else { usize::MAX };
-            let ptrs = if self.mapped_reads_available && fallback_idx < self.mapped_fallback.len() {
-                self.mapped_fallback[fallback_idx]
-            } else {
-                [0u64; 4]
-            };
             unsafe {
                 let dst = *buf.device_ptr() + (idx * 8) as u64;
+                // As above, use stable heap-backed host storage for async pointer
+                // table updates instead of a stack-local temporary.
+                let fallback_idx = if self.num_experts_per_layer > 0 {
+                    layer * self.num_experts_per_layer + expert
+                } else {
+                    return;
+                };
+                let src = if self.mapped_reads_available && fallback_idx < self.mapped_fallback.len() {
+                    self.mapped_fallback[fallback_idx].as_ptr() as *const std::ffi::c_void
+                } else if fallback_idx < self.cache_fast.len() {
+                    self.cache_fast[fallback_idx].as_ptr() as *const std::ffi::c_void
+                } else {
+                    return;
+                };
                 let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
                     dst,
-                    ptrs.as_ptr() as *const std::ffi::c_void,
+                    src,
                     32,
                     std::ptr::null_mut(),
                 );

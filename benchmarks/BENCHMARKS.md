@@ -1,5 +1,29 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-04 (QCN Polar4 AWQ after HCS async pointer lifetime fix)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3-Coder-Next, 1 GPU, AWQ attention, Polar4 KV, GPU decode, HCS on, timing instrumentation off.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| accuracy async ptr lifetime fix | 7,891.4 | 98.59 | 17010/24576 (69.2%) | 682 MB | [log](20260404_011629_qcn_polar4_awq_5090_accuracy_hcs_async_ptr_fix.log) |
+
+Notes:
+- Run executed via `./dev speed-test` on branch `accuracy`.
+- Fix restored stable host backing for async `cuMemcpyHtoDAsync_v2` expert-pointer table uploads in `src/gpu_decode.rs`.
+- This was run after a broken `release-test` on current main/accuracy had shown QCN collapsing into repeated `S` tokens and failing mini reference validation immediately.
+- Post-fix QCN AWQ reference-test result on the same branch state:
+  - `./dev reference-test qcn-a4`
+  - `13/13` prompts PASS
+  - first-token match `12/13`
+  - prefill argmax match `249/273 (91%)`
+  - prefill top-10 containment `273/273 (100%)`
+  - report: `logs/reference-test_20260404_011152/reference_test.html`
+
+---
+
 ## Standard Benchmarks — 2026-04-03 (QCN Polar4 AWQ speed-test rerun on c35d9b0)
 
 Hardware: EPYC 7742, 995 GB RAM, 1x RTX 5090 32 GB used for benchmark, 2x RTX 5090 present.
