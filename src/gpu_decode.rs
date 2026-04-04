@@ -7897,8 +7897,10 @@ impl GpuDecodeStore {
                 } else {
                     (2 * intermediate * hs * expert_bits as usize / 8) as u64
                 };
+                // Scales are raw BF16 (2 bytes each), NOT packed like weights.
+                // Formula: (K / group_size) * N * 2 bytes
                 let w13_scales_bytes = if gs == 0 { 0u64 } else {
-                    (2 * intermediate * hs / gs * 2 / 8) as u64
+                    (hs / gs * (2 * intermediate) * 2) as u64
                 };
                 let w2_packed_bytes = if expert_bits == 16 {
                     (hs * intermediate * 2) as u64
@@ -7906,7 +7908,7 @@ impl GpuDecodeStore {
                     (hs * intermediate * expert_bits as usize / 8) as u64
                 };
                 let w2_scales_bytes = if gs == 0 { 0u64 } else {
-                    (hs * intermediate / gs * 2 / 8) as u64
+                    (intermediate / gs * hs * 2) as u64
                 };
                 let total_bytes = (w13_packed_bytes + w13_scales_bytes + w2_packed_bytes
                     + w2_scales_bytes) as usize;
