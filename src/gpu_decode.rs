@@ -7897,7 +7897,7 @@ impl GpuDecodeStore {
                 } else {
                     (2 * intermediate * hs * expert_bits as usize / 8) as u64
                 };
-                // Scales are raw BF16 (2 bytes each), NOT packed like weights.
+                // Scales are raw BF16 (2 bytes each), NOT bit-packed.
                 // Formula: (K / group_size) * N * 2 bytes
                 let w13_scales_bytes = if gs == 0 { 0u64 } else {
                     (hs / gs * (2 * intermediate) * 2) as u64
@@ -8529,6 +8529,7 @@ impl GpuDecodeStore {
                                 *graph.d_batch_partials.device_ptr(),
                                 inv_wp, inv_sp,
                                 hs as i32, w13_n as i32, gs as i32, w13_ksplits as i32,
+                                d_wts,
                             ),
                         ).map_err(|e| format!("batched w13 v2[{}]: {:?}", layer_idx, e))?;
                     }
@@ -8545,6 +8546,7 @@ impl GpuDecodeStore {
                                 *graph.d_batch_gate_ups.device_ptr(),
                                 *graph.d_batch_partials.device_ptr(),
                                 w13_n as i32, w13_ksplits as i32,
+                                d_wts,
                             ),
                         ).map_err(|e| format!("batched reduce[{}]: {:?}", layer_idx, e))?;
                     }
@@ -8577,6 +8579,7 @@ impl GpuDecodeStore {
                             *graph.d_batch_expert_outs.device_ptr(),
                             inv_wp, inv_sp,
                             intermediate as i32, hs as i32, gs as i32,
+                            d_wts,
                         ),
                     ).map_err(|e| format!("batched silu_w2[{}]: {:?}", layer_idx, e))?;
                 }
@@ -17535,6 +17538,7 @@ impl GpuDecodeStore {
                         *graph.d_batch_partials.device_ptr(),
                         inv_wp, inv_sp,
                         expert_hs as i32, w13_n as i32, gs as i32, w13_ksplits as i32,
+                        d_wts,
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("batched w13 v2: {:?}", e)))?;
@@ -17552,6 +17556,7 @@ impl GpuDecodeStore {
                         *graph.d_batch_gate_ups.device_ptr(),
                         *graph.d_batch_partials.device_ptr(),
                         w13_n as i32, w13_ksplits as i32,
+                        d_wts,
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("batched reduce: {:?}", e)))?;
@@ -17591,6 +17596,7 @@ impl GpuDecodeStore {
                         *graph.d_batch_expert_outs.device_ptr(),
                         inv_wp, inv_sp,
                         intermediate as i32, expert_hs as i32, gs as i32,
+                        d_wts,
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("batched w2: {:?}", e)))?;

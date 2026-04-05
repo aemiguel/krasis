@@ -3527,9 +3527,11 @@ extern "C" __global__ void marlin_gemv_int4_v2_batched(
     float* __restrict__ partial_out,                    // [num_experts * k_splits * N] FP32
     const int* __restrict__ inv_weight_perm,            // [1024]
     const int* __restrict__ inv_scale_perm,             // [64]
-    int K, int N, int group_size, int k_splits
+    int K, int N, int group_size, int k_splits,
+    const float* __restrict__ weights                   // [num_experts] — skip if zero
 ) {
     int expert_idx = blockIdx.z;
+    if (weights[expert_idx] == 0.0f) return;
     const unsigned int* packed = (const unsigned int*)packed_ptrs[expert_idx];
     const unsigned short* scales = (const unsigned short*)scales_ptrs[expert_idx];
 
@@ -3652,9 +3654,11 @@ extern "C" __global__ void marlin_gemv_int8_v2_batched(
     float* __restrict__ partial_out,                    // [num_experts * k_splits * N] FP32
     const int* __restrict__ inv_weight_perm,            // [1024] INT8 inverse weight perm
     const int* __restrict__ inv_scale_perm,             // [64]
-    int K, int N, int group_size, int k_splits
+    int K, int N, int group_size, int k_splits,
+    const float* __restrict__ weights                   // [num_experts] — skip if zero
 ) {
     int expert_idx = blockIdx.z;
+    if (weights[expert_idx] == 0.0f) return;
     const unsigned int* packed = (const unsigned int*)packed_ptrs[expert_idx];
     const unsigned short* scales = (const unsigned short*)scales_ptrs[expert_idx];
 
@@ -3774,9 +3778,11 @@ extern "C" __global__ void marlin_gemv_int8_v2_batched(
 extern "C" __global__ void reduce_ksplits_bf16_batched(
     unsigned short* __restrict__ output,  // [num_experts * N] BF16
     const float* __restrict__ partial,    // [num_experts * k_splits * N] FP32
-    int N, int k_splits
+    int N, int k_splits,
+    const float* __restrict__ weights     // [num_experts] — skip if zero
 ) {
     int expert_idx = blockIdx.z;
+    if (weights[expert_idx] == 0.0f) return;
     int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= N) return;
 
@@ -3800,9 +3806,11 @@ extern "C" __global__ void fused_silu_w2_batched(
     unsigned short* __restrict__ expert_outs,               // [num_experts * N] BF16
     const int* __restrict__ inv_weight_perm,
     const int* __restrict__ inv_scale_perm,
-    int K, int N, int group_size
+    int K, int N, int group_size,
+    const float* __restrict__ weights                       // [num_experts] — skip if zero
 ) {
     int expert_idx = blockIdx.z;
+    if (weights[expert_idx] == 0.0f) return;
     const unsigned int* packed = (const unsigned int*)w2_packed_ptrs[expert_idx];
     const unsigned short* w2_scales = (const unsigned short*)w2_scales_ptrs[expert_idx];
     const unsigned short* gate_up = gate_ups + expert_idx * 2 * K;
@@ -3926,9 +3934,11 @@ extern "C" __global__ void fused_silu_w2_int8_batched(
     unsigned short* __restrict__ expert_outs,               // [num_experts * N] BF16
     const int* __restrict__ inv_weight_perm,
     const int* __restrict__ inv_scale_perm,
-    int K, int N, int group_size
+    int K, int N, int group_size,
+    const float* __restrict__ weights                       // [num_experts] — skip if zero
 ) {
     int expert_idx = blockIdx.z;
+    if (weights[expert_idx] == 0.0f) return;
     const unsigned int* packed = (const unsigned int*)w2_packed_ptrs[expert_idx];
     const unsigned short* w2_scales = (const unsigned short*)w2_scales_ptrs[expert_idx];
     const unsigned short* gate_up = gate_ups + expert_idx * 2 * K;
@@ -4056,6 +4066,7 @@ extern "C" __global__ void multi_expert_weighted_add_bf16(
     float sum = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&accum[n]));
     for (int e = 0; e < num_experts; e++) {
         float w = weights[e];
+        if (w == 0.0f) continue;  // skip dummy experts (stale data could NaN)
         float val = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&expert_outs[e * N + n]));
         sum += w * val;
     }
@@ -5409,9 +5420,11 @@ extern "C" __global__ void relu2_w2_batched(
     unsigned short* __restrict__ expert_outs,
     const int* __restrict__ inv_weight_perm,
     const int* __restrict__ inv_scale_perm,
-    int K, int N, int group_size
+    int K, int N, int group_size,
+    const float* __restrict__ weights                       // [num_experts] — skip if zero
 ) {
     int expert_idx = blockIdx.z;
+    if (weights[expert_idx] == 0.0f) return;
     const unsigned int* packed = (const unsigned int*)w2_packed_ptrs[expert_idx];
     const unsigned short* w2_scales = (const unsigned short*)w2_scales_ptrs[expert_idx];
     const unsigned short* up_out = up_outs + expert_idx * K;  // just K, not 2*K
@@ -5533,9 +5546,11 @@ extern "C" __global__ void relu2_w2_int8_batched(
     unsigned short* __restrict__ expert_outs,
     const int* __restrict__ inv_weight_perm,
     const int* __restrict__ inv_scale_perm,
-    int K, int N, int group_size
+    int K, int N, int group_size,
+    const float* __restrict__ weights                       // [num_experts] — skip if zero
 ) {
     int expert_idx = blockIdx.z;
+    if (weights[expert_idx] == 0.0f) return;
     const signed char* packed = (const signed char*)w2_packed_ptrs[expert_idx];
     const unsigned short* w2_scales = (const unsigned short*)w2_scales_ptrs[expert_idx];
     const unsigned short* up_out = up_outs + expert_idx * K;
