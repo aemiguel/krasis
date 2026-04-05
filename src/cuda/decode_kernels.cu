@@ -25,7 +25,7 @@ __device__ __forceinline__ __nv_fp8_e4m3 f32_to_fp8e4m3(float x) {
 }
 
 __device__ __forceinline__ float silu(float x) {
-    return x / (1.0f + expf(-x));
+    return x / (1.0f + __expf(-x));
 }
 
 // ── Embedding Lookup ───────────────────────────────────────────────────
@@ -191,7 +191,7 @@ extern "C" __global__ void sigmoid_topk(
     for (int i = 0; i < num_experts; i++) {
         float x = logits[i];
         if (bias) x += bias[i];
-        scores[i] = 1.0f / (1.0f + expf(-x));
+        scores[i] = 1.0f / (1.0f + __expf(-x));
         if (e_score_corr) scores[i] += e_score_corr[i];
     }
 
@@ -239,7 +239,7 @@ extern "C" __global__ void softmax_topk(
     // Softmax
     float sum_exp = 0.0f;
     for (int i = 0; i < num_experts; i++) {
-        scores[i] = expf(logits[i] - max_val);
+        scores[i] = __expf(logits[i] - max_val);
         sum_exp += scores[i];
     }
     for (int i = 0; i < num_experts; i++) {
@@ -434,7 +434,7 @@ extern "C" __global__ void fused_gate_topk(
     float score;
     if (scoring_func == 1) {
         // Sigmoid
-        score = 1.0f / (1.0f + expf(-acc));
+        score = 1.0f / (1.0f + __expf(-acc));
         if (e_score_corr) score += e_score_corr[eid];
     } else {
         // For softmax, store raw logit first (need cooperative reduction)
@@ -454,7 +454,7 @@ extern "C" __global__ void fused_gate_topk(
         // exp and sum
         float sum_exp = 0.0f;
         for (int i = 0; i < num_experts; i++) {
-            s_scores[i] = expf(s_scores[i] - max_val);
+            s_scores[i] = __expf(s_scores[i] - max_val);
             sum_exp += s_scores[i];
         }
         float inv_sum = 1.0f / sum_exp;
@@ -553,7 +553,7 @@ extern "C" __global__ void sigmoid_gate_inplace_bf16(
     const __nv_bfloat16* __restrict__ gate_logit_ptr, // [1], single BF16 on device
     int size
 ) {
-    float gate_value = 1.0f / (1.0f + expf(-bf16_to_f32(gate_logit_ptr[0])));
+    float gate_value = 1.0f / (1.0f + __expf(-bf16_to_f32(gate_logit_ptr[0])));
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) {
         data[i] = f32_to_bf16(bf16_to_f32(data[i]) * gate_value);
@@ -781,7 +781,7 @@ extern "C" __global__ void mla_attention_g(
                     }
                 }
             }
-            float w = expf(score * sm_scale - global_max);
+            float w = __expf(score * sm_scale - global_max);
             smem_weights[ti] = w;
             local_sum += w;
         }
@@ -966,7 +966,7 @@ extern "C" __global__ void mla_attention(
                     }
                 }
             }
-            float w = expf(score * sm_scale - global_max);
+            float w = __expf(score * sm_scale - global_max);
             smem_weights[ti] = w;
             local_sum += w;
         }
@@ -1136,7 +1136,7 @@ extern "C" __global__ void la_conv1d(
             out += conv_state[c * kernel_dim + k] * conv_weight[c * kernel_dim + k];
         }
         // Apply SiLU activation
-        output[c] = out / (1.0f + expf(-out));
+        output[c] = out / (1.0f + __expf(-out));
     }
 }
 
@@ -1204,10 +1204,10 @@ extern "C" __global__ void compute_gate_beta(
         int group_dim = 2 * ratio;
         float b = ba[group * group_dim + pos];
         float a = ba[group * group_dim + ratio + pos];
-        beta_out[i] = 1.0f / (1.0f + expf(-b));  // sigmoid(b)
+        beta_out[i] = 1.0f / (1.0f + __expf(-b));  // sigmoid(b)
         float al = A_log[i];
-        float sp = logf(1.0f + expf(a + dt_bias[i]));  // softplus(a + dt_bias)
-        gate_out[i] = expf(-expf(al) * sp);  // exp(-exp(A_log) * softplus(a + dt_bias))
+        float sp = logf(1.0f + __expf(a + dt_bias[i]));  // softplus(a + dt_bias)
+        gate_out[i] = __expf(-__expf(al) * sp);  // exp(-exp(A_log) * softplus(a + dt_bias))
     }
 }
 
@@ -1449,7 +1449,7 @@ extern "C" __global__ void gated_rmsnorm_silu(
     for (int i = tid; i < dv; i += num_threads) {
         float normed = smem[i] * rms_scale * norm_weight[i];
         float g = gate[i];
-        float silu_g = g / (1.0f + expf(-g));
+        float silu_g = g / (1.0f + __expf(-g));
         out[i] = silu_g * normed;
     }
 }
@@ -1502,7 +1502,7 @@ extern "C" __global__ void gated_rmsnorm_silu_bf16(
     for (int i = tid; i < dv; i += num_threads) {
         float normed = smem[i] * rms_scale * norm_weight[i];
         float g = gate[i];
-        float silu_g = g / (1.0f + expf(-g));
+        float silu_g = g / (1.0f + __expf(-g));
         __nv_bfloat16 result = __float2bfloat16(silu_g * normed);
         out[i] = *reinterpret_cast<unsigned short*>(&result);
     }
@@ -1702,7 +1702,7 @@ extern "C" __global__ void gqa_attention(
         // Step 3: Compute softmax weights in-place
         float local_sum = 0.0f;
         for (int pos = tid; pos < seq_len; pos += num_threads) {
-            float w = expf(smem_scores[pos] - global_max);
+            float w = __expf(smem_scores[pos] - global_max);
             smem_scores[pos] = w;
             local_sum += w;
         }
@@ -1755,16 +1755,16 @@ extern "C" __global__ void gqa_attention(
             }
             score *= sm_scale;
             if (score > local_max) {
-                local_sum *= expf(local_max - score);
+                local_sum *= __expf(local_max - score);
                 local_max = score;
             }
-            local_sum += expf(score - local_max);
+            local_sum += __expf(score - local_max);
         }
         for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
             float other_max = __shfl_down_sync(0xffffffff, local_max, offset);
             float other_sum = __shfl_down_sync(0xffffffff, local_sum, offset);
             float new_max = fmaxf(local_max, other_max);
-            local_sum = local_sum * expf(local_max - new_max) + other_sum * expf(other_max - new_max);
+            local_sum = local_sum * __expf(local_max - new_max) + other_sum * __expf(other_max - new_max);
             local_max = new_max;
         }
         if (lane_id == 0) {
@@ -1779,7 +1779,7 @@ extern "C" __global__ void gqa_attention(
                 float wm = smem_reduce[w];
                 float ws = smem_reduce[w + 16];
                 float new_max = fmaxf(gmax, wm);
-                gsum = gsum * expf(gmax - new_max) + ws * expf(wm - new_max);
+                gsum = gsum * __expf(gmax - new_max) + ws * __expf(wm - new_max);
                 gmax = new_max;
             }
             smem_reduce[0] = gmax;
@@ -1805,7 +1805,7 @@ extern "C" __global__ void gqa_attention(
                             *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
                     }
                 }
-                float weight = expf(score * sm_scale - global_max) * inv_sum;
+                float weight = __expf(score * sm_scale - global_max) * inv_sum;
                 acc += weight * fp8e4m3_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
             }
             out_head[d] = acc;
@@ -1920,7 +1920,7 @@ extern "C" __global__ void gqa_attention_tiled(
     // ── Step 3: exp(score - max) in-place, compute local sum ──
     float local_sum = 0.0f;
     for (int i = tid; i < tile_len; i += num_threads) {
-        float w = expf(smem_scores[i] - tile_max);
+        float w = __expf(smem_scores[i] - tile_max);
         smem_scores[i] = w;
         local_sum += w;
     }
@@ -1991,7 +1991,7 @@ extern "C" __global__ void gqa_attention_reduce(
         //            = sum_all(exp(score_i - global_max))
         float global_sum = 0.0f;
         for (int t = 0; t < num_tiles; t++) {
-            float correction = expf(lse[t * 2] - global_max);
+            float correction = __expf(lse[t * 2] - global_max);
             global_sum += correction * lse[t * 2 + 1];
             smem[t] = correction;  // just the rescaling factor, NOT multiplied by tile_sum
         }
@@ -2051,7 +2051,7 @@ extern "C" __global__ void apply_gated_attn(
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        float g = 1.0f / (1.0f + expf(-gate[idx]));
+        float g = 1.0f / (1.0f + __expf(-gate[idx]));
         attn_out[idx] *= g;
     }
 }
@@ -2065,7 +2065,7 @@ extern "C" __global__ void apply_gated_attn_bf16(
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        float g = 1.0f / (1.0f + expf(-gate[idx]));
+        float g = 1.0f / (1.0f + __expf(-gate[idx]));
         __nv_bfloat16 result = __float2bfloat16(attn_out[idx] * g);
         output[idx] = *reinterpret_cast<unsigned short*>(&result);
     }
@@ -2406,7 +2406,7 @@ extern "C" __global__ void marlin_gemv_int4_fused_silu_accum(
 ) {
     // If weight_ptr is non-NULL, read the gate logit and apply sigmoid on GPU
     if (weight_ptr != NULL) {
-        weight = 1.0f / (1.0f + expf(-(*weight_ptr)));
+        weight = 1.0f / (1.0f + __expf(-(*weight_ptr)));
     }
 
     extern __shared__ char smem_raw[];
@@ -2420,7 +2420,7 @@ extern "C" __global__ void marlin_gemv_int4_fused_silu_accum(
     for (int i = tid; i < K; i += 256) {
         float g = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[i]));
         float u = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[K + i]));
-        float silu_g = g / (1.0f + expf(-g));
+        float silu_g = g / (1.0f + __expf(-g));
         __nv_bfloat16 val = __float2bfloat16(silu_g * u);
         s_input[i] = *reinterpret_cast<unsigned short*>(&val);
     }
@@ -2539,7 +2539,7 @@ extern "C" __global__ void marlin_gemv_int8_fused_silu_accum(
     const float* weight_ptr
 ) {
     if (weight_ptr != NULL) {
-        weight = 1.0f / (1.0f + expf(-(*weight_ptr)));
+        weight = 1.0f / (1.0f + __expf(-(*weight_ptr)));
     }
 
     extern __shared__ char smem_raw[];
@@ -2552,7 +2552,7 @@ extern "C" __global__ void marlin_gemv_int8_fused_silu_accum(
     for (int i = tid; i < K; i += 256) {
         float g = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[i]));
         float u = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[K + i]));
-        float silu_g = g / (1.0f + expf(-g));
+        float silu_g = g / (1.0f + __expf(-g));
         __nv_bfloat16 val = __float2bfloat16(silu_g * u);
         s_input[i] = *reinterpret_cast<unsigned short*>(&val);
     }
@@ -3257,7 +3257,7 @@ extern "C" __global__ void marlin_gemv_int4_fused_silu_accum_v2(
     for (int i = tid; i < K; i += 256) {
         float g = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[i]));
         float u = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[K + i]));
-        float silu_g = g / (1.0f + expf(-g));
+        float silu_g = g / (1.0f + __expf(-g));
         __nv_bfloat16 val = __float2bfloat16(silu_g * u);
         s_input[i] = *reinterpret_cast<unsigned short*>(&val);
     }
@@ -3388,7 +3388,7 @@ extern "C" __global__ void marlin_gemv_int8_fused_silu_accum_v2(
     for (int i = tid; i < K; i += 256) {
         float g = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[i]));
         float u = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[K + i]));
-        float silu_g = g / (1.0f + expf(-g));
+        float silu_g = g / (1.0f + __expf(-g));
         __nv_bfloat16 val = __float2bfloat16(silu_g * u);
         s_input[i] = *reinterpret_cast<unsigned short*>(&val);
     }
@@ -3827,7 +3827,7 @@ extern "C" __global__ void fused_silu_w2_batched(
     for (int i = tid; i < K; i += 256) {
         float g = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[i]));
         float u = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[K + i]));
-        float silu_g = g / (1.0f + expf(-g));
+        float silu_g = g / (1.0f + __expf(-g));
         __nv_bfloat16 val = __float2bfloat16(silu_g * u);
         s_input[i] = *reinterpret_cast<unsigned short*>(&val);
     }
@@ -3955,7 +3955,7 @@ extern "C" __global__ void fused_silu_w2_int8_batched(
     for (int i = tid; i < K; i += 256) {
         float g = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[i]));
         float u = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[K + i]));
-        float silu_g = g / (1.0f + expf(-g));
+        float silu_g = g / (1.0f + __expf(-g));
         __nv_bfloat16 val = __float2bfloat16(silu_g * u);
         s_input[i] = *reinterpret_cast<unsigned short*>(&val);
     }
@@ -4251,7 +4251,7 @@ extern "C" __global__ void gqa_attention_g(
                         *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
                 }
             }
-            float w = expf(score * sm_scale - global_max);
+            float w = __expf(score * sm_scale - global_max);
             smem_weights[ti] = w;
             local_sum += w;
         }
@@ -4386,7 +4386,7 @@ extern "C" __global__ void gqa_attention_g_bf16(
                         *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
                 }
             }
-            float w = expf(score * sm_scale - global_max);
+            float w = __expf(score * sm_scale - global_max);
             smem_weights[ti] = w;
             local_sum += w;
         }
@@ -4534,7 +4534,7 @@ extern "C" __global__ void gqa_attention_tiled_g(
     // Step 3: exp(score - max) in-place, compute local sum
     float local_sum = 0.0f;
     for (int i = tid; i < tile_len; i += num_threads) {
-        float w = expf(smem_scores[i] - tile_max);
+        float w = __expf(smem_scores[i] - tile_max);
         smem_scores[i] = w;
         local_sum += w;
     }
@@ -4608,7 +4608,7 @@ extern "C" __global__ void gqa_attention_reduce_g(
         }
         float global_sum = 0.0f;
         for (int t = 0; t < num_tiles; t++) {
-            float correction = expf(lse[t * 2] - global_max);
+            float correction = __expf(lse[t * 2] - global_max);
             global_sum += correction * lse[t * 2 + 1];
             smem[t] = correction;
         }
@@ -5195,7 +5195,7 @@ extern "C" __global__ void la_fused_post_proj(
     for (int i = tid; i < dv; i += num_threads) {
         float normed = s_scratch[i] * rms_scale * norm_weight[i];
         float zv = z_h[i];
-        float silu_z = zv / (1.0f + expf(-zv));
+        float silu_z = zv / (1.0f + __expf(-zv));
         __nv_bfloat16 result = __float2bfloat16(silu_z * normed);
         out_h[i] = *reinterpret_cast<unsigned short*>(&result);
     }
@@ -5244,7 +5244,7 @@ extern "C" __global__ void mamba2_conv1d(
     }
 
     // SiLU activation: x * sigmoid(x)
-    float sigmoid_val = 1.0f / (1.0f + expf(-acc));
+    float sigmoid_val = 1.0f / (1.0f + __expf(-acc));
     output[idx] = acc * sigmoid_val;
 }
 
@@ -5277,13 +5277,13 @@ extern "C" __global__ void mamba2_discretize(
     if (x > 20.0f) {
         dt = x;  // softplus(x) ≈ x for large x
     } else {
-        dt = logf(1.0f + expf(x));
+        dt = logf(1.0f + __expf(x));
     }
     dt_out[h] = dt;
 
     // A = -exp(A_log), A_bar = exp(A * dt)
-    float A_val = -expf(A_log[h]);
-    A_bar[h] = expf(A_val * dt);
+    float A_val = -__expf(A_log[h]);
+    A_bar[h] = __expf(A_val * dt);
 
     // B_bar: each head maps to a group. B_bar[h, s] = dt[h] * B[group(h), s]
     int heads_per_group = num_heads / n_groups;
@@ -5380,7 +5380,7 @@ extern "C" __global__ void mamba2_gate_output(
         int head = idx / head_dim;
         float y_d = y[idx] + D[head] * x_skip[idx];
         float z_val = z[idx];
-        float silu_z = z_val / (1.0f + expf(-z_val));
+        float silu_z = z_val / (1.0f + __expf(-z_val));
         float gated = y_d * silu_z;
         s_gated[i] = gated;
         local_ss += gated * gated;
@@ -5869,7 +5869,7 @@ extern "C" __global__ void gqa_attention_polar4(
         for (int offset = 16; offset > 0; offset >>= 1) {
             score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
         }
-        float w = expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
+        float w = __expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
         local_sum_exp += w;
 
         for (int idx = 0; idx < lane_dim_count; idx++) {
@@ -6095,7 +6095,7 @@ extern "C" __global__ void gqa_attention_polar4_g(
         for (int offset = 16; offset > 0; offset >>= 1) {
             score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
         }
-        float w = expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
+        float w = __expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
         local_sum_exp += w;
 
         for (int idx = 0; idx < lane_dim_count; idx++) {
@@ -6261,7 +6261,7 @@ extern "C" __global__ void gqa_attention_polar4_tiled_g(
     // Step 3: exp(score - max) in-place, compute sum
     float local_sum = 0.0f;
     for (int i = tid; i < tile_len; i += num_threads) {
-        float w = expf(smem_scores[i] - tile_max);
+        float w = __expf(smem_scores[i] - tile_max);
         smem_scores[i] = w;
         local_sum += w;
     }
@@ -6350,7 +6350,7 @@ extern "C" __global__ void gqa_attention_polar4_reduce_g(
         }
         float global_sum = 0.0f;
         for (int t = 0; t < num_tiles; t++) {
-            float correction = expf(lse[t * 2] - global_max);
+            float correction = __expf(lse[t * 2] - global_max);
             global_sum += correction * lse[t * 2 + 1];
             tile_weights[t] = correction;
         }

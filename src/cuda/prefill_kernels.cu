@@ -261,7 +261,7 @@ extern "C" __global__ void silu_mul_batched_kernel(
     for (int i = threadIdx.x; i < N; i += blockDim.x) {
         float gate = bf16_to_float(gu[i]);
         float up = bf16_to_float(gu[N + i]);
-        float silu_gate = gate / (1.0f + expf(-gate));
+        float silu_gate = gate / (1.0f + __expf(-gate));
         o[i] = float_to_bf16(silu_gate * up);
     }
 }
@@ -329,7 +329,7 @@ extern "C" __global__ void sigmoid_mul_kernel(
     for (int i = threadIdx.x; i < N; i += blockDim.x) {
         float a = bf16_to_float(a_row[i]);
         float g = bf16_to_float(g_row[i]);
-        float sig = 1.0f / (1.0f + expf(-g));
+        float sig = 1.0f / (1.0f + __expf(-g));
         o_row[i] = float_to_bf16(a * sig);
     }
 }
@@ -402,7 +402,7 @@ extern "C" __global__ void sigmoid_topk_kernel(
 
     /* Compute sigmoid scores */
     for (int i = threadIdx.x; i < E; i += blockDim.x) {
-        scores[i] = 1.0f / (1.0f + expf(-g[i]));
+        scores[i] = 1.0f / (1.0f + __expf(-g[i]));
     }
     __syncthreads();
 
@@ -496,7 +496,7 @@ extern "C" __global__ void softmax_topk_kernel(
 
     float sum = 0.0f;
     for (int i = threadIdx.x; i < E; i += blockDim.x) {
-        scores[i] = expf(scores[i] - max_val);
+        scores[i] = __expf(scores[i] - max_val);
         sum += scores[i];
     }
     __shared__ float s_sum;
@@ -815,8 +815,8 @@ extern "C" __global__ void gqa_prefill_kernel(
         /* Online softmax update */
         float old_max = max_score;
         if (score > max_score) max_score = score;
-        float rescale = expf(old_max - max_score);
-        float new_exp = expf(score - max_score);
+        float rescale = __expf(old_max - max_score);
+        float new_exp = __expf(score - max_score);
         sum_exp = sum_exp * rescale + new_exp;
 
         /* Update accumulator: rescale old values and add new contribution */
@@ -1037,7 +1037,7 @@ extern "C" __global__ void causal_conv1d_fwd_kernel(
             acc += xv * w[j];
         }
         if (silu_act) {
-            acc = acc / (1.0f + expf(-acc));
+            acc = acc / (1.0f + __expf(-acc));
         }
         out_d[t] = float_to_bf16(acc);
     }
@@ -1115,10 +1115,10 @@ extern "C" __global__ void mamba2_ssd_sequential_kernel(
         /* Get dt, apply bias and softplus */
         float dt = bf16_to_float(dt_in[t * n_heads + head]);
         if (dt_bias != NULL) dt += dt_bias[head];
-        if (use_softplus) dt = logf(1.0f + expf(dt));
+        if (use_softplus) dt = logf(1.0f + __expf(dt));
 
         /* Discretize: A_bar = exp(A * dt) */
-        float A_bar = expf(A_val * dt);
+        float A_bar = __expf(A_val * dt);
 
         /* Get x for this timestep */
         float x_val = bf16_to_float(x[(t * n_heads + head) * head_dim + d]);
@@ -1286,7 +1286,7 @@ extern "C" __global__ void moe_add_shared_gated_kernel(
 {
     int row = blockIdx.x;
     if (row >= M) return;
-    float gate = 1.0f / (1.0f + expf(-gate_values[row]));
+    float gate = 1.0f / (1.0f + __expf(-gate_values[row]));
     float* a = accum + (int64_t)row * D;
     const __nv_bfloat16* s = shared_out + (int64_t)row * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
@@ -1489,7 +1489,7 @@ extern "C" __global__ void la_depthwise_conv1d_silu_kernel(
             acc += val * wt[w];
         }
         /* SiLU activation: x * sigmoid(x) */
-        float sig = 1.0f / (1.0f + expf(-acc));
+        float sig = 1.0f / (1.0f + __expf(-acc));
         out[t] = acc * sig;
     }
 
@@ -1582,12 +1582,12 @@ extern "C" __global__ void la_compute_gate_beta_kernel(
         float a = bf16_to_float(a_row[i]);
 
         /* beta = sigmoid(b) */
-        beta_row[i] = 1.0f / (1.0f + expf(-b));
+        beta_row[i] = 1.0f / (1.0f + __expf(-b));
 
         /* gate = -exp(A_log) * softplus(a + dt_bias) */
-        float a_val = expf(A_log[i]);
+        float a_val = __expf(A_log[i]);
         float x_sp = a + dt_bias[i];
-        float sp = (x_sp > 20.0f) ? x_sp : logf(1.0f + expf(x_sp));
+        float sp = (x_sp > 20.0f) ? x_sp : logf(1.0f + __expf(x_sp));
         gate_row[i] = -a_val * sp;
     }
 }
@@ -1695,7 +1695,7 @@ extern "C" __global__ void la_gated_rmsnorm_kernel(
     for (int i = threadIdx.x; i < dv; i += blockDim.x) {
         float normed = x_head[i] * rms_inv * weight[i];
         float g = bf16_to_float(g_head[i]);
-        float silu_g = g / (1.0f + expf(-g));
+        float silu_g = g / (1.0f + __expf(-g));
         o_head[i] = float_to_bf16(normed * silu_g);
     }
 }
@@ -1760,7 +1760,7 @@ extern "C" __global__ void la_fused_conv1d_silu_bf16_kernel(
         }
 
         /* SiLU activation */
-        float sig = 1.0f / (1.0f + expf(-acc));
+        float sig = 1.0f / (1.0f + __expf(-acc));
         float result = acc * sig;
 
         /* Write to appropriate BF16 output buffer */
@@ -1866,10 +1866,10 @@ extern "C" __global__ void la_compute_gate_beta_bf16_kernel(
         float b = bf16_to_float(b_row[i]);
         float a = bf16_to_float(a_row[i]);
         /* beta = sigmoid(b) */
-        beta_row[i] = float_to_bf16(1.0f / (1.0f + expf(-b)));
+        beta_row[i] = float_to_bf16(1.0f / (1.0f + __expf(-b)));
         /* gate = -exp(A_log) * softplus(a + dt_bias) */
-        float sp = logf(1.0f + expf(a + dt_bias[i]));
-        gate_row[i] = float_to_bf16(-expf(A_log[i]) * sp);
+        float sp = logf(1.0f + __expf(a + dt_bias[i]));
+        gate_row[i] = float_to_bf16(-__expf(A_log[i]) * sp);
     }
 }
 
@@ -1964,7 +1964,7 @@ extern "C" __global__ void la_gated_rmsnorm_bf16in_kernel(
     for (int i = threadIdx.x; i < dv; i += blockDim.x) {
         float normed = bf16_to_float(x_head[i]) * rms_inv * weight[i];
         float g = bf16_to_float(g_head[i]);
-        float silu_g = g / (1.0f + expf(-g));
+        float silu_g = g / (1.0f + __expf(-g));
         o_head[i] = float_to_bf16(normed * silu_g);
     }
 }
@@ -2039,7 +2039,7 @@ extern "C" __global__ void la_build_attn_matrix_kernel(
                 dot += k_beta[base_kbeta + d] * k[base_k_col + d];
             }
             float g_j = g_cum[base_g + col];
-            float decay = expf(g_i - g_j);
+            float decay = __expf(g_i - g_j);
             attn[base_attn + col] = -dot * decay;
         }
     }
@@ -2157,7 +2157,7 @@ extern "C" __global__ void la_chunk_recurrence_kernel(
 
             /* Compute attn_inter[d] = sum_j (q[t,j] * exp(g_t)) * state[j,d] */
             float attn_inter_d = 0.0f;
-            float exp_g = expf(g_t);
+            float exp_g = __expf(g_t);
             for (int j = 0; j < dk; j++) {
                 attn_inter_d += q_h[t * dk + j] * exp_g * st[j * dv + d];
             }
@@ -2231,7 +2231,7 @@ extern "C" __global__ void la_chunk_recurrence_kernel(
                     for (int dd = 0; dd < dk; dd++) {
                         dot += q_h[i * dk + dd] * k_h[j * dk + dd];
                     }
-                    float decay = expf(g_h[i] - g_h[j]);
+                    float decay = __expf(g_h[i] - g_h[j]);
                     s_attn[i * cs + j] = dot * decay;
                 }
             }
@@ -2244,7 +2244,7 @@ extern "C" __global__ void la_chunk_recurrence_kernel(
         for (int d = threadIdx.x; d < dv; d += blockDim.x) {
             /* attn_inter = (q[t] * exp(g[t])) @ state */
             float inter = 0.0f;
-            float exp_g = expf(g_h[t]);
+            float exp_g = __expf(g_h[t]);
             for (int j = 0; j < dk; j++) {
                 inter += q_h[t * dk + j] * exp_g * st[j * dv + d];
             }
@@ -2331,7 +2331,7 @@ extern "C" __global__ void la_chunk_output_kernel(
     float* out = output + (int64_t)head * cs * dv;
 
     for (int t = 0; t < cs; t++) {
-        float exp_g = expf(g_h[t]);
+        float exp_g = __expf(g_h[t]);
 
         for (int d = threadIdx.x; d < dv; d += blockDim.x) {
             /* Inter-chunk: (q[t] * exp(g[t])) @ state[:, d] */
@@ -2348,7 +2348,7 @@ extern "C" __global__ void la_chunk_output_kernel(
                 for (int j = 0; j < dk; j++) {
                     qk_dot += q_h[t * dk + j] * k_h[s * dk + j];
                 }
-                float decay = expf(g_h[t] - g_h[s]);
+                float decay = __expf(g_h[t] - g_h[s]);
                 intra += qk_dot * decay * vn_h[s * dv + d];
             }
 
@@ -2380,14 +2380,14 @@ extern "C" __global__ void la_state_update_kernel(
     const float* g_h = g_cum + (int64_t)head * cs;
 
     float g_last = g_h[cs - 1];
-    float g_last_exp = expf(g_last);
+    float g_last_exp = __expf(g_last);
 
     /* state[j, d] = state[j, d] * g_last_exp + sum_t k[t, j] * k_decay[t] * v_new[t, d] */
     for (int j = 0; j < dk; j++) {
         for (int d = threadIdx.x; d < dv; d += blockDim.x) {
             float s = st[j * dv + d] * g_last_exp;
             for (int t = 0; t < cs; t++) {
-                float k_decay = expf(g_last - g_h[t]);
+                float k_decay = __expf(g_last - g_h[t]);
                 s += k_h[t * dk + j] * k_decay * vn_h[t * dv + d];
             }
             st[j * dv + d] = s;
@@ -2508,7 +2508,7 @@ extern "C" __global__ void la_chunk_output_strided_kernel(
     float* out = output + ((int64_t)head * total_len + chunk_idx * cs) * dv;
 
     for (int t = 0; t < cs; t++) {
-        float exp_g = expf(g_h[t]);
+        float exp_g = __expf(g_h[t]);
 
         for (int d = threadIdx.x; d < dv; d += blockDim.x) {
             /* Inter-chunk: (q[t] * exp(g[t])) @ state[:, d] */
@@ -2525,7 +2525,7 @@ extern "C" __global__ void la_chunk_output_strided_kernel(
                 for (int j = 0; j < dk; j++) {
                     qk_dot += q_h[t * dk + j] * k_h[s * dk + j];
                 }
-                float decay = expf(g_h[t] - g_h[s]);
+                float decay = __expf(g_h[t] - g_h[s]);
                 intra += qk_dot * decay * vn_h[s * dv + d];
             }
 
@@ -2560,13 +2560,13 @@ extern "C" __global__ void la_state_update_strided_kernel(
     const float* g_h = g_cum + (int64_t)head * total_len + chunk_idx * cs;
 
     float g_last = g_h[cs - 1];
-    float g_last_exp = expf(g_last);
+    float g_last_exp = __expf(g_last);
 
     for (int j = 0; j < dk; j++) {
         for (int d = threadIdx.x; d < dv; d += blockDim.x) {
             float s = st[j * dv + d] * g_last_exp;
             for (int t = 0; t < cs; t++) {
-                float k_decay = expf(g_last - g_h[t]);
+                float k_decay = __expf(g_last - g_h[t]);
                 s += k_h[t * dk + j] * k_decay * vn_h[t * dv + d];
             }
             st[j * dv + d] = s;
@@ -2594,7 +2594,7 @@ extern "C" __global__ void la_scale_by_exp_g_kernel(
     int pos = blockIdx.y;
     if (head >= nv || pos >= total_len) return;
 
-    float eg = expf(g_cum[head * total_len + pos]);
+    float eg = __expf(g_cum[head * total_len + pos]);
     const float* src = k_beta + ((int64_t)head * total_len + pos) * dk;
     float* dst = k_beta_g + ((int64_t)head * total_len + pos) * dk;
 
@@ -2944,13 +2944,13 @@ extern "C" __global__ void flash_attn_tiled_kernel(
             /* Update online softmax state */
             float old_max = row_max_arr[r];
             float new_max = fmaxf(old_max, local_max);
-            float rescale = expf(old_max - new_max);
+            float rescale = __expf(old_max - new_max);
             row_max_arr[r] = new_max;
 
             /* Compute P = exp(score - max), local sum */
             float local_sum = 0.0f;
             for (int c = lane; c < FA_BC; c += 32) {
-                float p = expf(row[c] - new_max);
+                float p = __expf(row[c] - new_max);
                 row[c] = p;
                 local_sum += p;
             }
