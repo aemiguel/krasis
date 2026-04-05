@@ -8499,14 +8499,6 @@ impl GpuDecodeStore {
                 let d_w2s = d_upload_base + (ptr_stride * 3) as u64;
                 let d_wts = d_upload_base + (ptr_stride * 4) as u64;
 
-                // Zero MoE output accumulator
-                unsafe {
-                    k.zero_bf16.clone().launch(
-                        LaunchConfig::for_num_elems(hs as u32),
-                        (*graph.d_moe_out.device_ptr(), hs as i32),
-                    ).map_err(|e| format!("zero_bf16[{}]: {:?}", layer_idx, e))?;
-                }
-
                 // Batched w13 GEMV v2
                 if use_v2_w13 {
                     let w13_n_tiles = (w13_n + 15) / 16;
@@ -8584,7 +8576,7 @@ impl GpuDecodeStore {
                     ).map_err(|e| format!("batched silu_w2[{}]: {:?}", layer_idx, e))?;
                 }
 
-                // Multi-expert weighted add
+                // Multi-expert weighted add (init_zero=1: fused zero, no separate zero_bf16 needed)
                 unsafe {
                     k.multi_expert_weighted_add_bf16.clone().launch(
                         LaunchConfig {
@@ -8596,7 +8588,7 @@ impl GpuDecodeStore {
                             *graph.d_moe_out.device_ptr(),
                             *graph.d_batch_expert_outs.device_ptr(),
                             d_wts,
-                            hs as i32, topk as i32,
+                            hs as i32, topk as i32, 1i32,
                         ),
                     ).map_err(|e| format!("multi_expert_weighted_add[{}]: {:?}", layer_idx, e))?;
                 }
@@ -17270,17 +17262,7 @@ impl GpuDecodeStore {
             }
         }
 
-        // ── Step 5: Zero d_moe_out accumulator ──
-        {
-            unsafe {
-                // For LatentMoE: only zero expert_hs elements (latent_size, not hidden_size)
-                k.zero_bf16.clone().launch(
-                    LaunchConfig::for_num_elems(expert_hs as u32),
-                    (*graph.d_moe_out.device_ptr(), expert_hs as i32),
-                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("zero_bf16: {:?}", e)))?;
-            }
-        }
+        // ── Step 5: (zero fused into multi_expert_weighted_add_bf16 via init_zero=1) ──
 
         // ── Step 6: Double-buffered expert loop with DMA/compute overlap ──
         //
@@ -17614,7 +17596,7 @@ impl GpuDecodeStore {
                         *graph.d_moe_out.device_ptr(),
                         *graph.d_batch_expert_outs.device_ptr(),
                         d_wts,
-                        expert_hs as i32, hcs_batch_count as i32,
+                        expert_hs as i32, hcs_batch_count as i32, 1i32,
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("multi_expert_weighted_add: {:?}", e)))?;

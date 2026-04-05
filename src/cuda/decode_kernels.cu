@@ -4058,12 +4058,12 @@ extern "C" __global__ void multi_expert_weighted_add_bf16(
     unsigned short* __restrict__ accum,              // [N] BF16 moe_out
     const unsigned short* __restrict__ expert_outs,  // [num_experts * N] BF16
     const float* __restrict__ weights,               // [num_experts] FP32
-    int N, int num_experts
+    int N, int num_experts, int init_zero
 ) {
     int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= N) return;
 
-    float sum = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&accum[n]));
+    float sum = init_zero ? 0.0f : __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&accum[n]));
     for (int e = 0; e < num_experts; e++) {
         float w = weights[e];
         if (w == 0.0f) continue;  // skip dummy experts (stale data could NaN)
