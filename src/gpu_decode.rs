@@ -482,6 +482,53 @@ impl Drop for PinnedHostChunk {
     }
 }
 
+/// GPU buffer allocated with 64 KB address alignment.
+///
+/// Overallocates by 64 KB via cudarc's normal allocator, then bumps the
+/// returned pointer up to the next 64 KB boundary. The caller sees only
+/// the aligned pointer; the underlying CudaSlice owns the full allocation
+/// and frees it on drop.
+///
+/// Max waste: 64 KB per allocation (< 0.05% of a typical 128 MB chunk).
+const ALIGN_64KB: u64 = 64 * 1024;
+
+struct AlignedGpuBuffer {
+    /// The underlying allocation (overallocated by up to ALIGN_64KB).
+    inner: cudarc::driver::CudaSlice<u8>,
+    /// The 64 KB-aligned device pointer (stored for returning &u64).
+    aligned_ptr: u64,
+    /// Usable size (the size the caller requested).
+    len: usize,
+}
+
+impl AlignedGpuBuffer {
+    /// Allocate `size` bytes of zeroed GPU memory aligned to 64 KB.
+    fn new_zeroed(device: &std::sync::Arc<cudarc::driver::CudaDevice>, size: usize) -> Result<Self, cudarc::driver::DriverError> {
+        let alloc_size = size + ALIGN_64KB as usize;
+        let inner = device.alloc_zeros::<u8>(alloc_size)?;
+        let raw_ptr = *inner.device_ptr() as u64;
+        let aligned_ptr = (raw_ptr + ALIGN_64KB - 1) & !(ALIGN_64KB - 1);
+        Ok(Self { inner, aligned_ptr, len: size })
+    }
+
+    /// Allocate `size` bytes of uninitialised GPU memory aligned to 64 KB.
+    /// Use when data will be immediately overwritten (e.g. async DMA reload).
+    unsafe fn new_uninit(device: &std::sync::Arc<cudarc::driver::CudaDevice>, size: usize) -> Result<Self, cudarc::driver::DriverError> {
+        let alloc_size = size + ALIGN_64KB as usize;
+        let inner = device.alloc::<u8>(alloc_size)?;
+        let raw_ptr = *inner.device_ptr() as u64;
+        let aligned_ptr = (raw_ptr + ALIGN_64KB - 1) & !(ALIGN_64KB - 1);
+        Ok(Self { inner, aligned_ptr, len: size })
+    }
+
+    /// The 64 KB-aligned device pointer.
+    /// Returns &u64 so `*buf.device_ptr()` works identically to CudaSlice.
+    #[inline]
+    fn device_ptr(&self) -> &u64 {
+        &self.aligned_ptr
+    }
+}
+
 /// HCS state: resident expert cache + activation heatmap + dynamic eviction.
 struct HcsState {
     /// (layer_idx, expert_idx) → cache entry (for management operations).
@@ -509,7 +556,7 @@ struct HcsState {
 
     // ── Pool-based VRAM for dynamic eviction ──
     /// One contiguous VRAM allocation divided into equal-sized expert slots.
-    pool_buf: Option<cudarc::driver::CudaSlice<u8>>,
+    pool_buf: Option<AlignedGpuBuffer>,
     /// Bytes per slot (aligned).
     pool_slot_size: usize,
     /// Total number of slots in the pool.
@@ -523,7 +570,7 @@ struct HcsState {
     /// Chunked VRAM allocations for soft-tier experts.
     /// Each chunk is ~1 GB (proportional to total VRAM). Chunk 0 = hottest experts.
     /// Eviction drops chunks from the tail (coldest first), proportional to scratch needs.
-    soft_chunks: Vec<cudarc::driver::CudaSlice<u8>>,
+    soft_chunks: Vec<AlignedGpuBuffer>,
     /// Number of expert slots per chunk (all chunks same size except possibly the last).
     soft_slots_per_chunk: usize,
     /// Total number of chunks when fully loaded.
@@ -640,7 +687,7 @@ impl HcsState {
         debug_assert!(spc > 0);
         let chunk_idx = slot / spc;
         let offset = slot % spc;
-        let base = *self.soft_chunks[chunk_idx].device_ptr();
+        let base = self.soft_chunks[chunk_idx].device_ptr();
         base + (offset as u64 * self.soft_slot_size as u64)
     }
 
@@ -4713,7 +4760,7 @@ impl GpuDecodeStore {
             slots_per_chunk, soft_num_slots, soft_experts_available);
 
         // Allocate GPU chunks + pinned host mirrors for batch DMA reload
-        let mut soft_chunks: Vec<cudarc::driver::CudaSlice<u8>> = Vec::with_capacity(planned_num_chunks);
+        let mut soft_chunks: Vec<AlignedGpuBuffer> = Vec::with_capacity(planned_num_chunks);
         let mut soft_host_chunks: Vec<PinnedHostChunk> = Vec::with_capacity(planned_num_chunks);
         let startup_idle_floor_mb = self.vram_calibration
             .map(|cal| cal.required_idle_free_mb(cal.short_tokens) as usize)
@@ -4739,7 +4786,7 @@ impl GpuDecodeStore {
                     break;
                 }
             }
-            let chunk_buf = self.device.alloc_zeros::<u8>(chunk_bytes)
+            let chunk_buf = AlignedGpuBuffer::new_zeroed(&self.device, chunk_bytes)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("HCS soft chunk {} alloc ({} MB): {:?}",
                         c, chunk_bytes / (1024 * 1024), e)))?;
@@ -4862,7 +4909,7 @@ impl GpuDecodeStore {
                 if let Some((layer_idx, expert_idx, w13p_off, w13s_off, w2p_off, w2s_off)) = experts_per_slot[slot] {
                     let chunk_idx = slot / slots_per_chunk;
                     let offset_in_chunk = slot % slots_per_chunk;
-                    let dst = *soft_chunks[chunk_idx].device_ptr()
+                    let dst = soft_chunks[chunk_idx].device_ptr()
                         + (offset_in_chunk as u64 * slot_size as u64);
                     let entry = HcsCacheEntry {
                         d_buf: None,
@@ -14200,7 +14247,7 @@ impl GpuDecodeStore {
                 }
             }
 
-            let chunk_buf = match self.device.alloc_zeros::<u8>(chunk_bytes) {
+            let chunk_buf = match AlignedGpuBuffer::new_zeroed(&self.device, chunk_bytes) {
                 Ok(buf) => buf,
                 Err(e) => {
                     log::warn!("HCS soft reload: chunk {} alloc failed ({:.1} MB): {:?}",
@@ -14428,7 +14475,7 @@ impl GpuDecodeStore {
                 }
             }
 
-            let chunk_buf = match unsafe { self.device.alloc::<u8>(chunk_bytes) } {
+            let chunk_buf = match unsafe { AlignedGpuBuffer::new_uninit(&self.device, chunk_bytes) } {
                 Ok(buf) => buf,
                 Err(e) => {
                     log::warn!("HCS soft async reload: chunk {} alloc failed ({:.1} MB): {:?}",
@@ -19085,7 +19132,7 @@ impl GpuDecodeStore {
             log::info!("HCS pool: allocating {:.1} MB ({} slots x {:.1} KB/slot)",
                 pool_alloc_bytes as f64 / (1024.0 * 1024.0),
                 num_slots, slot_size as f64 / 1024.0);
-            let buf = self.device.alloc_zeros::<u8>(pool_alloc_bytes)
+            let buf = AlignedGpuBuffer::new_zeroed(&self.device, pool_alloc_bytes)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("HCS pool alloc ({} MB): {:?}", pool_alloc_bytes / (1024 * 1024), e)))?;
             let base = *buf.device_ptr();
