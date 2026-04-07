@@ -834,7 +834,7 @@ fn handle_chat_completion(
             request_id, activated, real_reload_ms);
     }
     // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
-    // ── Multi-GPU: copy KV cache from primary to all aux GPUs after prefill ──
+    // ── Multi-GPU: copy KV+LA state from primary to all aux GPUs after prefill ──
     if !state.aux_gpu_store_addrs.is_empty() {
         let t_kvcopy = Instant::now();
         let num_aux = state.aux_gpu_store_addrs.len();
@@ -846,9 +846,13 @@ fn handle_chat_completion(
             if let Err(e) = store.copy_kv_to_aux(aux_store, layer_start, layer_end, state.multi_gpu_gqa_offsets[i], prompt_len) {
                 log::error!("Request {}: KV cache copy to aux GPU{} failed: {}", request_id, i + 1, e);
             }
+            // Copy LA recurrent state (conv_state + recur_state) for linear attention layers
+            if let Err(e) = store.copy_la_states_to_aux(aux_store, layer_start, layer_end) {
+                log::error!("Request {}: LA state copy to aux GPU{} failed: {}", request_id, i + 1, e);
+            }
         }
         let kvcopy_ms = t_kvcopy.elapsed().as_secs_f64() * 1000.0;
-        log::info!("Request {}: KV cache copied to {} aux GPUs in {:.1}ms", request_id, num_aux, kvcopy_ms);
+        log::info!("Request {}: KV+LA state copied to {} aux GPUs in {:.1}ms", request_id, num_aux, kvcopy_ms);
     }
     let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
 
@@ -2295,6 +2299,9 @@ impl RustServer {
                 let layer_end = if i + 1 < num_aux { self.multi_gpu_split_layers[i + 1] } else { num_layers };
                 if let Err(e) = store.copy_kv_to_aux(aux_store, layer_start, layer_end, self.multi_gpu_gqa_offsets[i], prompt_len) {
                     log::error!("benchmark_request: KV copy to aux GPU{} failed: {}", i + 1, e);
+                }
+                if let Err(e) = store.copy_la_states_to_aux(aux_store, layer_start, layer_end) {
+                    log::error!("benchmark_request: LA state copy to aux GPU{} failed: {}", i + 1, e);
                 }
             }
         }

@@ -3059,6 +3059,11 @@ impl GpuDecodeStore {
                 "register_simple_int4_only: no pending simple INT4 data (call repack_marlin_int4_cpu first)"));
         };
 
+        // Bind CUDA context so raw cuMemAlloc/cuMemcpy target the correct GPU
+        self.device.bind_to_thread()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("register_simple_int4_only bind_to_thread: {:?}", e)))?;
+
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         let id = graph.weights.len();
@@ -6011,6 +6016,13 @@ impl GpuDecodeStore {
     fn py_copy_kv_to_aux(&self, aux_store_addr: usize, layer_start: usize, layer_end: usize, gqa_offset: usize, prompt_len: usize) -> PyResult<()> {
         let aux_store = unsafe { &mut *(aux_store_addr as *mut GpuDecodeStore) };
         self.copy_kv_to_aux(aux_store, layer_start, layer_end, gqa_offset, prompt_len)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    #[pyo3(signature = (aux_store_addr, layer_start, layer_end))]
+    fn py_copy_la_states_to_aux(&self, aux_store_addr: usize, layer_start: usize, layer_end: usize) -> PyResult<()> {
+        let aux_store = unsafe { &mut *(aux_store_addr as *mut GpuDecodeStore) };
+        self.copy_la_states_to_aux(aux_store, layer_start, layer_end)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 
@@ -10899,6 +10911,7 @@ impl GpuDecodeStore {
                         self.device.synchronize().map_err(|e| format!("gqa attn sync: {:?}", e))?;
                         graph.t_gqa_attn += (Instant::now() - t_gqa_attn_start).as_secs_f64();
                     }
+
                     let t_gqa_out_start = Instant::now();
 
                     // ── GQA: Apply gated attention + convert to BF16 for O projection ──
@@ -11930,6 +11943,109 @@ impl GpuDecodeStore {
 
         log::info!("copy_kv_to_aux: copied {} GQA layers, {} bytes total ({} positions, format={})",
             copied, total_bytes, prompt_len, graph.kv_format);
+        Ok(())
+    }
+
+    /// Copy Linear Attention recurrent state (conv_state + recur_state) from primary to aux GPU.
+    /// Must be called after prefill so the aux GPU has the correct LA state for decode.
+    pub fn copy_la_states_to_aux(
+        &self,
+        aux_store: &mut GpuDecodeStore,
+        layer_start: usize,
+        layer_end: usize,
+    ) -> Result<(), String> {
+        let graph = self.graph.as_ref().ok_or("primary graph not configured")?;
+        let aux_graph = aux_store.graph.as_ref().ok_or("aux graph not configured")?;
+
+        let mut copied = 0usize;
+        let mut total_bytes = 0usize;
+
+        for layer_idx in layer_start..layer_end {
+            // Get LA state from primary store
+            let (conv_src, recur_src, conv_bytes, recur_bytes) = match &graph.layers[layer_idx].attn {
+                GpuAttnConfig::LinearAttention {
+                    conv_state_ptr, recur_state_ptr,
+                    conv_dim, kernel_dim, nv, dk, dv, ..
+                } => {
+                    let cb = conv_dim * kernel_dim * 4; // FP32
+                    let rb = nv * dk * dv * 4;          // FP32
+                    (*conv_state_ptr, *recur_state_ptr, cb, rb)
+                }
+                _ => continue, // Not an LA layer
+            };
+
+            if conv_src == 0 || recur_src == 0 { continue; }
+
+            // Get LA state destination on aux store
+            let (conv_dst, recur_dst) = match &aux_graph.layers[layer_idx].attn {
+                GpuAttnConfig::LinearAttention {
+                    conv_state_ptr, recur_state_ptr, ..
+                } => (*conv_state_ptr, *recur_state_ptr),
+                _ => return Err(format!("Aux store layer {} is not LA but primary is", layer_idx)),
+            };
+
+            if conv_dst == 0 || recur_dst == 0 {
+                return Err(format!("Aux store missing LA state buffers for layer {}", layer_idx));
+            }
+
+            // Copy conv_state: GPU0 -> host -> GPU1
+            let max_bytes = conv_bytes.max(recur_bytes);
+            let mut host_buf = vec![0u8; max_bytes];
+
+            self.device.bind_to_thread()
+                .map_err(|e| format!("bind GPU0 for LA copy: {:?}", e))?;
+            self.device.synchronize()
+                .map_err(|e| format!("sync GPU0 before LA copy: {:?}", e))?;
+
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    conv_src, conv_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("LA conv_state D2H layer {}: {:?}", layer_idx, err));
+                }
+            }
+            aux_store.device.bind_to_thread()
+                .map_err(|e| format!("bind GPU1 for LA conv copy: {:?}", e))?;
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    conv_dst,
+                    host_buf.as_ptr() as *const std::ffi::c_void,
+                    conv_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("LA conv_state H2D layer {}: {:?}", layer_idx, err));
+                }
+            }
+
+            // Copy recur_state: GPU0 -> host -> GPU1
+            self.device.bind_to_thread()
+                .map_err(|e| format!("bind GPU0 for LA recur copy: {:?}", e))?;
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    recur_src, recur_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("LA recur_state D2H layer {}: {:?}", layer_idx, err));
+                }
+            }
+            aux_store.device.bind_to_thread()
+                .map_err(|e| format!("bind GPU1 for LA recur copy: {:?}", e))?;
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    recur_dst,
+                    host_buf.as_ptr() as *const std::ffi::c_void,
+                    recur_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("LA recur_state H2D layer {}: {:?}", layer_idx, err));
+                }
+            }
+
+            copied += 1;
+            total_bytes += conv_bytes + recur_bytes;
+        }
+
+        log::info!("copy_la_states_to_aux: copied {} LA layers, {} bytes total",
+            copied, total_bytes);
         Ok(())
     }
 

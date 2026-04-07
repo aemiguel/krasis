@@ -1357,8 +1357,19 @@ def main():
                     gqa_count += 1
             _multi_gpu_gqa_offsets.append(gqa_count)
 
-        # Recompute final boundaries for display
+        # Recompute final boundaries and total HCS for display
         boundaries = [0] + _multi_gpu_splits + [num_layers]
+        # Recompute HCS budgets for final splits (needed when loop was skipped)
+        gpu_hcs_budgets[0] = gpu0_hcs_total
+        for i in range(num_aux):
+            gpu_idx_in_list = i + 1
+            layer_start = boundaries[gpu_idx_in_list]
+            layer_end_b = boundaries[gpu_idx_in_list + 1]
+            attn_cost = sum(_layer_vram_mb[j] for j in range(layer_start, layer_end_b))
+            base_overhead = last_gpu_base_overhead if (i + 1 == num_aux) else 0
+            gpu_hcs_budgets[gpu_idx_in_list] = max(0,
+                aux_totals[i] - base_overhead - attn_cost - SAFETY_MARGIN_MB)
+        total_hcs = sum(gpu_hcs_budgets)
         _detail(f"HCS budgets: " + ", ".join(
             f"GPU{i} {gpu_hcs_budgets[i]:,.0f} MB" for i in range(num_gpus_available)
         ) + f" = {total_hcs:,.0f} MB total")
@@ -1441,8 +1452,13 @@ def main():
             gpu0_layer_end = _multi_gpu_split if _multi_gpu_split > 0 else len(_model.layers)
             store.set_decode_segment(0, gpu0_layer_end)
 
-            # Multi-GPU: restrict AWQ swaps to decode segment, track prefill-only layers
+            # Multi-GPU: ensure all layers are in Marlin format BEFORE restricting swaps.
+            # After calibration, weights may be in simple INT4. restrict_to_decode_segment
+            # removes swap entries for layers outside GPU0's segment, so those layers would
+            # be permanently stuck in simple INT4 if not swapped back to Marlin first.
+            # Prefill needs ALL layers in Marlin format on GPU0.
             if _multi_gpu_split > 0:
+                store.swap_to_marlin()
                 _model.restrict_to_decode_segment(0, gpu0_layer_end)
 
             # ── Initialize GPU0 HCS as fully reclaimable on the primary GPU ──
@@ -1677,13 +1693,15 @@ def main():
                 prompt_tokens, temperature=0.6
             )
 
-            # Copy KV cache to each aux store
+            # Copy KV cache and LA state to each aux store
             for i in range(num_aux):
                 seg_start = boundaries[i + 1]
                 seg_end = boundaries[i + 2]
                 gpu_store.py_copy_kv_to_aux(
                     all_aux_gpu_store_addrs[i], seg_start, seg_end,
                     _multi_gpu_gqa_offsets[i], prompt_len)
+                gpu_store.py_copy_la_states_to_aux(
+                    all_aux_gpu_store_addrs[i], seg_start, seg_end)
 
             # Reload soft HCS on GPU0 only (aux GPUs have no soft tier)
             r0, _ = gpu_store.py_hcs_reload_after_prefill(prompt_len)
