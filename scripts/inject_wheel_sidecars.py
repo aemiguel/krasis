@@ -64,6 +64,8 @@ def main() -> None:
     parser.add_argument("--wheel-dir", required=True)
     parser.add_argument("--marlin")
     parser.add_argument("--flash-attn")
+    parser.add_argument("--fla-dir",
+                        help="Directory containing libkrasis_fla_sm*.so files")
     args = parser.parse_args()
 
     sidecars: list[tuple[Path, str]] = []
@@ -71,6 +73,10 @@ def main() -> None:
         sidecars.append((Path(args.marlin), "krasis/libkrasis_marlin.so"))
     if args.flash_attn:
         sidecars.append((Path(args.flash_attn), "krasis/libkrasis_flash_attn.so"))
+    if args.fla_dir:
+        fla_dir = Path(args.fla_dir)
+        for fla_so in sorted(fla_dir.glob("libkrasis_fla_sm*.so")):
+            sidecars.append((fla_so, f"krasis/{fla_so.name}"))
     if not sidecars:
         raise SystemExit("no sidecars provided")
 

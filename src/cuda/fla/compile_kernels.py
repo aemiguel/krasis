@@ -1,36 +1,30 @@
 #!/usr/bin/env python3
-"""Build-time FLA kernel compiler.
+"""Build-time FLA kernel compiler with cross-compilation.
 
 Compiles the vendored FLA (Flash Linear Attention) Triton kernels for the Gated
-DeltaNet algorithm used by QCN's 36 linear attention layers.
+DeltaNet algorithm used by linear attention layers during prefill.
 
-This script:
-1. Imports the vendored FLA code
-2. Runs chunk_gated_delta_rule_fwd with representative inputs to trigger Triton JIT
-3. Extracts compiled cubins from the Triton cache
-4. Extracts kernel metadata (arg types, shared mem, num_warps, function name)
-5. Generates a C wrapper source file (fla_vendor.cu) with:
-   - Embedded cubin data as byte arrays
-   - cuModuleLoadData + cuModuleGetFunction init
-   - Extern "C" wrapper functions for each sub-kernel
-6. Compiles fla_vendor.cu into libkrasis_fla.so
+This script uses triton.compile() directly with GPUTarget to cross-compile
+cubins for ANY GPU architecture from ANY machine. No GPU of the target
+architecture needs to be present.
+
+It produces one libkrasis_fla_sm{arch}.so per target architecture, each
+containing all model-dimension variants (H=32, H=64, etc.) as separate
+symbols. At runtime, Rust detects the GPU architecture and dlopen's the
+matching .so.
 
 Usage:
-    python compile_kernels.py --output-dir <path> [--arch sm_120]
-
-The resulting libkrasis_fla.so is loaded by Rust via dlopen at runtime.
-No Python, Triton, or torch dependencies at runtime.
+    python compile_kernels.py --output-dir <path> [--arch sm_120 ...]
 
 Must be run with: KRASIS_DEV_SCRIPT=1
 """
 
 import argparse
-import json
 import os
 import re
 import struct
+import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 # Guard: only run via ./dev build
@@ -38,115 +32,194 @@ if os.environ.get("KRASIS_DEV_SCRIPT") != "1":
     print("ERROR: This script must be run via ./dev build, not directly.", file=sys.stderr)
     sys.exit(1)
 
+# ═══════════════════════════════════════════════════════════════════
+#  Target GPU architectures
+# ═══════════════════════════════════════════════════════════════════
+# These cover all NVIDIA GPUs with >= 16GB VRAM capable of running
+# large language models.
+TARGET_ARCHS = [80, 89, 90, 120]
+#  80 = Ampere (A100, A6000, RTX 3090) — also covers sm_86/87 via PTX fallback
+#  89 = Ada Lovelace (RTX 4090, L40, RTX 2000 Ada)
+#  90 = Hopper (H100, H200)
+# 120 = Blackwell (RTX 5090, B200)
 
-def find_all_triton_cache_entries(kernel_name: str, arch: int) -> list[dict]:
-    """Find ALL compiled Triton variants for a kernel name and architecture.
+# ═══════════════════════════════════════════════════════════════════
+#  Model dimension variants
+# ═══════════════════════════════════════════════════════════════════
+# H (num_value_heads) is the only dimension that varies across models.
+# K=128 and V=128 are universal across all known Qwen3 LA models.
+H_VALUES = [32, 64]
+# QCN/Q35B: H=32 (32 LA value heads)
+# Qwen3.5-122B: H=64 (64 LA value heads)
 
-    Returns a list of cache entries, one per unique constexpr configuration.
-    Each entry has: meta, cubin_path, source_path, name, n_args, entry_dir.
-    """
-    cache_dir = Path.home() / ".triton" / "cache"
-    if not cache_dir.exists():
-        return []
+# ═══════════════════════════════════════════════════════════════════
+#  Kernel specifications
+# ═══════════════════════════════════════════════════════════════════
+# Each kernel has:
+#   - import_path: where to find the decorated Triton kernel
+#   - symbol_name: the name it gets in the .so
+#   - signature: runtime parameter types (string keys = param names)
+#   - constexprs: compile-time constants (H is filled per-variant)
+#   - options: num_warps, num_stages for the compiler
+#   - h_dependent: whether we compile separate H variants
 
-    candidates = []
-    for entry_dir in cache_dir.iterdir():
-        if not entry_dir.is_dir():
-            continue
-        json_path = entry_dir / f"{kernel_name}.json"
-        if not json_path.exists():
-            continue
-        with open(json_path) as f:
-            meta = json.load(f)
-        if meta.get("target", {}).get("arch") == arch:
-            cubin_path = entry_dir / f"{kernel_name}.cubin"
-            source_path = entry_dir / f"{kernel_name}.source"
-            if cubin_path.exists():
-                n_args = 0
-                if source_path.exists():
-                    args = extract_kernel_args(str(source_path))
-                    n_args = len(args)
-                candidates.append({
-                    "meta": meta,
-                    "cubin_path": str(cubin_path),
-                    "source_path": str(source_path) if source_path.exists() else None,
-                    "name": kernel_name,
-                    "n_args": n_args,
-                    "entry_dir": str(entry_dir),
-                })
-    return candidates
+KERNEL_SPECS = [
+    {
+        "name": "chunk_fwd_kernel_o",
+        "import": ("fla.ops.common.chunk_o", "chunk_fwd_kernel_o"),
+        "symbol_base": "chunk_fwd_kernel_o",
+        "signature": {
+            "q": "*bf16", "k": "*bf16", "v": "*bf16", "h": "*bf16",
+            "g": "*bf16", "g_gamma": "*bf16", "o": "*bf16",
+            "cu_seqlens": "*i32", "chunk_indices": "*i32",
+            "scale": "fp32", "T": "i32",
+        },
+        "constexprs": {
+            "K": 128, "V": 128, "BT": 64, "BK": 64, "BV": 64,
+            "USE_G": True, "USE_G_GAMMA": False,
+            "TRANSPOSE_STATE": False, "IS_VARLEN": False,
+        },
+        "options": {"num_warps": 4, "num_stages": 3},
+        "h_dependent": True,
+    },
+    {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "import": ("fla.ops.common.chunk_delta_h",
+                    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
+        "symbol_base": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "signature": {
+            "k": "*bf16", "v": "*bf16", "w": "*bf16", "v_new": "*bf16",
+            "g": "*bf16", "gk": "*bf16", "h": "*bf16", "h0": "*bf16",
+            "ht": "*bf16", "cu_seqlens": "*i32", "chunk_offsets": "*i32",
+            "T": "i32",
+        },
+        "constexprs": {
+            "K": 128, "V": 128, "BT": 64, "BV": 64,
+            "USE_G": True, "USE_GK": False,
+            "USE_INITIAL_STATE": True, "STORE_FINAL_STATE": True,
+            "SAVE_NEW_VALUE": True, "USE_EXP2": True,
+            "TRANSPOSE_STATE": False, "IS_VARLEN": False,
+        },
+        "options": {"num_warps": 2, "num_stages": 2},
+        "h_dependent": True,
+    },
+    {
+        "name": "recompute_w_u_fwd_kernel",
+        "import": ("fla.ops.gated_delta_rule.wy_fast",
+                    "recompute_w_u_fwd_kernel"),
+        "symbol_base": "recompute_w_u_fwd_kernel",
+        "signature": {
+            "k": "*bf16", "v": "*bf16", "beta": "*bf16",
+            "w": "*bf16", "u": "*bf16", "A": "*bf16",
+            "g": "*bf16", "cu_seqlens": "*i32", "chunk_indices": "*i32",
+            "T": "i32",
+        },
+        "constexprs": {
+            "K": 128, "V": 128, "BT": 64, "BK": 64, "BV": 64,
+            "USE_G": True, "IS_VARLEN": False,
+        },
+        "options": {"num_warps": 4, "num_stages": 2},
+        "h_dependent": True,
+    },
+    {
+        "name": "chunk_scaled_dot_kkt_fwd_kernel",
+        "import": ("fla.ops.common.chunk_scaled_dot_kkt",
+                    "chunk_scaled_dot_kkt_fwd_kernel"),
+        "symbol_base": "chunk_scaled_dot_kkt_fwd_kernel",
+        "signature": {
+            "k": "*bf16", "g": "*bf16", "beta": "*bf16", "A": "*bf16",
+            "cu_seqlens": "*i32", "chunk_indices": "*i32", "T": "i32",
+        },
+        "constexprs": {
+            "K": 128, "BT": 64, "BK": 64,
+            "IS_VARLEN": False, "USE_G": True,
+        },
+        "options": {"num_warps": 4, "num_stages": 3},
+        "h_dependent": True,
+    },
+    {
+        "name": "chunk_local_cumsum_scalar_kernel",
+        "import": ("fla.ops.utils.cumsum",
+                    "chunk_local_cumsum_scalar_kernel"),
+        "symbol_base": "chunk_local_cumsum_scalar_kernel",
+        "signature": {
+            "s": "*bf16", "o": "*bf16", "scale": "fp32",
+            "cu_seqlens": "*i32", "chunk_indices": "*i32", "T": "i32",
+        },
+        "constexprs": {
+            "B": 1, "BT": 64, "REVERSE": False,
+            "HAS_SCALE": True, "IS_VARLEN": False, "HEAD_FIRST": False,
+        },
+        "options": {"num_warps": 4, "num_stages": 3},
+        "h_dependent": True,
+    },
+    {
+        "name": "merge_16x16_to_64x64_inverse_kernel",
+        "import": ("fla.ops.utils.solve_tril",
+                    "merge_16x16_to_64x64_inverse_kernel"),
+        "symbol_base": "merge_16x16_to_64x64_inverse_kernel",
+        "signature": {
+            "A": "*bf16", "Ai": "*bf16",
+            "cu_seqlens": "*i32", "chunk_indices": "*i32", "T": "i32",
+        },
+        "constexprs": {
+            "BT": 64, "USE_TMA": False,
+            "IS_VARLEN": False, "DOT_PRECISION": "ieee",
+        },
+        "options": {"num_warps": 4, "num_stages": 3},
+        "h_dependent": True,
+    },
+    {
+        "name": "l2norm_fwd_kernel",
+        "import": ("fla.modules.l2norm", "l2norm_fwd_kernel"),
+        "symbol_base": "l2norm_fwd_kernel",
+        "signature": {
+            "x": "*bf16", "y": "*bf16", "rstd": "*fp32",
+            "eps": "fp32", "T": "i32",
+        },
+        "constexprs": {
+            "D": 128, "BD": 128, "NB": 1, "BT": 128,
+        },
+        "options": {"num_warps": 4, "num_stages": 3},
+        "h_dependent": False,
+    },
+]
 
 
-def find_triton_cache_entry(kernel_name: str, arch: int) -> dict | None:
-    """Find a compiled Triton kernel in the cache by name and architecture.
+def import_kernel(module_path: str, kernel_name: str):
+    """Import a Triton kernel and unwrap decorators to get the JITFunction."""
+    import importlib
+    mod = importlib.import_module(module_path)
+    kernel = getattr(mod, kernel_name)
 
-    When multiple compiled variants exist (different constexpr configurations),
-    selects the one with the MOST runtime parameters. This ensures we get
-    the variant with all optional features enabled (e.g., USE_INITIAL_STATE=True,
-    STORE_FINAL_STATE=True) rather than a stripped-down version.
-    """
-    cache_dir = Path.home() / ".triton" / "cache"
-    if not cache_dir.exists():
-        return None
-
-    candidates = []
-    for entry_dir in cache_dir.iterdir():
-        if not entry_dir.is_dir():
-            continue
-        json_path = entry_dir / f"{kernel_name}.json"
-        if not json_path.exists():
-            continue
-        with open(json_path) as f:
-            meta = json.load(f)
-        if meta.get("target", {}).get("arch") == arch:
-            cubin_path = entry_dir / f"{kernel_name}.cubin"
-            source_path = entry_dir / f"{kernel_name}.source"
-            if cubin_path.exists():
-                # Count runtime args from TTIR to rank variants
-                n_args = 0
-                if source_path.exists():
-                    args = extract_kernel_args(str(source_path))
-                    n_args = len(args)
-                candidates.append({
-                    "meta": meta,
-                    "cubin_path": str(cubin_path),
-                    "source_path": str(source_path) if source_path.exists() else None,
-                    "name": kernel_name,
-                    "n_args": n_args,
-                })
-
-    if not candidates:
-        return None
-
-    # Pick the variant with the most runtime arguments (most features enabled)
-    best = max(candidates, key=lambda c: c["n_args"])
-    if len(candidates) > 1:
-        print(f"  {kernel_name}: {len(candidates)} variants, selected {best['n_args']}-arg variant")
-    return best
+    # Unwrap Heuristics -> Autotuner -> JITFunction
+    fn = kernel
+    while hasattr(fn, 'fn') and type(fn).__name__ != 'JITFunction':
+        fn = fn.fn
+    if type(fn).__name__ != 'JITFunction':
+        raise RuntimeError(f"Could not unwrap {kernel_name} to JITFunction "
+                          f"(got {type(fn).__name__})")
+    return fn
 
 
-def extract_kernel_args(source_path: str) -> list[tuple[str, str]]:
-    """Extract kernel argument names and types from Triton TTIR source.
+def extract_kernel_args_from_compiled(compiled) -> list[tuple[str, str]]:
+    """Extract kernel argument names and types from a compiled Triton kernel's TTIR.
 
     Returns list of (name, c_type) tuples.
     """
-    if not source_path or not os.path.exists(source_path):
+    ttir = compiled.asm.get('ttir', '')
+    if not ttir:
         return []
 
-    with open(source_path) as f:
-        source = f.read()
-
-    # Parse the TTIR function signature
-    # Format: @kernel_name(%name: !tt.ptr<bf16> ..., %name2: i32 ...)
-    # Find the function definition line
-    args = []
-    func_match = re.search(r'tt\.func public @\w+\((.+?)\)\s+attributes', source, re.DOTALL)
+    func_match = re.search(r'tt\.func public @\w+\((.+?)\)\s+attributes',
+                          ttir, re.DOTALL)
     if not func_match:
         return []
 
+    args = []
     params_str = func_match.group(1)
-    # Each param: %name: type {attrs} loc(...)
-    for param in re.finditer(r'%(\w+):\s+(!tt\.ptr<[^>]+>|i32|i64|f32|f64)', params_str):
+    for param in re.finditer(r'%(\w+):\s+(!tt\.ptr<[^>]+>|i32|i64|f32|f64)',
+                            params_str):
         name = param.group(1)
         tt_type = param.group(2)
 
@@ -161,23 +234,67 @@ def extract_kernel_args(source_path: str) -> list[tuple[str, str]]:
         elif tt_type == 'f64':
             c_type = "double"
         else:
-            c_type = "void*"  # fallback
-
+            c_type = "void*"
         args.append((name, c_type))
 
     return args
 
 
-def generate_c_wrapper(kernels: list[dict], output_path: str):
-    """Generate a C wrapper source file with embedded cubins and launch functions.
+def compile_kernel(spec: dict, h_value: int | None, arch: int):
+    """Cross-compile a single kernel for a specific (arch, H) combination.
 
-    Uses assembler .incbin to embed cubin files directly from disk, avoiding
-    nvcc issues with huge C byte arrays (38K+ lines). The incbin approach produces
-    identical binary output but compiles in seconds instead of minutes.
+    Returns dict with cubin, metadata, args, safe_name.
     """
+    import triton
+    from triton.compiler import ASTSource
+    from triton.backends.compiler import GPUTarget
+
+    mod_path, kernel_name = spec["import"]
+    jit_fn = import_kernel(mod_path, kernel_name)
+
+    # Build constexprs with H filled in
+    constexprs = dict(spec["constexprs"])
+    if spec["h_dependent"] and h_value is not None:
+        constexprs["H"] = h_value
+
+    target = GPUTarget(backend='cuda', arch=arch, warp_size=32)
+    src = ASTSource(
+        fn=jit_fn,
+        signature=spec["signature"],
+        constexprs=constexprs,
+    )
+
+    compiled = triton.compile(src, target=target, options=spec["options"])
+
+    # Extract runtime args from TTIR
+    args = extract_kernel_args_from_compiled(compiled)
+
+    # Build safe name for C symbol
+    base = spec["symbol_base"].replace("-", "_")
+    if spec["h_dependent"] and h_value is not None:
+        safe_name = f"{base}_h{h_value}"
+    else:
+        safe_name = base
+
+    return {
+        "name": spec["name"],
+        "safe_name": safe_name,
+        "cubin": compiled.asm['cubin'],
+        "meta": {
+            "num_warps": compiled.metadata.num_warps,
+            "shared": compiled.metadata.shared,
+            "name": compiled.metadata.name,
+        },
+        "args": args,
+        "h_tag": h_value if spec["h_dependent"] else None,
+    }
+
+
+def generate_c_wrapper(kernels: list[dict], output_path: str, cubin_dir: str):
+    """Generate a C wrapper source file with embedded cubins and launch functions."""
 
     lines = []
-    lines.append("// Auto-generated by compile_kernels.py — DO NOT EDIT")
+    lines.append("// Auto-generated by compile_kernels.py - DO NOT EDIT")
     lines.append("// FLA (Flash Linear Attention) vendored kernel wrappers")
     lines.append("// Gated DeltaNet forward pass for Krasis prefill")
     lines.append("")
@@ -186,12 +303,11 @@ def generate_c_wrapper(kernels: list[dict], output_path: str):
     lines.append('#include <stdio.h>')
     lines.append("")
 
-    # Embed cubin data via assembler .incbin (avoids nvcc large-array issues)
+    # Embed cubin data via assembler .incbin
     for k in kernels:
         sn = k['safe_name']
-        cubin_path = k["cubin_path"]
-        import os
-        cubin_size = os.path.getsize(cubin_path)
+        cubin_path = os.path.join(cubin_dir, f"{sn}.cubin")
+        cubin_size = len(k['cubin'])
         lines.append(f"// {k['name']} ({cubin_size} bytes)")
         lines.append(f'__asm__(".section .rodata\\n"')
         lines.append(f'        ".global cubin_{sn}\\n"')
@@ -218,13 +334,21 @@ def generate_c_wrapper(kernels: list[dict], output_path: str):
         sn = k['safe_name']
         shared_mem = k['meta'].get('shared', 0)
         lines.append(f'    res = cuModuleLoadData(&module_{sn}, cubin_{sn});')
-        lines.append(f'    if (res != CUDA_SUCCESS) {{ fprintf(stderr, "FLA: failed to load module {sn}: %d\\n", res); return -1; }}')
-        lines.append(f'    res = cuModuleGetFunction(&func_{sn}, module_{sn}, "{k["name"]}");')
-        lines.append(f'    if (res != CUDA_SUCCESS) {{ fprintf(stderr, "FLA: failed to get function {sn}: %d\\n", res); return -1; }}')
-        # Triton kernels that use >48KB shared memory need this attribute set
+        lines.append(f'    if (res != CUDA_SUCCESS) {{ '
+                    f'fprintf(stderr, "FLA: failed to load module {sn}: %d\\n", res); '
+                    f'return -1; }}')
+        lines.append(f'    res = cuModuleGetFunction(&func_{sn}, module_{sn}, '
+                    f'"{k["meta"]["name"]}");')
+        lines.append(f'    if (res != CUDA_SUCCESS) {{ '
+                    f'fprintf(stderr, "FLA: failed to get function {sn}: %d\\n", res); '
+                    f'return -1; }}')
         if shared_mem > 49152:
-            lines.append(f'    res = cuFuncSetAttribute(func_{sn}, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, {shared_mem});')
-            lines.append(f'    if (res != CUDA_SUCCESS) {{ fprintf(stderr, "FLA: failed to set shared mem for {sn}: %d\\n", res); return -1; }}')
+            lines.append(f'    res = cuFuncSetAttribute(func_{sn}, '
+                        f'CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, '
+                        f'{shared_mem});')
+            lines.append(f'    if (res != CUDA_SUCCESS) {{ '
+                        f'fprintf(stderr, "FLA: failed to set shared mem for '
+                        f'{sn}: %d\\n", res); return -1; }}')
     lines.append("    return 0;")
     lines.append("}")
     lines.append("")
@@ -233,15 +357,14 @@ def generate_c_wrapper(kernels: list[dict], output_path: str):
     lines.append('extern "C" void krasis_fla_cleanup(void) {')
     for k in kernels:
         sn = k['safe_name']
-        lines.append(f'    if (module_{sn}) {{ cuModuleUnload(module_{sn}); module_{sn} = NULL; }}')
+        lines.append(f'    if (module_{sn}) {{ cuModuleUnload(module_{sn}); '
+                    f'module_{sn} = NULL; }}')
     lines.append("}")
     lines.append("")
 
     # Per-kernel launch wrappers
-    # NOTE: Triton 3.5+ compiled cubins expect two hidden trailing arguments:
-    #   global_scratch (CUdeviceptr) - used for global scratch memory (0 = none)
-    #   profile_scratch (CUdeviceptr) - used for profiling (0 = none)
-    # These must be included in kernel_args or cuLaunchKernel returns INVALID_VALUE.
+    # Triton 3.5+ cubins expect two hidden trailing arguments:
+    #   global_scratch (CUdeviceptr) and profile_scratch (CUdeviceptr)
     for k in kernels:
         sn = k['safe_name']
         args = k['args']
@@ -249,7 +372,6 @@ def generate_c_wrapper(kernels: list[dict], output_path: str):
         num_warps = meta.get('num_warps', 4)
         shared_mem = meta.get('shared', 0)
 
-        # Build C function signature
         c_args = []
         for name, ctype in args:
             c_args.append(f"    {ctype} {name}")
@@ -262,8 +384,6 @@ def generate_c_wrapper(kernels: list[dict], output_path: str):
         lines.append(f'extern "C" CUresult krasis_fla_{sn}(')
         lines.append(sig)
         lines.append(") {")
-
-        # Build args array — include Triton hidden args (global_scratch, profile_scratch)
         lines.append(f"    CUdeviceptr global_scratch = 0;")
         lines.append(f"    CUdeviceptr profile_scratch = 0;")
         arg_names = [name for name, _ in args]
@@ -282,215 +402,130 @@ def generate_c_wrapper(kernels: list[dict], output_path: str):
         lines.append("}")
         lines.append("")
 
-    # Write output
     with open(output_path, "w") as f:
         f.write("\n".join(lines))
-    print(f"Generated {output_path} ({len(lines)} lines)")
+    print(f"  Generated {output_path} ({len(lines)} lines)")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compile FLA Triton kernels to C wrapper")
-    parser.add_argument("--output-dir", required=True, help="Output directory for generated files")
-    parser.add_argument("--arch", type=int, default=None, help="GPU architecture (e.g. 120 for sm_120)")
+    parser = argparse.ArgumentParser(
+        description="Cross-compile FLA Triton kernels for multiple GPU architectures")
+    parser.add_argument("--output-dir", required=True,
+                       help="Output directory for generated files")
+    parser.add_argument("--arch", type=int, nargs="*", default=None,
+                       help="Target GPU architectures (e.g. 80 89 90 120). "
+                            "Default: all supported architectures.")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Detect GPU arch if not specified
-    if args.arch is None:
-        import torch
-        cc = torch.cuda.get_device_capability(0)
-        arch = cc[0] * 10 + cc[1]  # e.g. (12, 0) -> 120
-        print(f"Detected GPU arch: sm_{arch}")
-    else:
-        arch = args.arch
-        print(f"Using specified GPU arch: sm_{arch}")
+    archs = args.arch if args.arch else TARGET_ARCHS
+    print(f"Target architectures: {['sm_' + str(a) for a in archs]}")
+    print(f"H values: {H_VALUES}")
+    print(f"Kernels: {len(KERNEL_SPECS)}")
+    total = sum(
+        len(H_VALUES) if s["h_dependent"] else 1 for s in KERNEL_SPECS
+    ) * len(archs)
+    print(f"Total compilations: {total}")
 
-    # Step 1: Import vendored FLA and trigger JIT compilation
+    # Add FLA source to path
     fla_dir = Path(__file__).parent.parent.parent / "cuda"
     sys.path.insert(0, str(fla_dir))
 
-    print("Importing vendored FLA...")
-    import torch
-    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
-
-    # Compile FLA kernels for all supported head counts.
-    # H is a tl.constexpr in every FLA kernel (used for stride computation),
-    # so we need separate cubins for each distinct num_v_heads value.
-    # Known models: QCN/Q35B use H=32, Qwen3.5-122B uses H=64.
-    h_values = [32, 64]
-    device = "cuda:0"
-    dtype = torch.bfloat16
-    B, T, K, V = 1, 1024, 128, 128
-
-    for H in h_values:
-        print(f"Running FLA forward with H={H} to trigger Triton JIT compilation...")
-        q = torch.randn(B, T, H, K, dtype=dtype, device=device)
-        k = torch.nn.functional.normalize(
-            torch.randn(B, T, H, K, dtype=dtype, device=device), p=2, dim=-1)
-        v = torch.randn(B, T, H, V, dtype=dtype, device=device)
-        g = torch.nn.functional.logsigmoid(
-            torch.randn(B, T, H, dtype=dtype, device=device))
-        beta = torch.rand(B, T, H, dtype=dtype, device=device).sigmoid()
-        initial_state = torch.zeros(B, H, K, V, dtype=dtype, device=device)
-        scale = K ** -0.5
-
-        chunk_gated_delta_rule_fwd(
-            q=q, k=k, v=v, g=g, beta=beta,
-            scale=scale, initial_state=initial_state,
-            output_final_state=True,
-        )
-        torch.cuda.synchronize()
-        print(f"  H={H} JIT compilation complete.")
-    print("All FLA kernel variants compiled.")
-
-    # Step 2: Find compiled kernels in Triton cache, grouped by H value.
-    # Strategy: find ALL FLA kernel names, then for each kernel, find all
-    # variants and group by their cache directory (each H produces a different cubin).
-    # We match variants to H values by tracking which directories appeared
-    # after each H compilation.
-    cache_dir = Path.home() / ".triton" / "cache"
-    all_fla_kernels = set()
-    if cache_dir.exists():
-        for entry_dir in cache_dir.iterdir():
-            if not entry_dir.is_dir():
-                continue
-            for f in entry_dir.iterdir():
-                if f.suffix == '.json' and not f.name.startswith('__grp__'):
-                    name = f.stem
-                    with open(f) as fp:
-                        meta = json.load(fp)
-                    if meta.get("target", {}).get("arch") == arch:
-                        source_file = entry_dir / f"{name}.source"
-                        if source_file.exists():
-                            src_text = source_file.read_text()[:200]
-                            if 'fla/ops' in src_text:
-                                all_fla_kernels.add(name)
-
-    print(f"Found {len(all_fla_kernels)} FLA kernel names for arch {arch}:")
-    for name in sorted(all_fla_kernels):
-        print(f"  {name}")
-
-    # Step 3: For each kernel, find all variants and group by H.
-    # We distinguish H by cubin content: different H values produce different cubins.
-    # Since we compiled exactly h_values=[32,64], we pick the best variant for each H
-    # by matching cubin size patterns (H=32 and H=64 produce cubins of different sizes).
-    kernels = []  # list of dicts with "h_tag" field
-    for name in sorted(all_fla_kernels):
-        variants = find_all_triton_cache_entries(name, arch)
-        if not variants:
-            print(f"  WARNING: no cache entries for {name}")
-            continue
-
-        # Group by cubin content (hash). Different H → different cubin.
-        by_cubin = {}
-        for v in variants:
-            cubin_size = os.path.getsize(v["cubin_path"])
-            key = (cubin_size, v["n_args"])
-            if key not in by_cubin:
-                by_cubin[key] = []
-            by_cubin[key].append(v)
-
-        # For each unique cubin, pick the best variant (most args) and tag with H.
-        # We expect exactly len(h_values) distinct cubins per kernel.
-        unique_variants = []
-        for key, group in by_cubin.items():
-            best = max(group, key=lambda c: c["n_args"])
-            unique_variants.append(best)
-
-        # Filter to only keep variants with the most runtime args.
-        # The Triton cache may contain stale entries from previous compilations
-        # with different constexpr configurations (e.g., USE_INITIAL_STATE=False,
-        # STORE_FINAL_STATE=False). Those produce cubins with fewer runtime args
-        # (missing h0/ht pointers). We always want the fully-featured variant
-        # that matches our compilation settings (initial_state=non-None,
-        # output_final_state=True).
-        max_n_args = max(v["n_args"] for v in unique_variants)
-        unique_variants = [v for v in unique_variants if v["n_args"] == max_n_args]
-
-        if len(unique_variants) == 1:
-            # Only one variant — shared across all H values (e.g. l2norm_fwd_kernel
-            # which doesn't use H). Generate one wrapper without H suffix.
-            v = unique_variants[0]
-            args = extract_kernel_args(v.get("source_path"))
-            safe_name = name.replace("-", "_")
-            kernels.append({
-                "name": name,
-                "safe_name": safe_name,
-                "meta": v["meta"],
-                "cubin_path": v["cubin_path"],
-                "args": args,
-                "h_tag": None,  # no H suffix needed
-            })
-            cubin_size = os.path.getsize(v["cubin_path"])
-            print(f"  {name}: {len(args)} args, {cubin_size}B (H-independent)")
-        else:
-            if len(unique_variants) != len(h_values):
-                print(f"  WARNING: {name}: expected {len(h_values)} variants after "
-                      f"filtering, got {len(unique_variants)}")
-            # Multiple variants — one per H. Sort by cubin size (smaller = fewer heads).
-            unique_variants.sort(key=lambda v: os.path.getsize(v["cubin_path"]))
-            for idx, (h_val, v) in enumerate(zip(sorted(h_values), unique_variants)):
-                args = extract_kernel_args(v.get("source_path"))
-                safe_name = f"{name.replace('-', '_')}_h{h_val}"
-                kernels.append({
-                    "name": name,
-                    "safe_name": safe_name,
-                    "meta": v["meta"],
-                    "cubin_path": v["cubin_path"],
-                    "args": args,
-                    "h_tag": h_val,
-                })
-                cubin_size = os.path.getsize(v["cubin_path"])
-                print(f"  {name} (H={h_val}): {len(args)} args, {cubin_size}B, "
-                      f"warps={v['meta'].get('num_warps')}")
-
-    if not kernels:
-        print("ERROR: No FLA kernels found in Triton cache!", file=sys.stderr)
-        sys.exit(1)
-
-    # Step 4: Generate C wrapper
-    c_path = output_dir / "fla_vendor.cu"
-    generate_c_wrapper(kernels, str(c_path))
-
-    # Step 5: Save individual cubins
-    cubin_dir = output_dir / "cubins"
-    cubin_dir.mkdir(exist_ok=True)
-    for k in kernels:
-        import shutil
-        dst = cubin_dir / f"{k['safe_name']}_sm{arch}.cubin"
-        shutil.copy2(k["cubin_path"], str(dst))
-        print(f"  Saved {dst.name}")
-
-    # Step 6: Compile fla_vendor.cu to libkrasis_fla.so
-    import subprocess
-    nvcc = "nvcc"
-    for p in ["/usr/local/cuda/bin/nvcc", "/usr/bin/nvcc"]:
+    # Find nvcc
+    nvcc = None
+    for p in ["/usr/local/cuda/bin/nvcc", "/usr/local/cuda-12.6/bin/nvcc", "/usr/bin/nvcc"]:
         if os.path.exists(p):
             nvcc = p
             break
-
-    so_path = output_dir / "libkrasis_fla.so"
-    compile_cmd = [
-        nvcc, "-shared",
-        "-o", str(so_path),
-        "-Xcompiler", "-fPIC",
-        "-Wno-deprecated-gpu-targets",
-        str(c_path),
-        "-lcuda",
-    ]
-    print(f"\nCompiling: {' '.join(compile_cmd)}")
-    result = subprocess.run(compile_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"ERROR: nvcc failed:\n{result.stderr}", file=sys.stderr)
+    if nvcc is None:
+        print("ERROR: nvcc not found", file=sys.stderr)
         sys.exit(1)
-    print(f"  Compiled {so_path.name} ({so_path.stat().st_size} bytes)")
 
-    print(f"\nDone. Generated files in {output_dir}:")
-    for f in sorted(output_dir.rglob("*")):
-        if f.is_file():
-            print(f"  {f.relative_to(output_dir)} ({f.stat().st_size} bytes)")
+    # Compile for each architecture
+    for arch in archs:
+        print(f"\n{'='*60}")
+        print(f"  Compiling for sm_{arch}")
+        print(f"{'='*60}")
+
+        arch_dir = output_dir / f"sm_{arch}"
+        arch_dir.mkdir(exist_ok=True)
+        cubin_dir = arch_dir / "cubins"
+        cubin_dir.mkdir(exist_ok=True)
+
+        kernels = []
+        for spec in KERNEL_SPECS:
+            if spec["h_dependent"]:
+                h_variants = H_VALUES
+            else:
+                h_variants = [None]
+
+            for h_val in h_variants:
+                h_label = f" H={h_val}" if h_val is not None else ""
+                print(f"  Compiling {spec['name']}{h_label} for sm_{arch}...",
+                      end="", flush=True)
+                try:
+                    k = compile_kernel(spec, h_val, arch)
+                    cubin_size = len(k['cubin'])
+                    n_args = len(k['args'])
+                    print(f" {cubin_size}B, {n_args} args, "
+                          f"warps={k['meta']['num_warps']}, "
+                          f"shared={k['meta']['shared']}")
+
+                    # Save cubin to disk (needed for .incbin)
+                    cubin_path = cubin_dir / f"{k['safe_name']}.cubin"
+                    with open(cubin_path, 'wb') as f:
+                        f.write(k['cubin'])
+
+                    kernels.append(k)
+                except Exception as e:
+                    print(f" FAILED: {e}")
+                    sys.exit(1)
+
+        # Generate C wrapper for this architecture
+        c_path = arch_dir / "fla_vendor.cu"
+        generate_c_wrapper(kernels, str(c_path), str(cubin_dir))
+
+        # Compile to .so
+        so_name = f"libkrasis_fla_sm{arch}.so"
+        so_path = arch_dir / so_name
+        compile_cmd = [
+            nvcc, "-shared",
+            "-o", str(so_path),
+            "-Xcompiler", "-fPIC",
+            "-Wno-deprecated-gpu-targets",
+            str(c_path),
+            "-lcuda",
+        ]
+        print(f"  Compiling {so_name}...")
+        result = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"ERROR: nvcc failed:\n{result.stderr}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  {so_name}: {so_path.stat().st_size} bytes")
+
+        # Also copy to the top-level output dir for easy access
+        import shutil
+        top_so = output_dir / so_name
+        shutil.copy2(str(so_path), str(top_so))
+
+    # Summary
+    print(f"\n{'='*60}")
+    print(f"  Build complete")
+    print(f"{'='*60}")
+    for arch in archs:
+        so_path = output_dir / f"libkrasis_fla_sm{arch}.so"
+        if so_path.exists():
+            print(f"  libkrasis_fla_sm{arch}.so: {so_path.stat().st_size:,} bytes")
+
+    n_kernels = sum(
+        len(H_VALUES) if s["h_dependent"] else 1 for s in KERNEL_SPECS
+    )
+    print(f"\n  {n_kernels} kernel variants x {len(archs)} architectures = "
+          f"{n_kernels * len(archs)} total cubins")
+    print(f"  H values: {H_VALUES}")
+    print(f"  K=128, V=128 (all known models)")
 
 
 if __name__ == "__main__":

@@ -8741,10 +8741,114 @@ Set KRASIS_NO_FLA=1 only if you explicitly want the slower custom LA path."
         log::info!("KRASIS_NO_FLA set — FLA disabled, using custom LA kernels");
         return Ok(None);
     }
-    let path = match find_vendor_so("libkrasis_fla.so") {
-        Some(p) => p,
-        None => {
-            return fail_or_warn("libkrasis_fla.so not found".to_string());
+
+    // Detect GPU compute capability and load the best-matching FLA .so.
+    // We ship pre-compiled cubins for multiple GPU architectures (sm_80, sm_89,
+    // sm_90, sm_120).  Selection priority:
+    //   1. Exact arch match (e.g. sm_120 on a 5090)
+    //   2. Same-generation base arch (e.g. sm_80 on an sm_86 RTX 3090)
+    //   3. Highest available .so if the GPU is newer than anything we compiled
+    //      for (forward compat — cubins from the latest gen we ship are the
+    //      best chance of working on a future GPU)
+    // Pre-Ampere (sm_75 and below) is not supported — Marlin INT4 kernels
+    // require Ampere or newer.
+    let path = {
+        // Query GPU compute capability via CUDA driver API
+        let mut cc_major: i32 = 0;
+        let mut cc_minor: i32 = 0;
+        unsafe {
+            cuda_sys::lib().cuDeviceGetAttribute(
+                &mut cc_major,
+                cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                0,
+            );
+            cuda_sys::lib().cuDeviceGetAttribute(
+                &mut cc_minor,
+                cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                0,
+            );
+        }
+        let arch = cc_major * 10 + cc_minor;
+
+        if arch > 0 && arch < 80 {
+            return fail_or_warn(format!(
+                "GPU sm_{} (pre-Ampere) is not supported. \
+                 Krasis requires an Ampere (sm_80) or newer GPU.",
+                arch
+            ));
+        }
+
+        let mut found: Option<String> = None;
+
+        if arch > 0 {
+            // 1. Exact arch match (e.g. libkrasis_fla_sm120.so)
+            let arch_name = format!("libkrasis_fla_sm{}.so", arch);
+            if let Some(p) = find_vendor_so(&arch_name) {
+                log::info!("Found arch-specific FLA library: {} (GPU sm_{})", arch_name, arch);
+                found = Some(p);
+            }
+
+            // 2. Same-generation base arch (sm_X0 cubins run on sm_XY via
+            //    CUDA binary compatibility within the same major version)
+            if found.is_none() {
+                let base_arch = cc_major * 10;
+                if base_arch != arch {
+                    let fallback_name = format!("libkrasis_fla_sm{}.so", base_arch);
+                    if let Some(p) = find_vendor_so(&fallback_name) {
+                        log::info!(
+                            "GPU sm_{} — using compatible FLA library: {} (base arch sm_{})",
+                            arch, fallback_name, base_arch
+                        );
+                        found = Some(p);
+                    }
+                }
+            }
+
+            // 3. Forward compatibility: if the GPU is newer than anything we
+            //    compiled for, try the highest available arch .so.  This is
+            //    best-effort — it may work (especially within the same CUDA
+            //    generation) or fail at kernel launch with a clear error.
+            if found.is_none() {
+                let mut best: Option<(u32, String)> = None;
+                for candidate_arch in [120, 90, 89, 80] {
+                    let name = format!("libkrasis_fla_sm{}.so", candidate_arch);
+                    if let Some(p) = find_vendor_so(&name) {
+                        match best {
+                            None => best = Some((candidate_arch, p)),
+                            Some((prev, _)) if candidate_arch > prev => {
+                                best = Some((candidate_arch, p));
+                            }
+                            _ => {}
+                        }
+                        break; // list is descending, first hit is highest
+                    }
+                }
+                if let Some((best_arch, p)) = best {
+                    log::warn!(
+                        "GPU sm_{} is newer than any pre-compiled FLA library. \
+                         Using sm_{} as best-effort forward compatibility. \
+                         If FLA kernels fail, rebuild with ./dev build on this GPU.",
+                        arch, best_arch
+                    );
+                    found = Some(p);
+                }
+            }
+        }
+
+        match found {
+            Some(p) => p,
+            None => {
+                let msg = if arch > 0 {
+                    format!(
+                        "No FLA library found for GPU sm_{}. \
+                         Rebuild with ./dev build or reinstall from a release wheel.",
+                        arch
+                    )
+                } else {
+                    "FLA library not found (could not detect GPU compute capability)".to_string()
+                };
+                return fail_or_warn(msg);
+            }
         }
     };
     let path_cstr = match std::ffi::CString::new(path.as_str()) {

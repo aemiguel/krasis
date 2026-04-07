@@ -14,10 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -37,6 +33,17 @@ jobs:
                 dnf install -y --nogpgcheck cuda-nvcc-12-6 cuda-cudart-devel-12-6 2>/dev/null || true
               ls -la /usr/local/cuda-12.6/bin/nvcc 2>/dev/null && echo "nvcc installed OK" || echo "WARNING: nvcc install failed"
             fi
+            # FLA kernel cross-compilation (no GPU needed — uses Triton cross-compile)
+            # CPU-only torch keeps download small (~200MB vs ~2.7GB for CUDA torch).
+            # FLA source files import torch at module level but compilation only uses Triton.
+            /opt/python/cp312-cp312/bin/pip install triton
+            /opt/python/cp312-cp312/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+            PATH="/usr/local/cuda-12.6/bin:$PATH" KRASIS_DEV_SCRIPT=1 \
+              /opt/python/cp312-cp312/bin/python src/cuda/fla/compile_kernels.py \
+              --output-dir /tmp/fla_build --arch 80 89 90 120
+            mkdir -p python/krasis
+            cp /tmp/fla_build/libkrasis_fla_sm*.so python/krasis/
+            ls -la python/krasis/libkrasis_fla_sm*.so
 
       - name: Inject vendored sidecars into wheels
         run: |
@@ -54,6 +61,11 @@ jobs:
               "krasis/libkrasis_marlin.so",
               "krasis/libkrasis_flash_attn.so",
           }
+          # FLA .so files are expected for each target architecture
+          fla_archs = [80, 89, 90, 120]
+          for arch in fla_archs:
+              required.add(f"krasis/libkrasis_fla_sm{arch}.so")
+
           missing = []
           for wheel in wheels:
               with zipfile.ZipFile(wheel) as zf:
@@ -90,19 +102,28 @@ jobs:
                   + ", ".join(missing_names)
               )
 
-          subprocess.run(
-              [
-                  "python3",
-                  "scripts/inject_wheel_sidecars.py",
-                  "--wheel-dir",
-                  str(wheel_dir),
-                  "--marlin",
-                  str(marlin),
-                  "--flash-attn",
-                  str(flash_attn),
-              ],
-              check=True,
-          )
+          # Find FLA .so directory (required — FLA must be compiled in before-script-linux)
+          fla_so = find_sidecar("libkrasis_fla_sm80.so")
+          if fla_so is None:
+              raise SystemExit(
+                  "FLA .so files not found — FLA compilation in before-script-linux failed"
+              )
+          fla_dir = str(fla_so.parent)
+
+          cmd = [
+              "python3",
+              "scripts/inject_wheel_sidecars.py",
+              "--wheel-dir",
+              str(wheel_dir),
+              "--marlin",
+              str(marlin),
+              "--flash-attn",
+              str(flash_attn),
+              "--fla-dir",
+              fla_dir,
+          ]
+
+          subprocess.run(cmd, check=True)
           PY
 
       - name: Build sdist

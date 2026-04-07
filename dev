@@ -335,8 +335,66 @@ cleanup_gpu() {
 
 # ── Commands ─────────────────────────────────────────────────────────
 
+do_build_fla() {
+    # Cross-compile FLA (Flash Linear Attention) Triton kernels for all
+    # target GPU architectures.  The resulting .so files are placed in
+    # python/krasis/ so maturin can include them in the wheel.
+    local fla_script="$SCRIPT_DIR/src/cuda/fla/compile_kernels.py"
+    local fla_src_dir="$SCRIPT_DIR/src/cuda/fla"
+    local dest="$SCRIPT_DIR/python/krasis"
+    local archs=(80 89 90 120)
+
+    # Check if recompilation is needed: any .so missing or any source newer?
+    local needs_rebuild=false
+    for arch in "${archs[@]}"; do
+        if [[ ! -f "$dest/libkrasis_fla_sm${arch}.so" ]]; then
+            needs_rebuild=true
+            break
+        fi
+    done
+    if ! $needs_rebuild; then
+        # Check if any Python source in fla/ is newer than the oldest .so
+        local oldest_so_mtime
+        oldest_so_mtime=$(stat --format="%Y" "$dest"/libkrasis_fla_sm*.so 2>/dev/null | sort -n | head -1)
+        if [[ -n "$oldest_so_mtime" ]]; then
+            while IFS= read -r pyfile; do
+                local py_mtime
+                py_mtime=$(stat --format="%Y" "$pyfile" 2>/dev/null) || continue
+                if [[ "$py_mtime" -gt "$oldest_so_mtime" ]]; then
+                    needs_rebuild=true
+                    break
+                fi
+            done < <(find "$fla_src_dir" -name "*.py" -type f 2>/dev/null)
+        fi
+    fi
+
+    if ! $needs_rebuild; then
+        ok "FLA kernels up to date (skipping)"
+        return
+    fi
+
+    info "Compiling FLA kernels for GPU architectures: ${archs[*]/#/sm_}..."
+    local fla_output="/tmp/fla_build"
+
+    KRASIS_DEV_SCRIPT=1 "$PYTHON" "$fla_script" --output-dir "$fla_output" \
+        --arch "${archs[@]}" || err "FLA kernel compilation failed"
+
+    mkdir -p "$dest"
+    local count=0
+    for so in "$fla_output"/libkrasis_fla_sm*.so; do
+        [[ -f "$so" ]] || continue
+        cp "$so" "$dest/"
+        count=$((count + 1))
+    done
+    ok "FLA kernels: $count architectures compiled"
+}
+
 do_build() {
     info "Building Rust extension (repo-local maturin build --release)..."
+
+    # Compile FLA kernels first so they're in python/krasis/ for maturin
+    do_build_fla
+
     cd "$SCRIPT_DIR"
     mkdir -p "$WHEEL_DIR"
     rm -f "$WHEEL_DIR"/krasis-*.whl
