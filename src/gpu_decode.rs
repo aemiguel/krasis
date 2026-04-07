@@ -7219,7 +7219,7 @@ impl GpuDecodeStore {
             t_moe_w2: std::cell::Cell::new(0.0),
             t_moe_scatter: std::cell::Cell::new(0.0),
             t_moe_shared: std::cell::Cell::new(0.0),
-            fla: crate::gpu_prefill::load_fla(has_linear_attention)?,
+            fla: crate::gpu_prefill::load_fla(has_linear_attention, la_nv)?,
             d_fla_g_cumsum: None,
             d_fla_a: None,
             d_fla_ai: None,

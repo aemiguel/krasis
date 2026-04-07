@@ -39,6 +39,44 @@ if os.environ.get("KRASIS_DEV_SCRIPT") != "1":
     sys.exit(1)
 
 
+def find_all_triton_cache_entries(kernel_name: str, arch: int) -> list[dict]:
+    """Find ALL compiled Triton variants for a kernel name and architecture.
+
+    Returns a list of cache entries, one per unique constexpr configuration.
+    Each entry has: meta, cubin_path, source_path, name, n_args, entry_dir.
+    """
+    cache_dir = Path.home() / ".triton" / "cache"
+    if not cache_dir.exists():
+        return []
+
+    candidates = []
+    for entry_dir in cache_dir.iterdir():
+        if not entry_dir.is_dir():
+            continue
+        json_path = entry_dir / f"{kernel_name}.json"
+        if not json_path.exists():
+            continue
+        with open(json_path) as f:
+            meta = json.load(f)
+        if meta.get("target", {}).get("arch") == arch:
+            cubin_path = entry_dir / f"{kernel_name}.cubin"
+            source_path = entry_dir / f"{kernel_name}.source"
+            if cubin_path.exists():
+                n_args = 0
+                if source_path.exists():
+                    args = extract_kernel_args(str(source_path))
+                    n_args = len(args)
+                candidates.append({
+                    "meta": meta,
+                    "cubin_path": str(cubin_path),
+                    "source_path": str(source_path) if source_path.exists() else None,
+                    "name": kernel_name,
+                    "n_args": n_args,
+                    "entry_dir": str(entry_dir),
+                })
+    return candidates
+
+
 def find_triton_cache_entry(kernel_name: str, arch: int) -> dict | None:
     """Find a compiled Triton kernel in the cache by name and architecture.
 
@@ -277,43 +315,41 @@ def main():
     import torch
     from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
 
-    # Run with representative QCN dimensions to trigger all kernel compilations
-    # QCN: num_v_heads=32 (not num_k_heads=16), k_head_dim=128, v_head_dim=128
-    B, T, H, K, V = 1, 1024, 32, 128, 128
+    # Compile FLA kernels for all supported head counts.
+    # H is a tl.constexpr in every FLA kernel (used for stride computation),
+    # so we need separate cubins for each distinct num_v_heads value.
+    # Known models: QCN/Q35B use H=32, Qwen3.5-122B uses H=64.
+    h_values = [32, 64]
     device = "cuda:0"
     dtype = torch.bfloat16
+    B, T, K, V = 1, 1024, 128, 128
 
-    q = torch.randn(B, T, H, K, dtype=dtype, device=device)
-    k = torch.nn.functional.normalize(
-        torch.randn(B, T, H, K, dtype=dtype, device=device), p=2, dim=-1)
-    v = torch.randn(B, T, H, V, dtype=dtype, device=device)
-    g = torch.nn.functional.logsigmoid(
-        torch.randn(B, T, H, dtype=dtype, device=device))
-    beta = torch.rand(B, T, H, dtype=dtype, device=device).sigmoid()
-    initial_state = torch.zeros(B, H, K, V, dtype=dtype, device=device)
-    scale = K ** -0.5
+    for H in h_values:
+        print(f"Running FLA forward with H={H} to trigger Triton JIT compilation...")
+        q = torch.randn(B, T, H, K, dtype=dtype, device=device)
+        k = torch.nn.functional.normalize(
+            torch.randn(B, T, H, K, dtype=dtype, device=device), p=2, dim=-1)
+        v = torch.randn(B, T, H, V, dtype=dtype, device=device)
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(B, T, H, dtype=dtype, device=device))
+        beta = torch.rand(B, T, H, dtype=dtype, device=device).sigmoid()
+        initial_state = torch.zeros(B, H, K, V, dtype=dtype, device=device)
+        scale = K ** -0.5
 
-    print("Running FLA forward to trigger Triton JIT compilation...")
-    chunk_gated_delta_rule_fwd(
-        q=q, k=k, v=v, g=g, beta=beta,
-        scale=scale, initial_state=initial_state,
-        output_final_state=True,
-    )
-    torch.cuda.synchronize()
-    print("JIT compilation complete.")
+        chunk_gated_delta_rule_fwd(
+            q=q, k=k, v=v, g=g, beta=beta,
+            scale=scale, initial_state=initial_state,
+            output_final_state=True,
+        )
+        torch.cuda.synchronize()
+        print(f"  H={H} JIT compilation complete.")
+    print("All FLA kernel variants compiled.")
 
-    # Step 2: Find compiled kernels in Triton cache
-    kernel_names = [
-        "chunk_local_cumsum_scalar_kernel",
-        "chunk_scaled_dot_kkt_fwd_kernel",
-        "merge_16x16_to_64x64_inverse_kernel",
-        "recompute_w_u_fwd_kernel",
-        "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
-        "l2norm_fwd_kernel",
-        # chunk_fwd_o kernel
-    ]
-
-    # Also search for any kernel names that match the FLA pattern
+    # Step 2: Find compiled kernels in Triton cache, grouped by H value.
+    # Strategy: find ALL FLA kernel names, then for each kernel, find all
+    # variants and group by their cache directory (each H produces a different cubin).
+    # We match variants to H values by tracking which directories appeared
+    # after each H compilation.
     cache_dir = Path.home() / ".triton" / "cache"
     all_fla_kernels = set()
     if cache_dir.exists():
@@ -326,40 +362,89 @@ def main():
                     with open(f) as fp:
                         meta = json.load(fp)
                     if meta.get("target", {}).get("arch") == arch:
-                        # Check if it's an FLA kernel
                         source_file = entry_dir / f"{name}.source"
                         if source_file.exists():
                             src_text = source_file.read_text()[:200]
                             if 'fla/ops' in src_text:
                                 all_fla_kernels.add(name)
 
-    print(f"Found {len(all_fla_kernels)} FLA kernels for arch {arch}:")
+    print(f"Found {len(all_fla_kernels)} FLA kernel names for arch {arch}:")
     for name in sorted(all_fla_kernels):
         print(f"  {name}")
 
-    # Step 3: Extract metadata for each kernel
-    kernels = []
+    # Step 3: For each kernel, find all variants and group by H.
+    # We distinguish H by cubin content: different H values produce different cubins.
+    # Since we compiled exactly h_values=[32,64], we pick the best variant for each H
+    # by matching cubin size patterns (H=32 and H=64 produce cubins of different sizes).
+    kernels = []  # list of dicts with "h_tag" field
     for name in sorted(all_fla_kernels):
-        entry = find_triton_cache_entry(name, arch)
-        if entry is None:
-            print(f"  WARNING: could not find cache entry for {name}")
+        variants = find_all_triton_cache_entries(name, arch)
+        if not variants:
+            print(f"  WARNING: no cache entries for {name}")
             continue
 
-        args = extract_kernel_args(entry.get("source_path"))
-        safe_name = name.replace("-", "_")
+        # Group by cubin content (hash). Different H → different cubin.
+        by_cubin = {}
+        for v in variants:
+            cubin_size = os.path.getsize(v["cubin_path"])
+            key = (cubin_size, v["n_args"])
+            if key not in by_cubin:
+                by_cubin[key] = []
+            by_cubin[key].append(v)
 
-        kernels.append({
-            "name": name,
-            "safe_name": safe_name,
-            "meta": entry["meta"],
-            "cubin_path": entry["cubin_path"],
-            "args": args,
-        })
+        # For each unique cubin, pick the best variant (most args) and tag with H.
+        # We expect exactly len(h_values) distinct cubins per kernel.
+        unique_variants = []
+        for key, group in by_cubin.items():
+            best = max(group, key=lambda c: c["n_args"])
+            unique_variants.append(best)
 
-        cubin_size = os.path.getsize(entry["cubin_path"])
-        print(f"  {name}: {len(args)} args, {cubin_size} bytes, "
-              f"warps={entry['meta'].get('num_warps')}, "
-              f"smem={entry['meta'].get('shared', 0)}")
+        # Filter to only keep variants with the most runtime args.
+        # The Triton cache may contain stale entries from previous compilations
+        # with different constexpr configurations (e.g., USE_INITIAL_STATE=False,
+        # STORE_FINAL_STATE=False). Those produce cubins with fewer runtime args
+        # (missing h0/ht pointers). We always want the fully-featured variant
+        # that matches our compilation settings (initial_state=non-None,
+        # output_final_state=True).
+        max_n_args = max(v["n_args"] for v in unique_variants)
+        unique_variants = [v for v in unique_variants if v["n_args"] == max_n_args]
+
+        if len(unique_variants) == 1:
+            # Only one variant — shared across all H values (e.g. l2norm_fwd_kernel
+            # which doesn't use H). Generate one wrapper without H suffix.
+            v = unique_variants[0]
+            args = extract_kernel_args(v.get("source_path"))
+            safe_name = name.replace("-", "_")
+            kernels.append({
+                "name": name,
+                "safe_name": safe_name,
+                "meta": v["meta"],
+                "cubin_path": v["cubin_path"],
+                "args": args,
+                "h_tag": None,  # no H suffix needed
+            })
+            cubin_size = os.path.getsize(v["cubin_path"])
+            print(f"  {name}: {len(args)} args, {cubin_size}B (H-independent)")
+        else:
+            if len(unique_variants) != len(h_values):
+                print(f"  WARNING: {name}: expected {len(h_values)} variants after "
+                      f"filtering, got {len(unique_variants)}")
+            # Multiple variants — one per H. Sort by cubin size (smaller = fewer heads).
+            unique_variants.sort(key=lambda v: os.path.getsize(v["cubin_path"]))
+            for idx, (h_val, v) in enumerate(zip(sorted(h_values), unique_variants)):
+                args = extract_kernel_args(v.get("source_path"))
+                safe_name = f"{name.replace('-', '_')}_h{h_val}"
+                kernels.append({
+                    "name": name,
+                    "safe_name": safe_name,
+                    "meta": v["meta"],
+                    "cubin_path": v["cubin_path"],
+                    "args": args,
+                    "h_tag": h_val,
+                })
+                cubin_size = os.path.getsize(v["cubin_path"])
+                print(f"  {name} (H={h_val}): {len(args)} args, {cubin_size}B, "
+                      f"warps={v['meta'].get('num_warps')}")
 
     if not kernels:
         print("ERROR: No FLA kernels found in Triton cache!", file=sys.stderr)

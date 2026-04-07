@@ -3508,10 +3508,10 @@ impl PrefillEngine {
 
         let lt = self.gqa_timing_enabled.get(); // reuse same env flag for LA timing
         let lt0 = Instant::now();
-        // 1. in_proj_qkvz GEMM: [M, hidden] -> [M, qkvz_dim] BF16
-        self.la_gemm(hidden, &lw.la_in_proj_qkvz, &lw.la_in_proj_qkvz_bf16, proj_buf, m)?;
         let la_diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok()
             && layer_idx < Self::diag_layer_limit();
+        // 1. in_proj_qkvz GEMM: [M, hidden] -> [M, qkvz_dim] BF16
+        self.la_gemm(hidden, &lw.la_in_proj_qkvz, &lw.la_in_proj_qkvz_bf16, proj_buf, m)?;
         if la_diag {
             let gemm_norm = self.diag_l2_norm(proj_buf, 0, qkvz_dim, qkvz_dim);
             eprintln!("[DIAG L{:02}] qkvz_gemm pos0 norm={:.6} (dim={})", layer_idx, gemm_norm, qkvz_dim);
@@ -8315,15 +8315,24 @@ pub fn allocate_scratch(
         GpuBuf::<u8>::alloc_zeroed(n).map_err(|e| format!("alloc {name}: {e}"))
     };
 
-    let max_inter = std::cmp::max(
-        max_tokens * inter * 2,
-        max_tokens * config.num_q_heads * config.head_dim * 2, // *2 for gated GQA (q + gate)
-    );
-
     let has_mamba2 = config.layer_types.iter().any(|&t| t == 1);
     let has_la = config.layer_types.iter().any(|&t| t == 3);
     // LA pads to chunk_size multiples, so total_len can be up to max_tokens + chunk_size - 1
     let la_max_len = if has_la { max_tokens + config.la_chunk_size } else { max_tokens };
+
+    let mut max_inter = std::cmp::max(
+        max_tokens * inter * 2,
+        max_tokens * config.num_q_heads * config.head_dim * 2, // *2 for gated GQA (q + gate)
+    );
+    // FLA path reuses scratch1/scratch2 as [fla_total, nv, dk] BF16 (after repeat-interleave).
+    // For models where nv * dk > num_q_heads * head_dim * 2 (e.g. 122B: 8192 vs 6144),
+    // the FLA buffers are larger than the GQA scratch.  Account for FLA padding too.
+    if has_la {
+        let fla_req = la_max_len * config.la_num_v_heads * config.la_k_head_dim;
+        if fla_req > max_inter {
+            max_inter = fla_req;
+        }
+    }
 
     Ok(PrefillScratch {
         d_hidden: alloc_u16(max_tokens * h, "hidden")?,
@@ -8715,7 +8724,7 @@ fn find_vendor_so(name: &str) -> Option<String> {
 /// For LA models this is required unless the user explicitly opted out with
 /// KRASIS_NO_FLA, because silently falling back to the older custom LA path
 /// hides packaging/runtime regressions and degrades performance.
-pub fn load_fla(require_for_la_model: bool) -> Result<Option<FlaKernels>, String> {
+pub fn load_fla(require_for_la_model: bool, nv: usize) -> Result<Option<FlaKernels>, String> {
     let fail_or_warn = |message: String| -> Result<Option<FlaKernels>, String> {
         if require_for_la_model {
             Err(format!(
@@ -8770,25 +8779,50 @@ Set KRASIS_NO_FLA=1 only if you explicitly want the slower custom LA path."
             return fail_or_warn(format!("krasis_fla_init() failed with rc={}", rc));
         }
 
-        // Load all 6 kernel function pointers
-        macro_rules! load_sym {
+        // Load all 6 kernel function pointers.
+        // FLA kernels have H (num_v_heads) baked in as a Triton constexpr.
+        // Try H-specific symbols first (e.g. _h64), fall back to generic.
+        let h_suffix = format!("_h{}", nv);
+        eprintln!("[FLA] Loading kernels for H={} from {}", nv, path);
+        let load_sym_for = |base_name: &str| -> Result<*mut std::ffi::c_void, String> {
+            // Try H-specific first (using CString for safe null termination)
+            let h_name_str = format!("{}{}", base_name, h_suffix);
+            let h_cstr = std::ffi::CString::new(h_name_str.clone())
+                .map_err(|_| format!("invalid symbol name: {}", h_name_str))?;
+            let sym = libc::dlsym(lib, h_cstr.as_ptr());
+            if !sym.is_null() {
+                eprintln!("[FLA] loaded {} (H={})", base_name, nv);
+                return Ok(sym);
+            }
+            // Fall back to generic (for H-independent kernels)
+            let generic_cstr = std::ffi::CString::new(base_name.to_string())
+                .map_err(|_| format!("invalid symbol name: {}", base_name))?;
+            let sym = libc::dlsym(lib, generic_cstr.as_ptr());
+            if !sym.is_null() {
+                eprintln!("[FLA] loaded {} (generic)", base_name);
+                return Ok(sym);
+            }
+            Err(format!("{} (H={}) not found in {}", base_name, nv, path))
+        };
+        macro_rules! load_fla_sym {
             ($name:expr) => {{
-                let sym = libc::dlsym(lib, concat!($name, "\0").as_ptr() as *const _);
-                if sym.is_null() {
-                    let _ = libc::dlclose(lib);
-                    return fail_or_warn(format!("{} not found in {}", $name, path));
+                match load_sym_for($name) {
+                    Ok(sym) => std::mem::transmute(sym),
+                    Err(msg) => {
+                        let _ = libc::dlclose(lib);
+                        return fail_or_warn(msg);
+                    }
                 }
-                std::mem::transmute(sym)
             }};
         }
 
         let kernels = FlaKernels {
-            cumsum: load_sym!("krasis_fla_chunk_local_cumsum_scalar_kernel"),
-            kkt: load_sym!("krasis_fla_chunk_scaled_dot_kkt_fwd_kernel"),
-            solve_tril: load_sym!("krasis_fla_merge_16x16_to_64x64_inverse_kernel"),
-            wy_repr: load_sym!("krasis_fla_recompute_w_u_fwd_kernel"),
-            state_recurrence: load_sym!("krasis_fla_chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
-            output: load_sym!("krasis_fla_chunk_fwd_kernel_o"),
+            cumsum: load_fla_sym!("krasis_fla_chunk_local_cumsum_scalar_kernel"),
+            kkt: load_fla_sym!("krasis_fla_chunk_scaled_dot_kkt_fwd_kernel"),
+            solve_tril: load_fla_sym!("krasis_fla_merge_16x16_to_64x64_inverse_kernel"),
+            wy_repr: load_fla_sym!("krasis_fla_recompute_w_u_fwd_kernel"),
+            state_recurrence: load_fla_sym!("krasis_fla_chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
+            output: load_fla_sym!("krasis_fla_chunk_fwd_kernel_o"),
         };
 
         log::info!("Loaded FLA (Flash Linear Attention) kernels from {}", path);
