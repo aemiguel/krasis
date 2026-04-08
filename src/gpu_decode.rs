@@ -1740,6 +1740,12 @@ struct GpuDecodeGraph {
     // DMA expert sub-timing (Phase 3 cold experts)
     t_dma_expert_wait: f64,  // time waiting for DMA events (cuStreamWaitEvent + actual DMA)
     t_dma_expert_compute: f64, // compute time for DMA'd experts (w13+silu+w2)
+    // Graph mode inter-graph timing breakdown
+    t_graph_sync_wait: f64,   // cuStreamSynchronize waiting for previous graph
+    t_graph_classify: f64,    // CPU expert classification (read topk + HCS lookup)
+    t_graph_cold_dma: f64,    // cold expert DMA + copy_stream sync
+    t_graph_upload: f64,      // batch pointer upload H2D
+    t_graph_launch: f64,      // cuGraphLaunch calls (just the CPU-side launch cost)
     // DMA instrumentation (accumulated across all layers per token, then across tokens)
     dma_bytes_total: u64,    // total bytes DMA'd (cold experts only)
     dma_call_count: u64,     // number of cuMemcpyHtoDAsync calls
@@ -2676,6 +2682,11 @@ impl GpuDecodeStore {
             t_expert_silu_w2: 0.0,
             t_dma_expert_wait: 0.0,
             t_dma_expert_compute: 0.0,
+            t_graph_sync_wait: 0.0,
+            t_graph_classify: 0.0,
+            t_graph_cold_dma: 0.0,
+            t_graph_upload: 0.0,
+            t_graph_launch: 0.0,
             dma_bytes_total: 0,
             dma_call_count: 0,
             dma_cold_experts: 0,
@@ -3599,6 +3610,11 @@ impl GpuDecodeStore {
                 graph.t_expert_silu_w2 = 0.0;
                 graph.t_dma_expert_wait = 0.0;
                 graph.t_dma_expert_compute = 0.0;
+                graph.t_graph_sync_wait = 0.0;
+                graph.t_graph_classify = 0.0;
+                graph.t_graph_cold_dma = 0.0;
+                graph.t_graph_upload = 0.0;
+                graph.t_graph_launch = 0.0;
                 graph.dma_bytes_total = 0;
                 graph.dma_call_count = 0;
                 graph.dma_cold_experts = 0;
@@ -9792,6 +9808,7 @@ impl GpuDecodeStore {
         }
 
         // ═══ LEGACY PATH (non-mapped reads) ═══
+        let timing = graph.timing_enabled;
 
         for graph_idx in 0..num_graphs {
             // ── If not first graph: populate d_batch_upload with expert pointers ──
@@ -9927,6 +9944,7 @@ impl GpuDecodeStore {
                     }
                 } else {
                     // ── Legacy CPU-side route sync path ──
+                    let t_sync_start = if timing { Some(std::time::Instant::now()) } else { None };
 
                     // Sync to get routing results
                     unsafe {
@@ -9935,6 +9953,11 @@ impl GpuDecodeStore {
                             return Err(format!("sync routing[{}]: {:?}", moe_layer_idx, err));
                         }
                     }
+
+                    if let Some(t) = t_sync_start {
+                        graph.t_graph_sync_wait += t.elapsed().as_secs_f64();
+                    }
+                    let t_classify_start = if timing { Some(std::time::Instant::now()) } else { None };
 
                     // Read topk indices/weights from GPU
                     if use_pinned {
@@ -10002,6 +10025,11 @@ impl GpuDecodeStore {
 
                     graph.dma_cold_experts += cold_experts.len() as u64;
 
+                    if let Some(t) = t_classify_start {
+                        graph.t_graph_classify += t.elapsed().as_secs_f64();
+                    }
+                    let t_cold_dma_start = if timing { Some(std::time::Instant::now()) } else { None };
+
                     // Queue ALL cold expert DMAs on copy_stream (no per-expert sync)
                     let mut cold_ptrs_list: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(cold_experts.len());
                     for (ci, &(_topk_pos, eid, _weight)) in cold_experts.iter().enumerate() {
@@ -10063,6 +10091,11 @@ impl GpuDecodeStore {
                         unsafe { cuda_sys::lib().cuStreamSynchronize(copy_stream); }
                     }
 
+                    if let Some(t) = t_cold_dma_start {
+                        graph.t_graph_cold_dma += t.elapsed().as_secs_f64();
+                    }
+                    let t_upload_start = if timing { Some(std::time::Instant::now()) } else { None };
+
                     // Add cold experts to batch with their VRAM pointers
                     for (ci, &(_topk_pos, _eid, weight)) in cold_experts.iter().enumerate() {
                         let (w13p, w13s, w2p, w2s) = cold_ptrs_list[ci];
@@ -10122,6 +10155,9 @@ impl GpuDecodeStore {
                     if let Some(t_padding_setup) = t_padding_setup {
                         graph.t_moe_padding_setup += t_padding_setup.elapsed().as_secs_f64();
                     }
+                    if let Some(t) = t_upload_start {
+                        graph.t_graph_upload += t.elapsed().as_secs_f64();
+                    }
                 }
             }
 
@@ -10136,10 +10172,14 @@ impl GpuDecodeStore {
             }
 
             // ── Replay graph ──
+            let t_launch_start = if timing { Some(std::time::Instant::now()) } else { None };
             let exec = &graph.per_layer_graphs[graph_idx];
             let err = unsafe { cuda_sys::lib().cuGraphLaunch(exec.0, replay_stream) };
             if err != cuda_sys::CUresult::CUDA_SUCCESS {
                 return Err(format!("cuGraphLaunch[{}]: {:?}", graph_idx, err));
+            }
+            if let Some(t) = t_launch_start {
+                graph.t_graph_launch += t.elapsed().as_secs_f64();
             }
             // DEBUG: sync after each graph to pinpoint crashes
             if std::env::var("KRASIS_GRAPH_DEBUG").is_ok() {
@@ -15012,6 +15052,9 @@ impl GpuDecodeStore {
                 g.t_gqa_proj = 0.0; g.t_gqa_attn = 0.0; g.t_gqa_out = 0.0;
                 g.t_expert_w13 = 0.0; g.t_expert_silu_w2 = 0.0;
                 g.t_dma_expert_wait = 0.0; g.t_dma_expert_compute = 0.0;
+                g.t_graph_sync_wait = 0.0; g.t_graph_classify = 0.0;
+                g.t_graph_cold_dma = 0.0; g.t_graph_upload = 0.0;
+                g.t_graph_launch = 0.0;
             }
         }
 
@@ -15698,8 +15741,21 @@ impl GpuDecodeStore {
                 eprintln!("  \x1b[36m├─────────────────────────────────────────────────┤\x1b[0m");
                 eprintln!("  \x1b[36m│\x1b[0m  Total:       {:7.2} ms/tok  ({:5.1} tok/s)    \x1b[36m│\x1b[0m", avg_total, 1000.0 / avg_total);
                 if graph_mode {
-                    eprintln!("  \x1b[36m│\x1b[0m  (per-component breakdown not available        \x1b[36m│\x1b[0m");
-                    eprintln!("  \x1b[36m│\x1b[0m   in CUDA graph mode -- kernels are opaque)    \x1b[36m│\x1b[0m");
+                    let avg_sync = graph.t_graph_sync_wait / n * 1000.0;
+                    let avg_classify = graph.t_graph_classify / n * 1000.0;
+                    let avg_cold_dma = graph.t_graph_cold_dma / n * 1000.0;
+                    let avg_upload = graph.t_graph_upload / n * 1000.0;
+                    let avg_launch = graph.t_graph_launch / n * 1000.0;
+                    let avg_inter_graph = avg_sync + avg_classify + avg_cold_dma + avg_upload;
+                    let avg_gpu_compute = avg_total - avg_inter_graph - avg_launch;
+                    eprintln!("  \x1b[36m├─────────────────────────────────────────────────┤\x1b[0m");
+                    eprintln!("  \x1b[36m│\x1b[0m  Graph inter-layer breakdown:                  \x1b[36m│\x1b[0m");
+                    eprintln!("  \x1b[36m│\x1b[0m    GPU compute: {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_gpu_compute, avg_gpu_compute / avg_total * 100.0);
+                    eprintln!("  \x1b[36m│\x1b[0m    Sync wait:   {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_sync, avg_sync / avg_total * 100.0);
+                    eprintln!("  \x1b[36m│\x1b[0m    Classify:    {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_classify, avg_classify / avg_total * 100.0);
+                    eprintln!("  \x1b[36m│\x1b[0m    Cold DMA:    {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_cold_dma, avg_cold_dma / avg_total * 100.0);
+                    eprintln!("  \x1b[36m│\x1b[0m    Upload:      {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_upload, avg_upload / avg_total * 100.0);
+                    eprintln!("  \x1b[36m│\x1b[0m    Launch:      {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_launch, avg_launch / avg_total * 100.0);
                 }
                 let avg_attn_la = graph.t_attn_la / n * 1000.0;
                 let avg_attn_gqa = graph.t_attn_gqa / n * 1000.0;
