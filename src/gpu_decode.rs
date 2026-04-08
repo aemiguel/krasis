@@ -8542,13 +8542,13 @@ impl GpuDecodeStore {
             let target = graph.num_sms * 4;
             ((target + w13_n_tiles - 1) / w13_n_tiles).clamp(1, w13_max_ksplits.min(8))
         } else { 1 };
-        // Batched expert ksplits: topk in z-dim provides block parallelism (min 4)
+        // Batched expert ksplits: topk in z-dim already provides block parallelism
         let w13_ksplits_batched = if w13_max_ksplits > 1 {
             let batch_z = graph.max_experts_per_tok.max(1);
             let target = graph.num_sms * 4;
             let effective = w13_n_tiles * batch_z;
-            if effective >= target { 4 } else {
-                ((target + effective - 1) / effective).clamp(4, w13_max_ksplits.min(8))
+            if effective >= target { 1 } else {
+                ((target + effective - 1) / effective).clamp(1, w13_max_ksplits.min(8))
             }
         } else { 1 };
         let use_v2_w13 = w13_ksplits > 1;
@@ -8581,7 +8581,7 @@ impl GpuDecodeStore {
                     unsafe {
                         w13_kernel.launch(
                             LaunchConfig {
-                                grid_dim: (w13_n_tiles as u32, w13_ksplits as u32, topk as u32),
+                                grid_dim: (w13_n_tiles as u32, w13_ksplits_batched as u32, topk as u32),
                                 block_dim: (256, 1, 1),
                                 shared_mem_bytes: w13_smem,
                             },
@@ -17057,13 +17057,13 @@ impl GpuDecodeStore {
         } else {
             1
         };
-        // Batched expert ksplits: topk in z-dim provides block parallelism (min 4)
+        // Batched expert ksplits: topk in z-dim already provides block parallelism
         let w13_ksplits_batched = if w13_max_ksplits > 1 {
             let batch_z = topk.max(1);
             let target = graph.num_sms * 4;
             let effective = w13_n_tiles * batch_z;
-            if effective >= target { 4 } else {
-                ((target + effective - 1) / effective).clamp(4, w13_max_ksplits.min(8))
+            if effective >= target { 1 } else {
+                ((target + effective - 1) / effective).clamp(1, w13_max_ksplits.min(8))
             }
         } else { 1 };
         let use_v2_w13 = w13_ksplits > 1;
@@ -17691,7 +17691,7 @@ impl GpuDecodeStore {
             unsafe {
                 w13_kernel.launch(
                     LaunchConfig {
-                        grid_dim: (w13_n_tiles as u32, w13_ksplits as u32, hcs_batch_count as u32),
+                        grid_dim: (w13_n_tiles as u32, w13_ksplits_batched as u32, hcs_batch_count as u32),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: w13_smem,
                     },
