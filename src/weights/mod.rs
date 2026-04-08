@@ -1503,6 +1503,38 @@ impl WeightStore {
             gpu_num_bits: 4,
         }
     }
+
+    /// Free the heap-backed Vecs in a LayerExpertBacking, returning total bytes freed.
+    ///
+    /// Used by WriteCombined DMA migration: after expert data is copied into WC memory
+    /// and decode pointers are redirected, the original heap backing is dead weight.
+    /// Freeing it incrementally (one layer at a time) keeps peak RAM manageable.
+    pub fn free_layer_backing_gpu(&self, layer_idx: usize) -> usize {
+        if layer_idx >= self.layer_backings_gpu.len() {
+            return 0;
+        }
+        // SAFETY: The backing data is dead — pointers have been redirected to WC memory.
+        // No concurrent access occurs during WC setup. We use ptr::read + ptr::write to
+        // swap Vecs without creating &mut through a const-to-mut cast.
+        unsafe {
+            let backing_ptr = &self.layer_backings_gpu[layer_idx] as *const LayerExpertBacking
+                as *mut LayerExpertBacking;
+
+            macro_rules! swap_free {
+                ($field:ident) => {{
+                    let field_ptr = std::ptr::addr_of_mut!((*backing_ptr).$field);
+                    let old = std::ptr::read(field_ptr);
+                    let len = old.len();
+                    std::ptr::write(field_ptr, Vec::new());
+                    drop(old);
+                    len
+                }};
+            }
+
+            swap_free!(w13_packed) + swap_free!(w13_scales)
+                + swap_free!(w2_packed) + swap_free!(w2_scales)
+        }
+    }
 }
 
 impl WeightStore {

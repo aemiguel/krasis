@@ -138,36 +138,69 @@ fn compile_cuda_kernels() {
     };
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let ptx_path = format!("{out_dir}/decode_kernels.ptx");
 
-    if is_output_fresh(&[cu_src], &[&ptx_path]) {
+    // Compile sm_80 PTX (works on Ampere SM86/3090, Ada SM89, Hopper, Blackwell via JIT)
+    let ptx_sm80 = format!("{out_dir}/decode_kernels_sm80.ptx");
+
+    if is_output_fresh(&[cu_src], &[&ptx_sm80]) {
         println!("cargo:rustc-cfg=has_decode_kernels");
-        println!("cargo:warning=Reusing cached GPU decode kernels at {ptx_path}");
-        return;
+        println!("cargo:warning=Reusing cached GPU decode kernels at {ptx_sm80}");
+    } else {
+        let status = std::process::Command::new(&nvcc)
+            .args([
+                "-ptx",
+                "-arch=sm_80",
+                "-O3",
+                "--use_fast_math",
+                "-o", &ptx_sm80,
+                cu_src,
+            ])
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                println!("cargo:rustc-cfg=has_decode_kernels");
+                println!("cargo:warning=Compiled GPU decode kernels to sm_80 PTX ({ptx_sm80})");
+            }
+            Ok(s) => {
+                println!("cargo:warning=nvcc failed with status {s} — GPU decode kernels disabled");
+                return;
+            }
+            Err(e) => {
+                println!("cargo:warning=nvcc execution error: {e} — GPU decode kernels disabled");
+                return;
+            }
+        }
     }
 
-    // Compile .cu to .ptx targeting sm_80 (works on Ampere, Ada, Hopper)
-    let status = std::process::Command::new(&nvcc)
-        .args([
-            "-ptx",
-            "-arch=sm_80",
-            "-O3",
-            "--use_fast_math",
-            "-o", &ptx_path,
-            cu_src,
-        ])
-        .status();
+    // Compile sm_120 PTX (native Blackwell — better warp scheduling on RTX 50x0)
+    let ptx_sm120 = format!("{out_dir}/decode_kernels_sm120.ptx");
+    if is_output_fresh(&[cu_src], &[&ptx_sm120]) {
+        println!("cargo:rustc-cfg=has_decode_kernels_sm120");
+        println!("cargo:warning=Reusing cached sm_120 GPU decode kernels at {ptx_sm120}");
+    } else {
+        let status_120 = std::process::Command::new(&nvcc)
+            .args([
+                "-ptx",
+                "-arch=sm_120",
+                "-O3",
+                "--use_fast_math",
+                "-o", &ptx_sm120,
+                cu_src,
+            ])
+            .status();
 
-    match status {
-        Ok(s) if s.success() => {
-            println!("cargo:rustc-cfg=has_decode_kernels");
-            println!("cargo:warning=Compiled GPU decode kernels to PTX ({ptx_path})");
-        }
-        Ok(s) => {
-            println!("cargo:warning=nvcc failed with status {s} — GPU decode kernels disabled");
-        }
-        Err(e) => {
-            println!("cargo:warning=nvcc execution error: {e} — GPU decode kernels disabled");
+        match status_120 {
+            Ok(s) if s.success() => {
+                println!("cargo:rustc-cfg=has_decode_kernels_sm120");
+                println!("cargo:warning=Compiled GPU decode kernels to sm_120 PTX ({ptx_sm120})");
+            }
+            Ok(s) => {
+                println!("cargo:warning=nvcc sm_120 failed with status {s} — sm_80 PTX will be used via JIT");
+            }
+            Err(e) => {
+                println!("cargo:warning=nvcc sm_120 execution error: {e} — sm_80 PTX will be used via JIT");
+            }
         }
     }
 }

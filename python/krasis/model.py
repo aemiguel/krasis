@@ -1783,16 +1783,22 @@ class KrasisModel:
             len(self.gpu_prefill_managers), self.gpu_prefill_threshold,
         )
 
-    def _start_ram_watchdog(self, floor_pct: float = 5.0):
+    def _start_ram_watchdog(self, floor_pct: float = 0.5):
         """Start daemon thread that monitors system RAM and exits if too low.
 
-        Checks /proc/meminfo every second. If MemAvailable drops below
-        floor_pct% of MemTotal, logs an error and calls os._exit() to
+        Checks /proc/meminfo every second. If (MemAvailable + SwapFree) drops
+        below floor_pct% of MemTotal, logs an error and calls os._exit() to
         prevent a full system OOM that kills desktop processes.
 
+        Swap is counted as available headroom because NVMe swap is fast enough
+        to absorb transient spikes (e.g. during WriteCombined expert migration).
+
         Args:
-            floor_pct: Minimum % free RAM before forced exit (default 5%)
+            floor_pct: Minimum % free RAM+swap before forced exit (default 0.5%).
+                       Override via KRASIS_RAM_FLOOR_PERCENT env var.
         """
+        floor_pct = float(os.environ.get("KRASIS_RAM_FLOOR_PERCENT", str(floor_pct)))
+
         def _watchdog():
             while True:
                 time.sleep(1.0)
@@ -1800,13 +1806,13 @@ class KrasisModel:
                 if not meminfo:
                     continue
                 total_kb = meminfo.get("MemTotal", 0)
-                avail_kb = meminfo.get("MemAvailable", 0)
+                avail_kb = meminfo.get("MemAvailable", 0) + meminfo.get("SwapFree", 0)
                 if total_kb == 0:
                     continue
                 pct_free = 100.0 * avail_kb / total_kb
                 if pct_free < floor_pct:
                     logger.error(
-                        "RAM WATCHDOG: %.1f%% free (%.1f GB available / %.1f GB total) "
+                        "RAM WATCHDOG: %.1f%% free (%.1f GB available+swap / %.1f GB total) "
                         "— below %.1f%% floor. Exiting to prevent system OOM!",
                         pct_free, avail_kb / 1024 / 1024,
                         total_kb / 1024 / 1024, floor_pct,
@@ -1815,7 +1821,7 @@ class KrasisModel:
 
         t = threading.Thread(target=_watchdog, daemon=True, name="ram-watchdog")
         t.start()
-        logger.info("RAM watchdog started: will exit if < %.1f%% free", floor_pct)
+        logger.info("RAM watchdog started: will exit if < %.1f%% free (RAM+swap)", floor_pct)
 
     # ── Multi-GPU calibration: replicate weights + measure inference cost ──
 
@@ -4517,6 +4523,13 @@ class KrasisModel:
         # Register MoE expert data from engine (all MoE layers at once)
         if self.krasis_engine is not None:
             store.setup_from_engine(self.krasis_engine)
+
+            # WriteCombined DMA staging: migrate expert weights from heap to WC memory.
+            # Must happen after setup_from_engine (pointers exist) but before
+            # allocate_prefill_engine (which reads the updated pointers).
+            if getattr(self, 'wc_alloc', False):
+                wc_msg = store.setup_wc_expert_memory(self.krasis_engine)
+                logger.info("WC expert memory: %s", wc_msg)
 
         # Register Nemotron MoE config (relu2, ungated, latent projections) — must come
         # after setup_from_engine which populates moe_layers[abs_layer_idx].

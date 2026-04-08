@@ -710,6 +710,11 @@ def main():
                         help="Enable Session messenger bridge (default: off)")
     parser.add_argument("--test-endpoints", action="store_true", default=False,
                         help="Enable test-only endpoints (/v1/internal/prefill_logits)")
+    parser.add_argument("--wc-alloc", action="store_true", default=False,
+                        help="Use WriteCombined host memory for expert DMA staging. "
+                             "Bypasses CPU cache for ~64%% higher PCIe bandwidth "
+                             "(~46 GB/s vs ~28 GB/s on Gen5). Requires NVMe swap on "
+                             "RAM-constrained systems.")
     # Apply config file defaults, then parse CLI (CLI wins over config file)
     if config_defaults:
         parser.set_defaults(**config_defaults)
@@ -911,6 +916,11 @@ def main():
 
     # ── Set decode mode (GPU only) ──
     _model.decode_mode = "gpu"
+
+    # ── WriteCombined DMA staging ──
+    if getattr(args, 'wc_alloc', False):
+        _model.wc_alloc = True
+        _detail("WriteCombined expert DMA staging enabled (--wc-alloc)")
 
     # ── GPU decode store setup (before warmup so decode warmup can use it) ──
     _status("Setting up GPU decode store")
