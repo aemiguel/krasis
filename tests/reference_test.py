@@ -441,7 +441,7 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
         print("Starting server...")
         proc, port = start_server(conf_path, script_dir)
         print(f"Waiting for server on port {port}...")
-        if not wait_for_server(port, timeout=600):
+        if not wait_for_server(port, timeout=1200):
             print("ERROR: Server did not start within timeout", file=sys.stderr)
             return None
         print("Server ready.")

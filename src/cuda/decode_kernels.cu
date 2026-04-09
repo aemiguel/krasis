@@ -224,7 +224,8 @@ extern "C" __global__ void softmax_topk(
     int* __restrict__ topk_indices,         // [topk]
     float* __restrict__ topk_weights,       // [topk]
     int num_experts,
-    int topk
+    int topk,
+    int norm_topk_prob                      // 1=renormalize weights to sum to 1
 ) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
@@ -261,7 +262,8 @@ extern "C" __global__ void softmax_topk(
         scores[best_idx] = -1e30f;
     }
 
-    // Normalize top-K weights to sum to 1.0 (norm_topk_prob)
+    // Normalize top-K weights to sum to 1.0 (only when norm_topk_prob is set)
+    if (norm_topk_prob) {
     float topk_sum = 0.0f;
     for (int t = 0; t < topk; t++) {
         topk_sum += topk_weights[t];
@@ -272,6 +274,7 @@ extern "C" __global__ void softmax_topk(
             topk_weights[t] *= inv_sum;
         }
     }
+    } // end norm_topk_prob
 }
 
 // ── Expert Classify + Batch Prepare ───────────────────────────────────
@@ -404,7 +407,8 @@ extern "C" __global__ void fused_gate_topk(
     int hidden_size,
     int topk,
     int scoring_func,                             // 0=softmax, 1=sigmoid
-    float routed_scaling_factor                   // for sigmoid normalization
+    float routed_scaling_factor,                  // for sigmoid normalization
+    int norm_topk_prob                            // 1=renormalize weights to sum to 1
 ) {
     const int eid = threadIdx.x;
     if (eid >= num_experts) return;
@@ -480,12 +484,14 @@ extern "C" __global__ void fused_gate_topk(
             s_scores[best_idx] = -1e30f;
         }
 
-        // Normalize weights
-        float sum = 0.0f;
-        for (int t = 0; t < topk; t++) sum += topk_weights[t];
-        if (sum > 0.0f) {
-            float inv = 1.0f / sum;
-            for (int t = 0; t < topk; t++) topk_weights[t] *= inv;
+        // Normalize weights (only when norm_topk_prob is set)
+        if (norm_topk_prob) {
+            float sum = 0.0f;
+            for (int t = 0; t < topk; t++) sum += topk_weights[t];
+            if (sum > 0.0f) {
+                float inv = 1.0f / sum;
+                for (int t = 0; t < topk; t++) topk_weights[t] *= inv;
+            }
         }
     }
 }
