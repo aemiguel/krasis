@@ -1878,6 +1878,16 @@ impl WeightStore {
         let experts_gated = has_gate_proj_experts(&index.weight_map);
         log::info!("Experts gated (have gate_proj): {experts_gated}");
 
+        // Detect MiniMax-style FP8 weights (w1/w2/w3 with embedded scales)
+        let minimax_fp8 = is_minimax_fp8(&index.weight_map);
+        if minimax_fp8 {
+            log::info!("Detected MiniMax FP8 weights (w1/w2/w3 format)");
+        }
+
+        // Get the right projection names for this model type
+        let (gate_name, up_name, down_name) = get_expert_proj_names(&index.weight_map);
+        log::info!("Using expert projection names: gate={}, up={}, down={}", gate_name, up_name, down_name);
+
         // Detect pre-quantized vs BF16 weights
         let prequantized = is_prequantized(&index.weight_map);
         let effective_group_size = if prequantized {
@@ -1913,7 +1923,19 @@ impl WeightStore {
             for eidx in 0..config.n_routed_experts {
                 let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.experts.{eidx}");
 
-                let (gate, up, down) = if !experts_gated {
+                let (gate, up, down) = if minimax_fp8 {
+                    // MiniMax: w1 (gate), w3 (up), w2 (down) - FP8 with block scales
+                    let g = QuantWeight::Int4(load_and_quantize_weight(
+                        &prefix, gate_name, &index.weight_map, &shards, effective_group_size,
+                    )?);
+                    let u = QuantWeight::Int4(load_and_quantize_weight(
+                        &prefix, up_name, &index.weight_map, &shards, effective_group_size,
+                    )?);
+                    let d = QuantWeight::Int4(load_and_quantize_weight(
+                        &prefix, down_name, &index.weight_map, &shards, effective_group_size,
+                    )?);
+                    (g, u, d)
+                } else if !experts_gated {
                     // Nemotron: ungated experts (no gate_proj, just up_proj + down_proj)
                     if prequantized {
                         let u = QuantWeight::Int4(load_prequantized_weight(
@@ -1943,6 +1965,7 @@ impl WeightStore {
                 } else {
                     load_and_quantize_expert(
                         &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
+                        gate_name, up_name, down_name,
                     )?
                 };
 
@@ -1985,6 +2008,7 @@ impl WeightStore {
                 let (gate, up, down) = if shared_has_gate {
                     load_and_quantize_expert(
                         &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
+                        gate_name, up_name, down_name,
                     )?
                 } else {
                     load_and_quantize_expert_ungated(
@@ -2268,6 +2292,7 @@ impl WeightStore {
         let shared_name = detect_shared_expert_name(&index.weight_map);
         let expert_sublayer = detect_expert_sublayer(&index.weight_map);
         let experts_gated = has_gate_proj_experts(&index.weight_map);
+        let (gate_name, up_name, down_name) = get_expert_proj_names(&index.weight_map);
 
         // Collect shard names needed for shared experts
         let mut shard_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2309,6 +2334,7 @@ impl WeightStore {
             let (gate, up, down) = if experts_gated {
                 load_and_quantize_expert(
                     &prefix, &index.weight_map, &shards, group_size, num_bits,
+                    gate_name, up_name, down_name,
                 )?
             } else {
                 load_and_quantize_expert_ungated(
@@ -2375,6 +2401,7 @@ impl WeightStore {
         let experts_gated = has_gate_proj_experts(&index.weight_map);
         let expert_sublayer = detect_expert_sublayer(&index.weight_map);
         let shared_name = detect_shared_expert_name(&index.weight_map);
+        let (gate_name, up_name, down_name) = get_expert_proj_names(&index.weight_map);
 
         let overall_start = std::time::Instant::now();
         let mut experts_gpu: Vec<Vec<UnifiedExpertWeights>> = Vec::new();
@@ -2394,6 +2421,7 @@ impl WeightStore {
                 } else {
                     load_and_quantize_expert(
                         &prefix, &index.weight_map, &shards, 0, 16,
+                        gate_name, up_name, down_name,
                     )?
                 };
                 let ew = ExpertWeights { gate, up, down };
@@ -2422,6 +2450,7 @@ impl WeightStore {
                 let (gate, up, down) = if experts_gated {
                     load_and_quantize_expert(
                         &prefix, &index.weight_map, &shards, 0, 16,
+                        gate_name, up_name, down_name,
                     )?
                 } else {
                     load_and_quantize_expert_ungated(
@@ -2511,7 +2540,12 @@ impl WeightStore {
         let prequantized = !mxfp4 && !stacked && is_prequantized(&index.weight_map);
         let experts_gated = has_gate_proj_experts(&index.weight_map);
         let expert_sublayer = detect_expert_sublayer(&index.weight_map);
-        log::info!("Cache build: experts gated={experts_gated}, sublayer={expert_sublayer}");
+        let minimax_fp8 = is_minimax_fp8(&index.weight_map);
+        let (gate_name, up_name, down_name) = get_expert_proj_names(&index.weight_map);
+        log::info!("Cache build: experts gated={experts_gated}, sublayer={expert_sublayer}, minimax_fp8={minimax_fp8}");
+        if minimax_fp8 {
+            log::info!("Using MiniMax projection names: gate={}, up={}, down={}", gate_name, up_name, down_name);
+        }
         let effective_group_size = if prequantized {
             let probe_layer = config.moe_abs_layer(start_moe_layer);
             let native_gs = detect_prequant_group_size(
@@ -2591,19 +2625,22 @@ impl WeightStore {
             let fmt = if stacked { "stacked" } else { "MXFP4" };
             log::info!("Issued {fmt} prefetch for layer {first_layer_idx} bulk tensors");
         } else {
-            let proj_names = if !experts_gated {
+            let proj_names: Vec<String> = if minimax_fp8 {
+                // MiniMax: w1/w2/w3 naming
+                vec![format!("{}.weight", gate_name), format!("{}.weight", up_name), format!("{}.weight", down_name)]
+            } else if !experts_gated {
                 if prequantized {
-                    vec!["up_proj.weight_packed", "up_proj.weight_scale",
-                         "down_proj.weight_packed", "down_proj.weight_scale"]
+                    vec!["up_proj.weight_packed".to_string(), "up_proj.weight_scale".to_string(),
+                         "down_proj.weight_packed".to_string(), "down_proj.weight_scale".to_string()]
                 } else {
-                    vec!["up_proj.weight", "down_proj.weight"]
+                    vec!["up_proj.weight".to_string(), "down_proj.weight".to_string()]
                 }
             } else if prequantized {
-                vec!["gate_proj.weight_packed", "gate_proj.weight_scale",
-                     "up_proj.weight_packed", "up_proj.weight_scale",
-                     "down_proj.weight_packed", "down_proj.weight_scale"]
+                vec!["gate_proj.weight_packed".to_string(), "gate_proj.weight_scale".to_string(),
+                     "up_proj.weight_packed".to_string(), "up_proj.weight_scale".to_string(),
+                     "down_proj.weight_packed".to_string(), "down_proj.weight_scale".to_string()]
             } else {
-                vec!["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
+                vec!["gate_proj.weight".to_string(), "up_proj.weight".to_string(), "down_proj.weight".to_string()]
             };
             for eidx in 0..config.n_routed_experts {
                 for proj in &proj_names {
@@ -2641,7 +2678,19 @@ impl WeightStore {
                 let mut data = Vec::with_capacity(config.n_routed_experts);
                 for eidx in 0..config.n_routed_experts {
                     let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.experts.{eidx}");
-                    let (gate, up, down) = if !experts_gated {
+                    let (gate, up, down) = if minimax_fp8 {
+                        // MiniMax: w1 (gate), w3 (up), w2 (down) - FP8 with block scales
+                        let g = QuantWeight::Int4(load_and_quantize_weight(
+                            &prefix, gate_name, &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        let u = QuantWeight::Int4(load_and_quantize_weight(
+                            &prefix, up_name, &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        let d = QuantWeight::Int4(load_and_quantize_weight(
+                            &prefix, down_name, &index.weight_map, &shards, effective_group_size,
+                        )?);
+                        (g, u, d)
+                    } else if !experts_gated {
                         // Nemotron: ungated experts (no gate_proj, just up_proj + down_proj)
                         if prequantized {
                             let u = QuantWeight::Int4(load_prequantized_weight(
@@ -2662,6 +2711,7 @@ impl WeightStore {
                             // For now, load BF16 and quantize fresh (fall through to non-prequant path)
                             load_and_quantize_expert(
                                 &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                                gate_name, up_name, down_name,
                             )?
                         } else {
                             let g = QuantWeight::Int4(load_prequantized_weight(
@@ -2678,6 +2728,7 @@ impl WeightStore {
                     } else {
                         load_and_quantize_expert(
                             &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                            gate_name, up_name, down_name,
                         )?
                     };
                     data.push(ExpertWeights { gate, up, down });
@@ -2792,6 +2843,7 @@ impl WeightStore {
                 let (gate, up, down) = if experts_gated {
                     load_and_quantize_expert(
                         &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                        gate_name, up_name, down_name,
                     )?
                 } else {
                     load_and_quantize_expert_ungated(
@@ -3258,7 +3310,8 @@ impl WeightStore {
         let prequantized = !mxfp4 && !stacked && is_prequantized(&index.weight_map);
         let experts_gated = has_gate_proj_experts(&index.weight_map);
         let expert_sublayer = detect_expert_sublayer(&index.weight_map);
-        log::info!("CPU cache build: experts gated={experts_gated}, sublayer={expert_sublayer}");
+        let (gate_name, up_name, down_name) = get_expert_proj_names(&index.weight_map);
+        log::info!("CPU cache build: experts gated={experts_gated}, sublayer={expert_sublayer}, projs=({gate_name},{up_name},{down_name})");
         let effective_group_size = if prequantized {
             let probe_layer = config.moe_abs_layer(start_moe_layer);
             let native_gs = detect_prequant_group_size(
@@ -3361,6 +3414,7 @@ impl WeightStore {
                     } else {
                         load_and_quantize_expert(
                             &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                            gate_name, up_name, down_name,
                         )?
                     };
                     data.push(ExpertWeights { gate, up, down });
@@ -3430,6 +3484,7 @@ impl WeightStore {
                 let (gate, up, down) = if experts_gated {
                     load_and_quantize_expert(
                         &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                        gate_name, up_name, down_name,
                     )?
                 } else {
                     load_and_quantize_expert_ungated(
@@ -5564,8 +5619,8 @@ fn detect_physical_cores() -> usize {
 fn detect_expert_prefix(weight_map: &HashMap<String, String>) -> Result<String, String> {
     for key in weight_map.keys() {
         if let Some(pos) = key.find(".layers.") {
-            // Standard MoE: .mlp.experts.  Nemotron: .mixer.experts.
-            if key.contains(".mlp.experts.") || key.contains(".mixer.experts.") {
+            // Standard MoE: .mlp.experts.  Nemotron: .mixer.experts.  MiniMax: .block_sparse_moe.experts.
+            if key.contains(".mlp.experts.") || key.contains(".mixer.experts.") || key.contains(".block_sparse_moe.experts.") {
                 let prefix = &key[..pos];
                 // Skip MTP (multi-token prediction) weights — not real model layers
                 if prefix == "mtp" || prefix.ends_with(".mtp") {
@@ -5578,11 +5633,14 @@ fn detect_expert_prefix(weight_map: &HashMap<String, String>) -> Result<String, 
     Err("Could not detect expert weight prefix from safetensors index".to_string())
 }
 
-/// Detect expert sublayer: "mlp" (standard) or "mixer" (Nemotron).
+/// Detect expert sublayer: "mlp" (standard), "mixer" (Nemotron), or "block_sparse_moe" (MiniMax).
 fn detect_expert_sublayer(weight_map: &HashMap<String, String>) -> &'static str {
     for key in weight_map.keys() {
         if key.contains(".mixer.experts.") {
             return "mixer";
+        }
+        if key.contains(".block_sparse_moe.experts.") {
+            return "block_sparse_moe";
         }
     }
     "mlp"
@@ -5616,6 +5674,35 @@ fn detect_shared_expert_name(weight_map: &HashMap<String, String>) -> &'static s
 /// Returns true if pre-quantized (weight_packed tensors found).
 fn is_prequantized(weight_map: &HashMap<String, String>) -> bool {
     weight_map.keys().any(|k| k.ends_with(".weight_packed"))
+}
+
+/// Detect MiniMax-style FP8 weights with embedded block scales (w1/w2/w3 + scale_inv).
+/// Returns true if weights are in MiniMax format: FP8 weights with their own block scales.
+fn is_minimax_fp8(weight_map: &HashMap<String, String>) -> bool {
+    // Check for MiniMax pattern: w1/w2/w3 weights with scale_inv but NOT weight_packed
+    let has_w1 = weight_map.keys().any(|k| k.contains(".w1.weight"));
+    let has_w2 = weight_map.keys().any(|k| k.contains(".w2.weight"));
+    let has_w3 = weight_map.keys().any(|k| k.contains(".w3.weight"));
+    let has_scale_inv = weight_map.keys().any(|k| k.contains(".weight_scale_inv"));
+    let has_weight_packed = weight_map.keys().any(|k| k.ends_with(".weight_packed"));
+
+    // MiniMax has w1/w2/w3 with scale_inv but NOT weight_packed
+    has_w1 && has_w2 && has_w3 && has_scale_inv && !has_weight_packed
+}
+
+/// Get expert weight names based on model type.
+/// Returns (gate_name, up_name, down_name) for the expert projections.
+fn get_expert_proj_names(weight_map: &HashMap<String, String>) -> (&'static str, &'static str, &'static str) {
+    if is_minimax_fp8(weight_map) {
+        // MiniMax: w1=gate, w3=up, w2=down
+        ("w1", "w3", "w2")
+    } else if weight_map.keys().any(|k| k.contains(".mixer.experts.")) && !weight_map.keys().any(|k| k.contains(".gate_proj.")) {
+        // Nemotron ungated: gate=AUTO, up=up_proj, down=down_proj (no gate_proj)
+        ("gate_proj", "up_proj", "down_proj")
+    } else {
+        // Standard: gate_proj, up_proj, down_proj
+        ("gate_proj", "up_proj", "down_proj")
+    }
 }
 
 /// Convert FP8 E4M3 byte to f32.
@@ -6042,15 +6129,23 @@ fn load_and_quantize_weight(
     let cols = info.shape[1];
 
     if info.dtype.is_fp8() {
-        // FP8 path: read as bytes, load per-tensor scale_inv, dequant to BF16
+        // FP8 path: read as bytes
         let fp8_data: &[u8] = shard.tensor_as_slice(&tensor_name)
             .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
 
         let scale_name = format!("{tensor_name}_scale_inv");
-        let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
 
-        let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
-        Ok(quantize_int4(&bf16_data, rows, cols, group_size))
+        // Try block-wise scales first (MiniMax M2.5 format: [inter/128, hidden/128])
+        let block_scales = load_fp8_block_scales(&scale_name, weight_map, shards);
+        if let Ok(bscales) = block_scales {
+            // Block-wise FP8: fuse dequant + INT4 quantization directly
+            Ok(quantize_int4_from_fp8_blocks(fp8_data, &bscales, rows, cols, group_size))
+        } else {
+            // Per-tensor FP8: existing path
+            let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
+            let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
+            Ok(quantize_int4(&bf16_data, rows, cols, group_size))
+        }
     } else {
         let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
             .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
@@ -6065,6 +6160,9 @@ fn load_and_quantize_expert(
     shards: &HashMap<String, MmapSafetensors>,
     group_size: usize,
     num_bits: u8,
+    gate_name: &str,
+    up_name: &str,
+    down_name: &str,
 ) -> Result<(QuantWeight, QuantWeight, QuantWeight), String> {
     if num_bits == 16 {
         // BF16 validation mode: load raw BF16 data, no quantization
@@ -6082,28 +6180,37 @@ fn load_and_quantize_expert(
                 let fp8_data: &[u8] = shard.tensor_as_slice(&tensor_name)
                     .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
                 let scale_name = format!("{tensor_name}_scale_inv");
-                let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
-                let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
-                Ok(QuantWeight::Bf16(QuantizedBf16 { data: bf16_data, rows, cols }))
+                // Try block-wise scales first
+                if let Ok(bscales) = load_fp8_block_scales(&scale_name, weight_map, shards) {
+                    let qint4 = quantize_int4_from_fp8_blocks(fp8_data, &bscales, rows, cols, DEFAULT_GROUP_SIZE);
+                    // Convert INT4 to BF16 for validation mode: f32 → bf16 (u16)
+                    let bf16_f32 = marlin::dequantize_int4(&qint4);
+                    let bf16_data: Vec<u16> = bf16_f32.iter().map(|&v| marlin::f32_to_bf16(v)).collect();
+                    Ok(QuantWeight::Bf16(QuantizedBf16 { data: bf16_data, rows, cols }))
+                } else {
+                    let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
+                    let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
+                    Ok(QuantWeight::Bf16(QuantizedBf16 { data: bf16_data, rows, cols }))
+                }
             } else {
                 let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
                     .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
                 Ok(QuantWeight::Bf16(QuantizedBf16 { data: bf16_data.to_vec(), rows, cols }))
             }
         };
-        let g = load_bf16("gate_proj")?;
-        let u = load_bf16("up_proj")?;
-        let d = load_bf16("down_proj")?;
+        let g = load_bf16(gate_name)?;
+        let u = load_bf16(up_name)?;
+        let d = load_bf16(down_name)?;
         Ok((g, u, d))
     } else if num_bits == 4 {
         let g = QuantWeight::Int4(load_and_quantize_weight(
-            prefix, "gate_proj", weight_map, shards, group_size,
+            prefix, gate_name, weight_map, shards, group_size,
         )?);
         let u = QuantWeight::Int4(load_and_quantize_weight(
-            prefix, "up_proj", weight_map, shards, group_size,
+            prefix, up_name, weight_map, shards, group_size,
         )?);
         let d = QuantWeight::Int4(load_and_quantize_weight(
-            prefix, "down_proj", weight_map, shards, group_size,
+            prefix, down_name, weight_map, shards, group_size,
         )?);
         Ok((g, u, d))
     } else {
@@ -6122,9 +6229,21 @@ fn load_and_quantize_expert(
                 let fp8_data: &[u8] = shard.tensor_as_slice(&tensor_name)
                     .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
                 let scale_name = format!("{tensor_name}_scale_inv");
-                let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
-                let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
-                Ok(QuantWeight::Int8(quantize_int8(&bf16_data, rows, cols, group_size)))
+                // Try block-wise scales first
+                if let Ok(bscales) = load_fp8_block_scales(&scale_name, weight_map, shards) {
+                    // Convert FP8 block scales to INT4, then dequantize→requantize to INT8
+                    let qint4 = quantize_int4_from_fp8_blocks(fp8_data, &bscales, rows, cols, group_size);
+                    // INT4 → f32 → INT8
+                    let bf16_f32 = marlin::dequantize_int4(&qint4);
+                    // Convert f32 to u16 for quantize_int8
+                    let weight_bf16: Vec<u16> = bf16_f32.iter().map(|&v| marlin::f32_to_bf16(v)).collect();
+                    let int8_data = quantize_int8(&weight_bf16, rows, cols, group_size);
+                    Ok(QuantWeight::Int8(int8_data))
+                } else {
+                    let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
+                    let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
+                    Ok(QuantWeight::Int8(quantize_int8(&bf16_data, rows, cols, group_size)))
+                }
             } else {
                 let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
                     .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
@@ -6132,9 +6251,9 @@ fn load_and_quantize_expert(
             }
         };
 
-        let g = load_int8("gate_proj")?;
-        let u = load_int8("up_proj")?;
-        let d = load_int8("down_proj")?;
+        let g = load_int8(gate_name)?;
+        let u = load_int8(up_name)?;
+        let d = load_int8(down_name)?;
         Ok((g, u, d))
     }
 }
@@ -6250,6 +6369,130 @@ fn load_fp8_scale(
         let data: &[u16] = shard.tensor_as_slice(scale_name)
             .map_err(|e| format!("Failed to read {scale_name}: {e}"))?;
         Ok(marlin::bf16_to_f32(data[0]))
+    }
+}
+
+/// Load block-wise FP8 scale_inv as a 2D array.
+///
+/// For MiniMax M2.5: scale shape is [intermediate/128, hidden/128] = [12, 24] for a
+/// [1536, 3072] weight. This represents one scale per 128x128 block.
+fn load_fp8_block_scales(
+    scale_name: &str,
+    weight_map: &HashMap<String, String>,
+    shards: &HashMap<String, MmapSafetensors>,
+) -> Result<Vec<f32>, String> {
+    let shard_name = weight_map.get(scale_name)
+        .ok_or_else(|| format!("FP8 block scale_inv not found: {scale_name}"))?;
+    let shard = shards.get(shard_name)
+        .ok_or_else(|| format!("Shard not loaded: {shard_name}"))?;
+    let info = shard.tensor_info(scale_name)
+        .ok_or_else(|| format!("Tensor not in shard: {scale_name}"))?;
+
+    // Shape should be 2D: [num_blocks_in, num_blocks_out]
+    if info.shape.len() != 2 {
+        return Err(format!("Expected 2D block scale, got shape {:?}", info.shape));
+    }
+
+    if info.dtype == Dtype::F32 {
+        let data: &[f32] = shard.tensor_as_slice(scale_name)
+            .map_err(|e| format!("Failed to read {scale_name}: {e}"))?;
+        Ok(data.to_vec())
+    } else {
+        // BF16 block scales
+        let data: &[u16] = shard.tensor_as_slice(scale_name)
+            .map_err(|e| format!("Failed to read {scale_name}: {e}"))?;
+        Ok(data.iter().map(|&b| marlin::bf16_to_f32(b)).collect())
+    }
+}
+
+/// Fused FP8 block dequantization + INT4 quantization.
+///
+/// Takes FP8 weight bytes and block-wise scale_inv, produces INT4 weights directly.
+/// This avoids a full BF16 intermediate buffer, which would be memory-prohibitive
+/// for 230B models.
+///
+/// Weight shape: [rows, cols] - e.g., [1536, 3072]
+/// Scale shape: [rows/128, cols/128] - e.g., [12, 24]
+/// Output: INT4 with scales per group (128 elements per group)
+fn quantize_int4_from_fp8_blocks(
+    fp8_data: &[u8],
+    block_scales: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> QuantizedInt4 {
+    // Block dimension is fixed at 128 for FP8 E4M3
+    const BLOCK_SIZE: usize = 128;
+    assert_eq!(rows % BLOCK_SIZE, 0, "rows must be multiple of {BLOCK_SIZE}");
+    assert_eq!(cols % BLOCK_SIZE, 0, "cols must be multiple of {BLOCK_SIZE}");
+
+    let num_block_rows = rows / BLOCK_SIZE;
+    let num_block_cols = cols / BLOCK_SIZE;
+    let num_groups_per_row = cols / group_size;
+
+    let mut scales = vec![0u16; rows * num_groups_per_row];
+    let mut packed = vec![0u32; rows * (cols / 8)];  // 4 bits per element = 8 per byte
+
+    // For each output row
+    for row in 0..rows {
+        let row_block_idx = row / BLOCK_SIZE;
+        let row_in_block = row % BLOCK_SIZE;
+
+        // For each output column group (group_size elements)
+        for g in 0..num_groups_per_row {
+            // Map column group to block column
+            let group_start_col = g * group_size;
+            let block_col_start = group_start_col / BLOCK_SIZE;
+            let col_in_block = group_start_col % BLOCK_SIZE;
+
+            // Compute max over this group, using FP8 block scales directly
+            let mut amax: f32 = 0.0;
+            for i in 0..group_size {
+                let col = group_start_col + i;
+                let block_col = col / BLOCK_SIZE;
+                let block_row = row / BLOCK_SIZE;
+                let block_idx = block_row * num_block_cols + block_col;
+                let fp8_scale = block_scales[block_idx];
+
+                // Original FP8 value * FP8 scale = real value
+                let fp8_val = fp8_data[row * cols + col];
+                let real_val = fp8e4m3_to_f32(fp8_val) * fp8_scale;
+                amax = amax.max(real_val.abs());
+            }
+
+            // Compute INT4 scale from the max value
+            let scale = if amax == 0.0 { 1.0 } else { amax / 7.0 };
+            scales[row * num_groups_per_row + g] = marlin::f32_to_bf16(scale);
+
+            // Quantize and pack
+            let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+            for i in (0..group_size).step_by(8) {
+                let mut word: u32 = 0;
+                for j in 0..8 {
+                    let col = group_start_col + i + j;
+                    let block_col = col / BLOCK_SIZE;
+                    let block_row = row / BLOCK_SIZE;
+                    let block_idx = block_row * num_block_cols + block_col;
+                    let fp8_scale = block_scales[block_idx];
+
+                    let fp8_val = fp8_data[row * cols + col];
+                    let real_val = fp8e4m3_to_f32(fp8_val) * fp8_scale;
+                    let q = (real_val * inv_scale).round().clamp(-8.0, 7.0) as i8;
+                    let u4 = (q + 8) as u8 & 0xF;
+                    word |= (u4 as u32) << (j * 4);
+                }
+                let packed_col = group_start_col / 8 + i / 8;
+                packed[row * (cols / 8) + packed_col] = word;
+            }
+        }
+    }
+
+    QuantizedInt4 {
+        packed,
+        scales,
+        rows,
+        cols,
+        group_size,
     }
 }
 

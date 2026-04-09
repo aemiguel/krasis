@@ -377,6 +377,7 @@ unsafe fn launch(
 /// Handle to loaded prefill kernel functions (raw CUfunction handles).
 pub struct PrefillKernels {
     rmsnorm: RawCuFunc,
+    rmsnorm_per_head: RawCuFunc,
     fused_add_rmsnorm: RawCuFunc,
     embedding: RawCuFunc,
     rope: RawCuFunc,
@@ -755,8 +756,9 @@ pub struct PrefillLayerWeights {
     pub la_conv_state_ptr: u64,      // [conv_dim, kernel_dim] FP32 (decode state)
     pub la_recur_state_ptr: u64,     // [nv, dk, dv] FP32 (decode state)
     // QK norm (Qwen3 models): per-head RMSNorm on Q and K after projection, before RoPE
-    pub q_norm_ptr: u64,             // BF16 [head_dim], 0 = no QK norm
-    pub k_norm_ptr: u64,             // BF16 [head_dim], 0 = no QK norm
+    pub q_norm_ptr: u64,             // BF16 [head_dim] or [num_heads*head_dim], 0 = no QK norm
+    pub k_norm_ptr: u64,             // BF16 [head_dim] or [num_kv_heads*head_dim], 0 = no QK norm
+    pub qk_norm_per_head: bool,      // true: weights are [num_heads*head_dim] (per-layer), false: [head_dim] (shared)
 }
 
 /// Expert weight pointers for DMA to GPU (mirrors ExpertDataPtr).
@@ -2559,6 +2561,27 @@ impl PrefillEngine {
         Ok(())
     }
 
+    /// Per-head RMSNorm: weight is [num_heads * head_dim], each row uses its head's weights.
+    fn launch_rmsnorm_per_head(&self, out: u64, x: u64, w: u64, m: usize, d: usize, num_heads: usize) -> Result<(), String> {
+        let t = std::cmp::max(32, ((std::cmp::min(1024, d) + 31) / 32) * 32) as u32;
+        let mut p0 = out; let mut p1 = x; let mut p2 = w;
+        let mut p3 = d as i32; let mut p4 = self.config.rms_norm_eps; let mut p5 = num_heads as i32;
+        unsafe {
+            launch(self.kernels.rmsnorm_per_head,
+                (m as u32, 1, 1), (t, 1, 1), t * 4, self.stream,
+                &mut [
+                    &mut p0 as *mut _ as *mut std::ffi::c_void,
+                    &mut p1 as *mut _ as *mut std::ffi::c_void,
+                    &mut p2 as *mut _ as *mut std::ffi::c_void,
+                    &mut p3 as *mut _ as *mut std::ffi::c_void,
+                    &mut p4 as *mut _ as *mut std::ffi::c_void,
+                    &mut p5 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn launch_fused_add_rmsnorm(
         &self, residual: u64, x: u64, w: u64, m: usize, d: usize,
     ) -> Result<(), String> {
@@ -2845,15 +2868,27 @@ impl PrefillEngine {
 
         if gt { self.stream_sync()?; self.t_gqa_proj.set(self.t_gqa_proj.get() + gt0.elapsed().as_secs_f64() * 1000.0); }
 
-        // QK LayerNorm: per-head RMSNorm on Q and K after projection, before RoPE
-        // Q is [m, num_q_heads, head_dim], K is [m, num_kv_heads, head_dim]
-        // Treat as [m*num_heads, head_dim] rows — existing rmsnorm kernel handles this.
+        // QK LayerNorm: RMSNorm on Q and K after projection, before RoPE.
+        // Two modes:
+        //   qk_norm_per_head=true (MiniMax): norm across full vector [num_heads*head_dim] per token.
+        //     → m rows of (num_heads * head_dim) with weights [num_heads*head_dim].
+        //   qk_norm_per_head=false (standard): norm per-head [head_dim], shared weights.
+        //     → (m * num_heads) rows of head_dim with weights [head_dim].
         let gt1 = Instant::now();
         if lw.q_norm_ptr != 0 {
-            self.launch_rmsnorm(q, q, lw.q_norm_ptr, m * cfg.num_q_heads, cfg.head_dim)?;
+            if lw.qk_norm_per_head {
+                // Full-vector norm: [m, num_heads*head_dim] with weight [num_heads*head_dim]
+                self.launch_rmsnorm(q, q, lw.q_norm_ptr, m, cfg.num_q_heads * cfg.head_dim)?;
+            } else {
+                self.launch_rmsnorm(q, q, lw.q_norm_ptr, m * cfg.num_q_heads, cfg.head_dim)?;
+            }
         }
         if lw.k_norm_ptr != 0 {
-            self.launch_rmsnorm(k, k, lw.k_norm_ptr, m * cfg.num_kv_heads, cfg.head_dim)?;
+            if lw.qk_norm_per_head {
+                self.launch_rmsnorm(k, k, lw.k_norm_ptr, m, cfg.num_kv_heads * cfg.head_dim)?;
+            } else {
+                self.launch_rmsnorm(k, k, lw.k_norm_ptr, m * cfg.num_kv_heads, cfg.head_dim)?;
+            }
         }
 
         if gt { self.stream_sync()?; self.t_gqa_norm.set(self.t_gqa_norm.get() + gt1.elapsed().as_secs_f64() * 1000.0); }
@@ -4711,24 +4746,48 @@ impl PrefillEngine {
         // 2. Top-K routing
         {
             let t = std::cmp::max(32, ((std::cmp::min(1024, n_experts) + 31) / 32) * 32) as u32;
+            let e_score_corr_ptr = self.layer_weights[layer_idx].moe_e_score_corr_ptr;
+            let norm_topk = self.layer_weights[layer_idx].moe_norm_topk_prob;
             let mut p0 = topk_weights_ptr;
             let mut p1 = topk_ids_ptr;
             let mut p2 = gate_out;
             let mut p3 = n_experts as i32;
             let mut p4 = topk as i32;
-            let kernel = if scoring_func == 1 { self.kernels.sigmoid_topk } else { self.kernels.softmax_topk };
-            let smem = (n_experts * 4 + topk * 8 + if scoring_func == 0 { 32 * 4 } else { 0 }) as u32;
-            unsafe {
-                launch(kernel,
-                    (m as u32, 1, 1), (t, 1, 1), smem, self.stream,
-                    &mut [
-                        &mut p0 as *mut _ as *mut std::ffi::c_void,
-                        &mut p1 as *mut _ as *mut std::ffi::c_void,
-                        &mut p2 as *mut _ as *mut std::ffi::c_void,
-                        &mut p3 as *mut _ as *mut std::ffi::c_void,
-                        &mut p4 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
+            if scoring_func == 1 {
+                // Sigmoid routing: pass e_score_correction_bias and norm_topk_prob
+                let mut p5 = e_score_corr_ptr;  // 0 = NULL
+                let mut p6 = if norm_topk { 1i32 } else { 0i32 };
+                // smem: scores[E] + sel_scores[E] + top_vals[topk] + top_idxs[topk]
+                let smem = (n_experts * 8 + topk * 8) as u32;
+                unsafe {
+                    launch(self.kernels.sigmoid_topk,
+                        (m as u32, 1, 1), (t, 1, 1), smem, self.stream,
+                        &mut [
+                            &mut p0 as *mut _ as *mut std::ffi::c_void,
+                            &mut p1 as *mut _ as *mut std::ffi::c_void,
+                            &mut p2 as *mut _ as *mut std::ffi::c_void,
+                            &mut p3 as *mut _ as *mut std::ffi::c_void,
+                            &mut p4 as *mut _ as *mut std::ffi::c_void,
+                            &mut p5 as *mut _ as *mut std::ffi::c_void,
+                            &mut p6 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+            } else {
+                // Softmax routing
+                let smem = (n_experts * 4 + topk * 8 + 32 * 4) as u32;
+                unsafe {
+                    launch(self.kernels.softmax_topk,
+                        (m as u32, 1, 1), (t, 1, 1), smem, self.stream,
+                        &mut [
+                            &mut p0 as *mut _ as *mut std::ffi::c_void,
+                            &mut p1 as *mut _ as *mut std::ffi::c_void,
+                            &mut p2 as *mut _ as *mut std::ffi::c_void,
+                            &mut p3 as *mut _ as *mut std::ffi::c_void,
+                            &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
             }
         }
 
@@ -5842,24 +5901,45 @@ impl PrefillEngine {
         let topk_weights_ptr = *self.scratch.d_topk_weights.device_ptr();
         {
             let t = std::cmp::max(32, ((std::cmp::min(1024, n_experts) + 31) / 32) * 32) as u32;
+            let e_score_corr_ptr = self.layer_weights[layer_idx].moe_e_score_corr_ptr;
+            let norm_topk = self.layer_weights[layer_idx].moe_norm_topk_prob;
             let mut p0 = topk_weights_ptr;
             let mut p1 = topk_ids_ptr;
             let mut p2 = gate_out;
             let mut p3 = n_experts as i32;
             let mut p4 = topk as i32;
-            let kernel = if scoring_func == 1 { self.kernels.sigmoid_topk } else { self.kernels.softmax_topk };
-            let smem = (n_experts * 4 + topk * 8 + if scoring_func == 0 { 32 * 4 } else { 0 }) as u32;
-            unsafe {
-                launch(kernel,
-                    (m as u32, 1, 1), (t, 1, 1), smem, self.stream,
-                    &mut [
-                        &mut p0 as *mut _ as *mut std::ffi::c_void,
-                        &mut p1 as *mut _ as *mut std::ffi::c_void,
-                        &mut p2 as *mut _ as *mut std::ffi::c_void,
-                        &mut p3 as *mut _ as *mut std::ffi::c_void,
-                        &mut p4 as *mut _ as *mut std::ffi::c_void,
-                    ],
-                )?;
+            if scoring_func == 1 {
+                let mut p5 = e_score_corr_ptr;
+                let mut p6 = if norm_topk { 1i32 } else { 0i32 };
+                let smem = (n_experts * 8 + topk * 8) as u32;
+                unsafe {
+                    launch(self.kernels.sigmoid_topk,
+                        (m as u32, 1, 1), (t, 1, 1), smem, self.stream,
+                        &mut [
+                            &mut p0 as *mut _ as *mut std::ffi::c_void,
+                            &mut p1 as *mut _ as *mut std::ffi::c_void,
+                            &mut p2 as *mut _ as *mut std::ffi::c_void,
+                            &mut p3 as *mut _ as *mut std::ffi::c_void,
+                            &mut p4 as *mut _ as *mut std::ffi::c_void,
+                            &mut p5 as *mut _ as *mut std::ffi::c_void,
+                            &mut p6 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+            } else {
+                let smem = (n_experts * 4 + topk * 8 + 32 * 4) as u32;
+                unsafe {
+                    launch(self.kernels.softmax_topk,
+                        (m as u32, 1, 1), (t, 1, 1), smem, self.stream,
+                        &mut [
+                            &mut p0 as *mut _ as *mut std::ffi::c_void,
+                            &mut p1 as *mut _ as *mut std::ffi::c_void,
+                            &mut p2 as *mut _ as *mut std::ffi::c_void,
+                            &mut p3 as *mut _ as *mut std::ffi::c_void,
+                            &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
             }
         }
 
@@ -7089,24 +7169,45 @@ impl PrefillEngine {
             // Top-K routing
             {
                 let t = std::cmp::max(32, ((std::cmp::min(1024, n_experts) + 31) / 32) * 32) as u32;
+                let e_score_corr_ptr = self.layer_weights[layer_idx].moe_e_score_corr_ptr;
+                let norm_topk = self.layer_weights[layer_idx].moe_norm_topk_prob;
                 let mut p0 = topk_weights_ptr;
                 let mut p1 = topk_ids_ptr;
                 let mut p2 = gate_out;
                 let mut p3 = n_experts as i32;
                 let mut p4 = topk as i32;
-                let kernel = if scoring_func == 1 { self.kernels.sigmoid_topk } else { self.kernels.softmax_topk };
-                let smem = (n_experts * 4 + topk * 8 + if scoring_func == 0 { 32 * 4 } else { 0 }) as u32;
-                unsafe {
-                    launch(kernel,
-                        (total_m as u32, 1, 1), (t, 1, 1), smem, self.stream,
-                        &mut [
-                            &mut p0 as *mut _ as *mut std::ffi::c_void,
-                            &mut p1 as *mut _ as *mut std::ffi::c_void,
-                            &mut p2 as *mut _ as *mut std::ffi::c_void,
-                            &mut p3 as *mut _ as *mut std::ffi::c_void,
-                            &mut p4 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
+                if scoring_func == 1 {
+                    let mut p5 = e_score_corr_ptr;
+                    let mut p6 = if norm_topk { 1i32 } else { 0i32 };
+                    let smem = (n_experts * 8 + topk * 8) as u32;
+                    unsafe {
+                        launch(self.kernels.sigmoid_topk,
+                            (total_m as u32, 1, 1), (t, 1, 1), smem, self.stream,
+                            &mut [
+                                &mut p0 as *mut _ as *mut std::ffi::c_void,
+                                &mut p1 as *mut _ as *mut std::ffi::c_void,
+                                &mut p2 as *mut _ as *mut std::ffi::c_void,
+                                &mut p3 as *mut _ as *mut std::ffi::c_void,
+                                &mut p4 as *mut _ as *mut std::ffi::c_void,
+                                &mut p5 as *mut _ as *mut std::ffi::c_void,
+                                &mut p6 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
+                } else {
+                    let smem = (n_experts * 4 + topk * 8 + 32 * 4) as u32;
+                    unsafe {
+                        launch(self.kernels.softmax_topk,
+                            (total_m as u32, 1, 1), (t, 1, 1), smem, self.stream,
+                            &mut [
+                                &mut p0 as *mut _ as *mut std::ffi::c_void,
+                                &mut p1 as *mut _ as *mut std::ffi::c_void,
+                                &mut p2 as *mut _ as *mut std::ffi::c_void,
+                                &mut p3 as *mut _ as *mut std::ffi::c_void,
+                                &mut p4 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
                 }
             }
 
@@ -7870,6 +7971,7 @@ impl PrefillKernels {
             "prefill_kernels",
             &[
                 "rmsnorm_batched_kernel",
+                "rmsnorm_per_head_kernel",
                 "fused_add_rmsnorm_batched_kernel",
                 "embedding_batched_kernel",
                 "rope_batched_kernel",
@@ -7984,6 +8086,7 @@ impl PrefillKernels {
 
         Ok(PrefillKernels {
             rmsnorm: get("rmsnorm_batched_kernel")?,
+            rmsnorm_per_head: get("rmsnorm_per_head_kernel")?,
             fused_add_rmsnorm: get("fused_add_rmsnorm_batched_kernel")?,
             embedding: get("embedding_batched_kernel")?,
             rope: get("rope_batched_kernel")?,
@@ -9451,16 +9554,20 @@ mod kernel_tests {
         unsafe {
             let threads = std::cmp::min(256, e) as u32;
             let threads = ((threads + 31) / 32) * 32;
-            let smem = (e * 4 + topk * 4 + topk * 4) as u32;
+            let smem = (e * 8 + topk * 8) as u32;
             let mut tw_ptr = *d_tw.device_ptr() as u64;
             let mut ti_ptr = *d_ti.device_ptr() as u64;
             let mut gate_ptr = *d_gate.device_ptr() as u64;
+            let mut corr_ptr = 0u64;  // NULL
+            let mut norm_topk = 0i32;
             let mut params: Vec<*mut std::ffi::c_void> = vec![
                 &mut tw_ptr as *mut _ as *mut _,
                 &mut ti_ptr as *mut _ as *mut _,
                 &mut gate_ptr as *mut _ as *mut _,
                 &mut e_i32 as *mut _ as *mut _,
                 &mut topk_i32 as *mut _ as *mut _,
+                &mut corr_ptr as *mut _ as *mut _,
+                &mut norm_topk as *mut _ as *mut _,
             ];
             launch(kernel, (m as u32, 1, 1), (threads, 1, 1), smem, ctx.stream(), &mut params).unwrap();
         }

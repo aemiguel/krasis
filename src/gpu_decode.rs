@@ -1257,6 +1257,7 @@ enum GpuAttnConfig {
         sm_scale: f32,
         q_norm_ptr: u64,   // 0 if no QK norm
         k_norm_ptr: u64,
+        qk_norm_per_head: bool,  // true: weights are [num_heads*head_dim] (per-layer), false: [head_dim] (shared)
         gated: bool,
     },
     MLA {
@@ -5057,7 +5058,7 @@ impl GpuDecodeStore {
                 attn: GpuAttnConfig::GQA {
                     q_proj: 0, k_proj: 0, v_proj: 0, o_proj: 0, fused_qkv: None,
                     num_heads: 0, num_kv_heads: 0, head_dim: 0, sm_scale: 0.0,
-                    q_norm_ptr: 0, k_norm_ptr: 0, gated: false,
+                    q_norm_ptr: 0, k_norm_ptr: 0, qk_norm_per_head: false, gated: false,
                 },
                 mlp: GpuMlpConfig::None,
             });
@@ -5116,7 +5117,7 @@ impl GpuDecodeStore {
                         q_proj_wid, k_proj_wid, v_proj_wid, o_proj_wid,
                         fused_qkv_wid,
                         num_heads, num_kv_heads, head_dim, sm_scale,
-                        q_norm_ptr=0, k_norm_ptr=0, gated=false))]
+                        q_norm_ptr=0, k_norm_ptr=0, qk_norm_per_head=false, gated=false))]
     #[allow(clippy::too_many_arguments)]
     fn register_gqa_layer(
         &mut self,
@@ -5126,7 +5127,7 @@ impl GpuDecodeStore {
         q_proj_wid: usize, k_proj_wid: usize, v_proj_wid: usize, o_proj_wid: usize,
         fused_qkv_wid: Option<usize>,
         num_heads: usize, num_kv_heads: usize, head_dim: usize, sm_scale: f32,
-        q_norm_ptr: usize, k_norm_ptr: usize, gated: bool,
+        q_norm_ptr: usize, k_norm_ptr: usize, qk_norm_per_head: bool, gated: bool,
     ) -> PyResult<()> {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
@@ -5139,7 +5140,7 @@ impl GpuDecodeStore {
                 attn: GpuAttnConfig::GQA {
                     q_proj: 0, k_proj: 0, v_proj: 0, o_proj: 0, fused_qkv: None,
                     num_heads: 0, num_kv_heads: 0, head_dim: 0, sm_scale: 0.0,
-                    q_norm_ptr: 0, k_norm_ptr: 0, gated: false,
+                    q_norm_ptr: 0, k_norm_ptr: 0, qk_norm_per_head: false, gated: false,
                 },
                 mlp: GpuMlpConfig::None,
             });
@@ -5160,10 +5161,11 @@ impl GpuDecodeStore {
             sm_scale,
             q_norm_ptr: q_norm_ptr as u64,
             k_norm_ptr: k_norm_ptr as u64,
+            qk_norm_per_head,
             gated,
         };
-        log::info!("GpuDecodeStore: registered GQA layer {} (heads={}, kv_heads={}, hd={}), total_layers={}",
-            layer_idx, num_heads, num_kv_heads, head_dim, graph.layers.len());
+        log::info!("GpuDecodeStore: registered GQA layer {} (heads={}, kv_heads={}, hd={}, qk_norm_per_head={}), total_layers={}",
+            layer_idx, num_heads, num_kv_heads, head_dim, qk_norm_per_head, graph.layers.len());
         Ok(())
     }
 
@@ -5276,7 +5278,7 @@ impl GpuDecodeStore {
                 attn: GpuAttnConfig::GQA {
                     q_proj: 0, k_proj: 0, v_proj: 0, o_proj: 0, fused_qkv: None,
                     num_heads: 0, num_kv_heads: 0, head_dim: 0, sm_scale: 0.0,
-                    q_norm_ptr: 0, k_norm_ptr: 0, gated: false,
+                    q_norm_ptr: 0, k_norm_ptr: 0, qk_norm_per_head: false, gated: false,
                 },
                 mlp: GpuMlpConfig::None,
             });
@@ -6716,12 +6718,12 @@ impl GpuDecodeStore {
                 la_in_proj_qkvz_bf16: None, la_in_proj_ba_bf16: None, la_out_proj_bf16: None,
                 la_conv_weight_ptr: 0, la_a_log_ptr: 0, la_dt_bias_ptr: 0,
                 la_norm_weight_ptr: 0, la_conv_state_ptr: 0, la_recur_state_ptr: 0,
-                q_norm_ptr: 0, k_norm_ptr: 0,
+                q_norm_ptr: 0, k_norm_ptr: 0, qk_norm_per_head: false,
             };
 
             match &l.attn {
                 GpuAttnConfig::GQA { q_proj, k_proj, v_proj, o_proj, gated,
-                                     q_norm_ptr, k_norm_ptr, .. } => {
+                                     q_norm_ptr, k_norm_ptr, qk_norm_per_head, .. } => {
                     lw.q_proj = extract_marlin(*q_proj);
                     lw.k_proj = extract_marlin(*k_proj);
                     lw.v_proj = extract_marlin(*v_proj);
@@ -6734,6 +6736,7 @@ impl GpuDecodeStore {
                     lw.gqa_gated = *gated;
                     lw.q_norm_ptr = *q_norm_ptr;
                     lw.k_norm_ptr = *k_norm_ptr;
+                    lw.qk_norm_per_head = *qk_norm_per_head;
                 }
                 GpuAttnConfig::Mamba2 { in_proj, out_proj,
                     conv_weight_ptr, a_ptr, d_ptr, dt_bias_ptr, norm_weight_ptr, .. } =>
@@ -6891,11 +6894,16 @@ impl GpuDecodeStore {
 
         // Convert QK norm weights from FP32 (decode format) to BF16 (prefill kernel format).
         // The decode path stores these as FP32 on GPU, but the prefill rmsnorm kernel expects BF16.
+        // For per-layer QK norm, weights are [num_heads * head_dim], not just [head_dim].
         let mut qk_norm_bf16_bufs: Vec<CudaSlice<u16>> = Vec::new();
         for lw in layer_weights.iter_mut() {
-            for norm_ptr in [&mut lw.q_norm_ptr, &mut lw.k_norm_ptr] {
+            let norm_sizes = if lw.qk_norm_per_head {
+                [config.num_q_heads * head_dim, config.num_kv_heads * head_dim]
+            } else {
+                [head_dim, head_dim]
+            };
+            for (norm_ptr, d) in [&mut lw.q_norm_ptr, &mut lw.k_norm_ptr].into_iter().zip(norm_sizes) {
                 if *norm_ptr != 0 {
-                    let d = head_dim;
                     // Download FP32 from GPU
                     let mut h_fp32 = vec![0.0f32; d];
                     unsafe {
@@ -8954,7 +8962,7 @@ impl GpuDecodeStore {
                         q_proj, k_proj, v_proj, o_proj,
                         fused_qkv,
                         num_heads, num_kv_heads, head_dim, sm_scale,
-                        q_norm_ptr, k_norm_ptr, gated,
+                        q_norm_ptr, k_norm_ptr, qk_norm_per_head, gated,
                     } => {
                         let nh = *num_heads; let nkv = *num_kv_heads;
                         let hd = *head_dim; let half_dim = graph.rope_half_dim;
@@ -9024,25 +9032,50 @@ impl GpuDecodeStore {
                             }
                         }
 
-                        // QK norm
+                        // QK norm: two modes
+                        // qk_norm_per_head=true (MiniMax): full-vector norm over [nh*hd], 1 block
+                        // qk_norm_per_head=false: per-head norm over [hd], nh blocks
                         if *q_norm_ptr != 0 {
                             let threads = 256u32;
-                            let cfg = LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
-                            unsafe {
-                                k.per_head_rmsnorm.clone().launch(cfg, (
-                                    *graph.d_gqa_q.device_ptr(), *q_norm_ptr, eps,
-                                    nh as i32, hd as i32, 0i32,
-                                )).map_err(|e| format!("per_head_rmsnorm Q[{}]: {:?}", layer_idx, e))?;
+                            if *qk_norm_per_head {
+                                // Full-vector: 1 block, dim=nh*hd, weight_per_head=1 (use full weight)
+                                let full_dim = nh * hd;
+                                let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                                unsafe {
+                                    k.per_head_rmsnorm.clone().launch(cfg, (
+                                        *graph.d_gqa_q.device_ptr(), *q_norm_ptr, eps,
+                                        1i32, full_dim as i32, 0i32,
+                                    )).map_err(|e| format!("per_head_rmsnorm Q[{}]: {:?}", layer_idx, e))?;
+                                }
+                            } else {
+                                let cfg = LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                                unsafe {
+                                    k.per_head_rmsnorm.clone().launch(cfg, (
+                                        *graph.d_gqa_q.device_ptr(), *q_norm_ptr, eps,
+                                        nh as i32, hd as i32, 0i32,
+                                    )).map_err(|e| format!("per_head_rmsnorm Q[{}]: {:?}", layer_idx, e))?;
+                                }
                             }
                         }
                         if *k_norm_ptr != 0 {
                             let threads = 256u32;
-                            let cfg = LaunchConfig { grid_dim: (nkv as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
-                            unsafe {
-                                k.per_head_rmsnorm.clone().launch(cfg, (
-                                    *graph.d_gqa_k.device_ptr(), *k_norm_ptr, eps,
-                                    nkv as i32, hd as i32, 0i32,
-                                )).map_err(|e| format!("per_head_rmsnorm K[{}]: {:?}", layer_idx, e))?;
+                            if *qk_norm_per_head {
+                                let full_dim = nkv * hd;
+                                let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                                unsafe {
+                                    k.per_head_rmsnorm.clone().launch(cfg, (
+                                        *graph.d_gqa_k.device_ptr(), *k_norm_ptr, eps,
+                                        1i32, full_dim as i32, 0i32,
+                                    )).map_err(|e| format!("per_head_rmsnorm K[{}]: {:?}", layer_idx, e))?;
+                                }
+                            } else {
+                                let cfg = LaunchConfig { grid_dim: (nkv as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                                unsafe {
+                                    k.per_head_rmsnorm.clone().launch(cfg, (
+                                        *graph.d_gqa_k.device_ptr(), *k_norm_ptr, eps,
+                                        nkv as i32, hd as i32, 0i32,
+                                    )).map_err(|e| format!("per_head_rmsnorm K[{}]: {:?}", layer_idx, e))?;
+                                }
                             }
                         }
 
@@ -10646,7 +10679,7 @@ impl GpuDecodeStore {
                     q_proj, k_proj, v_proj, o_proj,
                     fused_qkv,
                     num_heads, num_kv_heads, head_dim, sm_scale,
-                    q_norm_ptr, k_norm_ptr, gated,
+                    q_norm_ptr, k_norm_ptr, qk_norm_per_head, gated,
                 } => {
                     let nh = *num_heads;
                     let nkv = *num_kv_heads;
@@ -10725,41 +10758,46 @@ impl GpuDecodeStore {
                     }
 
                     // ── GQA: QK norm (if enabled) ──
-                    // q_norm/k_norm are [head_dim] shared across all heads (weight_per_head=0)
                     if *q_norm_ptr != 0 {
                         let threads = 256u32;
-                        let cfg = LaunchConfig {
-                            grid_dim: (nh as u32, 1, 1),
-                            block_dim: (threads, 1, 1),
-                            shared_mem_bytes: 0,
-                        };
-                        unsafe {
-                            k.per_head_rmsnorm.clone().launch(cfg, (
-                                *graph.d_gqa_q.device_ptr(),
-                                *q_norm_ptr,
-                                eps,
-                                nh as i32,
-                                hd as i32,
-                                0i32, // weight shared across heads
-                            )).map_err(|e| format!("per_head_rmsnorm Q[{}]: {:?}", layer_idx, e))?;
+                        if *qk_norm_per_head {
+                            let full_dim = nh * hd;
+                            let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                            unsafe {
+                                k.per_head_rmsnorm.clone().launch(cfg, (
+                                    *graph.d_gqa_q.device_ptr(), *q_norm_ptr, eps,
+                                    1i32, full_dim as i32, 0i32,
+                                )).map_err(|e| format!("per_head_rmsnorm Q[{}]: {:?}", layer_idx, e))?;
+                            }
+                        } else {
+                            let cfg = LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                            unsafe {
+                                k.per_head_rmsnorm.clone().launch(cfg, (
+                                    *graph.d_gqa_q.device_ptr(), *q_norm_ptr, eps,
+                                    nh as i32, hd as i32, 0i32,
+                                )).map_err(|e| format!("per_head_rmsnorm Q[{}]: {:?}", layer_idx, e))?;
+                            }
                         }
                     }
                     if *k_norm_ptr != 0 {
                         let threads = 256u32;
-                        let cfg = LaunchConfig {
-                            grid_dim: (nkv as u32, 1, 1),
-                            block_dim: (threads, 1, 1),
-                            shared_mem_bytes: 0,
-                        };
-                        unsafe {
-                            k.per_head_rmsnorm.clone().launch(cfg, (
-                                *graph.d_gqa_k.device_ptr(),
-                                *k_norm_ptr,
-                                eps,
-                                nkv as i32,
-                                hd as i32,
-                                0i32, // weight shared across heads
-                            )).map_err(|e| format!("per_head_rmsnorm K[{}]: {:?}", layer_idx, e))?;
+                        if *qk_norm_per_head {
+                            let full_dim = nkv * hd;
+                            let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                            unsafe {
+                                k.per_head_rmsnorm.clone().launch(cfg, (
+                                    *graph.d_gqa_k.device_ptr(), *k_norm_ptr, eps,
+                                    1i32, full_dim as i32, 0i32,
+                                )).map_err(|e| format!("per_head_rmsnorm K[{}]: {:?}", layer_idx, e))?;
+                            }
+                        } else {
+                            let cfg = LaunchConfig { grid_dim: (nkv as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                            unsafe {
+                                k.per_head_rmsnorm.clone().launch(cfg, (
+                                    *graph.d_gqa_k.device_ptr(), *k_norm_ptr, eps,
+                                    nkv as i32, hd as i32, 0i32,
+                                )).map_err(|e| format!("per_head_rmsnorm K[{}]: {:?}", layer_idx, e))?;
+                            }
                         }
                     }
 
@@ -13069,7 +13107,7 @@ impl GpuDecodeStore {
                     q_proj, k_proj, v_proj, o_proj,
                     fused_qkv,
                     num_heads, num_kv_heads, head_dim, sm_scale,
-                    q_norm_ptr, k_norm_ptr, gated,
+                    q_norm_ptr, k_norm_ptr, qk_norm_per_head, gated,
                 } => {
                     let nh = *num_heads;
                     let nkv = *num_kv_heads;
@@ -13143,15 +13181,29 @@ impl GpuDecodeStore {
                                 let threads = 256u32;
                                 let norm_fn = self.device.get_func(MODULE_NAME, "per_head_rmsnorm")
                                     .ok_or_else(|| "per_head_rmsnorm not found".to_string())?;
-                                unsafe {
-                                    norm_fn.clone().launch(
-                                        LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                        (*graph.d_gqa_q.device_ptr(), qnp, eps, nh as i32, hd as i32, 0i32),
-                                    ).map_err(|e| format!("batch qnorm[{}][{}]: {:?}", layer_idx, t, e))?;
-                                    norm_fn.launch(
-                                        LaunchConfig { grid_dim: (nkv as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                        (*graph.d_gqa_k.device_ptr(), knp, eps, nkv as i32, hd as i32, 0i32),
-                                    ).map_err(|e| format!("batch knorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                if *qk_norm_per_head {
+                                    // Full-vector norm: 1 block, dim=nh*hd
+                                    unsafe {
+                                        norm_fn.clone().launch(
+                                            LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                            (*graph.d_gqa_q.device_ptr(), qnp, eps, 1i32, (nh * hd) as i32, 0i32),
+                                        ).map_err(|e| format!("batch qnorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                        norm_fn.launch(
+                                            LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                            (*graph.d_gqa_k.device_ptr(), knp, eps, 1i32, (nkv * hd) as i32, 0i32),
+                                        ).map_err(|e| format!("batch knorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    }
+                                } else {
+                                    unsafe {
+                                        norm_fn.clone().launch(
+                                            LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                            (*graph.d_gqa_q.device_ptr(), qnp, eps, nh as i32, hd as i32, 0i32),
+                                        ).map_err(|e| format!("batch qnorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                        norm_fn.launch(
+                                            LaunchConfig { grid_dim: (nkv as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                            (*graph.d_gqa_k.device_ptr(), knp, eps, nkv as i32, hd as i32, 0i32),
+                                        ).map_err(|e| format!("batch knorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    }
                                 }
                             }
 
@@ -13324,15 +13376,29 @@ impl GpuDecodeStore {
                                 let threads = 256u32;
                                 let norm_fn = self.device.get_func(MODULE_NAME, "per_head_rmsnorm")
                                     .ok_or_else(|| "per_head_rmsnorm not found".to_string())?;
-                                unsafe {
-                                    norm_fn.clone().launch(
-                                        LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                        (*graph.d_gqa_q.device_ptr(), qnp, eps, nh as i32, hd as i32, 0i32),
-                                    ).map_err(|e| format!("batch qnorm[{}][{}]: {:?}", layer_idx, t, e))?;
-                                    norm_fn.launch(
-                                        LaunchConfig { grid_dim: (nkv as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                        (*graph.d_gqa_k.device_ptr(), knp, eps, nkv as i32, hd as i32, 0i32),
-                                    ).map_err(|e| format!("batch knorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                if *qk_norm_per_head {
+                                    // Full-vector norm: 1 block, dim=nh*hd
+                                    unsafe {
+                                        norm_fn.clone().launch(
+                                            LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                            (*graph.d_gqa_q.device_ptr(), qnp, eps, 1i32, (nh * hd) as i32, 0i32),
+                                        ).map_err(|e| format!("batch qnorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                        norm_fn.launch(
+                                            LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                            (*graph.d_gqa_k.device_ptr(), knp, eps, 1i32, (nkv * hd) as i32, 0i32),
+                                        ).map_err(|e| format!("batch knorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    }
+                                } else {
+                                    unsafe {
+                                        norm_fn.clone().launch(
+                                            LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                            (*graph.d_gqa_q.device_ptr(), qnp, eps, nh as i32, hd as i32, 0i32),
+                                        ).map_err(|e| format!("batch qnorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                        norm_fn.launch(
+                                            LaunchConfig { grid_dim: (nkv as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                            (*graph.d_gqa_k.device_ptr(), knp, eps, nkv as i32, hd as i32, 0i32),
+                                        ).map_err(|e| format!("batch knorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    }
                                 }
                             }
 

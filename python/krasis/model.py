@@ -4464,6 +4464,10 @@ class KrasisModel:
                 _gqa_head_dim = self.cfg.gqa_head_dim or self.cfg.head_dim
                 _gqa_sm_scale = 1.0 / (_gqa_head_dim ** 0.5)
                 _gqa_gated = hasattr(self.cfg, 'gated_attention') and self.cfg.gated_attention
+                # Detect per-layer QK norm (weights are [num_heads*head_dim] not [head_dim])
+                _qk_norm_per_head = False
+                if q_norm_src is not None and q_norm_src.numel() > _gqa_head_dim:
+                    _qk_norm_per_head = True
                 store.register_gqa_layer(
                     layer_idx=layer_idx,
                     input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
@@ -4475,6 +4479,7 @@ class KrasisModel:
                     num_kv_heads=self.cfg.num_key_value_heads,
                     head_dim=_gqa_head_dim, sm_scale=_gqa_sm_scale,
                     q_norm_ptr=q_norm_ptr, k_norm_ptr=k_norm_ptr,
+                    qk_norm_per_head=_qk_norm_per_head,
                     gated=_gqa_gated,
                 )
 

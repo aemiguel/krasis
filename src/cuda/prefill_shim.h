@@ -148,6 +148,8 @@ void krasis_sigmoid_topk(
     int         M,
     int         num_experts,
     int         topk,
+    const void* e_score_corr,   /* float, [E] or NULL */
+    int         norm_topk,      /* 1 = normalize weights */
     krasis_stream_t stream);
 
 /* Softmax routing with top-k selection (same signature as sigmoid variant). */

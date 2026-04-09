@@ -72,6 +72,44 @@ extern "C" __global__ void rmsnorm_batched_kernel(
     }
 }
 
+// Per-head variant: weight is [num_heads, D] and each row cycles through head weights
+extern "C" __global__ void rmsnorm_per_head_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    int D,
+    float eps,
+    int num_heads)
+{
+    int token = blockIdx.x;
+    int head = token % num_heads;
+    const __nv_bfloat16* x_row = x + (int64_t)token * D;
+    __nv_bfloat16* o_row = out + (int64_t)token * D;
+    const __nv_bfloat16* w_row = weight + head * D;
+
+    extern __shared__ float smem[];
+
+    float local_ss = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float v = bf16_to_float(x_row[i]);
+        local_ss += v * v;
+    }
+    smem[threadIdx.x] = local_ss;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    float rms_inv = rsqrtf(smem[0] / (float)D + eps);
+
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float v = bf16_to_float(x_row[i]) * rms_inv;
+        o_row[i] = float_to_bf16(v * bf16_to_float(w_row[i]));
+    }
+}
+
 extern "C" void krasis_rmsnorm_batched(
     void* out, const void* x, const void* weight,
     int M, int D, float eps, void* stream)
@@ -387,7 +425,9 @@ extern "C" __global__ void sigmoid_topk_kernel(
     int* __restrict__ topk_ids,             /* [M, topk] */
     const float* __restrict__ gate,         /* [M, E] FP32 */
     int E,
-    int topk)
+    int topk,
+    const float* __restrict__ e_score_corr, /* [E] or NULL */
+    int norm_topk)
 {
     int token = blockIdx.x;
     const float* g = gate + (int64_t)token * E;
@@ -396,24 +436,27 @@ extern "C" __global__ void sigmoid_topk_kernel(
 
     /* Initialize top-k with -inf */
     extern __shared__ char smem_raw[];
-    float* scores = (float*)smem_raw;    /* [E] */
-    float* top_vals = scores + E;        /* [topk] */
+    float* scores = (float*)smem_raw;        /* [E] - sigmoid scores (for weights) */
+    float* sel_scores = scores + E;          /* [E] - selection scores (with correction) */
+    float* top_vals = sel_scores + E;        /* [topk] */
     int* top_idxs = (int*)(top_vals + topk); /* [topk] */
 
     /* Compute sigmoid scores */
     for (int i = threadIdx.x; i < E; i += blockDim.x) {
-        scores[i] = 1.0f / (1.0f + __expf(-g[i]));
+        float s = 1.0f / (1.0f + __expf(-g[i]));
+        scores[i] = s;
+        sel_scores[i] = e_score_corr ? s + e_score_corr[i] : s;
     }
     __syncthreads();
 
-    /* Single-threaded top-k selection (E is typically small, e.g. 128) */
+    /* Single-threaded top-k selection using sel_scores (with correction bias) */
     if (threadIdx.x == 0) {
         for (int k = 0; k < topk; k++) {
             top_vals[k] = -1e30f;
             top_idxs[k] = -1;
         }
         for (int i = 0; i < E; i++) {
-            float s = scores[i];
+            float s = sel_scores[i];
             /* Find insertion point in sorted top-k */
             if (s > top_vals[topk - 1]) {
                 int pos = topk - 1;
@@ -426,26 +469,40 @@ extern "C" __global__ void sigmoid_topk_kernel(
                 top_idxs[pos] = i;
             }
         }
+        /* Output: use ORIGINAL sigmoid scores (without correction) as weights */
+        float sum = 0.0f;
         for (int k = 0; k < topk; k++) {
-            tw[k] = top_vals[k];
+            float w = scores[top_idxs[k]];
+            tw[k] = w;
+            sum += w;
+        }
+        for (int k = 0; k < topk; k++) {
             ti[k] = top_idxs[k];
+        }
+        /* Normalize weights if norm_topk_prob */
+        if (norm_topk && sum > 0.0f) {
+            for (int k = 0; k < topk; k++) {
+                tw[k] /= sum;
+            }
         }
     }
 }
 
 extern "C" void krasis_sigmoid_topk(
     void* topk_weights, void* topk_ids, const void* gate_logits,
-    int M, int num_experts, int topk, void* stream)
+    int M, int num_experts, int topk, const void* e_score_corr,
+    int norm_topk, void* stream)
 {
     if (M == 0) return;
     int threads = min(256, num_experts);
     threads = ((threads + 31) / 32) * 32;
     if (threads == 0) threads = 32;
-    int smem = num_experts * sizeof(float) + topk * (sizeof(float) + sizeof(int));
+    /* smem: scores[E] + sel_scores[E] + top_vals[topk] + top_idxs[topk] */
+    int smem = 2 * num_experts * sizeof(float) + topk * (sizeof(float) + sizeof(int));
     sigmoid_topk_kernel<<<M, threads, smem, (cudaStream_t)stream>>>(
         (float*)topk_weights, (int*)topk_ids,
         (const float*)gate_logits,
-        num_experts, topk);
+        num_experts, topk, (const float*)e_score_corr, norm_topk);
 }
 
 /* ── Softmax Top-K routing ─────────────────────────────────────────────── */

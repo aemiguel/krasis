@@ -459,6 +459,11 @@ class ModelConfig:
         rope_theta = cfg.get("rope_theta", rope_params.get("rope_theta", 10000.0))
         partial_rotary = cfg.get("partial_rotary_factor",
                                  rope_params.get("partial_rotary_factor", 1.0))
+        # Some models (MiniMax) specify rotary_dim directly instead of partial_rotary_factor
+        if partial_rotary == 1.0 and "rotary_dim" in cfg:
+            head_dim = cfg.get("head_dim", cfg["hidden_size"] // cfg["num_attention_heads"])
+            if head_dim > 0:
+                partial_rotary = cfg["rotary_dim"] / head_dim
 
         return cls(
             model_path=model_path,

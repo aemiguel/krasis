@@ -123,6 +123,7 @@ class WeightLoader:
         """Get or open a safetensors file handle (cached)."""
         if shard_name not in self._handles:
             path = os.path.join(self.model_path, shard_name)
+            logger.info(f"Opening shard: {shard_name}")
             self._handles[shard_name] = safe_open(path, framework="pt", device="cpu")
         return self._handles[shard_name]
 
@@ -137,6 +138,10 @@ class WeightLoader:
 
         FP8 models (e.g. Mistral 4) store weights as float8_e4m3fn with a
         companion weight_scale_inv tensor.  Dequant: bf16 = fp8.to(bf16) * scale_inv.
+
+        MiniMax M2.5 uses block-wise scales: scale_inv is [rows/128, cols/128]
+        for a weight of shape [rows, cols]. Each 128x128 block has its own scale.
+
         Non-FP8 tensors are returned as-is converted to BF16.
         """
         w = self._read_tensor(name)
@@ -150,7 +155,24 @@ class WeightLoader:
                 logger.warning("FP8 tensor %s has no scale_inv — raw conversion only", name)
                 return w.to(torch.bfloat16)
             scale_inv = self._read_tensor(scale_name).float()
-            w = w.to(torch.float32) * scale_inv
+
+            # Check for block-wise scales (MiniMax M2.5 format)
+            if scale_inv.ndim == 2:
+                # Block-wise FP8: scale_inv is [rows/128, cols/128]
+                # Each 128x128 block gets its own scale
+                rows, cols = w.shape
+                block_rows, block_cols = scale_inv.shape
+                # Reshape weight into blocks, apply scale, reshape back
+                w_f32 = w.to(torch.float32)
+                # View as [block_rows, 128, block_cols, 128]
+                w_blocked = w_f32.view(block_rows, 128, block_cols, 128)
+                # scale_inv is [block_rows, block_cols], expand to [block_rows, 1, block_cols, 1]
+                scale_expanded = scale_inv.unsqueeze(1).unsqueeze(3)
+                w_blocked = w_blocked * scale_expanded
+                w = w_blocked.view(rows, cols)
+            else:
+                # Per-tensor scale (standard FP8)
+                w = w.to(torch.float32) * scale_inv
             return w.to(torch.bfloat16)
         return w.to(torch.bfloat16)
 
@@ -357,14 +379,20 @@ class WeightLoader:
     ) -> Dict[str, torch.Tensor]:
         """Load MoE router gate weight and optional biases (BF16).
 
-        Supports both naming conventions:
+        Supports naming conventions:
         - "mlp.gate" (DeepSeek/Kimi/Qwen3)
         - "mlp.router" (GPT OSS)
+        - "block_sparse_moe.gate" (MiniMax)
         """
-        # Detect naming: "gate" vs "router"
+        # Detect naming: "gate" vs "router" vs "block_sparse_moe.gate"
         prefix_gate = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.gate"
         prefix_router = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.router"
-        if f"{prefix_gate}.weight" in self._weight_map:
+        prefix_block = f"{self.cfg.layers_prefix}.layers.{layer_idx}.block_sparse_moe.gate"
+
+        # Check which one exists
+        if f"{prefix_block}.weight" in self._weight_map:
+            prefix = prefix_block
+        elif f"{prefix_gate}.weight" in self._weight_map:
             prefix = prefix_gate
         else:
             prefix = prefix_router
@@ -375,8 +403,14 @@ class WeightLoader:
         bias_name = f"{prefix}.bias"
         if bias_name in self._weight_map:
             result["bias"] = self._load_bf16(bias_name, device)
-        # e_score_correction_bias (Kimi K2.5)
+        # e_score_correction_bias (Kimi K2.5, MiniMax)
+        # MiniMax stores it at block_sparse_moe.e_score_correction_bias (sibling of gate),
+        # others store it under the gate prefix itself
         corr_name = f"{prefix}.e_score_correction_bias"
+        if corr_name not in self._weight_map:
+            # Try parent prefix (MiniMax: block_sparse_moe.e_score_correction_bias)
+            parent = prefix.rsplit(".", 1)[0]  # strip ".gate" or ".router"
+            corr_name = f"{parent}.e_score_correction_bias"
         if corr_name in self._weight_map:
             result["e_score_correction_bias"] = self._load_bf16(corr_name, device)
         return result
