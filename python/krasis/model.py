@@ -598,15 +598,11 @@ class KrasisModel:
         # For standard models: moe_idx = abs_layer - first_k_dense_replace
         # For hybrid (Nemotron): MoE layers are scattered, this provides the mapping.
         self._abs_to_moe_idx: dict = {}
-        if self.cfg.layer_types is not None:
-            moe_seq = 0
-            for i, lt in enumerate(self.cfg.layer_types):
-                if lt == "moe":
-                    self._abs_to_moe_idx[i] = moe_seq
-                    moe_seq += 1
-        else:
-            for i in range(self.cfg.first_k_dense_replace, self.cfg.num_hidden_layers):
-                self._abs_to_moe_idx[i] = i - self.cfg.first_k_dense_replace
+        moe_seq = 0
+        for i in range(self.cfg.num_hidden_layers):
+            if self.cfg.is_moe_layer(i):
+                self._abs_to_moe_idx[i] = moe_seq
+                moe_seq += 1
 
         # Detect shared_expert_gate from weight map (Qwen3-Next)
         self._has_shared_expert_gate = self._detect_shared_expert_gate()
