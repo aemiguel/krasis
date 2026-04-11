@@ -143,13 +143,13 @@ install_capture_deps() {
     [[ -n "$PIP_BIN" ]] || err "KRASIS_DEV_PIP was not set by ./dev"
     ensure_torch
     info "Installing reference-capture and Hugging Face download dependencies"
-    "$PIP_BIN" install -U \
+    "$PIP_BIN" install \
         "huggingface_hub[cli]>=0.30" \
         "accelerate>=1.0" \
-        "transformers>=4.57.1" \
+        "transformers==4.57.1" \
         "safetensors>=0.7.0" \
         "sentencepiece" \
-        "protobuf"
+        "protobuf<7"
 }
 
 resolve_hf_cli() {
@@ -260,7 +260,6 @@ DOWNLOAD_CMD=(
     download
     "$REPO_ID"
     --local-dir "$DEST_DIR"
-    --resume-download
 )
 
 if [[ "$DETACH" -eq 1 ]]; then
