@@ -33,6 +33,144 @@ fn prefill_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Clone, Debug)]
+struct TraceRange {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PrefillTraceConfig {
+    step_range: Option<TraceRange>,
+    layer_range: Option<TraceRange>,
+    components: Option<std::collections::HashSet<String>>,
+    sample_values: usize,
+    max_elems: usize,
+}
+
+impl PrefillTraceConfig {
+    fn from_env() -> Option<Self> {
+        let enabled = std::env::var("KRASIS_TRACE")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        Some(Self {
+            step_range: parse_trace_range(std::env::var("KRASIS_TRACE_STEPS").ok().as_deref()),
+            layer_range: parse_trace_range(std::env::var("KRASIS_TRACE_LAYERS").ok().as_deref()),
+            components: parse_trace_components(std::env::var("KRASIS_TRACE_COMPONENTS").ok().as_deref()),
+            sample_values: std::env::var("KRASIS_TRACE_VALUES")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(4)
+                .max(1),
+            max_elems: std::env::var("KRASIS_TRACE_ELEMS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(64)
+                .max(1),
+        })
+    }
+
+    fn allows_component(&self, component: &str) -> bool {
+        self.components.as_ref().map_or(true, |set| {
+            set.contains("all") || set.contains(component)
+        })
+    }
+
+    fn should_emit(&self, step: usize, layer: Option<usize>, component: &str) -> bool {
+        if !self.allows_component(component) {
+            return false;
+        }
+        if let Some(range) = self.step_range.as_ref() {
+            if step < range.start || step > range.end {
+                return false;
+            }
+        }
+        if let Some(range) = self.layer_range.as_ref() {
+            if let Some(layer_idx) = layer {
+                if layer_idx < range.start || layer_idx > range.end {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn parse_trace_range(raw: Option<&str>) -> Option<TraceRange> {
+    let raw = raw?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    if let Some((start, end)) = raw.split_once('-') {
+        let start = start.trim().parse::<usize>().ok()?;
+        let end = end.trim().parse::<usize>().ok()?;
+        return Some(TraceRange { start, end: end.max(start) });
+    }
+    let value = raw.parse::<usize>().ok()?;
+    Some(TraceRange { start: value, end: value })
+}
+
+fn parse_trace_components(raw: Option<&str>) -> Option<std::collections::HashSet<String>> {
+    let raw = raw?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    let set = raw
+        .split(',')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    if set.is_empty() { None } else { Some(set) }
+}
+
+fn trace_format_sample(values: &[f32]) -> String {
+    values.iter()
+        .map(|v| format!("{:.6}", v))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn trace_emit_prefill_mark(
+    trace: Option<&PrefillTraceConfig>,
+    step: usize,
+    position: usize,
+    token_id: usize,
+    layer: Option<usize>,
+    component: &str,
+    message: &str,
+) {
+    let Some(trace) = trace else { return; };
+    if !trace.should_emit(step, layer, component) {
+        return;
+    }
+    let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    eprintln!(
+        "[KRASIS-TRACE] event=mark step={} pos={} tok={} layer={} component={} {}",
+        step, position, token_id, layer_s, component, message
+    );
+}
+
+fn trace_emit_prefill_global_mark(
+    trace: Option<&PrefillTraceConfig>,
+    component: &str,
+    message: &str,
+) {
+    let Some(trace) = trace else { return; };
+    if !trace.allows_component(component) {
+        return;
+    }
+    eprintln!(
+        "[KRASIS-TRACE] event=mark scope=global component={} {}",
+        component,
+        message,
+    );
+}
+
 const MARLIN_PIPE_STAGES: usize = 4;
 const MARLIN_MIN_THREAD_N: usize = 64;
 const MARLIN_MIN_THREAD_K: usize = 64;
@@ -879,6 +1017,7 @@ pub struct PrefillLogitPosition {
 pub struct PrefillEngine {
     pub device: Arc<CudaDevice>,
     pub kernels: PrefillKernels,
+    pub trace: Option<PrefillTraceConfig>,
     pub config: PrefillModelConfig,
     pub scratch: PrefillScratch,
     pub layer_weights: Vec<PrefillLayerWeights>,
@@ -1083,6 +1222,82 @@ impl PrefillEngine {
         self.safety_margin_mb = margin_mb.max(PREFILL_SAFETY_MARGIN_MB);
     }
 
+    fn refresh_trace_config(&mut self) {
+        self.trace = PrefillTraceConfig::from_env();
+    }
+
+    fn trace_emit_bf16(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer: Option<usize>,
+        component: &str,
+        tensor: &str,
+        ptr: u64,
+        n: usize,
+    ) {
+        let Some(trace) = self.trace.as_ref() else { return; };
+        if !trace.should_emit(step, layer, component) {
+            return;
+        }
+        let _ = self.stream_sync();
+        let count = n.min(trace.max_elems).max(1);
+        let mut raw = vec![0u16; count];
+        unsafe {
+            let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+                raw.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr,
+                count * 2,
+            );
+        }
+        let values = raw
+            .into_iter()
+            .map(|bits| f32::from_bits((bits as u32) << 16))
+            .collect::<Vec<_>>();
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut l2 = 0.0f64;
+        let mut nan = 0usize;
+        let mut inf = 0usize;
+        for &v in &values {
+            if v.is_nan() {
+                nan += 1;
+                continue;
+            }
+            if v.is_infinite() {
+                inf += 1;
+                continue;
+            }
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            let vf = v as f64;
+            sum += vf;
+            l2 += vf * vf;
+        }
+        let finite = count.saturating_sub(nan + inf).max(1);
+        let sample = trace_format_sample(&values[..values.len().min(trace.sample_values)]);
+        let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+        eprintln!(
+            "[KRASIS-TRACE] event=tensor step={} pos={} tok={} layer={} component={} tensor={} dtype=bf16 n={} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6} nan={} inf={}",
+            step,
+            position,
+            token_id,
+            layer_s,
+            component,
+            tensor,
+            count,
+            sample,
+            l2.sqrt(),
+            sum / finite as f64,
+            min_v,
+            max_v,
+            nan,
+            inf,
+        );
+    }
+
     /// Update HCS snapshot from the decode store's current HCS state.
     /// Must be called before each prefill so we know which experts are GPU-resident.
     pub fn update_hcs_snapshot(&mut self, cache_fast: &[[u64; 4]], num_experts_per_layer: usize) {
@@ -1140,6 +1355,19 @@ impl PrefillEngine {
             (evicted, freed_mb, cache_fast.to_vec(), ne)
         };
         self.update_hcs_snapshot(&cache_fast_snapshot, num_experts_per_layer);
+        trace_emit_prefill_global_mark(
+            self.trace.as_ref(),
+            "hcs_prefill",
+            &format!(
+                "phase=chunk_guard chunk_idx={} total_chunks={} chunk_tokens={} evicted={} freed_mb={:.1} hcs_cached={}",
+                chunk_idx,
+                total_chunks,
+                chunk_tokens,
+                evicted,
+                freed_mb,
+                self.hcs_cached_expert_count(),
+            ),
+        );
 
         if evicted > 0 && stderr_debug_enabled() {
             eprintln!(
@@ -1301,6 +1529,12 @@ impl PrefillEngine {
     /// VRAM → compute chunk_size → drop old scratch → allocate new scratch.
     pub fn prepare_for_prefill(&mut self, prompt_tokens: usize) -> Result<(), String> {
         self.bind_cuda_context()?;
+        self.refresh_trace_config();
+        trace_emit_prefill_global_mark(
+            self.trace.as_ref(),
+            "prefill",
+            &format!("phase=prepare_start prompt_tokens={}", prompt_tokens),
+        );
 
         // 1. Synchronize all GPU work (ensures pending cuMemFreeAsync from HCS
         //    soft eviction have completed on cudarc's internal stream).
@@ -1326,6 +1560,15 @@ impl PrefillEngine {
                     eprintln!("[SCRATCH] Pool trim: {:?}, freed {} MB",
                         trim_err, (free_after - free_before) / (1024 * 1024));
                 }
+                trace_emit_prefill_global_mark(
+                    self.trace.as_ref(),
+                    "prefill",
+                    &format!(
+                        "phase=pool_trim status={:?} freed_mb={}",
+                        trim_err,
+                        (free_after.saturating_sub(free_before)) / (1024 * 1024),
+                    ),
+                );
             }
         }
 
@@ -1472,6 +1715,17 @@ impl PrefillEngine {
                     (shared_scratch_elems * std::mem::size_of::<f32>()) as f64 / (1024.0 * 1024.0),
                 );
             }
+            trace_emit_prefill_global_mark(
+                self.trace.as_ref(),
+                "prefill",
+                &format!(
+                    "phase=alloc_attempt attempt={} scratch_tokens={} post_alloc_free_mb={} safety_mb={}",
+                    attempt,
+                    scratch_tokens,
+                    post_alloc_free_bytes / (1024 * 1024),
+                    safety_margin_mb,
+                ),
+            );
             if post_alloc_free_bytes >= safety_bytes || scratch_tokens <= 128 {
                 self.config.prefill_chunk_size = scratch_tokens;
                 break;
@@ -1557,6 +1811,19 @@ impl PrefillEngine {
             );
         }
 
+        trace_emit_prefill_global_mark(
+            self.trace.as_ref(),
+            "prefill",
+            &format!(
+                "phase=prepare_ready scratch_tokens={} scratch_mb={:.1} prompt_tokens={} free_mb={} safety_mb={}",
+                scratch_tokens,
+                scratch_mb,
+                prompt_tokens,
+                post_alloc_free_bytes / (1024 * 1024),
+                safety_margin_mb,
+            ),
+        );
+
         Ok(())
     }
 
@@ -1564,6 +1831,12 @@ impl PrefillEngine {
     /// GpuBuf::drop calls cuMemFree_v2 (synchronous, immediate release).
     pub fn release_scratch(&mut self) -> Result<(), String> {
         self.bind_cuda_context()?;
+        self.refresh_trace_config();
+        trace_emit_prefill_global_mark(
+            self.trace.as_ref(),
+            "prefill",
+            &format!("phase=release_scratch_start scratch_tokens={}", self.scratch.max_tokens),
+        );
         // Synchronize to ensure all prefill GPU work is done before freeing buffers.
         unsafe { cuda_sys::lib().cuCtxSynchronize(); }
         // Replace scratch with zero-capacity (drops old, frees VRAM immediately).
@@ -1596,6 +1869,11 @@ impl PrefillEngine {
                 cuda_sys::lib().cuMemPoolTrimTo(pool, 0);
             }
         }
+        trace_emit_prefill_global_mark(
+            self.trace.as_ref(),
+            "prefill",
+            "phase=release_scratch_complete",
+        );
         Ok(())
     }
 
@@ -1607,6 +1885,7 @@ impl PrefillEngine {
     ) -> Result<PrefillResult, String> {
         // Bind CUDA context to calling thread (needed for cross-thread use)
         self.bind_cuda_context()?;
+        self.refresh_trace_config();
 
         let t0 = Instant::now();
         let total_m = token_ids.len();
@@ -1615,6 +1894,17 @@ impl PrefillEngine {
         if total_m == 0 {
             return Err("Empty token sequence".to_string());
         }
+        trace_emit_prefill_global_mark(
+            self.trace.as_ref(),
+            "prefill",
+            &format!(
+                "phase=run_start prompt_tokens={} chunk_size={} suppress_tokens={} temperature={:.3}",
+                total_m,
+                self.config.prefill_chunk_size,
+                suppress_tokens.len(),
+                temperature,
+            ),
+        );
 
         // Diagnostic mode: compare per-layer norms against BF16 reference
         // Set KRASIS_PREFILL_DIAG=1 to enable.
@@ -1893,7 +2183,20 @@ impl PrefillEngine {
             let chunk_end = std::cmp::min(chunk_start + chunk_size, total_m);
             let m = chunk_end - chunk_start;
             let chunk_tokens = &token_ids[chunk_start..chunk_end];
+            let chunk_tok0 = chunk_tokens.first().copied().unwrap_or(0) as usize;
             let chunk_t0 = if debug_prefill { Some(Instant::now()) } else { None };
+            trace_emit_prefill_mark(
+                self.trace.as_ref(),
+                chunk_idx,
+                chunk_start,
+                chunk_tok0,
+                None,
+                "prefill_chunk",
+                &format!(
+                    "phase=chunk_start chunk_tokens={} chunk_end={} total_chunks={}",
+                    m, chunk_end, num_chunks
+                ),
+            );
 
             if m > self.scratch.max_tokens {
                 return Err(format!("Chunk {} tokens > scratch {}", m, self.scratch.max_tokens));
@@ -1909,6 +2212,18 @@ impl PrefillEngine {
             // 2. Embedding lookup
             self.launch_embedding(m)
                 .map_err(|e| format!("embedding chunk {} m={}: {}", chunk_idx, m, e))?;
+            if self.trace.as_ref().map_or(false, |t| t.should_emit(chunk_idx, None, "prefill_chunk")) {
+                self.trace_emit_bf16(
+                    chunk_idx,
+                    chunk_start,
+                    chunk_tok0,
+                    None,
+                    "prefill_chunk",
+                    "embedding_hidden",
+                    *self.scratch.d_hidden.device_ptr(),
+                    m * h,
+                );
+            }
             if timing {
                 self.stream_sync()?;
                 t_embed_ms += tc0.elapsed().as_secs_f64() * 1000.0;
@@ -1928,6 +2243,16 @@ impl PrefillEngine {
             let mut has_residual = false;
             for layer_idx in 0..num_hidden_layers {
                 let layer_type = self.layer_weights[layer_idx].layer_type;
+                let layer_name = match layer_type { 0 => "gqa", 1 => "mamba2", 2 => "pass", 3 => "la", _ => "unknown" };
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    chunk_idx,
+                    chunk_start,
+                    chunk_tok0,
+                    Some(layer_idx),
+                    "prefill_layer",
+                    &format!("phase=layer_start layer_type={} chunk_tokens={}", layer_name, m),
+                );
 
                 // DIAG: check norm weight values for layer 0
                 if diag && chunk_idx == 0 && layer_idx == 0 {
@@ -1971,6 +2296,18 @@ impl PrefillEngine {
                     ).map_err(|e| format!("fused_add_rmsnorm layer {}: {}", layer_idx, e))?;
                 }
                 if timing { self.stream_sync()?; t_norm_ms += tn0.elapsed().as_secs_f64() * 1000.0; }
+                if self.trace.as_ref().map_or(false, |t| t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")) {
+                    self.trace_emit_bf16(
+                        chunk_idx,
+                        chunk_start,
+                        chunk_tok0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "post_input_norm",
+                        *self.scratch.d_hidden.device_ptr(),
+                        m * h,
+                    );
+                }
 
 
                 // Mixer
@@ -2003,6 +2340,18 @@ impl PrefillEngine {
                     t_attn_ms += attn_elapsed;
                     match layer_type { 0 => t_gqa_ms += attn_elapsed, 3 => t_la_ms += attn_elapsed, _ => {} }
                 }
+                if self.trace.as_ref().map_or(false, |t| t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")) {
+                    self.trace_emit_bf16(
+                        chunk_idx,
+                        chunk_start,
+                        chunk_tok0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "mixer_out",
+                        *self.scratch.d_attn_out.device_ptr(),
+                        m * h,
+                    );
+                }
 
                 if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
                     let lt_name = match layer_type { 0 => "gqa", 1 => "mamba2", 3 => "la", _ => "?" };
@@ -2034,6 +2383,18 @@ impl PrefillEngine {
                     )?;
                 }
                 if timing { self.stream_sync()?; t_norm_ms += tn1.elapsed().as_secs_f64() * 1000.0; }
+                if self.trace.as_ref().map_or(false, |t| t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")) {
+                    self.trace_emit_bf16(
+                        chunk_idx,
+                        chunk_start,
+                        chunk_tok0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "pre_mlp_hidden",
+                        *self.scratch.d_hidden.device_ptr(),
+                        m * h,
+                    );
+                }
 
                 // DIAG: d_hidden before MLP (after post-attn-norm = MoE input)
                 if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
@@ -2062,6 +2423,18 @@ impl PrefillEngine {
                     eprintln!("[DIAG] layer{:02} -> NO MLP (no gate, no shared_w1)", layer_idx);
                 }
                 if timing { self.stream_sync()?; t_moe_ms += tm0.elapsed().as_secs_f64() * 1000.0; }
+                if self.trace.as_ref().map_or(false, |t| t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")) {
+                    self.trace_emit_bf16(
+                        chunk_idx,
+                        chunk_start,
+                        chunk_tok0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "post_mlp_hidden",
+                        *self.scratch.d_hidden.device_ptr(),
+                        m * h,
+                    );
+                }
 
                 if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
                     self.diag_print_norms(
@@ -2080,6 +2453,15 @@ impl PrefillEngine {
                     eprintln!("[DIAG] L{:02} {} moe={} residual_lastpos={:.4}",
                         layer_idx, lt_name, has_moe, last_pos_norm);
                 }
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    chunk_idx,
+                    chunk_start,
+                    chunk_tok0,
+                    Some(layer_idx),
+                    "prefill_layer",
+                    &format!("phase=layer_end layer_type={}", layer_name),
+                );
 
             }
             if let Some(chunk_t0) = chunk_t0 {
@@ -2094,6 +2476,15 @@ impl PrefillEngine {
                     m as f64 / (chunk_ms / 1000.0),
                 );
             }
+            trace_emit_prefill_mark(
+                self.trace.as_ref(),
+                chunk_idx,
+                chunk_start,
+                chunk_tok0,
+                None,
+                "prefill_chunk",
+                &format!("phase=chunk_end chunk_tokens={}", m),
+            );
         }
 
         // Use last chunk's m for final processing
@@ -2106,6 +2497,18 @@ impl PrefillEngine {
             self.final_norm_ptr,
             m, h,
         )?;
+        if self.trace.as_ref().map_or(false, |t| t.should_emit(num_chunks.saturating_sub(1), None, "prefill")) {
+            self.trace_emit_bf16(
+                num_chunks.saturating_sub(1),
+                total_m.saturating_sub(m),
+                token_ids.last().copied().unwrap_or(0) as usize,
+                None,
+                "prefill",
+                "final_hidden",
+                *self.scratch.d_hidden.device_ptr(),
+                m * h,
+            );
+        }
 
         if diag {
             let final_norm = self.diag_l2_norm(*self.scratch.d_hidden.device_ptr(), m - 1, h, h);
@@ -2132,6 +2535,16 @@ impl PrefillEngine {
 
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         log::info!("Rust prefill: {} tok in {:.1}ms ({:.0} tok/s)", total_m, ms, total_m as f64 / (ms / 1000.0));
+        trace_emit_prefill_global_mark(
+            self.trace.as_ref(),
+            "prefill",
+            &format!(
+                "phase=run_complete prompt_tokens={} first_token={} prefill_ms={:.1}",
+                total_m,
+                first_token,
+                ms,
+            ),
+        );
 
         if timing {
             let total = t_embed_ms + t_norm_ms + t_attn_ms + t_moe_ms + t_other_ms;
@@ -2803,6 +3216,9 @@ impl PrefillEngine {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
         let gt = self.gqa_timing_enabled.get();
+        let trace_step = if self.config.prefill_chunk_size > 0 { start_pos / self.config.prefill_chunk_size } else { 0 };
+        let mut attn_path = "custom_tiled";
+        let mut kv_append_path = "none";
 
         let hidden = *self.scratch.d_hidden.device_ptr();
         let q = *self.scratch.d_q.device_ptr();
@@ -2897,6 +3313,7 @@ impl PrefillEngine {
         let mut kv_cache_already_stored = false; // Set true by FP8 cross-chunk path
         if let Some(fa2_fwd) = self.kernels.flash_attn_fwd {
             if start_pos == 0 {
+                attn_path = "fa2_bf16";
                 // FA2 varlen forward: Q/K/V are [total_q, heads, head_dim] contiguous BF16.
                 // For single-sequence prefill: batch=1, cu_seqlens_q=[0,m], cu_seqlens_k=[0,m].
                 let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
@@ -2951,6 +3368,7 @@ impl PrefillEngine {
                 && layer_idx < self.kv_k_radius_ptrs.len()
                 && self.kv_k_radius_ptrs[layer_idx] != 0
             {
+                attn_path = "fa2_polar4_cross_chunk";
                 // Cross-chunk attention: reconstruct cached Polar4 K/V to BF16,
                 // concat current BF16 chunk, then run standard BF16 FA2.
                 let kv_stride = cfg.num_kv_heads * cfg.head_dim;
@@ -3058,6 +3476,7 @@ impl PrefillEngine {
                     self.gqa_bf16_calls.set(self.gqa_bf16_calls.get() + 1);
                 }
             } else if layer_k_ptr != 0 && layer_v_ptr != 0 {
+                attn_path = "fa2_cross_chunk";
                 // Cross-chunk attention: Q attends to all K/V (cached FP8 + current BF16)
                 let kv_stride = cfg.num_kv_heads * cfg.head_dim;
                 let total_kv = start_pos + m;
@@ -3069,6 +3488,7 @@ impl PrefillEngine {
                 let use_fp8_fa2 = self.kernels.flash_attn_fwd_fp8kv.is_some()
                     && cfg.head_dim <= 128;
                 if let (true, Some(fa2_fp8)) = (use_fp8_fa2, self.kernels.flash_attn_fwd_fp8kv) {
+                    attn_path = "fa2_fp8_cross_chunk";
                     // FP8 FA2 path: store current K/V to FP8 cache FIRST, then
                     // FA2 reads directly from cache (all FP8). No temp buffer needed.
                     let gt_kv_store = Instant::now();
@@ -3149,7 +3569,9 @@ impl PrefillEngine {
                         self.gqa_fp8_calls.set(self.gqa_fp8_calls.get() + 1);
                     }
                     kv_cache_already_stored = true;
+                    kv_append_path = "fp8_pre_attn";
                 } else {
+                    attn_path = "fa2_bf16_cross_chunk";
                     // Fallback: dequant FP8 cache + concat current BF16 K/V, then FA2 BF16
                     let kv_buf_bytes = (total_kv * kv_stride * 2) as u64; // BF16
                     let scratch_bytes =
@@ -3247,6 +3669,7 @@ impl PrefillEngine {
                 }
             } else {
                 // Cross-chunk but no KV cache pointers: fallback to custom tiled kernel
+                attn_path = "custom_tiled_cross_chunk";
                 self.launch_custom_tiled_attn(
                     attn_out, q, k, v, layer_k_ptr, layer_v_ptr,
                     m, start_pos, cfg,
@@ -3254,6 +3677,7 @@ impl PrefillEngine {
             }
         } else {
             // No FA2 available: use custom tiled kernel
+            attn_path = if start_pos == 0 { "custom_tiled" } else { "custom_tiled_cross_chunk" };
             self.launch_custom_tiled_attn(
                 attn_out, q, k, v, layer_k_ptr, layer_v_ptr,
                 m, start_pos, cfg,
@@ -3265,6 +3689,7 @@ impl PrefillEngine {
         if capture_kv_cache && self.kv_format == 2 && layer_idx < self.kv_k_radius_ptrs.len()
             && self.kv_k_radius_ptrs[layer_idx] != 0
         {
+            kv_append_path = "polar4_append";
             // Polar4: BF16 K,V -> 4-bit rotated polar format
             let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
             let num_blocks = (kv_stride / 16) as u32;
@@ -3293,6 +3718,7 @@ impl PrefillEngine {
                 )?;
             }
         } else if capture_kv_cache && layer_k_ptr != 0 && layer_v_ptr != 0 && !kv_cache_already_stored {
+            kv_append_path = "fp8_append";
             // FP8 E4M3: standard path
             let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
             let kt = std::cmp::max(32, ((std::cmp::min(256, kv_stride as usize) + 31) / 32) * 32) as u32;
@@ -3344,6 +3770,37 @@ impl PrefillEngine {
         self.la_gemm(attn_out, &lw.o_proj, &lw.o_proj_bf16, o_temp, m)?;
         self.memcpy_d2d(attn_out, o_temp, (m * cfg.hidden_size * 2) as u64)?;
         if gt { self.stream_sync()?; self.t_gqa_oproj.set(self.t_gqa_oproj.get() + gt_oproj.elapsed().as_secs_f64() * 1000.0); }
+        trace_emit_prefill_mark(
+            self.trace.as_ref(),
+            trace_step,
+            start_pos,
+            0,
+            Some(layer_idx),
+            "kv_cache",
+            &format!(
+                "phase=gqa_chunk_end m={} start_pos={} attn_path={} kv_append_path={} capture_kv_cache={} kv_format={} cache_ptrs={} cache_prestored={}",
+                m,
+                start_pos,
+                attn_path,
+                kv_append_path,
+                capture_kv_cache,
+                self.kv_format,
+                layer_k_ptr != 0 && layer_v_ptr != 0,
+                kv_cache_already_stored,
+            ),
+        );
+        if self.trace.as_ref().map_or(false, |t| t.should_emit(trace_step, Some(layer_idx), "gqa_prefill")) {
+            self.trace_emit_bf16(
+                trace_step,
+                start_pos,
+                0,
+                Some(layer_idx),
+                "gqa_prefill",
+                "attn_out",
+                attn_out,
+                m * cfg.hidden_size,
+            );
+        }
 
         Ok(())
     }
@@ -4897,6 +5354,11 @@ impl PrefillEngine {
         //    (zero copy), cold experts are H2D'd to a small staging buffer.
         let use_ptr_table = self.d_expert_w1_ptrs.is_some() && self.d_cold_staging.is_some();
         let cold_staging_base = self.d_cold_staging.as_ref().map_or(0, |s| *s.device_ptr());
+        let trace_step = if self.config.prefill_chunk_size > 0 { 0 } else { 0 };
+        let mut trace_hcs_count = 0usize;
+        let mut trace_pinned_count = 0usize;
+        let mut trace_cold_count = 0usize;
+        let mut trace_active_count = active_experts;
 
         // Also keep fused buffer pointers for the B parameter (needed as base reference
         // for the kernel's B_ptr arithmetic even in pointer table mode)
@@ -5062,6 +5524,10 @@ impl PrefillEngine {
                     }
                 }
             }
+            trace_hcs_count = hcs_count;
+            trace_pinned_count = pinned_count;
+            trace_cold_count = cold_count;
+            trace_active_count = active.len();
 
             // Upload pointer tables to GPU using SYNCHRONOUS copy.
             // cudarc pool allocations can be corrupted by HCS raw cuMemAlloc_v2 allocations,
@@ -5129,6 +5595,27 @@ impl PrefillEngine {
             }
         }
 
+        trace_emit_prefill_mark(
+            self.trace.as_ref(),
+            trace_step,
+            0,
+            0,
+            Some(layer_idx),
+            "moe_prefill",
+            &format!(
+                "phase=route_ready active_experts={} total_sorted={} use_ptr_table={} hcs_hits={} pinned_hits={} cold_experts={} max_cold_experts={} has_shared={} preloaded_layer={:?}",
+                trace_active_count,
+                total_sorted,
+                use_ptr_table,
+                trace_hcs_count,
+                trace_pinned_count,
+                trace_cold_count,
+                self.max_cold_experts,
+                has_shared,
+                self.preloaded_moe_layer,
+            ),
+        );
+
         // Wait for DMA/pointer table upload to complete (stream dependency)
         unsafe {
             cuda_sys::lib().cuStreamWaitEvent(self.stream, self.dma_event, 0);
@@ -5149,6 +5636,24 @@ impl PrefillEngine {
                 self.preload_next_moe_layer(layer_idx, num_layers)?;
             }
         }
+
+        trace_emit_prefill_mark(
+            self.trace.as_ref(),
+            trace_step,
+            0,
+            0,
+            Some(layer_idx),
+            "moe_prefill",
+            &format!(
+                "phase=dma_ready active_experts={} total_sorted={} use_ptr_table={} hcs_hits={} pinned_hits={} cold_experts={}",
+                trace_active_count,
+                total_sorted,
+                use_ptr_table,
+                trace_hcs_count,
+                trace_pinned_count,
+                trace_cold_count,
+            ),
+        );
 
         // Verify DMA: check first 16 bytes of fused buffer are non-zero
         if diag_moe && layer_idx == 0 {

@@ -13,6 +13,7 @@
 //! into the CUDA module at init time.
 
 use pyo3::prelude::*;
+use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -21,16 +22,396 @@ use cudarc::cublas::result as cublas_result;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig};
 use cudarc::driver::sys as cuda_sys;
 
-fn stderr_debug_enabled() -> bool {
-    std::env::var("KRASIS_DEBUG_STDERR")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+#[derive(Clone, Copy)]
+struct TraceRange {
+    start: usize,
+    end: usize,
 }
 
-fn prefill_debug_enabled() -> bool {
-    std::env::var("KRASIS_PREFILL_DEBUG")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+impl TraceRange {
+    fn contains(&self, value: usize) -> bool {
+        value >= self.start && value <= self.end
+    }
+}
+
+#[derive(Clone)]
+struct DecodeTraceConfig {
+    steps: Option<TraceRange>,
+    layers: Option<TraceRange>,
+    components: Option<HashSet<String>>,
+    sample_values: usize,
+    max_elems: usize,
+    dump_dir: Option<String>,
+}
+
+impl DecodeTraceConfig {
+    fn from_env() -> Option<Self> {
+        let enabled = std::env::var("KRASIS_TRACE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+
+        let components = std::env::var("KRASIS_TRACE_COMPONENTS")
+            .ok()
+            .and_then(|raw| {
+                let set: HashSet<String> = raw
+                    .split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if set.is_empty() { None } else { Some(set) }
+            });
+
+        Some(Self {
+            steps: parse_trace_range(std::env::var("KRASIS_TRACE_STEPS").ok().as_deref()),
+            layers: parse_trace_range(std::env::var("KRASIS_TRACE_LAYERS").ok().as_deref()),
+            components,
+            sample_values: std::env::var("KRASIS_TRACE_VALUES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(8),
+            max_elems: std::env::var("KRASIS_TRACE_ELEMS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(2048),
+            dump_dir: std::env::var("KRASIS_TRACE_DUMP_DIR").ok().filter(|s| !s.trim().is_empty()),
+        })
+    }
+
+    fn allows_step(&self, step: usize) -> bool {
+        self.steps.map(|r| r.contains(step)).unwrap_or(true)
+    }
+
+    fn allows_layer(&self, layer: usize) -> bool {
+        self.layers.map(|r| r.contains(layer)).unwrap_or(true)
+    }
+
+    fn allows_component(&self, component: &str) -> bool {
+        let Some(filters) = self.components.as_ref() else {
+            return true;
+        };
+        let component = component.to_ascii_lowercase();
+        if filters.contains("all") || filters.contains(&component) {
+            return true;
+        }
+        if let Some((prefix, _)) = component.split_once('_') {
+            return filters.contains(prefix);
+        }
+        false
+    }
+
+    fn should_emit(&self, step: usize, layer: Option<usize>, component: &str) -> bool {
+        self.allows_step(step)
+            && layer.map(|v| self.allows_layer(v)).unwrap_or(true)
+            && self.allows_component(component)
+    }
+
+    fn explicitly_enables(&self, component: &str) -> bool {
+        self.components
+            .as_ref()
+            .map(|filters| filters.contains(&component.to_ascii_lowercase()))
+            .unwrap_or(false)
+    }
+}
+
+fn parse_trace_range(raw: Option<&str>) -> Option<TraceRange> {
+    let raw = raw?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    if let Some((start, end)) = raw.split_once('-') {
+        let start = start.trim().parse::<usize>().ok()?;
+        let end = end.trim().parse::<usize>().ok()?;
+        return Some(TraceRange { start, end: end.max(start) });
+    }
+    let value = raw.parse::<usize>().ok()?;
+    Some(TraceRange { start: value, end: value })
+}
+
+fn trace_format_sample(values: &[f32]) -> String {
+    values.iter()
+        .map(|v| format!("{:.6}", v))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn trace_emit_mark(
+    trace: Option<&DecodeTraceConfig>,
+    step: usize,
+    position: usize,
+    token_id: usize,
+    layer: Option<usize>,
+    component: &str,
+    message: &str,
+) {
+    let Some(trace) = trace else { return; };
+    if !trace.should_emit(step, layer, component) {
+        return;
+    }
+    let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    eprintln!(
+        "[KRASIS-TRACE] event=mark step={} pos={} tok={} layer={} component={} {}",
+        step, position, token_id, layer_s, component, message
+    );
+}
+
+fn trace_emit_global_mark(
+    trace: Option<&DecodeTraceConfig>,
+    component: &str,
+    message: &str,
+) {
+    let Some(trace) = trace else { return; };
+    if !trace.allows_component(component) {
+        return;
+    }
+    eprintln!(
+        "[KRASIS-TRACE] event=mark scope=global component={} {}",
+        component,
+        message,
+    );
+}
+
+fn trace_emit_f32(
+    trace: Option<&DecodeTraceConfig>,
+    step: usize,
+    position: usize,
+    token_id: usize,
+    layer: Option<usize>,
+    component: &str,
+    tensor: &str,
+    ptr: u64,
+    n: usize,
+    device: &Arc<CudaDevice>,
+) {
+    let Some(trace) = trace else { return; };
+    if !trace.should_emit(step, layer, component) {
+        return;
+    }
+    let _ = device.synchronize();
+    let count = n.min(trace.max_elems).max(1);
+    let mut buf = vec![0.0f32; count];
+    unsafe {
+        let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            ptr,
+            count * 4,
+        );
+    }
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    let mut l2 = 0.0f64;
+    let mut nan = 0usize;
+    let mut inf = 0usize;
+    for &v in &buf {
+        if v.is_nan() {
+            nan += 1;
+            continue;
+        }
+        if v.is_infinite() {
+            inf += 1;
+            continue;
+        }
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+        let vf = v as f64;
+        sum += vf;
+        l2 += vf * vf;
+    }
+    let finite = count.saturating_sub(nan + inf).max(1);
+    let sample = trace_format_sample(&buf[..buf.len().min(trace.sample_values)]);
+    let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    eprintln!(
+        "[KRASIS-TRACE] event=tensor step={} pos={} tok={} layer={} component={} tensor={} dtype=f32 n={} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6} nan={} inf={}",
+        step,
+        position,
+        token_id,
+        layer_s,
+        component,
+        tensor,
+        count,
+        sample,
+        l2.sqrt(),
+        sum / finite as f64,
+        min_v,
+        max_v,
+        nan,
+        inf,
+    );
+}
+
+fn trace_emit_values(
+    trace: Option<&DecodeTraceConfig>,
+    step: usize,
+    position: usize,
+    token_id: usize,
+    layer: Option<usize>,
+    component: &str,
+    label: &str,
+    values: &[f32],
+) {
+    let Some(trace) = trace else { return; };
+    if !trace.should_emit(step, layer, component) {
+        return;
+    }
+    let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    let sample = trace_format_sample(&values[..values.len().min(trace.sample_values)]);
+    eprintln!(
+        "[KRASIS-TRACE] event=values step={} pos={} tok={} layer={} component={} label={} n={} sample=[{}]",
+        step,
+        position,
+        token_id,
+        layer_s,
+        component,
+        label,
+        values.len(),
+        sample,
+    );
+}
+
+fn trace_emit_global_values(
+    trace: Option<&DecodeTraceConfig>,
+    component: &str,
+    label: &str,
+    values: &[f32],
+) {
+    let Some(trace) = trace else { return; };
+    if !trace.allows_component(component) {
+        return;
+    }
+    let sample = trace_format_sample(&values[..values.len().min(trace.sample_values)]);
+    eprintln!(
+        "[KRASIS-TRACE] event=values scope=global component={} label={} n={} sample=[{}]",
+        component,
+        label,
+        values.len(),
+        sample,
+    );
+}
+
+fn trace_emit_logits(
+    trace: Option<&DecodeTraceConfig>,
+    step: usize,
+    position: usize,
+    token_id: usize,
+    topk: &[String],
+) {
+    let Some(trace) = trace else { return; };
+    if !trace.should_emit(step, None, "logits") {
+        return;
+    }
+    eprintln!(
+        "[KRASIS-TRACE] event=logits step={} pos={} tok={} topk=[{}]",
+        step,
+        position,
+        token_id,
+        topk.join(", "),
+    );
+}
+
+fn trace_emit_route(
+    trace: Option<&DecodeTraceConfig>,
+    step: usize,
+    layer: usize,
+    topk: usize,
+    ids: &[i32],
+    weights: &[f32],
+    norm_topk_prob: bool,
+    scoring_func: u8,
+    num_experts: usize,
+) {
+    let Some(trace) = trace else { return; };
+    if !trace.should_emit(step, Some(layer), "moe_route") {
+        return;
+    }
+    let wt_sum: f32 = weights.iter().sum();
+    eprintln!(
+        "[KRASIS-TRACE] event=route step={} layer={} component=moe_route topk={} ids={:?} weights=[{}] sum={:.6} norm_topk_prob={} scoring_func={} num_experts={}",
+        step,
+        layer,
+        topk,
+        ids,
+        weights.iter().map(|w| format!("{:.6}", w)).collect::<Vec<_>>().join(","),
+        wt_sum,
+        norm_topk_prob,
+        scoring_func,
+        num_experts,
+    );
+}
+
+fn trace_emit_bf16(
+    trace: Option<&DecodeTraceConfig>,
+    step: usize,
+    position: usize,
+    token_id: usize,
+    layer: Option<usize>,
+    component: &str,
+    tensor: &str,
+    ptr: u64,
+    n: usize,
+    device: &Arc<CudaDevice>,
+) {
+    let Some(trace) = trace else { return; };
+    if !trace.should_emit(step, layer, component) {
+        return;
+    }
+    let _ = device.synchronize();
+    let count = n.min(trace.max_elems).max(1);
+    let mut raw = vec![0u16; count];
+    unsafe {
+        let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+            raw.as_mut_ptr() as *mut std::ffi::c_void,
+            ptr,
+            count * 2,
+        );
+    }
+    let mut values = Vec::with_capacity(count);
+    for bits in raw {
+        values.push(f32::from_bits((bits as u32) << 16));
+    }
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    let mut l2 = 0.0f64;
+    let mut nan = 0usize;
+    let mut inf = 0usize;
+    for &v in &values {
+        if v.is_nan() {
+            nan += 1;
+            continue;
+        }
+        if v.is_infinite() {
+            inf += 1;
+            continue;
+        }
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+        let vf = v as f64;
+        sum += vf;
+        l2 += vf * vf;
+    }
+    let finite = count.saturating_sub(nan + inf).max(1);
+    let sample = trace_format_sample(&values[..values.len().min(trace.sample_values)]);
+    let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    eprintln!(
+        "[KRASIS-TRACE] event=tensor step={} pos={} tok={} layer={} component={} tensor={} dtype=bf16 n={} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6} nan={} inf={}",
+        step,
+        position,
+        token_id,
+        layer_s,
+        component,
+        tensor,
+        count,
+        sample,
+        l2.sqrt(),
+        sum / finite as f64,
+        min_v,
+        max_v,
+        nan,
+        inf,
+    );
 }
 
 // PTX compiled from src/cuda/decode_kernels.cu at build time.
@@ -876,7 +1257,7 @@ impl HcsState {
 
     /// Log HCS state after reload: total experts loaded, cache_fast vs counters,
     /// and check for duplicates (same expert in both hard and soft, or duplicated within soft).
-    fn log_hcs_post_reload(&self) {
+    fn log_hcs_post_reload(&self, trace: Option<&DecodeTraceConfig>) {
         let nep = self.num_experts_per_layer;
         if nep == 0 { return; }
 
@@ -918,36 +1299,48 @@ impl HcsState {
         let total_possible = num_layers * nep;
         let pct = if total_possible > 0 { cf_nonzero as f64 / total_possible as f64 * 100.0 } else { 0.0 };
 
-        if stderr_debug_enabled() {
-            eprintln!("  \x1b[35mHCS post-reload: cache_fast={} ({:.1}%), hashmap={}, num_cached={}, soft_num_cached={}, dupes={}, soft_dupes={}\x1b[0m",
-                cf_nonzero, pct, hm_count, self.num_cached, self.soft_num_cached, duplicates, soft_dupes);
-        }
+        trace_emit_global_mark(
+            trace,
+            "hcs",
+            &format!(
+                "phase=post_reload cache_fast={} cache_fast_pct={:.1} hashmap={} num_cached={} soft_num_cached={} dupes={} soft_dupes={}",
+                cf_nonzero, pct, hm_count, self.num_cached, self.soft_num_cached, duplicates, soft_dupes
+            ),
+        );
         log::info!("HCS post-reload: cache_fast={} ({:.1}%), hashmap={}, num_cached={}, soft_num_cached={}, dupes={}, soft_dupes={}",
             cf_nonzero, pct, hm_count, self.num_cached, self.soft_num_cached, duplicates, soft_dupes);
 
         // Warn if counters are inconsistent
         if cf_nonzero != hm_count {
-            if stderr_debug_enabled() {
-                eprintln!("  \x1b[31mHCS WARNING: cache_fast count ({}) != hashmap count ({})\x1b[0m", cf_nonzero, hm_count);
-            }
+            trace_emit_global_mark(
+                trace,
+                "hcs",
+                &format!("phase=post_reload_warning kind=cache_vs_hashmap cache_fast={} hashmap={}", cf_nonzero, hm_count),
+            );
             log::warn!("HCS post-reload: cache_fast count ({}) != hashmap count ({})", cf_nonzero, hm_count);
         }
         if cf_nonzero != self.num_cached {
-            if stderr_debug_enabled() {
-                eprintln!("  \x1b[31mHCS WARNING: cache_fast count ({}) != num_cached counter ({})\x1b[0m", cf_nonzero, self.num_cached);
-            }
+            trace_emit_global_mark(
+                trace,
+                "hcs",
+                &format!("phase=post_reload_warning kind=cache_vs_counter cache_fast={} num_cached={}", cf_nonzero, self.num_cached),
+            );
             log::warn!("HCS post-reload: cache_fast count ({}) != num_cached counter ({})", cf_nonzero, self.num_cached);
         }
         if duplicates > 0 {
-            if stderr_debug_enabled() {
-                eprintln!("  \x1b[31mHCS WARNING: {} duplicate entries in cache_fast!\x1b[0m", duplicates);
-            }
+            trace_emit_global_mark(
+                trace,
+                "hcs",
+                &format!("phase=post_reload_warning kind=cache_duplicates count={}", duplicates),
+            );
             log::warn!("HCS post-reload: {} duplicate entries in cache_fast!", duplicates);
         }
         if soft_dupes > 0 {
-            if stderr_debug_enabled() {
-                eprintln!("  \x1b[31mHCS WARNING: {} duplicate entries in soft_slot_to_expert!\x1b[0m", soft_dupes);
-            }
+            trace_emit_global_mark(
+                trace,
+                "hcs",
+                &format!("phase=post_reload_warning kind=soft_duplicates count={}", soft_dupes),
+            );
             log::warn!("HCS post-reload: {} duplicate entries in soft_slot_to_expert!", soft_dupes);
         }
     }
@@ -1506,6 +1899,9 @@ struct GpuDecodeGraph {
     // Indexed by MoE layer index. None = no shared expert or not yet pinned.
     shared_expert_vram: Vec<Option<HcsCacheEntry>>,
 
+    // Optional request-scoped debug trace. Unset in normal operation.
+    decode_trace: Option<DecodeTraceConfig>,
+
     // Adaptive Prefetch Layer state
     apfl: Option<ApflState>,
 
@@ -1700,6 +2096,7 @@ struct GpuDecodeGraph {
 
     // Timing
     timing_enabled: bool,
+    decode_step_counter: usize,
     timing_step_count: u64,
     t_total: f64,
     t_norm: f64,
@@ -2018,6 +2415,25 @@ pub struct GpuDecodeStore {
     /// Stored when the prefill engine is created so it's available for eviction checks
     /// even after the engine is taken by the RustServer.
     prefill_scratch_info: Option<(usize, usize)>,
+    /// Store-scoped trace config for setup/prefill/HCS work outside active decode requests.
+    trace_config: Option<DecodeTraceConfig>,
+}
+
+impl GpuDecodeStore {
+    fn refresh_trace_config(&mut self) {
+        self.trace_config = DecodeTraceConfig::from_env();
+    }
+
+    fn active_trace(&self) -> Option<&DecodeTraceConfig> {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.decode_trace.as_ref())
+            .or(self.trace_config.as_ref())
+    }
+
+    fn active_trace_owned(&self) -> Option<DecodeTraceConfig> {
+        self.active_trace().cloned()
+    }
 }
 
 #[pymethods]
@@ -2275,6 +2691,7 @@ impl GpuDecodeStore {
             debug_layer_captures: Vec::new(),
             prefill_engine_slot: None,
             prefill_scratch_info: None,
+            trace_config: DecodeTraceConfig::from_env(),
         })
     }
 
@@ -2319,7 +2736,8 @@ impl GpuDecodeStore {
         temperature: f32,
     ) -> PyResult<(usize, usize, bool)> {
         let prompt_len = token_ids.len();
-        let prefill_debug = prefill_debug_enabled();
+        self.refresh_trace_config();
+        let trace_cfg = self.active_trace_owned();
         let (cache_fast_snapshot, ne) = {
             let (cache_fast, ne) = self.export_hcs_snapshot();
             (cache_fast.to_vec(), ne)
@@ -2351,15 +2769,17 @@ impl GpuDecodeStore {
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
                 }
             };
-            if prefill_debug {
-                eprintln!(
-                    "[PREFILL-DEBUG] bridge prompt_tokens={} prefill_ms={:.1} chunk_size={} scratch_tokens={}",
+            trace_emit_global_mark(
+                trace_cfg.as_ref(),
+                "prefill",
+                &format!(
+                    "phase=rust_prefill_bridge prompt_tokens={} prefill_ms={:.1} chunk_size={} scratch_tokens={}",
                     prompt_len,
                     prefill_result.prefill_time_ms,
                     engine.config.prefill_chunk_size,
                     engine.scratch.max_tokens,
-                );
-            }
+                ),
+            );
 
             if let Err(e) = engine.release_scratch() {
                 log::error!("rust_prefill_tokens: failed to release scratch: {}", e);
@@ -2398,7 +2818,6 @@ impl GpuDecodeStore {
         let intermediate = if max_intermediate_size > 0 { max_intermediate_size } else { hidden_size * 4 };
         let moe_inter = if moe_intermediate_size > 0 { moe_intermediate_size } else { intermediate };
         let qkv_size = if max_qkv_size > 0 { max_qkv_size } else { hidden_size * 3 };
-
         let d_hidden = self.device.alloc_zeros::<u16>(hidden_size)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
         let d_residual = self.device.alloc_zeros::<u16>(hidden_size)
@@ -2550,6 +2969,7 @@ impl GpuDecodeStore {
             final_norm_size: 0,
             moe_layers: Vec::new(),
             shared_expert_vram: Vec::new(),
+            decode_trace: None,
             apfl: None,
             hcs: None,
             d_hidden,
@@ -2649,6 +3069,7 @@ impl GpuDecodeStore {
             d_gqa_gate_buf: None,
             gqa_max_smem_bytes: self.gqa_max_smem_bytes,
             timing_enabled: false,
+            decode_step_counter: 0,
             timing_step_count: 0,
             t_total: 0.0,
             t_norm: 0.0,
@@ -6362,10 +6783,15 @@ impl GpuDecodeStore {
             }
             total_bytes += entry.simple_packed_host.len() + entry.simple_scales_host.len();
         }
-        if stderr_debug_enabled() {
-            eprintln!("[krasis] Swapped to simple INT4 for decode ({:.1} MB DMA, {} weights)",
-                total_bytes as f64 / 1024.0 / 1024.0, self.single_slot_swaps.len());
-        }
+        trace_emit_global_mark(
+            self.active_trace(),
+            "weights",
+            &format!(
+                "phase=swap_to_simple_int4 dma_mb={:.1} weights={}",
+                total_bytes as f64 / 1024.0 / 1024.0,
+                self.single_slot_swaps.len(),
+            ),
+        );
         Ok(())
     }
 
@@ -6396,10 +6822,15 @@ impl GpuDecodeStore {
             }
             total_bytes += entry.marlin_packed_host.len() + entry.marlin_scales_host.len();
         }
-        if stderr_debug_enabled() {
-            eprintln!("[krasis] Swapped to Marlin for prefill ({:.1} MB DMA, {} weights)",
-                total_bytes as f64 / 1024.0 / 1024.0, self.single_slot_swaps.len());
-        }
+        trace_emit_global_mark(
+            self.active_trace(),
+            "weights",
+            &format!(
+                "phase=swap_to_marlin dma_mb={:.1} weights={}",
+                total_bytes as f64 / 1024.0 / 1024.0,
+                self.single_slot_swaps.len(),
+            ),
+        );
         Ok(())
     }
 
@@ -6660,9 +7091,11 @@ impl GpuDecodeStore {
         // Before each prefill, prepare_for_prefill() reallocates to the actual prompt size.
         // After each prefill, release_scratch() shrinks back and frees VRAM for decode HCS.
         config.prefill_chunk_size = 0; // Set dynamically per prompt
-        if stderr_debug_enabled() {
-            eprintln!("[PREFILL] Dynamic scratch allocation enabled (per-prompt sizing)");
-        }
+        trace_emit_global_mark(
+            self.active_trace(),
+            "prefill",
+            "phase=scratch_config mode=dynamic_per_prompt",
+        );
 
         // Build per-layer weights
         let mut layer_weights = Vec::with_capacity(num_layers);
@@ -6774,11 +7207,22 @@ impl GpuDecodeStore {
             }
 
             // MoE config
-            if i < 3 && stderr_debug_enabled() {
-                eprintln!("[PREFILL-INIT] layer {} mlp={}, moe_layers.len()={}, moe_layers[{}]={:?}",
-                    i, match &l.mlp { GpuMlpConfig::MoE{..} => "MoE", GpuMlpConfig::Dense{..} => "Dense", GpuMlpConfig::None => "None" },
-                    graph.moe_layers.len(), i,
-                    graph.moe_layers.get(i).map(|x| x.is_some()));
+            if i < 3 {
+                trace_emit_global_mark(
+                    self.active_trace(),
+                    "prefill",
+                    &format!(
+                        "phase=layer_init layer={} mlp={} moe_layers_len={} moe_present={}",
+                        i,
+                        match &l.mlp {
+                            GpuMlpConfig::MoE { .. } => "MoE",
+                            GpuMlpConfig::Dense { .. } => "Dense",
+                            GpuMlpConfig::None => "None",
+                        },
+                        graph.moe_layers.len(),
+                        graph.moe_layers.get(i).map(|x| x.is_some()).unwrap_or(false),
+                    ),
+                );
             }
             match &l.mlp {
                 GpuMlpConfig::MoE { gate_weight, gate_bias_ptr, e_score_corr_ptr,
@@ -6882,9 +7326,19 @@ impl GpuDecodeStore {
                 }
             }
 
-            if i < 3 && stderr_debug_enabled() {
-                eprintln!("[PREFILL-INIT] layer {} -> moe_gate_ptr={:#x}, shared_w1={}, shared_w2={}, moe_layer_idx={:?}",
-                    i, lw.moe_gate_ptr, lw.shared_w1.is_some(), lw.shared_w2.is_some(), lw.moe_layer_idx);
+            if i < 3 {
+                trace_emit_global_mark(
+                    self.active_trace(),
+                    "prefill",
+                    &format!(
+                        "phase=layer_init_resolved layer={} moe_gate_ptr=0x{:x} shared_w1={} shared_w2={} moe_layer_idx={:?}",
+                        i,
+                        lw.moe_gate_ptr,
+                        lw.shared_w1.is_some(),
+                        lw.shared_w2.is_some(),
+                        lw.moe_layer_idx,
+                    ),
+                );
             }
             layer_weights.push(lw);
         }
@@ -6985,9 +7439,11 @@ impl GpuDecodeStore {
         // synchronous and deterministic — no pool interaction with HCS.
         let scratch = allocate_scratch(&self.device, &config, 0)?;
         config.prefill_chunk_size = 0;
-        if stderr_debug_enabled() {
-            eprintln!("[PREFILL] Dynamic scratch: allocated minimal at init (sized per-prompt)");
-        }
+        trace_emit_global_mark(
+            self.active_trace(),
+            "prefill",
+            "phase=scratch_init mode=minimal_dynamic",
+        );
 
         // Create CUDA events for double-buffer synchronization
         let dma_event = unsafe {
@@ -7114,6 +7570,7 @@ impl GpuDecodeStore {
         Ok(PrefillEngine {
             device: self.device.clone(),
             kernels,
+            trace: None,
             config,
             scratch,
             layer_weights,
@@ -7950,6 +8407,7 @@ impl GpuDecodeStore {
     /// graphable kernels and dummy expert buffer for cold expert handling.
     /// Must be called after configure() and HCS pool init.
     fn init_cuda_graph_buffers(&mut self) -> Result<(), String> {
+        let trace_cfg = self.active_trace_owned();
         let graph = self.graph.as_mut()
             .ok_or_else(|| "Call configure first".to_string())?;
 
@@ -8026,10 +8484,15 @@ impl GpuDecodeStore {
         }
         graph.d_cublas_workspace = Some(d_workspace);
 
-        if stderr_debug_enabled() {
-            eprintln!("[krasis] CUDA graph infrastructure initialized (has_dummy={}, workspace=32KB)",
-                graph.d_dummy_expert.is_some());
-        }
+        trace_emit_global_mark(
+            trace_cfg.as_ref(),
+            "graph",
+            &format!(
+                "phase=init has_dummy={} workspace_bytes={}",
+                graph.d_dummy_expert.is_some(),
+                workspace_bytes,
+            ),
+        );
         Ok(())
     }
 
@@ -8047,6 +8510,7 @@ impl GpuDecodeStore {
     /// Verify that all LA and KV pointers baked into captured CUDA graphs are still valid.
     /// Returns true if graphs can be safely reused, false if recapture is needed.
     fn verify_graph_pointers(&self) -> bool {
+        let trace_cfg = self.active_trace_owned();
         let graph = match self.graph.as_ref() {
             Some(g) => g,
             None => return false,
@@ -8058,27 +8522,25 @@ impl GpuDecodeStore {
         // Check LA state pointers
         for &(li, captured_conv, captured_recur) in &graph.captured_la_ptrs {
             if li >= graph.layers.len() {
-                if stderr_debug_enabled() {
-                    eprintln!("[krasis] graph-reuse: LA layer {} out of range", li);
-                }
+                trace_emit_global_mark(trace_cfg.as_ref(), "graph", &format!("phase=pointer_verify kind=la result=out_of_range layer={}", li));
                 return false;
             }
             match &graph.layers[li].attn {
                 GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
                     if *conv_state_ptr != captured_conv || *recur_state_ptr != captured_recur {
-                        if stderr_debug_enabled() {
-                            eprintln!("[krasis] graph-reuse: LA layer {} ptrs changed! \
-                                conv: 0x{:x}→0x{:x}, recur: 0x{:x}→0x{:x}",
-                                li, captured_conv, *conv_state_ptr,
-                                captured_recur, *recur_state_ptr);
-                        }
+                        trace_emit_global_mark(
+                            trace_cfg.as_ref(),
+                            "graph",
+                            &format!(
+                                "phase=pointer_verify kind=la result=changed layer={} conv_prev=0x{:x} conv_now=0x{:x} recur_prev=0x{:x} recur_now=0x{:x}",
+                                li, captured_conv, *conv_state_ptr, captured_recur, *recur_state_ptr
+                            ),
+                        );
                         return false;
                     }
                 }
                 _ => {
-                    if stderr_debug_enabled() {
-                        eprintln!("[krasis] graph-reuse: layer {} no longer LA", li);
-                    }
+                    trace_emit_global_mark(trace_cfg.as_ref(), "graph", &format!("phase=pointer_verify kind=la result=type_changed layer={}", li));
                     return false;
                 }
             }
@@ -8087,18 +8549,18 @@ impl GpuDecodeStore {
         // Check KV cache pointers
         for &(li, captured_k, captured_v) in &graph.captured_kv_ptrs {
             if li >= graph.kv_k_ptrs.len() {
-                if stderr_debug_enabled() {
-                    eprintln!("[krasis] graph-reuse: KV layer {} out of range", li);
-                }
+                trace_emit_global_mark(trace_cfg.as_ref(), "graph", &format!("phase=pointer_verify kind=kv result=out_of_range layer={}", li));
                 return false;
             }
             if graph.kv_k_ptrs[li] != captured_k || graph.kv_v_ptrs[li] != captured_v {
-                if stderr_debug_enabled() {
-                    eprintln!("[krasis] graph-reuse: KV layer {} ptrs changed! \
-                        k: 0x{:x}→0x{:x}, v: 0x{:x}→0x{:x}",
-                        li, captured_k, graph.kv_k_ptrs[li],
-                        captured_v, graph.kv_v_ptrs[li]);
-                }
+                trace_emit_global_mark(
+                    trace_cfg.as_ref(),
+                    "graph",
+                    &format!(
+                        "phase=pointer_verify kind=kv result=changed layer={} k_prev=0x{:x} k_now=0x{:x} v_prev=0x{:x} v_now=0x{:x}",
+                        li, captured_k, graph.kv_k_ptrs[li], captured_v, graph.kv_v_ptrs[li]
+                    ),
+                );
                 return false;
             }
         }
@@ -8106,27 +8568,25 @@ impl GpuDecodeStore {
         // Check MLA cache pointers
         for &(li, captured_ckv, captured_kpe) in &graph.captured_mla_ptrs {
             if li >= graph.layers.len() {
-                if stderr_debug_enabled() {
-                    eprintln!("[krasis] graph-reuse: MLA layer {} out of range", li);
-                }
+                trace_emit_global_mark(trace_cfg.as_ref(), "graph", &format!("phase=pointer_verify kind=mla result=out_of_range layer={}", li));
                 return false;
             }
             match &graph.layers[li].attn {
                 GpuAttnConfig::MLA { ckv_cache_ptr, kpe_cache_ptr, .. } => {
                     if *ckv_cache_ptr != captured_ckv || *kpe_cache_ptr != captured_kpe {
-                        if stderr_debug_enabled() {
-                            eprintln!("[krasis] graph-reuse: MLA layer {} ptrs changed! \
-                                ckv: 0x{:x}→0x{:x}, kpe: 0x{:x}→0x{:x}",
-                                li, captured_ckv, *ckv_cache_ptr,
-                                captured_kpe, *kpe_cache_ptr);
-                        }
+                        trace_emit_global_mark(
+                            trace_cfg.as_ref(),
+                            "graph",
+                            &format!(
+                                "phase=pointer_verify kind=mla result=changed layer={} ckv_prev=0x{:x} ckv_now=0x{:x} kpe_prev=0x{:x} kpe_now=0x{:x}",
+                                li, captured_ckv, *ckv_cache_ptr, captured_kpe, *kpe_cache_ptr
+                            ),
+                        );
                         return false;
                     }
                 }
                 _ => {
-                    if stderr_debug_enabled() {
-                        eprintln!("[krasis] graph-reuse: layer {} no longer MLA", li);
-                    }
+                    trace_emit_global_mark(trace_cfg.as_ref(), "graph", &format!("phase=pointer_verify kind=mla result=type_changed layer={}", li));
                     return false;
                 }
             }
@@ -8135,9 +8595,7 @@ impl GpuDecodeStore {
         // Check Polar4 KV cache pointers
         for &(li, cap_kr, cap_vr, cap_ka, cap_va) in &graph.captured_polar4_ptrs {
             if li >= graph.kv_k_radius_ptrs.len() {
-                if stderr_debug_enabled() {
-                    eprintln!("[krasis] graph-reuse: Polar4 layer {} out of range", li);
-                }
+                trace_emit_global_mark(trace_cfg.as_ref(), "graph", &format!("phase=pointer_verify kind=polar4 result=out_of_range layer={}", li));
                 return false;
             }
             if graph.kv_k_radius_ptrs[li] != cap_kr
@@ -8145,9 +8603,7 @@ impl GpuDecodeStore {
                 || graph.kv_k_angles_ptrs[li] != cap_ka
                 || graph.kv_v_angles_ptrs[li] != cap_va
             {
-                if stderr_debug_enabled() {
-                    eprintln!("[krasis] graph-reuse: Polar4 layer {} ptrs changed!", li);
-                }
+                trace_emit_global_mark(trace_cfg.as_ref(), "graph", &format!("phase=pointer_verify kind=polar4 result=changed layer={}", li));
                 return false;
             }
         }
@@ -8181,6 +8637,7 @@ impl GpuDecodeStore {
         do_final: bool,
         gqa_cache_offset: usize,
     ) -> Result<(), String> {
+        let trace_cfg = self.active_trace_owned();
         let mut graph = self.graph.take()
             .ok_or_else(|| "Call configure first".to_string())?;
 
@@ -8217,10 +8674,14 @@ impl GpuDecodeStore {
         let num_moe = moe_indices.len();
         let num_graphs = num_moe + 1; // routing(0) + (num_moe-1) combined + final
 
-        if stderr_debug_enabled() {
-            eprintln!("[krasis] Capturing {} per-layer graphs ({} MoE layers, range {}-{}, emb={}, final={})",
-                num_graphs, num_moe, range_start, range_end, do_embedding, do_final);
-        }
+        trace_emit_global_mark(
+            trace_cfg.as_ref(),
+            "graph",
+            &format!(
+                "phase=capture_begin graphs={} moe_layers={} range_start={} range_end={} embedding={} final={}",
+                num_graphs, num_moe, range_start, range_end, do_embedding, do_final
+            ),
+        );
 
         // Create capture stream
         let mut capture_stream: cuda_sys::CUstream = std::ptr::null_mut();
@@ -8368,9 +8829,11 @@ impl GpuDecodeStore {
             match end_capture_and_instantiate(capture_stream, &label) {
                 Ok(exec) => {
                     captured_graphs.push(exec);
-                    if stderr_debug_enabled() {
-                        eprintln!("[krasis] Captured graph {} ({})", graph_idx, label);
-                    }
+                    trace_emit_global_mark(
+                        trace_cfg.as_ref(),
+                        "graph",
+                        &format!("phase=capture_graph graph_idx={} label={}", graph_idx, label),
+                    );
                 }
                 Err(e) => {
                     capture_err = Some(e);
@@ -8438,16 +8901,24 @@ impl GpuDecodeStore {
                 }
             }
         }
-        if stderr_debug_enabled() {
-            eprintln!("[krasis] Pointer snapshot: {} LA ptrs, {} KV ptrs, {} MLA ptrs, {} Polar4 ptrs",
-                graph.captured_la_ptrs.len(), graph.captured_kv_ptrs.len(),
-                graph.captured_mla_ptrs.len(), graph.captured_polar4_ptrs.len());
-        }
+        trace_emit_global_mark(
+            trace_cfg.as_ref(),
+            "graph",
+            &format!(
+                "phase=pointer_snapshot la={} kv={} mla={} polar4={}",
+                graph.captured_la_ptrs.len(),
+                graph.captured_kv_ptrs.len(),
+                graph.captured_mla_ptrs.len(),
+                graph.captured_polar4_ptrs.len(),
+            ),
+        );
 
         self.graph = Some(graph);
-        if stderr_debug_enabled() {
-            eprintln!("[krasis] Per-layer graphs captured: {} graphs", num_graphs);
-        }
+        trace_emit_global_mark(
+            trace_cfg.as_ref(),
+            "graph",
+            &format!("phase=capture_complete graphs={}", num_graphs),
+        );
         Ok(())
     }
 
@@ -10199,12 +10670,22 @@ impl GpuDecodeStore {
             if let Some(t) = t_launch_start {
                 graph.t_graph_launch += t.elapsed().as_secs_f64();
             }
-            // DEBUG: sync after each graph to pinpoint crashes
-            if std::env::var("KRASIS_GRAPH_DEBUG").is_ok() {
+            // Optional crash narrowing under trace: require explicit graph_sync so
+            // normal tracing does not serialize every graph replay.
+            if graph.decode_trace.as_ref().map(|t| t.explicitly_enables("graph_sync")).unwrap_or(false) {
                 let sync_err = unsafe { cuda_sys::lib().cuStreamSynchronize(replay_stream) };
                 if sync_err != cuda_sys::CUresult::CUDA_SUCCESS {
                     return Err(format!("graph[{}] post-launch sync: {:?}", graph_idx, sync_err));
                 }
+                trace_emit_mark(
+                    graph.decode_trace.as_ref(),
+                    graph.decode_step_counter.saturating_sub(1),
+                    position,
+                    token_id,
+                    None,
+                    "graph_sync",
+                    &format!("phase=post_launch_sync graph_idx={} status=ok", graph_idx),
+                );
             }
         }
 
@@ -10314,43 +10795,45 @@ impl GpuDecodeStore {
             log::info!("DBG {} [{:.4}, {:.4}, {:.4}, {:.4}]", label, buf[0], buf[1], buf[2], buf[3]);
         };
 
-        // Decode NaN diagnostic: check d_hidden for NaN after each component
-        let decode_nan_diag = std::env::var("KRASIS_DECODE_DIAG").map(|v| v == "1").unwrap_or(false);
-        let check_nan_bf16 = |label: &str, ptr: u64, n: usize, device: &std::sync::Arc<cudarc::driver::CudaDevice>| {
-            if !decode_nan_diag { return; }
-            let _ = device.synchronize();
-            let mut buf = vec![0u16; n.min(64)];
-            let dl = buf.len();
-            unsafe {
-                let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
-                    buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    ptr, dl * 2);
-            }
-            let has_nan = buf.iter().any(|&b| {
-                let bits = (b as u32) << 16;
-                f32::from_bits(bits).is_nan()
-            });
-            if has_nan {
-                let vals: Vec<f32> = buf[..4.min(dl)].iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-                eprintln!("[DECODE-NaN] {} NaN detected! first4=[{:.4},{:.4},{:.4},{:.4}]",
-                    label, vals[0], vals[1], vals[2], vals[3]);
-            }
+        let decode_step_counter = graph.decode_step_counter;
+        graph.decode_step_counter += 1;
+        let trace = graph.decode_trace.clone();
+        trace_emit_mark(
+            trace.as_ref(),
+            decode_step_counter,
+            position,
+            token_id,
+            None,
+            "step",
+            "phase=begin",
+        );
+        let trace_bf16 = |component: &str, layer: Option<usize>, tensor: &str, ptr: u64, n: usize| {
+            trace_emit_bf16(
+                trace.as_ref(),
+                decode_step_counter,
+                position,
+                token_id,
+                layer,
+                component,
+                tensor,
+                ptr,
+                n,
+                &self.device,
+            );
         };
-        let check_nan_f32 = |label: &str, ptr: u64, n: usize, device: &std::sync::Arc<cudarc::driver::CudaDevice>| {
-            if !decode_nan_diag { return; }
-            let _ = device.synchronize();
-            let mut buf = vec![0.0f32; n.min(64)];
-            let dl = buf.len();
-            unsafe {
-                let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
-                    buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    ptr, dl * 4);
-            }
-            let has_nan = buf.iter().any(|f| f.is_nan());
-            if has_nan {
-                eprintln!("[DECODE-NaN] {} NaN detected! first4=[{:.4},{:.4},{:.4},{:.4}]",
-                    label, buf[0], buf[1], buf[2], buf[3]);
-            }
+        let trace_f32 = |component: &str, layer: Option<usize>, tensor: &str, ptr: u64, n: usize| {
+            trace_emit_f32(
+                trace.as_ref(),
+                decode_step_counter,
+                position,
+                token_id,
+                layer,
+                component,
+                tensor,
+                ptr,
+                n,
+                &self.device,
+            );
         };
 
         // ── Multi-GPU segment config ──
@@ -10387,7 +10870,7 @@ impl GpuDecodeStore {
                 self.device.synchronize().map_err(|e| format!("sync after emb: {:?}", e))?;
                 debug_peek_bf16("after_embedding d_hidden", *graph.d_hidden.device_ptr(), 4);
             }
-            check_nan_bf16("after_embedding", *graph.d_hidden.device_ptr(), hs, &self.device);
+            trace_bf16("embedding", None, "d_hidden", *graph.d_hidden.device_ptr(), hs);
         }
 
         // first_residual: true only when embedding was done (layer 0 initializes residual stream)
@@ -10427,7 +10910,7 @@ impl GpuDecodeStore {
                 }
             }
             first_residual = false;
-            check_nan_bf16(&format!("L{} post_pre_attn_norm", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
+            trace_bf16("post_pre_attn_norm", Some(layer_idx), "d_hidden", *graph.d_hidden.device_ptr(), hs);
 
             // Timing: after pre-attn norm
             let t_attn_start = if timing {
@@ -10458,8 +10941,8 @@ impl GpuDecodeStore {
                         ba_w, *graph.d_hidden.device_ptr(),
                         *graph.d_la_ba.device_ptr())?;
                     if layer_idx < 2 {
-                        check_nan_f32(&format!("L{} la_qkvz_proj", layer_idx), *graph.d_la_qkvz.device_ptr(), 64, &self.device);
-                        check_nan_f32(&format!("L{} la_ba_proj", layer_idx), *graph.d_la_ba.device_ptr(), 64, &self.device);
+                        trace_f32("la_qkvz_proj", Some(layer_idx), "d_la_qkvz", *graph.d_la_qkvz.device_ptr(), 64);
+                        trace_f32("la_ba_proj", Some(layer_idx), "d_la_ba", *graph.d_la_ba.device_ptr(), 64);
                     }
 
                     if timing {
@@ -10526,7 +11009,7 @@ impl GpuDecodeStore {
                     }
                     // Now d_la_qkvz has conv output [q(key_dim), k(key_dim), v(nv*dv)] with SiLU
                     if layer_idx < 2 {
-                        check_nan_f32(&format!("L{} la_conv1d_out", layer_idx), *graph.d_la_qkvz.device_ptr(), 64, &self.device);
+                        trace_f32("la_conv1d_out", Some(layer_idx), "d_la_qkvz", *graph.d_la_qkvz.device_ptr(), 64);
                     }
 
                     // ── LA Step 4: Compute gate and beta from BA ──
@@ -10557,7 +11040,7 @@ impl GpuDecodeStore {
                     }
 
                     if layer_idx < 2 {
-                        check_nan_f32(&format!("L{} la_gate_beta", layer_idx), gate_ptr_local, 32, &self.device);
+                        trace_f32("la_gate_beta", Some(layer_idx), "gate_beta", gate_ptr_local, 32);
                     }
 
                     if timing {
@@ -10597,10 +11080,9 @@ impl GpuDecodeStore {
                                 ),
                             ).map_err(|e| format!("la_fused_post_proj[{}]: {:?}", layer_idx, e))?;
                         }
-                    }
-
-                    if layer_idx < 2 {
-                        check_nan_bf16(&format!("L{} la_fused_post_proj (BF16 out)", layer_idx), *graph.d_scratch.device_ptr(), 64, &self.device);
+                        trace_bf16("la_fused_post_proj", Some(layer_idx), "d_scratch", *graph.d_scratch.device_ptr(), dv_.min(128));
+                        trace_f32("la_fused_post_proj_z", Some(layer_idx), "d_la_gated_out", *graph.d_la_gated_out.device_ptr(), dv_.min(64));
+                        trace_f32("la_fused_post_proj_norm", Some(layer_idx), "norm_weight", *norm_weight_ptr, dv_.min(64));
                     }
 
                     if timing {
@@ -10611,31 +11093,30 @@ impl GpuDecodeStore {
 
                     // ── LA Step 9: Output projection ──
                     let out_w = &graph.weights[*out_proj];
-                    if layer_idx < 2 && decode_nan_diag {
-                        let _ = self.device.synchronize();
-                        eprintln!("[DECODE-DIAG] L{} out_proj: dtype={} rows={} cols={} marlin_int4={} simple_int4={} ptr=0x{:x}",
-                            layer_idx, out_w.dtype, out_w.rows, out_w.cols,
-                            out_w.is_marlin_int4(), out_w.has_simple_int4(), out_w.ptr);
-                        // Check d_scratch input
-                        let mut ibuf = vec![0u16; 32];
-                        unsafe {
-                            let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
-                                ibuf.as_mut_ptr() as *mut std::ffi::c_void,
-                                *graph.d_scratch.device_ptr(), 64);
-                        }
-                        let ivals: Vec<f32> = ibuf[..4].iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-                        let i_any_nan = ibuf.iter().any(|&b| f32::from_bits((b as u32) << 16).is_nan());
-                        eprintln!("[DECODE-DIAG] L{} out_proj input (d_scratch BF16): [{:.4},{:.4},{:.4},{:.4}] any_nan={}",
-                            layer_idx, ivals[0], ivals[1], ivals[2], ivals[3], i_any_nan);
-                    }
+                    trace_emit_mark(
+                        trace.as_ref(),
+                        decode_step_counter,
+                        position,
+                        token_id,
+                        Some(layer_idx),
+                        "la_out_proj",
+                        &format!(
+                            "dtype={} rows={} cols={} marlin_int4={} simple_int4={} ptr=0x{:x}",
+                            out_w.dtype,
+                            out_w.rows,
+                            out_w.cols,
+                            out_w.is_marlin_int4(),
+                            out_w.has_simple_int4(),
+                            out_w.ptr,
+                        ),
+                    );
+                    trace_bf16("la_out_proj_input", Some(layer_idx), "d_scratch", *graph.d_scratch.device_ptr(), 64);
                     self.gemv_bf16_internal(
                         out_w,
                         *graph.d_scratch.device_ptr(),
                         *graph.d_hidden.device_ptr(),
                     )?;
-                    if layer_idx < 2 {
-                        check_nan_bf16(&format!("L{} la_out_proj_output", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
-                    }
+                    trace_bf16("la_out_proj", Some(layer_idx), "d_hidden", *graph.d_hidden.device_ptr(), hs);
                     if timing {
                         self.device.synchronize().map_err(|e| format!("la out sync: {:?}", e))?;
                         graph.t_la_out += (Instant::now() - t_la_s8).as_secs_f64();
@@ -10702,7 +11183,22 @@ impl GpuDecodeStore {
                     // Q proj output for gated attn is [nh, 2*hd] = [head0_q(hd), head0_gate(hd), ...]
                     // Must split before QK norm/RoPE which expect [nh, hd] layout.
                     // Gate stored in d_la_qkvz (unused during GQA layers).
+                    // SAFETY: copy to d_gqa_out first to avoid aliased read/write.
+                    // With head_dim>128, split_gated_q spans multiple CUDA blocks and
+                    // cross-block read/write aliasing has no ordering guarantee.
                     if *gated {
+                        // Diagnostic: dump raw Q proj output BEFORE split
+                        trace_f32("gqa_gated_q_pre_split", Some(layer_idx), "d_gqa_q", *graph.d_gqa_q.device_ptr(), nh * hd * 2);
+                        let gated_q_size = nh * hd * 2; // Q + gate interleaved
+                        unsafe {
+                            let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                                *graph.d_gqa_out.device_ptr(),
+                                *graph.d_gqa_q.device_ptr(),
+                                gated_q_size * 4);
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(format!("D2D gated_q copy[{}]: {:?}", layer_idx, err));
+                            }
+                        }
                         let total = (nh * hd) as u32;
                         let threads = 256u32;
                         let blocks = (total + threads - 1) / threads;
@@ -10714,14 +11210,17 @@ impl GpuDecodeStore {
                                     shared_mem_bytes: 0,
                                 },
                                 (
-                                    *graph.d_gqa_q.device_ptr(),      // q_out (in-place safe)
+                                    *graph.d_gqa_q.device_ptr(),      // q_out
                                     *graph.d_la_qkvz.device_ptr(),    // gate_out
-                                    *graph.d_gqa_q.device_ptr(),      // qg_in
+                                    *graph.d_gqa_out.device_ptr(),    // qg_in (separate buffer)
                                     nh as i32,
                                     hd as i32,
                                 ),
                             ).map_err(|e| format!("split_gated_q[{}]: {:?}", layer_idx, e))?;
                         }
+                        // Diagnostic: dump Q and gate AFTER split
+                        trace_f32("gqa_q_post_split", Some(layer_idx), "d_gqa_q", *graph.d_gqa_q.device_ptr(), nh * hd);
+                        trace_f32("gqa_gate_post_split", Some(layer_idx), "d_la_qkvz", *graph.d_la_qkvz.device_ptr(), nh * hd);
                     }
 
                     // ── GQA: QK norm (if enabled) ──
@@ -10845,6 +11344,12 @@ impl GpuDecodeStore {
                     }
 
                     // ── GQA: Attention compute ──
+                    // Diagnostic: dump Q, K, gate values for first GQA layer on first few steps
+                    trace_f32("gqa_q", Some(layer_idx), "d_gqa_q", *graph.d_gqa_q.device_ptr(), nh * hd);
+                    trace_f32("gqa_k", Some(layer_idx), "d_gqa_k", *graph.d_gqa_k.device_ptr(), nkv * hd);
+                    if *gated {
+                        trace_f32("gqa_gate", Some(layer_idx), "d_la_qkvz", *graph.d_la_qkvz.device_ptr(), nh * hd);
+                    }
                     if timing {
                         self.device.synchronize().map_err(|e| format!("gqa proj sync: {:?}", e))?;
                         graph.t_gqa_proj += (Instant::now() - t_gqa_s1).as_secs_f64();
@@ -10975,6 +11480,8 @@ impl GpuDecodeStore {
                     }
                     } // end else (non-polar4)
 
+                    // Diagnostic: check attention output for first GQA layer
+                    trace_f32("gqa_attn", Some(layer_idx), "d_gqa_out", *graph.d_gqa_out.device_ptr(), nh * hd);
                     if timing {
                         self.device.synchronize().map_err(|e| format!("gqa attn sync: {:?}", e))?;
                         graph.t_gqa_attn += (Instant::now() - t_gqa_attn_start).as_secs_f64();
@@ -11018,6 +11525,9 @@ impl GpuDecodeStore {
                         }
                     }
 
+                    // Diagnostic: check d_scratch (BF16 input to O proj) after gating
+                    trace_bf16("gqa_post_gate", Some(layer_idx), "d_scratch", *graph.d_scratch.device_ptr(), o_size);
+
                     // ── GQA: O projection ──
                     let ow = &graph.weights[*o_proj];
                     self.gemv_bf16_internal(
@@ -11025,6 +11535,10 @@ impl GpuDecodeStore {
                         *graph.d_scratch.device_ptr(),
                         *graph.d_hidden.device_ptr(),
                     )?;
+
+                    // Diagnostic: check d_hidden (BF16 output of O proj) = attention contribution to residual
+                    trace_bf16("gqa_o_proj", Some(layer_idx), "d_hidden", *graph.d_hidden.device_ptr(), hs);
+
                     if timing {
                         self.device.synchronize().map_err(|e| format!("gqa out sync: {:?}", e))?;
                         graph.t_gqa_out += (Instant::now() - t_gqa_out_start).as_secs_f64();
@@ -11462,7 +11976,7 @@ impl GpuDecodeStore {
                 }
             }
 
-            check_nan_bf16(&format!("L{} post_attn", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
+            trace_bf16("post_attn", Some(layer_idx), "d_hidden", *graph.d_hidden.device_ptr(), hs);
 
             // ── Post-attention norm (fused residual add + RMSNorm) ──
             // Nemotron layers: post_attn_norm_size==0 means skip (single-sublayer blocks).
@@ -11487,7 +12001,7 @@ impl GpuDecodeStore {
                 }
             }
 
-            check_nan_bf16(&format!("L{} post_post_attn_norm", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
+            trace_bf16("post_post_attn_norm", Some(layer_idx), "d_hidden", *graph.d_hidden.device_ptr(), hs);
 
             // Timing: after post-attn norm, before MLP/MoE
             let t_mlp_start = if timing {
@@ -11566,7 +12080,8 @@ impl GpuDecodeStore {
                     }
                     if timing { graph.t_moe_d2d_copy += (Instant::now() - t_d2d).as_secs_f64(); }
                 }
-                check_nan_bf16(&format!("L{} post_moe", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
+                trace_bf16("post_moe", Some(layer_idx), "d_hidden", *graph.d_hidden.device_ptr(), hs);
+                trace_bf16("layer_residual", Some(layer_idx), "d_residual", *graph.d_residual.device_ptr(), hs);
                 #[cfg(feature = "gpu-debug")]
                 {
                     self.device.synchronize().map_err(|e| format!("sync moe dbg: {:?}", e))?;
@@ -11682,6 +12197,9 @@ impl GpuDecodeStore {
             self.device.synchronize().map_err(|e| format!("sync after all layers: {:?}", e))?;
             debug_peek_bf16("before_final_norm d_hidden", *graph.d_hidden.device_ptr(), 4);
         }
+        // Diagnostic: dump d_hidden and d_residual before final norm
+        trace_bf16("final_pre_norm_hidden", None, "d_hidden", *graph.d_hidden.device_ptr(), hs);
+        trace_bf16("final_pre_norm_residual", None, "d_residual", *graph.d_residual.device_ptr(), hs);
         {
             let smem = (hs as u32) * 4;
             let threads = 256u32.min(hs as u32);
@@ -11699,6 +12217,41 @@ impl GpuDecodeStore {
                     hs as i32,
                     0i32,
                 )).map_err(|e| format!("final_norm: {:?}", e))?;
+            }
+        }
+        // After final norm, d_hidden is the normed output for LM head
+        trace_bf16("final_post_norm", None, "d_hidden", *graph.d_hidden.device_ptr(), hs);
+        if let Some(trace_cfg) = trace.as_ref() {
+            if trace_cfg.should_emit(decode_step_counter, None, "final_post_norm") {
+                if let Some(dir) = trace_cfg.dump_dir.as_ref() {
+                    let _ = self.device.synchronize();
+                    let n = hs.min(trace_cfg.max_elems.max(1));
+                    let mut hbuf = vec![0u16; n];
+                    unsafe {
+                        let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+                            hbuf.as_mut_ptr() as *mut _,
+                            *graph.d_hidden.device_ptr(),
+                            n * 2,
+                        );
+                    }
+                    let f32_vals: Vec<f32> = hbuf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+                    let path = format!("{}/decode_step_{:04}_postnorm.bin", dir, decode_step_counter);
+                    if let Ok(mut file) = std::fs::File::create(&path) {
+                        let bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(f32_vals.as_ptr() as *const u8, f32_vals.len() * 4)
+                        };
+                        let _ = file.write_all(bytes);
+                        trace_emit_mark(
+                            trace.as_ref(),
+                            decode_step_counter,
+                            position,
+                            token_id,
+                            None,
+                            "final_post_norm",
+                            &format!("dump_path={} dump_values={}", path, n),
+                        );
+                    }
+                }
             }
         }
 
@@ -12237,6 +12790,8 @@ impl GpuDecodeStore {
             rng_state ^= rng_state << 17;
             rng_state
         };
+        self.refresh_trace_config();
+        let trace_config = self.active_trace_owned();
 
         // CUDA graph reuse: verify pointer stability on all GPUs before reusing.
         let mut all_reuse = self.verify_graph_pointers();
@@ -12247,20 +12802,34 @@ impl GpuDecodeStore {
             }
         }
         if all_reuse {
-            if stderr_debug_enabled() {
-                eprintln!("[krasis] CUDA graphs reused on all {} GPUs (ptrs verified stable)", num_gpus);
-            }
+            trace_emit_global_mark(
+                trace_config.as_ref(),
+                "graph",
+                &format!("phase=multi_gpu_graph_pointer_check result=reuse gpus={}", num_gpus),
+            );
         } else {
             if !self.verify_graph_pointers() {
                 let was = self.graph.as_ref().map(|g| g.graphs_ever_captured).unwrap_or(false);
-                if was && stderr_debug_enabled() { eprintln!("[krasis] GPU0 graph ptrs changed — invalidating"); }
+                if was {
+                    trace_emit_global_mark(
+                        trace_config.as_ref(),
+                        "graph",
+                        "phase=multi_gpu_graph_pointer_check gpu=0 result=invalidate",
+                    );
+                }
                 self.invalidate_cuda_graph();
             }
             for (i, &addr) in aux_store_addrs.iter().enumerate() {
                 let s = unsafe { &mut *(addr as *mut GpuDecodeStore) };
                 if !s.verify_graph_pointers() {
                     let was = s.graph.as_ref().map(|g| g.graphs_ever_captured).unwrap_or(false);
-                    if was && stderr_debug_enabled() { eprintln!("[krasis] GPU{} graph ptrs changed — invalidating", i + 1); }
+                    if was {
+                        trace_emit_global_mark(
+                            trace_config.as_ref(),
+                            "graph",
+                            &format!("phase=multi_gpu_graph_pointer_check gpu={} result=invalidate", i + 1),
+                        );
+                    }
                     s.invalidate_cuda_graph();
                 }
             }
@@ -12304,9 +12873,17 @@ impl GpuDecodeStore {
                 if needs_init {
                     match self.init_cuda_graph_buffers() {
                         Ok(()) => {
-                            if stderr_debug_enabled() { eprintln!("[krasis] GPU0 CUDA graph buffers initialized"); }
+                            trace_emit_global_mark(
+                                trace_config.as_ref(),
+                                "graph",
+                                "phase=multi_gpu_graph_buffers_init gpu=0 status=ok",
+                            );
                         }
-                        Err(e) => eprintln!("[krasis] GPU0 graph init failed: {}", e),
+                        Err(e) => trace_emit_global_mark(
+                            trace_config.as_ref(),
+                            "graph",
+                            &format!("phase=multi_gpu_graph_buffers_init gpu=0 status=error error={}", e),
+                        ),
                     }
                 }
             }
@@ -12320,9 +12897,17 @@ impl GpuDecodeStore {
                     if needs_init {
                         match s.init_cuda_graph_buffers() {
                             Ok(()) => {
-                                if stderr_debug_enabled() { eprintln!("[krasis] GPU{} CUDA graph buffers initialized", i + 1); }
+                                trace_emit_global_mark(
+                                    trace_config.as_ref(),
+                                    "graph",
+                                    &format!("phase=multi_gpu_graph_buffers_init gpu={} status=ok", i + 1),
+                                );
                             }
-                            Err(e) => eprintln!("[krasis] GPU{} graph init failed: {}", i + 1, e),
+                            Err(e) => trace_emit_global_mark(
+                                trace_config.as_ref(),
+                                "graph",
+                                &format!("phase=multi_gpu_graph_buffers_init gpu={} status=error error={}", i + 1, e),
+                            ),
                         }
                     }
                 }
@@ -12386,6 +12971,21 @@ impl GpuDecodeStore {
                         log::error!("multi-gpu upload_hidden to GPU{}: {}", i + 1, e);
                         step_ok = false; break;
                     }
+                    trace_emit_mark(
+                        trace_config.as_ref(),
+                        step,
+                        pos,
+                        next_token,
+                        None,
+                        "transfer",
+                        &format!(
+                            "phase=hidden_handoff mode=graph from_gpu={} to_gpu={} hidden_elems={} residual_elems={}",
+                            i,
+                            i + 1,
+                            h_hidden.len(),
+                            h_residual.len(),
+                        ),
+                    );
                     t_transfer_total += Instant::now().duration_since(t_xfer_start).as_secs_f64();
 
                     // Replay graphs on this aux GPU
@@ -12454,6 +13054,21 @@ impl GpuDecodeStore {
                         log::error!("multi-gpu upload_hidden to GPU{}: {}", i + 1, e);
                         step_ok = false; break;
                     }
+                    trace_emit_mark(
+                        trace_config.as_ref(),
+                        step,
+                        pos,
+                        next_token,
+                        None,
+                        "transfer",
+                        &format!(
+                            "phase=hidden_handoff mode=ungraphed from_gpu={} to_gpu={} hidden_elems={} residual_elems={}",
+                            i,
+                            i + 1,
+                            h_hidden.len(),
+                            h_residual.len(),
+                        ),
+                    );
                     if timing { aux.device.synchronize().ok(); }
                     t_transfer_total += Instant::now().duration_since(t_xfer_start).as_secs_f64();
 
@@ -12493,7 +13108,11 @@ impl GpuDecodeStore {
                                 Some((0, boundaries[1])), true, false, 0,
                             ) {
                                 Ok(()) => {
-                                    if stderr_debug_enabled() { eprintln!("[krasis] GPU0 per-layer graphs captured"); }
+                                    trace_emit_global_mark(
+                                        trace_config.as_ref(),
+                                        "graph",
+                                        "phase=multi_gpu_per_layer_capture gpu=0 status=ok",
+                                    );
                                 }
                                 Err(e) => {
                                     log::error!("multi-gpu: GPU0 graph capture failed (no ungraphed fallback): {}", e);
@@ -12513,7 +13132,11 @@ impl GpuDecodeStore {
                                     Some((boundaries[i + 1], boundaries[i + 2])), false, is_last, gqa_cache_offsets[i],
                                 ) {
                                     Ok(()) => {
-                                        if stderr_debug_enabled() { eprintln!("[krasis] GPU{} per-layer graphs captured", i + 1); }
+                                        trace_emit_global_mark(
+                                            trace_config.as_ref(),
+                                            "graph",
+                                            &format!("phase=multi_gpu_per_layer_capture gpu={} status=ok", i + 1),
+                                        );
                                     }
                                     Err(e) => {
                                         log::error!("multi-gpu: GPU{} graph capture failed (no ungraphed fallback): {}", i + 1, e);
@@ -12786,7 +13409,10 @@ impl GpuDecodeStore {
         let orig_batch_size = batch_size;
         let hs = graph.hidden_size;
         let eps = graph.eps;
-        let do_timing = std::env::var("KRASIS_SPEC_DEBUG").is_ok();
+        let trace_cfg = graph.decode_trace.clone();
+        let do_timing = trace_cfg.as_ref()
+            .map(|trace| trace.allows_component("spec"))
+            .unwrap_or(false);
         let mut tt_norm: f64 = 0.0;
         let mut tt_proj: f64 = 0.0;
         let mut tt_attn: f64 = 0.0;
@@ -13595,10 +14221,24 @@ impl GpuDecodeStore {
         if do_timing {
             self.device.synchronize().map_err(|e| format!("timing: {:?}", e))?;
             tt_lmhead += t_lm_start.elapsed().as_secs_f64();
-            eprintln!("  BATCH-TIMING batch={}/{}: norm={:.1}ms attn={:.1}ms moe={:.1}ms lmhead={:.1}ms total={:.1}ms",
-                batch_size, orig_batch_size,
-                tt_norm * 1000.0, tt_attn * 1000.0, tt_moe * 1000.0, tt_lmhead * 1000.0,
-                (tt_norm + tt_attn + tt_moe + tt_lmhead) * 1000.0);
+            trace_emit_mark(
+                trace_cfg.as_ref(),
+                0,
+                positions[0],
+                tokens[0],
+                None,
+                "spec",
+                &format!(
+                    "phase=batch_timing batch_size={} orig_batch_size={} norm_ms={:.3} attn_ms={:.3} moe_ms={:.3} lmhead_ms={:.3} total_ms={:.3}",
+                    batch_size,
+                    orig_batch_size,
+                    tt_norm * 1000.0,
+                    tt_attn * 1000.0,
+                    tt_moe * 1000.0,
+                    tt_lmhead * 1000.0,
+                    (tt_norm + tt_attn + tt_moe + tt_lmhead) * 1000.0,
+                ),
+            );
         }
 
         Ok(batch_size)
@@ -14184,6 +14824,7 @@ impl GpuDecodeStore {
         self.last_soft_reload_alloc_mb = 0.0;
         self.last_soft_reload_activated = 0;
         let cal = self.vram_calibration;
+        let trace_cfg = self.active_trace_owned();
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
@@ -14224,10 +14865,15 @@ impl GpuDecodeStore {
                     let freed_bytes = extra_chunks * hcs.soft_slots_per_chunk * hcs.soft_slot_size;
                     hcs.soft_chunks.truncate(hcs.soft_chunks_loaded);
                     hcs.vram_bytes = hcs.vram_bytes.saturating_sub(freed_bytes);
-                    if stderr_debug_enabled() {
-                        eprintln!("  \x1b[33mHCS soft: cancelled pending async reload ({} unactivated experts, {:.1} MB freed)\x1b[0m",
-                            unactivated, freed_bytes as f64 / (1024.0 * 1024.0));
-                    }
+                    trace_emit_global_mark(
+                        trace_cfg.as_ref(),
+                        "hcs",
+                        &format!(
+                            "phase=soft_cancel_pending unactivated={} freed_mb={:.1}",
+                            unactivated,
+                            freed_bytes as f64 / (1024.0 * 1024.0),
+                        ),
+                    );
                 }
             }
             // Fall through — the current prompt may need further eviction
@@ -14279,13 +14925,16 @@ impl GpuDecodeStore {
         };
 
         if free_bytes >= needed_bytes {
-            if stderr_debug_enabled() {
-                eprintln!(
-                    "  \x1b[32mHCS soft: skip eviction — {:.0} MB free >= {:.0} MB prefill floor\x1b[0m",
+            trace_emit_global_mark(
+                trace_cfg.as_ref(),
+                "hcs",
+                &format!(
+                    "phase=soft_skip_eviction free_mb={:.0} needed_mb={:.0} estimated_tokens={}",
                     free_bytes as f64 / (1024.0 * 1024.0),
-                    needed_bytes as f64 / (1024.0 * 1024.0)
-                );
-            }
+                    needed_bytes as f64 / (1024.0 * 1024.0),
+                    capped_tokens,
+                ),
+            );
             log::info!(
                 "HCS soft: skip eviction — {:.0} MB free >= {:.0} MB prefill floor for ~{} tokens",
                 free_bytes as f64 / (1024.0 * 1024.0),
@@ -14359,10 +15008,14 @@ impl GpuDecodeStore {
         self.last_soft_evict_experts = evicted;
         self.last_soft_evict_freed_mb = freed_mb;
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        if stderr_debug_enabled() {
-            eprintln!("  \x1b[33mHCS soft: evicted {} experts ({:.1} MB, {} of {} chunks dropped) in {:.1}ms for prefill (~{} tokens)\x1b[0m",
-                evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens);
-        }
+        trace_emit_global_mark(
+            trace_cfg.as_ref(),
+            "hcs",
+            &format!(
+                "phase=soft_evict experts={} freed_mb={:.1} chunks_dropped={} total_chunks={} elapsed_ms={:.1} estimated_tokens={}",
+                evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens
+            ),
+        );
         log::info!("HCS soft: evicted {} experts ({:.1} MB, {} of {} chunks dropped) in {:.1}ms for prefill (~{} tokens)",
             evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens);
 
@@ -14375,6 +15028,7 @@ impl GpuDecodeStore {
     /// Returns (loaded_count, reload_ms).
     pub fn hcs_reload_after_prefill(&mut self, actual_tokens: usize) -> (usize, f64) {
         let cal = self.vram_calibration;
+        let trace_cfg = self.active_trace_owned();
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
@@ -14550,12 +15204,18 @@ impl GpuDecodeStore {
         self.last_soft_reload_activated = loaded;
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let chunks_reloaded = hcs.soft_chunks_loaded - already_loaded;
-        eprintln!("  \x1b[32mHCS soft: reloaded {} experts ({:.1} MB, {}/{} chunks, batch DMA) in {:.1}ms\x1b[0m",
-            loaded, alloc_mb, chunks_reloaded, target_chunks, elapsed_ms);
+        trace_emit_global_mark(
+            trace_cfg.as_ref(),
+            "hcs",
+            &format!(
+                "phase=soft_reload_sync experts={} alloc_mb={:.1} chunks_reloaded={} target_chunks={} elapsed_ms={:.1}",
+                loaded, alloc_mb, chunks_reloaded, target_chunks, elapsed_ms
+            ),
+        );
         log::info!("HCS soft: reloaded {} experts ({:.1} MB, {}/{} chunks, batch DMA) in {:.1}ms",
             loaded, alloc_mb, chunks_reloaded, target_chunks, elapsed_ms);
 
-        hcs.log_hcs_post_reload();
+        hcs.log_hcs_post_reload(trace_cfg.as_ref());
 
         (loaded, elapsed_ms)
     }
@@ -14567,6 +15227,7 @@ impl GpuDecodeStore {
     /// Returns (num_experts_queued, alloc_mb).
     pub fn hcs_reload_after_prefill_async(&mut self, actual_tokens: usize) -> (usize, f64) {
         let cal = self.vram_calibration;
+        let trace_cfg = self.active_trace_owned();
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
@@ -14787,10 +15448,14 @@ impl GpuDecodeStore {
         self.last_soft_reload_alloc_mb = alloc_mb;
         self.last_soft_reload_activated = 0;
         let chunks_queued = hcs.soft_chunks.len() - already_loaded;
-        if stderr_debug_enabled() {
-            eprintln!("  \x1b[36mHCS soft: async reload queued {} experts ({:.1} MB, {}/{} chunks, batch DMA) in {:.1}ms\x1b[0m",
-                queued, alloc_mb, chunks_queued, target_chunks, elapsed_ms);
-        }
+        trace_emit_global_mark(
+            trace_cfg.as_ref(),
+            "hcs",
+            &format!(
+                "phase=soft_reload_async_queued experts={} alloc_mb={:.1} chunks_queued={} target_chunks={} elapsed_ms={:.1}",
+                queued, alloc_mb, chunks_queued, target_chunks, elapsed_ms
+            ),
+        );
         log::info!("HCS soft: async reload queued {} experts ({:.1} MB, {}/{} chunks, batch DMA) in {:.1}ms",
             queued, alloc_mb, chunks_queued, target_chunks, elapsed_ms);
 
@@ -14801,6 +15466,7 @@ impl GpuDecodeStore {
     /// If so, activate all cache entries and mark soft tier as loaded.
     /// Returns true if the soft tier just became available this call.
     pub fn hcs_check_soft_reload_complete(&mut self) -> bool {
+        let trace_cfg = self.active_trace_owned();
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return false,
@@ -14839,14 +15505,18 @@ impl GpuDecodeStore {
         hcs.num_cached += activated;
         self.last_soft_reload_activated = activated;
 
-        if stderr_debug_enabled() {
-            eprintln!("  \x1b[32mHCS soft: async reload complete — {} experts activated ({}/{} chunks)\x1b[0m",
-                activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks);
-        }
+        trace_emit_global_mark(
+            trace_cfg.as_ref(),
+            "hcs",
+            &format!(
+                "phase=soft_reload_async_complete activated={} chunks_loaded={} total_chunks={}",
+                activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks
+            ),
+        );
         log::info!("HCS soft: async reload complete — {} experts activated ({}/{} chunks)",
             activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks);
 
-        hcs.log_hcs_post_reload();
+        hcs.log_hcs_post_reload(trace_cfg.as_ref());
 
         true
     }
@@ -14856,6 +15526,7 @@ impl GpuDecodeStore {
     /// Used by --sync-hcs-reload to get clean decode measurements.
     /// Returns (activated_count, real_dma_ms). Returns (0, 0.0) if no reload pending.
     pub fn hcs_sync_soft_reload(&mut self) -> (usize, f64) {
+        let trace_cfg = self.active_trace_owned();
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
@@ -14897,14 +15568,18 @@ impl GpuDecodeStore {
         hcs.num_cached += activated;
         self.last_soft_reload_activated = activated;
 
-        if stderr_debug_enabled() {
-            eprintln!("  \x1b[32mHCS soft: sync reload complete — {} experts ({}/{} chunks) in {:.1}ms real DMA\x1b[0m",
-                activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks, real_dma_ms);
-        }
+        trace_emit_global_mark(
+            trace_cfg.as_ref(),
+            "hcs",
+            &format!(
+                "phase=soft_reload_sync_complete activated={} chunks_loaded={} total_chunks={} dma_ms={:.1}",
+                activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks, real_dma_ms
+            ),
+        );
         log::info!("HCS soft: sync reload complete — {} experts ({}/{} chunks) in {:.1}ms real DMA",
             activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks, real_dma_ms);
 
-        hcs.log_hcs_post_reload();
+        hcs.log_hcs_post_reload(trace_cfg.as_ref());
 
         (activated, real_dma_ms)
     }
@@ -14930,12 +15605,17 @@ impl GpuDecodeStore {
     {
         use std::time::Instant;
 
-        if stderr_debug_enabled() {
-            eprintln!("[krasis] gpu_generate_stream called: first_token={}, start_pos={}, max_tokens={}", first_token, start_position, max_tokens);
-        }
-
-        let decode_diag = std::env::var("KRASIS_DECODE_DIAG").map(|v| v == "1").unwrap_or(false);
-        let prefill_debug = prefill_debug_enabled();
+        self.refresh_trace_config();
+        let trace_config = self.active_trace_owned();
+        trace_emit_mark(
+            trace_config.as_ref(),
+            0,
+            start_position,
+            first_token,
+            None,
+            "request",
+            &format!("phase=gpu_generate_stream_enter max_tokens={}", max_tokens),
+        );
 
         // Bind CUDA context to this thread. Required when called from
         // the server thread (which differs from the setup thread).
@@ -14949,24 +15629,49 @@ impl GpuDecodeStore {
             None => { log::error!("gpu_generate_stream: graph not configured"); return 0; }
         };
 
-        if prefill_debug {
-            let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
-            if let Some(graph) = self.graph.as_ref() {
-                let (mapped_reads_available, hcs_cached, hcs_soft_cached, hcs_soft_loaded) =
-                    if let Some(hcs) = graph.hcs.as_ref() {
-                        (
-                            hcs.mapped_reads_available,
-                            hcs.num_cached,
-                            hcs.soft_num_cached,
-                            hcs.soft_loaded,
-                        )
-                    } else {
-                        (false, 0, 0, false)
-                    };
-                eprintln!(
-                    "[PREFILL-DEBUG] decode request start_pos={} max_tokens={} no_graph={} graphs_valid={} graphs_ever_captured={} gpu_route_sync={} mapped_reads_active={} mapped_reads_available={} hcs_cached={} hcs_soft_cached={} hcs_soft_loaded={} timing={}",
-                    start_position,
+        if let Some(graph) = self.graph.as_mut() {
+            graph.decode_trace = trace_config.clone();
+            trace_emit_mark(
+                graph.decode_trace.as_ref(),
+                0,
+                start_position,
+                first_token,
+                None,
+                "request",
+                &format!(
+                    "phase=decode_start max_tokens={} temperature={:.3} top_k={} top_p={:.3} presence_penalty={:.3} stop_ids={}",
                     max_tokens,
+                    temperature,
+                    top_k,
+                    top_p,
+                    presence_penalty,
+                    stop_ids.len(),
+                ),
+            );
+        }
+
+        let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
+        if let Some(graph) = self.graph.as_ref() {
+            let (mapped_reads_available, hcs_cached, hcs_soft_cached, hcs_soft_loaded) =
+                if let Some(hcs) = graph.hcs.as_ref() {
+                    (
+                        hcs.mapped_reads_available,
+                        hcs.num_cached,
+                        hcs.soft_num_cached,
+                        hcs.soft_loaded,
+                    )
+                } else {
+                    (false, 0, 0, false)
+                };
+            trace_emit_mark(
+                trace_config.as_ref(),
+                0,
+                start_position,
+                first_token,
+                None,
+                "graph",
+                &format!(
+                    "phase=decode_request_state no_graph={} graphs_valid={} graphs_ever_captured={} gpu_route_sync={} mapped_reads_active={} mapped_reads_available={} hcs_cached={} hcs_soft_cached={} hcs_soft_loaded={} timing={}",
                     no_graph,
                     graph.per_layer_graphs_valid,
                     graph.graphs_ever_captured,
@@ -14977,12 +15682,12 @@ impl GpuDecodeStore {
                     hcs_soft_cached,
                     hcs_soft_loaded,
                     graph.timing_enabled,
-                );
-            }
+                ),
+            );
         }
 
-        // Decode diagnostic: check LA recur state and conv state at decode start
-        if decode_diag {
+        // Optional initial LA state trace before the first decode step.
+        if let Some(trace) = trace_config.as_ref() {
             if let Some(ref graph) = self.graph {
                 for (li, layer) in graph.layers.iter().enumerate() {
                     if li >= 3 { break; } // Only check first 3 layers
@@ -14998,9 +15703,21 @@ impl GpuDecodeStore {
                         let head0_norm: f32 = state_buf.iter()
                             .map(|x| x * x).sum::<f32>().sqrt();
                         let any_nonzero = state_buf.iter().any(|&x| x != 0.0);
-                        eprintln!("[DECODE-DIAG] L{:02} recur_state: head0_norm={:.6} any_nonzero={} vals[0..4]=[{:.6},{:.6},{:.6},{:.6}]",
-                            li, head0_norm, any_nonzero,
-                            state_buf[0], state_buf[1], state_buf[2], state_buf[3]);
+                        trace_emit_mark(
+                            Some(trace),
+                            0,
+                            start_position,
+                            first_token,
+                            Some(li),
+                            "la_state",
+                            &format!(
+                                "recur_state_ptr=0x{:x} head0_norm={:.6} any_nonzero={} sample=[{}]",
+                                recur_state_ptr,
+                                head0_norm,
+                                any_nonzero,
+                                trace_format_sample(&state_buf[..state_buf.len().min(4)]),
+                            ),
+                        );
 
                         // Check conv state
                         let conv_size = conv_dim * kernel_dim;
@@ -15013,8 +15730,21 @@ impl GpuDecodeStore {
                         }
                         let conv_any_nonzero = conv_buf.iter().any(|&x| x != 0.0);
                         let conv_norm: f32 = conv_buf.iter().map(|x| x * x).sum::<f32>().sqrt();
-                        eprintln!("[DECODE-DIAG] L{:02} conv_state: norm={:.6} any_nonzero={}",
-                            li, conv_norm, conv_any_nonzero);
+                        trace_emit_mark(
+                            Some(trace),
+                            0,
+                            start_position,
+                            first_token,
+                            Some(li),
+                            "la_state",
+                            &format!(
+                                "conv_state_ptr=0x{:x} norm={:.6} any_nonzero={} sample=[{}]",
+                                conv_state_ptr,
+                                conv_norm,
+                                conv_any_nonzero,
+                                trace_format_sample(&conv_buf[..conv_buf.len().min(4)]),
+                            ),
+                        );
                     }
                 }
             }
@@ -15041,14 +15771,28 @@ impl GpuDecodeStore {
         // If stable, reuse graphs (skip ~30-40ms recapture overhead per request).
         // If pointers moved (shouldn't happen), fall back to invalidate + recapture.
         if self.verify_graph_pointers() {
-            if stderr_debug_enabled() {
-                eprintln!("[krasis] CUDA graphs reused from previous request (ptrs verified stable)");
-            }
+            trace_emit_mark(
+                trace_config.as_ref(),
+                0,
+                start_position,
+                first_token,
+                None,
+                "graph",
+                "phase=graph_pointer_check result=reuse",
+            );
         } else {
             let was_captured = self.graph.as_ref()
                 .map(|g| g.graphs_ever_captured).unwrap_or(false);
-            if was_captured && stderr_debug_enabled() {
-                eprintln!("[krasis] CUDA graph ptrs changed — invalidating, will recapture");
+            if was_captured {
+                trace_emit_mark(
+                    trace_config.as_ref(),
+                    0,
+                    start_position,
+                    first_token,
+                    None,
+                    "graph",
+                    "phase=graph_pointer_check result=invalidate",
+                );
             }
             self.invalidate_cuda_graph();
         }
@@ -15116,10 +15860,6 @@ impl GpuDecodeStore {
         // when the decoded text is complete.
         let mut detok = crate::server::StreamDetokenizer::new(tokenizer);
 
-        #[cfg(feature = "gpu-debug")]
-        let debug_logits = std::env::var("KRASIS_DEBUG_LOGITS").ok()
-            .map(|v| v.parse::<usize>().unwrap_or(0)).unwrap_or(0);
-
         // ── Speculative decode state ──
         let use_speculative = self.draft.is_some();
         let draft_k = self.draft_k;
@@ -15158,9 +15898,25 @@ impl GpuDecodeStore {
             if needs_init {
                 match self.init_cuda_graph_buffers() {
                     Ok(()) => {
-                        if stderr_debug_enabled() { eprintln!("[krasis] CUDA graph buffers initialized"); }
+                        trace_emit_mark(
+                            trace_config.as_ref(),
+                            0,
+                            start_position,
+                            first_token,
+                            None,
+                            "graph",
+                            "phase=graph_buffers_init status=ok",
+                        );
                     }
-                    Err(e) => eprintln!("[krasis] CUDA graph init failed: {}", e),
+                    Err(e) => trace_emit_mark(
+                        trace_config.as_ref(),
+                        0,
+                        start_position,
+                        first_token,
+                        None,
+                        "graph",
+                        &format!("phase=graph_buffers_init status=error error={}", e),
+                    ),
                 }
             }
         }
@@ -15222,13 +15978,31 @@ impl GpuDecodeStore {
                 spec_draft_time += draft_elapsed;
                 spec_rounds += 1;
 
-                if spec_rounds <= 3 && !draft_tokens.is_empty()
-                    && std::env::var("KRASIS_SPEC_DEBUG").is_ok()
-                {
-                    let draft_strs: Vec<String> = draft_tokens.iter()
-                        .map(|&t| format!("{}", t)).collect();
-                    log::info!("spec round {}: next_token={}, draft=[{}], dp={}",
-                        spec_rounds, next_token, draft_strs.join(","), draft_pos_before);
+                if !draft_tokens.is_empty() {
+                    let trace_cfg = self.graph.as_ref().and_then(|g| g.decode_trace.clone());
+                    if let Some(trace_cfg) = trace_cfg.as_ref() {
+                        if trace_cfg.should_emit(step, None, "spec") {
+                            let draft_strs: Vec<String> = draft_tokens.iter()
+                                .take(trace_cfg.sample_values.max(1))
+                                .map(|&t| format!("{}", t))
+                                .collect();
+                            trace_emit_mark(
+                                Some(trace_cfg),
+                                step,
+                                pos,
+                                next_token,
+                                None,
+                                "spec",
+                                &format!(
+                                    "phase=draft round={} draft_pos_before={} draft_count={} draft_tokens=[{}]",
+                                    spec_rounds,
+                                    draft_pos_before,
+                                    draft_tokens.len(),
+                                    draft_strs.join(","),
+                                ),
+                            );
+                        }
+                    }
                 }
 
                 // 2. If draft failed, fall back to single-token decode
@@ -15238,6 +16012,7 @@ impl GpuDecodeStore {
                         break;
                     }
                     let (target_pred, token_logprobs) = {
+                        let trace_for_sampling = self.graph.as_ref().and_then(|g| g.decode_trace.clone());
                         let logits = &mut self.graph.as_mut().unwrap().h_logits;
                         if presence_penalty != 0.0 {
                             for &tok in &seen_tokens {
@@ -15258,8 +16033,15 @@ impl GpuDecodeStore {
                         // Force-inject </think> when thinking budget is exhausted
                         let target_pred = if think_end_active && !think_within_budget {
                             if let Some(te) = self.think_end_token_for_suppress {
-                                eprintln!("[krasis] Thinking budget exhausted ({} tokens) — force-injecting </think>",
-                                    self.think_suppress_count);
+                                trace_emit_mark(
+                                    trace_for_sampling.as_ref(),
+                                    step,
+                                    pos,
+                                    next_token,
+                                    None,
+                                    "sampling",
+                                    &format!("phase=thinking_budget_exhausted count={}", self.think_suppress_count),
+                                );
                                 te
                             } else {
                                 crate::decode::sample_from_logits_pub(
@@ -15272,6 +16054,18 @@ impl GpuDecodeStore {
                         let token_logprobs = if logprobs_top_n > 0 {
                             Some(crate::decode::extract_top_logprobs(logits, vocab_size, logprobs_top_n))
                         } else { None };
+                        trace_emit_mark(
+                            trace_for_sampling.as_ref(),
+                            step,
+                            pos,
+                            next_token,
+                            None,
+                            "sampling",
+                            &format!(
+                                "phase=sample_result selected_token={} logits_buffer=h_logits speculative_fallback=1",
+                                target_pred,
+                            ),
+                        );
                         (target_pred, token_logprobs)
                     };
                     self.notify_token_generated(target_pred);
@@ -15509,19 +16303,50 @@ impl GpuDecodeStore {
                 }
 
                 // Timing breakdown for first 5 rounds
-                if spec_rounds <= 5 && std::env::var("KRASIS_SPEC_DEBUG").is_ok() {
-                    eprintln!("  spec round {}: draft={:.1}ms verify={:.1}ms save={:.1}ms restore={:.1}ms accepted={}/{} valid={}/{} total={:.1}ms target_pred={} draft[0]={}",
-                        spec_rounds, draft_elapsed * 1000.0, verify_ms, save_ms, restore_ms,
-                        accepted_in_round, draft_tokens.len(),
-                        valid_positions, batch_size,
-                        (draft_elapsed * 1000.0) + verify_ms + save_ms + restore_ms,
-                        target_pred, draft_tokens[0]);
-                    // Debug: show top logit values for position 0
-                    {
-                        let bl = &self.graph.as_ref().unwrap().h_batch_logits;
-                        let mut top5: Vec<(usize, f32)> = (0..vocab_size).map(|i| (i, bl[i])).collect();
-                        top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                        eprintln!("  pos0 top5: {:?}", &top5[..5]);
+                {
+                    let trace_cfg = self.graph.as_ref().and_then(|g| g.decode_trace.clone());
+                    if let Some(trace_cfg) = trace_cfg.as_ref() {
+                        if trace_cfg.should_emit(step, None, "spec") {
+                            trace_emit_mark(
+                                Some(trace_cfg),
+                                step,
+                                pos,
+                                next_token,
+                                None,
+                                "spec",
+                                &format!(
+                                    "phase=verify round={} draft_ms={:.3} verify_ms={:.3} save_ms={:.3} restore_ms={:.3} accepted={} draft_count={} valid_positions={} batch_size={} target_pred={} first_draft={}",
+                                    spec_rounds,
+                                    draft_elapsed * 1000.0,
+                                    verify_ms,
+                                    save_ms,
+                                    restore_ms,
+                                    accepted_in_round,
+                                    draft_tokens.len(),
+                                    valid_positions,
+                                    batch_size,
+                                    target_pred,
+                                    draft_tokens[0],
+                                ),
+                            );
+                            let bl = &self.graph.as_ref().unwrap().h_batch_logits;
+                            let mut top5: Vec<(usize, f32)> = (0..vocab_size).map(|i| (i, bl[i])).collect();
+                            top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                            let values: Vec<f32> = top5.iter()
+                                .take(trace_cfg.sample_values.max(1))
+                                .map(|(_, v)| *v)
+                                .collect();
+                            trace_emit_values(
+                                Some(trace_cfg),
+                                step,
+                                pos,
+                                next_token,
+                                None,
+                                "spec",
+                                "pos0_top_logits",
+                                &values,
+                            );
+                        }
                     }
                 }
 
@@ -15570,15 +16395,20 @@ impl GpuDecodeStore {
                     // Try to capture per-layer CUDA graphs after first token
                     let _has_graph_bufs = self.graph.as_ref()
                         .map(|g| g.d_graph_token_id.is_some()).unwrap_or(false);
-                    if stderr_debug_enabled() {
-                        eprintln!("[krasis] step={} has_graph_bufs={}", step, _has_graph_bufs);
-                    }
                     let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
                     if step == 0 && _has_graph_bufs && !no_graph
                     {
                         match self.capture_per_layer_graphs(None, true, true, 0) {
                             Ok(()) => {
-                                if stderr_debug_enabled() { eprintln!("[krasis] Per-layer CUDA graphs captured after token 0"); }
+                                trace_emit_mark(
+                                    self.graph.as_ref().and_then(|g| g.decode_trace.as_ref()),
+                                    step,
+                                    pos,
+                                    next_token,
+                                    None,
+                                    "graph",
+                                    "phase=per_layer_capture status=ok after_step=0",
+                                );
                                 sample_min_vram(&mut min_vram_free_bytes);
                             }
                             Err(e) => {
@@ -15589,34 +16419,21 @@ impl GpuDecodeStore {
                     }
                 }
 
+                let trace_cfg = self.graph.as_ref().and_then(|g| g.decode_trace.clone());
                 let logits = &mut self.graph.as_mut().unwrap().h_logits;
 
-                // Decode diagnostic: top-5 logits for first 3 steps
-                if decode_diag && step < 3 {
-                    let mut indexed: Vec<(usize, f32)> = logits.iter().copied()
-                        .enumerate().take(vocab_size).collect();
-                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    let top5: Vec<String> = indexed[..5.min(indexed.len())].iter()
-                        .map(|(idx, val)| {
-                            let tok_str = tokenizer.decode(&[*idx as u32], true).unwrap_or_default();
-                            format!("{}({:.3})\"{}\"", idx, val, tok_str.replace('\n', "\\n"))
-                        }).collect();
-                    eprintln!("[DECODE-DIAG] step={} pos={} input_tok={} top5=[{}]",
-                        step, pos, next_token, top5.join(", "));
-                }
-
-                #[cfg(feature = "gpu-debug")]
-                if debug_logits > 0 && step < debug_logits {
-                    let mut indexed: Vec<(usize, f32)> = logits.iter().copied()
-                        .enumerate().take(vocab_size).collect();
-                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    let top5: Vec<String> = indexed[..5.min(indexed.len())].iter()
-                        .map(|(idx, val)| {
-                            let tok_str = tokenizer.decode(&[*idx as u32], true).unwrap_or_default();
-                            format!("{}({:.3})\"{}\"", idx, val, tok_str.replace('\n', "\\n"))
-                        }).collect();
-                    log::warn!("LOGITS step={} pos={} input_tok={} top5=[{}]",
-                        step, pos, next_token, top5.join(", "));
+                if let Some(trace_cfg) = trace_cfg.as_ref() {
+                    if trace_cfg.should_emit(step, None, "logits") {
+                        let mut indexed: Vec<(usize, f32)> = logits.iter().copied()
+                            .enumerate().take(vocab_size).collect();
+                        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        let top5: Vec<String> = indexed[..5.min(indexed.len())].iter()
+                            .map(|(idx, val)| {
+                                let tok_str = tokenizer.decode(&[*idx as u32], true).unwrap_or_default();
+                                format!("{}({:.3})\"{}\"", idx, val, tok_str.replace('\n', "\\n"))
+                            }).collect();
+                        trace_emit_logits(Some(trace_cfg), step, pos, next_token, &top5);
+                    }
                 }
 
                 if presence_penalty != 0.0 {
@@ -15638,14 +16455,41 @@ impl GpuDecodeStore {
                         if tok < vocab_size { logits[tok] = f32::NEG_INFINITY; }
                     }
                 }
+                trace_emit_mark(
+                    trace_cfg.as_ref(),
+                    step,
+                    pos,
+                    next_token,
+                    None,
+                    "sampling",
+                    &format!(
+                        "phase=pre_sample presence_penalty={:.3} min_new_tokens_active={} think_end_active={} think_within_budget={} suppress_tokens={} stop_suppressed={} temperature={:.3} top_k={} top_p={:.3}",
+                        presence_penalty,
+                        generated < self.min_new_tokens,
+                        think_end_active,
+                        think_within_budget,
+                        self.suppress_tokens.len(),
+                        if suppressing { self.stop_token_ids_for_suppress.len() } else { 0 },
+                        temperature,
+                        top_k,
+                        top_p,
+                    ),
+                );
 
                 // Force-inject </think> when thinking budget is exhausted.
                 // Just lifting suppression isn't enough — degenerate models never
                 // produce EOS naturally once stuck in a thinking loop.
                 let target_pred = if think_end_active && !think_within_budget {
                     if let Some(te) = self.think_end_token_for_suppress {
-                        eprintln!("[krasis] Thinking budget exhausted ({} tokens) — force-injecting </think>",
-                            self.think_suppress_count);
+                        trace_emit_mark(
+                            self.graph.as_ref().and_then(|g| g.decode_trace.as_ref()),
+                            step,
+                            pos,
+                            next_token,
+                            None,
+                            "sampling",
+                            &format!("phase=thinking_budget_exhausted count={}", self.think_suppress_count),
+                        );
                         te
                     } else {
                         crate::decode::sample_from_logits_pub(
@@ -15655,6 +16499,18 @@ impl GpuDecodeStore {
                     crate::decode::sample_from_logits_pub(
                         logits, vocab_size, temperature, top_k, top_p, &mut rng_next)
                 };
+                trace_emit_mark(
+                    trace_cfg.as_ref(),
+                    step,
+                    pos,
+                    next_token,
+                    None,
+                    "sampling",
+                    &format!(
+                        "phase=sample_result selected_token={} logits_buffer=h_logits speculative_fallback=0",
+                        target_pred,
+                    ),
+                );
                 self.notify_token_generated(target_pred);
 
                 seen_tokens.insert(target_pred);
@@ -16068,6 +16924,7 @@ impl GpuDecodeStore {
         e_score_corr_ptr: usize,
         shared_gate_wid: Option<usize>,
     ) -> PyResult<()> {
+        let trace_cfg = self.active_trace_owned();
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
 
@@ -16152,25 +17009,28 @@ impl GpuDecodeStore {
             let se_k_w13 = graph.hidden_size;
             let expected_bf16 = se_k_w13 * se_n_w13 * 2;
             let expected_int8 = se_k_w13 * se_n_w13;
-            if stderr_debug_enabled() {
-                eprintln!("[SHARED_EXPERT_BITS] layer={} packed={} expected_bf16={} expected_int8={} moe_inter={} hidden={}",
-                    layer_idx, se.w13_packed_bytes, expected_bf16, expected_int8, graph.moe_intermediate_size, graph.hidden_size);
-            }
+            trace_emit_global_mark(
+                trace_cfg.as_ref(),
+                "setup",
+                &format!(
+                    "phase=shared_expert_bits_detect layer={} packed={} expected_bf16={} expected_int8={} moe_inter={} hidden={}",
+                    layer_idx,
+                    se.w13_packed_bytes,
+                    expected_bf16,
+                    expected_int8,
+                    graph.moe_intermediate_size,
+                    graph.hidden_size,
+                ),
+            );
             if se.w13_packed_bytes >= expected_bf16 {
                 graph.shared_expert_bits = 16;
-                if stderr_debug_enabled() {
-                    eprintln!("[SHARED_EXPERT_BITS] => BF16 (bits=16)");
-                }
+                trace_emit_global_mark(trace_cfg.as_ref(), "setup", "phase=shared_expert_bits_detect result=bf16 bits=16");
             } else if se.w13_packed_bytes >= expected_int8 {
                 graph.shared_expert_bits = 8;
-                if stderr_debug_enabled() {
-                    eprintln!("[SHARED_EXPERT_BITS] => INT8 (bits=8)");
-                }
+                trace_emit_global_mark(trace_cfg.as_ref(), "setup", "phase=shared_expert_bits_detect result=int8 bits=8");
             } else {
                 graph.shared_expert_bits = 4;
-                if stderr_debug_enabled() {
-                    eprintln!("[SHARED_EXPERT_BITS] => INT4 (bits=4)");
-                }
+                trace_emit_global_mark(trace_cfg.as_ref(), "setup", "phase=shared_expert_bits_detect result=int4 bits=4");
             }
 
             let total_bytes_se = se.w13_packed_bytes + se.w13_scales_bytes
@@ -17322,6 +18182,20 @@ impl GpuDecodeStore {
         }
         if timing { graph.t_moe_d2h_topk += (Instant::now() - t_d2h_start).as_secs_f64(); }
 
+        let ids: Vec<i32> = graph.h_topk_ids[..topk].to_vec();
+        let wts: Vec<f32> = graph.h_topk_weights[..topk].to_vec();
+        trace_emit_route(
+            graph.decode_trace.as_ref(),
+            graph.decode_step_counter,
+            layer_idx,
+            topk,
+            &ids,
+            &wts,
+            moe.norm_topk_prob,
+            sf,
+            ne,
+        );
+
         // ── Step 4.5a: Process PENDING spec results from previous layer ──
         //
         // The previous layer's moe_forward queued spec GEMV+topk on spec_stream.
@@ -17628,6 +18502,9 @@ impl GpuDecodeStore {
         let mut hcs_batch_count = 0usize;
         let mut dma_experts: [(usize, f32); 10] = [(0, 0.0); 10]; // (expert_idx_in_topk, weight)
         let mut dma_count = 0usize;
+        let mut hcs_hit_ids: Vec<usize> = Vec::new();
+        let mut apfl_hit_ids: Vec<usize> = Vec::new();
+        let mut dma_ids: Vec<usize> = Vec::new();
 
         for i in 0..topk {
             let eid = graph.h_topk_ids[i];
@@ -17657,6 +18534,7 @@ impl GpuDecodeStore {
                     graph.h_batch_weights[hcs_batch_count] = weight;
                     hcs_batch_count += 1;
                     hcs_hits += 1;
+                    hcs_hit_ids.push(eid);
                     graph.dma_hcs_experts += 1;
                 }
             } else {
@@ -17699,6 +18577,7 @@ impl GpuDecodeStore {
                         graph.h_batch_weights[hcs_batch_count] = weight;
                         hcs_batch_count += 1;
                         apfl_hits += 1;
+                        apfl_hit_ids.push(eid);
                     }
                 } else {
                     // Cold expert: needs DMA from CPU RAM
@@ -17713,8 +18592,40 @@ impl GpuDecodeStore {
                         );
                         dma_experts[dma_count] = (i, weight);
                         dma_count += 1;
+                        dma_ids.push(eid);
                     }
                 }
+            }
+        }
+
+        if let Some(trace_cfg) = graph.decode_trace.as_ref() {
+            if trace_cfg.should_emit(graph.decode_step_counter, Some(layer_idx), "moe_classify") {
+                let limit = trace_cfg.sample_values.max(1);
+                let fmt_ids = |ids: &[usize]| -> String {
+                    ids.iter()
+                        .take(limit)
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                trace_emit_mark(
+                    Some(trace_cfg),
+                    graph.decode_step_counter,
+                    graph.kv_current_pos,
+                    0,
+                    Some(layer_idx),
+                    "moe_classify",
+                    &format!(
+                        "phase=classify hcs_hits={} apfl_hits={} apfl_misses={} dma_count={} hcs_ids=[{}] apfl_ids=[{}] dma_ids=[{}]",
+                        hcs_hits,
+                        apfl_hits,
+                        apfl_misses,
+                        dma_count,
+                        fmt_ids(&hcs_hit_ids),
+                        fmt_ids(&apfl_hit_ids),
+                        fmt_ids(&dma_ids),
+                    ),
+                );
             }
         }
 
@@ -18325,6 +19236,32 @@ impl GpuDecodeStore {
             // No separate sync -- combined sync at end
         }
 
+        if let Some(trace_cfg) = graph.decode_trace.as_ref() {
+            if trace_cfg.should_emit(graph.decode_step_counter, Some(layer_idx), "moe_out") {
+                trace_emit_bf16(
+                    Some(trace_cfg),
+                    graph.decode_step_counter,
+                    graph.kv_current_pos,
+                    0,
+                    Some(layer_idx),
+                    "moe_out",
+                    "d_moe_out",
+                    *graph.d_moe_out.device_ptr(),
+                    expert_hs,
+                    device,
+                );
+                trace_emit_mark(
+                    Some(trace_cfg),
+                    graph.decode_step_counter,
+                    graph.kv_current_pos,
+                    0,
+                    Some(layer_idx),
+                    "moe_out",
+                    &format!("routed_scaling_factor={} shared_expert={}", rsf, moe.shared.is_some()),
+                );
+            }
+        }
+
         // Final sync: ensure shared expert + scale complete (debug builds only;
         // in release, same-stream ordering guarantees correctness without sync)
         #[cfg(feature = "gpu-debug")]
@@ -18605,11 +19542,26 @@ impl GpuDecodeStore {
                         w13p_bytes, w13s_bytes, w2p_bytes, w2s_bytes, total as f64 / 1024.0,
                     );
                     // BF16 diagnostic: verify CPU data at the pointer
-                    if expert.num_bits == 16 && stderr_debug_enabled() {
+                    if expert.num_bits == 16 {
                         let cpu_data = unsafe { std::slice::from_raw_parts(w13p_ptr as *const u16, 8) };
                         let vals: Vec<f32> = cpu_data.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
-                        eprintln!("[BF16-DMA] Expert[0][0] CPU w13p first8={:.4?} (ptr=0x{:x}, bytes={})",
-                            vals, w13p_ptr, w13p_bytes);
+                        let trace_cfg = self.active_trace_owned();
+                        trace_emit_global_mark(
+                            trace_cfg.as_ref(),
+                            "dma",
+                            &format!(
+                                "phase=expert_cpu_sample moe_layer={} expert=0 ptr=0x{:x} bytes={}",
+                                moe_idx,
+                                w13p_ptr,
+                                w13p_bytes,
+                            ),
+                        );
+                        trace_emit_global_values(
+                            trace_cfg.as_ref(),
+                            "dma",
+                            "expert_0_w13p_cpu_first8",
+                            &vals,
+                        );
                     }
                 }
             }
@@ -19336,6 +20288,7 @@ impl GpuDecodeStore {
         ranking: Vec<(usize, usize)>,
         budget_mb: usize,
     ) -> PyResult<String> {
+        let trace_cfg = self.active_trace_owned();
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
 
@@ -19465,14 +20418,29 @@ impl GpuDecodeStore {
                 let gpu_vals: Vec<f32> = gpu_check.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
                 let cpu_data = unsafe { std::slice::from_raw_parts(expert.w13_packed_ptr as *const u16, 8) };
                 let cpu_vals: Vec<f32> = cpu_data.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
-                if stderr_debug_enabled() {
-                    eprintln!("[HCS-VERIFY] L{}E{} GPU first8={:.4?}", layer_idx, expert_idx, gpu_vals);
-                    eprintln!("[HCS-VERIFY] L{}E{} CPU first8={:.4?}", layer_idx, expert_idx, cpu_vals);
-                }
                 let match_ok = gpu_vals == cpu_vals;
-                if stderr_debug_enabled() {
-                    eprintln!("[HCS-VERIFY] Match: {}", match_ok);
-                }
+                trace_emit_global_mark(
+                    trace_cfg.as_ref(),
+                    "hcs",
+                    &format!(
+                        "phase=pool_verify layer={} expert={} match={}",
+                        layer_idx,
+                        expert_idx,
+                        match_ok,
+                    ),
+                );
+                trace_emit_global_values(
+                    trace_cfg.as_ref(),
+                    "hcs",
+                    "pool_verify_gpu_first8",
+                    &gpu_vals,
+                );
+                trace_emit_global_values(
+                    trace_cfg.as_ref(),
+                    "hcs",
+                    "pool_verify_cpu_first8",
+                    &cpu_vals,
+                );
             }
 
             let entry = HcsCacheEntry {

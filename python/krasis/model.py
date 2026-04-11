@@ -29,11 +29,28 @@ from krasis.layer import TransformerLayer
 from krasis.kv_cache import PagedKVCache, SequenceKVState
 from krasis.sampler import sample
 
-# Debug: env var to enable per-layer decode logging
-_DEBUG_DECODE = os.environ.get("KRASIS_DEBUG_DECODE", "") == "1"
 from krasis.tokenizer import Tokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _python_trace_enabled(component: str) -> bool:
+    if os.environ.get("KRASIS_TRACE") != "1":
+        return False
+    raw = os.environ.get("KRASIS_TRACE_COMPONENTS", "").strip()
+    if not raw:
+        return True
+    filters = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    component = component.lower()
+    if "all" in filters or component in filters:
+        return True
+    prefix = component.split("_", 1)[0]
+    return prefix in filters
+
+
+def _python_trace(component: str, message: str) -> None:
+    if _python_trace_enabled(component):
+        logger.info("[KRASIS-TRACE] event=mark scope=python component=%s %s", component, message)
 
 
 def _weight_dtype_code(t: torch.Tensor) -> int:
@@ -2252,15 +2269,15 @@ class KrasisModel:
             t_shared_launched = time.perf_counter()
 
         # 3. Transfer to HCS device
-        if _DEBUG_DECODE:
-            import sys
+        trace_xdev = _python_trace_enabled("py_moe")
+        if trace_xdev:
             torch.cuda.synchronize(layer_dev)
             _xdev_t0 = time.perf_counter()
         hidden_hcs = _to_device(hidden_on_layer_dev, hcs_dev)
         topk_ids_hcs = _to_device(topk_ids, hcs_dev)
         topk_weights_hcs = _to_device(topk_weights, hcs_dev)
 
-        if _DEBUG_DECODE:
+        if trace_xdev:
             torch.cuda.synchronize(hcs_dev)
             _xdev_xfer_ms = (time.perf_counter() - _xdev_t0) * 1000
 
@@ -2270,14 +2287,14 @@ class KrasisModel:
 
         # 4. Routed experts on HCS device via its manager
         hcs_mgr = self.gpu_prefill_managers.get(str(hcs_dev))
-        if _DEBUG_DECODE:
+        if trace_xdev:
             _xdev_t1 = time.perf_counter()
         if hcs_mgr is not None:
             routed_output = hcs_mgr.forward(
                 moe_layer_idx, hidden_hcs, topk_ids_hcs, topk_weights_hcs,
                 routed_only=True,
             )
-            if _DEBUG_DECODE:
+            if trace_xdev:
                 torch.cuda.synchronize(hcs_dev)
                 _xdev_fwd_ms = (time.perf_counter() - _xdev_t1) * 1000
         else:
@@ -2292,11 +2309,11 @@ class KrasisModel:
             t_hcs_done = time.perf_counter()
 
         # 5. Transfer routed output back to layer_dev
-        if _DEBUG_DECODE:
+        if trace_xdev:
             _xdev_t2 = time.perf_counter()
         routed_on_layer = _to_device(routed_output, layer_dev)
 
-        if _DEBUG_DECODE:
+        if trace_xdev:
             torch.cuda.synchronize(layer_dev)
             _xdev_back_ms = (time.perf_counter() - _xdev_t2) * 1000
 
@@ -2305,7 +2322,7 @@ class KrasisModel:
             t_xfer_back = time.perf_counter()
 
         # 6. Apply scaling + combine with shared expert
-        if _DEBUG_DECODE:
+        if trace_xdev:
             _xdev_t3 = time.perf_counter()
         rsf = self.cfg.routed_scaling_factor
         if rsf != 1.0:
@@ -2318,12 +2335,18 @@ class KrasisModel:
         elif shared_output is not None:
             routed_on_layer = routed_on_layer + shared_output
 
-        if _DEBUG_DECODE:
+        if trace_xdev:
             torch.cuda.synchronize(layer_dev)
             _xdev_combine_ms = (time.perf_counter() - _xdev_t3) * 1000
-            print(
-                f"[DBG]   xdev L{moe_layer_idx}: xfer→hcs={_xdev_xfer_ms:.1f}ms fwd={_xdev_fwd_ms:.1f}ms xfer←={_xdev_back_ms:.1f}ms combine={_xdev_combine_ms:.1f}ms",
-                file=sys.stderr, flush=True,
+            _python_trace(
+                "py_moe",
+                (
+                    f"phase=cross_device_moe layer={moe_layer_idx} "
+                    f"xfer_to_hcs_ms={_xdev_xfer_ms:.3f} "
+                    f"hcs_forward_ms={_xdev_fwd_ms:.3f} "
+                    f"xfer_back_ms={_xdev_back_ms:.3f} "
+                    f"combine_ms={_xdev_combine_ms:.3f}"
+                ),
             )
 
         if timing:
@@ -2439,9 +2462,7 @@ class KrasisModel:
         # Pre-load layer 0 synchronously into buf 0 before the loop
         if _stream_attn:
             self._stream_attn_load(0, buf_idx=0)
-            if _DEBUG_DECODE:
-                import sys
-                print(f"[DBG] pre-loaded layer 0 into buf 0", file=sys.stderr, flush=True)
+            _python_trace("py_stream", "phase=preload layer=0 buffer=0")
 
         for abs_layer_idx in range(self.cfg.num_hidden_layers):
             layer = self.layers[abs_layer_idx]
@@ -2475,10 +2496,10 @@ class KrasisModel:
 
             # Double-buffered streaming attention
             _dbg_stream_ms = 0.0  # default for non-streaming layers
+            trace_stream = _python_trace_enabled("py_stream")
             if _stream_attn:
                 buf_idx = abs_layer_idx % 2
-                if _DEBUG_DECODE:
-                    import sys
+                if trace_stream:
                     torch.cuda.synchronize(layer_dev)
                     _dbg_t0 = time.perf_counter()
 
@@ -2494,7 +2515,7 @@ class KrasisModel:
                     # Fallback: synchronous load (first layer already loaded above)
                     self._stream_attn_load(abs_layer_idx, buf_idx)
 
-                if _DEBUG_DECODE:
+                if trace_stream:
                     torch.cuda.synchronize(layer_dev)
                     _dbg_stream_ms = (time.perf_counter() - _dbg_t0) * 1000
 
@@ -2612,8 +2633,8 @@ class KrasisModel:
                     _t_moe_layers += 1
 
             elif use_cross_device_moe:
-                if _DEBUG_DECODE:
-                    import sys
+                trace_layer = _python_trace_enabled("py_layer")
+                if trace_layer:
                     torch.cuda.synchronize(layer_dev)
                     _dbg_attn_t0 = time.perf_counter()
 
@@ -2645,7 +2666,7 @@ class KrasisModel:
                         _t_gqa_attn_total += _dt
                         _t_gqa_layers += 1
 
-                if _DEBUG_DECODE:
+                if trace_layer:
                     torch.cuda.synchronize(layer_dev)
                     _dbg_attn_ms = (time.perf_counter() - _dbg_attn_t0) * 1000
                     _dbg_moe_t0 = time.perf_counter()
@@ -2653,9 +2674,16 @@ class KrasisModel:
                 # MoE on HCS device, result back on layer_dev
                 hidden = self._cross_device_moe(layer, hidden, moe_layer_idx)
 
-                if _DEBUG_DECODE:
+                if trace_layer:
                     _dbg_moe_ms = (time.perf_counter() - _dbg_moe_t0) * 1000
-                    print(f"[DBG] L{abs_layer_idx} stream={_dbg_stream_ms:.1f}ms attn={_dbg_attn_ms:.1f}ms moe={_dbg_moe_ms:.1f}ms", file=sys.stderr, flush=True)
+                    _python_trace(
+                        "py_layer",
+                        (
+                            f"phase=decode_layer layer={abs_layer_idx} mode=cross_device "
+                            f"stream_ms={_dbg_stream_ms:.3f} attn_ms={_dbg_attn_ms:.3f} "
+                            f"moe_ms={_dbg_moe_ms:.3f}"
+                        ),
+                    )
 
                 if timing:
                     # _cross_device_moe already syncs internally when timing
@@ -2663,8 +2691,8 @@ class KrasisModel:
                     _t_moe_total += _t_moe_done - _t_la_done
                     _t_moe_layers += 1
             else:
-                if _DEBUG_DECODE:
-                    import sys
+                trace_layer = _python_trace_enabled("py_layer")
+                if trace_layer:
                     torch.cuda.synchronize(layer_dev)
                     _dbg_uni_t0 = time.perf_counter()
 
@@ -2703,10 +2731,17 @@ class KrasisModel:
                 else:
                     hidden = layer._dense_mlp_forward(hidden)
 
-                if _DEBUG_DECODE:
+                if trace_layer:
                     torch.cuda.synchronize(layer_dev)
                     _dbg_uni_ms = (time.perf_counter() - _dbg_uni_t0) * 1000
-                    print(f"[DBG] L{abs_layer_idx} stream={_dbg_stream_ms:.1f}ms unified={_dbg_uni_ms:.1f}ms (moe={layer.is_moe})", file=sys.stderr, flush=True)
+                    _python_trace(
+                        "py_layer",
+                        (
+                            f"phase=decode_layer layer={abs_layer_idx} mode=unified "
+                            f"stream_ms={_dbg_stream_ms:.3f} unified_ms={_dbg_uni_ms:.3f} "
+                            f"moe={int(layer.is_moe)}"
+                        ),
+                    )
 
                 if timing:
                     torch.cuda.synchronize(layer_dev)
@@ -3697,6 +3732,62 @@ class KrasisModel:
             self._transfer_mamba2_states()
             self._update_la_state_ptrs()
             self._update_la_state_ptrs_aux()
+
+            # Optional Python-side comparison against the first Rust decode step.
+            if os.environ.get("KRASIS_TRACE_PY_COMPARE") == "1":
+                logger.info(
+                    "[KRASIS-TRACE] event=python_compare phase=begin token=%d pos=%d prompt_len=%d",
+                    next_token, len(prompt_tokens), len(prompt_tokens),
+                )
+                # Snapshot recurrent states and KV caches before Python forward
+                saved_seq = []
+                for rank_states in seq_states_per_rank:
+                    rank_snap = []
+                    for s in rank_states:
+                        if s is not None:
+                            rank_snap.append({k: v.clone() if isinstance(v, torch.Tensor) else v
+                                              for k, v in s.items()})
+                        else:
+                            rank_snap.append(None)
+                    saved_seq.append(rank_snap)
+                # Save KV cache state (FP8 cache positions)
+                saved_kv = []
+                for kvc in self.kv_caches:
+                    if kvc is not None:
+                        saved_kv.append((kvc.k_cache.clone(), kvc.v_cache.clone()))
+                    else:
+                        saved_kv.append(None)
+                with torch.no_grad():
+                    tok_t = torch.tensor([next_token], dtype=torch.long, device=device)
+                    pos_t = torch.tensor([len(prompt_tokens)], dtype=torch.int32, device=device)
+                    py_logits = self.forward(tok_t, pos_t, seq_states_per_rank)
+                    py_top5 = torch.topk(py_logits[0], 5)
+                    top5 = ",".join(
+                        f"{py_top5.indices[i].item()}:{py_top5.values[i].item():.6f}"
+                        for i in range(5)
+                    )
+                    lmin, lmax = py_logits[0].min().item(), py_logits[0].max().item()
+                    logger.info(
+                        "[KRASIS-TRACE] event=python_compare phase=python_step pos=%d token=%d top5=[%s] logit_min=%.6f logit_max=%.6f spread=%.6f",
+                        len(prompt_tokens), next_token, top5, lmin, lmax, lmax - lmin,
+                    )
+                # Restore recurrent states
+                for ri, rank_snap in enumerate(saved_seq):
+                    for si, snap in enumerate(rank_snap):
+                        if snap is not None:
+                            for k, v in snap.items():
+                                if isinstance(v, torch.Tensor):
+                                    seq_states_per_rank[ri][si][k].copy_(v)
+                # Restore KV caches
+                for i, saved in enumerate(saved_kv):
+                    if saved is not None:
+                        self.kv_caches[i].k_cache.copy_(saved[0])
+                        self.kv_caches[i].v_cache.copy_(saved[1])
+                # Re-export state to Rust
+                self._update_la_state_ptrs()
+                self._update_la_state_ptrs_aux()
+                logger.info("[KRASIS-TRACE] event=python_compare phase=restore_complete pos=%d", len(prompt_tokens))
+
             # Multi-GPU: free prefill-only attention before decode
             self._free_prefill_only_attention()
             # Single-slot AWQ: swap simple INT4 into GPU slots for decode

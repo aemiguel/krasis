@@ -42,6 +42,17 @@
 #     ./dev run qcn --timing          Run server with timing enabled
 #     ./dev benchmark qcn             Normal speed benchmark (no timing overhead)
 #
+# Debug tracing:
+#   KRASIS_TRACE=1 enables structured decode tracing with zero normal-mode cost.
+#   Optional filters:
+#     KRASIS_TRACE_STEPS=0-1
+#     KRASIS_TRACE_LAYERS=0-3
+#     KRASIS_TRACE_COMPONENTS=embedding,gqa,moe,final
+#     KRASIS_TRACE_VALUES=8
+#     KRASIS_TRACE_ELEMS=2048
+#     KRASIS_TRACE_DUMP_DIR=/tmp/krasis-trace
+#     KRASIS_TRACE_PY_COMPARE=1  # one Python first-step compare before Rust decode
+#
 # Configs are short names that map to testconfigs/*.conf:
 #   qcn         -> testconfigs/qcn-4-4-a16.conf
 #   qcn-a4      -> testconfigs/qcn-4-4-awq.conf
