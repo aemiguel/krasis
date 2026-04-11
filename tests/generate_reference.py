@@ -14,6 +14,7 @@ This script must be run via ./dev generate-reference, not directly.
 import argparse
 import json
 import os
+import shlex
 import sys
 import time
 from datetime import datetime
@@ -74,6 +75,61 @@ def warn(msg: str):
 def die(msg: str):
     print(f"{RED}{BOLD}ERROR{NC} {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def build_invocation_metadata(model_name: str, profile_id: str, max_new_tokens: int) -> Dict[str, Any]:
+    run_dir = os.environ.get("KRASIS_RUN_DIR")
+    script_argv = [str(Path(arg)) if idx == 0 else arg for idx, arg in enumerate(sys.argv)]
+    dev_command = os.environ.get("KRASIS_DEV_CMD")
+    if not dev_command:
+        dev_command = " ".join(shlex.quote(arg) for arg in (["./dev", "generate-reference"] + sys.argv[1:]))
+    metadata: Dict[str, Any] = {
+        "captured_at": datetime.now().isoformat(),
+        "dev_command": dev_command,
+        "script_argv": script_argv,
+        "cwd": str(Path.cwd().resolve()),
+        "run_type": os.environ.get("KRASIS_RUN_TYPE"),
+        "model": model_name,
+        "profile_id": profile_id,
+        "max_new_tokens": max_new_tokens,
+    }
+    if run_dir:
+        metadata["run_dir"] = str(Path(run_dir).resolve())
+    return metadata
+
+
+def write_run_manifest(
+    invocation: Dict[str, Any],
+    output_path: Path,
+    model_name: str,
+    profile_id: str,
+    max_new_tokens: int,
+) -> None:
+    run_dir = invocation.get("run_dir")
+    if not run_dir:
+        return
+    manifest_path = Path(run_dir) / "generate_reference_manifest.json"
+    manifest = {
+        "kind": "generate_reference_manifest",
+        "captured_at": invocation.get("captured_at"),
+        "dev_command": invocation.get("dev_command"),
+        "script_argv": invocation.get("script_argv"),
+        "cwd": invocation.get("cwd"),
+        "run_dir": run_dir,
+        "run_type": invocation.get("run_type"),
+        "model": model_name,
+        "profile_id": profile_id,
+        "max_new_tokens": max_new_tokens,
+        "reference_output_path": str(output_path.resolve()),
+        "follow_up_commands": [
+            "./dev reference-inventory",
+            "./dev validate <config> --max-prompts 0 --no-server --port 1",
+            "./dev reference-test <config>",
+        ],
+    }
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    ok(f"Run manifest saved: {manifest_path}")
 
 
 def parse_prompt_conversations(lines: List[str]) -> List[List[str]]:
@@ -171,6 +227,7 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
     capture_settings = capture_settings_for_profile(profile_id)
     capture_settings["source"] = "local_generate_reference"
     info(f"Reference profile: {profile_id}")
+    invocation = build_invocation_metadata(model_name, profile_id, max_new_tokens)
 
     # Generate reference outputs
     result = {
@@ -182,6 +239,7 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
         "max_new_tokens": max_new_tokens,
         "eos_token_ids": eos_token_ids,
         "capture_settings": capture_settings,
+        "capture_invocation": invocation,
         "conversations": [],
     }
 
@@ -278,6 +336,7 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
         runtime_name="transformers",
         runtime_version=result.get("runtime_version"),
         torch_dtype="bfloat16",
+        extra={"capture_invocation": invocation},
     )
 
     # Save reference
@@ -293,6 +352,7 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
         str(output_path),
         max_new_tokens=max_new_tokens,
     )
+    write_run_manifest(invocation, output_path, model_name, profile_id, max_new_tokens)
 
     ok(f"Reference saved: {output_path}")
     ok(

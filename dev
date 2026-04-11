@@ -1013,9 +1013,20 @@ do_generate_reference() {
     ./dev generate-reference Qwen3-Coder-Next --profile greedy_chat_thinking_off"
     cleanup_gpu
     auto_rebuild
+    local run_dir logfile dev_cmd
+    run_dir=$(create_run_dir "generate-reference")
+    logfile="$run_dir/generate_reference_stdout.log"
+    printf -v dev_cmd '%q ' ./dev generate-reference "$@"
+    dev_cmd="${dev_cmd% }"
     info "Generating reference: $1"
+    info "Run dir: $run_dir"
     verify_repo_imports
-    KRASIS_DEV_SCRIPT=1 exec_repo_python "$SCRIPT_DIR/tests/generate_reference.py" "$@"
+    set +e
+    KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="generate-reference" KRASIS_DEV_CMD="$dev_cmd" \
+        run_repo_python "$SCRIPT_DIR/tests/generate_reference.py" "$@" 2>&1 | tee "$logfile"
+    local status=${PIPESTATUS[0]}
+    set -e
+    return "$status"
 }
 
 do_trace_diff() {
