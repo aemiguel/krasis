@@ -65,6 +65,14 @@ FAMILY_MEMBER_FIELDS = (
     "dtype",
 )
 
+PACKET_SIGNATURE_COUNT_FIELDS = (
+    "event",
+    "component",
+    "tensor",
+    "label",
+    "dtype",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Diff two KRASIS_TRACE logs")
@@ -765,6 +773,57 @@ def _family_member_brief(event: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in brief.items() if value is not None}
 
 
+def _counter_entries(
+    counts: collections.Counter[str],
+) -> List[Dict[str, Any]]:
+    return [
+        {"value": key, "count": count}
+        for key, count in sorted(counts.items())
+    ]
+
+
+def _packet_signature(
+    packet: Dict[str, Any],
+) -> Dict[str, Any]:
+    events = packet.get("events", [])
+    member_counts = _family_counts(events)
+    field_counts = {field: collections.Counter() for field in PACKET_SIGNATURE_COUNT_FIELDS}
+    ordered_members: List[List[Tuple[str, str]]] = []
+
+    for event in events:
+        member_key = _family_member_key(event)
+        ordered_members.append(list(member_key))
+        for field in PACKET_SIGNATURE_COUNT_FIELDS:
+            value = event.get(field)
+            if value is not None:
+                field_counts[field][str(value)] += 1
+
+    return {
+        "identity": packet.get("identity"),
+        "event_count": len(events),
+        "unique_member_count": len(member_counts),
+        "member_counts": [
+            {"member": list(member_key), "count": count}
+            for member_key, count in sorted(member_counts.items())
+        ],
+        "ordered_members": ordered_members,
+        "event_counts": _counter_entries(field_counts["event"]),
+        "component_counts": _counter_entries(field_counts["component"]),
+        "tensor_counts": _counter_entries(field_counts["tensor"]),
+        "label_counts": _counter_entries(field_counts["label"]),
+        "dtype_counts": _counter_entries(field_counts["dtype"]),
+    }
+
+
+def _packet_signature_key(packet: Optional[Dict[str, Any]]) -> Optional[str]:
+    if packet is None:
+        return None
+    signature = packet.get("signature")
+    if signature is None:
+        return None
+    return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+
 def _family_slice(
     events: Sequence[Dict[str, Any]],
     *,
@@ -978,6 +1037,8 @@ def _family_packets(
                 "events": packet_events,
             }
         )
+        packets[-1]["signature"] = _packet_signature(packets[-1])
+        packets[-1]["signature_key"] = _packet_signature_key(packets[-1])
         index = end
     return packets
 
@@ -985,11 +1046,19 @@ def _family_packets(
 def _packet_brief(packet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if packet is None:
         return None
+    signature = packet.get("signature") or {}
     return {
         "identity": packet.get("identity"),
         "start_index": packet.get("start_index"),
         "end_index": packet.get("end_index"),
         "event_count": packet.get("event_count"),
+        "signature_key": packet.get("signature_key"),
+        "signature": {
+            "unique_member_count": signature.get("unique_member_count"),
+            "member_counts": signature.get("member_counts"),
+            "event_counts": signature.get("event_counts"),
+            "component_counts": signature.get("component_counts"),
+        },
         "members": packet.get("members"),
     }
 
@@ -998,13 +1067,17 @@ def _packet_identity_equal(expected_packet: Dict[str, Any], actual_packet: Dict[
     return (expected_packet.get("identity") or []) == (actual_packet.get("identity") or [])
 
 
+def _packet_structure_equal(expected_packet: Dict[str, Any], actual_packet: Dict[str, Any]) -> bool:
+    return expected_packet.get("signature_key") == actual_packet.get("signature_key")
+
+
 def _packet_equal(
     expected_packet: Dict[str, Any],
     actual_packet: Dict[str, Any],
     *,
     ignore_fields: set[str],
 ) -> bool:
-    if not _packet_identity_equal(expected_packet, actual_packet):
+    if not _packet_structure_equal(expected_packet, actual_packet):
         return False
     expected_events = expected_packet.get("events", [])
     actual_events = actual_packet.get("events", [])
@@ -1073,6 +1146,11 @@ def _family_region_resync_hint(
     ):
         return None
 
+    current_expected_packet = expected_packets[expected_packet_index]
+    current_actual_packet = actual_packets[actual_packet_index]
+    if _packet_structure_equal(current_expected_packet, current_actual_packet):
+        return None
+
     best: Optional[Dict[str, Any]] = None
     max_expected_skip = min(window, max(0, len(expected_packets) - expected_packet_index - 1))
     max_actual_skip = min(window, max(0, len(actual_packets) - actual_packet_index - 1))
@@ -1085,24 +1163,29 @@ def _family_region_resync_hint(
             act_resume = actual_packet_index + actual_skip
             if exp_resume >= len(expected_packets) or act_resume >= len(actual_packets):
                 continue
-            if not _packet_equal(
+            if not _packet_structure_equal(
                 expected_packets[exp_resume],
                 actual_packets[act_resume],
-                ignore_fields=ignore_fields,
             ):
                 continue
 
-            resumed_packet_match_count = 0
+            resumed_packet_signature_match_count = 0
+            resumed_packet_exact_match_count = 0
             probe_expected = exp_resume
             probe_actual = act_resume
             while probe_expected < len(expected_packets) and probe_actual < len(actual_packets):
-                if not _packet_equal(
+                if not _packet_structure_equal(
+                    expected_packets[probe_expected],
+                    actual_packets[probe_actual],
+                ):
+                    break
+                resumed_packet_signature_match_count += 1
+                if _packet_equal(
                     expected_packets[probe_expected],
                     actual_packets[probe_actual],
                     ignore_fields=ignore_fields,
                 ):
-                    break
-                resumed_packet_match_count += 1
+                    resumed_packet_exact_match_count += 1
                 probe_expected += 1
                 probe_actual += 1
 
@@ -1119,7 +1202,8 @@ def _family_region_resync_hint(
                 "actual_skip": actual_skip,
                 "expected_resume_packet_index": exp_resume,
                 "actual_resume_packet_index": act_resume,
-                "resumed_packet_match_count": resumed_packet_match_count,
+                "resumed_packet_signature_match_count": resumed_packet_signature_match_count,
+                "resumed_packet_exact_match_count": resumed_packet_exact_match_count,
                 "expected_resume_packet": _packet_brief(expected_packets[exp_resume]),
                 "actual_resume_packet": _packet_brief(actual_packets[act_resume]),
                 "expected_skipped_packets": [
@@ -1134,7 +1218,8 @@ def _family_region_resync_hint(
             score = (
                 expected_skip + actual_skip,
                 max(expected_skip, actual_skip),
-                -resumed_packet_match_count,
+                -resumed_packet_signature_match_count,
+                -resumed_packet_exact_match_count,
             )
             if best is None or score < best["_score"]:
                 candidate["_score"] = score
@@ -1161,12 +1246,38 @@ def _family_region_analysis(
 
     expected_packet_index = _packet_index_for_event_index(expected_packets, event_index)
     actual_packet_index = _packet_index_for_event_index(actual_packets, event_index)
+    expected_focus_packet = (
+        expected_packets[expected_packet_index]
+        if expected_packet_index is not None and expected_packet_index < len(expected_packets)
+        else None
+    )
+    actual_focus_packet = (
+        actual_packets[actual_packet_index]
+        if actual_packet_index is not None and actual_packet_index < len(actual_packets)
+        else None
+    )
 
     return {
         "expected_packet_index": expected_packet_index,
         "actual_packet_index": actual_packet_index,
         "expected_packet_count": len(expected_packets),
         "actual_packet_count": len(actual_packets),
+        "expected_focus_packet": _packet_brief(expected_focus_packet),
+        "actual_focus_packet": _packet_brief(actual_focus_packet),
+        "focus_packet_structure_match": (
+            _packet_structure_equal(expected_focus_packet, actual_focus_packet)
+            if expected_focus_packet is not None and actual_focus_packet is not None
+            else None
+        ),
+        "focus_packet_exact_match": (
+            _packet_equal(
+                expected_focus_packet,
+                actual_focus_packet,
+                ignore_fields=ignore_fields,
+            )
+            if expected_focus_packet is not None and actual_focus_packet is not None
+            else None
+        ),
         "expected_packet_window": _packet_window(
             expected_packets,
             expected_packet_index,
@@ -1430,6 +1541,130 @@ def _resync_hint(
     return best
 
 
+def _classify_divergence(
+    comparison: Dict[str, Any],
+    *,
+    semantic_analysis: Optional[Dict[str, Any]],
+    family_analysis: Optional[Dict[str, Any]],
+    family_region_analysis: Optional[Dict[str, Any]],
+    resync_hint: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if comparison.get("status") == "match":
+        return {
+            "classification": "trace_match",
+            "summary": "All compared trace events matched",
+            "scope": "trace",
+            "confidence": "high",
+        }
+
+    expected_event = comparison.get("expected_event") or {}
+    actual_event = comparison.get("actual_event") or {}
+    component = expected_event.get("component") or actual_event.get("component")
+    event_name = expected_event.get("event") or actual_event.get("event")
+    reason = comparison.get("reason")
+
+    if component == "config_contract":
+        return {
+            "classification": "config_contract_divergence",
+            "summary": "Reference/runtime contract state diverged before or during validation",
+            "scope": "contract",
+            "confidence": "high",
+        }
+
+    same_family_identity = (
+        family_analysis is not None
+        and (family_analysis.get("expected_identity") or []) == (family_analysis.get("actual_identity") or [])
+    )
+
+    if reason == "event_value_mismatch":
+        if same_family_identity and family_analysis and family_analysis.get("first_shared_value_mismatch") is not None:
+            kind = semantic_analysis.get("kind") if semantic_analysis is not None else None
+            classification = f"same_family_{kind}_value_mismatch" if kind else "same_family_value_mismatch"
+            summary = (
+                f"Same-family {kind} value drift inside one decode packet"
+                if kind
+                else "Same-family value drift inside one decode packet"
+            )
+            return {
+                "classification": classification,
+                "summary": summary,
+                "scope": "decode_family",
+                "confidence": "high",
+            }
+        kind = semantic_analysis.get("kind") if semantic_analysis is not None else event_name
+        return {
+            "classification": f"same_position_{kind}_value_mismatch" if kind else "same_position_value_mismatch",
+            "summary": (
+                f"Same-position {kind} value mismatch"
+                if kind
+                else "Same-position value mismatch"
+            ),
+            "scope": "event",
+            "confidence": "high",
+        }
+
+    if same_family_identity and family_analysis:
+        if family_analysis.get("missing_members"):
+            return {
+                "classification": "decode_family_missing_member",
+                "summary": "Decode family is missing one or more expected sub-events",
+                "scope": "decode_family",
+                "confidence": "high",
+            }
+        if family_analysis.get("unexpected_members"):
+            return {
+                "classification": "decode_family_unexpected_member",
+                "summary": "Decode family contains unexpected extra sub-events",
+                "scope": "decode_family",
+                "confidence": "high",
+            }
+        if family_analysis.get("multiplicity_mismatches"):
+            return {
+                "classification": "decode_family_multiplicity_mismatch",
+                "summary": "Decode family contains the right member type but wrong multiplicity",
+                "scope": "decode_family",
+                "confidence": "high",
+            }
+
+    family_region_resync = None
+    if family_region_analysis is not None:
+        family_region_resync = family_region_analysis.get("resync_hint")
+    if family_region_resync is not None:
+        label_map = {
+            "missing_expected_families": "missing expected family packets",
+            "unexpected_actual_families": "unexpected actual family packets",
+            "shifted_family_region": "shifted family region with later realignment",
+        }
+        return {
+            "classification": family_region_resync.get("type", "family_region_shift"),
+            "summary": (
+                f"Family-region structural shift: {label_map.get(family_region_resync.get('type'), family_region_resync.get('type'))}"
+            ),
+            "scope": "decode_region",
+            "confidence": "medium" if family_region_resync.get("resumed_packet_exact_match_count", 0) == 0 else "high",
+        }
+
+    if resync_hint is not None:
+        label_map = {
+            "missing_expected_events": "missing expected events",
+            "unexpected_actual_events": "unexpected actual events",
+            "shifted_both_streams": "shifted event streams with later realignment",
+        }
+        return {
+            "classification": resync_hint.get("type", "event_stream_shift"),
+            "summary": f"Event-stream shift: {label_map.get(resync_hint.get('type'), resync_hint.get('type'))}",
+            "scope": "event_stream",
+            "confidence": "medium",
+        }
+
+    return {
+        "classification": reason or "trace_divergence",
+        "summary": f"Unclassified divergence at event={event_name} component={component}",
+        "scope": "generic",
+        "confidence": "low",
+    }
+
+
 def _print_summary(report: Dict[str, Any]) -> None:
     print("Trace diff")
     print(f"Expected: {report['expected_path']}")
@@ -1439,6 +1674,15 @@ def _print_summary(report: Dict[str, Any]) -> None:
     print(f"Matching prefix: {report['matching_prefix_count']}")
     print(f"Status: {report['comparison']['status']}")
     print(f"Reason: {report['comparison']['reason']}")
+    classification = report.get("classification")
+    if classification is not None:
+        print(
+            "Classification: "
+            f"{classification.get('classification')} "
+            f"scope={classification.get('scope')} "
+            f"confidence={classification.get('confidence')}"
+        )
+        print(f"Classification summary: {classification.get('summary')}")
 
     if report.get("matching_prefix_last_event") is not None:
         print(f"Last matching event: {_format_pairs(sorted(report['matching_prefix_last_event'].items()))}")
@@ -1604,13 +1848,15 @@ def _print_summary(report: Dict[str, Any]) -> None:
                 f" type={family_region_resync.get('type')}"
                 f" expected_skip={family_region_resync.get('expected_skip')}"
                 f" actual_skip={family_region_resync.get('actual_skip')}"
-                f" resumed_packet_match_count={family_region_resync.get('resumed_packet_match_count')}"
+                f" resumed_packet_signature_match_count={family_region_resync.get('resumed_packet_signature_match_count')}"
+                f" resumed_packet_exact_match_count={family_region_resync.get('resumed_packet_exact_match_count')}"
             )
             if family_region_resync.get("expected_skipped_packets"):
                 print("  expected_skipped_packets:")
                 for packet in family_region_resync["expected_skipped_packets"]:
                     print(
                         f"    events={packet.get('event_count')} "
+                        f"unique_members={packet.get('signature', {}).get('unique_member_count')} "
                         f"{_format_pairs(packet.get('identity') or [])}"
                     )
             if family_region_resync.get("actual_skipped_packets"):
@@ -1618,6 +1864,7 @@ def _print_summary(report: Dict[str, Any]) -> None:
                 for packet in family_region_resync["actual_skipped_packets"]:
                     print(
                         f"    events={packet.get('event_count')} "
+                        f"unique_members={packet.get('signature', {}).get('unique_member_count')} "
                         f"{_format_pairs(packet.get('identity') or [])}"
                     )
     if resync_hint is not None:
@@ -1776,6 +2023,13 @@ def main() -> int:
             window=max(args.resync_window, 0),
             ignore_fields=ignore_fields,
         )
+    report["classification"] = _classify_divergence(
+        comparison,
+        semantic_analysis=report["semantic_analysis"],
+        family_analysis=report["family_analysis"],
+        family_region_analysis=report["family_region_analysis"],
+        resync_hint=report["resync_hint"],
+    )
 
     _print_summary(report)
 
