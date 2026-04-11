@@ -22,6 +22,7 @@
 #   ./dev reference-test <config>   Compare engine output against BF16 reference data
 #   ./dev reference-test --compare <model>  Run 4 quant configs, produce comparative report
 #   ./dev reference-inventory       Inventory stored reference artifacts and classify contract state
+#   ./dev reference-prep <model>    Prepare HF capture deps and download a public model
 #   ./dev generate-reference <model>  Generate a BF16 HF reference capture
 #   ./dev trace-diff <expected> <actual>  Diff two KRASIS_TRACE logs offline
 #   ./dev awq-calibrate <config>    Run AWQ calibration, produce attention template
@@ -989,6 +990,17 @@ do_reference_inventory() {
     KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="reference-inventory" run_repo_python "$SCRIPT_DIR/tests/reference_inventory.py" "$@"
 }
 
+do_reference_prep() {
+    [[ $# -lt 1 && ! " ${*:-} " =~ [[:space:]](--help|-h|--list-models)[[:space:]] ]] && err "Usage: ./dev reference-prep <model> [--detach] [--print-urls|--urls-only] [--deps-only|--download-only] [--dest-root PATH]
+  Prepares the HF reference-capture environment and downloads a public model to ~/.krasis/models.
+  Examples:
+    ./dev reference-prep qcn
+    ./dev reference-prep qwen35 --detach
+    ./dev reference-prep gemma --urls-only"
+    info "Preparing reference host: ${1:-listing models}"
+    KRASIS_DEV_SCRIPT=1 KRASIS_DEV_PYTHON="$PYTHON" KRASIS_DEV_PIP="$PIP" "$SCRIPT_DIR/scripts/reference_capture_prep.sh" "$@"
+}
+
 do_generate_reference() {
     [[ $# -lt 1 ]] && err "Usage: ./dev generate-reference <model> [--max-tokens N] [--profile PROFILE]
   Generates a BF16 HuggingFace greedy reference with full contract metadata.
@@ -1009,7 +1021,8 @@ do_generate_reference() {
 do_trace_diff() {
     [[ $# -lt 2 ]] && err "Usage: ./dev trace-diff <expected-trace> <actual-trace> [--events mark,tensor,...] [--components decode,...] [--contexts ctx1,ctx2] [--phases artifact,validation] [--show-window N] [--resync-window N] [--family-resync-window N]
   Diffs two KRASIS_TRACE logs offline, reports the first divergence, summarizes matching-prefix plus context/phase counts,
-  gives bounded event-level and family-region resync hints for short shifted regions, and adds typed analysis for tensor/logits/route mismatches."
+  classifies the divergence, gives bounded event-level and family-region resync hints for short shifted regions,
+  adds typed analysis for tensor/logits/route mismatches, and reports stronger family-packet signatures."
     local run_dir
     run_dir=$(create_run_dir "trace-diff")
     info "Running trace diff"
@@ -1129,6 +1142,7 @@ case "$cmd" in
     release-test-all) do_release_test_all "$@" ;;
     reference-test) do_reference_test "$@" ;;
     reference-inventory) do_reference_inventory "$@" ;;
+    reference-prep) do_reference_prep "$@" ;;
     generate-reference) do_generate_reference "$@" ;;
     trace-diff)     do_trace_diff "$@" ;;
     perplexity)     do_perplexity "$@" ;;
@@ -1161,6 +1175,7 @@ case "$cmd" in
         echo "  reference-test <config>        Compare engine output against BF16 reference data"
         echo "  reference-test --compare <model>  Run comparative reference matrix"
         echo "  reference-inventory            Inventory stored reference artifacts"
+        echo "  reference-prep <model>         Prepare HF capture deps and download a public model"
         echo "  generate-reference <model>     Generate BF16 HF reference capture"
         echo "  trace-diff <expected> <actual> Diff two KRASIS_TRACE logs offline"
         echo "  release-test <model>           Run full release test (4 configs, report)"
@@ -1184,14 +1199,22 @@ case "$cmd" in
         echo "Reference workflow:"
         echo "  1. Inventory current artifacts:"
         echo "       ./dev reference-inventory"
-        echo "  2. Generate an explicit reference profile:"
+        echo "  2. Prepare the host and fetch the public model if needed:"
+        echo "       ./dev reference-prep <model>"
+        echo "  3. Generate an explicit reference profile:"
         echo "       ./dev generate-reference <model> --profile <profile>"
-        echo "  3. Validate the capture against a runtime config:"
+        echo "  4. Validate the capture against a runtime config:"
         echo "       ./dev validate <config> --max-prompts 0 --no-server --port 1"
-        echo "  4. Run the real comparison:"
+        echo "  5. Run the real comparison:"
         echo "       ./dev reference-test <config>"
-        echo "  5. Diff stored traces offline when needed:"
+        echo "  6. Diff stored traces offline when needed:"
         echo "       ./dev trace-diff <expected-trace> <actual-trace>"
+        echo "  Reference-prep aliases:"
+        echo "    qcn, qwen35, q122b, gemma, q235, q397"
+        echo "  Notes:"
+        echo "    - Uses public Hugging Face repo IDs only; does not use an HF token."
+        echo "    - Installs the capture/download Python deps in the repo env."
+        echo "    - Use --detach to keep a long download running with a log file."
         echo ""
         echo "Reference profiles for ./dev generate-reference:"
         echo "  auto                       Use thinking_off when template supports enable_thinking"
@@ -1214,10 +1237,11 @@ case "$cmd" in
         echo "  summarizes matching-prefix plus context/phase counts, can suggest a short"
         echo "  resync point when one stream has inserted or dropped a few events, emits"
         echo "  typed mismatch analysis for tensor, values, logits, route, and python_compare events,"
+        echo "  adds a top-level divergence classification summary,"
         echo "  adds local decode-family analysis for missing/unexpected sub-events within one"
         echo "  step/layer packet, adds bounded family-region resync hints across neighboring"
-        echo "  decode packets, and reports the nearest preceding config_contract state for"
-        echo "  decode divergences."
+        echo "  decode packets, reports stronger family-packet signatures, and reports the"
+        echo "  nearest preceding config_contract state for decode divergences."
         echo "  Example:"
         echo "    KRASIS_TRACE=1 KRASIS_TRACE_COMPONENTS=config_contract ./dev reference-inventory"
         echo "    ./dev trace-diff /tmp/expected.log /tmp/actual.log --components config_contract --contexts reference_test_single --phases artifact,validation"
@@ -1237,6 +1261,7 @@ case "$cmd" in
         echo "  ./dev release-test Qwen3-Coder-Next    Full release test"
         echo "  ./dev release-test-all                 Test all models (no resume)"
         echo "  ./dev release-test-all rc8             Test all models (resume on re-run with same target)"
+        echo "  ./dev reference-prep qcn --detach"
         echo "  ./dev awq-calibrate qcn    Build AWQ attention template"
         echo "  ./dev perplexity qcn"
         echo "  ./dev trace-diff /tmp/expected.log /tmp/actual.log --events mark,tensor"

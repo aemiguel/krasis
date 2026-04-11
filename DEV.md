@@ -83,7 +83,15 @@ config parsing. Run `./dev help` for full usage.
 # Run any Python command with the dev env
 ./dev python -m krasis.launcher
 ./dev python tests/test_network.py --port 8012
+
+# Prepare HF reference capture deps and download a public model
+./dev reference-prep qcn
+./dev reference-prep qwen35 --detach
 ```
+
+`reference-prep` installs the user-space capture/download dependencies in the
+repo env, maps common model aliases to the exact public Hugging Face repo IDs,
+and downloads into `~/.krasis/models`. Use `--detach` for long remote downloads.
 
 ### Auto-rebuild
 
