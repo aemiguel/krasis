@@ -236,6 +236,7 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
         "model_path": model_path,
         "generated_at": datetime.now().isoformat(),
         "runtime": "transformers",
+        "profile_id": profile_id,
         "max_new_tokens": max_new_tokens,
         "eos_token_ids": eos_token_ids,
         "capture_settings": capture_settings,
