@@ -9088,7 +9088,7 @@ mod kernel_tests {
             ).expect("Failed to load prefill kernels PTX");
             #[cfg(has_decode_kernels)]
             dev.load_ptx(
-                cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/decode_kernels.ptx"))),
+                cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/decode_kernels_sm80.ptx"))),
                 "decode_kernels",
                 &[
                     "kv_cache_write_polar4",
