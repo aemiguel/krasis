@@ -20,6 +20,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    from reference_contract import (
+        REFERENCE_PROFILES,
+        apply_capture_template,
+        build_contract,
+        canonical_profile_id,
+        capture_settings_for_profile,
+        emit_reference_generation_trace,
+        profile_filename,
+    )
+except ModuleNotFoundError:
+    from tests.reference_contract import (
+        REFERENCE_PROFILES,
+        apply_capture_template,
+        build_contract,
+        canonical_profile_id,
+        capture_settings_for_profile,
+        emit_reference_generation_trace,
+        profile_filename,
+    )
+
 # Guard: must be run via ./dev
 if not os.environ.get("KRASIS_DEV_SCRIPT"):
     print("ERROR: This script must be run via ./dev generate-reference, not directly.")
@@ -79,7 +100,7 @@ def parse_prompt_conversations(lines: List[str]) -> List[List[str]]:
     return conversations
 
 
-def generate_reference(model_name: str, max_new_tokens: int = 200):
+def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str = "auto"):
     """Generate reference outputs using HuggingFace transformers."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -146,15 +167,14 @@ def generate_reference(model_name: str, max_new_tokens: int = 200):
     eos_token_ids = list(set(eos_token_ids))
     info(f"EOS token IDs: {eos_token_ids}")
 
-    capture_settings = {
-        "add_generation_prompt": True,
-        "template_mode": "default",
-        "enable_thinking": None,
-        "source": "local_generate_reference",
-    }
+    profile_id = canonical_profile_id(tokenizer, profile)
+    capture_settings = capture_settings_for_profile(profile_id)
+    capture_settings["source"] = "local_generate_reference"
+    info(f"Reference profile: {profile_id}")
 
     # Generate reference outputs
     result = {
+        "format_version": 4,
         "model": model_name,
         "model_path": model_path,
         "generated_at": datetime.now().isoformat(),
@@ -190,23 +210,12 @@ def generate_reference(model_name: str, max_new_tokens: int = 200):
             # Apply chat template — disable thinking if the model supports it
             # We want the "normal" response for reference, not thinking tokens
             try:
-                template_out = tokenizer.apply_chat_template(
-                    messages,
-                    return_tensors="pt",
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-                capture_settings["template_mode"] = "enable_thinking_false"
-                capture_settings["enable_thinking"] = False
+                template_out = apply_capture_template(tokenizer, messages, capture_settings)
             except TypeError:
-                # Model doesn't support enable_thinking parameter
-                template_out = tokenizer.apply_chat_template(
-                    messages,
-                    return_tensors="pt",
-                    add_generation_prompt=True,
+                die(
+                    "Requested reference profile is incompatible with this tokenizer/chat template: "
+                    f"profile={profile_id}"
                 )
-                capture_settings["template_mode"] = "default"
-                capture_settings["enable_thinking"] = None
 
             # apply_chat_template may return a tensor or a BatchEncoding
             if hasattr(template_out, "input_ids"):
@@ -245,6 +254,7 @@ def generate_reference(model_name: str, max_new_tokens: int = 200):
 
             turn_result = {
                 "prompt": prompt,
+                "input_token_ids": input_ids[0].tolist(),
                 "token_ids": new_token_ids,
                 "text": text,
                 "num_tokens": len(new_token_ids),
@@ -256,25 +266,63 @@ def generate_reference(model_name: str, max_new_tokens: int = 200):
 
         result["conversations"].append(conv_result)
 
+    result["contract"] = build_contract(
+        model_name=model_name,
+        model_path=model_path,
+        tokenizer=tokenizer,
+        max_new_tokens=max_new_tokens,
+        add_generation_prompt=True,
+        enable_thinking=capture_settings["enable_thinking"],
+        profile_id=capture_settings["profile_id"],
+        prompt_source_path=str(PROMPTS_FILE),
+        runtime_name="transformers",
+        runtime_version=result.get("runtime_version"),
+        torch_dtype="bfloat16",
+    )
+
     # Save reference
     REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = REFERENCE_DIR / model_name / "greedy_reference.json"
+    output_path = REFERENCE_DIR / model_name / profile_filename(profile_id)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(result, f, indent=2)
 
+    emit_reference_generation_trace(
+        "generate_reference",
+        result["contract"],
+        str(output_path),
+        max_new_tokens=max_new_tokens,
+    )
+
     ok(f"Reference saved: {output_path}")
+    ok(
+        "Reference metadata: "
+        f"profile={result['contract'].get('profile_id')} "
+        f"template_hash={result['contract'].get('tokenizer', {}).get('chat_template_hash')} "
+        f"prompt_sha256={result['contract'].get('prompt_source', {}).get('sha256')}"
+    )
     ok(f"Total: {total_prompts} prompts, {sum(len(c['turns']) for c in result['conversations'])} turns")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate reference greedy decode outputs")
+    parser = argparse.ArgumentParser(
+        description="Generate BF16 HuggingFace greedy reference outputs with stored contract metadata"
+    )
     parser.add_argument("model", help="Model directory name under ~/.krasis/models/")
     parser.add_argument("--max-tokens", type=int, default=200,
                         help="Max new tokens per turn (default: 200)")
+    parser.add_argument(
+        "--profile",
+        default="auto",
+        choices=("auto",) + REFERENCE_PROFILES,
+        help=(
+            "Reference capture profile. auto chooses greedy_chat_thinking_off when "
+            "the tokenizer chat template supports enable_thinking, otherwise greedy_chat_default"
+        ),
+    )
     args = parser.parse_args()
 
-    generate_reference(args.model, args.max_tokens)
+    generate_reference(args.model, args.max_tokens, args.profile)
 
 
 if __name__ == "__main__":

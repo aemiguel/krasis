@@ -23,9 +23,32 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from krasis.run_paths import get_run_dir
+
+try:
+    from reference_contract import (
+        build_reference_artifact_metadata,
+        build_runtime_contract,
+        emit_contract_failure_trace,
+        emit_contract_trace,
+        format_contract_report,
+        load_or_infer_reference_contract,
+        reference_candidate_filenames,
+        validate_contracts,
+    )
+except ModuleNotFoundError:
+    from tests.reference_contract import (
+        build_reference_artifact_metadata,
+        build_runtime_contract,
+        emit_contract_failure_trace,
+        emit_contract_trace,
+        format_contract_report,
+        load_or_infer_reference_contract,
+        reference_candidate_filenames,
+        validate_contracts,
+    )
 
 
 # ── Config Matrix for Comparison Mode ─────────────────────────────
@@ -128,7 +151,7 @@ def detect_linear_attention(cfg: Dict[str, str]) -> bool:
     return False
 
 
-def find_reference_data(model_name: str, script_dir: str) -> Optional[str]:
+def find_reference_data(model_name: str, script_dir: str, profile_id: Optional[str] = None) -> Optional[str]:
     """Find reference data JSON for a model."""
     # krasis-internal sits beside krasisx
     internal_dir = os.path.join(os.path.dirname(script_dir), "krasis-internal")
@@ -137,9 +160,10 @@ def find_reference_data(model_name: str, script_dir: str) -> Optional[str]:
     # Search order
     suffixes = ["-prefill", "-expanded", ""]
     for suffix in suffixes:
-        candidate = os.path.join(ref_base, f"{model_name}{suffix}", "greedy_reference.json")
-        if os.path.isfile(candidate):
-            return candidate
+        for filename in reference_candidate_filenames(profile_id):
+            candidate = os.path.join(ref_base, f"{model_name}{suffix}", filename)
+            if os.path.isfile(candidate):
+                return candidate
 
     return None
 
@@ -151,6 +175,41 @@ def list_available_references(script_dir: str) -> List[str]:
     if not os.path.isdir(ref_base):
         return []
     return sorted(os.listdir(ref_base))
+
+
+def load_tokenizer_for_config(conf_path: str):
+    from transformers import AutoTokenizer
+
+    cfg = parse_config(conf_path)
+    model_path = os.path.expanduser(cfg.get("CFG_MODEL_PATH", ""))
+    if not model_path:
+        raise ValueError(f"Config has no CFG_MODEL_PATH/MODEL_PATH: {conf_path}")
+    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+
+def validate_reference_against_config(conf_path: str, ref_data: Dict, ref_path: Optional[str] = None) -> Dict[str, Any]:
+    tokenizer = load_tokenizer_for_config(conf_path)
+    reference_contract = load_or_infer_reference_contract(
+        ref_data,
+        os.path.expanduser(parse_config(conf_path).get("CFG_MODEL_PATH", "")),
+        tokenizer,
+    )
+    runtime_contract = build_runtime_contract(
+        conf_path,
+        tokenizer,
+        max_new_tokens=ref_data.get("max_new_tokens", 200),
+        effective_profile_id=reference_contract.get("profile_id"),
+    )
+    validation = validate_contracts(reference_contract, runtime_contract)
+    return {
+        "reference_artifact": build_reference_artifact_metadata(ref_data, reference_contract, ref_path),
+        "reference_contract": reference_contract,
+        "runtime_contract": runtime_contract,
+        "validation": validation,
+        "errors": validation["errors"],
+        "warnings": validation["warnings"],
+        "report_lines": format_contract_report(reference_contract, runtime_contract, validation),
+    }
 
 
 # ── Server Management ───────────────────────────────────────────────
@@ -1332,6 +1391,8 @@ def main():
     parser.add_argument("config", nargs="?", help="Config file path (single-config mode)")
     parser.add_argument("--compare", metavar="MODEL",
                         help="Run comparative test with all configs for MODEL (e.g. qcn, q35b, q122b)")
+    parser.add_argument("--profile", default=None,
+                        help="Reference profile id to require when selecting reference data")
     parser.add_argument("--verbose", action="store_true", help="Print detailed output")
     parser.add_argument("--no-server", action="store_true",
                         help="Don't start server, connect to already-running one")
@@ -1377,9 +1438,16 @@ def main():
         # Find reference data from the first config's model
         first_cfg = parse_config(valid_configs[0][1])
         model_name = resolve_model_name(first_cfg)
-        ref_path = find_reference_data(model_name, script_dir)
+        ref_path = find_reference_data(model_name, script_dir, args.profile)
         if ref_path is None:
             available = list_available_references(script_dir)
+            emit_contract_failure_trace(
+                context="reference_test_compare",
+                reason="missing_reference",
+                model=model_name,
+                requested_profile=args.profile or "auto",
+                available_count=len(available),
+            )
             print(f"ERROR: No reference data found for model '{model_name}'", file=sys.stderr)
             print(f"Available reference data: {', '.join(available)}", file=sys.stderr)
             sys.exit(1)
@@ -1393,6 +1461,36 @@ def main():
 
         if ref_data.get("format_version", 0) < 3:
             print(f"ERROR: Reference data format_version must be >= 3, got {ref_data.get('format_version')}", file=sys.stderr)
+            sys.exit(1)
+
+        validation_failed = False
+        for label, conf_path in valid_configs:
+            contract_check = validate_reference_against_config(conf_path, ref_data, ref_path)
+            print(
+                f"Reference artifact for {label}: "
+                f"{contract_check['reference_artifact']['state']} "
+                f"(format {contract_check['reference_artifact']['format_version']}, "
+                f"{contract_check['reference_artifact']['filename']})"
+            )
+            emit_contract_trace(
+                context=f"reference_test_compare:{label}",
+                reference_artifact=contract_check["reference_artifact"],
+                reference_contract=contract_check["reference_contract"],
+                runtime_contract=contract_check["runtime_contract"],
+                validation=contract_check["validation"],
+            )
+            if contract_check["warnings"]:
+                print(f"Contract warnings for {label}:")
+                for warning in contract_check["warnings"]:
+                    print(f"  - {warning}")
+            if contract_check["errors"]:
+                validation_failed = True
+                print(f"ERROR: Contract validation failed for {label} ({conf_path})", file=sys.stderr)
+                for err in contract_check["errors"]:
+                    print(f"  - {err}", file=sys.stderr)
+                for line in contract_check["report_lines"]:
+                    print(f"    {line}", file=sys.stderr)
+        if validation_failed:
             sys.exit(1)
 
         t_total_start = time.time()
@@ -1503,9 +1601,16 @@ def main():
         print(f"Config: {args.config}")
 
         # Find reference data
-        ref_path = find_reference_data(model_name, script_dir)
+        ref_path = find_reference_data(model_name, script_dir, args.profile)
         if ref_path is None:
             available = list_available_references(script_dir)
+            emit_contract_failure_trace(
+                context="reference_test_single",
+                reason="missing_reference",
+                model=model_name,
+                requested_profile=args.profile or "auto",
+                available_count=len(available),
+            )
             print(f"ERROR: No reference data found for model '{model_name}'", file=sys.stderr)
             print(f"Available reference data: {', '.join(available)}", file=sys.stderr)
             sys.exit(1)
@@ -1517,6 +1622,32 @@ def main():
 
         if ref_data.get("format_version", 0) < 3:
             print(f"ERROR: Reference data format_version must be >= 3, got {ref_data.get('format_version')}", file=sys.stderr)
+            sys.exit(1)
+
+        contract_check = validate_reference_against_config(args.config, ref_data, ref_path)
+        print(
+            f"Reference artifact state: "
+            f"{contract_check['reference_artifact']['state']} "
+            f"(format {contract_check['reference_artifact']['format_version']}, "
+            f"{contract_check['reference_artifact']['filename']})"
+        )
+        emit_contract_trace(
+            context="reference_test_single",
+            reference_artifact=contract_check["reference_artifact"],
+            reference_contract=contract_check["reference_contract"],
+            runtime_contract=contract_check["runtime_contract"],
+            validation=contract_check["validation"],
+        )
+        if contract_check["warnings"]:
+            print("Contract warnings:")
+            for warning in contract_check["warnings"]:
+                print(f"  - {warning}")
+        if contract_check["errors"]:
+            print("ERROR: Reference contract validation failed.", file=sys.stderr)
+            for err in contract_check["errors"]:
+                print(f"  - {err}", file=sys.stderr)
+            for line in contract_check["report_lines"]:
+                print(f"    {line}", file=sys.stderr)
             sys.exit(1)
 
         t_total_start = time.time()

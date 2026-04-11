@@ -24,6 +24,33 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from reference_contract import (
+        apply_capture_template,
+        build_reference_artifact_metadata,
+        build_runtime_contract,
+        capture_settings_for_reference,
+        emit_contract_failure_trace,
+        emit_contract_trace,
+        format_contract_report,
+        load_or_infer_reference_contract,
+        reference_candidate_filenames,
+        validate_contracts,
+    )
+except ModuleNotFoundError:
+    from tests.reference_contract import (
+        apply_capture_template,
+        build_reference_artifact_metadata,
+        build_runtime_contract,
+        capture_settings_for_reference,
+        emit_contract_failure_trace,
+        emit_contract_trace,
+        format_contract_report,
+        load_or_infer_reference_contract,
+        reference_candidate_filenames,
+        validate_contracts,
+    )
+
 # Guard: must be run via ./dev
 if not os.environ.get("KRASIS_DEV_SCRIPT"):
     print("ERROR: This script must be run via ./dev validate, not directly.")
@@ -143,7 +170,7 @@ def is_quantized_model(config_path: str) -> bool:
     return weight_quant != "bf16" or attn_quant != "bf16"
 
 
-def _resolve_reference_dir(model_name: str) -> Optional[Path]:
+def _resolve_reference_dir(model_name: str, profile_id: Optional[str] = None) -> Optional[Path]:
     """Find reference data directory for a model, checking name mapping."""
     # Try mapped name first, then exact name
     candidates = []
@@ -156,120 +183,55 @@ def _resolve_reference_dir(model_name: str) -> Optional[Path]:
         if not ref_dir.is_dir():
             continue
         for name in candidates:
-            path = ref_dir / name / "greedy_reference.json"
-            if path.is_file():
-                return ref_dir / name
+            for filename in reference_candidate_filenames(profile_id):
+                path = ref_dir / name / filename
+                if path.is_file():
+                    return ref_dir / name
     return None
 
 
-def load_reference(model_name: str) -> Dict[str, Any]:
+def load_reference(model_name: str, profile_id: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
     """Load reference outputs for a model."""
-    ref_dir = _resolve_reference_dir(model_name)
+    ref_dir = _resolve_reference_dir(model_name, profile_id)
     if ref_dir is None:
+        emit_contract_failure_trace(
+            context="validate_model",
+            reason="missing_reference",
+            model=model_name,
+            requested_profile=profile_id or "auto",
+        )
         die(f"No reference outputs found for {model_name}.\n"
             f"  Searched: {INTERNAL_REFERENCE_DIR}\n"
             f"           {LOCAL_REFERENCE_DIR}\n"
             f"  Name mappings tried: {_REF_DIR_MAP.get(model_name, model_name)}\n"
             f"  Generate with: ./dev generate-reference {model_name}")
-    ref_path = ref_dir / "greedy_reference.json"
+    ref_path = None
+    for filename in reference_candidate_filenames(profile_id):
+        candidate = ref_dir / filename
+        if candidate.is_file():
+            ref_path = candidate
+            break
+    if ref_path is None:
+        emit_contract_failure_trace(
+            context="validate_model",
+            reason="missing_reference_file",
+            model=model_name,
+            requested_profile=profile_id or "auto",
+            reference_dir=str(ref_dir),
+        )
+        die(f"Reference directory found but no matching reference file present: {ref_dir}")
     info(f"Reference data: {ref_path}")
     with open(ref_path) as f:
-        return json.load(f)
-
-
-def _extract_local_token_ids(template_out: Any) -> List[int]:
-    import torch
-
-    if hasattr(template_out, "input_ids"):
-        return template_out.input_ids[0].tolist()
-    if isinstance(template_out, torch.Tensor):
-        return template_out[0].tolist()
-    return list(template_out)
-
-
-def _flatten_reference_turns(reference: Dict[str, Any]) -> List[Dict[str, Any]]:
-    turns: List[Dict[str, Any]] = []
-    for conv in reference.get("conversations", []):
-        turns.extend(conv.get("turns", []))
-    return turns
-
-
-def resolve_reference_capture_settings(reference: Dict[str, Any], tokenizer: Any) -> Dict[str, Any]:
-    stored = reference.get("capture_settings")
-    if isinstance(stored, dict):
-        settings = dict(stored)
-        settings.setdefault("source", "stored_metadata")
-        settings.setdefault("add_generation_prompt", True)
-        return settings
-
-    first_turn = next(
-        (turn for turn in _flatten_reference_turns(reference) if turn.get("input_token_ids")),
-        None,
-    )
-    if first_turn is None:
-        return {
-            "source": "unknown_no_input_token_ids",
-            "add_generation_prompt": True,
-            "template_mode": "default",
-            "enable_thinking": None,
-        }
-
-    messages = [{"role": "user", "content": first_turn["prompt"]}]
-    candidates = [
-        ("enable_thinking_false", False, {"enable_thinking": False}),
-        ("enable_thinking_true", True, {"enable_thinking": True}),
-        ("default", None, {}),
-    ]
-    matches: List[str] = []
-    chosen: Optional[Tuple[str, Optional[bool]]] = None
-    for label, enable_thinking, kwargs in candidates:
-        try:
-            template_out = tokenizer.apply_chat_template(
-                messages,
-                return_tensors="pt",
-                add_generation_prompt=True,
-                **kwargs,
-            )
-        except TypeError:
-            continue
-        if _extract_local_token_ids(template_out) == first_turn["input_token_ids"]:
-            matches.append(label)
-            if chosen is None:
-                chosen = (label, enable_thinking)
-
-    if chosen is None:
-        return {
-            "source": "inferred_from_input_token_ids",
-            "add_generation_prompt": True,
-            "template_mode": "unknown",
-            "enable_thinking": None,
-            "candidate_matches": matches,
-        }
-
-    return {
-        "source": "inferred_from_input_token_ids",
-        "add_generation_prompt": True,
-        "template_mode": chosen[0],
-        "enable_thinking": chosen[1],
-        "candidate_matches": matches,
-    }
+        return json.load(f), str(ref_path)
 
 
 def apply_reference_chat_template(
     tokenizer: Any, messages: List[Dict[str, str]], capture_settings: Dict[str, Any]
 ) -> List[int]:
-    kwargs: Dict[str, Any] = {
-        "return_tensors": "pt",
-        "add_generation_prompt": bool(capture_settings.get("add_generation_prompt", True)),
-    }
-    if capture_settings.get("template_mode") != "default" and capture_settings.get("enable_thinking") is not None:
-        kwargs["enable_thinking"] = capture_settings["enable_thinking"]
-    try:
-        template_out = tokenizer.apply_chat_template(messages, **kwargs)
-    except TypeError:
-        kwargs.pop("enable_thinking", None)
-        template_out = tokenizer.apply_chat_template(messages, **kwargs)
-    return _extract_local_token_ids(template_out)
+    template_out = apply_capture_template(tokenizer, messages, capture_settings)
+    if hasattr(template_out, "input_ids"):
+        return template_out.input_ids[0].tolist()
+    return template_out[0].tolist()
 
 
 def launch_server(config_path: str, test_endpoints: bool = False) -> Tuple[subprocess.Popen, str]:
@@ -571,7 +533,8 @@ def compare_tokens(ref_ids: List[int], krasis_ids: List[int],
 def validate_model(config_path: str, no_server: bool = False, port: Optional[int] = None,
                     enable_logprobs: bool = True, enable_prefill: bool = True,
                     max_prompts: Optional[int] = None,
-                    return_summary: bool = False):
+                    return_summary: bool = False,
+                    profile_id: Optional[str] = None):
     """Run multi-layer validation against reference outputs.
 
     Layer 1: Decode token matching (always on)
@@ -598,7 +561,7 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
         info(f"Prompt cap: {max_prompts}")
 
     # Load reference
-    reference = load_reference(model_name)
+    reference, reference_path = load_reference(model_name, profile_id)
     ref_conversations = reference["conversations"]
     total_reference_prompts = sum(len(c["turns"]) for c in ref_conversations)
     if max_prompts is not None:
@@ -618,7 +581,48 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
         warn("Reference data has no prefill_logits — L3 will be skipped")
         enable_prefill = False
 
-    # Start server FIRST (before loading tokenizer) to avoid RAM contention
+    # Validate the reference/runtime contract before starting the server.
+    model_path = os.path.join(os.path.expanduser("~/.krasis/models"), model_name)
+    info(f"Loading tokenizer from {model_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    reference_contract = load_or_infer_reference_contract(reference, model_path, tokenizer)
+    runtime_contract = build_runtime_contract(
+        config_path,
+        tokenizer,
+        max_new_tokens=reference.get("max_new_tokens", 200),
+        effective_profile_id=reference_contract.get("profile_id"),
+    )
+    contract_validation = validate_contracts(reference_contract, runtime_contract)
+    reference_artifact = build_reference_artifact_metadata(reference, reference_contract, reference_path)
+    capture_settings = capture_settings_for_reference(reference, reference_contract, tokenizer)
+    info(
+        "Reference capture settings: "
+        f"template_mode={capture_settings.get('template_mode', 'unknown')}, "
+        f"enable_thinking={capture_settings.get('enable_thinking')}, "
+        f"source={capture_settings.get('source', 'unknown')}, "
+        f"profile={reference_contract.get('profile_id', 'unknown')}"
+    )
+    info(
+        "Reference artifact: "
+        f"state={reference_artifact.get('state')}, "
+        f"format_version={reference_artifact.get('format_version')}, "
+        f"file={reference_artifact.get('filename')}"
+    )
+    emit_contract_trace(
+        context="validate_model",
+        reference_artifact=reference_artifact,
+        reference_contract=reference_contract,
+        runtime_contract=runtime_contract,
+        validation=contract_validation,
+    )
+    if contract_validation["warnings"]:
+        for warning in contract_validation["warnings"]:
+            warn(f"Contract warning: {warning}")
+    if contract_validation["errors"]:
+        for line in format_contract_report(reference_contract, runtime_contract, contract_validation):
+            warn(line)
+        die("Reference contract validation failed")
+
     proc = None
     if not no_server:
         info(f"Starting Krasis server on port {config_port}...")
@@ -631,18 +635,6 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
         ok("Server is ready")
     else:
         info(f"Using existing server on port {config_port}")
-
-    # Load tokenizer AFTER server is healthy (server has released CPU RAM by now)
-    model_path = os.path.join(os.path.expanduser("~/.krasis/models"), model_name)
-    info(f"Loading tokenizer from {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    capture_settings = resolve_reference_capture_settings(reference, tokenizer)
-    info(
-        "Reference capture settings: "
-        f"template_mode={capture_settings.get('template_mode', 'unknown')}, "
-        f"enable_thinking={capture_settings.get('enable_thinking')}, "
-        f"source={capture_settings.get('source', 'unknown')}"
-    )
 
     # Run validation
     results: List[Dict[str, Any]] = []
@@ -891,6 +883,8 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
 def main():
     parser = argparse.ArgumentParser(description="Validate Krasis decode against reference outputs")
     parser.add_argument("config", help="Path to Krasis .conf file")
+    parser.add_argument("--profile", default=None,
+                        help="Reference profile id to require when selecting reference data")
     parser.add_argument("--no-server", action="store_true",
                         help="Don't start a server; connect to existing one")
     parser.add_argument("--port", type=int, default=None,
@@ -911,7 +905,8 @@ def main():
     sys.exit(validate_model(args.config, args.no_server, args.port,
                             enable_logprobs=enable_logprobs,
                             enable_prefill=enable_prefill,
-                            max_prompts=args.max_prompts))
+                            max_prompts=args.max_prompts,
+                            profile_id=args.profile))
 
 
 if __name__ == "__main__":

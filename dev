@@ -21,6 +21,9 @@
 #                                     all models with no resume capability.
 #   ./dev reference-test <config>   Compare engine output against BF16 reference data
 #   ./dev reference-test --compare <model>  Run 4 quant configs, produce comparative report
+#   ./dev reference-inventory       Inventory stored reference artifacts and classify contract state
+#   ./dev generate-reference <model>  Generate a BF16 HF reference capture
+#   ./dev trace-diff <expected> <actual>  Diff two KRASIS_TRACE logs offline
 #   ./dev awq-calibrate <config>    Run AWQ calibration, produce attention template
 #   ./dev test-kernels [name]       Run CUDA kernel unit tests (or filter by name)
 #   ./dev chat [args]               Run krasis chat from source
@@ -975,6 +978,46 @@ do_reference_test() {
     fi
 }
 
+do_reference_inventory() {
+    cleanup_gpu
+    auto_rebuild
+    local run_dir
+    run_dir=$(create_run_dir "reference-inventory")
+    info "Running reference inventory"
+    info "Run dir: $run_dir"
+    verify_repo_imports
+    KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="reference-inventory" run_repo_python "$SCRIPT_DIR/tests/reference_inventory.py" "$@"
+}
+
+do_generate_reference() {
+    [[ $# -lt 1 ]] && err "Usage: ./dev generate-reference <model> [--max-tokens N] [--profile PROFILE]
+  Generates a BF16 HuggingFace greedy reference with full contract metadata.
+  Profiles:
+    auto                    thinking_off if supported, otherwise default
+    greedy_chat_default     default template invocation
+    greedy_chat_thinking_off  pass enable_thinking=False
+    greedy_chat_thinking_on   pass enable_thinking=True
+  Example:
+    ./dev generate-reference Qwen3-Coder-Next --profile greedy_chat_thinking_off"
+    cleanup_gpu
+    auto_rebuild
+    info "Generating reference: $1"
+    verify_repo_imports
+    KRASIS_DEV_SCRIPT=1 exec_repo_python "$SCRIPT_DIR/tests/generate_reference.py" "$@"
+}
+
+do_trace_diff() {
+    [[ $# -lt 2 ]] && err "Usage: ./dev trace-diff <expected-trace> <actual-trace> [--events mark,tensor,...] [--components decode,...] [--contexts ctx1,ctx2] [--phases artifact,validation] [--show-window N] [--resync-window N] [--family-resync-window N]
+  Diffs two KRASIS_TRACE logs offline, reports the first divergence, summarizes matching-prefix plus context/phase counts,
+  gives bounded event-level and family-region resync hints for short shifted regions, and adds typed analysis for tensor/logits/route mismatches."
+    local run_dir
+    run_dir=$(create_run_dir "trace-diff")
+    info "Running trace diff"
+    info "Run dir: $run_dir"
+    verify_repo_imports
+    KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="trace-diff" run_repo_python "$SCRIPT_DIR/tests/trace_diff.py" "$@"
+}
+
 do_kill() {
     info "Killing all krasis processes and freeing GPU memory..."
 
@@ -1085,6 +1128,9 @@ case "$cmd" in
     release-test)   do_release_test "$@" ;;
     release-test-all) do_release_test_all "$@" ;;
     reference-test) do_reference_test "$@" ;;
+    reference-inventory) do_reference_inventory "$@" ;;
+    generate-reference) do_generate_reference "$@" ;;
+    trace-diff)     do_trace_diff "$@" ;;
     perplexity)     do_perplexity "$@" ;;
     awq-calibrate)  do_awq_calibrate "$@" ;;
     network)        do_network "$@" ;;
@@ -1098,40 +1144,83 @@ case "$cmd" in
         echo ""
         echo "Usage: ./dev <command> [args...]"
         echo ""
-        echo "Commands:"
-        echo "  build                     Rebuild Rust extension into this repo only"
-        echo "  run <config> [flags]      Launch server (add --benchmark for benchmarks)"
-        echo "  benchmark <config>        Run standard benchmark and exit"
-        echo "  speed-test                Run the fixed standard speed benchmark"
-        echo "  decode-harness <config>   Run synthetic GPU decode harness and exit"
-        echo "  release-test <model>      Run full release test (4 configs, report)"
-        echo "  reference-test <config>   Compare engine output against BF16 reference data"
-        echo "  reference-test --compare <model>  Run 4 quant configs, comparative report"
-        echo "  release-test-all [target] Run release test on all supported models sequentially"
-        echo "                            Without a target: runs all, no state saved."
-        echo "                            With a target (e.g. 'rc8'): saves progress to state file."
-        echo "                            Re-run with same target to resume from failed model."
-        echo "                            State file auto-deleted when all models pass."
-        echo "                            Sends Session messages on start/pass/fail per model."
-        echo "  perplexity <config>       Run perplexity eval (WikiText-2) and exit"
-        echo "  awq-calibrate <config>    Run AWQ attention calibration (produces template)"
-        echo "  test <config>             Short model test (benchmark + network tests)"
-        echo "  test <config> --thorough  Thorough test (+ stress + large prompts)"
-        echo "  network <port> [flags]    Run network tests against running server"
-        echo "  validate <config>         Validate model output against BF16 reference"
-        echo "  test-kernels [name]       Run CUDA kernel unit tests (or filter by name)"
-        echo "  chat [args]               Run krasis chat from source"
-        echo "  sanity                    Run sanity test prompts against running server"
-        echo "  kill                      Kill all krasis/GPU processes, reset if needed"
-        echo "  install                   Sync krasis command to ~/.local/bin (uses source)"
-        echo "  shell                     Python shell bound to this repo"
-        echo "  python <args>             Run Python bound to this repo"
-        echo "  verify-imports            Verify imports resolve inside this repo"
+        echo "Core commands:"
+        echo "  build                          Rebuild Rust extension into this repo only"
+        echo "  run <config> [flags]           Launch server (add --benchmark for benchmark mode)"
+        echo "  benchmark <config>             Run standard benchmark and exit"
+        echo "  speed-test                     Run the fixed standard speed benchmark"
+        echo "  decode-harness <config>        Run synthetic GPU decode harness and exit"
+        echo "  perplexity <config>            Run perplexity eval (WikiText-2) and exit"
+        echo "  awq-calibrate <config>         Run AWQ attention calibration (produces template)"
+        echo ""
+        echo "Test and validation commands:"
+        echo "  test <config>                  Short model test (benchmark + network tests)"
+        echo "  test <config> --thorough       Thorough test (+ stress + large prompts)"
+        echo "  network <port> [--large]       Run network tests against a running server"
+        echo "  validate <config>              Validate model output against BF16 reference"
+        echo "  reference-test <config>        Compare engine output against BF16 reference data"
+        echo "  reference-test --compare <model>  Run comparative reference matrix"
+        echo "  reference-inventory            Inventory stored reference artifacts"
+        echo "  generate-reference <model>     Generate BF16 HF reference capture"
+        echo "  trace-diff <expected> <actual> Diff two KRASIS_TRACE logs offline"
+        echo "  release-test <model>           Run full release test (4 configs, report)"
+        echo "  release-test-all [target]      Run release test on all supported models sequentially"
+        echo ""
+        echo "Maintenance commands:"
+        echo "  test-kernels [name]            Run CUDA kernel unit tests (or filter by name)"
+        echo "  chat [args]                    Run krasis chat from source"
+        echo "  sanity                         Run sanity test prompts against running server"
+        echo "  kill                           Kill all krasis/GPU processes, reset if needed"
+        echo "  install                        Sync krasis command to ~/.local/bin (uses source)"
+        echo "  shell                          Python shell bound to this repo"
+        echo "  python <args>                  Run Python bound to this repo"
+        echo "  verify-imports                 Verify imports resolve inside this repo"
         echo ""
         echo "Global flags:"
         echo "  --timing    Enable per-component decode timing (adds ~30-50% overhead)"
         echo "              Prints detailed breakdown of where decode time is spent."
         echo "              NOT for speed benchmarks — only for profiling."
+        echo ""
+        echo "Reference workflow:"
+        echo "  1. Inventory current artifacts:"
+        echo "       ./dev reference-inventory"
+        echo "  2. Generate an explicit reference profile:"
+        echo "       ./dev generate-reference <model> --profile <profile>"
+        echo "  3. Validate the capture against a runtime config:"
+        echo "       ./dev validate <config> --max-prompts 0 --no-server --port 1"
+        echo "  4. Run the real comparison:"
+        echo "       ./dev reference-test <config>"
+        echo "  5. Diff stored traces offline when needed:"
+        echo "       ./dev trace-diff <expected-trace> <actual-trace>"
+        echo ""
+        echo "Reference profiles for ./dev generate-reference:"
+        echo "  auto                       Use thinking_off when template supports enable_thinking"
+        echo "  greedy_chat_default        Default chat template invocation"
+        echo "  greedy_chat_thinking_off   Pass enable_thinking=False"
+        echo "  greedy_chat_thinking_on    Pass enable_thinking=True"
+        echo "  Output files:"
+        echo "    greedy_chat_default.json"
+        echo "    greedy_chat_thinking_off.json"
+        echo "    greedy_chat_thinking_on.json"
+        echo "  Notes:"
+        echo "    - Use explicit --profile for any durable reference capture."
+        echo "    - Legacy greedy_reference.json is compatibility-only and may fail closed."
+        echo "    - New captures store contract metadata and should be regenerated through ./dev only."
+        echo ""
+        echo "Trace / contract debugging:"
+        echo "  KRASIS_TRACE=1 enables structured trace output."
+        echo "  KRASIS_TRACE_COMPONENTS=config_contract traces reference inventory/generation/validation state."
+        echo "  ./dev trace-diff compares stored KRASIS_TRACE logs, reports the first divergence,"
+        echo "  summarizes matching-prefix plus context/phase counts, can suggest a short"
+        echo "  resync point when one stream has inserted or dropped a few events, emits"
+        echo "  typed mismatch analysis for tensor, values, logits, route, and python_compare events,"
+        echo "  adds local decode-family analysis for missing/unexpected sub-events within one"
+        echo "  step/layer packet, adds bounded family-region resync hints across neighboring"
+        echo "  decode packets, and reports the nearest preceding config_contract state for"
+        echo "  decode divergences."
+        echo "  Example:"
+        echo "    KRASIS_TRACE=1 KRASIS_TRACE_COMPONENTS=config_contract ./dev reference-inventory"
+        echo "    ./dev trace-diff /tmp/expected.log /tmp/actual.log --components config_contract --contexts reference_test_single --phases artifact,validation"
         echo ""
         echo "Configs: qcn, qcn-a4, q235, q235-a4, v2lite, deepseek-vl, qwen35, qwen35-a4"
         echo "         (or path to .conf file)"
@@ -1150,6 +1239,10 @@ case "$cmd" in
         echo "  ./dev release-test-all rc8             Test all models (resume on re-run with same target)"
         echo "  ./dev awq-calibrate qcn    Build AWQ attention template"
         echo "  ./dev perplexity qcn"
+        echo "  ./dev trace-diff /tmp/expected.log /tmp/actual.log --events mark,tensor"
+        echo "  ./dev trace-diff /tmp/expected.log /tmp/actual.log --components config_contract --contexts reference_inventory --show-window 3"
+        echo "  ./dev trace-diff /tmp/expected.log /tmp/actual.log --components decode --resync-window 6"
+        echo "  ./dev trace-diff /tmp/expected.log /tmp/actual.log --components decode --family-resync-window 3"
         echo "  ./dev test qcn"
         echo "  ./dev network 8012"
         echo "  ./dev python -m krasis.launcher"
