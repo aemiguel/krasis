@@ -20,14 +20,18 @@ warn()  { echo -e "${YELLOW}${BOLD}!!${NC} $*"; }
 err()   { echo -e "${RED}${BOLD}ERROR${NC} $*" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PREP_SCRIPT="$SCRIPT_DIR/scripts/reference_capture_prep.sh"
 PYTHON_BIN="${KRASIS_DEV_PYTHON:-python3}"
 PIP_BIN="${KRASIS_DEV_PIP:-}"
 MATURIN_BIN="${KRASIS_DEV_MATURIN:-maturin}"
-CAPTURE_ENV_DIR="${KRASIS_REFERENCE_CAPTURE_VENV:-${HOME}/.krasis/reference-capture-venv}"
+CAPTURE_ROOT="${KRASIS_REFERENCE_CAPTURE_ROOT:-${HOME}/.krasis}"
+CAPTURE_MODELS_DIR="${KRASIS_REFERENCE_CAPTURE_MODELS_DIR:-${CAPTURE_ROOT}/models}"
+CAPTURE_ENV_DIR="${KRASIS_REFERENCE_CAPTURE_VENV:-${CAPTURE_ROOT}/reference-capture-venv}"
 CAPTURE_PYTHON="${CAPTURE_ENV_DIR}/bin/python"
-READY_JSON="${KRASIS_REFERENCE_CAPTURE_READY_JSON:-${HOME}/.krasis/capture-host-ready.json}"
-READY_STAMP="${KRASIS_REFERENCE_CAPTURE_READY_STAMP:-${HOME}/.krasis/capture-host-ready.stamp}"
+READY_JSON="${KRASIS_REFERENCE_CAPTURE_READY_JSON:-${CAPTURE_ROOT}/capture-host-ready.json}"
+READY_STAMP="${KRASIS_REFERENCE_CAPTURE_READY_STAMP:-${CAPTURE_ROOT}/capture-host-ready.stamp}"
 BOOTSTRAP=0
+MODEL_ARG=""
 
 usage() {
     cat <<'EOF'
@@ -38,11 +42,12 @@ download queue or detached capture starts.
 
 Options:
   --bootstrap     Create/repair the isolated capture venv first via reference-prep --deps-only
+  --model MODEL   Validate extra runtime deps for a specific capture model alias/repo
   -h, --help      Show this help
 
 Success writes:
-  ~/.krasis/capture-host-ready.json
-  ~/.krasis/capture-host-ready.stamp
+  <capture-root>/capture-host-ready.json
+  <capture-root>/capture-host-ready.stamp
 
 Failure removes those readiness artifacts so queue logic can fail closed.
 EOF
@@ -53,6 +58,11 @@ while [[ $# -gt 0 ]]; do
         --bootstrap)
             BOOTSTRAP=1
             shift
+            ;;
+        --model)
+            [[ $# -ge 2 ]] || err "--model requires a model alias or repo id"
+            MODEL_ARG="$2"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -71,17 +81,29 @@ if [[ "$BOOTSTRAP" -eq 1 ]]; then
     KRASIS_DEV_SCRIPT=1 \
     KRASIS_DEV_PYTHON="$PYTHON_BIN" \
     KRASIS_DEV_PIP="$PIP_BIN" \
+    KRASIS_REFERENCE_CAPTURE_ROOT="$CAPTURE_ROOT" \
+    KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$CAPTURE_MODELS_DIR" \
     KRASIS_REFERENCE_CAPTURE_VENV="$CAPTURE_ENV_DIR" \
-    "$SCRIPT_DIR/scripts/reference_capture_prep.sh" --deps-only
+    "$PREP_SCRIPT" ${MODEL_ARG:+$MODEL_ARG} --deps-only
 fi
 
 [[ -x "$PYTHON_BIN" ]] || err "Repo Python not found at $PYTHON_BIN"
 [[ -x "$MATURIN_BIN" ]] || err "maturin not found at $MATURIN_BIN"
 [[ -x "$CAPTURE_PYTHON" ]] || err "Capture Python not found at $CAPTURE_PYTHON. Run ./dev capture-preflight --bootstrap"
 
+EXPECTED_CAPTURE_DEPS_JSON="$(
+    KRASIS_DEV_SCRIPT=1 \
+    KRASIS_DEV_PYTHON="$PYTHON_BIN" \
+    KRASIS_DEV_PIP="$PIP_BIN" \
+    KRASIS_REFERENCE_CAPTURE_ROOT="$CAPTURE_ROOT" \
+    KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$CAPTURE_MODELS_DIR" \
+    KRASIS_REFERENCE_CAPTURE_VENV="$CAPTURE_ENV_DIR" \
+    "$PREP_SCRIPT" ${MODEL_ARG:+$MODEL_ARG} --print-required-deps-json
+)"
+
 tmp_json="$(mktemp)"
 set +e
-PYTHONNOUSERSITE=1 PYTHONPATH="$SCRIPT_DIR/python:$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" SCRIPT_DIR="$SCRIPT_DIR" PYTHON_BIN="$PYTHON_BIN" MATURIN_BIN="$MATURIN_BIN" CAPTURE_PYTHON="$CAPTURE_PYTHON" READY_JSON="$READY_JSON" "$CAPTURE_PYTHON" - <<'PY' >"$tmp_json"
+PYTHONNOUSERSITE=1 PYTHONPATH="$SCRIPT_DIR/python:$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" SCRIPT_DIR="$SCRIPT_DIR" PYTHON_BIN="$PYTHON_BIN" MATURIN_BIN="$MATURIN_BIN" CAPTURE_PYTHON="$CAPTURE_PYTHON" READY_JSON="$READY_JSON" CAPTURE_ROOT="$CAPTURE_ROOT" CAPTURE_MODELS_DIR="$CAPTURE_MODELS_DIR" PREFLIGHT_MODEL_ARG="$MODEL_ARG" EXPECTED_CAPTURE_DEPS_JSON="$EXPECTED_CAPTURE_DEPS_JSON" "$CAPTURE_PYTHON" - <<'PY' >"$tmp_json"
 import importlib
 import inspect
 import json
@@ -97,15 +119,24 @@ python_bin = pathlib.Path(os.environ["PYTHON_BIN"])
 maturin_bin = pathlib.Path(os.environ["MATURIN_BIN"])
 capture_python = pathlib.Path(os.environ["CAPTURE_PYTHON"])
 ready_json = pathlib.Path(os.environ["READY_JSON"])
+capture_root = pathlib.Path(os.environ["CAPTURE_ROOT"]).resolve()
+capture_models_dir = pathlib.Path(os.environ["CAPTURE_MODELS_DIR"]).resolve()
+requested_model = os.environ.get("PREFLIGHT_MODEL_ARG", "").strip()
+required_capture_deps = json.loads(os.environ["EXPECTED_CAPTURE_DEPS_JSON"])
 
 result = {
     "kind": "capture_host_ready",
     "generated_at": datetime.now(timezone.utc).isoformat(),
     "repo_root": str(repo),
+    "capture_root": str(capture_root),
+    "capture_models_dir": str(capture_models_dir),
     "capture_env_dir": str(capture_python.parent.parent),
     "capture_python": str(capture_python),
     "repo_python": str(python_bin),
     "maturin": str(maturin_bin),
+    "home": os.environ.get("HOME", ""),
+    "requested_model": requested_model or None,
+    "required_dep_groups": None,
     "checks": [],
 }
 
@@ -156,6 +187,10 @@ for package in (
     "huggingface_hub",
     "accelerate",
     "safetensors",
+    "mamba-ssm",
+    "causal-conv1d",
+    "einops",
+    "ninja",
     "sentencepiece",
     "protobuf",
     "triton",
@@ -167,12 +202,9 @@ for package in (
 result["capture_packages"] = capture_packages
 
 required_versions_ok = True
-for package, expected in {
-    "transformers": "4.57.1",
-    "huggingface_hub": "0.36.2",
-    "accelerate": "1.13.0",
-    "safetensors": "0.7.0",
-}.items():
+for package, expected in required_capture_deps.items():
+    if package in ("sentencepiece", "protobuf"):
+        continue
     installed = capture_packages.get(package)
     if installed != expected:
         required_versions_ok = False
@@ -303,6 +335,15 @@ add_check(
 
 rc, maturin_stdout, maturin_stderr = command_output([str(maturin_bin), "--version"])
 add_check("maturin", rc == 0, version=maturin_stdout or maturin_stderr)
+
+resolved_env_root = capture_python.parent.parent.parent.resolve()
+capture_root_ok = capture_root == resolved_env_root
+add_check(
+    "capture_root_consistency",
+    capture_root_ok,
+    configured_root=str(capture_root),
+    resolved_env_root=str(resolved_env_root),
+)
 
 result["ready"] = all(check["ok"] for check in result["checks"])
 result["readiness_artifact"] = str(ready_json)

@@ -12,8 +12,11 @@ This script must be run via ./dev generate-reference, not directly.
 """
 
 import argparse
+import inspect
+import importlib
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -31,6 +34,7 @@ try:
         collect_capture_stop_ids,
         capture_settings_for_profile,
         emit_reference_generation_trace,
+        load_tokenizer_with_compat,
         profile_filename,
     )
 except ModuleNotFoundError:
@@ -43,6 +47,7 @@ except ModuleNotFoundError:
         collect_capture_stop_ids,
         capture_settings_for_profile,
         emit_reference_generation_trace,
+        load_tokenizer_with_compat,
         profile_filename,
     )
 
@@ -52,7 +57,7 @@ if not os.environ.get("KRASIS_DEV_SCRIPT"):
     print("  Usage: ./dev generate-reference <model-name>")
     sys.exit(1)
 
-MODELS_DIR = os.path.expanduser("~/.krasis/models")
+MODELS_DIR = os.environ.get("KRASIS_REFERENCE_CAPTURE_MODELS_DIR", os.path.expanduser("~/.krasis/models"))
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 REFERENCE_DIR = SCRIPT_DIR / "reference_outputs"
@@ -75,6 +80,12 @@ MODEL_ALIASES = {
     "minimax": "MiniMax-M2.5",
     "minimax25": "MiniMax-M2.5",
     "minimax-m2.5": "MiniMax-M2.5",
+    "nemotron-nano": "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "nemotronnano": "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "nvidia-nemotron-3-nano-30b-a3b-bf16": "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "nemotron-super": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+    "nemotronsuper": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+    "nvidia-nemotron-3-super-120b-a12b-bf16": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
     "q235": "Qwen3-235B-A22B",
     "qwen235": "Qwen3-235B-A22B",
     "qwen3-235b-a22b": "Qwen3-235B-A22B",
@@ -292,6 +303,162 @@ def build_teacher_forced_per_token_data(
     return per_token_data
 
 
+def _past_seen_tokens(past_key_values: Any) -> int:
+    if past_key_values is None:
+        return 0
+    if hasattr(past_key_values, "get_seq_length"):
+        try:
+            return int(past_key_values.get_seq_length())
+        except Exception:
+            return 0
+    if isinstance(past_key_values, tuple) and past_key_values:
+        try:
+            return int(past_key_values[0][0].shape[2])
+        except Exception:
+            return 0
+    return 0
+
+
+def maybe_patch_legacy_remote_cache_position(model: Any) -> None:
+    """Backfill cache_position for legacy remote-code generation hooks."""
+    import torch
+    from transformers.cache_utils import DynamicCache
+
+    prepare = getattr(model, "prepare_inputs_for_generation", None)
+    if prepare is None:
+        return
+
+    try:
+        prepare_sig = inspect.signature(prepare)
+        forward_sig = inspect.signature(model.forward)
+    except (TypeError, ValueError):
+        return
+
+    if "cache_position" not in prepare_sig.parameters:
+        return
+    if "cache_position" not in forward_sig.parameters:
+        return
+
+    module_name = getattr(model.__class__, "__module__", "")
+    if "transformers_modules" not in module_name:
+        return
+    model_module = importlib.import_module(module_name)
+    hybrid_cache_cls = getattr(model_module, "HybridMambaAttentionDynamicCache", None)
+
+    original_prepare = prepare
+
+    def patched_prepare_inputs_for_generation(*args: Any, **kwargs: Any) -> Any:
+        cache_state = kwargs.get("cache_params", kwargs.get("past_key_values"))
+
+        cache_position = kwargs.get("cache_position")
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        inputs_embeds = kwargs.get("inputs_embeds")
+        if input_ids is not None:
+            sequence_length = int(input_ids.shape[1])
+            batch_size = int(input_ids.shape[0])
+            device = input_ids.device
+        elif inputs_embeds is not None:
+            sequence_length = int(inputs_embeds.shape[1])
+            batch_size = int(inputs_embeds.shape[0])
+            device = inputs_embeds.device
+        else:
+            sequence_length = 0
+            batch_size = 1
+            device = model.device
+
+        if hybrid_cache_cls is not None and (
+            cache_state is None or isinstance(cache_state, DynamicCache) and not hasattr(cache_state, "conv_kernel_size")
+        ):
+            cache_state = hybrid_cache_cls(model.config, batch_size, model.dtype, device=device)
+
+        if cache_state is not None and kwargs.get("past_key_values") is None:
+            kwargs["past_key_values"] = cache_state
+
+        if cache_position is None and cache_state is not None:
+            kwargs["cache_position"] = torch.arange(
+                sequence_length,
+                device=device,
+                dtype=torch.long,
+            ) + _past_seen_tokens(cache_state)
+
+        model_inputs = original_prepare(*args, **kwargs)
+        if "cache_params" in forward_sig.parameters and "cache_params" not in model_inputs:
+            cache_for_forward = model_inputs.pop("past_key_values", None)
+            if cache_for_forward is not None:
+                model_inputs["cache_params"] = cache_for_forward
+        return model_inputs
+
+    setattr(model, "prepare_inputs_for_generation", patched_prepare_inputs_for_generation)
+
+
+def apply_model_config_compat(config: Any) -> None:
+    """Backfill config aliases expected by newer HF integration code."""
+
+    def _patch_one(target: Any) -> None:
+        if target is None or hasattr(target, "num_experts"):
+            return
+
+        expert_count = None
+        if hasattr(target, "num_local_experts"):
+            expert_count = getattr(target, "num_local_experts")
+        elif hasattr(target, "n_routed_experts"):
+            expert_count = getattr(target, "n_routed_experts")
+
+        if expert_count is not None:
+            setattr(target, "num_experts", expert_count)
+
+    _patch_one(config)
+    for attr_name in ("text_config", "language_config", "llm_config"):
+        _patch_one(getattr(config, attr_name, None))
+
+
+def _target_pattern_matches_param_name(pattern: str, param_name: str) -> bool:
+    regex = re.escape(pattern)
+    regex = regex.replace(r"\.\*\.", r"\..*\.")
+    regex = regex.replace(r"\*", r".*")
+    return re.search(regex, param_name) is not None
+
+
+def estimate_conversion_workspace_bytes(model_loader: Any, config: Any) -> int:
+    """Estimate the largest temporary tensor created by checkpoint conversion ops."""
+    import torch
+    from accelerate import init_empty_weights
+    from transformers.conversion_mapping import get_model_conversion_mapping
+    from transformers.core_model_loading import Concatenate, WeightConverter
+
+    try:
+        with init_empty_weights(include_buffers=True):
+            empty_model = model_loader.from_config(config, trust_remote_code=True)
+    except Exception as exc:
+        warn(f"Could not build empty model for conversion workspace estimate: {exc}")
+        return 0
+
+    try:
+        conversions = get_model_conversion_mapping(empty_model)
+        max_bytes = 0
+        seen_param_names = set()
+        for conversion in conversions:
+            if not isinstance(conversion, WeightConverter):
+                continue
+            if not any(isinstance(op, Concatenate) for op in conversion.operations):
+                continue
+            for param_name, param in empty_model.named_parameters():
+                if param_name in seen_param_names:
+                    continue
+                if not any(
+                    _target_pattern_matches_param_name(target_pattern, param_name)
+                    for target_pattern in conversion.target_patterns
+                ):
+                    continue
+                seen_param_names.add(param_name)
+                max_bytes = max(max_bytes, int(param.numel()) * torch.empty((), dtype=param.dtype).element_size())
+        return max_bytes
+    finally:
+        del empty_model
+
+
 def generate_reference(
     model_name: str,
     max_new_tokens: int = 200,
@@ -321,26 +488,9 @@ def generate_reference(
     info(f"Path: {model_path}")
     info(f"Conversations: {len(conversations)} ({total_prompts} prompts)")
     info(f"Max new tokens: {max_new_tokens}")
-    info(f"Decode diagnostics: first {diagnostic_steps} steps, top-{diagnostic_top_k}")
-    # Use only GPU 0 for loading; offload the rest to CPU.
-    # QCN has 512 experts/layer — too large for multi-GPU with transformers.
-    # Speed doesn't matter here, correctness does.
-    num_gpus = torch.cuda.device_count()
-    max_memory = {"cpu": "200GiB"}
-    # Use all available GPUs — give each one most of its memory
-    for i in range(num_gpus):
-        free_mb = torch.cuda.mem_get_info(i)[0] // (1024 * 1024)
-        alloc_gb = max(1, (free_mb - 2048)) / 1024  # leave 2GB headroom
-        max_memory[i] = f"{alloc_gb:.1f}GiB"
-        info(f"GPU {i}: {free_mb}MB free, allocating {alloc_gb:.1f}GiB")
-    info(f"Loading model in BF16 ({num_gpus} GPUs + CPU offload)...")
-
-    t0 = time.time()
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    info(f"Tokenizer loaded ({time.time() - t0:.1f}s)")
-
     t0 = time.time()
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    apply_model_config_compat(config)
     info(f"Config loaded ({time.time() - t0:.1f}s)")
 
     architectures = list(getattr(config, "architectures", []) or [])
@@ -352,6 +502,30 @@ def generate_reference(
     )
 
     t0 = time.time()
+    tokenizer = load_tokenizer_with_compat(model_path)
+    info(f"Tokenizer loaded ({time.time() - t0:.1f}s)")
+
+    conversion_workspace_bytes = estimate_conversion_workspace_bytes(model_loader, config)
+    conversion_workspace_gib = conversion_workspace_bytes / (1024 ** 3)
+    if conversion_workspace_bytes > 0:
+        info(f"Estimated conversion workspace reserve: {conversion_workspace_gib:.2f}GiB")
+
+    num_gpus = torch.cuda.device_count()
+    max_memory = {"cpu": "200GiB"}
+    base_headroom_mb = 2048
+    conversion_headroom_mb = (conversion_workspace_bytes + (1024 * 1024 - 1)) // (1024 * 1024)
+    total_headroom_mb = base_headroom_mb + conversion_headroom_mb
+    for i in range(num_gpus):
+        free_mb = torch.cuda.mem_get_info(i)[0] // (1024 * 1024)
+        alloc_gb = max(1, (free_mb - total_headroom_mb)) / 1024
+        max_memory[i] = f"{alloc_gb:.1f}GiB"
+        info(
+            f"GPU {i}: {free_mb}MB free, allocating {alloc_gb:.1f}GiB "
+            f"(headroom {total_headroom_mb}MB)"
+        )
+    info(f"Loading model in BF16 ({num_gpus} GPUs + CPU offload)...")
+
+    t0 = time.time()
     model = model_loader.from_pretrained(
         model_path,
         config=config,
@@ -360,6 +534,7 @@ def generate_reference(
         max_memory=max_memory,
         trust_remote_code=True,
     )
+    maybe_patch_legacy_remote_cache_position(model)
     model.eval()
     load_time = time.time() - t0
     info(f"Model loaded ({load_time:.1f}s)")
@@ -568,7 +743,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate BF16 HuggingFace greedy reference outputs with stored contract metadata"
     )
-    parser.add_argument("model", help="Model directory name under ~/.krasis/models/")
+    parser.add_argument("model", help="Model directory name under the active capture models dir")
     parser.add_argument("--max-tokens", type=int, default=200,
                         help="Max new tokens per turn (default: 200)")
     parser.add_argument(

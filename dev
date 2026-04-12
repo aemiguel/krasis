@@ -85,9 +85,11 @@ WHEEL_DIR="$SCRIPT_DIR/target/dev-wheels"
 REPO_PYTHONPATH="$SCRIPT_DIR/python"
 REPO_LIBPATH="$SCRIPT_DIR/python/krasis.libs"
 STANDARD_SPEED_TEST_CONFIG="$SCRIPT_DIR/tests/qcn-polar4-awq.conf"
-REFERENCE_CAPTURE_VENV="${HOME}/.krasis/reference-capture-venv"
-REFERENCE_CAPTURE_READY_JSON="${HOME}/.krasis/capture-host-ready.json"
-REFERENCE_CAPTURE_READY_STAMP="${HOME}/.krasis/capture-host-ready.stamp"
+REFERENCE_CAPTURE_ROOT="${KRASIS_REFERENCE_CAPTURE_ROOT:-${HOME}/.krasis}"
+REFERENCE_CAPTURE_MODELS_DIR="${REFERENCE_CAPTURE_ROOT}/models"
+REFERENCE_CAPTURE_VENV="${REFERENCE_CAPTURE_ROOT}/reference-capture-venv"
+REFERENCE_CAPTURE_READY_JSON="${REFERENCE_CAPTURE_ROOT}/capture-host-ready.json"
+REFERENCE_CAPTURE_READY_STAMP="${REFERENCE_CAPTURE_ROOT}/capture-host-ready.stamp"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -1095,6 +1097,8 @@ do_capture_preflight() {
     KRASIS_DEV_PYTHON="$PYTHON" \
     KRASIS_DEV_PIP="$PIP" \
     KRASIS_DEV_MATURIN="$MATURIN" \
+    KRASIS_REFERENCE_CAPTURE_ROOT="$REFERENCE_CAPTURE_ROOT" \
+    KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$REFERENCE_CAPTURE_MODELS_DIR" \
     KRASIS_REFERENCE_CAPTURE_VENV="$REFERENCE_CAPTURE_VENV" \
     KRASIS_REFERENCE_CAPTURE_READY_JSON="$REFERENCE_CAPTURE_READY_JSON" \
     KRASIS_REFERENCE_CAPTURE_READY_STAMP="$REFERENCE_CAPTURE_READY_STAMP" \
@@ -1102,16 +1106,21 @@ do_capture_preflight() {
 }
 
 do_reference_prep() {
-    [[ $# -lt 1 && ! " ${*:-} " =~ [[:space:]](--help|-h|--list-models|--deps-only)[[:space:]] ]] && err "Usage: ./dev reference-prep <model> [--detach] [--print-urls|--urls-only] [--deps-only|--download-only] [--dest-root PATH]
-  Prepares the HF reference-capture environment and downloads a public model to ~/.krasis/models.
+    [[ $# -lt 1 && ! " ${*:-} " =~ [[:space:]](--help|-h|--list-models|--deps-only|--print-deps-json)[[:space:]] ]] && err "Usage: ./dev reference-prep <model> [--detach] [--print-urls|--urls-only] [--deps-only|--download-only|--print-deps-json] [--dest-root PATH]
+  Prepares the HF reference-capture environment and downloads a public model to ${REFERENCE_CAPTURE_MODELS_DIR}.
   Examples:
     ./dev capture-preflight --bootstrap
     ./dev reference-prep qcn
     ./dev reference-prep qwen35 --detach
     ./dev reference-prep --deps-only
+    ./dev reference-prep --print-deps-json
     ./dev reference-prep gemma --urls-only"
     info "Preparing reference host: ${1:-listing models}"
-    KRASIS_DEV_SCRIPT=1 KRASIS_DEV_PYTHON="$PYTHON" KRASIS_DEV_PIP="$PIP" KRASIS_REFERENCE_CAPTURE_VENV="$REFERENCE_CAPTURE_VENV" "$SCRIPT_DIR/scripts/reference_capture_prep.sh" "$@"
+    KRASIS_DEV_SCRIPT=1 KRASIS_DEV_PYTHON="$PYTHON" KRASIS_DEV_PIP="$PIP" \
+    KRASIS_REFERENCE_CAPTURE_ROOT="$REFERENCE_CAPTURE_ROOT" \
+    KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$REFERENCE_CAPTURE_MODELS_DIR" \
+    KRASIS_REFERENCE_CAPTURE_VENV="$REFERENCE_CAPTURE_VENV" \
+    "$SCRIPT_DIR/scripts/reference_capture_prep.sh" "$@"
 }
 
 do_generate_reference() {
@@ -1135,6 +1144,7 @@ do_generate_reference() {
     verify_repo_python_imports
     set +e
     KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="generate-reference" KRASIS_DEV_CMD="$dev_cmd" \
+        KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$REFERENCE_CAPTURE_MODELS_DIR" \
         run_reference_capture_python "$SCRIPT_DIR/tests/generate_reference.py" "$@" 2>&1 | tee "$logfile"
     local status=${PIPESTATUS[0]}
     set -e
@@ -1340,11 +1350,15 @@ case "$cmd" in
         echo "    qcn, qwen35, q122b, gemma, minimax, q235, q397"
         echo "  Notes:"
         echo "    - Uses public Hugging Face repo IDs only; does not use an HF token."
+        echo "    - capture root:"
+        echo "        $REFERENCE_CAPTURE_ROOT"
         echo "    - capture-preflight writes:"
         echo "        $REFERENCE_CAPTURE_READY_JSON"
         echo "        $REFERENCE_CAPTURE_READY_STAMP"
         echo "    - reference-prep installs capture/download deps in the isolated capture venv:"
         echo "        $REFERENCE_CAPTURE_VENV"
+        echo "    - reference-prep downloads models to:"
+        echo "        $REFERENCE_CAPTURE_MODELS_DIR"
         echo "    - Use --detach to keep a long download running with a log file."
         echo ""
         echo "Reference profiles for ./dev generate-reference:"

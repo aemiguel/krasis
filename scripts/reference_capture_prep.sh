@@ -22,25 +22,47 @@ err()   { echo -e "${RED}${BOLD}ERROR${NC} $*" >&2; exit 1; }
 PYTHON_BIN="${KRASIS_DEV_PYTHON:-python3}"
 PIP_BIN="${KRASIS_DEV_PIP:-}"
 PYTHON_DIR="$(cd "$(dirname "$PYTHON_BIN")" && pwd)"
-CAPTURE_ENV_DIR="${KRASIS_REFERENCE_CAPTURE_VENV:-${HOME}/.krasis/reference-capture-venv}"
+CAPTURE_ROOT="${KRASIS_REFERENCE_CAPTURE_ROOT:-${HOME}/.krasis}"
+CAPTURE_ENV_DIR="${KRASIS_REFERENCE_CAPTURE_VENV:-${CAPTURE_ROOT}/reference-capture-venv}"
 CAPTURE_PYTHON="${CAPTURE_ENV_DIR}/bin/python"
 CAPTURE_PIP="${CAPTURE_ENV_DIR}/bin/pip"
-DEST_ROOT="${HOME}/.krasis/models"
+DEST_ROOT="${KRASIS_REFERENCE_CAPTURE_MODELS_DIR:-${CAPTURE_ROOT}/models}"
 LOG_ROOT=""
 MODEL_ARG=""
+REPO_ID=""
+LOCAL_NAME=""
 LIST_MODELS=0
 PRINT_URLS=0
 DETACH=0
 INSTALL_DEPS=1
 START_DOWNLOAD=1
 URLS_ONLY=0
-REQUIRED_CAPTURE_DEPS=(
-    "huggingface_hub==0.36.2"
-    "accelerate==1.13.0"
-    "transformers==4.57.1"
-    "safetensors==0.7.0"
+PRINT_DEPS_JSON=0
+PRINT_DEP_GROUPS=0
+PRINT_REQUIRED_DEPS_JSON=0
+BASE_ONLY=0
+NO_OVERLAP=0
+HF_HUB_VERSION="${KRASIS_REFERENCE_CAPTURE_HF_HUB_VERSION:-1.10.1}"
+ACCELERATE_VERSION="${KRASIS_REFERENCE_CAPTURE_ACCELERATE_VERSION:-1.13.0}"
+TRANSFORMERS_VERSION="${KRASIS_REFERENCE_CAPTURE_TRANSFORMERS_VERSION:-5.5.3}"
+SAFETENSORS_VERSION="${KRASIS_REFERENCE_CAPTURE_SAFETENSORS_VERSION:-0.7.0}"
+MAMBA_SSM_VERSION="${KRASIS_REFERENCE_CAPTURE_MAMBA_SSM_VERSION:-2.3.1}"
+CAUSAL_CONV1D_VERSION="${KRASIS_REFERENCE_CAPTURE_CAUSAL_CONV1D_VERSION:-1.6.1}"
+EINOPS_VERSION="${KRASIS_REFERENCE_CAPTURE_EINOPS_VERSION:-0.8.2}"
+NINJA_VERSION="${KRASIS_REFERENCE_CAPTURE_NINJA_VERSION:-1.13.0}"
+BASE_CAPTURE_DEPS=(
+    "huggingface_hub==${HF_HUB_VERSION}"
+    "accelerate==${ACCELERATE_VERSION}"
+    "transformers==${TRANSFORMERS_VERSION}"
+    "safetensors==${SAFETENSORS_VERSION}"
     "sentencepiece"
     "protobuf<7"
+)
+MAMBA_CAPTURE_DEPS=(
+    "mamba-ssm==${MAMBA_SSM_VERSION}"
+    "causal-conv1d==${CAUSAL_CONV1D_VERSION}"
+    "einops==${EINOPS_VERSION}"
+    "ninja==${NINJA_VERSION}"
 )
 
 usage() {
@@ -49,10 +71,10 @@ Usage: ./dev reference-prep <model> [options]
        ./dev reference-prep --deps-only
 
 Prepare the HF reference-capture environment and download a public model to
-~/.krasis/models without using an HF token.
+the capture-root models dir without using an HF token.
 
 Dependencies are installed into a dedicated capture venv at:
-  ~/.krasis/reference-capture-venv
+  <capture-root>/reference-capture-venv
 This keeps HF capture deps isolated from the main Krasis serving env.
 
 Options:
@@ -62,6 +84,11 @@ Options:
   --detach                Leave the download running in the background and log to krasis/logs
   --deps-only             Install/repair capture dependencies only; no model required
   --download-only         Start the download only; skip dependency installs
+  --base-only             Only install the base HF capture stack; skip model-family extras
+  --no-overlap            Do not overlap model-family extra builds with downloads
+  --print-deps-json       Print the authoritative pinned capture dependency set as JSON and exit
+  --print-dep-groups      Print the dependency groups and supported model families as JSON and exit
+  --print-required-deps-json  Print the flattened required dependency set for the target model/mode
   --dest-root PATH        Override the model root (default: ~/.krasis/models)
   -h, --help              Show this help
 
@@ -73,6 +100,8 @@ Supported aliases:
   minimax   -> MiniMaxAI/MiniMax-M2.5
   q235      -> Qwen/Qwen3-235B-A22B
   q397      -> Qwen/Qwen3.5-397B-A17B
+  nemotron-nano   -> nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  nemotron-super  -> nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
 
 You can also pass a full Hugging Face repo id directly, for example:
   ./dev reference-prep Qwen/Qwen3-Coder-Next
@@ -88,7 +117,66 @@ gemma    google/gemma-4-26B-A4B-it
 minimax  MiniMaxAI/MiniMax-M2.5
 q235     Qwen/Qwen3-235B-A22B
 q397     Qwen/Qwen3.5-397B-A17B
+nemotron-nano   nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+nemotron-super  nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
 EOF
+}
+
+print_required_capture_deps_json() {
+    "$PYTHON_BIN" - "$HF_HUB_VERSION" "$ACCELERATE_VERSION" "$TRANSFORMERS_VERSION" "$SAFETENSORS_VERSION" "$MAMBA_SSM_VERSION" "$CAUSAL_CONV1D_VERSION" "$EINOPS_VERSION" "$NINJA_VERSION" <<'PY'
+import json
+import sys
+
+payload = {
+    "base": {
+        "huggingface_hub": sys.argv[1],
+        "accelerate": sys.argv[2],
+        "transformers": sys.argv[3],
+        "safetensors": sys.argv[4],
+        "sentencepiece": "installed",
+        "protobuf": "<7",
+    },
+    "groups": {
+        "mamba_runtime": {
+            "mamba-ssm": sys.argv[5],
+            "causal-conv1d": sys.argv[6],
+            "einops": sys.argv[7],
+            "ninja": sys.argv[8],
+        }
+    },
+    "model_groups": {
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": ["mamba_runtime"],
+        "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": ["mamba_runtime"],
+    },
+}
+print(json.dumps(payload, sort_keys=True))
+PY
+}
+
+model_dep_groups_json() {
+    print_required_capture_deps_json
+}
+
+print_flat_required_capture_deps_json() {
+    local mode="${1:-full}"
+    KRASIS_CAPTURE_EXPECTED_DEPS="$(collect_required_capture_deps "$mode")" "$PYTHON_BIN" - <<'PY'
+import json
+import os
+
+deps = os.environ["KRASIS_CAPTURE_EXPECTED_DEPS"].splitlines()
+payload = {}
+for dep in deps:
+    if not dep:
+        continue
+    if dep == "sentencepiece":
+        payload["sentencepiece"] = "installed"
+    elif dep.startswith("protobuf<"):
+        payload["protobuf"] = dep.split("<", 1)[1]
+    else:
+        name, version = dep.split("==", 1)
+        payload[name] = version
+print(json.dumps(payload, sort_keys=True))
+PY
 }
 
 normalize_model_arg() {
@@ -103,6 +191,8 @@ normalize_model_arg() {
         minimax|minimax25|minimax-m2.5) echo "MiniMaxAI/MiniMax-M2.5" ;;
         q235|qwen235|qwen3-235b-a22b) echo "Qwen/Qwen3-235B-A22B" ;;
         q397|qwen397|qwen3.5-397b-a17b) echo "Qwen/Qwen3.5-397B-A17B" ;;
+        nemotron-nano|nemotronnano|nano|nvidia-nemotron-3-nano-30b-a3b-bf16) echo "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16" ;;
+        nemotron-super|nemotronsuper|super|nvidia-nemotron-3-super-120b-a12b-bf16) echo "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16" ;;
         */*) echo "$raw" ;;
         *)
             err "Unknown model alias: $raw
@@ -123,6 +213,46 @@ detect_torch_index_url() {
         12.1*|12.2*|12.3*) echo "https://download.pytorch.org/whl/cu121" ;;
         *) echo "https://download.pytorch.org/whl/cu118" ;;
     esac
+}
+
+required_dep_group_names_for_model() {
+    local repo_id="$1"
+    case "$repo_id" in
+        nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16|nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16)
+            echo "mamba_runtime"
+            ;;
+        *)
+            ;;
+    esac
+}
+
+append_dep_group_packages() {
+    local group_name="$1"
+    case "$group_name" in
+        mamba_runtime)
+            printf '%s\n' "${MAMBA_CAPTURE_DEPS[@]}"
+            ;;
+        *)
+            err "Unknown dependency group: $group_name"
+            ;;
+    esac
+}
+
+collect_required_capture_deps() {
+    local mode="${1:-full}"
+    local -a deps=("${BASE_CAPTURE_DEPS[@]}")
+
+    if [[ "$mode" != "base" && -n "$REPO_ID" ]]; then
+        while IFS= read -r group_name; do
+            [[ -n "$group_name" ]] || continue
+            while IFS= read -r package; do
+                [[ -n "$package" ]] || continue
+                deps+=("$package")
+            done < <(append_dep_group_packages "$group_name")
+        done < <(required_dep_group_names_for_model "$REPO_ID")
+    fi
+
+    printf '%s\n' "${deps[@]}"
 }
 
 ensure_torch() {
@@ -173,17 +303,33 @@ ensure_capture_env() {
 
 capture_deps_status() {
     ensure_capture_env >/dev/null
-    "$CAPTURE_PYTHON" - <<'PY'
+    local mode="${1:-full}"
+    local deps_json
+    deps_json=$(KRASIS_CAPTURE_EXPECTED_DEPS="$(collect_required_capture_deps "$mode")" "$PYTHON_BIN" - <<'PY'
+import json
+import os
+
+deps = os.environ["KRASIS_CAPTURE_EXPECTED_DEPS"].splitlines()
+payload = {}
+for dep in deps:
+    if not dep:
+        continue
+    if dep == "sentencepiece":
+        payload["sentencepiece"] = "installed"
+    elif dep.startswith("protobuf<"):
+        payload["protobuf"] = dep.split("<", 1)[1]
+    else:
+        name, version = dep.split("==", 1)
+        payload[name] = version
+print(json.dumps(payload))
+PY
+)
+    "$CAPTURE_PYTHON" - "$deps_json" <<'PY'
 from importlib import metadata
 import json
 import sys
 
-requirements = {
-    "huggingface_hub": "0.36.2",
-    "accelerate": "1.13.0",
-    "transformers": "4.57.1",
-    "safetensors": "0.7.0",
-}
+requirements = json.loads(sys.argv[1])
 status = {"ok": True, "packages": {}, "issues": []}
 for package, expected in requirements.items():
     try:
@@ -191,7 +337,7 @@ for package, expected in requirements.items():
     except metadata.PackageNotFoundError:
         installed = None
     status["packages"][package] = installed
-    if installed != expected:
+    if package not in ("sentencepiece", "protobuf") and installed != expected:
         status["ok"] = False
         status["issues"].append(
             {
@@ -201,37 +347,40 @@ for package, expected in requirements.items():
             }
         )
 
-for package in ("sentencepiece", "protobuf"):
-    try:
-        installed = metadata.version(package)
-    except metadata.PackageNotFoundError:
-        installed = None
-    status["packages"][package] = installed
-    if package == "sentencepiece" and installed is None:
+if "sentencepiece" in requirements:
+    installed = status["packages"].get("sentencepiece")
+    if installed is None:
         status["ok"] = False
         status["issues"].append(
             {
-                "package": package,
+                "package": "sentencepiece",
                 "installed": None,
                 "expected": "installed",
             }
         )
-    if package == "protobuf":
-        major = None
-        if installed:
-            try:
-                major = int(installed.split(".", 1)[0])
-            except ValueError:
-                major = None
-        if installed is None or major is None or major >= 7:
-            status["ok"] = False
-            status["issues"].append(
-                {
-                    "package": package,
-                    "installed": installed,
-                    "expected": "<7",
-                }
-            )
+
+if "protobuf" in requirements:
+    installed = status["packages"].get("protobuf")
+    major = None
+    if installed:
+        try:
+            major = int(installed.split(".", 1)[0])
+        except ValueError:
+            major = None
+    max_major_exclusive = None
+    try:
+        max_major_exclusive = int(requirements["protobuf"])
+    except ValueError:
+        max_major_exclusive = None
+    if installed is None or major is None or max_major_exclusive is None or major >= max_major_exclusive:
+        status["ok"] = False
+        status["issues"].append(
+            {
+                "package": "protobuf",
+                "installed": installed,
+                "expected": f"<{requirements['protobuf']}",
+            }
+        )
 
 print(json.dumps(status))
 PY
@@ -247,6 +396,10 @@ for package in (
     "accelerate",
     "transformers",
     "safetensors",
+    "mamba-ssm",
+    "causal-conv1d",
+    "einops",
+    "ninja",
     "sentencepiece",
     "protobuf",
 ):
@@ -259,10 +412,11 @@ PY
 }
 
 install_capture_deps() {
+    local mode="${1:-full}"
     ensure_capture_env
     ensure_torch
     local dep_status
-    dep_status=$(capture_deps_status)
+    dep_status=$(capture_deps_status "$mode")
     if "$CAPTURE_PYTHON" - "$dep_status" <<'PY'
 import json
 import sys
@@ -288,9 +442,32 @@ for issue in status["issues"]:
         f"expected={issue['expected']}"
     )
 PY
-    info "Installing pinned reference-capture and Hugging Face download dependencies"
-    "$CAPTURE_PIP" install "${REQUIRED_CAPTURE_DEPS[@]}"
+    info "Installing pinned reference-capture dependencies (mode: $mode)"
+    mapfile -t deps_to_install < <(collect_required_capture_deps "$mode")
+    "$CAPTURE_PIP" install "${deps_to_install[@]}"
     print_capture_dep_versions
+}
+
+install_capture_extra_deps_background() {
+    local mode="${1:-full}"
+    local log_file="$2"
+    [[ "$mode" == "full" ]] || return 0
+    mapfile -t extra_groups < <(required_dep_group_names_for_model "$REPO_ID")
+    [[ "${#extra_groups[@]}" -gt 0 ]] || return 0
+
+    mapfile -t extra_deps < <(
+        for group_name in "${extra_groups[@]}"; do
+            append_dep_group_packages "$group_name"
+        done
+    )
+    [[ "${#extra_deps[@]}" -gt 0 ]] || return 0
+
+    info "Starting model-family extra dependency build in background"
+    printf '%s\n' "Model: ${LOCAL_NAME}" "Repo: ${REPO_ID}" "Mode: ${mode}" > "$log_file"
+    printf '$ %q ' "$CAPTURE_PIP" install "${extra_deps[@]}" >> "$log_file"
+    printf '\n\n' >> "$log_file"
+    "$CAPTURE_PIP" install "${extra_deps[@]}" >> "$log_file" 2>&1 &
+    echo $!
 }
 
 resolve_hf_cli() {
@@ -343,6 +520,26 @@ while [[ $# -gt 0 ]]; do
             INSTALL_DEPS=0
             shift
             ;;
+        --base-only)
+            BASE_ONLY=1
+            shift
+            ;;
+        --no-overlap)
+            NO_OVERLAP=1
+            shift
+            ;;
+        --print-deps-json)
+            PRINT_DEPS_JSON=1
+            shift
+            ;;
+        --print-dep-groups)
+            PRINT_DEP_GROUPS=1
+            shift
+            ;;
+        --print-required-deps-json)
+            PRINT_REQUIRED_DEPS_JSON=1
+            shift
+            ;;
         --dest-root)
             [[ $# -ge 2 ]] || err "--dest-root requires a path"
             DEST_ROOT="$2"
@@ -368,6 +565,16 @@ if [[ "$LIST_MODELS" -eq 1 ]]; then
     exit 0
 fi
 
+if [[ "$PRINT_DEPS_JSON" -eq 1 ]]; then
+    print_required_capture_deps_json
+    exit 0
+fi
+
+if [[ "$PRINT_DEP_GROUPS" -eq 1 ]]; then
+    model_dep_groups_json
+    exit 0
+fi
+
 if [[ -z "$MODEL_ARG" && "$START_DOWNLOAD" -eq 1 ]]; then
     err "Missing model argument
   Run ./dev reference-prep --help for usage."
@@ -379,6 +586,15 @@ if [[ -n "$MODEL_ARG" ]]; then
     DEST_DIR="${DEST_ROOT%/}/${LOCAL_NAME}"
     REPO_URL="https://huggingface.co/${REPO_ID}"
     TREE_URL="${REPO_URL}/tree/main"
+
+    if [[ "$PRINT_REQUIRED_DEPS_JSON" -eq 1 ]]; then
+        dep_mode="full"
+        if [[ "$BASE_ONLY" -eq 1 ]]; then
+            dep_mode="base"
+        fi
+        print_flat_required_capture_deps_json "$dep_mode"
+        exit 0
+    fi
 
     info "Model repo: $REPO_ID"
     info "Local dir: $DEST_DIR"
@@ -393,10 +609,25 @@ if [[ -n "$MODEL_ARG" ]]; then
     fi
 fi
 
+if [[ "$PRINT_REQUIRED_DEPS_JSON" -eq 1 ]]; then
+    dep_mode="full"
+    if [[ "$BASE_ONLY" -eq 1 || -z "$REPO_ID" ]]; then
+        dep_mode="base"
+    fi
+    print_flat_required_capture_deps_json "$dep_mode"
+    exit 0
+fi
+
 mkdir -p "$DEST_ROOT"
 
 if [[ "$INSTALL_DEPS" -eq 1 ]]; then
-    install_capture_deps
+    dep_mode="full"
+    if [[ "$BASE_ONLY" -eq 1 || -z "$REPO_ID" ]]; then
+        dep_mode="base"
+    elif [[ "$NO_OVERLAP" -eq 0 ]]; then
+        dep_mode="base"
+    fi
+    install_capture_deps "$dep_mode"
 fi
 
 if [[ "$START_DOWNLOAD" -eq 0 ]]; then
@@ -431,8 +662,25 @@ if [[ "$DETACH" -eq 1 ]]; then
     exit 0
 fi
 
+extra_deps_pid=""
+extra_deps_log=""
+if [[ "$INSTALL_DEPS" -eq 1 && "$BASE_ONLY" -eq 0 && "$NO_OVERLAP" -eq 0 ]]; then
+    LOG_ROOT="${LOG_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/logs}"
+    mkdir -p "$LOG_ROOT"
+    ts=$(date +%Y%m%d_%H%M%S)
+    safe_name=$(echo "$LOCAL_NAME" | tr '/ ' '__')
+    extra_deps_log="$LOG_ROOT/reference-prep-extra-deps_${safe_name}_${ts}.log"
+    extra_deps_pid=$(install_capture_extra_deps_background "full" "$extra_deps_log" || true)
+fi
+
 info "Starting download"
 printf '$ %q ' "${DOWNLOAD_CMD[@]}"
 printf '\n'
 "${DOWNLOAD_CMD[@]}"
+if [[ -n "$extra_deps_pid" ]]; then
+    info "Waiting for model-family extra dependency build to finish (pid $extra_deps_pid)"
+    if ! wait "$extra_deps_pid"; then
+        err "Model-family extra dependency build failed. See log: $extra_deps_log"
+    fi
+fi
 ok "Download complete: $DEST_DIR"
