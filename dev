@@ -22,6 +22,7 @@
 #   ./dev reference-test <config>   Compare engine output against BF16 reference data
 #   ./dev reference-test --compare <model>  Run 4 quant configs, produce comparative report
 #   ./dev reference-inventory       Inventory stored reference artifacts and classify contract state
+#   ./dev capture-preflight         Verify or bootstrap a host for HF reference capture
 #   ./dev reference-prep <model>    Prepare HF capture deps and download a public model
 #   ./dev generate-reference <model>  Generate a BF16 HF reference capture
 #   ./dev trace-diff <expected> <actual>  Diff two KRASIS_TRACE logs offline
@@ -66,6 +67,8 @@
 #   deepseek-vl -> testconfigs/deepseek-vl2-4-4-a16.conf
 #   qwen35      -> testconfigs/qwen35-4-4-a16.conf
 #   qwen35-a4   -> testconfigs/qwen35-4-4-awq.conf
+#   gemma       -> tests/gemma-4-4-a16.conf
+#   minimax     -> tests/minimax-m2-4-4-a16.conf
 #
 set -euo pipefail
 
@@ -82,6 +85,9 @@ WHEEL_DIR="$SCRIPT_DIR/target/dev-wheels"
 REPO_PYTHONPATH="$SCRIPT_DIR/python"
 REPO_LIBPATH="$SCRIPT_DIR/python/krasis.libs"
 STANDARD_SPEED_TEST_CONFIG="$SCRIPT_DIR/tests/qcn-polar4-awq.conf"
+REFERENCE_CAPTURE_VENV="${HOME}/.krasis/reference-capture-venv"
+REFERENCE_CAPTURE_READY_JSON="${HOME}/.krasis/capture-host-ready.json"
+REFERENCE_CAPTURE_READY_STAMP="${HOME}/.krasis/capture-host-ready.stamp"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -94,6 +100,24 @@ info()  { echo -e "${CYAN}${BOLD}=>${NC} $*"; }
 ok()    { echo -e "${GREEN}${BOLD}OK${NC} $*"; }
 warn()  { echo -e "${YELLOW}${BOLD}!!${NC} $*"; }
 err()   { echo -e "${RED}${BOLD}ERROR${NC} $*" >&2; exit 1; }
+
+build_base_ld_library_path() {
+    local current="${LD_LIBRARY_PATH:-}"
+    local preferred=""
+
+    # Some container images expose CUDA compat stubs that can override the real
+    # host driver and trigger cuda error 803. When both exist, prefer the host
+    # driver directories explicitly.
+    if [[ -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 ]] && compgen -G "/usr/local/cuda*/compat/libcuda.so*" >/dev/null; then
+        preferred="/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu"
+    fi
+
+    if [[ -n "$preferred" ]]; then
+        echo "$preferred${current:+:$current}"
+    else
+        echo "$current"
+    fi
+}
 
 create_run_dir() {
     local run_type="$1"
@@ -128,15 +152,19 @@ resolve_config() {
         deepseek-vl|vl2)    echo "$SCRIPT_DIR/testconfigs/deepseek-vl2-4-4-a16.conf" ;;
         qwen35|Qwen3.5)     echo "$SCRIPT_DIR/testconfigs/qwen35-4-4-a16.conf" ;;
         qwen35-a4)          echo "$SCRIPT_DIR/testconfigs/qwen35-4-4-awq.conf" ;;
+        gemma|Gemma)        echo "$SCRIPT_DIR/tests/gemma-4-4-a16.conf" ;;
+        minimax|MiniMax)    echo "$SCRIPT_DIR/tests/minimax-m2-4-4-a16.conf" ;;
         *)
             # Try as a direct path
             if [[ -f "$name" ]]; then
                 echo "$name"
             elif [[ -f "$SCRIPT_DIR/testconfigs/$name" ]]; then
                 echo "$SCRIPT_DIR/testconfigs/$name"
+            elif [[ -f "$SCRIPT_DIR/tests/$name" ]]; then
+                echo "$SCRIPT_DIR/tests/$name"
             else
                 err "Unknown config: $name
-  Available: qcn, qcn-a4, q235, q235-a4, v2lite, deepseek-vl, qwen35, qwen35-a4
+  Available: qcn, qcn-a4, q235, q235-a4, v2lite, deepseek-vl, qwen35, qwen35-a4, gemma, minimax
   Or pass a path to a .conf file."
             fi
             ;;
@@ -190,7 +218,8 @@ auto_rebuild() {
 }
 
 run_repo_python() {
-    local ld_path="${LD_LIBRARY_PATH:-}"
+    local ld_path
+    ld_path="$(build_base_ld_library_path)"
     if [[ -d "$REPO_LIBPATH" ]]; then
         ld_path="$REPO_LIBPATH${ld_path:+:$ld_path}"
     fi
@@ -198,16 +227,37 @@ run_repo_python() {
 }
 
 exec_repo_python() {
-    local ld_path="${LD_LIBRARY_PATH:-}"
+    local ld_path
+    ld_path="$(build_base_ld_library_path)"
     if [[ -d "$REPO_LIBPATH" ]]; then
         ld_path="$REPO_LIBPATH${ld_path:+:$ld_path}"
     fi
     exec env PYTHONNOUSERSITE=1 PYTHONPATH="$REPO_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" LD_LIBRARY_PATH="$ld_path" "$PYTHON" "$@"
 }
 
+reference_capture_python_bin() {
+    local capture_python="$REFERENCE_CAPTURE_VENV/bin/python"
+    if [[ -x "$capture_python" ]]; then
+        echo "$capture_python"
+    else
+        echo "$PYTHON"
+    fi
+}
+
+run_reference_capture_python() {
+    local ld_path python_bin
+    python_bin="$(reference_capture_python_bin)"
+    ld_path="$(build_base_ld_library_path)"
+    if [[ -d "$REPO_LIBPATH" ]]; then
+        ld_path="$REPO_LIBPATH${ld_path:+:$ld_path}"
+    fi
+    PYTHONNOUSERSITE=1 PYTHONPATH="$REPO_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" LD_LIBRARY_PATH="$ld_path" "$python_bin" "$@"
+}
+
 verify_repo_imports() {
     local output
-    local ld_path="${LD_LIBRARY_PATH:-}"
+    local ld_path
+    ld_path="$(build_base_ld_library_path)"
     if [[ -d "$REPO_LIBPATH" ]]; then
         ld_path="$REPO_LIBPATH${ld_path:+:$ld_path}"
     fi
@@ -240,6 +290,52 @@ PY
         err "Import verification failed: dev runtime is not bound to this repo."
     }
     info "Import origin check:"
+    echo "$output"
+}
+
+verify_repo_python_imports() {
+    local output
+    local ld_path
+    ld_path="$(build_base_ld_library_path)"
+    if [[ -d "$REPO_LIBPATH" ]]; then
+        ld_path="$REPO_LIBPATH${ld_path:+:$ld_path}"
+    fi
+    local python_bin
+    python_bin="$(reference_capture_python_bin)"
+    output=$(PYTHONNOUSERSITE=1 PYTHONPATH="$REPO_PYTHONPATH" LD_LIBRARY_PATH="$ld_path" SCRIPT_DIR="$SCRIPT_DIR" "$python_bin" - <<'PY'
+import importlib
+import os
+import pathlib
+import sys
+
+repo = pathlib.Path(os.environ["SCRIPT_DIR"]).resolve()
+pkg = importlib.import_module("krasis")
+contract = importlib.import_module("tests.reference_contract")
+pkg_path = pathlib.Path(pkg.__file__).resolve()
+contract_path = pathlib.Path(contract.__file__).resolve()
+capture_path = (repo / "tests" / "generate_reference.py").resolve()
+
+def inside_repo(path: pathlib.Path) -> bool:
+    try:
+        path.relative_to(repo)
+        return True
+    except ValueError:
+        return False
+
+print(f"krasis: {pkg_path}")
+print(f"tests.reference_contract: {contract_path}")
+print(f"tests.generate_reference: {capture_path}")
+if not capture_path.is_file():
+    sys.exit(1)
+if not inside_repo(pkg_path) or not inside_repo(contract_path) or not inside_repo(capture_path):
+    sys.exit(1)
+PY
+) || {
+        echo "$output"
+        err "Python import verification failed: HF capture runtime is not bound to this repo."
+    }
+    info "Reference capture python: $python_bin"
+    info "Python import origin check:"
     echo "$output"
 }
 
@@ -406,6 +502,8 @@ do_build_fla() {
 
 do_build() {
     info "Building Rust extension (repo-local maturin build --release)..."
+    export LD_LIBRARY_PATH
+    LD_LIBRARY_PATH="$(build_base_ld_library_path)"
 
     # Compile FLA kernels first so they're in python/krasis/ for maturin
     do_build_fla
@@ -953,7 +1051,8 @@ do_reference_test() {
     if [[ "$1" == "--compare" ]]; then
         shift
         [[ $# -lt 1 ]] && err "Usage: ./dev reference-test --compare <model>
-  Available models: qcn, q35b, q122b"
+  Available models: qcn, q35b, q122b
+  Single-config aliases: gemma, minimax"
         local model="$1"
         shift
         cleanup_gpu
@@ -990,15 +1089,29 @@ do_reference_inventory() {
     KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="reference-inventory" run_repo_python "$SCRIPT_DIR/tests/reference_inventory.py" "$@"
 }
 
+do_capture_preflight() {
+    info "Running capture host preflight"
+    KRASIS_DEV_SCRIPT=1 \
+    KRASIS_DEV_PYTHON="$PYTHON" \
+    KRASIS_DEV_PIP="$PIP" \
+    KRASIS_DEV_MATURIN="$MATURIN" \
+    KRASIS_REFERENCE_CAPTURE_VENV="$REFERENCE_CAPTURE_VENV" \
+    KRASIS_REFERENCE_CAPTURE_READY_JSON="$REFERENCE_CAPTURE_READY_JSON" \
+    KRASIS_REFERENCE_CAPTURE_READY_STAMP="$REFERENCE_CAPTURE_READY_STAMP" \
+    "$SCRIPT_DIR/scripts/capture_preflight.sh" "$@"
+}
+
 do_reference_prep() {
-    [[ $# -lt 1 && ! " ${*:-} " =~ [[:space:]](--help|-h|--list-models)[[:space:]] ]] && err "Usage: ./dev reference-prep <model> [--detach] [--print-urls|--urls-only] [--deps-only|--download-only] [--dest-root PATH]
+    [[ $# -lt 1 && ! " ${*:-} " =~ [[:space:]](--help|-h|--list-models|--deps-only)[[:space:]] ]] && err "Usage: ./dev reference-prep <model> [--detach] [--print-urls|--urls-only] [--deps-only|--download-only] [--dest-root PATH]
   Prepares the HF reference-capture environment and downloads a public model to ~/.krasis/models.
   Examples:
+    ./dev capture-preflight --bootstrap
     ./dev reference-prep qcn
     ./dev reference-prep qwen35 --detach
+    ./dev reference-prep --deps-only
     ./dev reference-prep gemma --urls-only"
     info "Preparing reference host: ${1:-listing models}"
-    KRASIS_DEV_SCRIPT=1 KRASIS_DEV_PYTHON="$PYTHON" KRASIS_DEV_PIP="$PIP" "$SCRIPT_DIR/scripts/reference_capture_prep.sh" "$@"
+    KRASIS_DEV_SCRIPT=1 KRASIS_DEV_PYTHON="$PYTHON" KRASIS_DEV_PIP="$PIP" KRASIS_REFERENCE_CAPTURE_VENV="$REFERENCE_CAPTURE_VENV" "$SCRIPT_DIR/scripts/reference_capture_prep.sh" "$@"
 }
 
 do_generate_reference() {
@@ -1012,7 +1125,6 @@ do_generate_reference() {
   Example:
     ./dev generate-reference Qwen3-Coder-Next --profile greedy_chat_thinking_off"
     cleanup_gpu
-    auto_rebuild
     local run_dir logfile dev_cmd
     run_dir=$(create_run_dir "generate-reference")
     logfile="$run_dir/generate_reference_stdout.log"
@@ -1020,10 +1132,10 @@ do_generate_reference() {
     dev_cmd="${dev_cmd% }"
     info "Generating reference: $1"
     info "Run dir: $run_dir"
-    verify_repo_imports
+    verify_repo_python_imports
     set +e
     KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="generate-reference" KRASIS_DEV_CMD="$dev_cmd" \
-        run_repo_python "$SCRIPT_DIR/tests/generate_reference.py" "$@" 2>&1 | tee "$logfile"
+        run_reference_capture_python "$SCRIPT_DIR/tests/generate_reference.py" "$@" 2>&1 | tee "$logfile"
     local status=${PIPESTATUS[0]}
     set -e
     return "$status"
@@ -1153,6 +1265,7 @@ case "$cmd" in
     release-test-all) do_release_test_all "$@" ;;
     reference-test) do_reference_test "$@" ;;
     reference-inventory) do_reference_inventory "$@" ;;
+    capture-preflight) do_capture_preflight "$@" ;;
     reference-prep) do_reference_prep "$@" ;;
     generate-reference) do_generate_reference "$@" ;;
     trace-diff)     do_trace_diff "$@" ;;
@@ -1186,6 +1299,7 @@ case "$cmd" in
         echo "  reference-test <config>        Compare engine output against BF16 reference data"
         echo "  reference-test --compare <model>  Run comparative reference matrix"
         echo "  reference-inventory            Inventory stored reference artifacts"
+        echo "  capture-preflight             Verify or bootstrap a host for HF reference capture"
         echo "  reference-prep <model>         Prepare HF capture deps and download a public model"
         echo "  generate-reference <model>     Generate BF16 HF reference capture"
         echo "  trace-diff <expected> <actual> Diff two KRASIS_TRACE logs offline"
@@ -1210,21 +1324,27 @@ case "$cmd" in
         echo "Reference workflow:"
         echo "  1. Inventory current artifacts:"
         echo "       ./dev reference-inventory"
-        echo "  2. Prepare the host and fetch the public model if needed:"
+        echo "  2. Prove the host is ready before queueing downloads/captures:"
+        echo "       ./dev capture-preflight --bootstrap"
+        echo "  3. Prepare the host and fetch the public model if needed:"
         echo "       ./dev reference-prep <model>"
-        echo "  3. Generate an explicit reference profile:"
+        echo "  4. Generate an explicit reference profile:"
         echo "       ./dev generate-reference <model> --profile <profile>"
-        echo "  4. Validate the capture against a runtime config:"
+        echo "  5. Validate the capture against a runtime config:"
         echo "       ./dev validate <config> --max-prompts 0 --no-server --port 1"
-        echo "  5. Run the real comparison:"
+        echo "  6. Run the real comparison:"
         echo "       ./dev reference-test <config>"
-        echo "  6. Diff stored traces offline when needed:"
+        echo "  7. Diff stored traces offline when needed:"
         echo "       ./dev trace-diff <expected-trace> <actual-trace>"
         echo "  Reference-prep aliases:"
-        echo "    qcn, qwen35, q122b, gemma, q235, q397"
+        echo "    qcn, qwen35, q122b, gemma, minimax, q235, q397"
         echo "  Notes:"
         echo "    - Uses public Hugging Face repo IDs only; does not use an HF token."
-        echo "    - Installs the capture/download Python deps in the repo env."
+        echo "    - capture-preflight writes:"
+        echo "        $REFERENCE_CAPTURE_READY_JSON"
+        echo "        $REFERENCE_CAPTURE_READY_STAMP"
+        echo "    - reference-prep installs capture/download deps in the isolated capture venv:"
+        echo "        $REFERENCE_CAPTURE_VENV"
         echo "    - Use --detach to keep a long download running with a log file."
         echo ""
         echo "Reference profiles for ./dev generate-reference:"
@@ -1272,6 +1392,7 @@ case "$cmd" in
         echo "  ./dev release-test Qwen3-Coder-Next    Full release test"
         echo "  ./dev release-test-all                 Test all models (no resume)"
         echo "  ./dev release-test-all rc8             Test all models (resume on re-run with same target)"
+        echo "  ./dev capture-preflight --bootstrap"
         echo "  ./dev reference-prep qcn --detach"
         echo "  ./dev awq-calibrate qcn    Build AWQ attention template"
         echo "  ./dev perplexity qcn"

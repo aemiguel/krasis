@@ -20,12 +20,15 @@ Must be run with: KRASIS_DEV_SCRIPT=1
 """
 
 import argparse
+import inspect
 import os
 import re
 import struct
 import subprocess
 import sys
 from pathlib import Path
+
+from packaging import version
 
 # Guard: only run via ./dev build
 if os.environ.get("KRASIS_DEV_SCRIPT") != "1":
@@ -262,11 +265,21 @@ def compile_kernel(spec: dict, h_value: int | None, arch: int):
         constexprs["H"] = h_value
 
     target = GPUTarget(backend='cuda', arch=arch, warp_size=32)
-    src = ASTSource(
-        fn=jit_fn,
-        signature=spec["signature"],
-        constexprs=constexprs,
-    )
+    ast_params = inspect.signature(ASTSource).parameters
+    ast_kwargs = {
+        "fn": jit_fn,
+        "signature": spec["signature"],
+    }
+    if "constexprs" in ast_params:
+        ast_kwargs["constexprs"] = constexprs
+    elif "constants" in ast_params:
+        ast_kwargs["constants"] = constexprs
+    else:
+        raise RuntimeError(
+            f"Unsupported Triton ASTSource signature: {inspect.signature(ASTSource)}"
+        )
+
+    src = ASTSource(**ast_kwargs)
 
     compiled = triton.compile(src, target=target, options=spec["options"])
 
@@ -425,6 +438,27 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     archs = args.arch if args.arch else TARGET_ARCHS
+
+    import triton
+    triton_version = version.parse(triton.__version__)
+    max_supported_arch = 120 if triton_version >= version.parse("3.5.0") else 90
+    filtered_archs = [arch for arch in archs if arch <= max_supported_arch]
+    skipped_archs = [arch for arch in archs if arch > max_supported_arch]
+    if skipped_archs:
+        print(
+            f"WARNING: Triton {triton.__version__} cannot cross-compile "
+            f"{', '.join(f'sm_{arch}' for arch in skipped_archs)}; "
+            f"building up to sm_{max_supported_arch} only."
+        )
+    if not filtered_archs:
+        print(
+            f"ERROR: Triton {triton.__version__} does not support any requested "
+            f"architectures: {', '.join(f'sm_{arch}' for arch in archs)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    archs = filtered_archs
+
     print(f"Target architectures: {['sm_' + str(a) for a in archs]}")
     print(f"H values: {H_VALUES}")
     print(f"Kernels: {len(KERNEL_SPECS)}")

@@ -54,6 +54,29 @@ REPO_DIR = SCRIPT_DIR.parent
 REFERENCE_DIR = SCRIPT_DIR / "reference_outputs"
 PROMPTS_FILE = REPO_DIR / "benchmarks" / "sanity_test_prompts.txt"
 
+MODEL_ALIASES = {
+    "qcn": "Qwen3-Coder-Next",
+    "qwen3-coder-next": "Qwen3-Coder-Next",
+    "qwen35": "Qwen3.5-35B-A3B",
+    "q35b": "Qwen3.5-35B-A3B",
+    "qwen3.5-35b-a3b": "Qwen3.5-35B-A3B",
+    "q122b": "Qwen3.5-122B-A10B",
+    "qwen122": "Qwen3.5-122B-A10B",
+    "qwen3.5-122b-a10b": "Qwen3.5-122B-A10B",
+    "gemma": "gemma-4-26B-A4B-it",
+    "gemma26": "gemma-4-26B-A4B-it",
+    "gemma-4-26b-a4b-it": "gemma-4-26B-A4B-it",
+    "minimax": "MiniMax-M2.5",
+    "minimax25": "MiniMax-M2.5",
+    "minimax-m2.5": "MiniMax-M2.5",
+    "q235": "Qwen3-235B-A22B",
+    "qwen235": "Qwen3-235B-A22B",
+    "qwen3-235b-a22b": "Qwen3-235B-A22B",
+    "q397": "Qwen3.5-397B-A17B",
+    "qwen397": "Qwen3.5-397B-A17B",
+    "qwen3.5-397b-a17b": "Qwen3.5-397B-A17B",
+}
+
 BOLD = "\033[1m"
 CYAN = "\033[0;36m"
 GREEN = "\033[0;32m"
@@ -96,6 +119,33 @@ def build_invocation_metadata(model_name: str, profile_id: str, max_new_tokens: 
     if run_dir:
         metadata["run_dir"] = str(Path(run_dir).resolve())
     return metadata
+
+
+def resolve_model_name(raw_model: str) -> str:
+    raw = raw_model.strip()
+    if not raw:
+        die("Model name cannot be empty")
+
+    candidate = Path(raw)
+    if candidate.name != raw:
+        raw = candidate.name
+
+    if os.path.isdir(os.path.join(MODELS_DIR, raw)):
+        return raw
+
+    lowered = raw.lower()
+    resolved = MODEL_ALIASES.get(lowered)
+    if resolved and os.path.isdir(os.path.join(MODELS_DIR, resolved)):
+        return resolved
+
+    if "/" in raw_model:
+        basename = Path(raw_model).name
+        if os.path.isdir(os.path.join(MODELS_DIR, basename)):
+            return basename
+
+    if resolved:
+        return resolved
+    return raw
 
 
 def write_run_manifest(
@@ -159,8 +209,9 @@ def parse_prompt_conversations(lines: List[str]) -> List[List[str]]:
 def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str = "auto"):
     """Generate reference outputs using HuggingFace transformers."""
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
+    model_name = resolve_model_name(model_name)
     model_path = os.path.join(MODELS_DIR, model_name)
     if not os.path.isdir(model_path):
         die(f"Model not found: {model_path}")
@@ -196,9 +247,22 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
     info(f"Tokenizer loaded ({time.time() - t0:.1f}s)")
 
     t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    info(f"Config loaded ({time.time() - t0:.1f}s)")
+
+    architectures = list(getattr(config, "architectures", []) or [])
+    use_conditional_loader = any("ConditionalGeneration" in arch for arch in architectures)
+    model_loader = AutoModelForImageTextToText if use_conditional_loader else AutoModelForCausalLM
+    info(
+        "HF model loader: "
+        f"{model_loader.__name__} (architectures={architectures if architectures else ['unknown']})"
+    )
+
+    t0 = time.time()
+    model = model_loader.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16,
+        config=config,
+        dtype=torch.bfloat16,
         device_map="auto",
         max_memory=max_memory,
         trust_remote_code=True,

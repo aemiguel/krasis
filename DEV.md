@@ -84,14 +84,26 @@ config parsing. Run `./dev help` for full usage.
 ./dev python -m krasis.launcher
 ./dev python tests/test_network.py --port 8012
 
+# Prove the host is ready for HF reference capture
+./dev capture-preflight --bootstrap
+
 # Prepare HF reference capture deps and download a public model
 ./dev reference-prep qcn
 ./dev reference-prep qwen35 --detach
 ```
 
-`reference-prep` installs the user-space capture/download dependencies in the
-repo env, maps common model aliases to the exact public Hugging Face repo IDs,
-and downloads into `~/.krasis/models`. Use `--detach` for long remote downloads.
+`capture-preflight` verifies the actual host state before queueing downloads or
+captures. On success it writes:
+
+- `~/.krasis/capture-host-ready.json`
+- `~/.krasis/capture-host-ready.stamp`
+
+Use `--bootstrap` to create or repair the isolated capture venv first.
+
+`reference-prep` uses that isolated capture venv at
+`~/.krasis/reference-capture-venv`, maps common model aliases to the exact
+public Hugging Face repo IDs, and downloads into `~/.krasis/models`. Use
+`--detach` for long remote downloads.
 
 ### Auto-rebuild
 
