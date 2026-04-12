@@ -26,7 +26,9 @@ try:
         REFERENCE_PROFILES,
         apply_capture_template,
         build_contract,
+        build_reference_sanity_report,
         canonical_profile_id,
+        collect_capture_stop_ids,
         capture_settings_for_profile,
         emit_reference_generation_trace,
         profile_filename,
@@ -36,7 +38,9 @@ except ModuleNotFoundError:
         REFERENCE_PROFILES,
         apply_capture_template,
         build_contract,
+        build_reference_sanity_report,
         canonical_profile_id,
+        collect_capture_stop_ids,
         capture_settings_for_profile,
         emit_reference_generation_trace,
         profile_filename,
@@ -154,6 +158,7 @@ def write_run_manifest(
     model_name: str,
     profile_id: str,
     max_new_tokens: int,
+    sanity: Optional[Dict[str, Any]] = None,
 ) -> None:
     run_dir = invocation.get("run_dir")
     if not run_dir:
@@ -171,6 +176,7 @@ def write_run_manifest(
         "profile_id": profile_id,
         "max_new_tokens": max_new_tokens,
         "reference_output_path": str(output_path.resolve()),
+        "sanity": sanity,
         "follow_up_commands": [
             "./dev reference-inventory",
             "./dev validate <config> --max-prompts 0 --no-server --port 1",
@@ -271,20 +277,11 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
     load_time = time.time() - t0
     info(f"Model loaded ({load_time:.1f}s)")
 
-    # Determine EOS tokens
-    eos_token_ids = []
-    if tokenizer.eos_token_id is not None:
-        eos_token_ids.append(tokenizer.eos_token_id)
-    # Qwen3 models use <|im_end|> as end of turn
-    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    if isinstance(im_end_id, int) and im_end_id != tokenizer.unk_token_id:
-        eos_token_ids.append(im_end_id)
-    # Also check for <|endoftext|>
-    eot_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
-    if isinstance(eot_id, int) and eot_id != tokenizer.unk_token_id:
-        eos_token_ids.append(eot_id)
-
-    eos_token_ids = list(set(eos_token_ids))
+    eos_token_ids = collect_capture_stop_ids(
+        tokenizer,
+        model_path=model_path,
+        config_json=config.to_dict() if hasattr(config, "to_dict") else None,
+    )
     info(f"EOS token IDs: {eos_token_ids}")
 
     profile_id = canonical_profile_id(tokenizer, profile)
@@ -403,6 +400,11 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
         torch_dtype="bfloat16",
         extra={"capture_invocation": invocation},
     )
+    result["sanity"] = build_reference_sanity_report(
+        result,
+        expected_conversations=len(conversations),
+        expected_turns=total_prompts,
+    )
 
     # Save reference
     REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
@@ -417,7 +419,7 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
         str(output_path),
         max_new_tokens=max_new_tokens,
     )
-    write_run_manifest(invocation, output_path, model_name, profile_id, max_new_tokens)
+    write_run_manifest(invocation, output_path, model_name, profile_id, max_new_tokens, result["sanity"])
 
     ok(f"Reference saved: {output_path}")
     ok(
@@ -427,6 +429,26 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
         f"prompt_sha256={result['contract'].get('prompt_source', {}).get('sha256')}"
     )
     ok(f"Total: {total_prompts} prompts, {sum(len(c['turns']) for c in result['conversations'])} turns")
+    sanity = result["sanity"]
+    if sanity.get("status") == "pass":
+        ok("Reference sanity gate: PASS")
+    else:
+        warn(
+            "Reference sanity gate: FAIL "
+            + ", ".join(sanity.get("failed_checks", []))
+        )
+        for check in sanity.get("checks", []):
+            if not check.get("ok"):
+                warn(f"  {check.get('name')}: {check.get('detail')}")
+        for sample in sanity.get("thought_leakage", {}).get("samples", []):
+            warn(
+                "  thought sample "
+                f"conv={sample.get('conversation_index')} turn={sample.get('turn_index')}: "
+                f"{sample.get('preview')}"
+            )
+        die(
+            "Reference capture saved but not blessed. Fix the capture issue and recapture before using it as golden data."
+        )
 
 
 def main():

@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +27,8 @@ TURN_BOUNDARY_TOKENS = (
     "<|im_start|>",
     "<|start_header_id|>",
     "<|begin_of_text|>",
+    "<|turn>",
+    "<turn|>",
 )
 
 REFERENCE_PROFILE_DEFAULT = "greedy_chat_default"
@@ -75,7 +78,11 @@ def _sha256_file(path: Path) -> Optional[str]:
     return h.hexdigest()
 
 
-def _extract_chat_template(tokenizer_cfg: Dict[str, Any]) -> Tuple[str, str]:
+EMPTY_TEMPLATE_HASH = _sha256_bytes(b"")
+VISIBLE_THOUGHT_RE = re.compile(r"(?is)(<think>|</think>|<\|channel\>|<channel\|>|\bthought\b)")
+
+
+def _extract_chat_template(tokenizer_cfg: Dict[str, Any], model_dir: Optional[Path] = None) -> Tuple[str, str]:
     chat_template = tokenizer_cfg.get("chat_template")
     if isinstance(chat_template, str):
         return "default", chat_template
@@ -95,6 +102,10 @@ def _extract_chat_template(tokenizer_cfg: Dict[str, Any]) -> Tuple[str, str]:
                     return name, template
         if first_template:
             return first_name, first_template
+    if model_dir is not None:
+        template_path = model_dir / "chat_template.jinja"
+        if template_path.is_file():
+            return "chat_template.jinja", template_path.read_text()
     return "fallback", ""
 
 
@@ -111,6 +122,50 @@ def _collect_eos_ids(config_json: Dict[str, Any], generation_json: Dict[str, Any
                 eos_ids.append(value)
                 seen.add(value)
     return eos_ids
+
+
+def collect_capture_stop_ids(
+    tokenizer: Any,
+    *,
+    model_path: Optional[str] = None,
+    config_json: Optional[Dict[str, Any]] = None,
+    generation_json: Optional[Dict[str, Any]] = None,
+) -> List[int]:
+    """Collect model-authored stop ids for HF reference capture.
+
+    We prefer ids declared by the checkpoint config/generation_config and then
+    augment them with tokenizer-discoverable end-of-turn tokens when present.
+    This keeps capture aligned with each model's own stop contract instead of
+    relying on a small hardcoded Qwen-only token list.
+    """
+
+    config_data = config_json
+    generation_data = generation_json
+    if model_path:
+        model_dir = Path(model_path).expanduser().resolve()
+        if config_data is None:
+            config_data = _load_json(model_dir / "config.json")
+        if generation_data is None:
+            gen_path = model_dir / "generation_config.json"
+            generation_data = _load_json(gen_path) if gen_path.is_file() else {}
+    if config_data is None:
+        config_data = {}
+    if generation_data is None:
+        generation_data = {}
+
+    stop_ids = _collect_eos_ids(config_data, generation_data)
+    seen = set(stop_ids)
+    unknown_id = getattr(tokenizer, "unk_token_id", None)
+    for token in ("<turn|>", "<|im_end|>", "<|endoftext|>"):
+        raw = tokenizer.convert_tokens_to_ids(token)
+        if not isinstance(raw, int):
+            continue
+        if unknown_id is not None and raw == unknown_id:
+            continue
+        if raw not in seen:
+            stop_ids.append(raw)
+            seen.add(raw)
+    return stop_ids
 
 
 def _architecture_summary(config_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -370,7 +425,7 @@ def build_contract(
     config_json = _load_json(model_dir / "config.json")
     generation_json = _load_json(model_dir / "generation_config.json") if (model_dir / "generation_config.json").is_file() else {}
     tokenizer_cfg = _load_json(model_dir / "tokenizer_config.json") if (model_dir / "tokenizer_config.json").is_file() else {}
-    template_name, template_source = _extract_chat_template(tokenizer_cfg)
+    template_name, template_source = _extract_chat_template(tokenizer_cfg, model_dir)
     supports_enable_thinking = "enable_thinking" in template_source
 
     prompt_source = None
@@ -498,6 +553,112 @@ def build_reference_artifact_metadata(
         "generated_at": reference.get("generated_at"),
         "state": classify_reference_artifact_state(reference_contract),
         "capture_inference_source": reference_contract.get("extra", {}).get("capture_inference_source"),
+    }
+
+
+def build_reference_sanity_report(
+    reference: Dict[str, Any],
+    *,
+    expected_conversations: int,
+    expected_turns: int,
+) -> Dict[str, Any]:
+    conversations = reference.get("conversations", [])
+    actual_conversations = len(conversations)
+    actual_turns = sum(len(conv.get("turns", [])) for conv in conversations)
+    contract = reference.get("contract", {}) if isinstance(reference.get("contract"), dict) else {}
+    tokenizer = contract.get("tokenizer", {}) if isinstance(contract.get("tokenizer"), dict) else {}
+    stop = contract.get("stop", {}) if isinstance(contract.get("stop"), dict) else {}
+    request = contract.get("request", {}) if isinstance(contract.get("request"), dict) else {}
+
+    profile_candidates = [
+        reference.get("profile_id"),
+        reference.get("capture_settings", {}).get("profile_id") if isinstance(reference.get("capture_settings"), dict) else None,
+        contract.get("profile_id"),
+    ]
+    profile_values = sorted({value for value in profile_candidates if isinstance(value, str) and value})
+    template_hash = tokenizer.get("chat_template_hash")
+    artifact_stop_ids = sorted(set(reference.get("eos_token_ids", []) or []))
+    contract_stop_ids = sorted(set(stop.get("eos_token_ids", []) or []))
+
+    checks: List[Dict[str, Any]] = []
+
+    def add_check(name: str, ok: bool, detail: str) -> None:
+        checks.append({"name": name, "ok": ok, "detail": detail})
+
+    add_check(
+        "conversation_count",
+        actual_conversations == expected_conversations,
+        f"expected={expected_conversations} actual={actual_conversations}",
+    )
+    add_check(
+        "turn_count",
+        actual_turns == expected_turns,
+        f"expected={expected_turns} actual={actual_turns}",
+    )
+    add_check(
+        "profile_id_consistent",
+        len(profile_values) == 1,
+        f"values={profile_values if profile_values else ['missing']}",
+    )
+    add_check(
+        "template_hash_present",
+        isinstance(template_hash, str) and len(template_hash) == 64 and template_hash != EMPTY_TEMPLATE_HASH,
+        f"template_hash={template_hash or 'missing'}",
+    )
+    add_check(
+        "stop_ids_present",
+        bool(artifact_stop_ids),
+        f"artifact_stop_ids={artifact_stop_ids}",
+    )
+    add_check(
+        "stop_ids_match_contract",
+        bool(artifact_stop_ids) and artifact_stop_ids == contract_stop_ids,
+        f"artifact_stop_ids={artifact_stop_ids} contract_stop_ids={contract_stop_ids}",
+    )
+
+    thought_hits: List[Dict[str, Any]] = []
+    effective_profile = profile_values[0] if len(profile_values) == 1 else None
+    thinking_off = (
+        effective_profile == REFERENCE_PROFILE_THINKING_OFF
+        or request.get("enable_thinking") is False
+    )
+    if thinking_off:
+        for conv_idx, conv in enumerate(conversations):
+            for turn_idx, turn in enumerate(conv.get("turns", [])):
+                text = turn.get("text")
+                if not isinstance(text, str):
+                    continue
+                if VISIBLE_THOUGHT_RE.search(text):
+                    thought_hits.append(
+                        {
+                            "conversation_index": conv_idx,
+                            "turn_index": turn_idx,
+                            "preview": text[:160].replace("\n", " "),
+                        }
+                    )
+        add_check(
+            "thinking_off_visible_thought_leakage",
+            len(thought_hits) == 0,
+            f"matches={len(thought_hits)}",
+        )
+
+    failed_checks = [check for check in checks if not check["ok"]]
+    return {
+        "status": "pass" if not failed_checks else "fail",
+        "expected": {
+            "conversations": expected_conversations,
+            "turns": expected_turns,
+        },
+        "actual": {
+            "conversations": actual_conversations,
+            "turns": actual_turns,
+        },
+        "checks": checks,
+        "failed_checks": [check["name"] for check in failed_checks],
+        "thought_leakage": {
+            "count": len(thought_hits),
+            "samples": thought_hits[:3],
+        },
     }
 
 

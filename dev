@@ -56,7 +56,7 @@
 #     KRASIS_TRACE_VALUES=8
 #     KRASIS_TRACE_ELEMS=2048
 #     KRASIS_TRACE_DUMP_DIR=/tmp/krasis-trace
-#     KRASIS_TRACE_PY_COMPARE=1  # one Python first-step compare before Rust decode
+#     KRASIS_TRACE_PY_COMPARE=1  # one first-step compare via built test endpoint during validate
 #
 # Configs are short names that map to testconfigs/*.conf:
 #   qcn         -> testconfigs/qcn-4-4-a16.conf

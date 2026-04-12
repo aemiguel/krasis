@@ -93,6 +93,9 @@ impl DecodeTraceConfig {
             return true;
         };
         let component = component.to_ascii_lowercase();
+        if filters.contains("decode") && component != "config_contract" {
+            return true;
+        }
         if filters.contains("all") || filters.contains(&component) {
             return true;
         }
@@ -135,6 +138,25 @@ fn trace_format_sample(values: &[f32]) -> String {
         .map(|v| format!("{:.6}", v))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn sanitize_trace_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len().min(48));
+    for ch in label.chars() {
+        if out.len() >= 48 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "decode".to_string()
+    } else {
+        out
+    }
 }
 
 fn trace_emit_mark(
@@ -2097,6 +2119,8 @@ struct GpuDecodeGraph {
     // Timing
     timing_enabled: bool,
     decode_step_counter: usize,
+    trace_request_seq: u64,
+    trace_request_label: String,
     timing_step_count: u64,
     t_total: f64,
     t_norm: f64,
@@ -2417,6 +2441,7 @@ pub struct GpuDecodeStore {
     prefill_scratch_info: Option<(usize, usize)>,
     /// Store-scoped trace config for setup/prefill/HCS work outside active decode requests.
     trace_config: Option<DecodeTraceConfig>,
+    pending_trace_request_label: Option<String>,
 }
 
 impl GpuDecodeStore {
@@ -2433,6 +2458,29 @@ impl GpuDecodeStore {
 
     fn active_trace_owned(&self) -> Option<DecodeTraceConfig> {
         self.active_trace().cloned()
+    }
+
+    fn begin_trace_request(
+        &mut self,
+        default_label: &str,
+        explicit_label: Option<String>,
+    ) -> (u64, String) {
+        let fallback = sanitize_trace_label(default_label);
+        let Some(graph) = self.graph.as_mut() else {
+            return (0, fallback);
+        };
+        graph.decode_step_counter = 0;
+        graph.trace_request_seq = graph.trace_request_seq.saturating_add(1);
+        let label = explicit_label
+            .map(|value| sanitize_trace_label(&value))
+            .or_else(|| {
+                self.pending_trace_request_label
+                    .take()
+                    .map(|value| sanitize_trace_label(&value))
+            })
+            .unwrap_or(fallback);
+        graph.trace_request_label = label.clone();
+        (graph.trace_request_seq, label)
     }
 }
 
@@ -2692,7 +2740,12 @@ impl GpuDecodeStore {
             prefill_engine_slot: None,
             prefill_scratch_info: None,
             trace_config: DecodeTraceConfig::from_env(),
+            pending_trace_request_label: None,
         })
+    }
+
+    pub fn set_trace_request_label(&mut self, label: String) {
+        self.pending_trace_request_label = Some(label);
     }
 
     /// Pre-allocate the Rust prefill engine.
@@ -3070,6 +3123,8 @@ impl GpuDecodeStore {
             gqa_max_smem_bytes: self.gqa_max_smem_bytes,
             timing_enabled: false,
             decode_step_counter: 0,
+            trace_request_seq: 0,
+            trace_request_label: "decode".to_string(),
             timing_step_count: 0,
             t_total: 0.0,
             t_norm: 0.0,
@@ -6265,6 +6320,7 @@ impl GpuDecodeStore {
             &tokenizer,
             presence_penalty,
             0,
+            None,
             |token_id, _text, _finish_reason, _logprobs| {
                 tokens.push(token_id);
                 true
@@ -12235,7 +12291,17 @@ impl GpuDecodeStore {
                         );
                     }
                     let f32_vals: Vec<f32> = hbuf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-                    let path = format!("{}/decode_step_{:04}_postnorm.bin", dir, decode_step_counter);
+                    let request_seq = graph.trace_request_seq;
+                    let request_label = sanitize_trace_label(&graph.trace_request_label);
+                    let path = format!(
+                        "{}/req_{:04}_{}_decode_step_{:04}_pos_{:06}_tok_{:06}_postnorm.bin",
+                        dir,
+                        request_seq,
+                        request_label,
+                        decode_step_counter,
+                        position,
+                        token_id,
+                    );
                     if let Ok(mut file) = std::fs::File::create(&path) {
                         let bytes: &[u8] = unsafe {
                             std::slice::from_raw_parts(f32_vals.as_ptr() as *const u8, f32_vals.len() * 4)
@@ -12248,7 +12314,13 @@ impl GpuDecodeStore {
                             token_id,
                             None,
                             "final_post_norm",
-                            &format!("dump_path={} dump_values={}", path, n),
+                            &format!(
+                                "dump_path={} dump_values={} request_seq={} request_label={}",
+                                path,
+                                n,
+                                request_seq,
+                                request_label,
+                            ),
                         );
                     }
                 }
@@ -12737,6 +12809,7 @@ impl GpuDecodeStore {
         tokenizer: &tokenizers::Tokenizer,
         presence_penalty: f32,
         logprobs_top_n: usize,
+        trace_request_label: Option<String>,
         mut on_token: F,
     ) -> usize
     where
@@ -12792,6 +12865,22 @@ impl GpuDecodeStore {
         };
         self.refresh_trace_config();
         let trace_config = self.active_trace_owned();
+        let (trace_request_seq, trace_request_label) =
+            self.begin_trace_request("decode_multi", trace_request_label);
+        if let Some(graph) = self.graph.as_mut() {
+            graph.decode_trace = trace_config.clone();
+        }
+        trace_emit_global_mark(
+            trace_config.as_ref(),
+            "request",
+            &format!(
+                "phase=multi_gpu_decode_start request_seq={} request_label={} gpus={} max_tokens={}",
+                trace_request_seq,
+                trace_request_label,
+                num_gpus,
+                max_tokens,
+            ),
+        );
 
         // CUDA graph reuse: verify pointer stability on all GPUs before reusing.
         let mut all_reuse = self.verify_graph_pointers();
@@ -15598,6 +15687,7 @@ impl GpuDecodeStore {
         tokenizer: &tokenizers::Tokenizer,
         presence_penalty: f32,
         logprobs_top_n: usize,
+        trace_request_label: Option<String>,
         mut on_token: F,
     ) -> usize
     where
@@ -15607,6 +15697,8 @@ impl GpuDecodeStore {
 
         self.refresh_trace_config();
         let trace_config = self.active_trace_owned();
+        let (trace_request_seq, trace_request_label) =
+            self.begin_trace_request("decode", trace_request_label);
         trace_emit_mark(
             trace_config.as_ref(),
             0,
@@ -15614,7 +15706,12 @@ impl GpuDecodeStore {
             first_token,
             None,
             "request",
-            &format!("phase=gpu_generate_stream_enter max_tokens={}", max_tokens),
+            &format!(
+                "phase=gpu_generate_stream_enter max_tokens={} request_seq={} request_label={}",
+                max_tokens,
+                trace_request_seq,
+                trace_request_label,
+            ),
         );
 
         // Bind CUDA context to this thread. Required when called from
@@ -15639,13 +15736,15 @@ impl GpuDecodeStore {
                 None,
                 "request",
                 &format!(
-                    "phase=decode_start max_tokens={} temperature={:.3} top_k={} top_p={:.3} presence_penalty={:.3} stop_ids={}",
+                    "phase=decode_start max_tokens={} temperature={:.3} top_k={} top_p={:.3} presence_penalty={:.3} stop_ids={} request_seq={} request_label={}",
                     max_tokens,
                     temperature,
                     top_k,
                     top_p,
                     presence_penalty,
                     stop_ids.len(),
+                    trace_request_seq,
+                    trace_request_label,
                 ),
             );
         }

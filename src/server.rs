@@ -618,7 +618,12 @@ fn handle_chat_completion(
     let has_tools = !tools_json.is_empty();
 
     // ── Render chat template (reused for both token estimation and Rust prefill) ──
-    let rendered = match state.chat_template.apply_with_tools(&messages_json, &tools_json, true) {
+    let rendered = match state.chat_template.apply_with_tools(
+        &messages_json,
+        &tools_json,
+        true,
+        enable_thinking,
+    ) {
         Ok(r) => r,
         Err(e) => {
             log::error!("Chat template failed: {}", e);
@@ -935,8 +940,7 @@ fn handle_prefill_logits(
     } else if let Some(messages) = req.get("messages") {
         let messages_json = messages.to_string();
         let enable_thinking = req.get("enable_thinking").and_then(|v| v.as_bool()).unwrap_or(false);
-        // Always add generation prompt — enable_thinking controls suppression, not template
-        let rendered = match state.chat_template.apply(&messages_json, true) {
+        let rendered = match state.chat_template.apply(&messages_json, true, enable_thinking) {
             Ok(r) => r,
             Err(e) => {
                 let _ = send_json(stream, 500, &format!(r#"{{"error":"Chat template: {}"}}"#, e));
@@ -1134,14 +1138,14 @@ fn handle_reference_test(
         &suppress_tokens,
     );
 
-    // Release scratch to free VRAM for decode/HCS
-    if let Err(e) = engine.release_scratch() {
-        log::error!("reference_test: Failed to release scratch: {}", e);
-    }
-
-    let (first_token, prompt_len) = match prefill_result {
-        Ok(r) => (r.first_token as usize, r.prompt_len),
+    let (first_token, prompt_len, first_token_top_k) = match prefill_result {
+        Ok(r) => (
+            r.first_token as usize,
+            r.prompt_len,
+            crate::decode::extract_top_logprobs(&engine.h_logits, engine.h_logits.len(), top_logprobs),
+        ),
         Err(e) => {
+            let _ = engine.release_scratch();
             let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill failed: {}"}}"#, e));
             Python::with_gil(|py| {
                 let _ = state.py_model.call_method0(py, "server_cleanup");
@@ -1149,6 +1153,11 @@ fn handle_reference_test(
             return;
         }
     };
+
+    // Release scratch to free VRAM for decode/HCS
+    if let Err(e) = engine.release_scratch() {
+        log::error!("reference_test: Failed to release scratch: {}", e);
+    }
 
     // Set KV position and swap to simple INT4 for decode
     {
@@ -1191,8 +1200,7 @@ fn handle_reference_test(
     // First token
     let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
     all_text.push_str(&first_text);
-    // First token logprobs are not available from prefill, store empty
-    output_tokens.push((first_token, vec![]));
+    output_tokens.push((first_token, first_token_top_k.clone()));
 
     let decode_budget = max_tokens.saturating_sub(1);
 
@@ -1218,6 +1226,7 @@ fn handle_reference_test(
             tokenizer,
             0.0,  // no presence penalty
             top_logprobs,
+            Some("reference_test".to_string()),
             on_token,
         );
     }
@@ -1252,12 +1261,18 @@ fn handle_reference_test(
     // Escape text for JSON
     let text_escaped = serde_json::to_string(&all_text).unwrap_or_else(|_| "\"\"".to_string());
 
+    let mut first_topk_json = Vec::new();
+    for &(lp_tid, lp_val) in &first_token_top_k {
+        first_topk_json.push(format!(r#"{{"token_id":{},"log_prob":{:.6}}}"#, lp_tid, lp_val));
+    }
+
     let response = format!(
-        r#"{{"token_ids":[{}],"text":{},"num_tokens":{},"per_token_data":[{}],"finish_reason":"{}","timing":{{"prefill_ms":{:.1},"decode_ms":{:.1},"total_ms":{:.1},"prompt_tokens":{}}}}}"#,
+        r#"{{"token_ids":[{}],"text":{},"num_tokens":{},"per_token_data":[{}],"first_token_top_k":[{}],"finish_reason":"{}","timing":{{"prefill_ms":{:.1},"decode_ms":{:.1},"total_ms":{:.1},"prompt_tokens":{}}}}}"#,
         output_tokens.iter().map(|(t, _)| t.to_string()).collect::<Vec<_>>().join(","),
         text_escaped,
         output_tokens.len(),
         per_token_json.join(","),
+        first_topk_json.join(","),
         finish_reason,
         prefill_ms, decode_ms, total_ms, prompt_len
     );
@@ -1529,6 +1544,7 @@ fn handle_gpu_decode(
                 tokenizer,
                 presence_penalty,
                 logprobs_top_n,
+                Some(format!("chat_{}", request_id)),
                 &mut on_token,
             );
         } else {
@@ -1544,6 +1560,7 @@ fn handle_gpu_decode(
                 tokenizer,
                 presence_penalty,
                 logprobs_top_n,
+                Some(format!("chat_{}", request_id)),
                 on_token,
             );
         }
@@ -1688,6 +1705,7 @@ fn handle_gpu_decode(
                     tokenizer,
                     presence_penalty,
                     logprobs_top_n,
+                    Some(format!("chat_{}_nosse", request_id)),
                     &mut on_token,
                 );
             } else {
@@ -1702,6 +1720,7 @@ fn handle_gpu_decode(
                     tokenizer,
                     presence_penalty,
                     logprobs_top_n,
+                    Some(format!("chat_{}_nosse", request_id)),
                     on_token,
                 );
             }
@@ -2094,11 +2113,9 @@ impl RustServer {
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
             format!("Failed to load chat template: {}", e)))?;
 
-        // Estimate tokens by applying actual chat template and tokenizing
-        // Always add the generation prompt (assistant turn prefix) — enable_thinking
-        // controls thinking suppression later, not template rendering.
+        // Estimate tokens by applying the same chat template mode the request will use.
         let estimated_tokens = {
-            let rendered = chat_template.apply(&messages_json, true)
+            let rendered = chat_template.apply(&messages_json, true, enable_thinking)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("Chat template failed: {}", e)))?;
             tokenizer.encode(rendered.as_str(), false)
@@ -2134,7 +2151,7 @@ impl RustServer {
 
         // Tokenize using Rust tokenizer (always with generation prompt)
         let token_ids: Vec<u32> = {
-            let rendered = chat_template.apply(&messages_json, true)
+            let rendered = chat_template.apply(&messages_json, true, enable_thinking)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("Chat template failed: {}", e)))?;
             let encoding = tokenizer.encode(rendered.as_str(), true)
@@ -2325,6 +2342,7 @@ impl RustServer {
                 &tokenizer,
                 0.0,    // presence_penalty
                 0,      // logprobs_top_n
+                Some("benchmark".to_string()),
                 |_token_id: usize, _text: &str, _finish_reason: Option<&str>, _logprobs: Option<&[(u32, f32)]>| {
                     count += 1;
                     true
@@ -2342,6 +2360,7 @@ impl RustServer {
                 &tokenizer,
                 0.0,    // presence_penalty
                 0,      // logprobs_top_n
+                Some("benchmark".to_string()),
                 |_token_id, _text, _finish_reason, _logprobs: Option<&[(u32, f32)]>| {
                     count += 1;
                     true

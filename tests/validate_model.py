@@ -396,6 +396,37 @@ def send_prefill_logits(messages: List[Dict[str, str]], port: int,
         return {"error": str(e)}
 
 
+def send_reference_test(input_token_ids: List[int], port: int,
+                        stop_token_ids: Optional[List[int]] = None,
+                        top_logprobs: int = 10,
+                        max_tokens: int = 1) -> Dict[str, Any]:
+    """Call the test-only /v1/internal/reference_test endpoint with raw token IDs."""
+    payload = {
+        "input_token_ids": input_token_ids,
+        "max_tokens": max_tokens,
+        "top_logprobs": top_logprobs,
+    }
+    if stop_token_ids is not None:
+        payload["stop_token_ids"] = stop_token_ids
+    body = json.dumps(payload).encode()
+
+    try:
+        conn = http.client.HTTPConnection(DEFAULT_HOST, port, timeout=GENERATE_TIMEOUT)
+        conn.request("POST", "/v1/internal/reference_test", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp_body = resp.read().decode("utf-8", errors="replace")
+        conn.close()
+
+        if resp.status != 200:
+            return {"error": f"HTTP {resp.status}: {resp_body[:200]}"}
+
+        return json.loads(resp_body)
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def compare_prefill_logits(ref_positions: List[Dict], krasis_positions: List[Dict]) -> Dict[str, Any]:
     """Compare prefill logits at matching positions.
 
@@ -554,8 +585,11 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     layers_active = ["L1:tokens"]
     if enable_logprobs:
         layers_active.append("L2:logprobs")
+    compare_first_step = os.environ.get("KRASIS_TRACE_PY_COMPARE") == "1"
     if enable_prefill:
         layers_active.append("L3:prefill")
+    if compare_first_step:
+        layers_active.append("diag:first_step")
     info(f"Validation layers: {', '.join(layers_active)}")
     if max_prompts is not None:
         info(f"Prompt cap: {max_prompts}")
@@ -570,6 +604,14 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
         total_prompts = total_reference_prompts
     info(f"Reference: {total_prompts} prompts from {reference['generated_at']}")
     info(f"Reference runtime: {reference['runtime']} {reference.get('runtime_version', '')}")
+    sanity = reference.get("sanity")
+    if isinstance(sanity, dict):
+        info(
+            "Reference sanity: "
+            f"status={sanity.get('status')} failed_checks={','.join(sanity.get('failed_checks', [])) or 'none'}"
+        )
+        if sanity.get("status") == "fail":
+            die("Reference sanity gate failed for this artifact. Recapture it before validation.")
 
     # Check if reference has prefill logits
     has_ref_prefill = any(
@@ -626,7 +668,7 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     proc = None
     if not no_server:
         info(f"Starting Krasis server on port {config_port}...")
-        proc, log_path = launch_server(config_path, test_endpoints=enable_prefill)
+        proc, log_path = launch_server(config_path, test_endpoints=(enable_prefill or compare_first_step))
         info(f"Server log: {log_path}")
 
         if not wait_for_health(config_port):
@@ -643,6 +685,7 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     warn_count = 0
     fail_count = 0
 
+    first_step_compared = False
     try:
         for conv_idx, conv in enumerate(ref_conversations):
             messages: List[Dict[str, str]] = []
@@ -698,6 +741,38 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
                             fail_count += 1
                             messages.pop()
                             continue
+
+                if compare_first_step and not first_step_compared and ref_input_ids:
+                    stop_ids = reference.get("eos_token_ids") or reference.get("stop_token_ids")
+                    ref_diag = send_reference_test(
+                        ref_input_ids,
+                        config_port,
+                        stop_token_ids=stop_ids,
+                        top_logprobs=10,
+                        max_tokens=1,
+                    )
+                    if "error" in ref_diag and ref_diag.get("error"):
+                        print(f"    {YELLOW}Diag first_step: {ref_diag['error']}{NC}")
+                    else:
+                        first_step_compared = True
+                        actual_first = (ref_diag.get("token_ids") or [None])[0]
+                        expected_first = ref_token_ids[0] if ref_token_ids else None
+                        first_top_k = ref_diag.get("first_token_top_k") or []
+                        top_k_ids = [entry.get("token_id") for entry in first_top_k if isinstance(entry, dict)]
+                        expected_rank = (top_k_ids.index(expected_first) + 1) if expected_first in top_k_ids else None
+                        top_k_preview = ", ".join(
+                            f"{entry.get('token_id')}:{entry.get('log_prob', 0.0):.3f}"
+                            for entry in first_top_k[:5]
+                            if isinstance(entry, dict)
+                        )
+                        color = GREEN if actual_first == expected_first else (YELLOW if expected_rank else RED)
+                        rank_text = f"rank {expected_rank}" if expected_rank is not None else "not in top-k"
+                        print(
+                            f"    {color}Diag first_step: expected={expected_first} "
+                            f"actual={actual_first} expected_in_actual_topk={rank_text}{NC}"
+                        )
+                        if top_k_preview:
+                            print(f"    {DIM}Diag top-k: {top_k_preview}{NC}")
 
                 # ── Layer 3: Prefill logits (first turn only, if enabled) ──
                 ref_prefill = turn.get("prefill_logits")
