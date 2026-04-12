@@ -22,6 +22,7 @@
 #   ./dev reference-test <config>   Compare engine output against BF16 reference data
 #   ./dev reference-test --compare <model>  Run 4 quant configs, produce comparative report
 #   ./dev reference-inventory       Inventory stored reference artifacts and classify contract state
+#   ./dev capture-box <subcommand>  Run HF capture commands through the strict paid-box wrapper
 #   ./dev capture-preflight         Verify or bootstrap a host for HF reference capture
 #   ./dev reference-prep <model>    Prepare HF capture deps and download a public model
 #   ./dev generate-reference <model>  Generate a BF16 HF reference capture
@@ -74,6 +75,36 @@ set -euo pipefail
 
 # ── Environment ──────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+infer_repo_home() {
+    local path="$1"
+    case "$path" in
+        /home/*/*)
+            local remainder="${path#/home/}"
+            local user="${remainder%%/*}"
+            [[ -n "$user" ]] && echo "/home/$user"
+            ;;
+        /Users/*/*)
+            local remainder="${path#/Users/}"
+            local user="${remainder%%/*}"
+            [[ -n "$user" ]] && echo "/Users/$user"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+REFERENCE_CAPTURE_ROOT_SOURCE="home"
+if [[ -n "${KRASIS_REFERENCE_CAPTURE_ROOT:-}" ]]; then
+    REFERENCE_CAPTURE_ROOT="${KRASIS_REFERENCE_CAPTURE_ROOT}"
+    REFERENCE_CAPTURE_ROOT_SOURCE="env"
+elif REPO_HOME="$(infer_repo_home "$SCRIPT_DIR")"; then
+    REFERENCE_CAPTURE_ROOT="${REPO_HOME}/.krasis"
+    REFERENCE_CAPTURE_ROOT_SOURCE="repo_home"
+else
+    REFERENCE_CAPTURE_ROOT="${HOME}/.krasis"
+fi
+
 PYTHON="/home/main/miniconda3/envs/ktransformers/bin/python"
 export PYTHONUNBUFFERED=1
 # WSL2: add CUDA driver path so Rust cudarc can find libcuda.so
@@ -85,7 +116,6 @@ WHEEL_DIR="$SCRIPT_DIR/target/dev-wheels"
 REPO_PYTHONPATH="$SCRIPT_DIR/python"
 REPO_LIBPATH="$SCRIPT_DIR/python/krasis.libs"
 STANDARD_SPEED_TEST_CONFIG="$SCRIPT_DIR/tests/qcn-polar4-awq.conf"
-REFERENCE_CAPTURE_ROOT="${KRASIS_REFERENCE_CAPTURE_ROOT:-${HOME}/.krasis}"
 REFERENCE_CAPTURE_MODELS_DIR="${REFERENCE_CAPTURE_ROOT}/models"
 REFERENCE_CAPTURE_VENV="${REFERENCE_CAPTURE_ROOT}/reference-capture-venv"
 REFERENCE_CAPTURE_READY_JSON="${REFERENCE_CAPTURE_ROOT}/capture-host-ready.json"
@@ -254,6 +284,48 @@ run_reference_capture_python() {
         ld_path="$REPO_LIBPATH${ld_path:+:$ld_path}"
     fi
     PYTHONNOUSERSITE=1 PYTHONPATH="$REPO_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" LD_LIBRARY_PATH="$ld_path" "$python_bin" "$@"
+}
+
+print_capture_box_env() {
+    info "Capture-box environment"
+    echo "repo_root=$SCRIPT_DIR"
+    echo "repo_home=$1"
+    echo "HOME=$HOME"
+    echo "PATH=$PATH"
+    echo "capture_root=$REFERENCE_CAPTURE_ROOT"
+    echo "capture_root_source=$REFERENCE_CAPTURE_ROOT_SOURCE"
+    echo "capture_models_dir=$REFERENCE_CAPTURE_MODELS_DIR"
+    echo "capture_venv=$REFERENCE_CAPTURE_VENV"
+    echo "ready_json=$REFERENCE_CAPTURE_READY_JSON"
+    echo "ready_stamp=$REFERENCE_CAPTURE_READY_STAMP"
+}
+
+enter_capture_box_env() {
+    local repo_home
+    repo_home="$(infer_repo_home "$SCRIPT_DIR" || true)"
+    [[ -n "$repo_home" ]] || err "Cannot derive a stable user home from repo path $SCRIPT_DIR.
+Run from a checkout under /home/<user>/... or /Users/<user>/..., or set KRASIS_REFERENCE_CAPTURE_ROOT explicitly."
+
+    export HOME="$repo_home"
+    export PATH="$repo_home/.cargo/bin:$PATH"
+    export KRASIS_CAPTURE_BOX_ACTIVE=1
+    export KRASIS_CAPTURE_BOX_REPO_HOME="$repo_home"
+    export KRASIS_REFERENCE_CAPTURE_ROOT="$repo_home/.krasis"
+    export KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE="capture_box"
+    REFERENCE_CAPTURE_ROOT="$KRASIS_REFERENCE_CAPTURE_ROOT"
+    REFERENCE_CAPTURE_ROOT_SOURCE="$KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE"
+    REFERENCE_CAPTURE_MODELS_DIR="${REFERENCE_CAPTURE_ROOT}/models"
+    REFERENCE_CAPTURE_VENV="${REFERENCE_CAPTURE_ROOT}/reference-capture-venv"
+    REFERENCE_CAPTURE_READY_JSON="${REFERENCE_CAPTURE_ROOT}/capture-host-ready.json"
+    REFERENCE_CAPTURE_READY_STAMP="${REFERENCE_CAPTURE_ROOT}/capture-host-ready.stamp"
+    export KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$REFERENCE_CAPTURE_MODELS_DIR"
+    export KRASIS_REFERENCE_CAPTURE_VENV="$REFERENCE_CAPTURE_VENV"
+    export KRASIS_REFERENCE_CAPTURE_READY_JSON="$REFERENCE_CAPTURE_READY_JSON"
+    export KRASIS_REFERENCE_CAPTURE_READY_STAMP="$REFERENCE_CAPTURE_READY_STAMP"
+
+    if [[ ! "$SCRIPT_DIR" =~ ^"$repo_home"/ ]]; then
+        err "Repo path $SCRIPT_DIR is not inside the enforced capture-box home $repo_home."
+    fi
 }
 
 verify_repo_imports() {
@@ -1098,6 +1170,7 @@ do_capture_preflight() {
     KRASIS_DEV_PIP="$PIP" \
     KRASIS_DEV_MATURIN="$MATURIN" \
     KRASIS_REFERENCE_CAPTURE_ROOT="$REFERENCE_CAPTURE_ROOT" \
+    KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE="$REFERENCE_CAPTURE_ROOT_SOURCE" \
     KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$REFERENCE_CAPTURE_MODELS_DIR" \
     KRASIS_REFERENCE_CAPTURE_VENV="$REFERENCE_CAPTURE_VENV" \
     KRASIS_REFERENCE_CAPTURE_READY_JSON="$REFERENCE_CAPTURE_READY_JSON" \
@@ -1118,6 +1191,7 @@ do_reference_prep() {
     info "Preparing reference host: ${1:-listing models}"
     KRASIS_DEV_SCRIPT=1 KRASIS_DEV_PYTHON="$PYTHON" KRASIS_DEV_PIP="$PIP" \
     KRASIS_REFERENCE_CAPTURE_ROOT="$REFERENCE_CAPTURE_ROOT" \
+    KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE="$REFERENCE_CAPTURE_ROOT_SOURCE" \
     KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$REFERENCE_CAPTURE_MODELS_DIR" \
     KRASIS_REFERENCE_CAPTURE_VENV="$REFERENCE_CAPTURE_VENV" \
     "$SCRIPT_DIR/scripts/reference_capture_prep.sh" "$@"
@@ -1144,11 +1218,63 @@ do_generate_reference() {
     verify_repo_python_imports
     set +e
     KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="generate-reference" KRASIS_DEV_CMD="$dev_cmd" \
+        KRASIS_REFERENCE_CAPTURE_ROOT="$REFERENCE_CAPTURE_ROOT" \
+        KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE="$REFERENCE_CAPTURE_ROOT_SOURCE" \
         KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$REFERENCE_CAPTURE_MODELS_DIR" \
         run_reference_capture_python "$SCRIPT_DIR/tests/generate_reference.py" "$@" 2>&1 | tee "$logfile"
     local status=${PIPESTATUS[0]}
     set -e
     return "$status"
+}
+
+do_capture_box() {
+    local subcmd="${1:-help}"
+    shift || true
+    enter_capture_box_env
+
+    case "$subcmd" in
+        env)
+            print_capture_box_env "$KRASIS_CAPTURE_BOX_REPO_HOME"
+            ;;
+        preflight|capture-preflight)
+            print_capture_box_env "$KRASIS_CAPTURE_BOX_REPO_HOME"
+            do_capture_preflight "$@"
+            ;;
+        prep|reference-prep)
+            print_capture_box_env "$KRASIS_CAPTURE_BOX_REPO_HOME"
+            do_reference_prep "$@"
+            ;;
+        generate|generate-reference)
+            print_capture_box_env "$KRASIS_CAPTURE_BOX_REPO_HOME"
+            do_generate_reference "$@"
+            ;;
+        help|-h|--help)
+            echo "Usage: ./dev capture-box <subcommand> [args...]"
+            echo ""
+            echo "Strict paid-box wrapper for HF capture work."
+            echo "It enforces one remote identity before any expensive work:"
+            echo "  - HOME := inferred repo owner home"
+            echo "  - PATH prepends <repo-home>/.cargo/bin"
+            echo "  - capture root := <repo-home>/.krasis"
+            echo "  - capture root source := capture_box"
+            echo ""
+            echo "Subcommands:"
+            echo "  env                            Print the enforced environment and exit"
+            echo "  preflight [args...]            Run ./dev capture-preflight under the enforced environment"
+            echo "  prep [args...]                 Run ./dev reference-prep under the enforced environment"
+            echo "  generate [args...]             Run ./dev generate-reference under the enforced environment"
+            echo ""
+            echo "Examples:"
+            echo "  ./dev capture-box env"
+            echo "  ./dev capture-box preflight --bootstrap --model qcn"
+            echo "  ./dev capture-box prep qcn --detach"
+            echo "  ./dev capture-box generate Qwen3-Coder-Next --profile greedy_chat_thinking_off"
+            ;;
+        *)
+            err "Unknown capture-box subcommand: $subcmd
+  Expected one of: env, preflight, prep, generate"
+            ;;
+    esac
 }
 
 do_trace_diff() {
@@ -1275,6 +1401,7 @@ case "$cmd" in
     release-test-all) do_release_test_all "$@" ;;
     reference-test) do_reference_test "$@" ;;
     reference-inventory) do_reference_inventory "$@" ;;
+    capture-box)    do_capture_box "$@" ;;
     capture-preflight) do_capture_preflight "$@" ;;
     reference-prep) do_reference_prep "$@" ;;
     generate-reference) do_generate_reference "$@" ;;
@@ -1309,6 +1436,7 @@ case "$cmd" in
         echo "  reference-test <config>        Compare engine output against BF16 reference data"
         echo "  reference-test --compare <model>  Run comparative reference matrix"
         echo "  reference-inventory            Inventory stored reference artifacts"
+        echo "  capture-box <subcommand>      Strict paid-box wrapper for HF reference capture"
         echo "  capture-preflight             Verify or bootstrap a host for HF reference capture"
         echo "  reference-prep <model>         Prepare HF capture deps and download a public model"
         echo "  generate-reference <model>     Generate BF16 HF reference capture"
@@ -1334,17 +1462,19 @@ case "$cmd" in
         echo "Reference workflow:"
         echo "  1. Inventory current artifacts:"
         echo "       ./dev reference-inventory"
-        echo "  2. Prove the host is ready before queueing downloads/captures:"
-        echo "       ./dev capture-preflight --bootstrap"
-        echo "  3. Prepare the host and fetch the public model if needed:"
-        echo "       ./dev reference-prep <model>"
-        echo "  4. Generate an explicit reference profile:"
-        echo "       ./dev generate-reference <model> --profile <profile>"
-        echo "  5. Validate the capture against a runtime config:"
+        echo "  2. On paid boxes, enforce the remote environment first:"
+        echo "       ./dev capture-box env"
+        echo "  3. Prove the host is ready before queueing downloads/captures:"
+        echo "       ./dev capture-box preflight --bootstrap --model <model>"
+        echo "  4. Prepare the host and fetch the public model if needed:"
+        echo "       ./dev capture-box prep <model>"
+        echo "  5. Generate an explicit reference profile:"
+        echo "       ./dev capture-box generate <model> --profile <profile>"
+        echo "  6. Validate the capture against a runtime config:"
         echo "       ./dev validate <config> --max-prompts 0 --no-server --port 1"
-        echo "  6. Run the real comparison:"
+        echo "  7. Run the real comparison:"
         echo "       ./dev reference-test <config>"
-        echo "  7. Diff stored traces offline when needed:"
+        echo "  8. Diff stored traces offline when needed:"
         echo "       ./dev trace-diff <expected-trace> <actual-trace>"
         echo "  Reference-prep aliases:"
         echo "    qcn, qwen35, q122b, gemma, minimax, q235, q397"
@@ -1352,6 +1482,8 @@ case "$cmd" in
         echo "    - Uses public Hugging Face repo IDs only; does not use an HF token."
         echo "    - capture root:"
         echo "        $REFERENCE_CAPTURE_ROOT"
+        echo "    - paid-box wrapper:"
+        echo "        ./dev capture-box ..."
         echo "    - capture-preflight writes:"
         echo "        $REFERENCE_CAPTURE_READY_JSON"
         echo "        $REFERENCE_CAPTURE_READY_STAMP"
@@ -1406,8 +1538,10 @@ case "$cmd" in
         echo "  ./dev release-test Qwen3-Coder-Next    Full release test"
         echo "  ./dev release-test-all                 Test all models (no resume)"
         echo "  ./dev release-test-all rc8             Test all models (resume on re-run with same target)"
-        echo "  ./dev capture-preflight --bootstrap"
-        echo "  ./dev reference-prep qcn --detach"
+        echo "  ./dev capture-box env"
+        echo "  ./dev capture-box preflight --bootstrap --model qcn"
+        echo "  ./dev capture-box prep qcn --detach"
+        echo "  ./dev capture-box generate Qwen3-Coder-Next --profile greedy_chat_thinking_off"
         echo "  ./dev awq-calibrate qcn    Build AWQ attention template"
         echo "  ./dev perplexity qcn"
         echo "  ./dev trace-diff /tmp/expected.log /tmp/actual.log --events mark,tensor"

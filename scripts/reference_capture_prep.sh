@@ -23,6 +23,7 @@ PYTHON_BIN="${KRASIS_DEV_PYTHON:-python3}"
 PIP_BIN="${KRASIS_DEV_PIP:-}"
 PYTHON_DIR="$(cd "$(dirname "$PYTHON_BIN")" && pwd)"
 CAPTURE_ROOT="${KRASIS_REFERENCE_CAPTURE_ROOT:-${HOME}/.krasis}"
+CAPTURE_ROOT_SOURCE="${KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE:-home}"
 CAPTURE_ENV_DIR="${KRASIS_REFERENCE_CAPTURE_VENV:-${CAPTURE_ROOT}/reference-capture-venv}"
 CAPTURE_PYTHON="${CAPTURE_ENV_DIR}/bin/python"
 CAPTURE_PIP="${CAPTURE_ENV_DIR}/bin/pip"
@@ -598,6 +599,7 @@ if [[ -n "$MODEL_ARG" ]]; then
 
     info "Model repo: $REPO_ID"
     info "Local dir: $DEST_DIR"
+    info "Capture root: $CAPTURE_ROOT (source: $CAPTURE_ROOT_SOURCE)"
     if [[ "$PRINT_URLS" -eq 1 ]]; then
         info "Public repo URL: $REPO_URL"
         info "Public file tree: $TREE_URL"
@@ -650,6 +652,12 @@ if [[ "$DETACH" -eq 1 ]]; then
     ts=$(date +%Y%m%d_%H%M%S)
     safe_name=$(echo "$LOCAL_NAME" | tr '/ ' '__')
     log_file="$LOG_ROOT/reference-prep_${safe_name}_${ts}.log"
+    extra_deps_pid=""
+    extra_deps_log=""
+    if [[ "$INSTALL_DEPS" -eq 1 && "$BASE_ONLY" -eq 0 && "$NO_OVERLAP" -eq 0 ]]; then
+        extra_deps_log="$LOG_ROOT/reference-prep-extra-deps_${safe_name}_${ts}.log"
+        extra_deps_pid=$(install_capture_extra_deps_background "full" "$extra_deps_log" || true)
+    fi
     info "Starting detached download"
     info "Log file: $log_file"
     printf '%s\n' "Repo: $REPO_ID" "Dest: $DEST_DIR" "URL: $REPO_URL" > "$log_file"
@@ -658,6 +666,10 @@ if [[ "$DETACH" -eq 1 ]]; then
     nohup "${DOWNLOAD_CMD[@]}" >> "$log_file" 2>&1 < /dev/null &
     pid=$!
     ok "Download started in background (pid $pid)"
+    if [[ -n "$extra_deps_pid" ]]; then
+        ok "Model-family extra dependency build started in background (pid $extra_deps_pid)"
+        echo "Extra deps log: $extra_deps_log"
+    fi
     echo "Tail with: tail -f $log_file"
     exit 0
 fi

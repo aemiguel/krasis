@@ -29,8 +29,10 @@ These versions are known to work together. Don't upgrade without testing.
 |---------|---------|-------|
 | torch | 2.9.1+cu128 | CUDA 12.8 |
 | sgl-kernel | 0.0.1+ | Provides Marlin GEMM + fused MoE kernels |
-| transformers | 4.57.1 | |
+| transformers | 5.5.3 | Capture env pin for current public-model reference capture |
 | safetensors | 0.7.0 | |
+| mamba-ssm | 2.3.1 | Required for Nemotron reference capture |
+| causal-conv1d | 1.6.1 | Required for Nemotron reference capture |
 | maturin | 1.12.4 | At ~/.local/bin/maturin |
 
 ### Installing from scratch
@@ -85,12 +87,17 @@ config parsing. Run `./dev help` for full usage.
 ./dev python tests/test_network.py --port 8012
 
 # Prove the host is ready for HF reference capture
-./dev capture-preflight --bootstrap
+./dev capture-box env
+./dev capture-box preflight --bootstrap --model qcn
 
 # Prepare HF reference capture deps and download a public model
-./dev reference-prep qcn
-./dev reference-prep qwen35 --detach
+./dev capture-box prep qcn
+./dev capture-box prep qwen35 --detach
 ```
+
+`capture-box` is the strict paid-box wrapper for HF reference capture work. It
+forces `HOME`, `PATH`, and the capture root to the repo owner home before any
+bootstrap, download, or generation work starts.
 
 `capture-preflight` verifies the actual host state before queueing downloads or
 captures. On success it writes:
@@ -102,8 +109,10 @@ Use `--bootstrap` to create or repair the isolated capture venv first.
 
 `reference-prep` uses that isolated capture venv at
 `~/.krasis/reference-capture-venv`, maps common model aliases to the exact
-public Hugging Face repo IDs, and downloads into `~/.krasis/models`. Use
-`--detach` for long remote downloads.
+public Hugging Face repo IDs, and downloads into `~/.krasis/models`. It also
+owns the authoritative pinned capture dependency set for that env; preflight
+verifies against the same source so future Transformers bumps only need one
+change. Use `--detach` for long remote downloads.
 
 ### Auto-rebuild
 

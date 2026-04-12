@@ -25,6 +25,7 @@ PYTHON_BIN="${KRASIS_DEV_PYTHON:-python3}"
 PIP_BIN="${KRASIS_DEV_PIP:-}"
 MATURIN_BIN="${KRASIS_DEV_MATURIN:-maturin}"
 CAPTURE_ROOT="${KRASIS_REFERENCE_CAPTURE_ROOT:-${HOME}/.krasis}"
+CAPTURE_ROOT_SOURCE="${KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE:-home}"
 CAPTURE_MODELS_DIR="${KRASIS_REFERENCE_CAPTURE_MODELS_DIR:-${CAPTURE_ROOT}/models}"
 CAPTURE_ENV_DIR="${KRASIS_REFERENCE_CAPTURE_VENV:-${CAPTURE_ROOT}/reference-capture-venv}"
 CAPTURE_PYTHON="${CAPTURE_ENV_DIR}/bin/python"
@@ -32,6 +33,39 @@ READY_JSON="${KRASIS_REFERENCE_CAPTURE_READY_JSON:-${CAPTURE_ROOT}/capture-host-
 READY_STAMP="${KRASIS_REFERENCE_CAPTURE_READY_STAMP:-${CAPTURE_ROOT}/capture-host-ready.stamp}"
 BOOTSTRAP=0
 MODEL_ARG=""
+
+infer_repo_home() {
+    local path="$1"
+    case "$path" in
+        /home/*/*)
+            local remainder="${path#/home/}"
+            local user="${remainder%%/*}"
+            [[ -n "$user" ]] && echo "/home/$user"
+            ;;
+        /Users/*/*)
+            local remainder="${path#/Users/}"
+            local user="${remainder%%/*}"
+            [[ -n "$user" ]] && echo "/Users/$user"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+fail_fast_bootstrap_checks() {
+    [[ -x "$PYTHON_BIN" ]] || err "Repo Python not found at $PYTHON_BIN"
+    [[ -x "$MATURIN_BIN" ]] || err "maturin not found at $MATURIN_BIN"
+    command -v cargo >/dev/null 2>&1 || err "cargo is not on PATH. Refusing to spend paid-box time on capture bootstrap until the Rust toolchain path is fixed."
+    command -v rustc >/dev/null 2>&1 || err "rustc is not on PATH. Refusing to spend paid-box time on capture bootstrap until the Rust toolchain path is fixed."
+
+    local repo_home=""
+    repo_home="$(infer_repo_home "$SCRIPT_DIR" || true)"
+    if [[ -n "$repo_home" && "$CAPTURE_ROOT_SOURCE" == "home" && "$HOME" != "$repo_home" ]]; then
+        err "Repo is under $repo_home but HOME is $HOME, and capture root is still following HOME.
+Set KRASIS_REFERENCE_CAPTURE_ROOT explicitly or run the built command from the intended user environment before bootstrap."
+    fi
+}
 
 usage() {
     cat <<'EOF'
@@ -77,11 +111,13 @@ done
 mkdir -p "$(dirname "$READY_JSON")"
 
 if [[ "$BOOTSTRAP" -eq 1 ]]; then
+    fail_fast_bootstrap_checks
     info "Bootstrapping isolated capture environment"
     KRASIS_DEV_SCRIPT=1 \
     KRASIS_DEV_PYTHON="$PYTHON_BIN" \
     KRASIS_DEV_PIP="$PIP_BIN" \
     KRASIS_REFERENCE_CAPTURE_ROOT="$CAPTURE_ROOT" \
+    KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE="$CAPTURE_ROOT_SOURCE" \
     KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$CAPTURE_MODELS_DIR" \
     KRASIS_REFERENCE_CAPTURE_VENV="$CAPTURE_ENV_DIR" \
     "$PREP_SCRIPT" ${MODEL_ARG:+$MODEL_ARG} --deps-only
@@ -96,6 +132,7 @@ EXPECTED_CAPTURE_DEPS_JSON="$(
     KRASIS_DEV_PYTHON="$PYTHON_BIN" \
     KRASIS_DEV_PIP="$PIP_BIN" \
     KRASIS_REFERENCE_CAPTURE_ROOT="$CAPTURE_ROOT" \
+    KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE="$CAPTURE_ROOT_SOURCE" \
     KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$CAPTURE_MODELS_DIR" \
     KRASIS_REFERENCE_CAPTURE_VENV="$CAPTURE_ENV_DIR" \
     "$PREP_SCRIPT" ${MODEL_ARG:+$MODEL_ARG} --print-required-deps-json
@@ -103,7 +140,7 @@ EXPECTED_CAPTURE_DEPS_JSON="$(
 
 tmp_json="$(mktemp)"
 set +e
-PYTHONNOUSERSITE=1 PYTHONPATH="$SCRIPT_DIR/python:$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" SCRIPT_DIR="$SCRIPT_DIR" PYTHON_BIN="$PYTHON_BIN" MATURIN_BIN="$MATURIN_BIN" CAPTURE_PYTHON="$CAPTURE_PYTHON" READY_JSON="$READY_JSON" CAPTURE_ROOT="$CAPTURE_ROOT" CAPTURE_MODELS_DIR="$CAPTURE_MODELS_DIR" PREFLIGHT_MODEL_ARG="$MODEL_ARG" EXPECTED_CAPTURE_DEPS_JSON="$EXPECTED_CAPTURE_DEPS_JSON" "$CAPTURE_PYTHON" - <<'PY' >"$tmp_json"
+PYTHONNOUSERSITE=1 PYTHONPATH="$SCRIPT_DIR/python:$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" SCRIPT_DIR="$SCRIPT_DIR" PYTHON_BIN="$PYTHON_BIN" MATURIN_BIN="$MATURIN_BIN" CAPTURE_PYTHON="$CAPTURE_PYTHON" READY_JSON="$READY_JSON" CAPTURE_ROOT="$CAPTURE_ROOT" CAPTURE_MODELS_DIR="$CAPTURE_MODELS_DIR" KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE="$CAPTURE_ROOT_SOURCE" PREFLIGHT_MODEL_ARG="$MODEL_ARG" EXPECTED_CAPTURE_DEPS_JSON="$EXPECTED_CAPTURE_DEPS_JSON" "$CAPTURE_PYTHON" - <<'PY' >"$tmp_json"
 import importlib
 import inspect
 import json
@@ -129,6 +166,7 @@ result = {
     "generated_at": datetime.now(timezone.utc).isoformat(),
     "repo_root": str(repo),
     "capture_root": str(capture_root),
+    "capture_root_source": os.environ.get("KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE", "unknown"),
     "capture_models_dir": str(capture_models_dir),
     "capture_env_dir": str(capture_python.parent.parent),
     "capture_python": str(capture_python),
