@@ -82,6 +82,55 @@ EMPTY_TEMPLATE_HASH = _sha256_bytes(b"")
 VISIBLE_THOUGHT_RE = re.compile(r"(?is)(<think>|</think>|<\|channel\>|<channel\|>|\bthought\b)")
 
 
+def _validate_turn_decode_diagnostics(
+    turn: Dict[str, Any],
+    *,
+    expected_steps: int,
+    expected_top_k: int,
+) -> Optional[str]:
+    token_ids = turn.get("token_ids")
+    per_token_data = turn.get("per_token_data")
+    if not isinstance(token_ids, list):
+        return "turn token_ids missing"
+    if expected_steps <= 0:
+        return None
+    if not token_ids:
+        return None
+    if not isinstance(per_token_data, list):
+        return "per_token_data missing"
+
+    expected_count = min(len(token_ids), expected_steps)
+    if len(per_token_data) != expected_count:
+        return f"expected {expected_count} per_token_data entries, got {len(per_token_data)}"
+
+    for idx, entry in enumerate(per_token_data):
+        if not isinstance(entry, dict):
+            return f"step {idx} entry is not an object"
+        if entry.get("token_id") != token_ids[idx]:
+            return f"step {idx} token_id mismatch: entry={entry.get('token_id')} token_ids={token_ids[idx]}"
+        if not isinstance(entry.get("rank"), int) or entry["rank"] < 1:
+            return f"step {idx} rank missing or invalid"
+        top_k = entry.get("top_k")
+        if not isinstance(top_k, list) or not top_k:
+            return f"step {idx} top_k missing"
+        if len(top_k) > expected_top_k:
+            return f"step {idx} top_k length {len(top_k)} exceeds expected {expected_top_k}"
+        top_k_ids = []
+        for top_idx, top_entry in enumerate(top_k):
+            if not isinstance(top_entry, dict):
+                return f"step {idx} top_k[{top_idx}] is not an object"
+            token_id = top_entry.get("token_id")
+            log_prob = top_entry.get("log_prob")
+            if not isinstance(token_id, int):
+                return f"step {idx} top_k[{top_idx}] token_id invalid"
+            if not isinstance(log_prob, (int, float)):
+                return f"step {idx} top_k[{top_idx}] log_prob invalid"
+            top_k_ids.append(token_id)
+        if token_ids[idx] not in top_k_ids and entry["rank"] <= len(top_k_ids):
+            return f"step {idx} rank={entry['rank']} but selected token missing from top_k"
+    return None
+
+
 def _extract_chat_template(tokenizer_cfg: Dict[str, Any], model_dir: Optional[Path] = None) -> Tuple[str, str]:
     chat_template = tokenizer_cfg.get("chat_template")
     if isinstance(chat_template, str):
@@ -565,10 +614,12 @@ def build_reference_sanity_report(
     conversations = reference.get("conversations", [])
     actual_conversations = len(conversations)
     actual_turns = sum(len(conv.get("turns", [])) for conv in conversations)
+    format_version = reference.get("format_version")
     contract = reference.get("contract", {}) if isinstance(reference.get("contract"), dict) else {}
     tokenizer = contract.get("tokenizer", {}) if isinstance(contract.get("tokenizer"), dict) else {}
     stop = contract.get("stop", {}) if isinstance(contract.get("stop"), dict) else {}
     request = contract.get("request", {}) if isinstance(contract.get("request"), dict) else {}
+    decode_diagnostics = reference.get("decode_diagnostics", {}) if isinstance(reference.get("decode_diagnostics"), dict) else {}
 
     profile_candidates = [
         reference.get("profile_id"),
@@ -616,6 +667,47 @@ def build_reference_sanity_report(
         f"artifact_stop_ids={artifact_stop_ids} contract_stop_ids={contract_stop_ids}",
     )
 
+    diag_steps = decode_diagnostics.get("captured_steps_per_turn")
+    diag_top_k = decode_diagnostics.get("top_k")
+    diag_errors: List[Dict[str, Any]] = []
+    diagnostics_required = isinstance(format_version, int) and format_version >= 5
+    diagnostics_declared = isinstance(diag_steps, int) and diag_steps >= 0 and isinstance(diag_top_k, int) and diag_top_k >= 0
+    add_check(
+        "decode_diagnostics_declared",
+        diagnostics_declared if diagnostics_required else True,
+        (
+            f"format_version={format_version!r} captured_steps_per_turn={diag_steps!r} "
+            f"top_k={diag_top_k!r}"
+        ),
+    )
+    if diagnostics_declared:
+        for conv_idx, conv in enumerate(conversations):
+            for turn_idx, turn in enumerate(conv.get("turns", [])):
+                error = _validate_turn_decode_diagnostics(
+                    turn,
+                    expected_steps=diag_steps,
+                    expected_top_k=diag_top_k,
+                )
+                if error is not None:
+                    diag_errors.append(
+                        {
+                            "conversation_index": conv_idx,
+                            "turn_index": turn_idx,
+                            "detail": error,
+                        }
+                    )
+        add_check(
+            "decode_diagnostics_valid",
+            len(diag_errors) == 0,
+            f"invalid_turns={len(diag_errors)}",
+        )
+    elif diagnostics_required:
+        add_check(
+            "decode_diagnostics_valid",
+            False,
+            "decode_diagnostics missing for format_version >= 5",
+        )
+
     thought_hits: List[Dict[str, Any]] = []
     effective_profile = profile_values[0] if len(profile_values) == 1 else None
     thinking_off = (
@@ -658,6 +750,13 @@ def build_reference_sanity_report(
         "thought_leakage": {
             "count": len(thought_hits),
             "samples": thought_hits[:3],
+        },
+        "decode_diagnostics": {
+            "required": diagnostics_required,
+            "declared": diagnostics_declared,
+            "captured_steps_per_turn": diag_steps if diagnostics_declared else None,
+            "top_k": diag_top_k if diagnostics_declared else None,
+            "invalid_turns": diag_errors[:3],
         },
     }
 

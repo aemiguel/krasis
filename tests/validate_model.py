@@ -308,6 +308,9 @@ def send_chat_greedy(messages: List[Dict[str, str]], port: int,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0,
+        "top_k": 1,
+        "top_p": 1.0,
+        "presence_penalty": 0.0,
         "stream": True,
         "enable_thinking": False,
     }
@@ -612,6 +615,16 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
         )
         if sanity.get("status") == "fail":
             die("Reference sanity gate failed for this artifact. Recapture it before validation.")
+    decode_diagnostics = reference.get("decode_diagnostics")
+    if isinstance(decode_diagnostics, dict):
+        info(
+            "Reference decode diagnostics: "
+            f"coverage={decode_diagnostics.get('coverage', 'unknown')} "
+            f"steps={decode_diagnostics.get('captured_steps_per_turn', 'unknown')} "
+            f"top_k={decode_diagnostics.get('top_k', 'unknown')}"
+        )
+    else:
+        info("Reference decode diagnostics: legacy capture (none declared)")
 
     # Check if reference has prefill logits
     has_ref_prefill = any(

@@ -294,7 +294,7 @@ PY
 }
 
 resolve_hf_cli() {
-    ensure_capture_env
+    ensure_capture_env >/dev/null
     if [[ -x "$CAPTURE_ENV_DIR/bin/hf" ]]; then
         echo "$CAPTURE_ENV_DIR/bin/hf"
         return 0

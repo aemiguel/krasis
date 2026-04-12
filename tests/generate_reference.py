@@ -57,6 +57,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 REFERENCE_DIR = SCRIPT_DIR / "reference_outputs"
 PROMPTS_FILE = REPO_DIR / "benchmarks" / "sanity_test_prompts.txt"
+DEFAULT_DIAGNOSTIC_STEPS = 4
+DEFAULT_DIAGNOSTIC_TOPK = 10
 
 MODEL_ALIASES = {
     "qcn": "Qwen3-Coder-Next",
@@ -158,6 +160,8 @@ def write_run_manifest(
     model_name: str,
     profile_id: str,
     max_new_tokens: int,
+    diagnostic_steps: int,
+    diagnostic_top_k: int,
     sanity: Optional[Dict[str, Any]] = None,
 ) -> None:
     run_dir = invocation.get("run_dir")
@@ -175,6 +179,10 @@ def write_run_manifest(
         "model": model_name,
         "profile_id": profile_id,
         "max_new_tokens": max_new_tokens,
+        "decode_diagnostics": {
+            "captured_steps_per_turn": diagnostic_steps,
+            "top_k": diagnostic_top_k,
+        },
         "reference_output_path": str(output_path.resolve()),
         "sanity": sanity,
         "follow_up_commands": [
@@ -212,7 +220,85 @@ def parse_prompt_conversations(lines: List[str]) -> List[List[str]]:
     return conversations
 
 
-def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str = "auto"):
+def _decode_token_text(tokenizer: Any, token_id: int) -> str:
+    try:
+        return tokenizer.decode([int(token_id)], skip_special_tokens=False)
+    except Exception:
+        return ""
+
+
+def build_teacher_forced_per_token_data(
+    model: Any,
+    tokenizer: Any,
+    prompt_input_ids: Any,
+    generated_token_ids: List[int],
+    *,
+    diagnostic_steps: int,
+    diagnostic_top_k: int,
+) -> List[Dict[str, Any]]:
+    if diagnostic_steps <= 0 or diagnostic_top_k <= 0 or not generated_token_ids:
+        return []
+
+    import torch
+
+    steps_to_capture = min(len(generated_token_ids), diagnostic_steps)
+    teacher_suffix = generated_token_ids[: max(0, steps_to_capture - 1)]
+    teacher_ids = prompt_input_ids[0].tolist() + teacher_suffix
+    teacher_tensor = torch.tensor([teacher_ids], dtype=prompt_input_ids.dtype, device=model.device)
+
+    with torch.no_grad():
+        logits = model(teacher_tensor).logits[0].float()
+
+    prompt_len = prompt_input_ids.shape[1]
+    vocab_size = logits.shape[-1]
+    top_k = min(int(diagnostic_top_k), int(vocab_size))
+    per_token_data: List[Dict[str, Any]] = []
+
+    for step in range(steps_to_capture):
+        logit_pos = prompt_len - 1 + step
+        step_logits = logits[logit_pos]
+        log_probs = torch.log_softmax(step_logits, dim=-1)
+        expected_token_id = int(generated_token_ids[step])
+        expected_log_prob = float(log_probs[expected_token_id].item())
+        expected_logit = float(step_logits[expected_token_id].item())
+        expected_rank = int(torch.count_nonzero(step_logits > step_logits[expected_token_id]).item()) + 1
+
+        top_vals, top_ids = torch.topk(log_probs, k=top_k)
+        top_k_entries = []
+        for tok_id, log_prob in zip(top_ids.tolist(), top_vals.tolist()):
+            top_k_entries.append(
+                {
+                    "token_id": int(tok_id),
+                    "text": _decode_token_text(tokenizer, int(tok_id)),
+                    "log_prob": float(log_prob),
+                }
+            )
+
+        prev_token_id = int(prompt_input_ids[0, -1].item()) if step == 0 else int(generated_token_ids[step - 1])
+        per_token_data.append(
+            {
+                "position": int(logit_pos),
+                "previous_token_id": prev_token_id,
+                "previous_token_text": _decode_token_text(tokenizer, prev_token_id),
+                "token_id": expected_token_id,
+                "text": _decode_token_text(tokenizer, expected_token_id),
+                "log_prob": expected_log_prob,
+                "logit": expected_logit,
+                "rank": expected_rank,
+                "top_k": top_k_entries,
+            }
+        )
+
+    return per_token_data
+
+
+def generate_reference(
+    model_name: str,
+    max_new_tokens: int = 200,
+    profile: str = "auto",
+    diagnostic_steps: int = DEFAULT_DIAGNOSTIC_STEPS,
+    diagnostic_top_k: int = DEFAULT_DIAGNOSTIC_TOPK,
+):
     """Generate reference outputs using HuggingFace transformers."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
@@ -235,6 +321,7 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
     info(f"Path: {model_path}")
     info(f"Conversations: {len(conversations)} ({total_prompts} prompts)")
     info(f"Max new tokens: {max_new_tokens}")
+    info(f"Decode diagnostics: first {diagnostic_steps} steps, top-{diagnostic_top_k}")
     # Use only GPU 0 for loading; offload the rest to CPU.
     # QCN has 512 experts/layer — too large for multi-GPU with transformers.
     # Speed doesn't matter here, correctness does.
@@ -292,7 +379,7 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
 
     # Generate reference outputs
     result = {
-        "format_version": 4,
+        "format_version": 5,
         "model": model_name,
         "model_path": model_path,
         "generated_at": datetime.now().isoformat(),
@@ -302,6 +389,13 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
         "eos_token_ids": eos_token_ids,
         "capture_settings": capture_settings,
         "capture_invocation": invocation,
+        "decode_diagnostics": {
+            "schema_version": 1,
+            "coverage": "teacher_forced_first_generated_steps",
+            "captured_steps_per_turn": diagnostic_steps,
+            "top_k": diagnostic_top_k,
+            "log_prob_base": "natural_log",
+        },
         "conversations": [],
     }
 
@@ -379,6 +473,16 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
                 "text": text,
                 "num_tokens": len(new_token_ids),
             }
+            per_token_data = build_teacher_forced_per_token_data(
+                model,
+                tokenizer,
+                input_ids,
+                new_token_ids,
+                diagnostic_steps=diagnostic_steps,
+                diagnostic_top_k=diagnostic_top_k,
+            )
+            if per_token_data:
+                turn_result["per_token_data"] = per_token_data
             conv_result["turns"].append(turn_result)
 
             # Add assistant response to history for multi-turn
@@ -419,7 +523,16 @@ def generate_reference(model_name: str, max_new_tokens: int = 200, profile: str 
         str(output_path),
         max_new_tokens=max_new_tokens,
     )
-    write_run_manifest(invocation, output_path, model_name, profile_id, max_new_tokens, result["sanity"])
+    write_run_manifest(
+        invocation,
+        output_path,
+        model_name,
+        profile_id,
+        max_new_tokens,
+        diagnostic_steps,
+        diagnostic_top_k,
+        result["sanity"],
+    )
 
     ok(f"Reference saved: {output_path}")
     ok(
@@ -467,9 +580,32 @@ def main():
             "the tokenizer chat template supports enable_thinking, otherwise greedy_chat_default"
         ),
     )
+    parser.add_argument(
+        "--diag-steps",
+        type=int,
+        default=DEFAULT_DIAGNOSTIC_STEPS,
+        help=f"Teacher-forced decode diagnostic coverage per turn (default: {DEFAULT_DIAGNOSTIC_STEPS})",
+    )
+    parser.add_argument(
+        "--diag-topk",
+        type=int,
+        default=DEFAULT_DIAGNOSTIC_TOPK,
+        help=f"Top-k entries to store for each diagnostic step (default: {DEFAULT_DIAGNOSTIC_TOPK})",
+    )
     args = parser.parse_args()
 
-    generate_reference(args.model, args.max_tokens, args.profile)
+    if args.diag_steps < 0:
+        die("--diag-steps must be >= 0")
+    if args.diag_topk < 0:
+        die("--diag-topk must be >= 0")
+
+    generate_reference(
+        args.model,
+        args.max_tokens,
+        args.profile,
+        diagnostic_steps=args.diag_steps,
+        diagnostic_top_k=args.diag_topk,
+    )
 
 
 if __name__ == "__main__":
