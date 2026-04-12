@@ -90,6 +90,9 @@ config parsing. Run `./dev help` for full usage.
 ./dev capture-box env
 ./dev capture-box preflight --bootstrap --model qcn
 
+# Bootstrap once, then queue multiple model downloads
+./dev capture-box stage qcn gemma
+
 # Prepare HF reference capture deps and download a public model
 ./dev capture-box prep qcn
 ./dev capture-box prep qwen35 --detach
@@ -113,6 +116,11 @@ public Hugging Face repo IDs, and downloads into `~/.krasis/models`. It also
 owns the authoritative pinned capture dependency set for that env; preflight
 verifies against the same source so future Transformers bumps only need one
 change. Use `--detach` for long remote downloads.
+
+`capture-box stage` is the quickest paid-box path when you already know the
+models you want. It runs one enforced-environment bootstrap, then queues each
+requested model through `reference-prep --detach` so downloads start quickly
+without redoing the host bootstrap step for every model.
 
 ### Auto-rebuild
 

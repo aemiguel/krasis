@@ -343,7 +343,10 @@ def maybe_patch_legacy_remote_cache_position(model: Any) -> None:
     if "transformers_modules" not in module_name:
         return
     model_module = importlib.import_module(module_name)
-    hybrid_cache_cls = getattr(model_module, "HybridMambaAttentionDynamicCache", None)
+    hybrid_cache_cls = (
+        getattr(model_module, "HybridMambaAttentionDynamicCache", None)
+        or getattr(model_module, "NemotronHHybridDynamicCache", None)
+    )
 
     original_prepare = prepare
 
@@ -425,8 +428,13 @@ def estimate_conversion_workspace_bytes(model_loader: Any, config: Any) -> int:
     """Estimate the largest temporary tensor created by checkpoint conversion ops."""
     import torch
     from accelerate import init_empty_weights
-    from transformers.conversion_mapping import get_model_conversion_mapping
-    from transformers.core_model_loading import Concatenate, WeightConverter
+
+    try:
+        from transformers.conversion_mapping import get_model_conversion_mapping
+        from transformers.core_model_loading import Concatenate, WeightConverter
+    except ImportError as exc:
+        warn(f"Could not inspect conversion mapping on this transformers version: {exc}")
+        return 0
 
     try:
         with init_empty_weights(include_buffers=True):

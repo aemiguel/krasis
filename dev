@@ -1179,12 +1179,13 @@ do_capture_preflight() {
 }
 
 do_reference_prep() {
-    [[ $# -lt 1 && ! " ${*:-} " =~ [[:space:]](--help|-h|--list-models|--deps-only|--print-deps-json)[[:space:]] ]] && err "Usage: ./dev reference-prep <model> [--detach] [--print-urls|--urls-only] [--deps-only|--download-only|--print-deps-json] [--dest-root PATH]
+    [[ $# -lt 1 && ! " ${*:-} " =~ [[:space:]](--help|-h|--list-models|--deps-only|--print-deps-json)[[:space:]] ]] && err "Usage: ./dev reference-prep <model> [--detach] [--print-urls|--urls-only] [--deps-only|--download-only|--print-deps-json] [--max-workers N] [--retry-count N] [--retry-backoff-sec N] [--enable-xet|--disable-xet] [--dest-root PATH]
   Prepares the HF reference-capture environment and downloads a public model to ${REFERENCE_CAPTURE_MODELS_DIR}.
   Examples:
     ./dev capture-preflight --bootstrap
     ./dev reference-prep qcn
     ./dev reference-prep qwen35 --detach
+    ./dev reference-prep qcn --download-only --max-workers 4 --retry-count 8
     ./dev reference-prep --deps-only
     ./dev reference-prep --print-deps-json
     ./dev reference-prep gemma --urls-only"
@@ -1244,8 +1245,81 @@ do_capture_box() {
             print_capture_box_env "$KRASIS_CAPTURE_BOX_REPO_HOME"
             do_reference_prep "$@"
             ;;
+        stage)
+            local dry_run=0
+            local skip_bootstrap=0
+            local -a stage_models=()
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --dry-run)
+                        dry_run=1
+                        shift
+                        ;;
+                    --no-bootstrap)
+                        skip_bootstrap=1
+                        shift
+                        ;;
+                    -h|--help)
+                        echo "Usage: ./dev capture-box stage [--dry-run] [--no-bootstrap] <model> [more models...]"
+                        echo ""
+                        echo "Bootstrap the paid-box capture host once, then queue one or more model"
+                        echo "downloads through the enforced capture-box environment."
+                        echo ""
+                        echo "Options:"
+                        echo "  --dry-run       Print the exact staged commands without running them"
+                        echo "  --no-bootstrap  Skip capture-preflight --bootstrap and assume the host is already ready"
+                        echo ""
+                        echo "Example:"
+                        echo "  ./dev capture-box stage qcn gemma"
+                        echo "  ./dev capture-box stage --dry-run qcn gemma"
+                        return 0
+                        ;;
+                    -*)
+                        err "Unknown capture-box stage option: $1"
+                        ;;
+                    *)
+                        stage_models+=("$1")
+                        shift
+                        ;;
+                esac
+            done
+            [[ "${#stage_models[@]}" -gt 0 ]] || err "Usage: ./dev capture-box stage [--dry-run] [--no-bootstrap] <model> [more models...]"
+            print_capture_box_env "$KRASIS_CAPTURE_BOX_REPO_HOME"
+            if [[ "$skip_bootstrap" -eq 0 ]]; then
+                info "Stage bootstrap target: ${stage_models[0]}"
+                if [[ "$dry_run" -eq 1 ]]; then
+                    local bootstrap_cmd
+                    printf -v bootstrap_cmd '%q ' ./dev capture-box preflight --bootstrap --model "${stage_models[0]}"
+                    echo "DRY RUN: ${bootstrap_cmd% }"
+                else
+                    do_capture_preflight --bootstrap --model "${stage_models[0]}"
+                fi
+            else
+                warn "Skipping capture bootstrap as requested"
+            fi
+            local model
+            for model in "${stage_models[@]}"; do
+                info "Queueing staged model: $model"
+                if [[ "$dry_run" -eq 1 ]]; then
+                    local prep_cmd
+                    printf -v prep_cmd '%q ' ./dev capture-box prep "$model" --detach
+                    echo "DRY RUN: ${prep_cmd% }"
+                else
+                    do_reference_prep "$model" --detach
+                fi
+            done
+            if [[ "$dry_run" -eq 1 ]]; then
+                info "Dry run complete"
+            else
+                ok "Staged ${#stage_models[@]} model download(s)"
+                echo "Next: run ./dev capture-box generate <model> --profile <profile> once the first model is ready."
+            fi
+            ;;
         generate|generate-reference)
             print_capture_box_env "$KRASIS_CAPTURE_BOX_REPO_HOME"
+            [[ $# -ge 1 ]] || err "Usage: ./dev capture-box generate <model> [--profile PROFILE] [--max-tokens N]"
+            info "Verifying paid-box capture host for model: $1"
+            do_capture_preflight --bootstrap --model "$1"
             do_generate_reference "$@"
             ;;
         help|-h|--help)
@@ -1262,17 +1336,19 @@ do_capture_box() {
             echo "  env                            Print the enforced environment and exit"
             echo "  preflight [args...]            Run ./dev capture-preflight under the enforced environment"
             echo "  prep [args...]                 Run ./dev reference-prep under the enforced environment"
+            echo "  stage [args...]                Bootstrap once, then queue one or more model downloads"
             echo "  generate [args...]             Run ./dev generate-reference under the enforced environment"
             echo ""
             echo "Examples:"
             echo "  ./dev capture-box env"
             echo "  ./dev capture-box preflight --bootstrap --model qcn"
             echo "  ./dev capture-box prep qcn --detach"
+            echo "  ./dev capture-box stage qcn gemma"
             echo "  ./dev capture-box generate Qwen3-Coder-Next --profile greedy_chat_thinking_off"
             ;;
         *)
             err "Unknown capture-box subcommand: $subcmd
-  Expected one of: env, preflight, prep, generate"
+  Expected one of: env, preflight, prep, stage, generate"
             ;;
     esac
 }
@@ -1470,6 +1546,8 @@ case "$cmd" in
         echo "       ./dev capture-box prep <model>"
         echo "  5. Generate an explicit reference profile:"
         echo "       ./dev capture-box generate <model> --profile <profile>"
+        echo "    Or stage multiple downloads at once:"
+        echo "       ./dev capture-box stage qcn gemma"
         echo "  6. Validate the capture against a runtime config:"
         echo "       ./dev validate <config> --max-prompts 0 --no-server --port 1"
         echo "  7. Run the real comparison:"
@@ -1541,6 +1619,7 @@ case "$cmd" in
         echo "  ./dev capture-box env"
         echo "  ./dev capture-box preflight --bootstrap --model qcn"
         echo "  ./dev capture-box prep qcn --detach"
+        echo "  ./dev capture-box stage qcn gemma"
         echo "  ./dev capture-box generate Qwen3-Coder-Next --profile greedy_chat_thinking_off"
         echo "  ./dev awq-calibrate qcn    Build AWQ attention template"
         echo "  ./dev perplexity qcn"

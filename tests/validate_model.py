@@ -33,6 +33,7 @@ try:
         emit_contract_failure_trace,
         emit_contract_trace,
         format_contract_report,
+        load_tokenizer_with_compat,
         load_or_infer_reference_contract,
         reference_candidate_filenames,
         validate_contracts,
@@ -46,6 +47,7 @@ except ModuleNotFoundError:
         emit_contract_failure_trace,
         emit_contract_trace,
         format_contract_report,
+        load_tokenizer_with_compat,
         load_or_infer_reference_contract,
         reference_candidate_filenames,
         validate_contracts,
@@ -575,8 +577,6 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     Layer 2: Decode logprobs comparison (when enable_logprobs=True)
     Layer 3: Prefill logit comparison (when enable_prefill=True, requires --test-endpoints)
     """
-    from transformers import AutoTokenizer
-
     model_name = extract_model_name(config_path)
     config_port = port if port else extract_port(config_path)
     is_quant = is_quantized_model(config_path)
@@ -639,7 +639,7 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     # Validate the reference/runtime contract before starting the server.
     model_path = os.path.join(os.path.expanduser("~/.krasis/models"), model_name)
     info(f"Loading tokenizer from {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = load_tokenizer_with_compat(model_path)
     reference_contract = load_or_infer_reference_contract(reference, model_path, tokenizer)
     runtime_contract = build_runtime_contract(
         config_path,

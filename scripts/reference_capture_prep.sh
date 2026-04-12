@@ -28,6 +28,7 @@ CAPTURE_ENV_DIR="${KRASIS_REFERENCE_CAPTURE_VENV:-${CAPTURE_ROOT}/reference-capt
 CAPTURE_PYTHON="${CAPTURE_ENV_DIR}/bin/python"
 CAPTURE_PIP="${CAPTURE_ENV_DIR}/bin/pip"
 DEST_ROOT="${KRASIS_REFERENCE_CAPTURE_MODELS_DIR:-${CAPTURE_ROOT}/models}"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 LOG_ROOT=""
 MODEL_ARG=""
 REPO_ID=""
@@ -43,7 +44,9 @@ PRINT_DEP_GROUPS=0
 PRINT_REQUIRED_DEPS_JSON=0
 BASE_ONLY=0
 NO_OVERLAP=0
+INTERNAL_DOWNLOAD_LOOP=0
 HF_HUB_VERSION="${KRASIS_REFERENCE_CAPTURE_HF_HUB_VERSION:-1.10.1}"
+LEGACY_HF_HUB_VERSION="${KRASIS_REFERENCE_CAPTURE_LEGACY_HF_HUB_VERSION:-0.36.2}"
 ACCELERATE_VERSION="${KRASIS_REFERENCE_CAPTURE_ACCELERATE_VERSION:-1.13.0}"
 TRANSFORMERS_VERSION="${KRASIS_REFERENCE_CAPTURE_TRANSFORMERS_VERSION:-5.5.3}"
 SAFETENSORS_VERSION="${KRASIS_REFERENCE_CAPTURE_SAFETENSORS_VERSION:-0.7.0}"
@@ -51,20 +54,16 @@ MAMBA_SSM_VERSION="${KRASIS_REFERENCE_CAPTURE_MAMBA_SSM_VERSION:-2.3.1}"
 CAUSAL_CONV1D_VERSION="${KRASIS_REFERENCE_CAPTURE_CAUSAL_CONV1D_VERSION:-1.6.1}"
 EINOPS_VERSION="${KRASIS_REFERENCE_CAPTURE_EINOPS_VERSION:-0.8.2}"
 NINJA_VERSION="${KRASIS_REFERENCE_CAPTURE_NINJA_VERSION:-1.13.0}"
-BASE_CAPTURE_DEPS=(
-    "huggingface_hub==${HF_HUB_VERSION}"
-    "accelerate==${ACCELERATE_VERSION}"
-    "transformers==${TRANSFORMERS_VERSION}"
-    "safetensors==${SAFETENSORS_VERSION}"
-    "sentencepiece"
-    "protobuf<7"
-)
 MAMBA_CAPTURE_DEPS=(
     "mamba-ssm==${MAMBA_SSM_VERSION}"
     "causal-conv1d==${CAUSAL_CONV1D_VERSION}"
     "einops==${EINOPS_VERSION}"
     "ninja==${NINJA_VERSION}"
 )
+DOWNLOAD_MAX_WORKERS="${KRASIS_REFERENCE_CAPTURE_MAX_WORKERS:-8}"
+DOWNLOAD_RETRY_COUNT="${KRASIS_REFERENCE_CAPTURE_DOWNLOAD_RETRY_COUNT:-6}"
+DOWNLOAD_RETRY_BACKOFF_SEC="${KRASIS_REFERENCE_CAPTURE_DOWNLOAD_RETRY_BACKOFF_SEC:-15}"
+DISABLE_XET="${KRASIS_REFERENCE_CAPTURE_DISABLE_XET:-1}"
 
 usage() {
     cat <<'EOF'
@@ -87,6 +86,11 @@ Options:
   --download-only         Start the download only; skip dependency installs
   --base-only             Only install the base HF capture stack; skip model-family extras
   --no-overlap            Do not overlap model-family extra builds with downloads
+  --max-workers N         Set hf download worker concurrency (default: 8)
+  --retry-count N         Retry failed downloads this many times (default: 6)
+  --retry-backoff-sec N   Sleep between failed attempts (default: 15)
+  --enable-xet            Leave HF Xet enabled for this run
+  --disable-xet           Disable HF Xet for this run (default)
   --print-deps-json       Print the authoritative pinned capture dependency set as JSON and exit
   --print-dep-groups      Print the dependency groups and supported model families as JSON and exit
   --print-required-deps-json  Print the flattened required dependency set for the target model/mode
@@ -124,7 +128,11 @@ EOF
 }
 
 print_required_capture_deps_json() {
-    "$PYTHON_BIN" - "$HF_HUB_VERSION" "$ACCELERATE_VERSION" "$TRANSFORMERS_VERSION" "$SAFETENSORS_VERSION" "$MAMBA_SSM_VERSION" "$CAUSAL_CONV1D_VERSION" "$EINOPS_VERSION" "$NINJA_VERSION" <<'PY'
+    local resolved_hf_hub_version
+    local resolved_transformers_version
+    resolved_hf_hub_version="$(resolve_capture_hf_hub_version)"
+    resolved_transformers_version="$(resolve_capture_transformers_version)"
+    "$PYTHON_BIN" - "$resolved_hf_hub_version" "$ACCELERATE_VERSION" "$resolved_transformers_version" "$SAFETENSORS_VERSION" "$MAMBA_SSM_VERSION" "$CAUSAL_CONV1D_VERSION" "$EINOPS_VERSION" "$NINJA_VERSION" <<'PY'
 import json
 import sys
 
@@ -239,9 +247,80 @@ append_dep_group_packages() {
     esac
 }
 
+resolve_capture_transformers_version() {
+    local resolved_version="$TRANSFORMERS_VERSION"
+    local config_path=""
+
+    if [[ -n "$LOCAL_NAME" ]]; then
+        config_path="${DEST_ROOT%/}/${LOCAL_NAME}/config.json"
+    fi
+
+    if [[ -n "$config_path" && -f "$config_path" ]]; then
+        local model_specific_version
+        model_specific_version=$("$PYTHON_BIN" - "$config_path" "$resolved_version" <<'PY'
+import json
+import sys
+
+config_path = sys.argv[1]
+default_version = sys.argv[2]
+
+try:
+    with open(config_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+except Exception:
+    print(default_version)
+    raise SystemExit(0)
+
+model_type = payload.get("model_type")
+transformers_version = payload.get("transformers_version")
+
+if model_type == "nemotron_h" and isinstance(transformers_version, str) and transformers_version.strip():
+    print(transformers_version.strip())
+else:
+    print(default_version)
+PY
+)
+        if [[ -n "$model_specific_version" ]]; then
+            resolved_version="$model_specific_version"
+        fi
+    fi
+
+    echo "$resolved_version"
+}
+
+resolve_capture_hf_hub_version() {
+    local resolved_version="$HF_HUB_VERSION"
+    local transformers_version
+    transformers_version="$(resolve_capture_transformers_version)"
+
+    if [[ "$transformers_version" == 4.* ]]; then
+        resolved_version="$LEGACY_HF_HUB_VERSION"
+    fi
+
+    echo "$resolved_version"
+}
+
+emit_base_capture_deps() {
+    local resolved_hf_hub_version
+    local resolved_transformers_version
+    resolved_hf_hub_version="$(resolve_capture_hf_hub_version)"
+    resolved_transformers_version="$(resolve_capture_transformers_version)"
+    printf '%s\n' \
+        "huggingface_hub==${resolved_hf_hub_version}" \
+        "accelerate==${ACCELERATE_VERSION}" \
+        "transformers==${resolved_transformers_version}" \
+        "safetensors==${SAFETENSORS_VERSION}" \
+        "sentencepiece" \
+        "protobuf<7"
+}
+
 collect_required_capture_deps() {
     local mode="${1:-full}"
-    local -a deps=("${BASE_CAPTURE_DEPS[@]}")
+    local -a deps=()
+    while IFS= read -r package; do
+        [[ -n "$package" ]] || continue
+        deps+=("$package")
+    done < <(emit_base_capture_deps)
 
     if [[ "$mode" != "base" && -n "$REPO_ID" ]]; then
         while IFS= read -r group_name; do
@@ -492,6 +571,128 @@ resolve_hf_cli() {
     err "No Hugging Face CLI found after dependency install."
 }
 
+validate_positive_int() {
+    local value="$1"
+    local label="$2"
+    [[ "$value" =~ ^[0-9]+$ ]] || err "$label must be a non-negative integer, got: $value"
+}
+
+download_lock_dir() {
+    echo "${DEST_DIR}/.cache/huggingface/download"
+}
+
+count_matching_files() {
+    local root="$1"
+    local pattern="$2"
+    if [[ -d "$root" ]]; then
+        find "$root" -type f -name "$pattern" | wc -l | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+live_download_pids_for_target() {
+    local pattern
+    pattern="download[[:space:]]+${REPO_ID}.*--local-dir[[:space:]]+${DEST_DIR}"
+    pgrep -af "$pattern" | awk -v self="$$" '$1 != self {print $1}'
+}
+
+clear_stale_local_dir_locks() {
+    local lock_dir
+    lock_dir="$(download_lock_dir)"
+    [[ -d "$lock_dir" ]] || return 0
+
+    local -a active_pids=()
+    mapfile -t active_pids < <(live_download_pids_for_target || true)
+    if [[ "${#active_pids[@]}" -gt 0 ]]; then
+        warn "Leaving local-dir shard locks in place; active downloader pid(s): ${active_pids[*]}"
+        return 0
+    fi
+
+    local lock_count
+    lock_count=$(count_matching_files "$lock_dir" "*.lock")
+    if [[ "$lock_count" -eq 0 ]]; then
+        return 0
+    fi
+
+    warn "Clearing ${lock_count} stale local-dir shard lock(s) under $lock_dir"
+    find "$lock_dir" -type f -name '*.lock' -delete
+}
+
+build_download_command() {
+    DOWNLOAD_CMD=(
+        $HF_CLI
+        download
+        "$REPO_ID"
+        --local-dir "$DEST_DIR"
+        --max-workers "$DOWNLOAD_MAX_WORKERS"
+    )
+}
+
+print_download_state() {
+    local lock_dir incomplete_count lock_count
+    lock_dir="$(download_lock_dir)"
+    incomplete_count=$(count_matching_files "$lock_dir" "*.incomplete")
+    lock_count=$(count_matching_files "$lock_dir" "*.lock")
+    info "Download state: workers=${DOWNLOAD_MAX_WORKERS} retries=${DOWNLOAD_RETRY_COUNT} backoff=${DOWNLOAD_RETRY_BACKOFF_SEC}s xet_disabled=${DISABLE_XET} incomplete=${incomplete_count} locks=${lock_count}"
+}
+
+run_download_with_retries() {
+    local max_attempts attempt status current_workers
+    validate_positive_int "$DOWNLOAD_MAX_WORKERS" "--max-workers"
+    validate_positive_int "$DOWNLOAD_RETRY_COUNT" "--retry-count"
+    validate_positive_int "$DOWNLOAD_RETRY_BACKOFF_SEC" "--retry-backoff-sec"
+
+    max_attempts=$((DOWNLOAD_RETRY_COUNT + 1))
+    current_workers="$DOWNLOAD_MAX_WORKERS"
+    attempt=1
+
+    while [[ "$attempt" -le "$max_attempts" ]]; do
+        DOWNLOAD_MAX_WORKERS="$current_workers"
+        clear_stale_local_dir_locks
+        build_download_command
+        print_download_state
+        info "Starting download attempt ${attempt}/${max_attempts}"
+        printf '$ '
+        if [[ "$DISABLE_XET" -eq 1 ]]; then
+            printf 'HF_HUB_DISABLE_XET=1 '
+        fi
+        printf '%q ' "${DOWNLOAD_CMD[@]}"
+        printf '\n'
+
+        status=0
+        if [[ "$DISABLE_XET" -eq 1 ]]; then
+            HF_HUB_DISABLE_XET=1 "${DOWNLOAD_CMD[@]}" || status=$?
+        else
+            "${DOWNLOAD_CMD[@]}" || status=$?
+        fi
+        if [[ "$status" -eq 0 ]]; then
+            ok "Download complete: $DEST_DIR"
+            return 0
+        fi
+
+        warn "Download attempt ${attempt}/${max_attempts} failed with exit code ${status}"
+        print_download_state
+        clear_stale_local_dir_locks
+        if [[ "$attempt" -ge "$max_attempts" ]]; then
+            break
+        fi
+
+        if [[ "$current_workers" -gt 1 ]]; then
+            current_workers=$(((current_workers + 1) / 2))
+            warn "Reducing hf download workers for retry: ${current_workers}"
+        fi
+
+        if [[ "$DOWNLOAD_RETRY_BACKOFF_SEC" -gt 0 ]]; then
+            info "Sleeping ${DOWNLOAD_RETRY_BACKOFF_SEC}s before retry"
+            sleep "$DOWNLOAD_RETRY_BACKOFF_SEC"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    err "Download failed after ${max_attempts} attempt(s): $DEST_DIR"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --list-models)
@@ -529,6 +730,29 @@ while [[ $# -gt 0 ]]; do
             NO_OVERLAP=1
             shift
             ;;
+        --max-workers)
+            [[ $# -ge 2 ]] || err "--max-workers requires an integer"
+            DOWNLOAD_MAX_WORKERS="$2"
+            shift 2
+            ;;
+        --retry-count)
+            [[ $# -ge 2 ]] || err "--retry-count requires an integer"
+            DOWNLOAD_RETRY_COUNT="$2"
+            shift 2
+            ;;
+        --retry-backoff-sec)
+            [[ $# -ge 2 ]] || err "--retry-backoff-sec requires an integer"
+            DOWNLOAD_RETRY_BACKOFF_SEC="$2"
+            shift 2
+            ;;
+        --enable-xet)
+            DISABLE_XET=0
+            shift
+            ;;
+        --disable-xet)
+            DISABLE_XET=1
+            shift
+            ;;
         --print-deps-json)
             PRINT_DEPS_JSON=1
             shift
@@ -545,6 +769,10 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || err "--dest-root requires a path"
             DEST_ROOT="$2"
             shift 2
+            ;;
+        --internal-download-loop)
+            INTERNAL_DOWNLOAD_LOOP=1
+            shift
             ;;
         -h|--help)
             usage
@@ -639,12 +867,7 @@ fi
 
 HF_CLI=$(resolve_hf_cli)
 info "Hugging Face CLI: $HF_CLI"
-DOWNLOAD_CMD=(
-    $HF_CLI
-    download
-    "$REPO_ID"
-    --local-dir "$DEST_DIR"
-)
+build_download_command
 
 if [[ "$DETACH" -eq 1 ]]; then
     LOG_ROOT="${LOG_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/logs}"
@@ -652,18 +875,46 @@ if [[ "$DETACH" -eq 1 ]]; then
     ts=$(date +%Y%m%d_%H%M%S)
     safe_name=$(echo "$LOCAL_NAME" | tr '/ ' '__')
     log_file="$LOG_ROOT/reference-prep_${safe_name}_${ts}.log"
+    local_xet_flag="--disable-xet"
+    detached_cmd=""
     extra_deps_pid=""
     extra_deps_log=""
+    if [[ "$DISABLE_XET" -eq 0 ]]; then
+        local_xet_flag="--enable-xet"
+    fi
     if [[ "$INSTALL_DEPS" -eq 1 && "$BASE_ONLY" -eq 0 && "$NO_OVERLAP" -eq 0 ]]; then
         extra_deps_log="$LOG_ROOT/reference-prep-extra-deps_${safe_name}_${ts}.log"
         extra_deps_pid=$(install_capture_extra_deps_background "full" "$extra_deps_log" || true)
     fi
     info "Starting detached download"
     info "Log file: $log_file"
-    printf '%s\n' "Repo: $REPO_ID" "Dest: $DEST_DIR" "URL: $REPO_URL" > "$log_file"
-    printf '$ %q ' "${DOWNLOAD_CMD[@]}" >> "$log_file"
-    printf '\n\n' >> "$log_file"
-    nohup "${DOWNLOAD_CMD[@]}" >> "$log_file" 2>&1 < /dev/null &
+    printf '%s\n' \
+        "Repo: $REPO_ID" \
+        "Dest: $DEST_DIR" \
+        "URL: $REPO_URL" \
+        "Max workers: $DOWNLOAD_MAX_WORKERS" \
+        "Retry count: $DOWNLOAD_RETRY_COUNT" \
+        "Retry backoff sec: $DOWNLOAD_RETRY_BACKOFF_SEC" \
+        "Disable Xet: $DISABLE_XET" > "$log_file"
+    printf -v detached_cmd '%q ' \
+        env \
+        KRASIS_DEV_SCRIPT=1 \
+        KRASIS_DEV_PYTHON="$PYTHON_BIN" \
+        KRASIS_DEV_PIP="$PIP_BIN" \
+        KRASIS_REFERENCE_CAPTURE_ROOT="$CAPTURE_ROOT" \
+        KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE="$CAPTURE_ROOT_SOURCE" \
+        KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$DEST_ROOT" \
+        KRASIS_REFERENCE_CAPTURE_VENV="$CAPTURE_ENV_DIR" \
+        "$SCRIPT_PATH" "$MODEL_ARG" --download-only --internal-download-loop \
+        --max-workers "$DOWNLOAD_MAX_WORKERS" \
+        --retry-count "$DOWNLOAD_RETRY_COUNT" \
+        --retry-backoff-sec "$DOWNLOAD_RETRY_BACKOFF_SEC" \
+        --dest-root "$DEST_ROOT" \
+        "$local_xet_flag"
+    detached_cmd="${detached_cmd% }"
+    printf '$ %s\n\n' "$detached_cmd" >> "$log_file"
+    nohup bash -lc "$detached_cmd; status=\$?; printf '\\nDETACHED_EXIT:%s\\n' \"\$status\"; exit \"\$status\"" \
+        >> "$log_file" 2>&1 < /dev/null &
     pid=$!
     ok "Download started in background (pid $pid)"
     if [[ -n "$extra_deps_pid" ]]; then
@@ -671,6 +922,11 @@ if [[ "$DETACH" -eq 1 ]]; then
         echo "Extra deps log: $extra_deps_log"
     fi
     echo "Tail with: tail -f $log_file"
+    exit 0
+fi
+
+if [[ "$INTERNAL_DOWNLOAD_LOOP" -eq 1 ]]; then
+    run_download_with_retries
     exit 0
 fi
 
@@ -686,13 +942,10 @@ if [[ "$INSTALL_DEPS" -eq 1 && "$BASE_ONLY" -eq 0 && "$NO_OVERLAP" -eq 0 ]]; the
 fi
 
 info "Starting download"
-printf '$ %q ' "${DOWNLOAD_CMD[@]}"
-printf '\n'
-"${DOWNLOAD_CMD[@]}"
+run_download_with_retries
 if [[ -n "$extra_deps_pid" ]]; then
     info "Waiting for model-family extra dependency build to finish (pid $extra_deps_pid)"
     if ! wait "$extra_deps_pid"; then
         err "Model-family extra dependency build failed. See log: $extra_deps_log"
     fi
 fi
-ok "Download complete: $DEST_DIR"

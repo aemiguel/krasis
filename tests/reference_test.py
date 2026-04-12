@@ -34,6 +34,7 @@ try:
         emit_contract_failure_trace,
         emit_contract_trace,
         format_contract_report,
+        load_tokenizer_with_compat,
         load_or_infer_reference_contract,
         reference_candidate_filenames,
         validate_contracts,
@@ -45,6 +46,7 @@ except ModuleNotFoundError:
         emit_contract_failure_trace,
         emit_contract_trace,
         format_contract_report,
+        load_tokenizer_with_compat,
         load_or_infer_reference_contract,
         reference_candidate_filenames,
         validate_contracts,
@@ -178,13 +180,11 @@ def list_available_references(script_dir: str) -> List[str]:
 
 
 def load_tokenizer_for_config(conf_path: str):
-    from transformers import AutoTokenizer
-
     cfg = parse_config(conf_path)
     model_path = os.path.expanduser(cfg.get("CFG_MODEL_PATH", ""))
     if not model_path:
         raise ValueError(f"Config has no CFG_MODEL_PATH/MODEL_PATH: {conf_path}")
-    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    return load_tokenizer_with_compat(model_path)
 
 
 def validate_reference_against_config(conf_path: str, ref_data: Dict, ref_path: Optional[str] = None) -> Dict[str, Any]:

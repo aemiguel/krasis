@@ -61,6 +61,70 @@ def _load_json(path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def _normalize_extra_special_tokens(raw: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, list):
+        return None
+
+    normalized: Dict[str, Any] = {}
+    used_keys = set()
+
+    for idx, item in enumerate(raw):
+        if isinstance(item, str):
+            token_value: Any = item
+            key_source = item
+        elif isinstance(item, dict):
+            token_value = item
+            key_source = str(
+                item.get("content")
+                or item.get("token")
+                or item.get("id")
+                or f"extra_special_token_{idx}"
+            )
+        else:
+            token_value = item
+            key_source = f"extra_special_token_{idx}"
+
+        key = re.sub(r"[^a-z0-9]+", "_", key_source.lower()).strip("_")
+        if not key:
+            key = f"extra_special_token_{idx}"
+        if key[0].isdigit():
+            key = f"extra_special_token_{idx}_{key}"
+        if not key.endswith("_token"):
+            key = f"{key}_token"
+        while key in used_keys:
+            key = f"{key}_{idx}"
+        normalized[key] = token_value
+        used_keys.add(key)
+
+    return normalized
+
+
+def load_tokenizer_with_compat(model_path: str):
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    except AttributeError as exc:
+        if "object has no attribute 'keys'" not in str(exc):
+            raise
+        tokenizer_cfg_path = Path(model_path) / "tokenizer_config.json"
+        if not tokenizer_cfg_path.is_file():
+            raise
+        tokenizer_cfg = _load_json(tokenizer_cfg_path)
+        normalized = _normalize_extra_special_tokens(tokenizer_cfg.get("extra_special_tokens"))
+        if not normalized:
+            raise
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            extra_special_tokens=normalized,
+        )
+        setattr(tokenizer, "_krasis_extra_special_tokens_compat", normalized)
+        return tokenizer
+
+
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -771,6 +835,21 @@ def resolve_reference_model_name(reference: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _resolve_model_dir(root: Path, model_name: str) -> Optional[Path]:
+    candidate = (root / model_name).resolve()
+    if candidate.is_dir():
+        return candidate
+
+    folded_name = model_name.casefold()
+    try:
+        for child in root.iterdir():
+            if child.is_dir() and child.name.casefold() == folded_name:
+                return child.resolve()
+    except FileNotFoundError:
+        return None
+    return None
+
+
 def resolve_local_reference_model_path(
     reference: Dict[str, Any],
     model_root: Optional[str] = None,
@@ -783,8 +862,8 @@ def resolve_local_reference_model_path(
 
     if model_name:
         for root in roots:
-            candidate = (root / model_name).resolve()
-            if candidate.is_dir():
+            candidate = _resolve_model_dir(root, model_name)
+            if candidate is not None:
                 return str(candidate)
 
     stored_model_path = reference.get("model_path")

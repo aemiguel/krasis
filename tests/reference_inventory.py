@@ -17,16 +17,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from transformers import AutoTokenizer
-except ModuleNotFoundError as exc:  # pragma: no cover
-    print(f"ERROR: missing transformers dependency: {exc}", file=sys.stderr)
-    sys.exit(1)
-
-try:
     from reference_contract import (
         build_reference_artifact_metadata,
         emit_contract_failure_trace,
         emit_reference_inventory_trace,
+        load_tokenizer_with_compat,
         load_or_infer_reference_contract,
         resolve_local_reference_model_path,
         resolve_reference_model_name,
@@ -36,6 +31,7 @@ except ModuleNotFoundError:
         build_reference_artifact_metadata,
         emit_contract_failure_trace,
         emit_reference_inventory_trace,
+        load_tokenizer_with_compat,
         load_or_infer_reference_contract,
         resolve_local_reference_model_path,
         resolve_reference_model_name,
@@ -122,7 +118,7 @@ def _output_path(args: argparse.Namespace) -> Path:
 
 
 def _load_tokenizer(model_path: str):
-    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    return load_tokenizer_with_compat(model_path)
 
 
 def _inventory_entry(reference_path: Path, reference_root: Path, model_root: str) -> Dict[str, Any]:
