@@ -6162,12 +6162,6 @@ impl GpuDecodeStore {
         Ok((hcs.soft_max_mb, loaded_soft_mb))
     }
 
-    /// Run a single GPU decode step (for testing). Fills d_hidden and h_logits.
-    fn py_gpu_decode_step(&mut self, token_id: usize, position: usize) -> PyResult<()> {
-        self.gpu_decode_step(token_id, position)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
-    }
-
     /// Batch GPU decode: generate tokens without streaming. Returns list of token IDs.
     /// Used by benchmark engine path and decode warmup.
     #[pyo3(signature = (first_token, start_position, max_tokens, temperature, top_k, top_p, stop_ids, presence_penalty=0.0))]
@@ -11105,7 +11099,7 @@ impl GpuDecodeStore {
                     }
                     let t_la_s5 = Instant::now();
 
-                    // ── LA Steps 5-8 FUSED: repeat-interleave + l2norm + delta_net + rmsnorm → BF16 ──
+                    // ── LA Steps 5-8: fused by default, optional unfused debug path ──
                     // Conv output in d_la_qkvz: [q(key_dim), k(key_dim), v(nv*dv)]
                     // Gate/beta in d_la_conv_out (from step 4)
                     // Z saved in d_la_gated_out (from step 2)
@@ -11114,27 +11108,137 @@ impl GpuDecodeStore {
                         let q_conv_ptr = *graph.d_la_qkvz.device_ptr();
                         let k_conv_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64 };
                         let v_conv_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(2 * key_dim) as u64 };
-                        let threads = 256u32;
-                        // Shared memory: dk*2 (Q+K) + dv + 32 (warp scratch) floats
-                        let smem = ((dk_ * 2 + dv_ + 32) as u32) * 4;
-                        unsafe {
-                            k.la_fused_post_proj.clone().launch(
-                                LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
-                                (
-                                    *recur_state_ptr,                   // state [nv, dk, dv]
-                                    q_conv_ptr,                         // q from conv output [nk*dk]
-                                    k_conv_ptr,                         // k from conv output [nk*dk]
-                                    v_conv_ptr,                         // v from conv output [nv*dv]
-                                    gate_ptr_local,                     // gate [nv]
-                                    beta_ptr_local,                     // beta [nv]
-                                    *graph.d_la_gated_out.device_ptr(), // z [nv*dv]
-                                    *norm_weight_ptr,                   // norm weight [dv]
-                                    *graph.d_scratch.device_ptr(),      // BF16 output
-                                    *scale,                             // q_scale
-                                    eps,
-                                    ((((nv_ << 16) | dk_) as i64) << 32) | (((dv_ << 16) | hr_) as i64 & 0xFFFFFFFF_i64),
-                                ),
-                            ).map_err(|e| format!("la_fused_post_proj[{}]: {:?}", layer_idx, e))?;
+                        let use_unfused_la = std::env::var("KRASIS_LA_DECODE_UNFUSED")
+                            .map(|v| v != "0")
+                            .unwrap_or(false);
+
+                        if use_unfused_la {
+                            trace_emit_mark(
+                                trace.as_ref(),
+                                decode_step_counter,
+                                position,
+                                token_id,
+                                Some(layer_idx),
+                                "la_path",
+                                "phase=post_proj mode=unfused",
+                            );
+
+                            let q_ptr_for_recur: u64;
+                            let k_ptr_for_recur: u64;
+                            if hr_ > 1 {
+                                let total_q = (nv_ * dk_) as u32;
+                                let threads = 256u32;
+                                let blocks = (total_q + threads - 1) / threads;
+                                unsafe {
+                                    k.repeat_interleave_heads.clone().launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (
+                                            *graph.d_la_recur_out.device_ptr(),
+                                            q_conv_ptr,
+                                            nk_ as i32,
+                                            dk_ as i32,
+                                            hr_ as i32,
+                                        ),
+                                    ).map_err(|e| format!("la_unfused_ri_q[{}]: {:?}", layer_idx, e))?;
+                                    let k_out = unsafe {
+                                        (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64
+                                    };
+                                    k.repeat_interleave_heads.clone().launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (
+                                            k_out,
+                                            k_conv_ptr,
+                                            nk_ as i32,
+                                            dk_ as i32,
+                                            hr_ as i32,
+                                        ),
+                                    ).map_err(|e| format!("la_unfused_ri_k[{}]: {:?}", layer_idx, e))?;
+                                }
+                                q_ptr_for_recur = *graph.d_la_recur_out.device_ptr();
+                                k_ptr_for_recur = unsafe {
+                                    (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64
+                                };
+                            } else {
+                                q_ptr_for_recur = q_conv_ptr;
+                                k_ptr_for_recur = k_conv_ptr;
+                            }
+
+                            {
+                                let threads = 256u32;
+                                unsafe {
+                                    k.l2norm_scale_per_head.clone().launch(
+                                        LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (q_ptr_for_recur, *scale, nv_ as i32, dk_ as i32),
+                                    ).map_err(|e| format!("la_unfused_l2_q[{}]: {:?}", layer_idx, e))?;
+                                    k.l2norm_scale_per_head.clone().launch(
+                                        LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (k_ptr_for_recur, 1.0f32, nv_ as i32, dk_ as i32),
+                                    ).map_err(|e| format!("la_unfused_l2_k[{}]: {:?}", layer_idx, e))?;
+                                }
+                            }
+
+                            {
+                                let threads = 256u32;
+                                unsafe {
+                                    k.gated_delta_net_step.clone().launch(
+                                        LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (
+                                            *recur_state_ptr,
+                                            q_ptr_for_recur,
+                                            k_ptr_for_recur,
+                                            v_conv_ptr,
+                                            gate_ptr_local,
+                                            beta_ptr_local,
+                                            *graph.d_la_ba.device_ptr(),
+                                            nv_ as i32,
+                                            dk_ as i32,
+                                            dv_ as i32,
+                                        ),
+                                    ).map_err(|e| format!("la_unfused_recur[{}]: {:?}", layer_idx, e))?;
+                                }
+                            }
+
+                            {
+                                let threads = 256u32;
+                                let smem = (dv_ as u32 + 32) * 4;
+                                unsafe {
+                                    k.gated_rmsnorm_silu_bf16.clone().launch(
+                                        LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
+                                        (
+                                            *graph.d_scratch.device_ptr(),
+                                            *graph.d_la_ba.device_ptr(),
+                                            *graph.d_la_gated_out.device_ptr(),
+                                            *norm_weight_ptr,
+                                            eps,
+                                            nv_ as i32,
+                                            dv_ as i32,
+                                        ),
+                                    ).map_err(|e| format!("la_unfused_norm[{}]: {:?}", layer_idx, e))?;
+                                }
+                            }
+                        } else {
+                            let threads = 256u32;
+                            // Shared memory: dk*2 (Q+K) + dv + 32 (warp scratch) floats
+                            let smem = ((dk_ * 2 + dv_ + 32) as u32) * 4;
+                            unsafe {
+                                k.la_fused_post_proj.clone().launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
+                                    (
+                                        *recur_state_ptr,                   // state [nv, dk, dv]
+                                        q_conv_ptr,                         // q from conv output [nk*dk]
+                                        k_conv_ptr,                         // k from conv output [nk*dk]
+                                        v_conv_ptr,                         // v from conv output [nv*dv]
+                                        gate_ptr_local,                     // gate [nv]
+                                        beta_ptr_local,                     // beta [nv]
+                                        *graph.d_la_gated_out.device_ptr(), // z [nv*dv]
+                                        *norm_weight_ptr,                   // norm weight [dv]
+                                        *graph.d_scratch.device_ptr(),      // BF16 output
+                                        *scale,                             // q_scale
+                                        eps,
+                                        ((((nv_ << 16) | dk_) as i64) << 32) | (((dv_ << 16) | hr_) as i64 & 0xFFFFFFFF_i64),
+                                    ),
+                                ).map_err(|e| format!("la_fused_post_proj[{}]: {:?}", layer_idx, e))?;
+                            }
                         }
                         trace_bf16("la_fused_post_proj", Some(layer_idx), "d_scratch", *graph.d_scratch.device_ptr(), dv_.min(128));
                         trace_f32("la_fused_post_proj_z", Some(layer_idx), "d_la_gated_out", *graph.d_la_gated_out.device_ptr(), dv_.min(64));
