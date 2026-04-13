@@ -81,7 +81,6 @@ class TransformerLayer:
         krasis_engine=None,
         gpu_prefill_manager=None,
         gpu_prefill_threshold: int = 300,
-        attention_backend: str = "rust",
     ):
         self.cfg = cfg
         self.layer_idx = layer_idx
@@ -115,11 +114,6 @@ class TransformerLayer:
             self.attention = None
             self.gqa_weights = weights.get("attention", {})
             self.mamba2_weights = None
-        elif attention_backend == "trtllm":
-            raise NotImplementedError(
-                "MLA attention (trtllm backend) is not currently supported. "
-                "DeepSeek models require native CUDA MLA kernels (not yet implemented)."
-            )
         else:
             # MLA attention — not currently supported
             raise NotImplementedError(

@@ -220,6 +220,12 @@ Each combination runs as an isolated subprocess. Per-combo logs are saved to `be
 
 For launcher flags, per-component quantization options, and direct server usage, see [ADVANCED.md](ADVANCED.md).
 
+Validation-only BF16 policy:
+
+- BF16-heavy configs are for correctness validation and debugging, not production use.
+- Production runs must use the normal Rust serving path and quantized configs.
+- In particular, `gpu_expert_bits = 16` is a validation mode for proving correctness, not a deployment target.
+
 ### Chat Client
 
 ```bash
@@ -247,4 +253,3 @@ SSPL-1.0
 Krasis is free to use, modify and distribute.  
 
 If you want to support the project or offer Krasis as part of a commercial product or a hosted/managed service, please [get in touch](https://forms.gle/ue4nvyvNNHtUZ7MQ7).
-

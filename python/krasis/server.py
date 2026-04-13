@@ -839,6 +839,29 @@ def main():
     _detail(f"Experts: GPU INT{args.gpu_expert_bits}  |  Attention: {args.attention_quant}  |  KV: {args.kv_dtype}")
     _detail(f"Layer groups: {args.layer_group_size}  |  KV cache: {args.kv_cache_mb} MB  |  Threads: {args.krasis_threads}")
     _dim("GPU-only mode: CPU expert weights and CPU decoder skipped")
+    validation_components = []
+    if args.gpu_expert_bits == 16:
+        validation_components.append("GPU experts=BF16")
+    if args.attention_quant == "bf16":
+        validation_components.append("attention=BF16")
+    if args.shared_expert_quant == "bf16":
+        validation_components.append("shared expert=BF16")
+    if args.dense_mlp_quant == "bf16":
+        validation_components.append("dense MLP=BF16")
+    if args.lm_head_quant == "bf16":
+        validation_components.append("lm head=BF16")
+    if validation_components:
+        joined = ", ".join(validation_components)
+        _warn(
+            "BF16 validation path enabled: "
+            f"{joined}. Use this only for correctness/debugging; production runs "
+            "must use the Rust serving path with quantized configs."
+        )
+        logger.warning(
+            "BF16 validation path enabled (%s); production runs must use the "
+            "Rust serving path with quantized configs.",
+            joined,
+        )
 
     # ── Force rebuild: delete existing expert caches before loading ──
     if getattr(args, 'force_rebuild_cache', False):

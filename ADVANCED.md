@@ -17,6 +17,12 @@ Krasis has two entry points:
 
 Never run Python scripts directly. Always use one of these commands.
 
+BF16 validation policy:
+
+- BF16-heavy configs are validation-only. Use them to prove correctness or isolate quantization from logic bugs.
+- Production runs must use the normal Rust serving path with quantized configs.
+- `gpu_expert_bits = 16` is not a production mode.
+
 ### Dev Commands
 
 | Command | Description |
@@ -73,6 +79,8 @@ Config files use `KEY=VALUE` format. CLI flags override config file values.
 | `--kv-dtype` | fp8_e4m3 | KV cache dtype: `fp8_e4m3` or `bf16` |
 
 Legacy `int4`/`int8` values for `--attention-quant` are auto-migrated to `awq`.
+
+When BF16 is selected for experts or major components, treat that run as validation-only rather than production.
 
 ### Memory & Caching
 

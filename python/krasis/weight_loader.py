@@ -194,6 +194,32 @@ class WeightLoader:
             w = w + 1.0  # Qwen3NextRMSNorm convention: (1 + weight) * x
         return w
 
+    def _maybe_apply_delta_rms_bias(self, weight: torch.Tensor, label: str) -> torch.Tensor:
+        """Apply +1 only when the stored tensor is actually in delta form.
+
+        Some families mix RMSNorm conventions: outer layer norms can use stored
+        deltas ((1 + w) * x) while inner LA norms are already absolute scales
+        (w * x). Infer the convention from the tensor values themselves instead
+        of assuming one rule for every RMSNorm in the model.
+        """
+        if not self.cfg.norm_bias_one:
+            return weight
+
+        mean_abs_to_zero = weight.float().abs().mean().item()
+        mean_abs_to_one = (weight.float() - 1.0).abs().mean().item()
+        if mean_abs_to_zero <= mean_abs_to_one:
+            logger.debug(
+                "Applying +1 RMSNorm bias for %s (delta-style tensor: mean|w|=%.4f mean|w-1|=%.4f)",
+                label, mean_abs_to_zero, mean_abs_to_one,
+            )
+            return weight + 1.0
+
+        logger.debug(
+            "Leaving RMSNorm weight unchanged for %s (absolute-style tensor: mean|w|=%.4f mean|w-1|=%.4f)",
+            label, mean_abs_to_zero, mean_abs_to_one,
+        )
+        return weight
+
     def load_lm_head(self, device: torch.device):
         """Load LM head weight.
 
@@ -471,7 +497,11 @@ class WeightLoader:
         weights["conv1d_weight"] = self._load_bf16(f"{prefix}.conv1d.weight", device)
         weights["A_log"] = self._load_bf16(f"{prefix}.A_log", device)
         weights["dt_bias"] = self._load_bf16(f"{prefix}.dt_bias", device)
-        weights["norm_weight"] = self._load_bf16(f"{prefix}.norm.weight", device)
+        norm_weight = self._load_bf16(f"{prefix}.norm.weight", device)
+        weights["norm_weight"] = self._maybe_apply_delta_rms_bias(
+            norm_weight,
+            f"{prefix}.norm.weight",
+        )
 
         return weights
 

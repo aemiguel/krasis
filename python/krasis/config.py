@@ -221,11 +221,11 @@ class QuantConfig:
     Components NOT configurable (always BF16): embedding, kv_b_proj/w_kc/w_vc,
     layernorms, gate weight. These are either too quality-critical or too small.
     """
-    lm_head: str = "int8"          # "bf16" or "int8"
-    attention: str = "bf16" # "bf16" or "awq" (calibrated per-tensor)
-    shared_expert: str = "int8"    # "bf16" or "int8"
-    dense_mlp: str = "int8"        # "bf16" or "int8"
-    gpu_expert_bits: int = 4       # 4, 8 (Marlin), or 16 (BF16 validation)
+    lm_head: str = "int8"          # "bf16" or "int8" ("bf16" is validation-only)
+    attention: str = "bf16" # "bf16" or "awq" (calibrated per-tensor; "bf16" is validation-oriented)
+    shared_expert: str = "int8"    # "bf16" or "int8" ("bf16" is validation-only)
+    dense_mlp: str = "int8"        # "bf16" or "int8" ("bf16" is validation-only)
+    gpu_expert_bits: int = 4       # 4, 8 (Marlin), or 16 (BF16 validation-only; not production)
     cpu_expert_bits: int = 4       # 4 or 8 for CPU expert quantization
     kv_cache_format: str = "fp8"   # "bf16", "fp8", or "polar4"
 

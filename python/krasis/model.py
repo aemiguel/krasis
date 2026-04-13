@@ -506,7 +506,6 @@ class KrasisModel:
         krasis_threads: int = 40,
         gpu_prefill: bool = False,  # Rust prefill replaces Python GpuPrefillManager
         gpu_prefill_threshold: int = 300,
-        attention_backend: str = "rust",  # "rust" (Rust prefill) or "trtllm" (unsupported)
         quant_cfg: QuantConfig = None,
         force_load: bool = False,
         layer_group_size: int = 1,
@@ -537,7 +536,6 @@ class KrasisModel:
         self.krasis_threads = krasis_threads
         self.gpu_prefill_enabled = gpu_prefill
         self.gpu_prefill_threshold = gpu_prefill_threshold
-        self.attention_backend = attention_backend
         self.force_load = force_load
         # When attention is quantized, it's permanently VRAM-resident (much smaller),
         # so streaming from CPU is unnecessary and would overwrite MarlinWeight attrs.
@@ -564,7 +562,7 @@ class KrasisModel:
         logger.info(
             "KrasisModel: %d layers, PP=%s, %d GPUs, attn=%s%s",
             self.cfg.num_hidden_layers, pp_partition, len(self.ranks),
-            attention_backend, hybrid_info,
+            "rust", hybrid_info,
         )
 
         # Will be populated by load()
@@ -721,8 +719,15 @@ class KrasisModel:
         cache_dir = cache_dir_for_model(self.cfg.model_path)
         has_gpu_cache = False
         if gpu_bits == 16:
-            print(f"\n\033[1m\033[36m▸ Loading BF16 expert weights from safetensors (validation mode)\033[0m", flush=True)
-            logger.info("Phase 2: Loading GPU expert weights (BF16 validation)...")
+            print(
+                f"\n\033[1m\033[36m▸ Loading BF16 expert weights from safetensors "
+                f"(validation-only, not production)\033[0m",
+                flush=True,
+            )
+            logger.warning(
+                "Phase 2: Loading GPU expert weights in BF16 validation-only mode; "
+                "production runs must use the Rust serving path with quantized configs."
+            )
         else:
             has_gpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_marlin_int{gpu_bits}_g128.bin"))
             if has_gpu_cache:
@@ -735,7 +740,11 @@ class KrasisModel:
         cpu_elapsed = time.perf_counter() - cpu_start
         logger.info("Expert weights loaded in %.1fs", cpu_elapsed)
         if gpu_bits == 16:
-            print(f"  \033[0;32mBF16 expert weights loaded in {cpu_elapsed:.0f}s.\033[0m", flush=True)
+            print(
+                f"  \033[0;32mBF16 validation weights loaded in {cpu_elapsed:.0f}s. "
+                f"Use quantized Rust production configs for real runs.\033[0m",
+                flush=True,
+            )
         elif has_gpu_cache:
             print(f"  \033[0;32mExpert weights loaded in {cpu_elapsed:.0f}s.\033[0m", flush=True)
         else:
@@ -1105,7 +1114,6 @@ class KrasisModel:
                     krasis_engine=None,
                     gpu_prefill_manager=None,
                     gpu_prefill_threshold=self.gpu_prefill_threshold,
-                    attention_backend=self.attention_backend,
                 )
                 # Extract attention weights to CPU, null GPU refs
                 w = self._extract_layer_weights(layer, layer.device)
@@ -1164,7 +1172,6 @@ class KrasisModel:
                     krasis_engine=None,
                     gpu_prefill_manager=None,
                     gpu_prefill_threshold=self.gpu_prefill_threshold,
-                    attention_backend=self.attention_backend,
                 )
                 self.layers.append(layer)
 
@@ -1327,7 +1334,6 @@ class KrasisModel:
                 krasis_engine=old_layer.krasis_engine,
                 gpu_prefill_manager=old_layer.gpu_prefill_manager,
                 gpu_prefill_threshold=self.gpu_prefill_threshold,
-                attention_backend=self.attention_backend,
             )
             # Preserve CPU decode buffers
             for buf_name in ('_cpu_act_buf', '_cpu_ids_buf', '_cpu_wts_buf',
@@ -1370,7 +1376,6 @@ class KrasisModel:
                 krasis_engine=old_layer.krasis_engine,
                 gpu_prefill_manager=old_layer.gpu_prefill_manager,
                 gpu_prefill_threshold=self.gpu_prefill_threshold,
-                attention_backend=self.attention_backend,
             )
             for buf_name in ('_cpu_act_buf', '_cpu_ids_buf', '_cpu_wts_buf',
                              '_cpu_out_buf', '_gpu_out_buf'):
@@ -2148,7 +2153,6 @@ class KrasisModel:
         """
         self.kv_caches = []
         self._kv_layer_offsets = {}
-        use_combined = (self.attention_backend == "trtllm")
         kv_mb = self.kv_cache_mb
 
         for gpu_idx, (start, end) in enumerate(self._layer_split):
@@ -2171,7 +2175,7 @@ class KrasisModel:
                     num_layers=num_kv_layers,
                     device=dev,
                     kv_dtype=self.kv_dtype,
-                    combined=use_combined,
+                    combined=False,
                     max_mb=kv_mb,
                     kv_format=self.quant_cfg.kv_cache_format,
                 )
