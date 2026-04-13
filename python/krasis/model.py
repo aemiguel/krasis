@@ -5784,4 +5784,19 @@ class KrasisModel:
                 if s is not None:
                     s.free()
             self._server_seq_states = None
+
+        # Request-scoped recurrent state must be reset alongside KV cleanup.
+        # Otherwise an internal test request can leak LA/Mamba decode state into
+        # the next chat request even though the KV pages were freed.
+        if self.cfg.is_hybrid:
+            for layer in self.layers:
+                if layer.layer_type == "linear_attention":
+                    layer.attention.reset_state()
+
+        decode_states = getattr(self, '_mamba2_decode_states', None)
+        if decode_states:
+            for buffers in decode_states.values():
+                buffers['conv_state'].zero_()
+                buffers['ssm_state'].zero_()
+
         self._rust_kv_refs = None
