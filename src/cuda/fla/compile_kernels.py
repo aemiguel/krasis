@@ -73,7 +73,7 @@ KERNEL_SPECS = [
         "symbol_base": "chunk_fwd_kernel_o",
         "signature": {
             "q": "*bf16", "k": "*bf16", "v": "*bf16", "h": "*bf16",
-            "g": "*bf16", "g_gamma": "*bf16", "o": "*bf16",
+            "g": "*fp32", "g_gamma": "*bf16", "o": "*bf16",
             "cu_seqlens": "*i32", "chunk_indices": "*i32",
             "scale": "fp32", "T": "i32",
         },
@@ -94,8 +94,8 @@ KERNEL_SPECS = [
         "symbol_base": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
         "signature": {
             "k": "*bf16", "v": "*bf16", "w": "*bf16", "v_new": "*bf16",
-            "g": "*bf16", "gk": "*bf16", "h": "*bf16", "h0": "*bf16",
-            "ht": "*bf16", "cu_seqlens": "*i32", "chunk_offsets": "*i32",
+            "g": "*fp32", "gk": "*bf16", "h": "*bf16", "h0": "*bf16",
+            "ht": "*fp32", "cu_seqlens": "*i32", "chunk_offsets": "*i32",
             "T": "i32",
         },
         "constexprs": {
@@ -118,7 +118,7 @@ KERNEL_SPECS = [
         "signature": {
             "k": "*bf16", "v": "*bf16", "beta": "*bf16",
             "w": "*bf16", "u": "*bf16", "A": "*bf16",
-            "g": "*bf16", "cu_seqlens": "*i32", "chunk_indices": "*i32",
+            "g": "*fp32", "cu_seqlens": "*i32", "chunk_indices": "*i32",
             "T": "i32",
         },
         "constexprs": {
@@ -134,7 +134,7 @@ KERNEL_SPECS = [
                     "chunk_scaled_dot_kkt_fwd_kernel"),
         "symbol_base": "chunk_scaled_dot_kkt_fwd_kernel",
         "signature": {
-            "k": "*bf16", "g": "*bf16", "beta": "*bf16", "A": "*bf16",
+            "k": "*bf16", "g": "*fp32", "beta": "*bf16", "A": "*fp32",
             "cu_seqlens": "*i32", "chunk_indices": "*i32", "T": "i32",
         },
         "constexprs": {
@@ -150,7 +150,7 @@ KERNEL_SPECS = [
                     "chunk_local_cumsum_scalar_kernel"),
         "symbol_base": "chunk_local_cumsum_scalar_kernel",
         "signature": {
-            "s": "*bf16", "o": "*bf16", "scale": "fp32",
+            "s": "*bf16", "o": "*fp32", "scale": "fp32",
             "cu_seqlens": "*i32", "chunk_indices": "*i32", "T": "i32",
         },
         "constexprs": {
@@ -166,7 +166,7 @@ KERNEL_SPECS = [
                     "merge_16x16_to_64x64_inverse_kernel"),
         "symbol_base": "merge_16x16_to_64x64_inverse_kernel",
         "signature": {
-            "A": "*bf16", "Ai": "*bf16",
+            "A": "*fp32", "Ai": "*bf16",
             "cu_seqlens": "*i32", "chunk_indices": "*i32", "T": "i32",
         },
         "constexprs": {

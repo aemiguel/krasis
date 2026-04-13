@@ -10990,10 +10990,8 @@ impl GpuDecodeStore {
                     self.gemv_bf16_to_f32(
                         ba_w, *graph.d_hidden.device_ptr(),
                         *graph.d_la_ba.device_ptr())?;
-                    if layer_idx < 2 {
-                        trace_f32("la_qkvz_proj", Some(layer_idx), "d_la_qkvz", *graph.d_la_qkvz.device_ptr(), 64);
-                        trace_f32("la_ba_proj", Some(layer_idx), "d_la_ba", *graph.d_la_ba.device_ptr(), 64);
-                    }
+                    trace_f32("la_qkvz_proj", Some(layer_idx), "d_la_qkvz", *graph.d_la_qkvz.device_ptr(), 64);
+                    trace_f32("la_ba_proj", Some(layer_idx), "d_la_ba", *graph.d_la_ba.device_ptr(), 64);
 
                     if timing {
                         self.device.synchronize().map_err(|e| format!("la proj sync: {:?}", e))?;
@@ -11057,10 +11055,25 @@ impl GpuDecodeStore {
                             ).map_err(|e| format!("la_conv1d[{}]: {:?}", layer_idx, e))?;
                         }
                     }
-                    // Now d_la_qkvz has conv output [q(key_dim), k(key_dim), v(nv*dv)] with SiLU
-                    if layer_idx < 2 {
-                        trace_f32("la_conv1d_out", Some(layer_idx), "d_la_qkvz", *graph.d_la_qkvz.device_ptr(), 64);
-                    }
+                    // Now d_la_qkvz has conv output [q(key_dim), k(key_dim), v(nv*dv)] with SiLU.
+                    // Trace the split views directly: a flat sample of d_la_qkvz only shows
+                    // the first few Q values and can completely hide K/V-specific corruption.
+                    trace_f32("la_conv1d_out", Some(layer_idx), "d_la_qkvz", *graph.d_la_qkvz.device_ptr(), 64);
+                    trace_f32("la_conv_q", Some(layer_idx), "d_la_qkvz_q", *graph.d_la_qkvz.device_ptr(), dk_.min(32));
+                    trace_f32(
+                        "la_conv_k",
+                        Some(layer_idx),
+                        "d_la_qkvz_k",
+                        unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64 },
+                        dk_.min(32),
+                    );
+                    trace_f32(
+                        "la_conv_v",
+                        Some(layer_idx),
+                        "d_la_qkvz_v",
+                        unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(2 * key_dim) as u64 },
+                        dv_.min(32),
+                    );
 
                     // ── LA Step 4: Compute gate and beta from BA ──
                     // BA is interleaved: [h0_b(ratio), h0_a(ratio), h1_b(ratio), h1_a(ratio), ...]
@@ -11089,9 +11102,9 @@ impl GpuDecodeStore {
                         }
                     }
 
-                    if layer_idx < 2 {
-                        trace_f32("la_gate_beta", Some(layer_idx), "gate_beta", gate_ptr_local, 32);
-                    }
+                    trace_f32("la_gate_beta", Some(layer_idx), "gate_beta", gate_ptr_local, 32);
+                    trace_f32("la_gate", Some(layer_idx), "gate", gate_ptr_local, nv_.min(32));
+                    trace_f32("la_beta", Some(layer_idx), "beta", beta_ptr_local, nv_.min(32));
 
                     if timing {
                         self.device.synchronize().map_err(|e| format!("la conv sync: {:?}", e))?;
@@ -11197,6 +11210,13 @@ impl GpuDecodeStore {
                                     ).map_err(|e| format!("la_unfused_recur[{}]: {:?}", layer_idx, e))?;
                                 }
                             }
+                            trace_f32(
+                                "la_recur_out",
+                                Some(layer_idx),
+                                "d_la_ba",
+                                *graph.d_la_ba.device_ptr(),
+                                dv_.min(64),
+                            );
 
                             {
                                 let threads = 256u32;
@@ -15893,7 +15913,6 @@ impl GpuDecodeStore {
         if let Some(trace) = trace_config.as_ref() {
             if let Some(ref graph) = self.graph {
                 for (li, layer) in graph.layers.iter().enumerate() {
-                    if li >= 3 { break; } // Only check first 3 layers
                     if let GpuAttnConfig::LinearAttention { recur_state_ptr, conv_state_ptr, nv, dk, dv, conv_dim, kernel_dim, .. } = &layer.attn {
                         // Download recur state and compute L2 norm of first head
                         let head_size = dk * dv; // 128*128=16384 for QCN

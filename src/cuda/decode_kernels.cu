@@ -1212,7 +1212,8 @@ extern "C" __global__ void compute_gate_beta(
         float a = ba[group * group_dim + ratio + pos];
         beta_out[i] = 1.0f / (1.0f + __expf(-b));  // sigmoid(b)
         float al = A_log[i];
-        float sp = logf(1.0f + __expf(a + dt_bias[i]));  // softplus(a + dt_bias)
+        float x_sp = a + dt_bias[i];
+        float sp = (x_sp > 20.0f) ? x_sp : logf(1.0f + __expf(x_sp));  // stable softplus(a + dt_bias)
         gate_out[i] = __expf(-__expf(al) * sp);  // exp(-exp(A_log) * softplus(a + dt_bias))
     }
 }

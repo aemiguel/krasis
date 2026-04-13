@@ -9598,6 +9598,7 @@ mod kernel_tests {
                 &[
                     "kv_cache_write_polar4",
                     "gqa_attention_polar4",
+                    "gated_delta_net_step",
                 ],
             ).expect("Failed to load decode kernels PTX");
             GpuTestCtx { dev }
@@ -11455,6 +11456,167 @@ mod kernel_tests {
         let actual_state = ctx.download_f32(&d_state);
         let expected_state = data.expected_bytes("state_out");
         assert_close_f32(&actual_state, &expected_state, data.meta.atol, data.meta.rtol, "la_state_update");
+    }
+
+    #[cfg(has_decode_kernels)]
+    #[test]
+    fn test_la_decode_step_matches_prefill_single_token() {
+        let ctx = GpuTestCtx::new();
+        let k_out = ctx.get_kernel("la_chunk_output_kernel");
+        let k_su = ctx.get_kernel("la_state_update_kernel");
+        let k_decode = ctx.get_decode_kernel("gated_delta_net_step");
+
+        let nv = 4usize;
+        let cs = 1usize;
+        let dk = 8usize;
+        let dv = 8usize;
+
+        let mut q = Vec::with_capacity(nv * cs * dk);
+        let mut k = Vec::with_capacity(nv * cs * dk);
+        let mut v = Vec::with_capacity(nv * dv);
+        let mut state = Vec::with_capacity(nv * dk * dv);
+        let mut gate = Vec::with_capacity(nv);
+        let mut beta = Vec::with_capacity(nv);
+
+        for h in 0..nv {
+            gate.push(0.55 + 0.08 * (h as f32));
+            beta.push(0.20 + 0.07 * (h as f32));
+            for i in 0..dk {
+                let x = (h * dk + i) as f32;
+                q.push((x * 0.17 + 0.3).sin() * 0.6);
+                k.push((x * 0.11 + 0.9).cos() * 0.5);
+            }
+            for j in 0..dv {
+                let x = (h * dv + j) as f32;
+                v.push((x * 0.13 + 0.4).sin() * 0.7);
+            }
+            for i in 0..dk {
+                for j in 0..dv {
+                    let x = (h * dk * dv + i * dv + j) as f32;
+                    state.push((x * 0.07 + 0.2).sin() * 0.25);
+                }
+            }
+        }
+
+        let mut v_new = vec![0.0f32; nv * cs * dv];
+        let mut g_cum = vec![0.0f32; nv * cs];
+        for h in 0..nv {
+            let g = gate[h];
+            g_cum[h] = g.ln();
+            for j in 0..dv {
+                let mut mem = 0.0f32;
+                for i in 0..dk {
+                    let state_idx = h * dk * dv + i * dv + j;
+                    let k_idx = h * dk + i;
+                    mem += state[state_idx] * k[k_idx];
+                }
+                let v_idx = h * dv + j;
+                v_new[h * dv + j] = beta[h] * v[v_idx] - g * mem;
+            }
+        }
+
+        let to_bytes = |vals: &[f32]| -> Vec<u8> {
+            vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+        };
+
+        let d_q = ctx.upload_f32(&to_bytes(&q));
+        let d_k = ctx.upload_f32(&to_bytes(&k));
+        let d_v = ctx.upload_f32(&to_bytes(&v));
+        let d_v_new = ctx.upload_f32(&to_bytes(&v_new));
+        let d_g_cum = ctx.upload_f32(&to_bytes(&g_cum));
+        let d_gate = ctx.upload_f32(&to_bytes(&gate));
+        let d_beta = ctx.upload_f32(&to_bytes(&beta));
+        let d_state_prefill = ctx.upload_f32(&to_bytes(&state));
+        let d_state_decode = ctx.upload_f32(&to_bytes(&state));
+        let d_output_prefill = ctx.alloc_f32(nv * cs * dv);
+        let d_output_decode = ctx.alloc_f32(nv * dv);
+
+        let mut nv_i32 = nv as i32;
+        let mut cs_i32 = cs as i32;
+        let mut dk_i32 = dk as i32;
+        let mut dv_i32 = dv as i32;
+
+        unsafe {
+            let threads = std::cmp::min(256, dv) as u32;
+            let mut out_ptr = *d_output_prefill.device_ptr() as u64;
+            let mut q_ptr = *d_q.device_ptr() as u64;
+            let mut k_ptr = *d_k.device_ptr() as u64;
+            let mut vn_ptr = *d_v_new.device_ptr() as u64;
+            let mut gc_ptr = *d_g_cum.device_ptr() as u64;
+            let mut st_ptr = *d_state_prefill.device_ptr() as u64;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut out_ptr as *mut _ as *mut _,
+                &mut q_ptr as *mut _ as *mut _,
+                &mut k_ptr as *mut _ as *mut _,
+                &mut vn_ptr as *mut _ as *mut _,
+                &mut gc_ptr as *mut _ as *mut _,
+                &mut st_ptr as *mut _ as *mut _,
+                &mut nv_i32 as *mut _ as *mut _,
+                &mut cs_i32 as *mut _ as *mut _,
+                &mut dk_i32 as *mut _ as *mut _,
+                &mut dv_i32 as *mut _ as *mut _,
+            ];
+            launch(k_out, (nv as u32, 1, 1), (threads, 1, 1), 0, ctx.stream(), &mut params).unwrap();
+
+            let mut st_ptr = *d_state_prefill.device_ptr() as u64;
+            let mut k_ptr = *d_k.device_ptr() as u64;
+            let mut vn_ptr = *d_v_new.device_ptr() as u64;
+            let mut gc_ptr = *d_g_cum.device_ptr() as u64;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut st_ptr as *mut _ as *mut _,
+                &mut k_ptr as *mut _ as *mut _,
+                &mut vn_ptr as *mut _ as *mut _,
+                &mut gc_ptr as *mut _ as *mut _,
+                &mut nv_i32 as *mut _ as *mut _,
+                &mut cs_i32 as *mut _ as *mut _,
+                &mut dk_i32 as *mut _ as *mut _,
+                &mut dv_i32 as *mut _ as *mut _,
+            ];
+            launch(k_su, (nv as u32, 1, 1), (threads, 1, 1), 0, ctx.stream(), &mut params).unwrap();
+
+            let mut st_ptr = *d_state_decode.device_ptr() as u64;
+            let mut q_ptr = *d_q.device_ptr() as u64;
+            let mut k_ptr = *d_k.device_ptr() as u64;
+            let mut v_ptr = *d_v.device_ptr() as u64;
+            let mut gate_ptr = *d_gate.device_ptr() as u64;
+            let mut beta_ptr = *d_beta.device_ptr() as u64;
+            let mut out_ptr = *d_output_decode.device_ptr() as u64;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut st_ptr as *mut _ as *mut _,
+                &mut q_ptr as *mut _ as *mut _,
+                &mut k_ptr as *mut _ as *mut _,
+                &mut v_ptr as *mut _ as *mut _,
+                &mut gate_ptr as *mut _ as *mut _,
+                &mut beta_ptr as *mut _ as *mut _,
+                &mut out_ptr as *mut _ as *mut _,
+                &mut nv_i32 as *mut _ as *mut _,
+                &mut dk_i32 as *mut _ as *mut _,
+                &mut dv_i32 as *mut _ as *mut _,
+            ];
+            launch(k_decode, (nv as u32, 1, 1), (threads, 1, 1), 0, ctx.stream(), &mut params).unwrap();
+        }
+        self::cuda_sync();
+
+        let out_prefill = ctx.dev.dtoh_sync_copy(&d_output_prefill).unwrap();
+        let out_decode = ctx.dev.dtoh_sync_copy(&d_output_decode).unwrap();
+        let state_prefill = ctx.dev.dtoh_sync_copy(&d_state_prefill).unwrap();
+        let state_decode = ctx.dev.dtoh_sync_copy(&d_state_decode).unwrap();
+
+        let compare = |label: &str, a: &[f32], b: &[f32]| {
+            let mut max_abs = 0.0f32;
+            let mut avg_abs = 0.0f32;
+            for (av, bv) in a.iter().zip(b.iter()) {
+                let diff = (av - bv).abs();
+                max_abs = max_abs.max(diff);
+                avg_abs += diff;
+            }
+            avg_abs /= a.len() as f32;
+            assert!(max_abs < 1e-4, "{label}: max_abs too high: {max_abs:.6}");
+            assert!(avg_abs < 1e-5, "{label}: avg_abs too high: {avg_abs:.6}");
+        };
+
+        compare("la_single_token_output", &out_prefill, &out_decode);
+        compare("la_single_token_state", &state_prefill, &state_decode);
     }
 
     #[test]
