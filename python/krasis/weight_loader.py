@@ -190,33 +190,49 @@ class WeightLoader:
             name = f"{self.cfg.layers_prefix}.norm_f.weight"
         logger.info("Loading final norm: %s", name)
         w = self._load_bf16(name, device)
-        if self.cfg.norm_bias_one:
-            w = w + 1.0  # Qwen3NextRMSNorm convention: (1 + weight) * x
-        return w
+        return self._maybe_apply_delta_rms_bias(w, name)
+
+    def _norm_uses_delta_rms_bias(self, label: str) -> bool:
+        """Return whether a norm tensor uses the Qwen delta-RMS convention.
+
+        Qwen3-Next and Qwen3.5 mix two norm contracts:
+        - outer RMS norms store deltas and apply (1 + w) * x
+        - linear-attention inner norm stores direct scales and applies w * x
+
+        Use the tensor role rather than value heuristics so the rule stays
+        stable across models within the family.
+        """
+        delta_suffixes = (
+            ".input_layernorm.weight",
+            ".post_attention_layernorm.weight",
+            ".q_norm.weight",
+            ".k_norm.weight",
+        )
+        if label.endswith(delta_suffixes):
+            return True
+        final_norm_suffixes = (
+            ".norm.weight",
+            ".norm_f.weight",
+        )
+        if label.endswith(final_norm_suffixes) and ".layers." not in label:
+            return True
+        return False
 
     def _maybe_apply_delta_rms_bias(self, weight: torch.Tensor, label: str) -> torch.Tensor:
-        """Apply +1 only when the stored tensor is actually in delta form.
-
-        Some families mix RMSNorm conventions: outer layer norms can use stored
-        deltas ((1 + w) * x) while inner LA norms are already absolute scales
-        (w * x). Infer the convention from the tensor values themselves instead
-        of assuming one rule for every RMSNorm in the model.
-        """
+        """Apply +1 only to norm roles that use the delta-RMS contract."""
         if not self.cfg.norm_bias_one:
             return weight
 
-        mean_abs_to_zero = weight.float().abs().mean().item()
-        mean_abs_to_one = (weight.float() - 1.0).abs().mean().item()
-        if mean_abs_to_zero <= mean_abs_to_one:
+        if self._norm_uses_delta_rms_bias(label):
             logger.debug(
-                "Applying +1 RMSNorm bias for %s (delta-style tensor: mean|w|=%.4f mean|w-1|=%.4f)",
-                label, mean_abs_to_zero, mean_abs_to_one,
+                "Applying +1 RMSNorm bias for %s (delta-RMS role)",
+                label,
             )
             return weight + 1.0
 
         logger.debug(
-            "Leaving RMSNorm weight unchanged for %s (absolute-style tensor: mean|w|=%.4f mean|w-1|=%.4f)",
-            label, mean_abs_to_zero, mean_abs_to_one,
+            "Leaving RMSNorm weight unchanged for %s (direct-scale role)",
+            label,
         )
         return weight
 
@@ -330,13 +346,11 @@ class WeightLoader:
         k_norm_name = f"{prefix}.k_norm.weight"
         if q_norm_name in self._weight_map:
             w = self._load_bf16(q_norm_name, device)
-            if self.cfg.norm_bias_one:
-                w = w + 1.0  # Qwen3NextRMSNorm convention
+            w = self._maybe_apply_delta_rms_bias(w, q_norm_name)
             weights["q_norm"] = w
         if k_norm_name in self._weight_map:
             w = self._load_bf16(k_norm_name, device)
-            if self.cfg.norm_bias_one:
-                w = w + 1.0  # Qwen3NextRMSNorm convention
+            w = self._maybe_apply_delta_rms_bias(w, k_norm_name)
             weights["k_norm"] = w
 
         # Attention sinks (GPT OSS: learnable logits for attention normalization)
@@ -357,10 +371,11 @@ class WeightLoader:
             "post_attention_layernorm": self._load_bf16(
                 f"{prefix}.post_attention_layernorm.weight", device),
         }
-        if self.cfg.norm_bias_one:
-            # Qwen3NextRMSNorm convention: (1 + weight) * x
-            for k in norms:
-                norms[k] = norms[k] + 1.0
+        for key in norms:
+            norms[key] = self._maybe_apply_delta_rms_bias(
+                norms[key],
+                f"{prefix}.{key}.weight",
+            )
         return norms
 
     def load_dense_mlp(
