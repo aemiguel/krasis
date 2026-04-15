@@ -7409,34 +7409,12 @@ impl GpuDecodeStore {
             layer_weights.push(lw);
         }
 
-        // Convert QK norm weights from FP32 (decode format) to BF16 (prefill kernel format).
-        // The decode path stores these as FP32 on GPU, but the prefill rmsnorm kernel expects BF16.
-        let mut qk_norm_bf16_bufs: Vec<CudaSlice<u16>> = Vec::new();
-        for lw in layer_weights.iter_mut() {
-            for norm_ptr in [&mut lw.q_norm_ptr, &mut lw.k_norm_ptr] {
-                if *norm_ptr != 0 {
-                    let d = head_dim;
-                    // Download FP32 from GPU
-                    let mut h_fp32 = vec![0.0f32; d];
-                    unsafe {
-                        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
-                            h_fp32.as_mut_ptr() as *mut std::ffi::c_void,
-                            *norm_ptr, (d * 4) as usize,
-                        );
-                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                            return Err(format!("QK norm FP32 download: {:?}", err));
-                        }
-                    }
-                    // Convert FP32 -> BF16 on CPU
-                    let h_bf16: Vec<u16> = h_fp32.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect();
-                    // Upload BF16 to GPU
-                    let d_bf16 = self.device.htod_copy(h_bf16)
-                        .map_err(|e| format!("QK norm BF16 upload: {e}"))?;
-                    *norm_ptr = *d_bf16.device_ptr();
-                    qk_norm_bf16_bufs.push(d_bf16);
-                }
-            }
-        }
+        // Prefill and decode both consume QK norm weights as FP32.
+        // Keep the original Python-registered FP32 buffers intact here.
+        // Outer RMSNorm weights are already bias-adjusted on the Python load path for
+        // Qwen3-Next, so prefill must reuse them as-is rather than adding +1 again.
+        let qk_norm_bf16_bufs: Vec<CudaSlice<u16>> = Vec::new();
+        let prefill_final_norm_ptr = graph.final_norm_ptr;
 
         // Build MoE expert data
         let mut moe_layers: Vec<Option<PrefillMoeLayerData>> = Vec::new();
@@ -7642,7 +7620,7 @@ impl GpuDecodeStore {
             layer_weights,
             moe_layers,
             embedding_ptr: graph.embedding_ptr,
-            final_norm_ptr: graph.final_norm_ptr,
+            final_norm_ptr: prefill_final_norm_ptr,
             lm_head: extract_marlin(graph.lm_head_wid),
             lm_head_bf16_ptr: {
                 let w = &graph.weights[graph.lm_head_wid];
