@@ -725,12 +725,14 @@ class KrasisModel:
         if gpu_bits == 16:
             print(
                 f"\n\033[1m\033[36m▸ Loading BF16 expert weights from safetensors "
-                f"(validation-only, not production)\033[0m",
+                f"(UNVALIDATED debug path only; not for validation or production)\033[0m",
                 flush=True,
             )
             logger.warning(
-                "Phase 2: Loading GPU expert weights in BF16 validation-only mode; "
-                "production runs must use the Rust serving path with quantized configs."
+                "Phase 2: Loading GPU expert weights in UNVALIDATED BF16 debug mode; "
+                "this path likely contains unknown bugs and must not be used for "
+                "validation. Production and correctness work must use external HF "
+                "BF16 reference data plus quantized Krasis runs."
             )
         else:
             has_gpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_marlin_int{gpu_bits}_g128.bin"))
@@ -745,8 +747,8 @@ class KrasisModel:
         logger.info("Expert weights loaded in %.1fs", cpu_elapsed)
         if gpu_bits == 16:
             print(
-                f"  \033[0;32mBF16 validation weights loaded in {cpu_elapsed:.0f}s. "
-                f"Use quantized Rust production configs for real runs.\033[0m",
+                f"  \033[0;32mUNVALIDATED BF16 debug weights loaded in {cpu_elapsed:.0f}s. "
+                f"Do not use this path for validation; use HF BF16 as the oracle.\033[0m",
                 flush=True,
             )
         elif has_gpu_cache:
