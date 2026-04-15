@@ -72,6 +72,40 @@ extern "C" __global__ void rmsnorm_batched_kernel(
     }
 }
 
+extern "C" __global__ void rmsnorm_batched_fp32w_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ weight,
+    int D,
+    float eps)
+{
+    int token = blockIdx.x;
+    const __nv_bfloat16* x_row = x + (int64_t)token * D;
+    __nv_bfloat16* o_row = out + (int64_t)token * D;
+
+    extern __shared__ float smem[];
+
+    float local_ss = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float v = bf16_to_float(x_row[i]);
+        local_ss += v * v;
+    }
+    smem[threadIdx.x] = local_ss;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    float rms_inv = rsqrtf(smem[0] / (float)D + eps);
+
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float v = bf16_to_float(x_row[i]) * rms_inv;
+        o_row[i] = float_to_bf16(v * weight[i]);
+    }
+}
+
 extern "C" void krasis_rmsnorm_batched(
     void* out, const void* x, const void* weight,
     int M, int D, float eps, void* stream)
@@ -1867,8 +1901,11 @@ extern "C" __global__ void la_compute_gate_beta_bf16_kernel(
         float a = bf16_to_float(a_row[i]);
         /* beta = sigmoid(b) */
         beta_row[i] = float_to_bf16(1.0f / (1.0f + __expf(-b)));
-        /* gate = -exp(A_log) * softplus(a + dt_bias) */
-        float sp = logf(1.0f + __expf(a + dt_bias[i]));
+        /* gate = -exp(A_log) * softplus(a + dt_bias)
+         * Match the FP32 path's stable softplus to avoid BF16 fast-path overflow.
+         */
+        float x_sp = a + dt_bias[i];
+        float sp = (x_sp > 20.0f) ? x_sp : logf(1.0f + __expf(x_sp));
         gate_row[i] = float_to_bf16(-__expf(A_log[i]) * sp);
     }
 }
@@ -3286,19 +3323,24 @@ extern "C" __global__ void moe_scatter_fused_kernel(
 
 
 /* Scatter fused MoE w2 output back to per-token FP32 accumulator with topk weights.
- * After the fused Marlin w2 kernel, output is at C[sorted_id] where sorted_id = token*topk+slot.
- * This kernel iterates over m*topk entries, applies topk_weight * scale_factor, and scatter-adds
- * to the per-token accumulator.
+ * The fused Marlin w2 kernel writes each valid routed row to its compact sorted_id slot
+ * (token*topk+slot), while sorted_ids itself lives in a padded expert-block layout.
+ * Iterate the full padded metadata stream so scattered valid entries are visited, but read
+ * source rows from the compact sorted_id slot written by the fused GEMM.
  *
- * Grid: (M * topk, 1, 1), Block: (threads, 1, 1)
+ * Grid: (total_sorted, 1, 1), Block: (threads, 1, 1)
  */
 extern "C" __global__ void moe_scatter_weighted_kernel(
     float* __restrict__ accum,              // [M, hidden] FP32 accumulator (pre-zeroed)
     const __nv_bfloat16* __restrict__ src,  // [M*topk, hidden] fused w2 output (indexed by sorted_id)
+    const int* __restrict__ sorted_ids,     // [total_sorted] maps sorted position -> token*topk+slot
     const float* __restrict__ topk_weights, // [M * topk] routing weights
-    int hidden, int M, int topk, float scale_factor
+    int hidden, int M, int topk, int total_sorted, float scale_factor
 ) {
-    int sorted_id = blockIdx.x;  // 0 to M*topk-1
+    int row = blockIdx.x;  // padded sorted metadata row
+    if (row >= total_sorted) return;
+    int sorted_id = sorted_ids[row];
+    if (sorted_id < 0) return;
     int token = sorted_id / topk;
     if (token >= M) return;
     float w = topk_weights[sorted_id] * scale_factor;

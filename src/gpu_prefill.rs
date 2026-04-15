@@ -21,6 +21,13 @@ use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr};
 use cudarc::driver::sys as cuda_sys;
 use pyo3::prelude::*;
 
+use crate::weights::marlin::{
+    MarlinRepacked,
+    bf16_to_f32,
+    dequantize_marlin,
+    dequantize_marlin_int8,
+};
+
 fn stderr_debug_enabled() -> bool {
     std::env::var("KRASIS_DEBUG_STDERR")
         .map(|v| v == "1")
@@ -133,6 +140,547 @@ fn trace_format_sample(values: &[f32]) -> String {
         .map(|v| format!("{:.6}", v))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn round_f32_slice_to_bf16(values: &[f32]) -> Vec<f32> {
+    values
+        .iter()
+        .map(|&v| half::bf16::from_f32(v).to_f32())
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct TraceDiffSummary {
+    max_abs: f32,
+    max_abs_idx: usize,
+    actual_at_max: f32,
+    expected_at_max: f32,
+    l2: f32,
+    mean_abs: f32,
+}
+
+fn summarize_trace_diff(actual: &[f32], expected: &[f32]) -> TraceDiffSummary {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "trace diff compare length mismatch: actual={} expected={}",
+        actual.len(),
+        expected.len(),
+    );
+    if actual.is_empty() {
+        return TraceDiffSummary {
+            max_abs: 0.0,
+            max_abs_idx: 0,
+            actual_at_max: 0.0,
+            expected_at_max: 0.0,
+            l2: 0.0,
+            mean_abs: 0.0,
+        };
+    }
+
+    let mut max_abs = 0.0f32;
+    let mut max_abs_idx = 0usize;
+    let mut actual_at_max = actual[0];
+    let mut expected_at_max = expected[0];
+    let mut sum_sq = 0.0f64;
+    let mut sum_abs = 0.0f64;
+
+    for (idx, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+        let diff = a - e;
+        let abs = diff.abs();
+        if abs > max_abs {
+            max_abs = abs;
+            max_abs_idx = idx;
+            actual_at_max = a;
+            expected_at_max = e;
+        }
+        let diff64 = diff as f64;
+        sum_sq += diff64 * diff64;
+        sum_abs += abs as f64;
+    }
+
+    TraceDiffSummary {
+        max_abs,
+        max_abs_idx,
+        actual_at_max,
+        expected_at_max,
+        l2: sum_sq.sqrt() as f32,
+        mean_abs: (sum_abs / actual.len() as f64) as f32,
+    }
+}
+
+fn download_device_u16(ptr: u64, len: usize) -> Result<Vec<u16>, String> {
+    let mut out = vec![0u16; len];
+    unsafe {
+        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+            out.as_mut_ptr() as *mut std::ffi::c_void,
+            ptr,
+            len * std::mem::size_of::<u16>(),
+        );
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!("cuMemcpyDtoH u16 failed: {:?}", err));
+        }
+    }
+    Ok(out)
+}
+
+fn download_device_u32(ptr: u64, len: usize) -> Result<Vec<u32>, String> {
+    let mut out = vec![0u32; len];
+    unsafe {
+        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+            out.as_mut_ptr() as *mut std::ffi::c_void,
+            ptr,
+            len * std::mem::size_of::<u32>(),
+        );
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!("cuMemcpyDtoH u32 failed: {:?}", err));
+        }
+    }
+    Ok(out)
+}
+
+fn download_device_i32(ptr: u64, len: usize) -> Result<Vec<i32>, String> {
+    let mut out = vec![0i32; len];
+    unsafe {
+        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+            out.as_mut_ptr() as *mut std::ffi::c_void,
+            ptr,
+            len * std::mem::size_of::<i32>(),
+        );
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!("cuMemcpyDtoH i32 failed: {:?}", err));
+        }
+    }
+    Ok(out)
+}
+
+fn download_device_f32(ptr: u64, len: usize) -> Result<Vec<f32>, String> {
+    let mut out = vec![0.0f32; len];
+    unsafe {
+        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+            out.as_mut_ptr() as *mut std::ffi::c_void,
+            ptr,
+            len * std::mem::size_of::<f32>(),
+        );
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!("cuMemcpyDtoH f32 failed: {:?}", err));
+        }
+    }
+    Ok(out)
+}
+
+fn compute_bf16_gemm_row_cpu_reference(
+    input_row_bf16: &[u16],
+    weight_ptr: u64,
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>, String> {
+    if input_row_bf16.len() != cols {
+        return Err(format!(
+            "bf16 cpu ref input length mismatch: got {} expected {}",
+            input_row_bf16.len(),
+            cols,
+        ));
+    }
+    let weight = download_device_u16(weight_ptr, rows * cols)?;
+    let input_f32: Vec<f32> = input_row_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+    let mut out = vec![0.0f32; rows];
+    for row in 0..rows {
+        let row_slice = &weight[row * cols..(row + 1) * cols];
+        let mut acc = 0.0f32;
+        for i in 0..cols {
+            acc += bf16_to_f32(row_slice[i]) * input_f32[i];
+        }
+        out[row] = acc;
+    }
+    Ok(out)
+}
+
+fn format_i32_sample(values: &[i32]) -> String {
+    values
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn compute_router_topk_cpu_reference(
+    logits: &[f32],
+    topk: usize,
+    scoring_func: u8,
+    gate_bias: Option<&[f32]>,
+    e_score_corr: Option<&[f32]>,
+) -> Result<(Vec<f32>, Vec<i32>), String> {
+    if topk == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut scores = logits.to_vec();
+    if let Some(bias) = gate_bias {
+        if bias.len() != scores.len() {
+            return Err(format!(
+                "router gate bias length mismatch: got {} expected {}",
+                bias.len(),
+                scores.len(),
+            ));
+        }
+        for (score, &b) in scores.iter_mut().zip(bias.iter()) {
+            *score += b;
+        }
+    }
+    if let Some(corr) = e_score_corr {
+        if corr.len() != scores.len() {
+            return Err(format!(
+                "router e_score correction length mismatch: got {} expected {}",
+                corr.len(),
+                scores.len(),
+            ));
+        }
+        for (score, &c) in scores.iter_mut().zip(corr.iter()) {
+            *score += c;
+        }
+    }
+
+    match scoring_func {
+        0 => {
+            let max_val = scores
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut exp_scores = scores
+                .iter()
+                .map(|&v| (v - max_val).exp())
+                .collect::<Vec<_>>();
+            let sum = exp_scores.iter().copied().sum::<f32>();
+            let inv_sum = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            for v in &mut exp_scores {
+                *v *= inv_sum;
+            }
+            let mut ranked = exp_scores
+                .iter()
+                .copied()
+                .enumerate()
+                .collect::<Vec<_>>();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let take = topk.min(ranked.len());
+            let mut out_w = Vec::with_capacity(take);
+            let mut out_i = Vec::with_capacity(take);
+            let wsum = ranked.iter().take(take).map(|(_, v)| *v).sum::<f32>();
+            let inv_wsum = if wsum > 0.0 { 1.0 / wsum } else { 0.0 };
+            for (idx, value) in ranked.into_iter().take(take) {
+                out_w.push(value * inv_wsum);
+                out_i.push(idx as i32);
+            }
+            Ok((out_w, out_i))
+        }
+        1 => {
+            let mut ranked = scores
+                .iter()
+                .copied()
+                .map(|v| 1.0 / (1.0 + (-v).exp()))
+                .enumerate()
+                .collect::<Vec<_>>();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let take = topk.min(ranked.len());
+            let mut out_w = Vec::with_capacity(take);
+            let mut out_i = Vec::with_capacity(take);
+            for (idx, value) in ranked.into_iter().take(take) {
+                out_w.push(value);
+                out_i.push(idx as i32);
+            }
+            Ok((out_w, out_i))
+        }
+        other => Err(format!("unsupported router scoring_func {}", other)),
+    }
+}
+
+fn compute_topk_ids_from_logits_cpu(logits: &[f32], topk: usize) -> Vec<i32> {
+    if topk == 0 || logits.is_empty() {
+        return Vec::new();
+    }
+    let mut ranked = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+        .into_iter()
+        .take(topk.min(logits.len()))
+        .map(|(idx, _)| idx as i32)
+        .collect()
+}
+
+fn compute_marlin_gemm_row_cpu_reference(
+    input_row_bf16: &[u16],
+    weight: &MarlinWeight,
+) -> Result<Vec<f32>, String> {
+    if input_row_bf16.len() != weight.k {
+        return Err(format!(
+            "marlin cpu ref input length mismatch: got {} expected {}",
+            input_row_bf16.len(),
+            weight.k,
+        ));
+    }
+    let packed_len = match weight.num_bits {
+        4 => (weight.k / 16) * (weight.n * 2),
+        8 => (weight.k / 16) * (weight.n * 4),
+        other => return Err(format!("unsupported Marlin bit width: {}", other)),
+    };
+    let scales_len = (weight.k / weight.group_size) * weight.n;
+    let packed = download_device_u32(weight.packed, packed_len)?;
+    let scales = download_device_u16(weight.scales, scales_len)?;
+    let repacked = MarlinRepacked {
+        packed,
+        scales,
+        k: weight.k,
+        n: weight.n,
+        group_size: weight.group_size,
+    };
+    let dequant = match weight.num_bits {
+        4 => dequantize_marlin(&repacked),
+        8 => dequantize_marlin_int8(&repacked),
+        _ => unreachable!(),
+    };
+    let input_f32: Vec<f32> = input_row_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+    let mut out = vec![0.0f32; weight.n];
+    for out_idx in 0..weight.n {
+        let row = &dequant[out_idx * weight.k..(out_idx + 1) * weight.k];
+        let mut acc = 0.0f32;
+        for i in 0..weight.k {
+            acc += row[i] * input_f32[i];
+        }
+        out[out_idx] = acc;
+    }
+    Ok(out)
+}
+
+fn compute_marlin_gemm_row_cpu_reference_alt_layout(
+    input_row_bf16: &[u16],
+    weight: &MarlinWeight,
+) -> Result<Vec<f32>, String> {
+    if input_row_bf16.len() != weight.k {
+        return Err(format!(
+            "marlin alt cpu ref input length mismatch: got {} expected {}",
+            input_row_bf16.len(),
+            weight.k,
+        ));
+    }
+    let packed_len = match weight.num_bits {
+        4 => (weight.k / 16) * (weight.n * 2),
+        8 => (weight.k / 16) * (weight.n * 4),
+        other => return Err(format!("unsupported Marlin bit width: {}", other)),
+    };
+    let scales_len = (weight.k / weight.group_size) * weight.n;
+    let packed = download_device_u32(weight.packed, packed_len)?;
+    let scales = download_device_u16(weight.scales, scales_len)?;
+    let repacked = MarlinRepacked {
+        packed,
+        scales,
+        k: weight.k,
+        n: weight.n,
+        group_size: weight.group_size,
+    };
+    let dequant = match weight.num_bits {
+        4 => dequantize_marlin(&repacked),
+        8 => dequantize_marlin_int8(&repacked),
+        _ => unreachable!(),
+    };
+    let input_f32: Vec<f32> = input_row_bf16.iter().map(|&v| bf16_to_f32(v)).collect();
+    let mut out = vec![0.0f32; weight.n];
+    for out_idx in 0..weight.n {
+        let mut acc = 0.0f32;
+        for i in 0..weight.k {
+            acc += dequant[i * weight.n + out_idx] * input_f32[i];
+        }
+        out[out_idx] = acc;
+    }
+    Ok(out)
+}
+
+fn diag_compute_moe_accum_last_cpu_from_rows(
+    expert_out_rows_bf16: &[f32],
+    gather_src: &[i32],
+    gather_weights: &[f32],
+    last_pos: usize,
+    h: usize,
+) -> Result<Vec<f32>, String> {
+    if gather_src.len() != gather_weights.len() {
+        return Err(format!(
+            "moe accum cpu ref gather length mismatch: src={} weights={}",
+            gather_src.len(),
+            gather_weights.len(),
+        ));
+    }
+    if expert_out_rows_bf16.len() != gather_src.len() * h {
+        return Err(format!(
+            "moe accum cpu ref expert_out length mismatch: got {} expected {}",
+            expert_out_rows_bf16.len(),
+            gather_src.len() * h,
+        ));
+    }
+    let mut out = vec![0.0f32; h];
+    for row in 0..gather_src.len() {
+        if gather_src[row] != last_pos as i32 {
+            continue;
+        }
+        let wt = gather_weights[row];
+        let row_slice = &expert_out_rows_bf16[row * h..(row + 1) * h];
+        for i in 0..h {
+            out[i] += row_slice[i] * wt;
+        }
+    }
+    Ok(out)
+}
+
+fn diag_compute_moe_accum_last_cpu_from_sorted_rows(
+    expert_out_rows_bf16: &[f32],
+    sorted_ids: &[i32],
+    sorted_weights: &[f32],
+    last_pos: usize,
+    h: usize,
+    topk: usize,
+) -> Result<Vec<f32>, String> {
+    if sorted_ids.len() != sorted_weights.len() {
+        return Err(format!(
+            "moe accum cpu ref sorted length mismatch: ids={} weights={}",
+            sorted_ids.len(),
+            sorted_weights.len(),
+        ));
+    }
+    if expert_out_rows_bf16.len() != sorted_ids.len() * h {
+        return Err(format!(
+            "moe accum cpu ref sorted expert_out length mismatch: got {} expected {}",
+            expert_out_rows_bf16.len(),
+            sorted_ids.len() * h,
+        ));
+    }
+    if topk == 0 {
+        return Err("moe accum cpu ref sorted topk must be > 0".to_string());
+    }
+    let mut out = vec![0.0f32; h];
+    for row in 0..sorted_ids.len() {
+        let sid = sorted_ids[row];
+        if sid < 0 {
+            continue;
+        }
+        let token = (sid as usize) / topk;
+        if token != last_pos {
+            continue;
+        }
+        let sid_usize = sid as usize;
+        if sid_usize >= sorted_ids.len() {
+            return Err(format!(
+                "moe accum cpu ref sorted sid out of range: sid={} rows={}",
+                sid_usize,
+                sorted_ids.len(),
+            ));
+        }
+        let wt = sorted_weights[row];
+        let row_slice = &expert_out_rows_bf16[sid_usize * h..(sid_usize + 1) * h];
+        for i in 0..h {
+            out[i] += row_slice[i] * wt;
+        }
+    }
+    Ok(out)
+}
+
+fn diag_compute_moe_accum_last_cpu_from_sorted_positions(
+    expert_out_rows_bf16: &[f32],
+    sorted_ids: &[i32],
+    sorted_weights: &[f32],
+    last_pos: usize,
+    h: usize,
+    topk: usize,
+) -> Result<Vec<f32>, String> {
+    if sorted_ids.len() != sorted_weights.len() {
+        return Err(format!(
+            "moe accum cpu ref sorted-position length mismatch: ids={} weights={}",
+            sorted_ids.len(),
+            sorted_weights.len(),
+        ));
+    }
+    if expert_out_rows_bf16.len() != sorted_ids.len() * h {
+        return Err(format!(
+            "moe accum cpu ref sorted-position expert_out length mismatch: got {} expected {}",
+            expert_out_rows_bf16.len(),
+            sorted_ids.len() * h,
+        ));
+    }
+    if topk == 0 {
+        return Err("moe accum cpu ref sorted-position topk must be > 0".to_string());
+    }
+    let mut out = vec![0.0f32; h];
+    for row in 0..sorted_ids.len() {
+        let sid = sorted_ids[row];
+        if sid < 0 {
+            continue;
+        }
+        let token = (sid as usize) / topk;
+        if token != last_pos {
+            continue;
+        }
+        let wt = sorted_weights[row];
+        let row_slice = &expert_out_rows_bf16[row * h..(row + 1) * h];
+        for i in 0..h {
+            out[i] += row_slice[i] * wt;
+        }
+    }
+    Ok(out)
+}
+
+fn diag_compute_moe_total_accum_last_cpu(
+    routed_accum_last: &[f32],
+    shared_out_last_bf16: Option<&[f32]>,
+    shared_gate_raw: Option<f32>,
+) -> Result<Vec<f32>, String> {
+    let mut out = routed_accum_last.to_vec();
+    let Some(shared_out) = shared_out_last_bf16 else { return Ok(out); };
+    if shared_out.len() != out.len() {
+        return Err(format!(
+            "moe total accum cpu ref shared length mismatch: shared={} accum={}",
+            shared_out.len(),
+            out.len(),
+        ));
+    }
+    let shared_scale = shared_gate_raw
+        .map(|raw| 1.0 / (1.0 + (-raw).exp()))
+        .unwrap_or(1.0);
+    for i in 0..out.len() {
+        out[i] += shared_out[i] * shared_scale;
+    }
+    Ok(out)
+}
+
+fn diag_compute_shared_gate_raw_last_cpu(
+    hidden_last_bf16: &[f32],
+    shared_gate_weight_bf16: &[f32],
+) -> Result<f32, String> {
+    if hidden_last_bf16.len() != shared_gate_weight_bf16.len() {
+        return Err(format!(
+            "shared gate cpu ref length mismatch: hidden={} gate={}",
+            hidden_last_bf16.len(),
+            shared_gate_weight_bf16.len(),
+        ));
+    }
+    let mut acc = 0.0f32;
+    for i in 0..hidden_last_bf16.len() {
+        acc += hidden_last_bf16[i] * shared_gate_weight_bf16[i];
+    }
+    Ok(acc)
+}
+
+fn diag_max_abs_diff(a: &[f32], b: &[f32]) -> Result<f32, String> {
+    if a.len() != b.len() {
+        return Err(format!("diff length mismatch: {} vs {}", a.len(), b.len()));
+    }
+    let mut max_abs = 0.0f32;
+    for i in 0..a.len() {
+        let diff = (a[i] - b[i]).abs();
+        if diff > max_abs {
+            max_abs = diff;
+        }
+    }
+    Ok(max_abs)
 }
 
 fn trace_emit_prefill_mark(
@@ -515,6 +1063,7 @@ unsafe fn launch(
 /// Handle to loaded prefill kernel functions (raw CUfunction handles).
 pub struct PrefillKernels {
     rmsnorm: RawCuFunc,
+    rmsnorm_fp32w: RawCuFunc,
     fused_add_rmsnorm: RawCuFunc,
     embedding: RawCuFunc,
     rope: RawCuFunc,
@@ -782,6 +1331,7 @@ pub struct PrefillModelConfig {
     pub num_experts_per_tok: usize,
     pub expert_bits: u8,
     pub shared_expert_bits: u8,
+    pub shared_expert_intermediate_size: usize,
     pub group_size: usize,
     pub sms: usize,
     pub device_ordinal: usize,
@@ -893,8 +1443,8 @@ pub struct PrefillLayerWeights {
     pub la_conv_state_ptr: u64,      // [conv_dim, kernel_dim] FP32 (decode state)
     pub la_recur_state_ptr: u64,     // [nv, dk, dv] FP32 (decode state)
     // QK norm (Qwen3 models): per-head RMSNorm on Q and K after projection, before RoPE
-    pub q_norm_ptr: u64,             // BF16 [head_dim], 0 = no QK norm
-    pub k_norm_ptr: u64,             // BF16 [head_dim], 0 = no QK norm
+    pub q_norm_ptr: u64,             // FP32 [head_dim], 0 = no QK norm
+    pub k_norm_ptr: u64,             // FP32 [head_dim], 0 = no QK norm
 }
 
 /// Expert weight pointers for DMA to GPU (mirrors ExpertDataPtr).
@@ -1068,6 +1618,8 @@ pub struct PrefillEngine {
     // Separate Marlin workspace for shared_stream (avoids d_fp32_scratch conflict)
     // These are allocated dynamically in prepare_for_prefill and freed in release_scratch
     // to maximize VRAM available for HCS during decode.
+    pub d_shared_bf16_scratch1: Option<CudaSlice<u16>>,
+    pub d_shared_bf16_scratch2: Option<CudaSlice<u16>>,
     pub d_shared_fp32_scratch: Option<CudaSlice<f32>>,
     pub d_shared_workspace: Option<CudaSlice<i32>>,
     // Contiguous expert weight buffers for fused MoE (gap 1)
@@ -1161,6 +1713,7 @@ pub struct PrefillEngine {
     pub d_fla_w: Option<CudaSlice<u16>>,          // [B, T, H, K] BF16 WY representation w
     pub d_fla_u: Option<CudaSlice<u16>>,          // [B, T, H, V] BF16 WY representation u
     pub d_fla_h: Option<CudaSlice<u16>>,          // [B, NT, H, K, V] BF16 per-chunk states
+    pub d_fla_h0: Option<CudaSlice<u16>>,         // [B, H, K, V] BF16 initial state
     pub d_fla_final_state: Option<CudaSlice<f32>>,  // [B, H, K, V] FP32 final state
     pub d_fla_v_new: Option<CudaSlice<u16>>,      // [B, T, H, V] BF16 corrected values
     pub d_fla_o: Option<CudaSlice<u16>>,          // [B, T, H, V] BF16 output
@@ -1281,6 +1834,496 @@ impl PrefillEngine {
         let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
         eprintln!(
             "[KRASIS-TRACE] event=tensor step={} pos={} tok={} layer={} component={} tensor={} dtype=bf16 n={} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6} nan={} inf={}",
+            step,
+            position,
+            token_id,
+            layer_s,
+            component,
+            tensor,
+            count,
+            sample,
+            l2.sqrt(),
+            sum / finite as f64,
+            min_v,
+            max_v,
+            nan,
+            inf,
+        );
+    }
+
+    fn trace_emit_bf16_row(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer: Option<usize>,
+        component: &str,
+        tensor: &str,
+        base_ptr: u64,
+        row_idx: usize,
+        row_elems: usize,
+    ) {
+        if row_elems == 0 {
+            return;
+        }
+        let row_ptr = base_ptr + (row_idx * row_elems * 2) as u64;
+        self.trace_emit_bf16(
+            step,
+            position,
+            token_id,
+            layer,
+            component,
+            tensor,
+            row_ptr,
+            row_elems,
+        );
+    }
+
+    fn trace_emit_f32(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer: Option<usize>,
+        component: &str,
+        tensor: &str,
+        ptr: u64,
+        n: usize,
+    ) {
+        let Some(trace) = self.trace.as_ref() else { return; };
+        if !trace.should_emit(step, layer, component) {
+            return;
+        }
+        let _ = self.stream_sync();
+        let count = n.min(trace.max_elems).max(1);
+        let mut values = vec![0.0f32; count];
+        unsafe {
+            let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+                values.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr,
+                count * 4,
+            );
+        }
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut l2 = 0.0f64;
+        let mut nan = 0usize;
+        let mut inf = 0usize;
+        for &v in &values {
+            if v.is_nan() {
+                nan += 1;
+                continue;
+            }
+            if v.is_infinite() {
+                inf += 1;
+                continue;
+            }
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            let vf = v as f64;
+            sum += vf;
+            l2 += vf * vf;
+        }
+        let finite = count.saturating_sub(nan + inf).max(1);
+        let sample = trace_format_sample(&values[..values.len().min(trace.sample_values)]);
+        let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+        eprintln!(
+            "[KRASIS-TRACE] event=tensor step={} pos={} tok={} layer={} component={} tensor={} dtype=f32 n={} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6} nan={} inf={}",
+            step,
+            position,
+            token_id,
+            layer_s,
+            component,
+            tensor,
+            count,
+            sample,
+            l2.sqrt(),
+            sum / finite as f64,
+            min_v,
+            max_v,
+            nan,
+            inf,
+        );
+    }
+
+    fn trace_emit_f32_values(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer: Option<usize>,
+        component: &str,
+        tensor: &str,
+        values: &[f32],
+    ) {
+        let Some(trace) = self.trace.as_ref() else { return; };
+        if !trace.should_emit(step, layer, component) {
+            return;
+        }
+        if values.is_empty() {
+            return;
+        }
+        let count = values.len().min(trace.max_elems).max(1);
+        let values = &values[..count];
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut l2 = 0.0f64;
+        let mut nan = 0usize;
+        let mut inf = 0usize;
+        for &v in values {
+            if v.is_nan() {
+                nan += 1;
+                continue;
+            }
+            if v.is_infinite() {
+                inf += 1;
+                continue;
+            }
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            let vf = v as f64;
+            sum += vf;
+            l2 += vf * vf;
+        }
+        let finite = count.saturating_sub(nan + inf).max(1);
+        let sample = trace_format_sample(&values[..values.len().min(trace.sample_values)]);
+        let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+        eprintln!(
+            "[KRASIS-TRACE] event=tensor step={} pos={} tok={} layer={} component={} tensor={} dtype=f32 n={} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6} nan={} inf={}",
+            step,
+            position,
+            token_id,
+            layer_s,
+            component,
+            tensor,
+            count,
+            sample,
+            l2.sqrt(),
+            sum / finite as f64,
+            min_v,
+            max_v,
+            nan,
+            inf,
+        );
+    }
+
+    fn trace_emit_compare_summary(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer: Option<usize>,
+        component: &str,
+        stage: &str,
+        actual_label: &str,
+        expected_label: &str,
+        actual: &[f32],
+        expected: &[f32],
+    ) -> TraceDiffSummary {
+        let summary = summarize_trace_diff(actual, expected);
+        let Some(trace) = self.trace.as_ref() else { return summary; };
+        if !trace.should_emit(step, layer, component) {
+            return summary;
+        }
+        let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+        eprintln!(
+            "[KRASIS-TRACE] event=compare step={} pos={} tok={} layer={} component={} stage={} actual={} expected={} max_abs={:.6} max_abs_idx={} actual_at_max={:.6} expected_at_max={:.6} l2={:.6} mean_abs={:.6}",
+            step,
+            position,
+            token_id,
+            layer_s,
+            component,
+            stage,
+            actual_label,
+            expected_label,
+            summary.max_abs,
+            summary.max_abs_idx,
+            summary.actual_at_max,
+            summary.expected_at_max,
+            summary.l2,
+            summary.mean_abs,
+        );
+        summary
+    }
+
+    fn trace_emit_router_compare_last(
+        &self,
+        layer_idx: usize,
+        hidden_ptr: u64,
+        gate_ptr: u64,
+        gate_rows: usize,
+        gate_cols: usize,
+        gate_bias_ptr: u64,
+        e_score_corr_ptr: u64,
+        scoring_func: u8,
+        topk: usize,
+        gate_out_ptr: u64,
+        topk_ids_ptr: u64,
+        topk_weights_ptr: u64,
+        m: usize,
+    ) {
+        if !self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "prefill_layer")) {
+            return;
+        }
+        let _ = self.stream_sync();
+        let last_pos = m.saturating_sub(1);
+        let hidden_row_ptr = hidden_ptr + (last_pos * gate_cols * 2) as u64;
+        let gate_row_ptr = gate_out_ptr + (last_pos * gate_rows * 4) as u64;
+        let topk_ids_row_ptr = topk_ids_ptr + (last_pos * topk * 4) as u64;
+        let topk_weights_row_ptr = topk_weights_ptr + (last_pos * topk * 4) as u64;
+        match (
+            download_device_u16(hidden_row_ptr, gate_cols),
+            download_device_f32(gate_row_ptr, gate_rows),
+            download_device_i32(topk_ids_row_ptr, topk),
+            download_device_f32(topk_weights_row_ptr, topk),
+        ) {
+            (Ok(hidden_row_bf16), Ok(actual_logits), Ok(actual_topk_ids), Ok(actual_topk_weights)) => {
+                match compute_bf16_gemm_row_cpu_reference(
+                    &hidden_row_bf16,
+                    gate_ptr,
+                    gate_rows,
+                    gate_cols,
+                ) {
+                    Ok(expected_logits) => {
+                        self.trace_emit_f32_values(
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            "router_logits_last_cpu_ref",
+                            &expected_logits,
+                        );
+                        let logits_summary = self.trace_emit_compare_summary(
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            "router_logits",
+                            "router_logits_last_vendor",
+                            "router_logits_last_cpu_ref",
+                            &actual_logits,
+                            &expected_logits,
+                        );
+                        let gate_bias = if gate_bias_ptr != 0 {
+                            match download_device_f32(gate_bias_ptr, gate_rows) {
+                                Ok(v) => Some(v),
+                                Err(err) => {
+                                    trace_emit_prefill_mark(
+                                        self.trace.as_ref(),
+                                        0,
+                                        last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        &format!("phase=router_gate_bias_download_failed error={}", err),
+                                    );
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let e_score_corr = if e_score_corr_ptr != 0 {
+                            match download_device_f32(e_score_corr_ptr, gate_rows) {
+                                Ok(v) => Some(v),
+                                Err(err) => {
+                                    trace_emit_prefill_mark(
+                                        self.trace.as_ref(),
+                                        0,
+                                        last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        &format!("phase=router_e_score_corr_download_failed error={}", err),
+                                    );
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        match compute_router_topk_cpu_reference(
+                            &expected_logits,
+                            topk,
+                            scoring_func,
+                            gate_bias.as_deref(),
+                            e_score_corr.as_deref(),
+                        ) {
+                            Ok((expected_topk_weights, expected_topk_ids)) => {
+                                self.trace_emit_f32_values(
+                                    0,
+                                    last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    "router_topk_weights_last_cpu_ref",
+                                    &expected_topk_weights,
+                                );
+                                let topk_summary = self.trace_emit_compare_summary(
+                                    0,
+                                    last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    "router_topk_weights",
+                                    "router_topk_weights_last_vendor",
+                                    "router_topk_weights_last_cpu_ref",
+                                    &actual_topk_weights,
+                                    &expected_topk_weights,
+                                );
+                                let ids_match = actual_topk_ids == expected_topk_ids;
+                                trace_emit_prefill_mark(
+                                    self.trace.as_ref(),
+                                    0,
+                                    last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    &format!(
+                                        "phase=router_topk_ids actual=[{}] expected=[{}] match={} logits_max_abs={:.6} topk_w_max_abs={:.6} scoring_func={} gate_bias_present={} e_score_corr_present={}",
+                                        format_i32_sample(&actual_topk_ids),
+                                        format_i32_sample(&expected_topk_ids),
+                                        ids_match,
+                                        logits_summary.max_abs,
+                                        topk_summary.max_abs,
+                                        scoring_func,
+                                        gate_bias.is_some(),
+                                        e_score_corr.is_some(),
+                                    ),
+                                );
+                            }
+                            Err(err) => {
+                                trace_emit_prefill_mark(
+                                    self.trace.as_ref(),
+                                    0,
+                                    last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    &format!("phase=router_topk_cpu_ref_failed error={}", err),
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            &format!("phase=router_logits_cpu_ref_failed error={}", err),
+                        );
+                    }
+                }
+            }
+            (Err(err), _, _, _) | (_, Err(err), _, _) | (_, _, Err(err), _) | (_, _, _, Err(err)) => {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    0,
+                    last_pos,
+                    0,
+                    Some(layer_idx),
+                    "prefill_layer",
+                    &format!("phase=router_trace_download_failed error={}", err),
+                );
+            }
+        }
+    }
+
+    fn trace_emit_f32_row(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer: Option<usize>,
+        component: &str,
+        tensor: &str,
+        base_ptr: u64,
+        row_idx: usize,
+        row_elems: usize,
+    ) {
+        if row_elems == 0 {
+            return;
+        }
+        let row_ptr = base_ptr + (row_idx * row_elems * 4) as u64;
+        self.trace_emit_f32(
+            step,
+            position,
+            token_id,
+            layer,
+            component,
+            tensor,
+            row_ptr,
+            row_elems,
+        );
+    }
+
+    fn trace_emit_f32_position_blocks(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer: Option<usize>,
+        component: &str,
+        tensor: &str,
+        base_ptr: u64,
+        pos_idx: usize,
+        block_count: usize,
+        block_stride_elems: usize,
+        block_elems: usize,
+    ) {
+        let Some(trace) = self.trace.as_ref() else { return; };
+        if !trace.should_emit(step, layer, component) || block_count == 0 || block_elems == 0 {
+            return;
+        }
+        let max_blocks = (trace.max_elems / block_elems).max(1);
+        let use_blocks = block_count.min(max_blocks);
+        let count = use_blocks * block_elems;
+        let _ = self.stream_sync();
+        let mut values = vec![0.0f32; count];
+        unsafe {
+            for block in 0..use_blocks {
+                let src_ptr = base_ptr + (((block * block_stride_elems) + (pos_idx * block_elems)) * 4) as u64;
+                let dst_ptr = values[block * block_elems..].as_mut_ptr() as *mut std::ffi::c_void;
+                let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    dst_ptr,
+                    src_ptr,
+                    block_elems * 4,
+                );
+            }
+        }
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut l2 = 0.0f64;
+        let mut nan = 0usize;
+        let mut inf = 0usize;
+        for &v in &values {
+            if v.is_nan() {
+                nan += 1;
+                continue;
+            }
+            if v.is_infinite() {
+                inf += 1;
+                continue;
+            }
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            let vf = v as f64;
+            sum += vf;
+            l2 += vf * vf;
+        }
+        let finite = count.saturating_sub(nan + inf).max(1);
+        let sample = trace_format_sample(&values[..values.len().min(trace.sample_values)]);
+        let layer_s = layer.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+        eprintln!(
+            "[KRASIS-TRACE] event=tensor step={} pos={} tok={} layer={} component={} tensor={} dtype=f32 n={} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6} nan={} inf={}",
             step,
             position,
             token_id,
@@ -1478,6 +2521,644 @@ impl PrefillEngine {
         }).collect()
     }
 
+    fn diag_compute_fla_output_last_cpu(
+        &self,
+        q_ptr: u64,
+        k_ptr: u64,
+        v_new_ptr: u64,
+        h_ptr: u64,
+        g_ptr: u64,
+        m: usize,
+        nv: usize,
+        dk: usize,
+        dv: usize,
+        fla_bt: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let last_pos = m.saturating_sub(1);
+        let chunk_idx = last_pos / fla_bt;
+        let chunk_pos = last_pos % fla_bt;
+        let chunk_start = chunk_idx * fla_bt;
+
+        let q_last = self.diag_download_bf16(
+            q_ptr + ((last_pos * nv * dk * 2) as u64),
+            nv * dk,
+        );
+        let k_chunk = self.diag_download_bf16(
+            k_ptr + ((chunk_start * nv * dk * 2) as u64),
+            fla_bt * nv * dk,
+        );
+        let v_chunk = self.diag_download_bf16(
+            v_new_ptr + ((chunk_start * nv * dv * 2) as u64),
+            fla_bt * nv * dv,
+        );
+        let g_chunk = self.diag_download_f32(
+            g_ptr + ((chunk_start * nv * 4) as u64),
+            fla_bt * nv,
+        );
+        let h_chunk = self.diag_download_bf16(
+            h_ptr + ((chunk_idx * nv * dk * dv * 2) as u64),
+            nv * dk * dv,
+        );
+
+        let mut state_term = vec![0.0f32; nv * dv];
+        let mut local_term = vec![0.0f32; nv * dv];
+        let mut output = vec![0.0f32; nv * dv];
+
+        for head in 0..nv {
+            let q_off = head * dk;
+            let out_off = head * dv;
+            let h_off = head * dk * dv;
+            let g_t = g_chunk[chunk_pos * nv + head];
+            let exp_gt = g_t.exp();
+
+            for d in 0..dv {
+                let mut accum = 0.0f32;
+                for i in 0..dk {
+                    accum += q_last[q_off + i] * h_chunk[h_off + i * dv + d];
+                }
+                state_term[out_off + d] = accum * exp_gt;
+            }
+
+            for s in 0..=chunk_pos {
+                let k_off = (s * nv + head) * dk;
+                let v_off = (s * nv + head) * dv;
+                let mut qk = 0.0f32;
+                for i in 0..dk {
+                    qk += q_last[q_off + i] * k_chunk[k_off + i];
+                }
+                let weight = qk * (g_t - g_chunk[s * nv + head]).exp();
+                for d in 0..dv {
+                    local_term[out_off + d] += weight * v_chunk[v_off + d];
+                }
+            }
+
+            for d in 0..dv {
+                output[out_off + d] = state_term[out_off + d] + local_term[out_off + d];
+            }
+        }
+
+        (output, state_term, local_term)
+    }
+
+    fn diag_compute_la_gated_rmsnorm_last_cpu(
+        &self,
+        x_last: &[f32],
+        gate_ptr: u64,
+        weight_ptr: u64,
+        m: usize,
+        nv: usize,
+        dv: usize,
+        gate_is_bf16: bool,
+    ) -> Vec<f32> {
+        let last_pos = m.saturating_sub(1);
+        let gate_last = if gate_is_bf16 {
+            self.diag_download_bf16(
+                gate_ptr + ((last_pos * nv * dv * 2) as u64),
+                nv * dv,
+            )
+        } else {
+            self.diag_download_f32(
+                gate_ptr + ((last_pos * nv * dv * 4) as u64),
+                nv * dv,
+            )
+        };
+        let weight = self.diag_download_f32(weight_ptr, dv);
+        let mut out = vec![0.0f32; nv * dv];
+
+        for head in 0..nv {
+            let off = head * dv;
+            let x_head = &x_last[off..off + dv];
+            let g_head = &gate_last[off..off + dv];
+            let out_head = &mut out[off..off + dv];
+
+            let mut ss = 0.0f32;
+            for &x in x_head {
+                ss += x * x;
+            }
+            let rms_inv = 1.0f32 / (ss / dv as f32 + self.config.rms_norm_eps).sqrt();
+
+            for i in 0..dv {
+                let normed = x_head[i] * rms_inv * weight[i];
+                let g = g_head[i];
+                let silu_g = g / (1.0f32 + (-g).exp());
+                out_head[i] = normed * silu_g;
+            }
+        }
+
+        out
+    }
+
+    fn diag_compute_fused_add_rmsnorm_last_cpu(
+        &self,
+        residual_last: &[f32],
+        x_last: &[f32],
+        weight_ptr: u64,
+        d: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let weight = self.diag_download_bf16(weight_ptr, d);
+        let mut residual_out = vec![0.0f32; d];
+        let mut sum_sq = 0.0f64;
+        for i in 0..d {
+            let added = residual_last[i] + x_last[i];
+            let rounded = half::bf16::from_f32(added).to_f32();
+            residual_out[i] = rounded;
+            let v = rounded as f64;
+            sum_sq += v * v;
+        }
+        let rms_inv = (sum_sq / d as f64 + self.config.rms_norm_eps as f64).sqrt().recip() as f32;
+        let out = residual_out
+            .iter()
+            .zip(weight.iter())
+            .map(|(&r, &w)| half::bf16::from_f32(r * rms_inv * w).to_f32())
+            .collect::<Vec<_>>();
+        (residual_out, out)
+    }
+
+    fn diag_compute_residual_add_last_cpu(
+        &self,
+        residual_last: &[f32],
+        x_last: &[f32],
+    ) -> Vec<f32> {
+        residual_last
+            .iter()
+            .zip(x_last.iter())
+            .map(|(&residual, &x)| half::bf16::from_f32(residual + x).to_f32())
+            .collect()
+    }
+
+    fn diag_compute_la_gated_rmsnorm_last_details_cpu(
+        &self,
+        x_last: &[f32],
+        gate_ptr: u64,
+        weight_ptr: u64,
+        m: usize,
+        nv: usize,
+        dv: usize,
+        gate_is_bf16: bool,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let last_pos = m.saturating_sub(1);
+        let gate_last = if gate_is_bf16 {
+            self.diag_download_bf16(
+                gate_ptr + ((last_pos * nv * dv * 2) as u64),
+                nv * dv,
+            )
+        } else {
+            self.diag_download_f32(
+                gate_ptr + ((last_pos * nv * dv * 4) as u64),
+                nv * dv,
+            )
+        };
+        let weight = self.diag_download_f32(weight_ptr, dv);
+        let mut rms_inv_per_head = vec![0.0f32; nv];
+        let mut normed = vec![0.0f32; nv * dv];
+        let mut silu_gate = vec![0.0f32; nv * dv];
+        let mut out_fp32 = vec![0.0f32; nv * dv];
+
+        for head in 0..nv {
+            let off = head * dv;
+            let x_head = &x_last[off..off + dv];
+            let g_head = &gate_last[off..off + dv];
+
+            let mut ss = 0.0f32;
+            for &x in x_head {
+                ss += x * x;
+            }
+            let rms_inv = 1.0f32 / (ss / dv as f32 + self.config.rms_norm_eps).sqrt();
+            rms_inv_per_head[head] = rms_inv;
+
+            for i in 0..dv {
+                let normed_val = x_head[i] * rms_inv * weight[i];
+                let g = g_head[i];
+                let silu_g = g / (1.0f32 + (-g).exp());
+                normed[off + i] = normed_val;
+                silu_gate[off + i] = silu_g;
+                out_fp32[off + i] = normed_val * silu_g;
+            }
+        }
+
+        let out_bf16 = round_f32_slice_to_bf16(&out_fp32);
+        (gate_last, weight, rms_inv_per_head, normed, silu_gate, out_fp32, out_bf16)
+    }
+
+    fn diag_compute_fla_wy_last_cpu(
+        &self,
+        ai_ptr: u64,
+        k_ptr: u64,
+        v_ptr: u64,
+        beta_ptr: u64,
+        g_ptr: u64,
+        m: usize,
+        nv: usize,
+        dk: usize,
+        dv: usize,
+        fla_bt: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let last_pos = m.saturating_sub(1);
+        let chunk_pos = last_pos % fla_bt;
+        let chunk_start = last_pos - chunk_pos;
+
+        let ai_last = self.diag_download_bf16(
+            ai_ptr + ((last_pos * nv * fla_bt * 2) as u64),
+            nv * fla_bt,
+        );
+        let k_chunk = self.diag_download_bf16(
+            k_ptr + ((chunk_start * nv * dk * 2) as u64),
+            fla_bt * nv * dk,
+        );
+        let v_chunk = self.diag_download_bf16(
+            v_ptr + ((chunk_start * nv * dv * 2) as u64),
+            fla_bt * nv * dv,
+        );
+        let beta_chunk = self.diag_download_bf16(
+            beta_ptr + ((chunk_start * nv * 2) as u64),
+            fla_bt * nv,
+        );
+        let g_chunk = self.diag_download_f32(
+            g_ptr + ((chunk_start * nv * 4) as u64),
+            fla_bt * nv,
+        );
+
+        let mut w = vec![0.0f32; nv * dk];
+        let mut u = vec![0.0f32; nv * dv];
+
+        for head in 0..nv {
+            let ai_off = head * fla_bt;
+            let w_off = head * dk;
+            let u_off = head * dv;
+
+            for s in 0..=chunk_pos {
+                let a = ai_last[ai_off + s];
+                let beta = beta_chunk[s * nv + head];
+                let exp_g = g_chunk[s * nv + head].exp();
+                let k_off = (s * nv + head) * dk;
+                let v_off = (s * nv + head) * dv;
+                for i in 0..dk {
+                    w[w_off + i] += a * beta * exp_g * k_chunk[k_off + i];
+                }
+                for d in 0..dv {
+                    u[u_off + d] += a * beta * v_chunk[v_off + d];
+                }
+            }
+        }
+
+        (w, u)
+    }
+
+    fn diag_compute_custom_value_corrected_last_from_fla_inputs(
+        &self,
+        k_ptr: u64,
+        v_ptr: u64,
+        beta_ptr: u64,
+        g_ptr: u64,
+        m: usize,
+        nv: usize,
+        dk: usize,
+        dv: usize,
+        fla_bt: usize,
+    ) -> Vec<f32> {
+        let last_pos = m.saturating_sub(1);
+        let chunk_pos = last_pos % fla_bt;
+        let g_chunk = self.diag_download_f32(
+            g_ptr + (((last_pos - chunk_pos) * nv * 4) as u64),
+            fla_bt * nv,
+        );
+        let value_corrected_chunk = self.diag_compute_custom_value_corrected_chunk_from_g_chunk(
+            k_ptr,
+            v_ptr,
+            beta_ptr,
+            &g_chunk,
+            m,
+            nv,
+            dk,
+            dv,
+            fla_bt,
+        );
+        value_corrected_chunk[(chunk_pos * nv * dv)..((chunk_pos + 1) * nv * dv)].to_vec()
+    }
+
+    fn diag_compute_custom_value_corrected_chunk_from_g_chunk(
+        &self,
+        k_ptr: u64,
+        v_ptr: u64,
+        beta_ptr: u64,
+        g_chunk: &[f32],
+        m: usize,
+        nv: usize,
+        dk: usize,
+        dv: usize,
+        fla_bt: usize,
+    ) -> Vec<f32> {
+        let last_pos = m.saturating_sub(1);
+        let chunk_pos = last_pos % fla_bt;
+        let chunk_start = last_pos - chunk_pos;
+
+        let k_chunk = self.diag_download_bf16(
+            k_ptr + ((chunk_start * nv * dk * 2) as u64),
+            fla_bt * nv * dk,
+        );
+        let v_chunk = self.diag_download_bf16(
+            v_ptr + ((chunk_start * nv * dv * 2) as u64),
+            fla_bt * nv * dv,
+        );
+        let beta_chunk = self.diag_download_bf16(
+            beta_ptr + ((chunk_start * nv * 2) as u64),
+            fla_bt * nv,
+        );
+        assert_eq!(
+            g_chunk.len(),
+            fla_bt * nv,
+            "g_chunk length mismatch: got {} expected {}",
+            g_chunk.len(),
+            fla_bt * nv,
+        );
+        let mut value_corrected_chunk = vec![0.0f32; fla_bt * nv * dv];
+
+        for head in 0..nv {
+            for row in 0..=chunk_pos {
+                let row_off = (row * nv + head) * dv;
+                let beta = beta_chunk[row * nv + head];
+                let v_off = (row * nv + head) * dv;
+
+                for d in 0..dv {
+                    value_corrected_chunk[row_off + d] = beta * v_chunk[v_off + d];
+                }
+
+                for col in 0..row {
+                    let k_row_off = (row * nv + head) * dk;
+                    let k_col_off = (col * nv + head) * dk;
+                    let mut kk = 0.0f32;
+                    for i in 0..dk {
+                        kk += k_chunk[k_row_off + i] * k_chunk[k_col_off + i];
+                    }
+                    let attn = -beta * kk * (g_chunk[row * nv + head] - g_chunk[col * nv + head]).exp();
+                    let src_off = (col * nv + head) * dv;
+                    for d in 0..dv {
+                        value_corrected_chunk[row_off + d] += attn * value_corrected_chunk[src_off + d];
+                    }
+                }
+            }
+        }
+
+        value_corrected_chunk
+    }
+
+    fn diag_compute_fla_local_output_last_from_g_chunk_and_v_chunk(
+        &self,
+        q_ptr: u64,
+        k_ptr: u64,
+        v_chunk: &[f32],
+        g_chunk: &[f32],
+        m: usize,
+        nv: usize,
+        dk: usize,
+        dv: usize,
+        fla_bt: usize,
+    ) -> Vec<f32> {
+        let last_pos = m.saturating_sub(1);
+        let chunk_pos = last_pos % fla_bt;
+        let chunk_start = last_pos - chunk_pos;
+
+        let q_last = self.diag_download_bf16(
+            q_ptr + ((last_pos * nv * dk * 2) as u64),
+            nv * dk,
+        );
+        let k_chunk_bf16 = self.diag_download_bf16(
+            k_ptr + ((chunk_start * nv * dk * 2) as u64),
+            fla_bt * nv * dk,
+        );
+        assert_eq!(
+            g_chunk.len(),
+            fla_bt * nv,
+            "g_chunk length mismatch: got {} expected {}",
+            g_chunk.len(),
+            fla_bt * nv,
+        );
+        assert_eq!(
+            v_chunk.len(),
+            fla_bt * nv * dv,
+            "v_chunk length mismatch: got {} expected {}",
+            v_chunk.len(),
+            fla_bt * nv * dv,
+        );
+
+        let mut local_term = vec![0.0f32; nv * dv];
+
+        for head in 0..nv {
+            let q_off = head * dk;
+            let out_off = head * dv;
+            let g_t = g_chunk[chunk_pos * nv + head];
+
+            for s in 0..=chunk_pos {
+                let k_off = (s * nv + head) * dk;
+                let v_off = (s * nv + head) * dv;
+                let mut qk = 0.0f32;
+                for i in 0..dk {
+                    qk += q_last[q_off + i] * k_chunk_bf16[k_off + i];
+                }
+                let weight = qk * (g_t - g_chunk[s * nv + head]).exp();
+                for d in 0..dv {
+                    local_term[out_off + d] += weight * v_chunk[v_off + d];
+                }
+            }
+        }
+
+        local_term
+    }
+
+    fn diag_compute_repeat_l2norm_last_cpu(
+        &self,
+        src_ptr: u64,
+        m: usize,
+        nk: usize,
+        dk: usize,
+        hr: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let last_pos = m.saturating_sub(1);
+        let src_last = self.diag_download_bf16(
+            src_ptr + ((last_pos * nk * dk * 2) as u64),
+            nk * dk,
+        );
+        let nv = nk * hr;
+        let mut out = vec![0.0f32; nv * dk];
+
+        for v_head in 0..nv {
+            let k_head = v_head / hr;
+            let src_off = k_head * dk;
+            let dst_off = v_head * dk;
+            let src = &src_last[src_off..src_off + dk];
+            let mut ss = 0.0f32;
+            for &x in src {
+                ss += x * x;
+            }
+            let inv = 1.0f32 / (ss + 1e-6).sqrt();
+            for i in 0..dk {
+                out[dst_off + i] = src[i] * inv * scale;
+            }
+        }
+
+        out
+    }
+
+    fn diag_compute_fla_a_last_cpu_from_g_chunk(
+        &self,
+        k_ptr: u64,
+        beta_ptr: u64,
+        g_chunk: &[f32],
+        m: usize,
+        nv: usize,
+        dk: usize,
+        fla_bt: usize,
+    ) -> Vec<f32> {
+        let last_pos = m.saturating_sub(1);
+        let chunk_pos = last_pos % fla_bt;
+        let chunk_start = last_pos - chunk_pos;
+
+        let k_chunk = self.diag_download_bf16(
+            k_ptr + ((chunk_start * nv * dk * 2) as u64),
+            fla_bt * nv * dk,
+        );
+        assert_eq!(
+            g_chunk.len(),
+            fla_bt * nv,
+            "g_chunk length mismatch: got {} expected {}",
+            g_chunk.len(),
+            fla_bt * nv,
+        );
+        let beta_last = self.diag_download_bf16(
+            beta_ptr + ((last_pos * nv * 2) as u64),
+            nv,
+        );
+
+        let mut a_last = vec![0.0f32; nv * fla_bt];
+
+        for head in 0..nv {
+            let row_off = head * fla_bt;
+            let k_last_off = (chunk_pos * nv + head) * dk;
+            let g_last = g_chunk[chunk_pos * nv + head];
+            let beta = beta_last[head];
+
+            for s in 0..chunk_pos {
+                let k_s_off = (s * nv + head) * dk;
+                let mut kk = 0.0f32;
+                for i in 0..dk {
+                    kk += k_chunk[k_last_off + i] * k_chunk[k_s_off + i];
+                }
+                a_last[row_off + s] = beta * kk * (g_last - g_chunk[s * nv + head]).exp();
+            }
+        }
+
+        a_last
+    }
+
+    fn diag_compute_fla_a_last_cpu(
+        &self,
+        k_ptr: u64,
+        g_ptr: u64,
+        beta_ptr: u64,
+        m: usize,
+        nv: usize,
+        dk: usize,
+        fla_bt: usize,
+    ) -> Vec<f32> {
+        let last_pos = m.saturating_sub(1);
+        let chunk_pos = last_pos % fla_bt;
+        let chunk_start = last_pos - chunk_pos;
+        let g_chunk = self.diag_download_f32(
+            g_ptr + ((chunk_start * nv * 4) as u64),
+            fla_bt * nv,
+        );
+        self.diag_compute_fla_a_last_cpu_from_g_chunk(
+            k_ptr, beta_ptr, &g_chunk, m, nv, dk, fla_bt,
+        )
+    }
+
+    fn diag_compute_fla_g_cumsum_chunk_cpu_from_gate_f32(
+        &self,
+        gate_ptr: u64,
+        m: usize,
+        nv: usize,
+        fla_bt: usize,
+    ) -> Vec<f32> {
+        let last_pos = m.saturating_sub(1);
+        let chunk_pos = last_pos % fla_bt;
+        let chunk_start = last_pos - chunk_pos;
+
+        let gate_chunk = self.diag_download_f32(
+            gate_ptr + ((chunk_start * nv * 4) as u64),
+            fla_bt * nv,
+        );
+
+        let mut g_chunk = vec![0.0f32; fla_bt * nv];
+        for head in 0..nv {
+            let mut sum = 0.0f32;
+            for s in 0..=chunk_pos {
+                sum += gate_chunk[s * nv + head];
+                g_chunk[s * nv + head] = sum;
+            }
+        }
+        g_chunk
+    }
+
+    fn diag_compute_fla_g_cumsum_last_cpu_from_gate_f32(
+        &self,
+        gate_ptr: u64,
+        m: usize,
+        nv: usize,
+        fla_bt: usize,
+    ) -> Vec<f32> {
+        let last_pos = m.saturating_sub(1);
+        let chunk_pos = last_pos % fla_bt;
+        let g_chunk =
+            self.diag_compute_fla_g_cumsum_chunk_cpu_from_gate_f32(gate_ptr, m, nv, fla_bt);
+        g_chunk[(chunk_pos * nv)..((chunk_pos + 1) * nv)].to_vec()
+    }
+
+    fn diag_compute_fla_ai_last_cpu_from_a(
+        &self,
+        a_ptr: u64,
+        m: usize,
+        nv: usize,
+        fla_bt: usize,
+    ) -> Vec<f32> {
+        let last_pos = m.saturating_sub(1);
+        let chunk_idx = last_pos / fla_bt;
+        let chunk_pos = last_pos % fla_bt;
+        let chunk_start = chunk_idx * fla_bt;
+
+        let a_chunk = self.diag_download_f32(
+            a_ptr + ((chunk_start * nv * fla_bt * 4) as u64),
+            fla_bt * nv * fla_bt,
+        );
+
+        let mut ai_last = vec![0.0f32; nv * fla_bt];
+
+        for head in 0..nv {
+            let mut inv = vec![0.0f32; fla_bt * fla_bt];
+            for i in 0..fla_bt {
+                inv[i * fla_bt + i] = 1.0;
+            }
+
+            for row in 0..fla_bt {
+                for col in 0..row {
+                    let a = a_chunk[(row * nv + head) * fla_bt + col];
+                    if a == 0.0 {
+                        continue;
+                    }
+                    for k in 0..=col {
+                        inv[row * fla_bt + k] -= a * inv[col * fla_bt + k];
+                    }
+                }
+            }
+
+            let src = &inv[chunk_pos * fla_bt..(chunk_pos + 1) * fla_bt];
+            let dst = &mut ai_last[head * fla_bt..(head + 1) * fla_bt];
+            dst.copy_from_slice(src);
+        }
+
+        ai_last
+    }
+
     /// Print L2 norms at multiple positions for a given buffer, in a format
     /// that can be compared against the BF16 sublayer reference data.
     fn diag_print_norms(&self, label: &str, ptr: u64, positions: &[usize], h: usize) {
@@ -1512,13 +3193,74 @@ impl PrefillEngine {
         }
     }
 
-    /// Get the diagnostic layer limit from KRASIS_PREFILL_DIAG_LAYERS env var.
-    /// Default: 9999 (all layers). Set to e.g. 5 for layers 0-4.
-    fn diag_layer_limit() -> usize {
-        std::env::var("KRASIS_PREFILL_DIAG_LAYERS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(9999)
+    /// Check whether diagnostics should fire for a specific layer.
+    ///
+    /// Supported KRASIS_PREFILL_DIAG_LAYERS forms:
+    /// - unset: all layers
+    /// - `N`: layers 0..N-1
+    /// - `A-B`: inclusive range
+    /// - `A,B,C`: exact layer list
+    fn diag_layer_enabled(layer_idx: usize) -> bool {
+        let Some(raw) = std::env::var("KRASIS_PREFILL_DIAG_LAYERS").ok() else {
+            return true;
+        };
+        let spec = raw.trim();
+        if spec.is_empty() {
+            return true;
+        }
+        if let Ok(limit) = spec.parse::<usize>() {
+            return layer_idx < limit;
+        }
+        for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some((start_s, end_s)) = part.split_once('-') {
+                if let (Ok(start), Ok(end)) =
+                    (start_s.trim().parse::<usize>(), end_s.trim().parse::<usize>())
+                {
+                    if layer_idx >= start && layer_idx <= end {
+                        return true;
+                    }
+                    continue;
+                }
+            }
+            if let Ok(single) = part.parse::<usize>() {
+                if layer_idx == single {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn diag_dump_gate_values(
+        &self,
+        gate_out: u64,
+        m: usize,
+        layer_idx: usize,
+        label: &str,
+    ) -> Result<(), String> {
+        let diag_positions = Self::diag_positions(m);
+        let mut h_gate = vec![0.0f32; m];
+        self.stream_sync()?;
+        unsafe {
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                h_gate.as_mut_ptr() as *mut _,
+                gate_out,
+                (m * 4) as usize,
+            );
+        }
+        let mut parts = Vec::new();
+        for &pos in &diag_positions {
+            let raw = h_gate[pos];
+            let sig = 1.0f32 / (1.0f32 + (-raw).exp());
+            parts.push(format!("{}:{:.4}->{:.4}", pos, raw, sig));
+        }
+        eprintln!(
+            "[DIAG] layer{:02}_moe {} {}",
+            layer_idx,
+            label,
+            parts.join(" ")
+        );
+        Ok(())
     }
 
     /// Dynamically allocate scratch buffers sized for this prompt.
@@ -1578,6 +3320,8 @@ impl PrefillEngine {
         self.scratch = allocate_scratch(&self.device, &self.config, 0)
             .map_err(|e| format!("alloc empty scratch: {e}"))?;
         self.d_cold_staging = None;
+        self.d_shared_bf16_scratch1 = None;
+        self.d_shared_bf16_scratch2 = None;
         self.d_shared_fp32_scratch = None;
         self.d_shared_workspace = None;
         self.d_fla_g_cumsum = None;
@@ -1586,6 +3330,7 @@ impl PrefillEngine {
         self.d_fla_w = None;
         self.d_fla_u = None;
         self.d_fla_h = None;
+        self.d_fla_h0 = None;
         self.d_fla_final_state = None;
         self.d_fla_v_new = None;
         self.d_fla_o = None;
@@ -1682,6 +3427,8 @@ impl PrefillEngine {
                     .map_err(|e| format!("alloc fla_u: {e}"))?);
                 self.d_fla_h = Some(self.device.alloc_zeros::<u16>(fla_nt * nv * dk * dv)
                     .map_err(|e| format!("alloc fla_h: {e}"))?);
+                self.d_fla_h0 = Some(self.device.alloc_zeros::<u16>(nv * dk * dv)
+                    .map_err(|e| format!("alloc fla_h0: {e}"))?);
                 self.d_fla_final_state = Some(self.device.alloc_zeros::<f32>(nv * dk * dv)
                     .map_err(|e| format!("alloc fla_final_state: {e}"))?);
                 self.d_fla_v_new = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
@@ -1691,9 +3438,21 @@ impl PrefillEngine {
             }
 
             // Shared expert Marlin workspace: sized for actual chunk, not max possible.
-            let shared_scratch_n = std::cmp::max(self.config.hidden_size, self.config.moe_intermediate_size);
+            let shared_w13_n = if self.config.moe_gated {
+                2 * self.config.shared_expert_intermediate_size.max(self.config.moe_intermediate_size)
+            } else {
+                self.config.shared_expert_intermediate_size.max(self.config.moe_intermediate_size)
+            };
+            let shared_scratch_n = std::cmp::max(
+                self.config.hidden_size,
+                shared_w13_n,
+            );
             let shared_scratch_elems = scratch_tokens * shared_scratch_n;
             if shared_scratch_elems > 0 {
+                self.d_shared_bf16_scratch1 = Some(self.device.alloc_zeros::<u16>(shared_scratch_elems)
+                    .map_err(|e| format!("alloc shared_bf16_scratch1: {e}"))?);
+                self.d_shared_bf16_scratch2 = Some(self.device.alloc_zeros::<u16>(shared_scratch_elems)
+                    .map_err(|e| format!("alloc shared_bf16_scratch2: {e}"))?);
                 self.d_shared_fp32_scratch = Some(self.device.alloc_zeros::<f32>(shared_scratch_elems)
                     .map_err(|e| format!("alloc shared_fp32_scratch: {e}"))?);
                 self.d_shared_workspace = Some(self.device.alloc_zeros::<i32>(self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM)
@@ -1706,12 +3465,13 @@ impl PrefillEngine {
             unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut post_alloc_free_bytes, &mut total_bytes); }
             if debug_prefill {
                 eprintln!(
-                    "[PREFILL-DEBUG] alloc attempt={} scratch_tokens={} post_alloc_free_mb={} safety_mb={} cold_staging_mb={} shared_fp32_mb={:.1}",
+                    "[PREFILL-DEBUG] alloc attempt={} scratch_tokens={} post_alloc_free_mb={} safety_mb={} cold_staging_mb={} shared_bf16_mb={:.1} shared_fp32_mb={:.1}",
                     attempt,
                     scratch_tokens,
                     post_alloc_free_bytes / (1024 * 1024),
                     safety_margin_mb,
                     (n_routed * self.cold_expert_bytes) / (1024 * 1024),
+                    (shared_scratch_elems * 2 * std::mem::size_of::<u16>()) as f64 / (1024.0 * 1024.0),
                     (shared_scratch_elems * std::mem::size_of::<f32>()) as f64 / (1024.0 * 1024.0),
                 );
             }
@@ -1756,6 +3516,8 @@ impl PrefillEngine {
             self.scratch = allocate_scratch(&self.device, &self.config, 0)
                 .map_err(|e| format!("alloc empty scratch: {e}"))?;
             self.d_cold_staging = None;
+            self.d_shared_bf16_scratch1 = None;
+            self.d_shared_bf16_scratch2 = None;
             self.d_shared_fp32_scratch = None;
             self.d_shared_workspace = None;
             self.d_fla_g_cumsum = None;
@@ -1764,6 +3526,7 @@ impl PrefillEngine {
             self.d_fla_w = None;
             self.d_fla_u = None;
             self.d_fla_h = None;
+            self.d_fla_h0 = None;
             self.d_fla_final_state = None;
             self.d_fla_v_new = None;
             self.d_fla_o = None;
@@ -1846,6 +3609,8 @@ impl PrefillEngine {
         // Free prefill-only GPU buffers: cold staging + shared expert scratch.
         // These are only needed during prefill and waste ~1.2 GB of HCS space if kept.
         self.d_cold_staging = None;
+        self.d_shared_bf16_scratch1 = None;
+        self.d_shared_bf16_scratch2 = None;
         self.d_shared_fp32_scratch = None;
         self.d_shared_workspace = None;
         self.d_fla_g_cumsum = None;
@@ -1854,6 +3619,7 @@ impl PrefillEngine {
         self.d_fla_w = None;
         self.d_fla_u = None;
         self.d_fla_h = None;
+        self.d_fla_h0 = None;
         self.d_fla_final_state = None;
         self.d_fla_v_new = None;
         self.d_fla_o = None;
@@ -1913,7 +3679,6 @@ impl PrefillEngine {
         // KRASIS_PREFILL_DIAG_MOE_DETAIL=1 to enable heavy per-row MoE diagnostics
         let diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
         let diag_positions = if diag { Self::diag_positions(total_m) } else { vec![] };
-        let diag_layer_limit = if diag { Self::diag_layer_limit() } else { 0 };
         let diag_moe_detail = std::env::var("KRASIS_PREFILL_DIAG_MOE_DETAIL").is_ok();
         let debug_prefill = prefill_debug_enabled();
 
@@ -2184,6 +3949,8 @@ impl PrefillEngine {
             let m = chunk_end - chunk_start;
             let chunk_tokens = &token_ids[chunk_start..chunk_end];
             let chunk_tok0 = chunk_tokens.first().copied().unwrap_or(0) as usize;
+            let chunk_last_pos = chunk_end.saturating_sub(1);
+            let chunk_last_tok = chunk_tokens.last().copied().unwrap_or(0) as usize;
             let chunk_t0 = if debug_prefill { Some(Instant::now()) } else { None };
             trace_emit_prefill_mark(
                 self.trace.as_ref(),
@@ -2223,6 +3990,17 @@ impl PrefillEngine {
                     *self.scratch.d_hidden.device_ptr(),
                     m * h,
                 );
+                self.trace_emit_bf16_row(
+                    chunk_idx,
+                    chunk_last_pos,
+                    chunk_last_tok,
+                    None,
+                    "prefill_chunk",
+                    "embedding_hidden_last",
+                    *self.scratch.d_hidden.device_ptr(),
+                    m.saturating_sub(1),
+                    h,
+                );
             }
             if timing {
                 self.stream_sync()?;
@@ -2230,8 +4008,14 @@ impl PrefillEngine {
             }
 
             if diag && chunk_idx == 0 {
-                eprintln!("[DIAG] === Prefill diagnostic: m={} positions={:?} layers=0..{} ===",
-                    m, diag_positions, diag_layer_limit);
+                let diag_layers = std::env::var("KRASIS_PREFILL_DIAG_LAYERS")
+                    .unwrap_or_else(|_| "all".to_string());
+                eprintln!(
+                    "[DIAG] === Prefill diagnostic: m={} positions={:?} layers={} ===",
+                    m,
+                    diag_positions,
+                    diag_layers
+                );
                 // Log input token IDs for verification against reference
                 let id_str: Vec<String> = chunk_tokens.iter().map(|t| t.to_string()).collect();
                 eprintln!("[DIAG] input_token_ids [{}]: {}", chunk_tokens.len(), id_str.join(", "));
@@ -2297,6 +4081,41 @@ impl PrefillEngine {
                 }
                 if timing { self.stream_sync()?; t_norm_ms += tn0.elapsed().as_secs_f64() * 1000.0; }
                 if self.trace.as_ref().map_or(false, |t| t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")) {
+                    let post_moe_trace_inputs = match (
+                        download_device_u16(
+                            *self.scratch.d_residual.device_ptr() + ((m.saturating_sub(1) * h * 2) as u64),
+                            h,
+                        ),
+                        download_device_u16(
+                            *self.scratch.d_hidden.device_ptr() + ((m.saturating_sub(1) * h * 2) as u64),
+                            h,
+                        ),
+                    ) {
+                        (Ok(residual_last_bf16), Ok(hidden_last_bf16)) => Some((residual_last_bf16, hidden_last_bf16)),
+                        (Err(err), _) | (_, Err(err)) => {
+                            trace_emit_prefill_mark(
+                                self.trace.as_ref(),
+                                chunk_idx,
+                                chunk_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                &format!("phase=post_moe_trace_input_download_failed error={}", err),
+                            );
+                            None
+                        }
+                    };
+                    self.trace_emit_bf16_row(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "layer_input_residual_last",
+                        *self.scratch.d_residual.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
                     self.trace_emit_bf16(
                         chunk_idx,
                         chunk_start,
@@ -2307,6 +4126,38 @@ impl PrefillEngine {
                         *self.scratch.d_hidden.device_ptr(),
                         m * h,
                     );
+                    self.trace_emit_bf16_row(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "post_input_norm_last",
+                        *self.scratch.d_hidden.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
+                    if let Some((residual_last_bf16, hidden_last_bf16)) = post_moe_trace_inputs.as_ref() {
+                        let residual_last = residual_last_bf16
+                            .iter()
+                            .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                            .collect::<Vec<_>>();
+                        let hidden_last = hidden_last_bf16
+                            .iter()
+                            .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                            .collect::<Vec<_>>();
+                        let pre_mixer_residual_last =
+                            self.diag_compute_residual_add_last_cpu(&residual_last, &hidden_last);
+                        self.trace_emit_f32_values(
+                            chunk_idx,
+                            chunk_last_pos,
+                            0,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            "pre_mixer_residual_last",
+                            &pre_mixer_residual_last,
+                        );
+                    }
                 }
 
 
@@ -2351,9 +4202,20 @@ impl PrefillEngine {
                         *self.scratch.d_attn_out.device_ptr(),
                         m * h,
                     );
+                    self.trace_emit_bf16_row(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "mixer_out_last",
+                        *self.scratch.d_attn_out.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
                 }
 
-                if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
+                if diag && chunk_idx == 0 && Self::diag_layer_enabled(layer_idx) {
                     let lt_name = match layer_type { 0 => "gqa", 1 => "mamba2", 3 => "la", _ => "?" };
                     self.diag_print_norms(
                         &format!("layer{:02}_{}_mixer", layer_idx, lt_name),
@@ -2363,6 +4225,23 @@ impl PrefillEngine {
                 // Post-attention RMSNorm
                 let tn1 = Instant::now();
                 let post_norm = self.layer_weights[layer_idx].post_attn_norm;
+                let post_attn_trace_inputs = if post_norm != 0
+                    && self.trace.as_ref().map_or(false, |t| t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer"))
+                {
+                    let last_pos = m.saturating_sub(1);
+                    Some((
+                        self.diag_download_bf16(
+                            *self.scratch.d_residual.device_ptr() + ((last_pos * h * 2) as u64),
+                            h,
+                        ),
+                        self.diag_download_bf16(
+                            *self.scratch.d_attn_out.device_ptr() + ((last_pos * h * 2) as u64),
+                            h,
+                        ),
+                    ))
+                } else {
+                    None
+                };
                 if post_norm != 0 {
                     self.launch_fused_add_rmsnorm(
                         *self.scratch.d_residual.device_ptr(),
@@ -2384,6 +4263,66 @@ impl PrefillEngine {
                 }
                 if timing { self.stream_sync()?; t_norm_ms += tn1.elapsed().as_secs_f64() * 1000.0; }
                 if self.trace.as_ref().map_or(false, |t| t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")) {
+                    if let Some((residual_last_in, mixer_last_in)) = post_attn_trace_inputs.as_ref() {
+                        let last_pos = m.saturating_sub(1);
+                        let (expected_residual_last, expected_hidden_last) =
+                            self.diag_compute_fused_add_rmsnorm_last_cpu(
+                                residual_last_in,
+                                mixer_last_in,
+                                post_norm,
+                                h,
+                            );
+                        let actual_residual_last = self.diag_download_bf16(
+                            *self.scratch.d_residual.device_ptr() + ((last_pos * h * 2) as u64),
+                            h,
+                        );
+                        let actual_hidden_last = self.diag_download_bf16(
+                            *self.scratch.d_hidden.device_ptr() + ((last_pos * h * 2) as u64),
+                            h,
+                        );
+                        self.trace_emit_f32_values(
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            "post_attn_residual_last_cpu_ref",
+                            &expected_residual_last,
+                        );
+                        self.trace_emit_compare_summary(
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            "post_attn_residual",
+                            "post_attn_residual_last_vendor",
+                            "post_attn_residual_last_cpu_ref",
+                            &actual_residual_last,
+                            &expected_residual_last,
+                        );
+                        self.trace_emit_f32_values(
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            "pre_mlp_hidden_last_cpu_ref",
+                            &expected_hidden_last,
+                        );
+                        self.trace_emit_compare_summary(
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            "post_attn_norm",
+                            "pre_mlp_hidden_last_vendor",
+                            "pre_mlp_hidden_last_cpu_ref",
+                            &actual_hidden_last,
+                            &expected_hidden_last,
+                        );
+                    }
                     self.trace_emit_bf16(
                         chunk_idx,
                         chunk_start,
@@ -2394,10 +4333,21 @@ impl PrefillEngine {
                         *self.scratch.d_hidden.device_ptr(),
                         m * h,
                     );
+                    self.trace_emit_bf16_row(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "pre_mlp_hidden_last",
+                        *self.scratch.d_hidden.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
                 }
 
                 // DIAG: d_hidden before MLP (after post-attn-norm = MoE input)
-                if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
+                if diag && chunk_idx == 0 && Self::diag_layer_enabled(layer_idx) {
                     self.diag_print_norms(
                         &format!("layer{:02}_pre_mlp", layer_idx),
                         *self.scratch.d_hidden.device_ptr(), &diag_positions, h);
@@ -2406,7 +4356,7 @@ impl PrefillEngine {
                 // MLP (dense or MoE)
                 let tm0 = Instant::now();
                 if self.layer_weights[layer_idx].moe_gate_ptr != 0 {
-                    if diag && layer_idx < diag_layer_limit {
+                    if diag && Self::diag_layer_enabled(layer_idx) {
                         eprintln!("[DIAG] layer{:02} -> forward_moe (gate_ptr=0x{:x})",
                             layer_idx, self.layer_weights[layer_idx].moe_gate_ptr);
                     }
@@ -2415,15 +4365,39 @@ impl PrefillEngine {
                     // Double-buffer preload is now inside forward_moe_fused itself,
                     // so DMA(N+1) overlaps with compute(N) on the GPU.
                 } else if self.layer_weights[layer_idx].shared_w1.is_some() {
-                    if diag && layer_idx < diag_layer_limit {
+                    if diag && Self::diag_layer_enabled(layer_idx) {
                         eprintln!("[DIAG] layer{:02} -> forward_dense_mlp", layer_idx);
                     }
                     self.forward_dense_mlp(layer_idx, m)?;
-                } else if diag && layer_idx < diag_layer_limit {
+                } else if diag && Self::diag_layer_enabled(layer_idx) {
                     eprintln!("[DIAG] layer{:02} -> NO MLP (no gate, no shared_w1)", layer_idx);
                 }
                 if timing { self.stream_sync()?; t_moe_ms += tm0.elapsed().as_secs_f64() * 1000.0; }
                 if self.trace.as_ref().map_or(false, |t| t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")) {
+                    let post_mlp_trace_inputs = match (
+                        download_device_u16(
+                            *self.scratch.d_residual.device_ptr() + ((m.saturating_sub(1) * h * 2) as u64),
+                            h,
+                        ),
+                        download_device_u16(
+                            *self.scratch.d_hidden.device_ptr() + ((m.saturating_sub(1) * h * 2) as u64),
+                            h,
+                        ),
+                    ) {
+                        (Ok(residual_last_bf16), Ok(hidden_last_bf16)) => Some((residual_last_bf16, hidden_last_bf16)),
+                        (Err(err), _) | (_, Err(err)) => {
+                            trace_emit_prefill_mark(
+                                self.trace.as_ref(),
+                                chunk_idx,
+                                chunk_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                &format!("phase=post_mlp_trace_input_download_failed error={}", err),
+                            );
+                            None
+                        }
+                    };
                     self.trace_emit_bf16(
                         chunk_idx,
                         chunk_start,
@@ -2434,9 +4408,50 @@ impl PrefillEngine {
                         *self.scratch.d_hidden.device_ptr(),
                         m * h,
                     );
+                    self.trace_emit_bf16_row(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "post_mlp_hidden_last",
+                        *self.scratch.d_hidden.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
+                    if let Some((residual_last_bf16, hidden_last_bf16)) = post_mlp_trace_inputs.as_ref() {
+                        let residual_last = residual_last_bf16
+                            .iter()
+                            .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                            .collect::<Vec<_>>();
+                        let hidden_last = hidden_last_bf16
+                            .iter()
+                            .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                            .collect::<Vec<_>>();
+                        let post_moe_last =
+                            self.diag_compute_residual_add_last_cpu(&residual_last, &hidden_last);
+                        self.trace_emit_f32_values(
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            "post_moe_last",
+                            &post_moe_last,
+                        );
+                        self.trace_emit_f32_values(
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            "layer_output_residual_last",
+                            &post_moe_last,
+                        );
+                    }
                 }
 
-                if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
+                if diag && chunk_idx == 0 && Self::diag_layer_enabled(layer_idx) {
                     self.diag_print_norms(
                         &format!("layer{:02}_mlp", layer_idx),
                         *self.scratch.d_hidden.device_ptr(), &diag_positions, h);
@@ -2489,6 +4504,38 @@ impl PrefillEngine {
 
         // Use last chunk's m for final processing
         let m = total_m - (num_chunks - 1) * chunk_size.min(total_m);
+        let trace_prefill_final = self.trace.as_ref().map_or(false, |t| {
+            t.should_emit(num_chunks.saturating_sub(1), None, "prefill")
+        });
+        let final_trace_inputs = if trace_prefill_final && m > 0 {
+            let last_pos = m - 1;
+            match (
+                download_device_u16(
+                    *self.scratch.d_residual.device_ptr() + (last_pos * h * 2) as u64,
+                    h,
+                ),
+                download_device_u16(
+                    *self.scratch.d_hidden.device_ptr() + (last_pos * h * 2) as u64,
+                    h,
+                ),
+            ) {
+                (Ok(residual_last), Ok(hidden_last)) => Some((residual_last, hidden_last)),
+                (Err(err), _) | (_, Err(err)) => {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        num_chunks.saturating_sub(1),
+                        total_m.saturating_sub(1),
+                        token_ids.last().copied().unwrap_or(0) as usize,
+                        None,
+                        "prefill",
+                        &format!("phase=final_prefill_trace_input_download_failed error={}", err),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // 4. Final RMSNorm
         self.launch_fused_add_rmsnorm(
@@ -2508,6 +4555,110 @@ impl PrefillEngine {
                 *self.scratch.d_hidden.device_ptr(),
                 m * h,
             );
+            self.trace_emit_bf16_row(
+                num_chunks.saturating_sub(1),
+                total_m.saturating_sub(1),
+                token_ids.last().copied().unwrap_or(0) as usize,
+                None,
+                "prefill",
+                "final_hidden_last",
+                *self.scratch.d_hidden.device_ptr(),
+                m.saturating_sub(1),
+                h,
+            );
+        }
+        if let Some((residual_last_bf16, hidden_last_bf16)) = final_trace_inputs.as_ref() {
+            let last_pos = m - 1;
+            let token_id = token_ids.last().copied().unwrap_or(0) as usize;
+            let residual_last = residual_last_bf16
+                .iter()
+                .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                .collect::<Vec<_>>();
+            let hidden_last = hidden_last_bf16
+                .iter()
+                .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                .collect::<Vec<_>>();
+            let (expected_final_residual, expected_final_hidden) =
+                self.diag_compute_fused_add_rmsnorm_last_cpu(
+                    &residual_last,
+                    &hidden_last,
+                    self.final_norm_ptr,
+                    h,
+                );
+            self.trace_emit_f32_values(
+                num_chunks.saturating_sub(1),
+                total_m.saturating_sub(1),
+                token_id,
+                None,
+                "prefill",
+                "final_residual_last_cpu_ref",
+                &expected_final_residual,
+            );
+            self.trace_emit_f32_values(
+                num_chunks.saturating_sub(1),
+                total_m.saturating_sub(1),
+                token_id,
+                None,
+                "prefill",
+                "final_hidden_last_cpu_ref",
+                &expected_final_hidden,
+            );
+            match (
+                download_device_u16(
+                    *self.scratch.d_residual.device_ptr() + (last_pos * h * 2) as u64,
+                    h,
+                ),
+                download_device_u16(
+                    *self.scratch.d_hidden.device_ptr() + (last_pos * h * 2) as u64,
+                    h,
+                ),
+            ) {
+                (Ok(actual_final_residual_bf16), Ok(actual_final_hidden_bf16)) => {
+                    let actual_final_residual = actual_final_residual_bf16
+                        .iter()
+                        .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                        .collect::<Vec<_>>();
+                    let actual_final_hidden = actual_final_hidden_bf16
+                        .iter()
+                        .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                        .collect::<Vec<_>>();
+                    self.trace_emit_compare_summary(
+                        num_chunks.saturating_sub(1),
+                        total_m.saturating_sub(1),
+                        token_id,
+                        None,
+                        "prefill",
+                        "final_residual",
+                        "final_residual_last_vendor",
+                        "final_residual_last_cpu_ref",
+                        &actual_final_residual,
+                        &expected_final_residual,
+                    );
+                    self.trace_emit_compare_summary(
+                        num_chunks.saturating_sub(1),
+                        total_m.saturating_sub(1),
+                        token_id,
+                        None,
+                        "prefill",
+                        "final_hidden_bf16_roundtrip",
+                        "final_hidden_last_vendor",
+                        "final_hidden_last_cpu_ref",
+                        &actual_final_hidden,
+                        &expected_final_hidden,
+                    );
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        num_chunks.saturating_sub(1),
+                        total_m.saturating_sub(1),
+                        token_id,
+                        None,
+                        "prefill",
+                        &format!("phase=final_prefill_trace_output_download_failed error={}", err),
+                    );
+                }
+            }
         }
 
         if diag {
@@ -2517,6 +4668,166 @@ impl PrefillEngine {
 
         // 5. LM head + sampling
         let first_token = self.lm_head_and_sample(m, temperature, suppress_tokens)?;
+        if trace_prefill_final && m > 0 {
+            let last_pos = m - 1;
+            let token_id = token_ids.last().copied().unwrap_or(0) as usize;
+            match download_device_u16(
+                *self.scratch.d_hidden.device_ptr() + (last_pos * h * 2) as u64,
+                h,
+            ) {
+                Ok(final_hidden_last_bf16) => {
+                    let expected_logits = if let Some(ref lm) = self.lm_head {
+                        compute_marlin_gemm_row_cpu_reference(&final_hidden_last_bf16, lm)
+                    } else if self.lm_head_bf16_ptr != 0 {
+                        compute_bf16_gemm_row_cpu_reference(
+                            &final_hidden_last_bf16,
+                            self.lm_head_bf16_ptr,
+                            self.lm_head_bf16_rows,
+                            self.lm_head_bf16_cols,
+                        )
+                    } else {
+                        Err("no lm head registered for final trace".to_string())
+                    };
+                    match expected_logits {
+                        Ok(expected_logits) => {
+                            let actual_logits = self.h_logits.clone();
+                            self.trace_emit_compare_summary(
+                                num_chunks.saturating_sub(1),
+                                total_m.saturating_sub(1),
+                                token_id,
+                                None,
+                                "prefill",
+                                "prefill_logits",
+                                "prefill_logits_vendor",
+                                "prefill_logits_cpu_ref",
+                                &actual_logits,
+                                &expected_logits,
+                            );
+                            if let Some(ref lm) = self.lm_head {
+                                if let Ok(expected_alt_logits) =
+                                    compute_marlin_gemm_row_cpu_reference_alt_layout(
+                                        &final_hidden_last_bf16,
+                                        lm,
+                                    )
+                                {
+                                    self.trace_emit_compare_summary(
+                                        num_chunks.saturating_sub(1),
+                                        total_m.saturating_sub(1),
+                                        token_id,
+                                        None,
+                                        "prefill",
+                                        "prefill_logits_alt_layout",
+                                        "prefill_logits_vendor",
+                                        "prefill_logits_cpu_ref_alt_layout",
+                                        &actual_logits,
+                                        &expected_alt_logits,
+                                    );
+                                    let default_summary =
+                                        summarize_trace_diff(&actual_logits, &expected_logits);
+                                    let alt_summary =
+                                        summarize_trace_diff(&actual_logits, &expected_alt_logits);
+                                    trace_emit_prefill_mark(
+                                        self.trace.as_ref(),
+                                        num_chunks.saturating_sub(1),
+                                        total_m.saturating_sub(1),
+                                        token_id,
+                                        None,
+                                        "prefill",
+                                        &format!(
+                                            "phase=prefill_logits_layout_check default_max_abs={:.6} alt_max_abs={:.6} better={}",
+                                            default_summary.max_abs,
+                                            alt_summary.max_abs,
+                                            if alt_summary.max_abs < default_summary.max_abs {
+                                                "alt"
+                                            } else {
+                                                "default"
+                                            },
+                                        ),
+                                    );
+                                }
+                            }
+                            let actual_topk = compute_topk_ids_from_logits_cpu(&actual_logits, 10);
+                            let expected_topk = compute_topk_ids_from_logits_cpu(&expected_logits, 10);
+                            let actual_argmax_total = actual_logits
+                                .iter()
+                                .enumerate()
+                                .max_by(|(ia, a), (ib, b)| b.total_cmp(a).then_with(|| ia.cmp(ib)))
+                                .map(|(idx, _)| idx as i32)
+                                .unwrap_or(-1);
+                            let actual_argmax_partial = actual_logits
+                                .iter()
+                                .enumerate()
+                                .max_by(|(_, a), (_, b)| {
+                                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                                .map(|(idx, _)| idx as i32)
+                                .unwrap_or(-1);
+                            let nan_count = actual_logits.iter().filter(|v| v.is_nan()).count();
+                            let pos_inf_count =
+                                actual_logits.iter().filter(|v| v.is_infinite() && **v > 0.0).count();
+                            let neg_inf_count =
+                                actual_logits.iter().filter(|v| v.is_infinite() && **v < 0.0).count();
+                            trace_emit_prefill_mark(
+                                self.trace.as_ref(),
+                                num_chunks.saturating_sub(1),
+                                total_m.saturating_sub(1),
+                                token_id,
+                                None,
+                                "prefill",
+                                &format!(
+                                    "phase=prefill_selector_check first_token={} actual_argmax_total={} actual_argmax_partial={} topk_head={} nan_count={} pos_inf_count={} neg_inf_count={}",
+                                    first_token,
+                                    actual_argmax_total,
+                                    actual_argmax_partial,
+                                    actual_topk.first().copied().unwrap_or(-1),
+                                    nan_count,
+                                    pos_inf_count,
+                                    neg_inf_count,
+                                ),
+                            );
+                            trace_emit_prefill_mark(
+                                self.trace.as_ref(),
+                                num_chunks.saturating_sub(1),
+                                total_m.saturating_sub(1),
+                                token_id,
+                                None,
+                                "prefill",
+                                &format!(
+                                    "phase=prefill_logits_topk actual=[{}] expected=[{}] first_token={} actual_argmax={} expected_argmax={}",
+                                    format_i32_sample(&actual_topk),
+                                    format_i32_sample(&expected_topk),
+                                    first_token,
+                                    actual_topk.first().copied().unwrap_or(-1),
+                                    expected_topk.first().copied().unwrap_or(-1),
+                                ),
+                            );
+                        }
+                        Err(err) => {
+                            trace_emit_prefill_mark(
+                                self.trace.as_ref(),
+                                num_chunks.saturating_sub(1),
+                                total_m.saturating_sub(1),
+                                token_id,
+                                None,
+                                "prefill",
+                                &format!("phase=prefill_logits_cpu_ref_failed error={}", err),
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        num_chunks.saturating_sub(1),
+                        total_m.saturating_sub(1),
+                        token_id,
+                        None,
+                        "prefill",
+                        &format!("phase=final_hidden_for_logits_download_failed error={}", err),
+                    );
+                }
+            }
+        }
 
         // 6. Sync
         self.stream_sync()?;
@@ -2972,6 +5283,25 @@ impl PrefillEngine {
         Ok(())
     }
 
+    fn launch_rmsnorm_fp32w(&self, out: u64, x: u64, w: u64, m: usize, d: usize) -> Result<(), String> {
+        let t = std::cmp::max(32, ((std::cmp::min(1024, d) + 31) / 32) * 32) as u32;
+        let mut p0 = out; let mut p1 = x; let mut p2 = w;
+        let mut p3 = d as i32; let mut p4 = self.config.rms_norm_eps;
+        unsafe {
+            launch(self.kernels.rmsnorm_fp32w,
+                (m as u32, 1, 1), (t, 1, 1), t * 4, self.stream,
+                &mut [
+                    &mut p0 as *mut _ as *mut std::ffi::c_void,
+                    &mut p1 as *mut _ as *mut std::ffi::c_void,
+                    &mut p2 as *mut _ as *mut std::ffi::c_void,
+                    &mut p3 as *mut _ as *mut std::ffi::c_void,
+                    &mut p4 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn launch_fused_add_rmsnorm(
         &self, residual: u64, x: u64, w: u64, m: usize, d: usize,
     ) -> Result<(), String> {
@@ -3266,10 +5596,10 @@ impl PrefillEngine {
         // Treat as [m*num_heads, head_dim] rows — existing rmsnorm kernel handles this.
         let gt1 = Instant::now();
         if lw.q_norm_ptr != 0 {
-            self.launch_rmsnorm(q, q, lw.q_norm_ptr, m * cfg.num_q_heads, cfg.head_dim)?;
+            self.launch_rmsnorm_fp32w(q, q, lw.q_norm_ptr, m * cfg.num_q_heads, cfg.head_dim)?;
         }
         if lw.k_norm_ptr != 0 {
-            self.launch_rmsnorm(k, k, lw.k_norm_ptr, m * cfg.num_kv_heads, cfg.head_dim)?;
+            self.launch_rmsnorm_fp32w(k, k, lw.k_norm_ptr, m * cfg.num_kv_heads, cfg.head_dim)?;
         }
 
         if gt { self.stream_sync()?; self.t_gqa_norm.set(self.t_gqa_norm.get() + gt1.elapsed().as_secs_f64() * 1000.0); }
@@ -3800,6 +6130,17 @@ impl PrefillEngine {
                 attn_out,
                 m * cfg.hidden_size,
             );
+            self.trace_emit_bf16_row(
+                trace_step,
+                start_pos + m.saturating_sub(1),
+                0,
+                Some(layer_idx),
+                "gqa_prefill",
+                "attn_out_last",
+                attn_out,
+                m.saturating_sub(1),
+                cfg.hidden_size,
+            );
         }
 
         Ok(())
@@ -3976,7 +6317,7 @@ impl PrefillEngine {
         let lt = self.gqa_timing_enabled.get(); // reuse same env flag for LA timing
         let lt0 = Instant::now();
         let la_diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok()
-            && layer_idx < Self::diag_layer_limit();
+            && Self::diag_layer_enabled(layer_idx);
         // 1. in_proj_qkvz GEMM: [M, hidden] -> [M, qkvz_dim] BF16
         self.la_gemm(hidden, &lw.la_in_proj_qkvz, &lw.la_in_proj_qkvz_bf16, proj_buf, m)?;
         if la_diag {
@@ -4176,6 +6517,11 @@ impl PrefillEngine {
                         )?;
                     }
                 }
+                if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                    let last_pos = m.saturating_sub(1);
+                    self.trace_emit_bf16_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "beta_last", beta_bf16_buf, last_pos, nv);
+                    self.trace_emit_bf16_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "gate_last", gate_bf16_buf, last_pos, nv);
+                }
 
                 // Fused repeat-interleave + L2 norm (BF16 in, BF16 out)
                 // Reads [M, nk, dk] BF16, writes [M, nv, dk] BF16 normalized
@@ -4223,7 +6569,6 @@ impl PrefillEngine {
                         )?;
                     }
                 }
-
                 if lt { self.stream_sync()?; self.t_la_prep.set(self.t_la_prep.get() + lt2.elapsed().as_secs_f64() * 1000.0); }
 
                 // ── FLA (Flash Linear Attention) ──
@@ -4239,6 +6584,12 @@ impl PrefillEngine {
                 // beta and gate for FLA
                 let fla_beta_bf16 = beta_bf16_buf;
                 let fla_gate_bf16 = gate_bf16_buf;
+                if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                    let last_pos = m.saturating_sub(1);
+                    self.trace_emit_bf16_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "q_last", fla_q_bf16, last_pos, nv * dk);
+                    self.trace_emit_bf16_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "k_last", fla_k_bf16, last_pos, nv * dk);
+                    self.trace_emit_bf16_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "v_last", fla_v_bf16, last_pos, nv * dv);
+                }
 
                 // Zero-pad beyond M (BF16 = 2 bytes per element)
                 if fla_pad > 0 {
@@ -4269,9 +6620,7 @@ impl PrefillEngine {
                 let w_fla = *self.d_fla_w.as_ref().ok_or("no fla_w")?.device_ptr();
                 let u_fla = *self.d_fla_u.as_ref().ok_or("no fla_u")?.device_ptr();
                 let h_fla = *self.d_fla_h.as_ref().ok_or("no fla_h")?.device_ptr();
-                // h0 is only read by step 5, so reuse the output buffer as a zeroed
-                // BF16 initial state and let step 6 overwrite it later.
-                let h0_fla = *self.d_fla_o.as_ref().ok_or("no fla_o")?.device_ptr();
+                let h0_fla = *self.d_fla_h0.as_ref().ok_or("no fla_h0")?.device_ptr();
                 let ht_fla = *self.d_fla_final_state.as_ref().ok_or("no fla_final_state")?.device_ptr();
                 let v_new_fla = *self.d_fla_v_new.as_ref().ok_or("no fla_v_new")?.device_ptr();
                 let o_fla = *self.d_fla_o.as_ref().ok_or("no fla_o")?.device_ptr();
@@ -4281,8 +6630,15 @@ impl PrefillEngine {
 
                 // DEBUG: sync before FLA to catch conv/gate/repeat kernel errors
 
-                // Zero h0 (BF16 initial state) — separate from ht (FP32 output)
+                // Zero runtime FLA scratch/state buffers that the vendor recurrence
+                // treats as zero-initialized outputs for each request.
                 unsafe {
+                    let _ = cuda_sys::lib().cuMemsetD8Async(
+                        a_fla, 0, (fla_total * nv * fla_bt * 4) as usize, self.stream);
+                    let _ = cuda_sys::lib().cuMemsetD8Async(
+                        ai_fla, 0, (fla_total * nv * fla_bt * 2) as usize, self.stream);
+                    let _ = cuda_sys::lib().cuMemsetD8Async(
+                        h_fla, 0, (fla_nt * nv * dk * dv * 2) as usize, self.stream);
                     let _ = cuda_sys::lib().cuMemsetD8Async(
                         h0_fla, 0, (nv * dk * dv * 2) as usize, self.stream);
                 }
@@ -4290,15 +6646,295 @@ impl PrefillEngine {
                 let stream_ptr = self.stream as *mut std::ffi::c_void;
 
                 let g_cum_fla = *self.d_fla_g_cumsum.as_ref().ok_or("no fla_g_cumsum")?.device_ptr();
+                let trace_la_mixer = self
+                    .trace
+                    .as_ref()
+                    .map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer"));
+                let mut trace_stage_summaries: Vec<(&'static str, f32, usize, f32, f32)> = Vec::new();
+                let mut trace_g_cumsum_chunk_fp32_gate_ref: Option<Vec<f32>> = None;
+                let mut trace_value_corrected_chunk_fp32_gate_ref: Option<Vec<f32>> = None;
 
-                // Step 1: cumsum — gate(BF16) → g_cumsum(FP32)
-                // Grid: (NT, B*H) = (fla_nt, nv)
-                let rc = unsafe {
-                    (fla.cumsum)(fla_gate_bf16, g_cum_fla, 1.0f32,
-                        0, 0, t_arg,
-                        fla_nt as u32, nv as u32, 1, stream_ptr)
-                };
-                if rc != 0 { return Err(format!("FLA cumsum failed: {}", rc)); }
+                // Step 1: compute gate in FP32 and cumsum in FP32.
+                // The established chunked path keeps gate/cumsum in FP32; feeding
+                // BF16 gate into the vendored cumsum drifts enough on QCN to alter
+                // the exp-weighted decay factors materially on the exact failing
+                // prompt. Keep beta on the existing BF16 fast path, but restore FP32
+                // gate accumulation before entering the vendored FLA chain.
+                let gate_fp32_token_major = fp32_scratch; // [T, nv]
+                {
+                    let gt = std::cmp::max(32, ((std::cmp::min(1024, nv) + 31) / 32) * 32) as u32;
+                    let mut g0 = g_cum_fla; // throwaway beta FP32 output
+                    let mut g1 = gate_fp32_token_major;
+                    let mut g2 = la_b;
+                    let mut g3 = la_a;
+                    let mut g4 = lw.la_a_log_ptr;
+                    let mut g5 = lw.la_dt_bias_ptr;
+                    let mut g6 = nv as i32;
+                    unsafe {
+                        launch(self.kernels.la_compute_gate_beta,
+                            (m as u32, 1, 1), (gt, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut g0 as *mut _ as *mut std::ffi::c_void,
+                                &mut g1 as *mut _ as *mut std::ffi::c_void,
+                                &mut g2 as *mut _ as *mut std::ffi::c_void,
+                                &mut g3 as *mut _ as *mut std::ffi::c_void,
+                                &mut g4 as *mut _ as *mut std::ffi::c_void,
+                                &mut g5 as *mut _ as *mut std::ffi::c_void,
+                                &mut g6 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
+                }
+                if fla_pad > 0 {
+                    unsafe {
+                        let _ = cuda_sys::lib().cuMemsetD8Async(
+                            gate_fp32_token_major + (m * nv * 4) as u64,
+                            0,
+                            (fla_pad * nv * 4) as usize,
+                            self.stream,
+                        );
+                    }
+                }
+                // la_cumsum expects head-major [nv, num_chunks, BT], while the FLA
+                // kernels consume token-major [T, nv]. Transpose into head-major for
+                // the prefix sum, then transpose the FP32 cumulative gate back.
+                self.launch_transpose_f32(g_cum_fla, gate_fp32_token_major, fla_total, nv)?;
+                {
+                    let mut cs0 = fp32_scratch; // head-major FP32 cumsum scratch
+                    let mut cs1 = g_cum_fla;     // head-major FP32 gate input
+                    let mut cs2 = fla_nt as i32;
+                    let mut cs3 = fla_bt as i32;
+                    unsafe {
+                        launch(self.kernels.la_cumsum,
+                            (nv as u32, fla_nt as u32, 1), (1, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut cs0 as *mut _ as *mut std::ffi::c_void,
+                                &mut cs1 as *mut _ as *mut std::ffi::c_void,
+                                &mut cs2 as *mut _ as *mut std::ffi::c_void,
+                                &mut cs3 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
+                }
+                self.launch_transpose_f32(g_cum_fla, fp32_scratch, nv, fla_total)?;
+                if trace_la_mixer {
+                    let last_pos = m.saturating_sub(1);
+                    let beta_trace_scratch = a_fla; // trace-only scratch; kkt overwrites A afterwards
+                    let gate_trace_snapshot = {
+                        let gt = std::cmp::max(32, ((std::cmp::min(1024, nv) + 31) / 32) * 32) as u32;
+                        let mut g0 = beta_trace_scratch;
+                        let mut g1 = gate_fp32_token_major;
+                        let mut g2 = la_b;
+                        let mut g3 = la_a;
+                        let mut g4 = lw.la_a_log_ptr;
+                        let mut g5 = lw.la_dt_bias_ptr;
+                        let mut g6 = nv as i32;
+                        unsafe {
+                            launch(self.kernels.la_compute_gate_beta,
+                                (m as u32, 1, 1), (gt, 1, 1), 0, self.stream,
+                                &mut [
+                                    &mut g0 as *mut _ as *mut std::ffi::c_void,
+                                    &mut g1 as *mut _ as *mut std::ffi::c_void,
+                                    &mut g2 as *mut _ as *mut std::ffi::c_void,
+                                    &mut g3 as *mut _ as *mut std::ffi::c_void,
+                                    &mut g4 as *mut _ as *mut std::ffi::c_void,
+                                    &mut g5 as *mut _ as *mut std::ffi::c_void,
+                                    &mut g6 as *mut _ as *mut std::ffi::c_void,
+                                ],
+                            )?;
+                        }
+                        if fla_pad > 0 {
+                            unsafe {
+                                let _ = cuda_sys::lib().cuMemsetD8Async(
+                                    gate_fp32_token_major + (m * nv * 4) as u64,
+                                    0,
+                                    (fla_pad * nv * 4) as usize,
+                                    self.stream,
+                                );
+                            }
+                        }
+                        (
+                            self.diag_download_f32(
+                                beta_trace_scratch + ((last_pos * nv * 4) as u64),
+                                nv,
+                            ),
+                            self.diag_download_f32(
+                                gate_fp32_token_major + ((last_pos * nv * 4) as u64),
+                                nv,
+                            ),
+                            self.diag_compute_fla_g_cumsum_chunk_cpu_from_gate_f32(
+                                gate_fp32_token_major,
+                                m,
+                                nv,
+                                fla_bt,
+                            ),
+                        )
+                    };
+                    let q_last_vendor = self.diag_download_bf16(
+                        fla_q_bf16 + ((last_pos * nv * dk * 2) as u64),
+                        nv * dk,
+                    );
+                    let q_last_fp32_ref = self.diag_compute_repeat_l2norm_last_cpu(
+                        conv_q_bf16,
+                        m,
+                        nk,
+                        dk,
+                        hr,
+                        scale,
+                    );
+                    let q_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "prep_q_vs_fp32_ref",
+                        "q_last_vendor",
+                        "q_last_fp32_ref",
+                        &q_last_vendor,
+                        &q_last_fp32_ref,
+                    );
+                    trace_stage_summaries.push((
+                        "prep_q_vs_fp32_ref",
+                        q_summary.max_abs,
+                        q_summary.max_abs_idx,
+                        q_summary.actual_at_max,
+                        q_summary.expected_at_max,
+                    ));
+                    let k_last_vendor = self.diag_download_bf16(
+                        fla_k_bf16 + ((last_pos * nv * dk * 2) as u64),
+                        nv * dk,
+                    );
+                    let k_last_fp32_ref = self.diag_compute_repeat_l2norm_last_cpu(
+                        conv_k_bf16,
+                        m,
+                        nk,
+                        dk,
+                        hr,
+                        1.0,
+                    );
+                    let k_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "prep_k_vs_fp32_ref",
+                        "k_last_vendor",
+                        "k_last_fp32_ref",
+                        &k_last_vendor,
+                        &k_last_fp32_ref,
+                    );
+                    trace_stage_summaries.push((
+                        "prep_k_vs_fp32_ref",
+                        k_summary.max_abs,
+                        k_summary.max_abs_idx,
+                        k_summary.actual_at_max,
+                        k_summary.expected_at_max,
+                    ));
+                    let beta_last_vendor = self.diag_download_bf16(
+                        fla_beta_bf16 + ((last_pos * nv * 2) as u64),
+                        nv,
+                    );
+                    let (
+                        beta_last_fp32_ref,
+                        gate_last_fp32_ref,
+                        g_cumsum_chunk_fp32_gate_ref,
+                    ) = gate_trace_snapshot;
+                    trace_g_cumsum_chunk_fp32_gate_ref =
+                        Some(g_cumsum_chunk_fp32_gate_ref.clone());
+                    let g_cumsum_last_fp32_gate_ref =
+                        g_cumsum_chunk_fp32_gate_ref[((last_pos % fla_bt) * nv)
+                            ..(((last_pos % fla_bt) + 1) * nv)]
+                            .to_vec();
+                    let beta_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "prep_beta_vs_fp32_ref",
+                        "beta_last_vendor",
+                        "beta_last_fp32_ref",
+                        &beta_last_vendor,
+                        &beta_last_fp32_ref,
+                    );
+                    trace_stage_summaries.push((
+                        "prep_beta_vs_fp32_ref",
+                        beta_summary.max_abs,
+                        beta_summary.max_abs_idx,
+                        beta_summary.actual_at_max,
+                        beta_summary.expected_at_max,
+                    ));
+                    self.trace_emit_f32_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "g_cumsum_last", g_cum_fla, last_pos, nv);
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "gate_last_fp32_ref",
+                        &gate_last_fp32_ref,
+                    );
+                    let g_cumsum_last_vendor = self.diag_download_f32(
+                        g_cum_fla + ((last_pos * nv * 4) as u64),
+                        nv,
+                    );
+                    let g_cumsum_last_vendor_minus_fp32_gate_ref = g_cumsum_last_vendor
+                        .iter()
+                        .zip(g_cumsum_last_fp32_gate_ref.iter())
+                        .map(|(vendor, cpu)| vendor - cpu)
+                        .collect::<Vec<f32>>();
+                    let g_cumsum_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "g_cumsum_vs_fp32_gate_ref",
+                        "g_cumsum_last_vendor",
+                        "g_cumsum_last_fp32_gate_ref",
+                        &g_cumsum_last_vendor,
+                        &g_cumsum_last_fp32_gate_ref,
+                    );
+                    trace_stage_summaries.push((
+                        "g_cumsum_vs_fp32_gate_ref",
+                        g_cumsum_summary.max_abs,
+                        g_cumsum_summary.max_abs_idx,
+                        g_cumsum_summary.actual_at_max,
+                        g_cumsum_summary.expected_at_max,
+                    ));
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "g_cumsum_last_fp32_gate_ref",
+                        &g_cumsum_last_fp32_gate_ref,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "g_cumsum_last_vendor_minus_fp32_gate_ref",
+                        &g_cumsum_last_vendor_minus_fp32_gate_ref,
+                    );
+                }
+                if la_diag {
+                    self.stream_sync()?;
+                    let g_head0 = self.diag_download_f32(g_cum_fla, (nv * 4).max(4));
+                    eprintln!(
+                        "[DIAG L{:02} FLA] step1_cumsum: g_head0[0..4]=[{:.4},{:.4},{:.4},{:.4}]",
+                        layer_idx,
+                        *g_head0.get(0).unwrap_or(&0.0),
+                        *g_head0.get(nv).unwrap_or(&0.0),
+                        *g_head0.get(nv * 2).unwrap_or(&0.0),
+                        *g_head0.get(nv * 3).unwrap_or(&0.0),
+                    );
+                }
 
                 // Step 2: kkt — k, g_cumsum, beta → A
                 // Grid: (NT, B*H) = (fla_nt, nv)
@@ -4308,6 +6944,118 @@ impl PrefillEngine {
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA kkt failed: {}", rc)); }
+                if trace_la_mixer {
+                    let last_pos = m.saturating_sub(1);
+                    self.trace_emit_f32_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "a_last", a_fla, last_pos, nv * fla_bt);
+                    let vendor_a = self.diag_download_f32(
+                        a_fla + ((last_pos * nv * fla_bt * 4) as u64),
+                        nv * fla_bt,
+                    );
+                    let cpu_a = self.diag_compute_fla_a_last_cpu(
+                        fla_k_bf16,
+                        g_cum_fla,
+                        fla_beta_bf16,
+                        m,
+                        nv,
+                        dk,
+                        fla_bt,
+                    );
+                    let vendor_a_minus_cpu = vendor_a
+                        .iter()
+                        .zip(cpu_a.iter())
+                        .map(|(vendor, cpu)| vendor - cpu)
+                        .collect::<Vec<f32>>();
+                    let cpu_a_from_fp32_gate_ref = self.diag_compute_fla_a_last_cpu_from_g_chunk(
+                        fla_k_bf16,
+                        fla_beta_bf16,
+                        trace_g_cumsum_chunk_fp32_gate_ref
+                            .as_ref()
+                            .ok_or("missing trace fp32 gate cumsum chunk")?,
+                        m,
+                        nv,
+                        dk,
+                        fla_bt,
+                    );
+                    let vendor_a_minus_fp32_gate_ref = vendor_a
+                        .iter()
+                        .zip(cpu_a_from_fp32_gate_ref.iter())
+                        .map(|(vendor, cpu)| vendor - cpu)
+                        .collect::<Vec<f32>>();
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "a_last_cpu_ref",
+                        &cpu_a,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "a_last_cpu_ref_from_fp32_gate_ref",
+                        &cpu_a_from_fp32_gate_ref,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "a_last_vendor_minus_cpu_ref",
+                        &vendor_a_minus_cpu,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "a_last_vendor_minus_fp32_gate_ref",
+                        &vendor_a_minus_fp32_gate_ref,
+                    );
+                    let summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "kkt",
+                        "a_last_vendor",
+                        "a_last_cpu_ref",
+                        &vendor_a,
+                        &cpu_a,
+                    );
+                    trace_stage_summaries.push((
+                        "kkt",
+                        summary.max_abs,
+                        summary.max_abs_idx,
+                        summary.actual_at_max,
+                        summary.expected_at_max,
+                    ));
+                    let fp32_gate_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "kkt_vs_fp32_gate_ref",
+                        "a_last_vendor",
+                        "a_last_cpu_ref_from_fp32_gate_ref",
+                        &vendor_a,
+                        &cpu_a_from_fp32_gate_ref,
+                    );
+                    trace_stage_summaries.push((
+                        "kkt_vs_fp32_gate_ref",
+                        fp32_gate_summary.max_abs,
+                        fp32_gate_summary.max_abs_idx,
+                        fp32_gate_summary.actual_at_max,
+                        fp32_gate_summary.expected_at_max,
+                    ));
+                }
 
                 // Step 3: solve_tril — A → Ai
                 // Grid: (NT, B*H) = (fla_nt, nv)
@@ -4317,6 +7065,67 @@ impl PrefillEngine {
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA solve_tril failed: {}", rc)); }
+                if trace_la_mixer {
+                    let last_pos = m.saturating_sub(1);
+                    self.trace_emit_bf16_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "ai_last", ai_fla, last_pos, nv * fla_bt);
+                    let vendor_ai = self.diag_download_bf16(
+                        ai_fla + ((last_pos * nv * fla_bt * 2) as u64),
+                        nv * fla_bt,
+                    );
+                    let cpu_ai_from_vendor_a =
+                        self.diag_compute_fla_ai_last_cpu_from_a(a_fla, m, nv, fla_bt);
+                    let vendor_ai_minus_cpu = vendor_ai
+                        .iter()
+                        .zip(cpu_ai_from_vendor_a.iter())
+                        .map(|(vendor, cpu)| vendor - cpu)
+                        .collect::<Vec<f32>>();
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "ai_last_cpu_ref_from_vendor_a",
+                        &cpu_ai_from_vendor_a,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "ai_last_vendor_minus_cpu_ref",
+                        &vendor_ai_minus_cpu,
+                    );
+                    let summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "solve_tril",
+                        "ai_last_vendor",
+                        "ai_last_cpu_ref_from_vendor_a",
+                        &vendor_ai,
+                        &cpu_ai_from_vendor_a,
+                    );
+                    trace_stage_summaries.push((
+                        "solve_tril",
+                        summary.max_abs,
+                        summary.max_abs_idx,
+                        summary.actual_at_max,
+                        summary.expected_at_max,
+                    ));
+                }
+                if la_diag {
+                    self.stream_sync()?;
+                    let a_h0p0 = self.diag_l2_norm_f32(a_fla, 0, nv * fla_bt, fla_bt);
+                    let ai_h0p0 = self.diag_l2_norm(ai_fla, 0, nv * fla_bt, fla_bt);
+                    eprintln!(
+                        "[DIAG L{:02} FLA] step3_solve: A_h0p0={:.6} Ai_h0p0={:.6}",
+                        layer_idx, a_h0p0, ai_h0p0
+                    );
+                }
 
                 // Step 4: recompute_w_u — k, v, beta, Ai, g → w, u
                 // Grid: (NT, B*H) = (fla_nt, nv)
@@ -4327,6 +7136,242 @@ impl PrefillEngine {
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA wy_repr failed: {}", rc)); }
+                if trace_la_mixer {
+                    let last_pos = m.saturating_sub(1);
+                    self.trace_emit_bf16_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "w_last", w_fla, last_pos, nv * dk);
+                    self.trace_emit_bf16_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "u_last", u_fla, last_pos, nv * dv);
+                    let vendor_w = self.diag_download_bf16(
+                        w_fla + ((last_pos * nv * dk * 2) as u64),
+                        nv * dk,
+                    );
+                    let vendor_u = self.diag_download_bf16(
+                        u_fla + ((last_pos * nv * dv * 2) as u64),
+                        nv * dv,
+                    );
+                    let (cpu_w, cpu_u) = self.diag_compute_fla_wy_last_cpu(
+                        ai_fla,
+                        fla_k_bf16,
+                        fla_v_bf16,
+                        fla_beta_bf16,
+                        g_cum_fla,
+                        m,
+                        nv,
+                        dk,
+                        dv,
+                        fla_bt,
+                    );
+                    let vendor_w_minus_cpu = vendor_w
+                        .iter()
+                        .zip(cpu_w.iter())
+                        .map(|(vendor, cpu)| vendor - cpu)
+                        .collect::<Vec<f32>>();
+                    let vendor_u_minus_cpu = vendor_u
+                        .iter()
+                        .zip(cpu_u.iter())
+                        .map(|(vendor, cpu)| vendor - cpu)
+                        .collect::<Vec<f32>>();
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "w_last_cpu_ref",
+                        &cpu_w,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "u_last_cpu_ref",
+                        &cpu_u,
+                    );
+                    let custom_value_corrected =
+                        self.diag_compute_custom_value_corrected_last_from_fla_inputs(
+                            fla_k_bf16,
+                            fla_v_bf16,
+                            fla_beta_bf16,
+                            g_cum_fla,
+                            m,
+                            nv,
+                            dk,
+                            dv,
+                            fla_bt,
+                        );
+                    let custom_value_corrected_chunk_fp32_gate_ref =
+                        self.diag_compute_custom_value_corrected_chunk_from_g_chunk(
+                            fla_k_bf16,
+                            fla_v_bf16,
+                            fla_beta_bf16,
+                            trace_g_cumsum_chunk_fp32_gate_ref
+                                .as_ref()
+                                .ok_or("missing trace fp32 gate cumsum chunk")?,
+                            m,
+                            nv,
+                            dk,
+                            dv,
+                            fla_bt,
+                        );
+                    trace_value_corrected_chunk_fp32_gate_ref =
+                        Some(custom_value_corrected_chunk_fp32_gate_ref.clone());
+                    let custom_value_corrected_fp32_gate_ref =
+                        custom_value_corrected_chunk_fp32_gate_ref
+                            [((last_pos % fla_bt) * nv * dv)..(((last_pos % fla_bt) + 1) * nv * dv)]
+                            .to_vec();
+                    let vendor_u_minus_custom = vendor_u
+                        .iter()
+                        .zip(custom_value_corrected.iter())
+                        .map(|(vendor, custom)| vendor - custom)
+                        .collect::<Vec<f32>>();
+                    let vendor_u_minus_fp32_gate_ref = vendor_u
+                        .iter()
+                        .zip(custom_value_corrected_fp32_gate_ref.iter())
+                        .map(|(vendor, custom)| vendor - custom)
+                        .collect::<Vec<f32>>();
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "w_last_vendor_minus_cpu_ref",
+                        &vendor_w_minus_cpu,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "u_last_vendor_minus_cpu_ref",
+                        &vendor_u_minus_cpu,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "value_corrected_last_custom_ref",
+                        &custom_value_corrected,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "value_corrected_last_fp32_gate_ref",
+                        &custom_value_corrected_fp32_gate_ref,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "u_last_vendor_minus_custom_ref",
+                        &vendor_u_minus_custom,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "u_last_vendor_minus_fp32_gate_ref",
+                        &vendor_u_minus_fp32_gate_ref,
+                    );
+                    let w_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "wy_repr_w",
+                        "w_last_vendor",
+                        "w_last_cpu_ref",
+                        &vendor_w,
+                        &cpu_w,
+                    );
+                    trace_stage_summaries.push((
+                        "wy_repr_w",
+                        w_summary.max_abs,
+                        w_summary.max_abs_idx,
+                        w_summary.actual_at_max,
+                        w_summary.expected_at_max,
+                    ));
+                    let u_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "wy_repr_u_vs_vendor_cpu_ref",
+                        "u_last_vendor",
+                        "u_last_cpu_ref",
+                        &vendor_u,
+                        &cpu_u,
+                    );
+                    trace_stage_summaries.push((
+                        "wy_repr_u_vs_vendor_cpu_ref",
+                        u_summary.max_abs,
+                        u_summary.max_abs_idx,
+                        u_summary.actual_at_max,
+                        u_summary.expected_at_max,
+                    ));
+                    let custom_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "wy_repr_u_vs_custom_value_corrected",
+                        "u_last_vendor",
+                        "value_corrected_last_custom_ref",
+                        &vendor_u,
+                        &custom_value_corrected,
+                    );
+                    trace_stage_summaries.push((
+                        "wy_repr_u_vs_custom_value_corrected",
+                        custom_summary.max_abs,
+                        custom_summary.max_abs_idx,
+                        custom_summary.actual_at_max,
+                        custom_summary.expected_at_max,
+                    ));
+                    let fp32_gate_u_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "wy_repr_u_vs_fp32_gate_ref",
+                        "u_last_vendor",
+                        "value_corrected_last_fp32_gate_ref",
+                        &vendor_u,
+                        &custom_value_corrected_fp32_gate_ref,
+                    );
+                    trace_stage_summaries.push((
+                        "wy_repr_u_vs_fp32_gate_ref",
+                        fp32_gate_u_summary.max_abs,
+                        fp32_gate_u_summary.max_abs_idx,
+                        fp32_gate_u_summary.actual_at_max,
+                        fp32_gate_u_summary.expected_at_max,
+                    ));
+                }
+                if la_diag {
+                    self.stream_sync()?;
+                    let w_h0p0 = self.diag_l2_norm(w_fla, 0, nv * dk, dk);
+                    let u_h0p0 = self.diag_l2_norm(u_fla, 0, nv * dv, dv);
+                    let w_h0plast = self.diag_l2_norm(w_fla, m - 1, nv * dk, dk);
+                    let u_h0plast = self.diag_l2_norm(u_fla, m - 1, nv * dv, dv);
+                    eprintln!(
+                        "[DIAG L{:02} FLA] step4_wy: w_h0p0={:.6} u_h0p0={:.6} w_h0plast={:.6} u_h0plast={:.6}",
+                        layer_idx, w_h0p0, u_h0p0, w_h0plast, u_h0plast
+                    );
+                }
 
                 // Step 5: state_recurrence — k, u, w, g, h0 → h, v_new, ht
                 // Grid: (cdiv(V, BV), B*H) = (cdiv(dv, 32), nv) — BV=32 baked into cubin
@@ -4350,6 +7395,31 @@ impl PrefillEngine {
                         sr_grid_x, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA state_recurrence failed: {}", rc)); }
+                if trace_la_mixer {
+                    let last_pos = m.saturating_sub(1);
+                    self.trace_emit_bf16_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "v_new_last", v_new_fla, last_pos, nv * dv);
+                }
+                if la_diag {
+                    self.stream_sync()?;
+                    let h_chunk0h0 = self.diag_l2_norm(h_fla, 0, dk * dv, dk * dv);
+                    let vnew_h0p0 = self.diag_l2_norm(v_new_fla, 0, nv * dv, dv);
+                    let vnew_h0plast = self.diag_l2_norm(v_new_fla, m - 1, nv * dv, dv);
+                    let ht_h0 = self.diag_l2_norm_f32(ht_fla, 0, dk * dv, dk * dv);
+                    let vnew_last_raw =
+                        self.diag_download_bf16(v_new_fla + (((m - 1) * nv * dv) * 2) as u64, 4);
+                    eprintln!(
+                        "[DIAG L{:02} FLA] step5_recur: h_chunk0h0={:.6} vnew_h0p0={:.6} vnew_h0plast={:.6} ht_h0={:.6} vnew_last_raw=[{:.6},{:.6},{:.6},{:.6}]",
+                        layer_idx,
+                        h_chunk0h0,
+                        vnew_h0p0,
+                        vnew_h0plast,
+                        ht_h0,
+                        *vnew_last_raw.get(0).unwrap_or(&0.0),
+                        *vnew_last_raw.get(1).unwrap_or(&0.0),
+                        *vnew_last_raw.get(2).unwrap_or(&0.0),
+                        *vnew_last_raw.get(3).unwrap_or(&0.0),
+                    );
+                }
 
                 // Step 6: output — q, k, v_new, h, g → o
                 // Grid: (cdiv(V, BV), NT, B*H) = (cdiv(dv, BV), fla_nt, nv) — 3D grid
@@ -4375,6 +7445,200 @@ impl PrefillEngine {
                         o_grid_x, fla_nt as u32, nv as u32, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA output failed: {}", rc)); }
+                if trace_la_mixer {
+                    let last_pos = m.saturating_sub(1);
+                    self.trace_emit_bf16_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "output_last", o_fla, last_pos, nv * dv);
+                    let vendor_output = self.diag_download_bf16(
+                        o_fla + ((last_pos * nv * dv * 2) as u64),
+                        nv * dv,
+                    );
+                    let (cpu_output, cpu_state_term, cpu_local_term) =
+                        self.diag_compute_fla_output_last_cpu(
+                            fla_q_bf16,
+                            fla_k_bf16,
+                            v_new_fla,
+                            h_fla,
+                            g_cum_fla,
+                            m,
+                            nv,
+                            dk,
+                            dv,
+                            fla_bt,
+                        );
+                    let vendor_minus_cpu = vendor_output
+                        .iter()
+                        .zip(cpu_output.iter())
+                        .map(|(vendor, cpu)| vendor - cpu)
+                        .collect::<Vec<f32>>();
+                    let mut cpu_local_output_fp32_gate_ref: Option<Vec<f32>> = None;
+                    if last_pos / fla_bt == 0 {
+                        cpu_local_output_fp32_gate_ref = Some(
+                            self.diag_compute_fla_local_output_last_from_g_chunk_and_v_chunk(
+                                fla_q_bf16,
+                                fla_k_bf16,
+                                trace_value_corrected_chunk_fp32_gate_ref
+                                    .as_ref()
+                                    .ok_or("missing trace fp32 gate value-corrected chunk")?,
+                                trace_g_cumsum_chunk_fp32_gate_ref
+                                    .as_ref()
+                                    .ok_or("missing trace fp32 gate cumsum chunk")?,
+                                m,
+                                nv,
+                                dk,
+                                dv,
+                                fla_bt,
+                            ),
+                        );
+                    }
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "output_last_cpu_ref",
+                        &cpu_output,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "output_last_cpu_state_ref",
+                        &cpu_state_term,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "output_last_cpu_local_ref",
+                        &cpu_local_term,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "output_last_vendor_minus_cpu_ref",
+                        &vendor_minus_cpu,
+                    );
+                    if let Some(cpu_local_output_fp32_gate_ref) =
+                        cpu_local_output_fp32_gate_ref.as_ref()
+                    {
+                        let vendor_minus_fp32_gate_ref = vendor_output
+                            .iter()
+                            .zip(cpu_local_output_fp32_gate_ref.iter())
+                            .map(|(vendor, cpu)| vendor - cpu)
+                            .collect::<Vec<f32>>();
+                        self.trace_emit_f32_values(
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "la_mixer",
+                            "output_last_cpu_local_fp32_gate_ref",
+                            cpu_local_output_fp32_gate_ref,
+                        );
+                        self.trace_emit_f32_values(
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "la_mixer",
+                            "output_last_vendor_minus_fp32_gate_ref",
+                            &vendor_minus_fp32_gate_ref,
+                        );
+                        let output_fp32_gate_summary = self.trace_emit_compare_summary(
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "la_mixer",
+                            "output_vs_fp32_gate_ref",
+                            "output_last_vendor",
+                            "output_last_cpu_local_fp32_gate_ref",
+                            &vendor_output,
+                            cpu_local_output_fp32_gate_ref,
+                        );
+                        trace_stage_summaries.push((
+                            "output_vs_fp32_gate_ref",
+                            output_fp32_gate_summary.max_abs,
+                            output_fp32_gate_summary.max_abs_idx,
+                            output_fp32_gate_summary.actual_at_max,
+                            output_fp32_gate_summary.expected_at_max,
+                        ));
+                    }
+                    let output_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "output",
+                        "output_last_vendor",
+                        "output_last_cpu_ref",
+                        &vendor_output,
+                        &cpu_output,
+                    );
+                    trace_stage_summaries.push((
+                        "output",
+                        output_summary.max_abs,
+                        output_summary.max_abs_idx,
+                        output_summary.actual_at_max,
+                        output_summary.expected_at_max,
+                    ));
+                    let first_bad = trace_stage_summaries.iter().find(|(stage, max_abs, _, _, _)| {
+                        match *stage {
+                            "kkt" => *max_abs > 5e-3,
+                            _ => *max_abs > 2e-2,
+                        }
+                    });
+                    if let Some((stage, max_abs, idx, actual, expected)) = first_bad {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "la_mixer",
+                            &format!(
+                                "first_mismatch stage={} max_abs={:.6} idx={} actual={:.6} expected={:.6}",
+                                stage, max_abs, idx, actual, expected
+                            ),
+                        );
+                    } else {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "la_mixer",
+                            "first_mismatch stage=none",
+                        );
+                    }
+                }
+                if la_diag {
+                    self.stream_sync()?;
+                    let o_h0p0 = self.diag_l2_norm(o_fla, 0, nv * dv, dv);
+                    let o_h0plast = self.diag_l2_norm(o_fla, m - 1, nv * dv, dv);
+                    let o_last_raw =
+                        self.diag_download_bf16(o_fla + (((m - 1) * nv * dv) * 2) as u64, 4);
+                    eprintln!(
+                        "[DIAG L{:02} FLA] step6_output: o_h0p0={:.6} o_h0plast={:.6} o_last_raw=[{:.6},{:.6},{:.6},{:.6}]",
+                        layer_idx,
+                        o_h0p0,
+                        o_h0plast,
+                        *o_last_raw.get(0).unwrap_or(&0.0),
+                        *o_last_raw.get(1).unwrap_or(&0.0),
+                        *o_last_raw.get(2).unwrap_or(&0.0),
+                        *o_last_raw.get(3).unwrap_or(&0.0),
+                    );
+                }
                 if std::env::var("KRASIS_FLA_DEBUG").is_ok() { self.stream_sync().map_err(|e| format!("FLA output sync: {e}"))?; eprintln!("[FLA-DBG] step6 output OK"); }
                 if lt { self.stream_sync()?; self.t_la_fla.set(self.t_la_fla.get() + lt4.elapsed().as_secs_f64() * 1000.0); }
                 let lt5 = Instant::now();
@@ -4458,6 +7722,215 @@ impl PrefillEngine {
                         }
                     }
                 }
+                if trace_la_mixer {
+                    let last_pos = m.saturating_sub(1);
+                    self.trace_emit_bf16_row(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_out_last",
+                        rmsnorm_out,
+                        last_pos,
+                        nv * dv,
+                    );
+                    let output_last = self.diag_download_bf16(
+                        o_fla + ((last_pos * nv * dv * 2) as u64),
+                        nv * dv,
+                    );
+                    let (
+                        grmsnorm_gate_last,
+                        grmsnorm_weight,
+                        grmsnorm_rms_inv,
+                        grmsnorm_normed,
+                        grmsnorm_silu_gate,
+                        grmsnorm_cpu_ref,
+                        grmsnorm_cpu_ref_bf16,
+                    ) = self.diag_compute_la_gated_rmsnorm_last_details_cpu(
+                        &output_last,
+                        la_z,
+                        lw.la_norm_weight_ptr,
+                        m,
+                        nv,
+                        dv,
+                        true,
+                    );
+                    let grmsnorm_vendor = self.diag_download_bf16(
+                        rmsnorm_out + ((last_pos * nv * dv * 2) as u64),
+                        nv * dv,
+                    );
+                    let grmsnorm_vendor_minus_cpu = grmsnorm_vendor
+                        .iter()
+                        .zip(grmsnorm_cpu_ref.iter())
+                        .map(|(vendor, cpu)| vendor - cpu)
+                        .collect::<Vec<f32>>();
+                    let grmsnorm_vendor_minus_cpu_bf16 = grmsnorm_vendor
+                        .iter()
+                        .zip(grmsnorm_cpu_ref_bf16.iter())
+                        .map(|(vendor, cpu)| vendor - cpu)
+                        .collect::<Vec<f32>>();
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_input_last",
+                        &output_last,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_gate_last",
+                        &grmsnorm_gate_last,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_weight",
+                        &grmsnorm_weight,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_rms_inv_per_head",
+                        &grmsnorm_rms_inv,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_normed_last_cpu_ref",
+                        &grmsnorm_normed,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_silu_gate_last_cpu_ref",
+                        &grmsnorm_silu_gate,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_out_last_cpu_ref",
+                        &grmsnorm_cpu_ref,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_out_last_vendor_minus_cpu_ref",
+                        &grmsnorm_vendor_minus_cpu,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_out_last_cpu_ref_bf16",
+                        &grmsnorm_cpu_ref_bf16,
+                    );
+                    self.trace_emit_f32_values(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "grmsnorm_out_last_vendor_minus_cpu_ref_bf16",
+                        &grmsnorm_vendor_minus_cpu_bf16,
+                    );
+                    let grmsnorm_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "gated_rmsnorm",
+                        "grmsnorm_out_last_vendor",
+                        "grmsnorm_out_last_cpu_ref",
+                        &grmsnorm_vendor,
+                        &grmsnorm_cpu_ref,
+                    );
+                    let grmsnorm_bf16_summary = self.trace_emit_compare_summary(
+                        0,
+                        last_pos,
+                        0,
+                        Some(layer_idx),
+                        "la_mixer",
+                        "gated_rmsnorm_bf16_roundtrip",
+                        "grmsnorm_out_last_vendor",
+                        "grmsnorm_out_last_cpu_ref_bf16",
+                        &grmsnorm_vendor,
+                        &grmsnorm_cpu_ref_bf16,
+                    );
+                    trace_stage_summaries.push((
+                        "gated_rmsnorm_bf16_roundtrip",
+                        grmsnorm_bf16_summary.max_abs,
+                        grmsnorm_bf16_summary.max_abs_idx,
+                        grmsnorm_bf16_summary.actual_at_max,
+                        grmsnorm_bf16_summary.expected_at_max,
+                    ));
+                    trace_stage_summaries.push((
+                        "gated_rmsnorm_fp32_reference_gap",
+                        grmsnorm_summary.max_abs,
+                        grmsnorm_summary.max_abs_idx,
+                        grmsnorm_summary.actual_at_max,
+                        grmsnorm_summary.expected_at_max,
+                    ));
+                    let first_bad = trace_stage_summaries.iter().find(|(stage, max_abs, _, _, _)| {
+                        match *stage {
+                            "kkt" => *max_abs > 5e-3,
+                            "gated_rmsnorm_bf16_roundtrip" => *max_abs > 1e-2,
+                            "gated_rmsnorm_fp32_reference_gap" => false,
+                            _ => *max_abs > 2e-2,
+                        }
+                    });
+                    if let Some((stage, max_abs, idx, actual, expected)) = first_bad {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "la_mixer",
+                            &format!(
+                                "first_mismatch stage={} max_abs={:.6} idx={} actual={:.6} expected={:.6}",
+                                stage, max_abs, idx, actual, expected
+                            ),
+                        );
+                    } else {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "la_mixer",
+                            "first_mismatch stage=none",
+                        );
+                    }
+                }
                 if lt { self.stream_sync()?; self.t_la_norm.set(self.t_la_norm.get() + lt6.elapsed().as_secs_f64() * 1000.0); }
 
             } else {
@@ -4537,8 +8010,13 @@ impl PrefillEngine {
                               &mut g3 as *mut _ as *mut std::ffi::c_void,
                               &mut g4 as *mut _ as *mut std::ffi::c_void,
                               &mut g5 as *mut _ as *mut std::ffi::c_void,
-                              &mut g6 as *mut _ as *mut std::ffi::c_void])?;
+                        &mut g6 as *mut _ as *mut std::ffi::c_void])?;
                 }
+            }
+            if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                let last_pos = m.saturating_sub(1);
+                self.trace_emit_f32_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "beta_last", la_beta, last_pos, nv);
+                self.trace_emit_f32_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "gate_last", la_gate, last_pos, nv);
             }
             if hr > 1 {
                 let dt = std::cmp::max(32, ((std::cmp::min(256, dk) + 31) / 32) * 32) as u32;
@@ -4587,6 +8065,12 @@ impl PrefillEngine {
                               &mut l2 as *mut _ as *mut std::ffi::c_void,
                               &mut l3 as *mut _ as *mut std::ffi::c_void])?;
                 }
+            }
+            if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                let last_pos = m.saturating_sub(1);
+                self.trace_emit_f32_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "q_last", la_q, last_pos, nv * dk);
+                self.trace_emit_f32_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "k_last", la_k, last_pos, nv * dk);
+                self.trace_emit_f32_row(0, last_pos, 0, Some(layer_idx), "la_mixer", "v_last", la_v, last_pos, nv * dv);
             }
             if lt { self.stream_sync()?; self.t_la_prep.set(self.t_la_prep.get() + lt2.elapsed().as_secs_f64() * 1000.0); }
 
@@ -4686,6 +8170,22 @@ impl PrefillEngine {
                     )?;
                 }
             }
+            if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                let last_pos = m.saturating_sub(1);
+                self.trace_emit_f32_position_blocks(
+                    0,
+                    last_pos,
+                    0,
+                    Some(layer_idx),
+                    "la_mixer",
+                    "g_cumsum_last",
+                    la_g_cum,
+                    last_pos,
+                    nv,
+                    total_len,
+                    1,
+                );
+            }
 
             // DIAG: after transposition + cumsum, before attn matrix
             if la_diag {
@@ -4729,6 +8229,22 @@ impl PrefillEngine {
                     )?;
                 }
             }
+            if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                let last_pos = m.saturating_sub(1);
+                self.trace_emit_f32_position_blocks(
+                    0,
+                    last_pos,
+                    0,
+                    Some(layer_idx),
+                    "la_mixer",
+                    "attn_last",
+                    la_attn,
+                    last_pos,
+                    nv,
+                    total_len * chunk_size,
+                    chunk_size,
+                );
+            }
 
             // 14. Triangular solve: (I - A) * value_corrected = v_beta
             // Copy v_beta to la_v_new_full (will be overwritten with solution)
@@ -4754,6 +8270,22 @@ impl PrefillEngine {
                         ],
                     )?;
                 }
+            }
+            if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                let last_pos = m.saturating_sub(1);
+                self.trace_emit_f32_position_blocks(
+                    0,
+                    last_pos,
+                    0,
+                    Some(layer_idx),
+                    "la_mixer",
+                    "value_corrected_last",
+                    la_v_beta,
+                    last_pos,
+                    nv,
+                    total_len * dv,
+                    dv,
+                );
             }
 
             // 15. Second triangular solve: (I - A) * k_cumdecay = k_beta * exp(g_cum)
@@ -4801,6 +8333,22 @@ impl PrefillEngine {
                         ],
                     )?;
                 }
+            }
+            if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                let last_pos = m.saturating_sub(1);
+                self.trace_emit_f32_position_blocks(
+                    0,
+                    last_pos,
+                    0,
+                    Some(layer_idx),
+                    "la_mixer",
+                    "k_cumdecay_last",
+                    la_k_beta,
+                    last_pos,
+                    nv,
+                    total_len * dk,
+                    dk,
+                );
             }
 
             // DIAG: after both triangular solves
@@ -4868,6 +8416,26 @@ impl PrefillEngine {
                         )?;
                     }
                 }
+                if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                    let last_pos = m.saturating_sub(1);
+                    let last_chunk = last_pos / cs;
+                    if c == last_chunk {
+                        let chunk_pos = last_pos % cs;
+                        self.trace_emit_f32_position_blocks(
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "la_mixer",
+                            "v_new_last",
+                            la_v_new,
+                            chunk_pos,
+                            nv,
+                            cs * dv,
+                            dv,
+                        );
+                    }
+                }
 
                 // DIAG: after v_new for chunk 0
                 if la_diag && c == 0 {
@@ -4910,6 +8478,25 @@ impl PrefillEngine {
                                 &mut co10 as *mut _ as *mut std::ffi::c_void,
                             ],
                         )?;
+                    }
+                }
+                if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                    let last_pos = m.saturating_sub(1);
+                    let last_chunk = last_pos / cs;
+                    if c == last_chunk {
+                        self.trace_emit_f32_position_blocks(
+                            0,
+                            last_pos,
+                            0,
+                            Some(layer_idx),
+                            "la_mixer",
+                            "output_last",
+                            output_buf,
+                            last_pos,
+                            nv,
+                            total_len * dv,
+                            dv,
+                        );
                     }
                 }
 
@@ -5014,6 +8601,20 @@ impl PrefillEngine {
                 }
                 if lt { self.stream_sync()?; self.t_la_norm.set(self.t_la_norm.get() + lt6.elapsed().as_secs_f64() * 1000.0); }
             }
+            if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "la_mixer")) {
+                let last_pos = m.saturating_sub(1);
+                self.trace_emit_bf16_row(
+                    0,
+                    last_pos,
+                    0,
+                    Some(layer_idx),
+                    "la_mixer",
+                    "grmsnorm_out_last",
+                    rmsnorm_out,
+                    last_pos,
+                    nv * dv,
+                );
+            }
             let lt7 = Instant::now();
             // 21. Output projection: [M, nv*dv] BF16 -> [M, hidden] BF16
             // Input is rmsnorm_out (la_v or la_v_beta, sized [M, nv*dv]).
@@ -5030,6 +8631,117 @@ impl PrefillEngine {
             }
             let o_temp = *self.scratch.d_scratch1.device_ptr();
             self.la_gemm(rmsnorm_out, &lw.la_out_proj, &lw.la_out_proj_bf16, o_temp, m)?;
+            if self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "prefill_layer")) {
+                self.stream_sync()?;
+                let last_pos = m.saturating_sub(1);
+                if let Some(ref w) = lw.la_out_proj {
+                    let input_row_ptr = rmsnorm_out + (last_pos * value_dim * 2) as u64;
+                    let actual_row_ptr = o_temp + (last_pos * cfg.hidden_size * 2) as u64;
+                    match (
+                        download_device_u16(input_row_ptr, value_dim),
+                        download_device_u16(actual_row_ptr, cfg.hidden_size),
+                    ) {
+                        (Ok(input_row_bf16), Ok(actual_row_bf16)) => {
+                            match compute_marlin_gemm_row_cpu_reference(&input_row_bf16, w) {
+                                Ok(expected_fp32) => {
+                                    let actual_f32: Vec<f32> = actual_row_bf16
+                                        .iter()
+                                        .map(|&v| bf16_to_f32(v))
+                                        .collect();
+                                    let expected_bf16 = round_f32_slice_to_bf16(&expected_fp32);
+                                    self.trace_emit_f32_values(
+                                        0,
+                                        last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        "la_out_proj_last_cpu_ref",
+                                        &expected_fp32,
+                                    );
+                                    let actual_minus_ref: Vec<f32> = actual_f32
+                                        .iter()
+                                        .zip(expected_fp32.iter())
+                                        .map(|(&a, &e)| a - e)
+                                        .collect();
+                                    self.trace_emit_f32_values(
+                                        0,
+                                        last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        "la_out_proj_last_vendor_minus_cpu_ref",
+                                        &actual_minus_ref,
+                                    );
+                                    self.trace_emit_compare_summary(
+                                        0,
+                                        last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        "la_out_proj",
+                                        "mixer_out_last_vendor",
+                                        "mixer_out_last_cpu_ref_bf16",
+                                        &actual_f32,
+                                        &expected_bf16,
+                                    );
+                                    if let Ok(expected_alt_fp32) =
+                                        compute_marlin_gemm_row_cpu_reference_alt_layout(
+                                            &input_row_bf16,
+                                            w,
+                                        )
+                                    {
+                                        let expected_alt_bf16 =
+                                            round_f32_slice_to_bf16(&expected_alt_fp32);
+                                        self.trace_emit_f32_values(
+                                            0,
+                                            last_pos,
+                                            0,
+                                            Some(layer_idx),
+                                            "prefill_layer",
+                                            "la_out_proj_last_cpu_ref_alt_layout",
+                                            &expected_alt_fp32,
+                                        );
+                                        self.trace_emit_compare_summary(
+                                            0,
+                                            last_pos,
+                                            0,
+                                            Some(layer_idx),
+                                            "prefill_layer",
+                                            "la_out_proj_alt_layout",
+                                            "mixer_out_last_vendor",
+                                            "mixer_out_last_cpu_ref_alt_layout_bf16",
+                                            &actual_f32,
+                                            &expected_alt_bf16,
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    trace_emit_prefill_mark(
+                                        self.trace.as_ref(),
+                                        0,
+                                        last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        &format!("phase=la_out_proj_cpu_ref_failed error={}", err),
+                                    );
+                                }
+                            }
+                        }
+                        (Err(err), _) | (_, Err(err)) => {
+                            trace_emit_prefill_mark(
+                                self.trace.as_ref(),
+                                0,
+                                last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                &format!("phase=la_out_proj_download_failed error={}", err),
+                            );
+                        }
+                    }
+                }
+            }
             self.memcpy_d2d(attn_out, o_temp, (m * cfg.hidden_size * 2) as u64)?;
             if la_diag {
                 let post_oproj_norm = self.diag_l2_norm(attn_out, 0, cfg.hidden_size, cfg.hidden_size);
@@ -5188,6 +8900,21 @@ impl PrefillEngine {
                 )?;
             }
         }
+        self.trace_emit_router_compare_last(
+            layer_idx,
+            hidden,
+            gate_ptr,
+            n_experts,
+            h,
+            self.layer_weights[layer_idx].moe_gate_bias_ptr,
+            self.layer_weights[layer_idx].moe_e_score_corr_ptr,
+            scoring_func,
+            topk,
+            gate_out,
+            topk_ids_ptr,
+            topk_weights_ptr,
+            m,
+        );
 
         // 3. moe_align_block_size: padded prefix sum + build sorted token/expert maps
         let block_size = 64i32; // MarlinDefault max thread_m_blocks=4 -> max block_size=64
@@ -6084,8 +9811,9 @@ impl PrefillEngine {
                 &manual_accum[..8], manual_l2);
         }
 
-        // 11. Zero accumulator then scatter-add with topk_weights * scale_factor
-        // moe_scatter_weighted iterates m*topk entries (no padding waste)
+        // 11. Zero accumulator then scatter-add with topk_weights * scale_factor.
+        // sorted_ids is padded per expert block, so valid entries can extend past
+        // the first m*topk positions. Iterate total_sorted and skip -1 pads.
         let moe_accum = *self.scratch.d_moe_accum.device_ptr();
         {
             let zt = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
@@ -6107,14 +9835,16 @@ impl PrefillEngine {
             let st = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
             let mut s0 = moe_accum;
             let mut s1 = fused_output_ptr;
-            let mut s2 = topk_weights_ptr;
-            let mut s3 = h as i32;
-            let mut s4 = m as i32;
-            let mut s5 = topk as i32;
-            let mut s6 = scale_factor;
+            let mut s2 = sorted_ids_val;
+            let mut s3 = topk_weights_ptr;
+            let mut s4 = h as i32;
+            let mut s5 = m as i32;
+            let mut s6 = topk as i32;
+            let mut s7 = total_sorted as i32;
+            let mut s8 = scale_factor;
             unsafe {
                 launch(self.kernels.moe_scatter_weighted,
-                    (m_topk as u32, 1, 1), (st, 1, 1), 0, self.stream,
+                    (total_sorted as u32, 1, 1), (st, 1, 1), 0, self.stream,
                     &mut [
                         &mut s0 as *mut _ as *mut std::ffi::c_void,
                         &mut s1 as *mut _ as *mut std::ffi::c_void,
@@ -6123,8 +9853,300 @@ impl PrefillEngine {
                         &mut s4 as *mut _ as *mut std::ffi::c_void,
                         &mut s5 as *mut _ as *mut std::ffi::c_void,
                         &mut s6 as *mut _ as *mut std::ffi::c_void,
+                        &mut s7 as *mut _ as *mut std::ffi::c_void,
+                        &mut s8 as *mut _ as *mut std::ffi::c_void,
                     ],
                 )?;
+            }
+        }
+
+        let moe_trace_enabled = self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "prefill_layer"));
+        let moe_last_pos = m.saturating_sub(1);
+        let mut traced_routed_accum_last_cpu: Option<Vec<f32>> = None;
+        let mut traced_routed_accum_last_vendor: Option<Vec<f32>> = None;
+        if moe_trace_enabled {
+            if m_topk <= 4096 {
+                match (
+                    download_device_u16(fused_output_ptr, m_topk * h),
+                    download_device_f32(topk_weights_ptr, m * topk),
+                    download_device_i32(sorted_ids_val, total_sorted),
+                    download_device_f32(moe_accum + ((moe_last_pos * h * 4) as u64), h),
+                ) {
+                    (Ok(expert_out_rows_u16), Ok(topk_weights), Ok(sorted_ids), Ok(actual_routed_accum_last)) => {
+                        traced_routed_accum_last_vendor = Some(actual_routed_accum_last.clone());
+                        let expert_out_rows_bf16: Vec<f32> =
+                            expert_out_rows_u16.iter().map(|&bits| bf16_to_f32(bits)).collect();
+                        let mut gather_src = Vec::with_capacity(m_topk);
+                        let mut gather_weights = Vec::with_capacity(m_topk);
+                        for pos in 0..m {
+                            let row = &topk_weights[pos * topk..(pos + 1) * topk];
+                            for &wt in row {
+                                gather_src.push(pos as i32);
+                                gather_weights.push(wt * scale_factor);
+                            }
+                        }
+                        match diag_compute_moe_accum_last_cpu_from_rows(
+                            &expert_out_rows_bf16,
+                            &gather_src,
+                            &gather_weights,
+                            moe_last_pos,
+                            h,
+                        ) {
+                            Ok(expected_routed_accum_last) => {
+                                self.trace_emit_f32_values(
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    "moe_routed_accum_last_cpu_ref",
+                                    &expected_routed_accum_last,
+                                );
+                                self.trace_emit_compare_summary(
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    "moe_routed_accum",
+                                    "moe_routed_accum_last_vendor",
+                                    "moe_routed_accum_last_cpu_ref",
+                                    &actual_routed_accum_last,
+                                    &expected_routed_accum_last,
+                                );
+                                let sorted_ids_active = &sorted_ids[..std::cmp::min(total_sorted, sorted_ids.len())];
+                                let mut sorted_in_range = 0usize;
+                                let mut sorted_pad = 0usize;
+                                let mut sorted_out_of_range = 0usize;
+                                let mut sorted_duplicates = 0usize;
+                                let mut sorted_max_sid = -1i32;
+                                let mut sorted_seen = vec![false; m_topk];
+                                for &sid in sorted_ids_active {
+                                    if sid < 0 {
+                                        sorted_pad += 1;
+                                        continue;
+                                    }
+                                    sorted_max_sid = sorted_max_sid.max(sid);
+                                    let sid_usize = sid as usize;
+                                    if sid_usize >= m_topk {
+                                        sorted_out_of_range += 1;
+                                        continue;
+                                    }
+                                    sorted_in_range += 1;
+                                    if std::mem::replace(&mut sorted_seen[sid_usize], true) {
+                                        sorted_duplicates += 1;
+                                    }
+                                }
+                                let sorted_missing = sorted_seen.iter().filter(|&&seen| !seen).count();
+                                trace_emit_prefill_mark(
+                                    self.trace.as_ref(),
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    &format!(
+                                        "phase=sorted_ids_integrity total_sorted={} m_topk={} in_range={} pad={} out_of_range={} duplicates={} missing={} max_sid={}",
+                                        sorted_ids_active.len(),
+                                        m_topk,
+                                        sorted_in_range,
+                                        sorted_pad,
+                                        sorted_out_of_range,
+                                        sorted_duplicates,
+                                        sorted_missing,
+                                        sorted_max_sid,
+                                    ),
+                                );
+                                let mut sorted_weights = Vec::with_capacity(sorted_ids_active.len());
+                                for &sid in sorted_ids_active {
+                                    if sid >= 0 {
+                                        let sid_usize = sid as usize;
+                                        let wt = if sid_usize < topk_weights.len() {
+                                            topk_weights[sid_usize] * scale_factor
+                                        } else {
+                                            0.0
+                                        };
+                                        sorted_weights.push(wt);
+                                    } else {
+                                        sorted_weights.push(0.0);
+                                    }
+                                }
+                                match diag_compute_moe_accum_last_cpu_from_sorted_rows(
+                                    &expert_out_rows_bf16,
+                                    sorted_ids_active,
+                                    &sorted_weights,
+                                    moe_last_pos,
+                                    h,
+                                    topk,
+                                ) {
+                                    Ok(expected_routed_accum_last_sorted_ids) => {
+                                        self.trace_emit_f32_values(
+                                            0,
+                                            moe_last_pos,
+                                            0,
+                                            Some(layer_idx),
+                                            "prefill_layer",
+                                            "moe_routed_accum_last_cpu_ref_sorted_ids",
+                                            &expected_routed_accum_last_sorted_ids,
+                                        );
+                                        self.trace_emit_compare_summary(
+                                            0,
+                                            moe_last_pos,
+                                            0,
+                                            Some(layer_idx),
+                                            "prefill_layer",
+                                            "moe_routed_accum_sorted_ids",
+                                            "moe_routed_accum_last_vendor",
+                                            "moe_routed_accum_last_cpu_ref_sorted_ids",
+                                            &actual_routed_accum_last,
+                                            &expected_routed_accum_last_sorted_ids,
+                                        );
+                                        let mut best_name = "token_major";
+                                        let mut best_vec = expected_routed_accum_last.clone();
+                                        let token_major_max_abs =
+                                            diag_max_abs_diff(&actual_routed_accum_last, &expected_routed_accum_last)
+                                                .unwrap_or(f32::INFINITY);
+                                        let sorted_ids_max_abs =
+                                            diag_max_abs_diff(
+                                                &actual_routed_accum_last,
+                                                &expected_routed_accum_last_sorted_ids,
+                                            )
+                                            .unwrap_or(f32::INFINITY);
+                                        let mut sorted_pos_max_abs = f32::INFINITY;
+                                        match diag_compute_moe_accum_last_cpu_from_sorted_positions(
+                                            &expert_out_rows_bf16,
+                                            sorted_ids_active,
+                                            &sorted_weights,
+                                            moe_last_pos,
+                                            h,
+                                            topk,
+                                        ) {
+                                            Ok(expected_routed_accum_last_sorted_pos) => {
+                                                self.trace_emit_f32_values(
+                                                    0,
+                                                    moe_last_pos,
+                                                    0,
+                                                    Some(layer_idx),
+                                                    "prefill_layer",
+                                                    "moe_routed_accum_last_cpu_ref_sorted_positions",
+                                                    &expected_routed_accum_last_sorted_pos,
+                                                );
+                                                self.trace_emit_compare_summary(
+                                                    0,
+                                                    moe_last_pos,
+                                                    0,
+                                                    Some(layer_idx),
+                                                    "prefill_layer",
+                                                    "moe_routed_accum_sorted_positions",
+                                                    "moe_routed_accum_last_vendor",
+                                                    "moe_routed_accum_last_cpu_ref_sorted_positions",
+                                                    &actual_routed_accum_last,
+                                                    &expected_routed_accum_last_sorted_pos,
+                                                );
+                                                sorted_pos_max_abs = diag_max_abs_diff(
+                                                    &actual_routed_accum_last,
+                                                    &expected_routed_accum_last_sorted_pos,
+                                                )
+                                                .unwrap_or(f32::INFINITY);
+                                                if sorted_ids_max_abs < token_major_max_abs {
+                                                    best_name = "sorted_ids";
+                                                    best_vec = expected_routed_accum_last_sorted_ids.clone();
+                                                }
+                                                let current_best = diag_max_abs_diff(
+                                                    &actual_routed_accum_last,
+                                                    &best_vec,
+                                                )
+                                                .unwrap_or(f32::INFINITY);
+                                                if sorted_pos_max_abs < current_best {
+                                                    best_name = "sorted_positions";
+                                                    best_vec = expected_routed_accum_last_sorted_pos;
+                                                }
+                                            }
+                                            Err(err) => {
+                                                trace_emit_prefill_mark(
+                                                    self.trace.as_ref(),
+                                                    0,
+                                                    moe_last_pos,
+                                                    0,
+                                                    Some(layer_idx),
+                                                    "prefill_layer",
+                                                    &format!("phase=moe_routed_accum_sorted_positions_cpu_ref_failed error={}", err),
+                                                );
+                                                if sorted_ids_max_abs < token_major_max_abs {
+                                                    best_name = "sorted_ids";
+                                                    best_vec = expected_routed_accum_last_sorted_ids.clone();
+                                                }
+                                            }
+                                        }
+                                        trace_emit_prefill_mark(
+                                            self.trace.as_ref(),
+                                            0,
+                                            moe_last_pos,
+                                            0,
+                                            Some(layer_idx),
+                                            "prefill_layer",
+                                            &format!(
+                                                "phase=moe_routed_accum_seed_select token_major_max_abs={:.6} sorted_ids_max_abs={:.6} sorted_positions_max_abs={:.6} best={}",
+                                                token_major_max_abs,
+                                                sorted_ids_max_abs,
+                                                sorted_pos_max_abs,
+                                                best_name,
+                                            ),
+                                        );
+                                        traced_routed_accum_last_cpu = Some(best_vec);
+                                    }
+                                    Err(err) => {
+                                        trace_emit_prefill_mark(
+                                            self.trace.as_ref(),
+                                            0,
+                                            moe_last_pos,
+                                            0,
+                                            Some(layer_idx),
+                                            "prefill_layer",
+                                            &format!("phase=moe_routed_accum_sorted_ids_cpu_ref_failed error={}", err),
+                                        );
+                                        traced_routed_accum_last_cpu = Some(expected_routed_accum_last);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                trace_emit_prefill_mark(
+                                    self.trace.as_ref(),
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    &format!("phase=moe_routed_accum_cpu_ref_failed error={}", err),
+                                );
+                            }
+                        }
+                    }
+                    (Err(err), _, _, _)
+                    | (_, Err(err), _, _)
+                    | (_, _, Err(err), _)
+                    | (_, _, _, Err(err)) => {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            0,
+                            moe_last_pos,
+                            0,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            &format!("phase=moe_routed_accum_download_failed error={}", err),
+                        );
+                    }
+                }
+            } else {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    0,
+                    moe_last_pos,
+                    0,
+                    Some(layer_idx),
+                    "prefill_layer",
+                    &format!("phase=moe_routed_accum_trace_skipped total_active={}", m_topk),
+                );
             }
         }
 
@@ -6159,7 +10181,8 @@ impl PrefillEngine {
                 cuda_sys::lib().cuEventRecord(self.shared_event, self.shared_stream);
                 cuda_sys::lib().cuStreamWaitEvent(self.stream, self.shared_event, 0);
             }
-            let s1_buf = *self.scratch.d_scratch1.device_ptr();
+            let s1_buf = *self.d_shared_bf16_scratch1.as_ref()
+                .ok_or("d_shared_bf16_scratch1 not allocated")?.device_ptr();
             let lw_ref = &self.layer_weights[layer_idx];
 
             // Add shared expert to accumulator (with optional sigmoid gate)
@@ -6193,6 +10216,12 @@ impl PrefillEngine {
                         cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
                     ).map_err(|e| format!("shared gate GEMM: {:?}", e))?;
                 }
+                if diag_moe
+                    && std::env::var("KRASIS_PREFILL_DIAG_MOE_DETAIL").is_ok()
+                    && Self::diag_layer_enabled(layer_idx)
+                {
+                    self.diag_dump_gate_values(gate_out, m, layer_idx, "shared_gate")?;
+                }
                 // Add shared expert with sigmoid gating
                 let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
                 let mut as0 = moe_accum; let mut as1 = s1_buf;
@@ -6224,6 +10253,207 @@ impl PrefillEngine {
                             &mut as3 as *mut _ as *mut std::ffi::c_void,
                         ],
                     )?;
+                }
+            }
+        }
+
+        if moe_trace_enabled {
+            let trace_shared_buf = *self.d_shared_bf16_scratch1.as_ref()
+                .ok_or("d_shared_bf16_scratch1 not allocated")?.device_ptr();
+            self.stream_sync()?;
+            match (
+                download_device_f32(moe_accum + ((moe_last_pos * h * 4) as u64), h),
+                download_device_u16(trace_shared_buf + ((moe_last_pos * h * 2) as u64), h),
+                download_device_u16(hidden + ((moe_last_pos * h * 2) as u64), h),
+            ) {
+                (Ok(actual_total_accum_last), Ok(shared_out_last_u16), Ok(hidden_last_u16)) => {
+                    let shared_out_last_bf16: Vec<f32> =
+                        shared_out_last_u16.iter().map(|&bits| bf16_to_f32(bits)).collect();
+                    let hidden_last_bf16: Vec<f32> =
+                        hidden_last_u16.iter().map(|&bits| bf16_to_f32(bits)).collect();
+                    let shared_gate_raw = if self.layer_weights[layer_idx].shared_gate_ptr != 0 {
+                        download_device_f32(*self.scratch.d_gate_out.device_ptr() + ((moe_last_pos * 4) as u64), 1)
+                            .ok()
+                            .and_then(|v| v.into_iter().next())
+                    } else {
+                        None
+                    };
+                    let shared_gate_cpu_ref = if self.layer_weights[layer_idx].shared_gate_ptr != 0
+                        && self.layer_weights[layer_idx].shared_gate_rows == 1
+                        && self.layer_weights[layer_idx].shared_gate_cols == h
+                    {
+                        download_device_u16(self.layer_weights[layer_idx].shared_gate_ptr, h)
+                            .ok()
+                            .and_then(|gate_weight_u16| {
+                                let gate_weight_bf16: Vec<f32> = gate_weight_u16
+                                    .iter()
+                                    .map(|&bits| bf16_to_f32(bits))
+                                    .collect();
+                                diag_compute_shared_gate_raw_last_cpu(
+                                    &hidden_last_bf16,
+                                    &gate_weight_bf16,
+                                )
+                                .ok()
+                            })
+                    } else {
+                        None
+                    };
+                    let routed_seed = traced_routed_accum_last_cpu
+                        .clone()
+                        .unwrap_or_else(|| actual_total_accum_last.clone());
+                    let routed_vendor = traced_routed_accum_last_vendor
+                        .clone()
+                        .unwrap_or_else(|| routed_seed.clone());
+                    match diag_compute_moe_total_accum_last_cpu(
+                        &routed_seed,
+                        if has_shared { Some(&shared_out_last_bf16) } else { None },
+                        shared_gate_raw,
+                    ) {
+                        Ok(expected_total_accum_last) => {
+                            let actual_shared_contrib_last: Vec<f32> = actual_total_accum_last
+                                .iter()
+                                .zip(routed_vendor.iter())
+                                .map(|(total, routed)| total - routed)
+                                .collect();
+                            let expected_shared_contrib_last: Vec<f32> = expected_total_accum_last
+                                .iter()
+                                .zip(routed_seed.iter())
+                                .map(|(total, routed)| total - routed)
+                                .collect();
+                            self.trace_emit_f32_values(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "shared_out_last_vendor",
+                                &shared_out_last_bf16,
+                            );
+                            self.trace_emit_f32_values(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_shared_contrib_last_vendor",
+                                &actual_shared_contrib_last,
+                            );
+                            if let Some(raw) = shared_gate_raw {
+                                let gate_trace = [raw, 1.0 / (1.0 + (-raw).exp())];
+                                self.trace_emit_f32_values(
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    "shared_gate_last_raw_sigmoid",
+                                    &gate_trace,
+                                );
+                            }
+                            if let Some(raw_cpu_ref) = shared_gate_cpu_ref {
+                                let gate_trace = [raw_cpu_ref, 1.0 / (1.0 + (-raw_cpu_ref).exp())];
+                                self.trace_emit_f32_values(
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    "shared_gate_last_cpu_ref",
+                                    &gate_trace,
+                                );
+                                if let Some(raw) = shared_gate_raw {
+                                    self.trace_emit_compare_summary(
+                                        0,
+                                        moe_last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        "shared_gate",
+                                        "shared_gate_last_raw_sigmoid",
+                                        "shared_gate_last_cpu_ref",
+                                        &[raw, 1.0 / (1.0 + (-raw).exp())],
+                                        &[raw_cpu_ref, 1.0 / (1.0 + (-raw_cpu_ref).exp())],
+                                    );
+                                }
+                            }
+                            self.trace_emit_f32_values(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_total_accum_last_cpu_ref",
+                                &expected_total_accum_last,
+                            );
+                            self.trace_emit_f32_values(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_shared_contrib_last_cpu_ref",
+                                &expected_shared_contrib_last,
+                            );
+                            self.trace_emit_compare_summary(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_total_accum",
+                                "moe_total_accum_last_vendor",
+                                "moe_total_accum_last_cpu_ref",
+                                &actual_total_accum_last,
+                                &expected_total_accum_last,
+                            );
+                            self.trace_emit_compare_summary(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_shared_add",
+                                "moe_shared_contrib_last_vendor",
+                                "moe_shared_contrib_last_cpu_ref",
+                                &actual_shared_contrib_last,
+                                &expected_shared_contrib_last,
+                            );
+                            self.trace_emit_compare_summary(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_shared_add_vs_ungated_ref",
+                                "moe_shared_contrib_last_vendor",
+                                "shared_out_last_vendor",
+                                &actual_shared_contrib_last,
+                                &shared_out_last_bf16,
+                            );
+                        }
+                        Err(err) => {
+                            trace_emit_prefill_mark(
+                                self.trace.as_ref(),
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                &format!("phase=moe_total_accum_cpu_ref_failed error={}", err),
+                            );
+                        }
+                    }
+                }
+                (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        0,
+                        moe_last_pos,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        &format!("phase=moe_total_accum_download_failed error={}", err),
+                    );
                 }
             }
         }
@@ -6276,6 +10506,51 @@ impl PrefillEngine {
             }).sum::<f32>().sqrt();
             eprintln!("[DIAG FUSED L0] hidden_after_bf16[tok0] L2={:.4} first4={:?}",
                 norm, h_hid[..4].iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect::<Vec<f32>>());
+        }
+
+        if moe_trace_enabled {
+            match (
+                download_device_f32(moe_accum + ((moe_last_pos * h * 4) as u64), h),
+                download_device_u16(hidden + ((moe_last_pos * h * 2) as u64), h),
+            ) {
+                (Ok(total_accum_last), Ok(actual_hidden_last_u16)) => {
+                    let expected_hidden_last = round_f32_slice_to_bf16(&total_accum_last);
+                    let actual_hidden_last: Vec<f32> =
+                        actual_hidden_last_u16.iter().map(|&bits| bf16_to_f32(bits)).collect();
+                    self.trace_emit_f32_values(
+                        0,
+                        moe_last_pos,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "post_mlp_hidden_last_cpu_ref",
+                        &expected_hidden_last,
+                    );
+                    self.trace_emit_compare_summary(
+                        0,
+                        moe_last_pos,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "post_mlp_hidden_bf16_roundtrip",
+                        "post_mlp_hidden_last_vendor",
+                        "post_mlp_hidden_last_cpu_ref",
+                        &actual_hidden_last,
+                        &expected_hidden_last,
+                    );
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        0,
+                        moe_last_pos,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        &format!("phase=post_mlp_hidden_cpu_ref_failed error={}", err),
+                    );
+                }
+            }
         }
 
         // NOTE: Pin-as-you-go caching is deferred to rolling-scan pipeline (multi-chunk only).
@@ -6367,6 +10642,21 @@ impl PrefillEngine {
                 )?;
             }
         }
+        self.trace_emit_router_compare_last(
+            layer_idx,
+            hidden,
+            gate_ptr,
+            n_experts,
+            h,
+            lw.moe_gate_bias_ptr,
+            lw.moe_e_score_corr_ptr,
+            scoring_func,
+            topk,
+            gate_out,
+            topk_ids_ptr,
+            topk_weights_ptr,
+            m,
+        );
 
         // 3. GPU-only routing: count experts, prefix sum, build maps
         //    This replaces the CPU round-trip (stream_sync + D2H + CPU binning + H2D)
@@ -6470,9 +10760,8 @@ impl PrefillEngine {
 
         // Diagnostic: dump routing weights, expert ids, and active counts for layer 0
         let diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
-        let diag_layer_limit = Self::diag_layer_limit();
         let diag_moe_detail = std::env::var("KRASIS_PREFILL_DIAG_MOE_DETAIL").is_ok();
-        if diag && diag_moe_detail && layer_idx < diag_layer_limit {
+        if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
             // Download top-k weights and ids for token 0
             let mut h_weights = vec![0.0f32; m * topk];
             let mut h_ids = vec![0i32; m * topk];
@@ -6542,7 +10831,7 @@ impl PrefillEngine {
         }
 
         // Diagnostic: check gathered input norms before expert GEMMs
-        if diag && diag_moe_detail && layer_idx < diag_layer_limit && total_active > 0 {
+        if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) && total_active > 0 {
             let diag_positions = Self::diag_positions(m);
             let mut parts = Vec::new();
             for &pos in &diag_positions {
@@ -6630,7 +10919,7 @@ impl PrefillEngine {
         // Launch shared expert async if all experts are cached (no DMA conflict)
         // Force sync when diagnostics are active so we can add intermediate norm checks
         let all_cached = work.iter().all(|w| w.is_cached);
-        let shared_async = has_shared && all_cached && !(diag && layer_idx < diag_layer_limit);
+        let shared_async = has_shared && all_cached && !(diag && Self::diag_layer_enabled(layer_idx));
         if shared_async {
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
@@ -6665,7 +10954,7 @@ impl PrefillEngine {
                     let mut cur_buf = 0usize;
 
                     // Diagnostic: log first cold expert DMA parameters + buffer sizes
-                    if diag && diag_moe_detail && layer_idx < diag_layer_limit {
+                    if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
                         let fe = &moe_data.experts[cold_work[0].eid];
                         let buf_w13p_bytes = h * w13_n * bits as usize / 8;
                         let buf_w13s_bytes = (h / gs) * w13_n * 2;
@@ -6741,7 +11030,7 @@ impl PrefillEngine {
         // pin_queue data is available when rolling-scan is implemented.
 
         // Diagnostic: dump per-row expert_out norms before scatter to find outliers
-        if diag && diag_moe_detail && layer_idx < diag_layer_limit && total_active > 0 {
+        if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) && total_active > 0 {
             self.stream_sync()?;
             // Download expert_out [total_active, h] BF16 and gather_src_map [total_active] i32
             let mut h_expert_out = vec![0u16; total_active * h];
@@ -6848,8 +11137,96 @@ impl PrefillEngine {
             }
         }
 
+        let moe_trace_enabled = self.trace.as_ref().map_or(false, |t| t.should_emit(0, Some(layer_idx), "prefill_layer"));
+        let moe_last_pos = m.saturating_sub(1);
+        let mut traced_routed_accum_last_cpu: Option<Vec<f32>> = None;
+        let mut traced_routed_accum_last_vendor: Option<Vec<f32>> = None;
+        if moe_trace_enabled {
+            if total_active <= 4096 {
+                match (
+                    download_device_i32(gather_src_ptr, total_active),
+                    download_device_f32(gather_wt_ptr, total_active),
+                    download_device_u16(expert_out, total_active * h),
+                    download_device_f32(moe_accum + ((moe_last_pos * h * 4) as u64), h),
+                ) {
+                    (Ok(gather_src), Ok(gather_weights), Ok(expert_out_rows_u16), Ok(actual_routed_accum_last)) => {
+                        traced_routed_accum_last_vendor = Some(actual_routed_accum_last.clone());
+                        let expert_out_rows_bf16: Vec<f32> =
+                            expert_out_rows_u16.iter().map(|&bits| bf16_to_f32(bits)).collect();
+                        match diag_compute_moe_accum_last_cpu_from_rows(
+                            &expert_out_rows_bf16,
+                            &gather_src,
+                            &gather_weights,
+                            moe_last_pos,
+                            h,
+                        ) {
+                            Ok(expected_routed_accum_last) => {
+                                self.trace_emit_f32_values(
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    "moe_routed_accum_last_cpu_ref",
+                                    &expected_routed_accum_last,
+                                );
+                                self.trace_emit_compare_summary(
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    "moe_routed_accum",
+                                    "moe_routed_accum_last_vendor",
+                                    "moe_routed_accum_last_cpu_ref",
+                                    &actual_routed_accum_last,
+                                    &expected_routed_accum_last,
+                                );
+                                traced_routed_accum_last_cpu = Some(expected_routed_accum_last);
+                            }
+                            Err(err) => {
+                                trace_emit_prefill_mark(
+                                    self.trace.as_ref(),
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    &format!("phase=moe_routed_accum_cpu_ref_failed error={}", err),
+                                );
+                            }
+                        }
+                    }
+                    (Err(err), _, _, _)
+                    | (_, Err(err), _, _)
+                    | (_, _, Err(err), _)
+                    | (_, _, _, Err(err)) => {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            0,
+                            moe_last_pos,
+                            0,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            &format!("phase=moe_routed_accum_download_failed error={}", err),
+                        );
+                    }
+                }
+            } else {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    0,
+                    moe_last_pos,
+                    0,
+                    Some(layer_idx),
+                    "prefill_layer",
+                    &format!("phase=moe_routed_accum_trace_skipped total_active={}", total_active),
+                );
+            }
+        }
+
         // Diagnostic: routed accum norms at all diagnostic positions
-        if diag && layer_idx < diag_layer_limit {
+        if diag && Self::diag_layer_enabled(layer_idx) {
             let diag_positions = Self::diag_positions(m);
             let mut routed_parts = Vec::new();
             for &pos in &diag_positions {
@@ -6933,7 +11310,7 @@ impl PrefillEngine {
                 let s2_buf = *self.scratch.d_scratch2.device_ptr();
                 let shared_inter = sw1.n / (if gated { 2 } else { 1 });
 
-                if diag && diag_moe_detail && layer_idx < diag_layer_limit {
+                if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
                     eprintln!("[DIAG] layer{:02}_moe shared_expert sw1: n={} k={} bits={} gs={} groups={}",
                         layer_idx, sw1.n, sw1.k, sw1.num_bits, sw1.group_size, sw1.num_groups);
                     eprintln!("[DIAG] layer{:02}_moe shared_expert sw2: n={} k={} bits={} gs={} groups={}",
@@ -6945,7 +11322,7 @@ impl PrefillEngine {
                 self.marlin_gemm(hidden, sw1, s1_buf, m)?;
 
                 if gated {
-                    if diag && diag_moe_detail && layer_idx < diag_layer_limit {
+                    if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
                         let w1_norm = self.diag_l2_norm(s1_buf, 0, sw1.n, sw1.n);
                         eprintln!("[DIAG] layer{:02}_moe shared_w1_out_norm pos0={:.6} (dim={})", layer_idx, w1_norm, sw1.n);
                     }
@@ -6964,7 +11341,7 @@ impl PrefillEngine {
                         )?;
                     }
 
-                    if diag && diag_moe_detail && layer_idx < diag_layer_limit {
+                    if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
                         let act_norm = self.diag_l2_norm(s2_buf, 0, shared_inter, shared_inter);
                         eprintln!("[DIAG] layer{:02}_moe shared_act_out_norm pos0={:.6} (dim={})", layer_idx, act_norm, shared_inter);
                     }
@@ -6989,7 +11366,12 @@ impl PrefillEngine {
             }
 
             // Add shared expert result (in scratch1) to accumulator, with optional sigmoid gate
-            let s1_buf = *self.scratch.d_scratch1.device_ptr();
+            let s1_buf = if shared_async {
+                *self.d_shared_bf16_scratch1.as_ref()
+                    .ok_or("d_shared_bf16_scratch1 not allocated")?.device_ptr()
+            } else {
+                *self.scratch.d_scratch1.device_ptr()
+            };
             let sg_ptr = lw.shared_gate_ptr;
             if sg_ptr != 0 {
                 // Compute shared gate: hidden [m, h] @ gate [h, 1] -> gate_out [m, 1] FP32
@@ -7019,6 +11401,9 @@ impl PrefillEngine {
                         cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                         cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
                     ).map_err(|e| format!("shared gate GEMM: {:?}", e))?;
+                }
+                if diag && diag_moe_detail && Self::diag_layer_enabled(layer_idx) {
+                    self.diag_dump_gate_values(gate_out, m, layer_idx, "shared_gate")?;
                 }
                 // Add shared expert with sigmoid gating
                 let ast = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
@@ -7055,8 +11440,213 @@ impl PrefillEngine {
             }
         }
 
+        if moe_trace_enabled {
+            let trace_shared_buf = if shared_async {
+                *self.d_shared_bf16_scratch1.as_ref()
+                    .ok_or("d_shared_bf16_scratch1 not allocated")?.device_ptr()
+            } else {
+                *self.scratch.d_scratch1.device_ptr()
+            };
+            self.stream_sync()?;
+            match (
+                download_device_f32(moe_accum + ((moe_last_pos * h * 4) as u64), h),
+                download_device_u16(trace_shared_buf + ((moe_last_pos * h * 2) as u64), h),
+                download_device_u16(hidden + ((moe_last_pos * h * 2) as u64), h),
+            ) {
+                (Ok(actual_total_accum_last), Ok(shared_out_last_u16), Ok(hidden_last_u16)) => {
+                    let shared_out_last_bf16: Vec<f32> =
+                        shared_out_last_u16.iter().map(|&bits| bf16_to_f32(bits)).collect();
+                    let hidden_last_bf16: Vec<f32> =
+                        hidden_last_u16.iter().map(|&bits| bf16_to_f32(bits)).collect();
+                    let shared_gate_raw = if lw.shared_gate_ptr != 0 {
+                        download_device_f32(*self.scratch.d_gate_out.device_ptr() + ((moe_last_pos * 4) as u64), 1)
+                            .ok()
+                            .and_then(|v| v.into_iter().next())
+                    } else {
+                        None
+                    };
+                    let shared_gate_cpu_ref = if lw.shared_gate_ptr != 0
+                        && lw.shared_gate_rows == 1
+                        && lw.shared_gate_cols == h
+                    {
+                        download_device_u16(lw.shared_gate_ptr, h)
+                            .ok()
+                            .and_then(|gate_weight_u16| {
+                                let gate_weight_bf16: Vec<f32> = gate_weight_u16
+                                    .iter()
+                                    .map(|&bits| bf16_to_f32(bits))
+                                    .collect();
+                                diag_compute_shared_gate_raw_last_cpu(
+                                    &hidden_last_bf16,
+                                    &gate_weight_bf16,
+                                )
+                                .ok()
+                            })
+                    } else {
+                        None
+                    };
+                    let routed_seed = traced_routed_accum_last_cpu
+                        .clone()
+                        .unwrap_or_else(|| actual_total_accum_last.clone());
+                    let routed_vendor = traced_routed_accum_last_vendor
+                        .clone()
+                        .unwrap_or_else(|| routed_seed.clone());
+                    match diag_compute_moe_total_accum_last_cpu(
+                        &routed_seed,
+                        if has_shared { Some(&shared_out_last_bf16) } else { None },
+                        shared_gate_raw,
+                    ) {
+                        Ok(expected_total_accum_last) => {
+                            let actual_shared_contrib_last: Vec<f32> = actual_total_accum_last
+                                .iter()
+                                .zip(routed_vendor.iter())
+                                .map(|(total, routed)| total - routed)
+                                .collect();
+                            let expected_shared_contrib_last: Vec<f32> = expected_total_accum_last
+                                .iter()
+                                .zip(routed_seed.iter())
+                                .map(|(total, routed)| total - routed)
+                                .collect();
+                            self.trace_emit_f32_values(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "shared_out_last_vendor",
+                                &shared_out_last_bf16,
+                            );
+                            self.trace_emit_f32_values(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_shared_contrib_last_vendor",
+                                &actual_shared_contrib_last,
+                            );
+                            if let Some(raw) = shared_gate_raw {
+                                let gate_trace = [raw, 1.0 / (1.0 + (-raw).exp())];
+                                self.trace_emit_f32_values(
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    "shared_gate_last_raw_sigmoid",
+                                    &gate_trace,
+                                );
+                            }
+                            if let Some(raw_cpu_ref) = shared_gate_cpu_ref {
+                                let gate_trace = [raw_cpu_ref, 1.0 / (1.0 + (-raw_cpu_ref).exp())];
+                                self.trace_emit_f32_values(
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    "shared_gate_last_cpu_ref",
+                                    &gate_trace,
+                                );
+                                if let Some(raw) = shared_gate_raw {
+                                    self.trace_emit_compare_summary(
+                                        0,
+                                        moe_last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        "shared_gate",
+                                        "shared_gate_last_raw_sigmoid",
+                                        "shared_gate_last_cpu_ref",
+                                        &[raw, 1.0 / (1.0 + (-raw).exp())],
+                                        &[raw_cpu_ref, 1.0 / (1.0 + (-raw_cpu_ref).exp())],
+                                    );
+                                }
+                            }
+                            self.trace_emit_f32_values(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_total_accum_last_cpu_ref",
+                                &expected_total_accum_last,
+                            );
+                            self.trace_emit_f32_values(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_shared_contrib_last_cpu_ref",
+                                &expected_shared_contrib_last,
+                            );
+                            self.trace_emit_compare_summary(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_total_accum",
+                                "moe_total_accum_last_vendor",
+                                "moe_total_accum_last_cpu_ref",
+                                &actual_total_accum_last,
+                                &expected_total_accum_last,
+                            );
+                            self.trace_emit_compare_summary(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_shared_add",
+                                "moe_shared_contrib_last_vendor",
+                                "moe_shared_contrib_last_cpu_ref",
+                                &actual_shared_contrib_last,
+                                &expected_shared_contrib_last,
+                            );
+                            self.trace_emit_compare_summary(
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                "moe_shared_add_vs_ungated_ref",
+                                "moe_shared_contrib_last_vendor",
+                                "shared_out_last_vendor",
+                                &actual_shared_contrib_last,
+                                &shared_out_last_bf16,
+                            );
+                        }
+                        Err(err) => {
+                            trace_emit_prefill_mark(
+                                self.trace.as_ref(),
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                &format!("phase=moe_total_accum_cpu_ref_failed error={}", err),
+                            );
+                        }
+                    }
+                }
+                (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        0,
+                        moe_last_pos,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        &format!("phase=moe_total_accum_download_failed error={}", err),
+                    );
+                }
+            }
+        }
+
         // Diagnostic: total accum norms + shared expert norms + gate values at all positions
-        if diag && layer_idx < diag_layer_limit {
+        if diag && Self::diag_layer_enabled(layer_idx) {
             let diag_positions = Self::diag_positions(m);
             // Total accum (routed + shared)
             let mut total_parts = Vec::new();
@@ -7108,6 +11698,51 @@ impl PrefillEngine {
             }
         }
 
+        if moe_trace_enabled {
+            match (
+                download_device_f32(moe_accum + ((moe_last_pos * h * 4) as u64), h),
+                download_device_u16(hidden + ((moe_last_pos * h * 2) as u64), h),
+            ) {
+                (Ok(total_accum_last), Ok(actual_hidden_last_u16)) => {
+                    let expected_hidden_last = round_f32_slice_to_bf16(&total_accum_last);
+                    let actual_hidden_last: Vec<f32> =
+                        actual_hidden_last_u16.iter().map(|&bits| bf16_to_f32(bits)).collect();
+                    self.trace_emit_f32_values(
+                        0,
+                        moe_last_pos,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "post_mlp_hidden_last_cpu_ref",
+                        &expected_hidden_last,
+                    );
+                    self.trace_emit_compare_summary(
+                        0,
+                        moe_last_pos,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        "post_mlp_hidden_bf16_roundtrip",
+                        "post_mlp_hidden_last_vendor",
+                        "post_mlp_hidden_last_cpu_ref",
+                        &actual_hidden_last,
+                        &expected_hidden_last,
+                    );
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        0,
+                        moe_last_pos,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        &format!("phase=post_mlp_hidden_cpu_ref_failed error={}", err),
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -7122,8 +11757,12 @@ impl PrefillEngine {
         let gated = lw.moe_gated;
         let activation = lw.moe_activation;
         let hidden = *self.scratch.d_hidden.device_ptr();
-        let s1_buf = *self.scratch.d_scratch1.device_ptr();
-        let s2_buf = *self.scratch.d_scratch2.device_ptr();
+        let s1_buf = *self.d_shared_bf16_scratch1.as_ref()
+            .ok_or("d_shared_bf16_scratch1 not allocated (call prepare_for_prefill first)")?
+            .device_ptr();
+        let s2_buf = *self.d_shared_bf16_scratch2.as_ref()
+            .ok_or("d_shared_bf16_scratch2 not allocated (call prepare_for_prefill first)")?
+            .device_ptr();
 
         // BF16 validation mode: use cuBLAS on shared_stream
         if let (Some(sw1_bf16), Some(sw2_bf16)) = (&lw.shared_w1_bf16, &lw.shared_w2_bf16) {
@@ -7258,8 +11897,12 @@ impl PrefillEngine {
         let gated = lw.moe_gated;
         let activation = lw.moe_activation;
         let hidden = *self.scratch.d_hidden.device_ptr();
-        let s1_buf = *self.scratch.d_scratch1.device_ptr();
-        let s2_buf = *self.scratch.d_scratch2.device_ptr();
+        let s1_buf = *self.d_shared_bf16_scratch1.as_ref()
+            .ok_or("d_shared_bf16_scratch1 not allocated (call prepare_for_prefill first)")?
+            .device_ptr();
+        let s2_buf = *self.d_shared_bf16_scratch2.as_ref()
+            .ok_or("d_shared_bf16_scratch2 not allocated (call prepare_for_prefill first)")?
+            .device_ptr();
         let shared_inter = sw1.n / (if gated { 2 } else { 1 });
 
         // w1 GEMM on shared_stream: [m, h] @ [w13_n, h]^T -> [m, w13_n]
@@ -7918,8 +12561,10 @@ impl PrefillEngine {
         let gated = lw.moe_gated;
         let activation = lw.moe_activation;
         let hidden = *self.scratch.d_hidden.device_ptr();
-        let s1_buf = *self.scratch.d_scratch1.device_ptr();
-        let s2_buf = *self.scratch.d_scratch2.device_ptr();
+        let s1_buf = *self.d_shared_bf16_scratch1.as_ref()
+            .ok_or("d_shared_bf16_scratch1 not allocated")?.device_ptr();
+        let s2_buf = *self.d_shared_bf16_scratch2.as_ref()
+            .ok_or("d_shared_bf16_scratch2 not allocated")?.device_ptr();
         let shared_ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
 
         // BF16 validation mode: reuse the async BF16 method
@@ -8375,6 +13020,7 @@ impl PrefillKernels {
             "prefill_kernels",
             &[
                 "rmsnorm_batched_kernel",
+                "rmsnorm_batched_fp32w_kernel",
                 "fused_add_rmsnorm_batched_kernel",
                 "embedding_batched_kernel",
                 "rope_batched_kernel",
@@ -8489,6 +13135,7 @@ impl PrefillKernels {
 
         Ok(PrefillKernels {
             rmsnorm: get("rmsnorm_batched_kernel")?,
+            rmsnorm_fp32w: get("rmsnorm_batched_fp32w_kernel")?,
             fused_add_rmsnorm: get("fused_add_rmsnorm_batched_kernel")?,
             embedding: get("embedding_batched_kernel")?,
             rope: get("rope_batched_kernel")?,
@@ -8584,6 +13231,7 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     let h = config.hidden_size;
     let inter = config.intermediate_size;
     let moe_inter = config.moe_intermediate_size;
+    let shared_inter = config.shared_expert_intermediate_size.max(moe_inter);
     let topk = config.num_experts_per_tok.max(1);
     let has_la = config.layer_types.iter().any(|&t| t == 3);
     let has_mamba2 = config.layer_types.iter().any(|&t| t == 1);
@@ -8597,7 +13245,7 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     per_token += h * 2;
     // d_scratch1: max(max_tokens * inter * 2, max_tokens * num_q_heads * head_dim * 2) * 2 bytes
     let max_inter_per_tok = std::cmp::max(
-        inter * 2,
+        inter.max(shared_inter) * 2,
         config.num_q_heads * config.head_dim * 2,
     );
     per_token += max_inter_per_tok * 2; // BF16
@@ -8605,7 +13253,7 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     per_token += max_inter_per_tok * 2;
     // d_fp32_scratch: max(marlin_ctmp, la_size) -- both scale with max_tokens
     {
-        let mut max_gemm_n = std::cmp::max(h, inter * 2);
+        let mut max_gemm_n = std::cmp::max(h, inter.max(shared_inter) * 2);
         let gqa_q_n = config.num_q_heads * config.head_dim * 2;
         if gqa_q_n > max_gemm_n { max_gemm_n = gqa_q_n; }
         if has_la {
@@ -8670,10 +13318,14 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     per_token += topk * 4;
     // d_gather_weight_map: max_tokens * topk * 4 (sequential only, small)
     per_token += topk * 4;
-    // d_shared_fp32_scratch: max_tokens * max(h, moe_inter) * 4 (FP32)
-    // Shared expert Marlin workspace, allocated dynamically in prepare_for_prefill.
+    // Shared expert async overlap scratch, allocated dynamically in prepare_for_prefill.
+    // BF16 s1/s2 must hold the larger of final hidden_size and gated shared W1 width.
+    // FP32 scratch must match the same width because Marlin uses it as C_tmp.
     if config.n_routed_experts > 0 {
-        per_token += std::cmp::max(h, moe_inter) * 4;
+        let shared_w13_n = if config.moe_gated { 2 * shared_inter } else { shared_inter };
+        let shared_scratch_n = std::cmp::max(h, shared_w13_n);
+        per_token += shared_scratch_n * 2 * 2;
+        per_token += shared_scratch_n * 4;
     }
     // LA buffers (scale with la_max_len = max_tokens + la_chunk_size, approx max_tokens)
     if has_la {
@@ -8727,6 +13379,7 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     // d_logits: vocab_size * 4
     fixed += config.vocab_size * 4;
     if has_la {
+        fixed += config.la_num_v_heads * config.la_k_head_dim * config.la_v_head_dim * 2; // d_fla_h0
         fixed += config.la_num_v_heads * config.la_k_head_dim * config.la_v_head_dim * 4; // d_fla_final_state
     }
     // d_expert_counts, offsets, write_offsets: n_routed * 4 each
@@ -8809,6 +13462,7 @@ pub fn allocate_scratch(
     let h = config.hidden_size;
     let inter = config.intermediate_size;           // max of dense + moe for general scratch
     let moe_inter = config.moe_intermediate_size;   // actual MoE expert intermediate
+    let shared_inter = config.shared_expert_intermediate_size.max(moe_inter);
     let topk = config.num_experts_per_tok.max(1);
 
     // Fused sorted count: max_tokens * topk + n_routed * block_size (block padding for Marlin).
@@ -8844,7 +13498,7 @@ pub fn allocate_scratch(
     let la_max_len = if has_la { max_tokens + config.la_chunk_size } else { max_tokens };
 
     let mut max_inter = std::cmp::max(
-        max_tokens * inter * 2,
+        max_tokens * inter.max(shared_inter) * 2,
         max_tokens * config.num_q_heads * config.head_dim * 2, // *2 for gated GQA (q + gate)
     );
     // FLA path reuses scratch1/scratch2 as [fla_total, nv, dk] BF16 (after repeat-interleave).
@@ -9557,6 +14211,7 @@ mod kernel_tests {
                     "softmax_topk_kernel",
                     "transpose_3d_021_kernel",
                     "transpose_3d_021_bf16_kernel",
+                    "la_transpose_f32_kernel",
                     "concat_3_bf16_kernel",
                     "gated_q_split_kernel",
                     "kv_cache_append_fp8_kernel",
@@ -9565,9 +14220,15 @@ mod kernel_tests {
                     "flash_attn_tiled_kernel",
                     "la_l2norm_per_head_kernel",
                     "la_compute_gate_beta_kernel",
+                    "la_compute_gate_beta_bf16_kernel",
+                    "la_bf16_to_fp32_kernel",
                     "la_gated_rmsnorm_kernel",
+                    "la_gated_rmsnorm_bf16in_kernel",
                     "la_depthwise_conv1d_silu_kernel",
+                    "la_fused_conv1d_silu_bf16_kernel",
+                    "la_update_conv_state_kernel",
                     "la_uninterleave_qkvz_kernel",
+                    "la_fused_repeat_l2norm_bf16_kernel",
                     "moe_count_experts_kernel",
                     "moe_prefix_sum_kernel",
                     "moe_build_maps_kernel",
@@ -9784,6 +14445,58 @@ mod kernel_tests {
             panic!("{}: {} / {} elements differ", label, fail_count, n);
         }
         eprintln!("  {} PASS ({} elements, exact match)", label, n);
+    }
+
+    fn f32_to_bf16_bytes(values: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 2);
+        for &v in values {
+            out.extend_from_slice(&half::bf16::from_f32(v).to_bits().to_le_bytes());
+        }
+        out
+    }
+
+    fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+        bytes.chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect()
+    }
+
+    fn load_test_fla(nv: usize) -> FlaKernels {
+        let mut cc_major: i32 = 0;
+        let mut cc_minor: i32 = 0;
+        unsafe {
+            cuda_sys::lib().cuDeviceGetAttribute(
+                &mut cc_major,
+                cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                0,
+            );
+            cuda_sys::lib().cuDeviceGetAttribute(
+                &mut cc_minor,
+                cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                0,
+            );
+        }
+        let arch = cc_major * 10 + cc_minor;
+        let sidecar_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("krasis");
+        for candidate_arch in [arch, cc_major * 10, 120, 90, 89, 80] {
+            if candidate_arch <= 0 {
+                continue;
+            }
+            let sidecar = sidecar_dir.join(format!("libkrasis_fla_sm{}.so", candidate_arch));
+            if sidecar.exists() {
+                std::env::set_var(
+                    format!("KRASIS_LIBKRASIS_FLA_SM{}_SO", candidate_arch),
+                    sidecar.to_string_lossy().to_string(),
+                );
+            }
+        }
+
+        let Some(fla) = load_fla(false, nv).expect("FLA load failed for test") else {
+            panic!("FLA library unavailable for test");
+        };
+        fla
     }
 
     // ── Test functions ─────────────────────────────────────────────────
@@ -11005,6 +15718,107 @@ mod kernel_tests {
         assert_close_f32(&actual_gate, &expected_gate, data.meta.atol as f64, data.meta.rtol as f64, "la_gate_beta_gate");
     }
 
+    #[test]
+    fn test_la_gate_beta_bf16_matches_fp32_path_on_large_softplus_inputs() {
+        let ctx = GpuTestCtx::new();
+        let fp32_kernel = ctx.get_kernel("la_compute_gate_beta_kernel");
+        let bf16_kernel = ctx.get_kernel("la_compute_gate_beta_bf16_kernel");
+
+        let m = 2usize;
+        let nv = 4usize;
+
+        let b_vals = [
+            -12.0f32, -1.25, 0.0, 8.0,
+            12.0, 1.5, -4.0, 0.75,
+        ];
+        let a_vals = [
+            80.0f32, 25.0, -3.0, 0.25,
+            40.0, 21.0, 5.0, -10.0,
+        ];
+        let a_log_vals = [0.0f32, 0.5, -0.75, 0.25];
+        let dt_bias_vals = [30.0f32, 0.5, 35.0, -1.0];
+
+        let to_bf16_bytes = |vals: &[f32]| -> Vec<u8> {
+            vals.iter()
+                .flat_map(|&v| half::bf16::from_f32(v).to_bits().to_le_bytes())
+                .collect()
+        };
+        let to_bf16_bytes_from_f32_bytes = |bytes: &[u8]| -> Vec<u8> {
+            bytes
+                .chunks_exact(4)
+                .flat_map(|chunk| {
+                    half::bf16::from_f32(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                        .to_bits()
+                        .to_le_bytes()
+                })
+                .collect()
+        };
+
+        let d_b = ctx.upload_bf16(&to_bf16_bytes(&b_vals));
+        let d_a = ctx.upload_bf16(&to_bf16_bytes(&a_vals));
+        let d_alog = ctx.upload_f32(
+            &a_log_vals.iter().flat_map(|&v| v.to_le_bytes()).collect::<Vec<u8>>()
+        );
+        let d_dtbias = ctx.upload_f32(
+            &dt_bias_vals.iter().flat_map(|&v| v.to_le_bytes()).collect::<Vec<u8>>()
+        );
+        let d_beta_fp32 = ctx.alloc_f32(m * nv);
+        let d_gate_fp32 = ctx.alloc_f32(m * nv);
+        let d_beta_bf16 = ctx.alloc_bf16(m * nv);
+        let d_gate_bf16 = ctx.alloc_bf16(m * nv);
+
+        let mut nv_i32 = nv as i32;
+        unsafe {
+            let threads = std::cmp::min(1024, nv) as u32;
+            let threads = ((threads + 31) / 32) * 32;
+
+            let mut beta_fp32_ptr = *d_beta_fp32.device_ptr() as u64;
+            let mut gate_fp32_ptr = *d_gate_fp32.device_ptr() as u64;
+            let mut b_ptr = *d_b.device_ptr() as u64;
+            let mut a_ptr = *d_a.device_ptr() as u64;
+            let mut alog_ptr = *d_alog.device_ptr() as u64;
+            let mut dtbias_ptr = *d_dtbias.device_ptr() as u64;
+            let mut fp32_params: Vec<*mut std::ffi::c_void> = vec![
+                &mut beta_fp32_ptr as *mut _ as *mut _,
+                &mut gate_fp32_ptr as *mut _ as *mut _,
+                &mut b_ptr as *mut _ as *mut _,
+                &mut a_ptr as *mut _ as *mut _,
+                &mut alog_ptr as *mut _ as *mut _,
+                &mut dtbias_ptr as *mut _ as *mut _,
+                &mut nv_i32 as *mut _ as *mut _,
+            ];
+            launch(fp32_kernel, (m as u32, 1, 1), (threads, 1, 1), 0, ctx.stream(), &mut fp32_params).unwrap();
+
+            let mut beta_bf16_ptr = *d_beta_bf16.device_ptr() as u64;
+            let mut gate_bf16_ptr = *d_gate_bf16.device_ptr() as u64;
+            let mut b_bf16_ptr = *d_b.device_ptr() as u64;
+            let mut a_bf16_ptr = *d_a.device_ptr() as u64;
+            let mut alog_bf16_ptr = *d_alog.device_ptr() as u64;
+            let mut dtbias_bf16_ptr = *d_dtbias.device_ptr() as u64;
+            let mut bf16_params: Vec<*mut std::ffi::c_void> = vec![
+                &mut beta_bf16_ptr as *mut _ as *mut _,
+                &mut gate_bf16_ptr as *mut _ as *mut _,
+                &mut b_bf16_ptr as *mut _ as *mut _,
+                &mut a_bf16_ptr as *mut _ as *mut _,
+                &mut alog_bf16_ptr as *mut _ as *mut _,
+                &mut dtbias_bf16_ptr as *mut _ as *mut _,
+                &mut nv_i32 as *mut _ as *mut _,
+            ];
+            launch(bf16_kernel, (m as u32, 1, 1), (threads, 1, 1), 0, ctx.stream(), &mut bf16_params).unwrap();
+        }
+        self::cuda_sync();
+
+        let beta_fp32 = ctx.download_f32(&d_beta_fp32);
+        let gate_fp32 = ctx.download_f32(&d_gate_fp32);
+        let beta_expected = to_bf16_bytes_from_f32_bytes(&beta_fp32);
+        let gate_expected = to_bf16_bytes_from_f32_bytes(&gate_fp32);
+        let beta_actual = ctx.download_bf16(&d_beta_bf16);
+        let gate_actual = ctx.download_bf16(&d_gate_bf16);
+
+        assert_close_bf16(&beta_actual, &beta_expected, 1e-2, 1e-2, "la_gate_beta_bf16_beta_parity");
+        assert_close_bf16(&gate_actual, &gate_expected, 1e-2, 1e-2, "la_gate_beta_bf16_gate_parity");
+    }
+
     // ── Tier 2: LA Gated RMSNorm ─────────────────────────────────────
 
     #[test]
@@ -11017,10 +15831,17 @@ mod kernel_tests {
         let nv = 32usize;
         let dv = 128usize;
         let eps: f32 = 1e-6;
+        let weight_f32_bytes: Vec<u8> = data.input_bytes("weight")
+            .chunks_exact(2)
+            .flat_map(|chunk| {
+                let val = half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+                val.to_le_bytes()
+            })
+            .collect();
 
         let d_x = ctx.upload_f32(&data.input_bytes("x"));
         let d_gate = ctx.upload_bf16(&data.input_bytes("gate"));
-        let d_weight = ctx.upload_bf16(&data.input_bytes("weight"));
+        let d_weight = ctx.upload_f32(&weight_f32_bytes);
         let d_out = ctx.alloc_bf16(m * nv * dv);
 
         let mut nv_i32 = nv as i32;
@@ -11051,6 +15872,212 @@ mod kernel_tests {
         let actual = ctx.download_bf16(&d_out);
         let expected = data.expected_bytes("out");
         assert_close_bf16(&actual, &expected, data.meta.atol, data.meta.rtol, "la_gated_rmsnorm");
+    }
+
+    #[test]
+    fn test_la_gated_rmsnorm_bf16in_matches_fp32_path() {
+        let data = TestData::load("la_gated_rmsnorm_m64_nv32_dv128");
+        let ctx = GpuTestCtx::new();
+        let bf16_to_fp32 = ctx.get_kernel("la_bf16_to_fp32_kernel");
+        let fp32_kernel = ctx.get_kernel("la_gated_rmsnorm_kernel");
+        let bf16_kernel = ctx.get_kernel("la_gated_rmsnorm_bf16in_kernel");
+
+        let m = 64usize;
+        let nv = 32usize;
+        let dv = 128usize;
+        let eps: f32 = 1e-6;
+        let weight_f32_bytes: Vec<u8> = data.input_bytes("weight")
+            .chunks_exact(2)
+            .flat_map(|chunk| {
+                let val = half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+                val.to_le_bytes()
+            })
+            .collect();
+
+        let x_bf16_bytes: Vec<u8> = data.input_bytes("x")
+            .chunks_exact(4)
+            .flat_map(|chunk| {
+                let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                half::bf16::from_f32(val).to_bits().to_le_bytes()
+            })
+            .collect();
+
+        let d_x_bf16 = ctx.upload_bf16(&x_bf16_bytes);
+        let d_x_fp32 = ctx.alloc_f32(m * nv * dv);
+        let d_gate = ctx.upload_bf16(&data.input_bytes("gate"));
+        let d_weight = ctx.upload_f32(&weight_f32_bytes);
+        let d_out_fp32 = ctx.alloc_bf16(m * nv * dv);
+        let d_out_bf16 = ctx.alloc_bf16(m * nv * dv);
+
+        let mut dim_i32 = (nv * dv) as i32;
+        unsafe {
+            let threads = std::cmp::max(32, ((std::cmp::min(1024, nv * dv) + 31) / 32) * 32) as u32;
+            let mut out_ptr = *d_x_fp32.device_ptr() as u64;
+            let mut in_ptr = *d_x_bf16.device_ptr() as u64;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut out_ptr as *mut _ as *mut _,
+                &mut in_ptr as *mut _ as *mut _,
+                &mut dim_i32 as *mut _ as *mut _,
+            ];
+            launch(
+                bf16_to_fp32,
+                (m as u32, 1, 1),
+                (threads, 1, 1),
+                0,
+                ctx.stream(),
+                &mut params,
+            ).unwrap();
+        }
+
+        let mut nv_i32 = nv as i32;
+        let mut dv_i32 = dv as i32;
+        let mut eps_f32 = eps;
+        unsafe {
+            let threads = std::cmp::min(256, dv) as u32;
+            let threads = ((threads + 31) / 32) * 32;
+            let smem = threads * 4;
+
+            let mut out_fp32_ptr = *d_out_fp32.device_ptr() as u64;
+            let mut x_fp32_ptr = *d_x_fp32.device_ptr() as u64;
+            let mut gate_ptr = *d_gate.device_ptr() as u64;
+            let mut w_ptr = *d_weight.device_ptr() as u64;
+            let mut fp32_params: Vec<*mut std::ffi::c_void> = vec![
+                &mut out_fp32_ptr as *mut _ as *mut _,
+                &mut x_fp32_ptr as *mut _ as *mut _,
+                &mut gate_ptr as *mut _ as *mut _,
+                &mut w_ptr as *mut _ as *mut _,
+                &mut nv_i32 as *mut _ as *mut _,
+                &mut dv_i32 as *mut _ as *mut _,
+                &mut eps_f32 as *mut _ as *mut _,
+            ];
+            launch(
+                fp32_kernel,
+                (m as u32, nv as u32, 1),
+                (threads, 1, 1),
+                smem,
+                ctx.stream(),
+                &mut fp32_params,
+            ).unwrap();
+
+            let mut out_bf16_ptr = *d_out_bf16.device_ptr() as u64;
+            let mut x_bf16_ptr = *d_x_bf16.device_ptr() as u64;
+            let mut gate_bf16_ptr = *d_gate.device_ptr() as u64;
+            let mut w_bf16_ptr = *d_weight.device_ptr() as u64;
+            let mut bf16_params: Vec<*mut std::ffi::c_void> = vec![
+                &mut out_bf16_ptr as *mut _ as *mut _,
+                &mut x_bf16_ptr as *mut _ as *mut _,
+                &mut gate_bf16_ptr as *mut _ as *mut _,
+                &mut w_bf16_ptr as *mut _ as *mut _,
+                &mut nv_i32 as *mut _ as *mut _,
+                &mut dv_i32 as *mut _ as *mut _,
+                &mut eps_f32 as *mut _ as *mut _,
+            ];
+            launch(
+                bf16_kernel,
+                (m as u32, nv as u32, 1),
+                (threads, 1, 1),
+                smem,
+                ctx.stream(),
+                &mut bf16_params,
+            ).unwrap();
+        }
+        self::cuda_sync();
+
+        let actual = ctx.download_bf16(&d_out_bf16);
+        let expected = ctx.download_bf16(&d_out_fp32);
+        assert_close_bf16(&actual, &expected, 1e-2, 1e-2, "la_gated_rmsnorm_bf16in_parity");
+    }
+
+    #[test]
+    fn test_la_fused_repeat_l2norm_bf16_matches_cpu_reference() {
+        let ctx = GpuTestCtx::new();
+        let kernel = ctx.get_kernel("la_fused_repeat_l2norm_bf16_kernel");
+
+        let m = 64usize;
+        let nk = 4usize;
+        let hr = 8usize;
+        let nv = nk * hr;
+        let dk = 128usize;
+        let scale = 0.375f32;
+
+        let input_f32: Vec<f32> = (0..m)
+            .flat_map(|token| {
+                (0..nk).flat_map(move |head| {
+                    (0..dk).map(move |dim| {
+                        let token_term = ((token % 7) as f32 - 3.0) * 0.125;
+                        let head_term = ((head % 3) as f32 - 1.0) * 0.25;
+                        let dim_term = ((dim % 17) as f32 - 8.0) * 0.03125;
+                        let cross_term = ((token + head + dim) % 5) as f32 * 0.015625;
+                        token_term + head_term + dim_term + cross_term
+                    })
+                })
+            })
+            .collect();
+        let input_bf16_bytes: Vec<u8> = input_f32
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+
+        let d_input = ctx.upload_bf16(&input_bf16_bytes);
+        let d_output = ctx.alloc_bf16(m * nv * dk);
+
+        let mut nk_i32 = nk as i32;
+        let mut dk_i32 = dk as i32;
+        let mut hr_i32 = hr as i32;
+        let mut scale_f32 = scale;
+
+        unsafe {
+            let threads = std::cmp::max(32, ((std::cmp::min(256, dk) + 31) / 32) * 32) as u32;
+            let smem = threads * 4;
+            let mut out_ptr = *d_output.device_ptr() as u64;
+            let mut in_ptr = *d_input.device_ptr() as u64;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut out_ptr as *mut _ as *mut _,
+                &mut in_ptr as *mut _ as *mut _,
+                &mut nk_i32 as *mut _ as *mut _,
+                &mut dk_i32 as *mut _ as *mut _,
+                &mut hr_i32 as *mut _ as *mut _,
+                &mut scale_f32 as *mut _ as *mut _,
+            ];
+            launch(
+                kernel,
+                (m as u32, nv as u32, 1),
+                (threads, 1, 1),
+                smem,
+                ctx.stream(),
+                &mut params,
+            ).unwrap();
+        }
+        self::cuda_sync();
+
+        let actual = ctx.download_bf16(&d_output);
+
+        let input_bf16_vals: Vec<f32> = input_bf16_bytes
+            .chunks_exact(2)
+            .map(|chunk| half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .collect();
+        let mut expected = Vec::with_capacity(actual.len());
+        for token in 0..m {
+            for v_head in 0..nv {
+                let k_head = v_head / hr;
+                let src = &input_bf16_vals[((token * nk + k_head) * dk)..((token * nk + k_head + 1) * dk)];
+                let sumsq: f32 = src.iter().map(|&v| v * v).sum();
+                let inv_norm = (sumsq + 1e-6f32).sqrt().recip();
+                for &v in src {
+                    expected.extend_from_slice(
+                        &half::bf16::from_f32(v * inv_norm * scale).to_bits().to_le_bytes(),
+                    );
+                }
+            }
+        }
+
+        assert_close_bf16(
+            &actual,
+            &expected,
+            1e-2,
+            1e-2,
+            "la_fused_repeat_l2norm_bf16_cpu_parity",
+        );
     }
 
     // ── Tier 2: LA Conv1d + SiLU ─────────────────────────────────────
@@ -11101,6 +16128,234 @@ mod kernel_tests {
         let actual_state = ctx.download_f32(&d_state);
         let expected_state = data.expected_bytes("state_out");
         assert_close_f32(&actual_state, &expected_state, data.meta.atol as f64, data.meta.rtol as f64, "la_conv1d_state");
+    }
+
+    #[test]
+    fn test_la_fused_conv1d_silu_bf16_matches_old_kernel_path() {
+        let data = TestData::load("la_conv1d_m64_cd384_k4");
+        let ctx = GpuTestCtx::new();
+        let old_kernel = ctx.get_kernel("la_depthwise_conv1d_silu_kernel");
+        let fused_kernel = ctx.get_kernel("la_fused_conv1d_silu_bf16_kernel");
+        let state_kernel = ctx.get_kernel("la_update_conv_state_kernel");
+        let transpose_kernel = ctx.get_kernel("la_transpose_f32_kernel");
+        let split_kernel = ctx.get_kernel("la_split_conv_output_kernel");
+
+        let m = 64usize;
+        let key_dim = 128usize;
+        let value_dim = 128usize;
+        let conv_dim = key_dim * 2 + value_dim;
+        let kernel_dim = 4usize;
+
+        let input_bytes = data.input_bytes("x");
+        let mut q_bytes = Vec::with_capacity(m * key_dim * 2);
+        let mut k_bytes = Vec::with_capacity(m * key_dim * 2);
+        let mut v_bytes = Vec::with_capacity(m * value_dim * 2);
+        for token in 0..m {
+            let row = token * conv_dim * 2;
+            q_bytes.extend_from_slice(&input_bytes[row..row + key_dim * 2]);
+            k_bytes.extend_from_slice(&input_bytes[row + key_dim * 2..row + (key_dim * 2) * 2]);
+            v_bytes.extend_from_slice(&input_bytes[row + (key_dim * 2) * 2..row + conv_dim * 2]);
+        }
+
+        let d_input = ctx.upload_bf16(&input_bytes);
+        let d_q_in = ctx.upload_bf16(&q_bytes);
+        let d_k_in = ctx.upload_bf16(&k_bytes);
+        let d_v_in = ctx.upload_bf16(&v_bytes);
+        let d_weight = ctx.upload_f32(&data.input_bytes("weight"));
+        let d_old_state = ctx.upload_f32(&data.input_bytes("conv_state"));
+        let d_fused_state = ctx.upload_f32(&data.input_bytes("conv_state"));
+
+        let d_old_conv = ctx.alloc_f32(conv_dim * m);
+        let d_old_transposed = ctx.alloc_f32(conv_dim * m);
+        let d_old_q = ctx.alloc_f32(m * key_dim);
+        let d_old_k = ctx.alloc_f32(m * key_dim);
+        let d_old_v = ctx.alloc_f32(m * value_dim);
+        let d_fused_q = ctx.alloc_bf16(m * key_dim);
+        let d_fused_k = ctx.alloc_bf16(m * key_dim);
+        let d_fused_v = ctx.alloc_bf16(m * value_dim);
+
+        let mut m_i32 = m as i32;
+        let mut conv_dim_i32 = conv_dim as i32;
+        let mut key_dim_i32 = key_dim as i32;
+        let mut value_dim_i32 = value_dim as i32;
+        let mut kernel_dim_i32 = kernel_dim as i32;
+
+        unsafe {
+            let old_threads = ((std::cmp::min(256, m) as u32 + 31) / 32) * 32;
+            let mut out_ptr = *d_old_conv.device_ptr() as u64;
+            let mut state_ptr = *d_old_state.device_ptr() as u64;
+            let mut input_ptr = *d_input.device_ptr() as u64;
+            let mut weight_ptr = *d_weight.device_ptr() as u64;
+            let mut old_params: Vec<*mut std::ffi::c_void> = vec![
+                &mut out_ptr as *mut _ as *mut _,
+                &mut state_ptr as *mut _ as *mut _,
+                &mut input_ptr as *mut _ as *mut _,
+                &mut weight_ptr as *mut _ as *mut _,
+                &mut m_i32 as *mut _ as *mut _,
+                &mut conv_dim_i32 as *mut _ as *mut _,
+                &mut kernel_dim_i32 as *mut _ as *mut _,
+            ];
+            launch(
+                old_kernel,
+                (conv_dim as u32, 1, 1),
+                (old_threads, 1, 1),
+                0,
+                ctx.stream(),
+                &mut old_params,
+            ).unwrap();
+
+            let transpose_threads = ((std::cmp::min(1024, conv_dim) as u32 + 31) / 32) * 32;
+            let mut transposed_ptr = *d_old_transposed.device_ptr() as u64;
+            let mut conv_ptr = *d_old_conv.device_ptr() as u64;
+            let mut rows_i32 = conv_dim as i32;
+            let mut cols_i32 = m as i32;
+            let mut transpose_params: Vec<*mut std::ffi::c_void> = vec![
+                &mut transposed_ptr as *mut _ as *mut _,
+                &mut conv_ptr as *mut _ as *mut _,
+                &mut rows_i32 as *mut _ as *mut _,
+                &mut cols_i32 as *mut _ as *mut _,
+            ];
+            launch(
+                transpose_kernel,
+                (m as u32, 1, 1),
+                (transpose_threads, 1, 1),
+                0,
+                ctx.stream(),
+                &mut transpose_params,
+            ).unwrap();
+
+            let split_threads = ((std::cmp::min(256, conv_dim) as u32 + 31) / 32) * 32;
+            let mut old_q_ptr = *d_old_q.device_ptr() as u64;
+            let mut old_k_ptr = *d_old_k.device_ptr() as u64;
+            let mut old_v_ptr = *d_old_v.device_ptr() as u64;
+            let mut old_in_ptr = *d_old_transposed.device_ptr() as u64;
+            let mut split_params: Vec<*mut std::ffi::c_void> = vec![
+                &mut old_q_ptr as *mut _ as *mut _,
+                &mut old_k_ptr as *mut _ as *mut _,
+                &mut old_v_ptr as *mut _ as *mut _,
+                &mut old_in_ptr as *mut _ as *mut _,
+                &mut key_dim_i32 as *mut _ as *mut _,
+                &mut value_dim_i32 as *mut _ as *mut _,
+            ];
+            launch(
+                split_kernel,
+                (m as u32, 1, 1),
+                (split_threads, 1, 1),
+                0,
+                ctx.stream(),
+                &mut split_params,
+            ).unwrap();
+
+            let fused_threads = ((std::cmp::min(1024, conv_dim) as u32 + 31) / 32) * 32;
+            let mut fused_q_ptr = *d_fused_q.device_ptr() as u64;
+            let mut fused_k_ptr = *d_fused_k.device_ptr() as u64;
+            let mut fused_v_ptr = *d_fused_v.device_ptr() as u64;
+            let mut fused_state_ptr = *d_fused_state.device_ptr() as u64;
+            let mut q_in_ptr = *d_q_in.device_ptr() as u64;
+            let mut k_in_ptr = *d_k_in.device_ptr() as u64;
+            let mut v_in_ptr = *d_v_in.device_ptr() as u64;
+            let mut fused_weight_ptr = *d_weight.device_ptr() as u64;
+            let mut fused_params: Vec<*mut std::ffi::c_void> = vec![
+                &mut fused_q_ptr as *mut _ as *mut _,
+                &mut fused_k_ptr as *mut _ as *mut _,
+                &mut fused_v_ptr as *mut _ as *mut _,
+                &mut fused_state_ptr as *mut _ as *mut _,
+                &mut q_in_ptr as *mut _ as *mut _,
+                &mut k_in_ptr as *mut _ as *mut _,
+                &mut v_in_ptr as *mut _ as *mut _,
+                &mut fused_weight_ptr as *mut _ as *mut _,
+                &mut m_i32 as *mut _ as *mut _,
+                &mut key_dim_i32 as *mut _ as *mut _,
+                &mut value_dim_i32 as *mut _ as *mut _,
+                &mut kernel_dim_i32 as *mut _ as *mut _,
+            ];
+            launch(
+                fused_kernel,
+                (m as u32, 1, 1),
+                (fused_threads, 1, 1),
+                0,
+                ctx.stream(),
+                &mut fused_params,
+            ).unwrap();
+
+            let state_threads = ((std::cmp::min(32, kernel_dim) as u32 + 31) / 32) * 32;
+            let mut state_params: Vec<*mut std::ffi::c_void> = vec![
+                &mut fused_state_ptr as *mut _ as *mut _,
+                &mut q_in_ptr as *mut _ as *mut _,
+                &mut k_in_ptr as *mut _ as *mut _,
+                &mut v_in_ptr as *mut _ as *mut _,
+                &mut m_i32 as *mut _ as *mut _,
+                &mut key_dim_i32 as *mut _ as *mut _,
+                &mut value_dim_i32 as *mut _ as *mut _,
+                &mut kernel_dim_i32 as *mut _ as *mut _,
+            ];
+            launch(
+                state_kernel,
+                (conv_dim as u32, 1, 1),
+                (state_threads, 1, 1),
+                0,
+                ctx.stream(),
+                &mut state_params,
+            ).unwrap();
+        }
+        self::cuda_sync();
+
+        let old_q = ctx.download_f32(&d_old_q);
+        let old_k = ctx.download_f32(&d_old_k);
+        let old_v = ctx.download_f32(&d_old_v);
+        let fused_q = ctx.download_bf16(&d_fused_q);
+        let fused_k = ctx.download_bf16(&d_fused_k);
+        let fused_v = ctx.download_bf16(&d_fused_v);
+
+        let f32_bytes_to_bf16_bytes = |bytes: &[u8]| -> Vec<u8> {
+            bytes.chunks_exact(4)
+                .flat_map(|chunk| {
+                    half::bf16::from_f32(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                        .to_bits()
+                        .to_le_bytes()
+                })
+                .collect()
+        };
+
+        assert_close_bf16(
+            &fused_q,
+            &f32_bytes_to_bf16_bytes(&old_q),
+            1e-2,
+            1e-2,
+            "la_fused_conv1d_q_old_path_parity",
+        );
+        assert_close_bf16(
+            &fused_k,
+            &f32_bytes_to_bf16_bytes(&old_k),
+            1e-2,
+            1e-2,
+            "la_fused_conv1d_k_old_path_parity",
+        );
+        assert_close_bf16(
+            &fused_v,
+            &f32_bytes_to_bf16_bytes(&old_v),
+            1e-2,
+            1e-2,
+            "la_fused_conv1d_v_old_path_parity",
+        );
+
+        let actual_old_state = ctx.download_f32(&d_old_state);
+        let actual_fused_state = ctx.download_f32(&d_fused_state);
+        let expected_state = data.expected_bytes("state_out");
+        assert_close_f32(
+            &actual_old_state,
+            &expected_state,
+            data.meta.atol as f64,
+            data.meta.rtol as f64,
+            "la_conv1d_old_state_expected",
+        );
+        assert_close_f32(
+            &actual_fused_state,
+            &expected_state,
+            data.meta.atol as f64,
+            data.meta.rtol as f64,
+            "la_fused_conv1d_state_expected",
+        );
     }
 
     // ── Tier 2: LA Uninterleave QKVZ ─────────────────────────────────
@@ -11458,6 +16713,539 @@ mod kernel_tests {
         assert_close_f32(&actual_state, &expected_state, data.meta.atol, data.meta.rtol, "la_state_update");
     }
 
+    #[test]
+    fn test_fla_output_single_chunk_matches_cpu_reference_zero_state() {
+        let ctx = GpuTestCtx::new();
+        let fla = load_test_fla(32);
+
+        let t = 17usize;
+        let nv = 32usize;
+        let dk = 128usize;
+        let dv = 128usize;
+        let nt = 1usize;
+
+        let mut q = vec![0.0f32; t * nv * dk];
+        let mut k = vec![0.0f32; t * nv * dk];
+        let mut v_new = vec![0.0f32; t * nv * dv];
+        let mut g_cum = vec![0.0f32; t * nv];
+
+        for pos in 0..t {
+            for head in 0..nv {
+                let gate = -0.12f32 * (pos as f32) - 0.015f32 * (head as f32);
+                g_cum[pos * nv + head] = gate;
+
+                for i in 0..dk {
+                    let idx = (pos * nv + head) * dk + i;
+                    let x = idx as f32;
+                    q[idx] = ((x * 0.013) + 0.21).sin() * 0.14;
+                    k[idx] = ((x * 0.017) + 0.37).cos() * 0.16;
+                }
+                for i in 0..dv {
+                    let idx = (pos * nv + head) * dv + i;
+                    let x = idx as f32;
+                    v_new[idx] = ((x * 0.011) + 0.49).sin() * 0.19;
+                }
+            }
+        }
+
+        let mut expected = vec![0.0f32; t * nv * dv];
+        for pos in 0..t {
+            for head in 0..nv {
+                let g_t = g_cum[pos * nv + head];
+                let q_off = (pos * nv + head) * dk;
+                let out_off = (pos * nv + head) * dv;
+                for s in 0..=pos {
+                    let k_off = (s * nv + head) * dk;
+                    let v_off = (s * nv + head) * dv;
+                    let mut qk = 0.0f32;
+                    for i in 0..dk {
+                        qk += q[q_off + i] * k[k_off + i];
+                    }
+                    let weight = qk * (g_t - g_cum[s * nv + head]).exp();
+                    for d in 0..dv {
+                        expected[out_off + d] += weight * v_new[v_off + d];
+                    }
+                }
+            }
+        }
+        let expected_bf16 = f32_to_bf16_bytes(&expected);
+
+        let d_q = ctx.upload_bf16(&f32_to_bf16_bytes(&q));
+        let d_k = ctx.upload_bf16(&f32_to_bf16_bytes(&k));
+        let d_v_new = ctx.upload_bf16(&f32_to_bf16_bytes(&v_new));
+        let d_g_cum = ctx.upload_f32(
+            &g_cum.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()
+        );
+        let d_h = ctx.alloc_bf16(nt * nv * dk * dv);
+        let d_out = ctx.alloc_bf16(t * nv * dv);
+
+        let mut q_ptr = *d_q.device_ptr() as u64;
+        let mut k_ptr = *d_k.device_ptr() as u64;
+        let mut v_ptr = *d_v_new.device_ptr() as u64;
+        let mut h_ptr = *d_h.device_ptr() as u64;
+        let mut g_ptr = *d_g_cum.device_ptr() as u64;
+        let mut o_ptr = *d_out.device_ptr() as u64;
+        let mut scale = 1.0f32;
+        let mut t_i32 = t as i32;
+
+        let rc = unsafe {
+            (fla.output)(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                h_ptr,
+                g_ptr,
+                0,
+                o_ptr,
+                0,
+                0,
+                scale,
+                t_i32,
+                1,
+                nt as u32,
+                nv as u32,
+                ctx.stream() as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!(rc, 0, "FLA output kernel returned rc={}", rc);
+        self::cuda_sync();
+
+        let actual = ctx.download_bf16(&d_out);
+        let actual_f32 = bf16_bytes_to_f32(&actual);
+        let expected_f32 = bf16_bytes_to_f32(&expected_bf16);
+
+        let mut max_abs_err = 0.0f32;
+        let mut worst_idx = 0usize;
+        for i in 0..actual_f32.len() {
+            let err = (actual_f32[i] - expected_f32[i]).abs();
+            if err > max_abs_err {
+                max_abs_err = err;
+                worst_idx = i;
+            }
+        }
+        eprintln!(
+            "  fla_output_zero_state max_abs_err={:.6} worst_idx={} actual={:.6} expected={:.6}",
+            max_abs_err,
+            worst_idx,
+            actual_f32[worst_idx],
+            expected_f32[worst_idx],
+        );
+        assert_close_bf16(&actual, &expected_bf16, 2e-2, 2e-2, "fla_output_zero_state_cpu_parity");
+    }
+
+    #[test]
+    fn test_fla_state_recurrence_zero_state_preserves_u_as_v_new() {
+        let ctx = GpuTestCtx::new();
+        let fla = load_test_fla(32);
+
+        let t = 17usize;
+        let nv = 32usize;
+        let dk = 128usize;
+        let dv = 128usize;
+        let nt = 1usize;
+
+        let mut k = vec![0.0f32; t * nv * dk];
+        let mut u = vec![0.0f32; t * nv * dv];
+        let mut w = vec![0.0f32; t * nv * dk];
+        let mut g_cum = vec![0.0f32; t * nv];
+
+        for pos in 0..t {
+            for head in 0..nv {
+                g_cum[pos * nv + head] = -0.09f32 * (pos as f32) - 0.013f32 * (head as f32);
+                for i in 0..dk {
+                    let idx = (pos * nv + head) * dk + i;
+                    let x = idx as f32;
+                    k[idx] = ((x * 0.019) + 0.33).sin() * 0.12;
+                    w[idx] = ((x * 0.023) + 0.17).cos() * 0.11;
+                }
+                for i in 0..dv {
+                    let idx = (pos * nv + head) * dv + i;
+                    let x = idx as f32;
+                    u[idx] = ((x * 0.015) + 0.41).sin() * 0.18;
+                }
+            }
+        }
+
+        let d_k = ctx.upload_bf16(&f32_to_bf16_bytes(&k));
+        let d_u = ctx.upload_bf16(&f32_to_bf16_bytes(&u));
+        let d_w = ctx.upload_bf16(&f32_to_bf16_bytes(&w));
+        let d_g = ctx.upload_f32(
+            &g_cum.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()
+        );
+        let d_v_new = ctx.alloc_bf16(t * nv * dv);
+        let d_h = ctx.alloc_bf16(nt * nv * dk * dv);
+        let d_h0 = ctx.alloc_bf16(nv * dk * dv);
+        let d_ht = ctx.alloc_f32(nv * dk * dv);
+
+        let k_ptr = *d_k.device_ptr() as u64;
+        let u_ptr = *d_u.device_ptr() as u64;
+        let w_ptr = *d_w.device_ptr() as u64;
+        let v_new_ptr = *d_v_new.device_ptr() as u64;
+        let g_ptr = *d_g.device_ptr() as u64;
+        let h_ptr = *d_h.device_ptr() as u64;
+        let h0_ptr = *d_h0.device_ptr() as u64;
+        let ht_ptr = *d_ht.device_ptr() as u64;
+        let mut t_i32 = t as i32;
+        let sr_grid_x = ((dv + 31) / 32) as u32;
+
+        let rc = unsafe {
+            (fla.state_recurrence)(
+                k_ptr,
+                u_ptr,
+                w_ptr,
+                v_new_ptr,
+                g_ptr,
+                0,
+                h_ptr,
+                h0_ptr,
+                ht_ptr,
+                0,
+                0,
+                t_i32,
+                sr_grid_x,
+                nv as u32,
+                1,
+                ctx.stream() as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!(rc, 0, "FLA state_recurrence kernel returned rc={}", rc);
+        self::cuda_sync();
+
+        let actual_v_new = ctx.download_bf16(&d_v_new);
+        let expected_v_new = f32_to_bf16_bytes(&u);
+        assert_close_bf16(
+            &actual_v_new,
+            &expected_v_new,
+            2e-2,
+            2e-2,
+            "fla_state_recurrence_zero_state_v_new_equals_u",
+        );
+
+        let actual_h = ctx.download_bf16(&d_h);
+        let zero_h = vec![0u8; actual_h.len()];
+        assert_close_bf16(
+            &actual_h,
+            &zero_h,
+            0.0,
+            0.0,
+            "fla_state_recurrence_zero_state_chunk_h_is_zero",
+        );
+    }
+
+    #[test]
+    fn test_fla_wy_repr_single_chunk_matches_cpu_reference() {
+        let ctx = GpuTestCtx::new();
+        let fla = load_test_fla(32);
+
+        let t = 17usize;
+        let nv = 32usize;
+        let dk = 128usize;
+        let dv = 128usize;
+        let bt = 64usize;
+        let nt = 1usize;
+
+        let mut k = vec![0.0f32; t * nv * dk];
+        let mut v = vec![0.0f32; t * nv * dv];
+        let mut beta = vec![0.0f32; t * nv];
+        let mut g_cum = vec![0.0f32; t * nv];
+        let mut a = vec![0.0f32; t * nv * bt];
+
+        for pos in 0..t {
+            for head in 0..nv {
+                beta[pos * nv + head] = 0.55f32 + 0.01f32 * (head as f32) + 0.005f32 * (pos as f32);
+                g_cum[pos * nv + head] = -0.08f32 * (pos as f32) - 0.012f32 * (head as f32);
+
+                for col in 0..=pos {
+                    let idx = (pos * nv + head) * bt + col;
+                    a[idx] = if col == pos {
+                        1.0
+                    } else {
+                        (((pos * 19 + col * 7 + head * 3) as f32) * 0.013).sin() * 0.09
+                    };
+                }
+
+                for i in 0..dk {
+                    let idx = (pos * nv + head) * dk + i;
+                    let x = idx as f32;
+                    k[idx] = ((x * 0.017) + 0.29).sin() * 0.15;
+                }
+                for i in 0..dv {
+                    let idx = (pos * nv + head) * dv + i;
+                    let x = idx as f32;
+                    v[idx] = ((x * 0.013) + 0.41).cos() * 0.18;
+                }
+            }
+        }
+
+        let mut expected_u = vec![0.0f32; t * nv * dv];
+        let mut expected_w = vec![0.0f32; t * nv * dk];
+        for pos in 0..t {
+            for head in 0..nv {
+                for src in 0..=pos {
+                    let a_coeff = a[(pos * nv + head) * bt + src];
+                    let beta_src = beta[src * nv + head];
+                    let g_src = g_cum[src * nv + head].exp();
+
+                    let v_off = (src * nv + head) * dv;
+                    let u_off = (pos * nv + head) * dv;
+                    for d in 0..dv {
+                        expected_u[u_off + d] += a_coeff * (v[v_off + d] * beta_src);
+                    }
+
+                    let k_off = (src * nv + head) * dk;
+                    let w_off = (pos * nv + head) * dk;
+                    for d in 0..dk {
+                        expected_w[w_off + d] += a_coeff * (k[k_off + d] * beta_src * g_src);
+                    }
+                }
+            }
+        }
+
+        let expected_u_bf16 = f32_to_bf16_bytes(&expected_u);
+        let expected_w_bf16 = f32_to_bf16_bytes(&expected_w);
+
+        let d_k = ctx.upload_bf16(&f32_to_bf16_bytes(&k));
+        let d_v = ctx.upload_bf16(&f32_to_bf16_bytes(&v));
+        let d_beta = ctx.upload_bf16(&f32_to_bf16_bytes(&beta));
+        let d_a = ctx.upload_bf16(&f32_to_bf16_bytes(&a));
+        let d_g = ctx.upload_f32(
+            &g_cum.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()
+        );
+        let d_w = ctx.alloc_bf16(t * nv * dk);
+        let d_u = ctx.alloc_bf16(t * nv * dv);
+
+        let k_ptr = *d_k.device_ptr() as u64;
+        let v_ptr = *d_v.device_ptr() as u64;
+        let beta_ptr = *d_beta.device_ptr() as u64;
+        let w_ptr = *d_w.device_ptr() as u64;
+        let u_ptr = *d_u.device_ptr() as u64;
+        let a_ptr = *d_a.device_ptr() as u64;
+        let g_ptr = *d_g.device_ptr() as u64;
+        let t_i32 = t as i32;
+
+        let rc = unsafe {
+            (fla.wy_repr)(
+                k_ptr,
+                v_ptr,
+                beta_ptr,
+                w_ptr,
+                u_ptr,
+                a_ptr,
+                g_ptr,
+                0,
+                0,
+                t_i32,
+                nt as u32,
+                nv as u32,
+                1,
+                ctx.stream() as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!(rc, 0, "FLA wy_repr kernel returned rc={}", rc);
+        self::cuda_sync();
+
+        let actual_w = ctx.download_bf16(&d_w);
+        let actual_u = ctx.download_bf16(&d_u);
+
+        let actual_w_f32 = bf16_bytes_to_f32(&actual_w);
+        let expected_w_f32 = bf16_bytes_to_f32(&expected_w_bf16);
+        let actual_u_f32 = bf16_bytes_to_f32(&actual_u);
+        let expected_u_f32 = bf16_bytes_to_f32(&expected_u_bf16);
+
+        let mut worst_w_idx = 0usize;
+        let mut worst_w_err = 0.0f32;
+        for i in 0..actual_w_f32.len() {
+            let err = (actual_w_f32[i] - expected_w_f32[i]).abs();
+            if err > worst_w_err {
+                worst_w_err = err;
+                worst_w_idx = i;
+            }
+        }
+
+        let mut worst_u_idx = 0usize;
+        let mut worst_u_err = 0.0f32;
+        for i in 0..actual_u_f32.len() {
+            let err = (actual_u_f32[i] - expected_u_f32[i]).abs();
+            if err > worst_u_err {
+                worst_u_err = err;
+                worst_u_idx = i;
+            }
+        }
+
+        eprintln!(
+            "  fla_wy_repr max_abs_err_w={:.6} worst_w_idx={} actual={:.6} expected={:.6}",
+            worst_w_err,
+            worst_w_idx,
+            actual_w_f32[worst_w_idx],
+            expected_w_f32[worst_w_idx],
+        );
+        eprintln!(
+            "  fla_wy_repr max_abs_err_u={:.6} worst_u_idx={} actual={:.6} expected={:.6}",
+            worst_u_err,
+            worst_u_idx,
+            actual_u_f32[worst_u_idx],
+            expected_u_f32[worst_u_idx],
+        );
+
+        assert_close_bf16(&actual_w, &expected_w_bf16, 2e-2, 2e-2, "fla_wy_repr_w_cpu_parity");
+        assert_close_bf16(&actual_u, &expected_u_bf16, 2e-2, 2e-2, "fla_wy_repr_u_cpu_parity");
+    }
+
+    #[test]
+    fn test_fla_kkt_single_chunk_matches_cpu_reference() {
+        let ctx = GpuTestCtx::new();
+        let fla = load_test_fla(32);
+
+        let t = 17usize;
+        let nv = 32usize;
+        let dk = 128usize;
+        let bt = 64usize;
+        let nt = 1usize;
+
+        let mut k = vec![0.0f32; t * nv * dk];
+        let mut beta = vec![0.0f32; t * nv];
+        let mut g_cum = vec![0.0f32; t * nv];
+
+        for pos in 0..t {
+            for head in 0..nv {
+                beta[pos * nv + head] = 0.42f32 + 0.008f32 * (head as f32) + 0.006f32 * (pos as f32);
+                g_cum[pos * nv + head] = -0.07f32 * (pos as f32) - 0.01f32 * (head as f32);
+                for i in 0..dk {
+                    let idx = (pos * nv + head) * dk + i;
+                    let x = idx as f32;
+                    k[idx] = ((x * 0.019) + 0.31).cos() * 0.14;
+                }
+            }
+        }
+
+        let mut expected_a = vec![0.0f32; t * nv * bt];
+        for pos in 0..t {
+            for head in 0..nv {
+                let beta_t = beta[pos * nv + head];
+                let g_t = g_cum[pos * nv + head];
+                let q_off = (pos * nv + head) * dk;
+                for src in 0..pos {
+                    let k_off = (src * nv + head) * dk;
+                    let mut kk = 0.0f32;
+                    for i in 0..dk {
+                        kk += k[q_off + i] * k[k_off + i];
+                    }
+                    expected_a[(pos * nv + head) * bt + src] =
+                        kk * (g_t - g_cum[src * nv + head]).exp() * beta_t;
+                }
+            }
+        }
+
+        let d_k = ctx.upload_bf16(&f32_to_bf16_bytes(&k));
+        let d_beta = ctx.upload_bf16(&f32_to_bf16_bytes(&beta));
+        let d_g = ctx.upload_f32(
+            &g_cum.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()
+        );
+        let d_a = ctx.alloc_f32(t * nv * bt);
+
+        let k_ptr = *d_k.device_ptr() as u64;
+        let g_ptr = *d_g.device_ptr() as u64;
+        let beta_ptr = *d_beta.device_ptr() as u64;
+        let a_ptr = *d_a.device_ptr() as u64;
+        let t_i32 = t as i32;
+
+        let rc = unsafe {
+            (fla.kkt)(
+                k_ptr,
+                g_ptr,
+                beta_ptr,
+                a_ptr,
+                0,
+                0,
+                t_i32,
+                nt as u32,
+                nv as u32,
+                1,
+                ctx.stream() as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!(rc, 0, "FLA kkt kernel returned rc={}", rc);
+        self::cuda_sync();
+
+        let actual_a = ctx.download_f32(&d_a);
+        let expected_a_bytes = expected_a
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+
+        assert_close_f32(&actual_a, &expected_a_bytes, 5e-3, 5e-3, "fla_kkt_cpu_parity");
+    }
+
+    #[test]
+    fn test_fla_solve_tril_single_chunk_matches_cpu_reference() {
+        let ctx = GpuTestCtx::new();
+        let fla = load_test_fla(32);
+
+        let t = 17usize;
+        let nv = 32usize;
+        let bt = 64usize;
+        let nt = 1usize;
+
+        let mut a = vec![0.0f32; t * nv * bt];
+        for row in 0..t {
+            for head in 0..nv {
+                for col in 0..row {
+                    let idx = (row * nv + head) * bt + col;
+                    a[idx] = (((row * 23 + col * 11 + head * 5) as f32) * 0.009).sin() * 0.08;
+                }
+            }
+        }
+
+        let mut expected_ai = vec![0.0f32; t * nv * bt];
+        for head in 0..nv {
+            for col in 0..t {
+                expected_ai[(col * nv + head) * bt + col] = 1.0;
+                for row in (col + 1)..t {
+                    let mut sum = 0.0f32;
+                    for k in col..row {
+                        let l_ik = if k == row {
+                            1.0
+                        } else {
+                            a[(row * nv + head) * bt + k]
+                        };
+                        sum += l_ik * expected_ai[(k * nv + head) * bt + col];
+                    }
+                    expected_ai[(row * nv + head) * bt + col] = -sum;
+                }
+            }
+        }
+
+        let d_a = ctx.upload_f32(
+            &a.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()
+        );
+        let d_ai = ctx.alloc_bf16(t * nv * bt);
+
+        let a_ptr = *d_a.device_ptr() as u64;
+        let ai_ptr = *d_ai.device_ptr() as u64;
+        let t_i32 = t as i32;
+
+        let rc = unsafe {
+            (fla.solve_tril)(
+                a_ptr,
+                ai_ptr,
+                0,
+                0,
+                t_i32,
+                nt as u32,
+                nv as u32,
+                1,
+                ctx.stream() as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!(rc, 0, "FLA solve_tril kernel returned rc={}", rc);
+        self::cuda_sync();
+
+        let actual_ai = ctx.download_bf16(&d_ai);
+        let expected_ai_bf16 = f32_to_bf16_bytes(&expected_ai);
+
+        assert_close_bf16(&actual_ai, &expected_ai_bf16, 2e-2, 2e-2, "fla_solve_tril_cpu_parity");
+    }
+
     #[cfg(has_decode_kernels)]
     #[test]
     fn test_la_decode_step_matches_prefill_single_token() {
@@ -11698,6 +17486,88 @@ mod kernel_tests {
         let actual = ctx.download_f32(&d_accum);
         let expected = data.expected_bytes("accum");
         assert_close_f32(&actual, &expected, data.meta.atol, data.meta.rtol, "moe_scatter_fused");
+    }
+
+    #[test]
+    fn test_moe_scatter_weighted_uses_compact_sorted_id_source_layout() {
+        let ctx = GpuTestCtx::new();
+        let kernel = ctx.get_kernel("moe_scatter_weighted_kernel");
+
+        let m = 2usize;
+        let topk = 2usize;
+        let hidden = 4usize;
+        let scale_factor = 1.0f32;
+
+        let src_rows: Vec<f32> = vec![
+            10.0, 11.0, 12.0, 13.0,
+            20.0, 21.0, 22.0, 23.0,
+            30.0, 31.0, 32.0, 33.0,
+            40.0, 41.0, 42.0, 43.0,
+        ];
+        let sorted_ids: Vec<i32> = vec![1, -1, 3, 0, -1, 2];
+        let topk_weights: Vec<f32> = vec![0.5, 1.5, 2.0, 3.0];
+        let total_sorted = sorted_ids.len();
+
+        let mut expected = vec![0.0f32; m * hidden];
+        for row in 0..sorted_ids.len() {
+            let sid = sorted_ids[row];
+            if sid < 0 {
+                continue;
+            }
+            let sid = sid as usize;
+            let token = sid / topk;
+            let wt = topk_weights[sid] * scale_factor;
+            for i in 0..hidden {
+                expected[token * hidden + i] += src_rows[sid * hidden + i] * wt;
+            }
+        }
+
+        let src_bytes: Vec<u8> = src_rows
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_bits())
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect();
+        let sorted_ids_bytes: Vec<u8> = sorted_ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let topk_weights_bytes: Vec<u8> = topk_weights.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let d_src = ctx.upload_bf16(&src_bytes);
+        let d_sorted_ids = ctx.upload_i32(&sorted_ids_bytes);
+        let d_topk_weights = ctx.upload_f32(&topk_weights_bytes);
+        let d_accum = ctx.alloc_f32(m * hidden);
+
+        let mut accum_ptr = *d_accum.device_ptr() as u64;
+        let mut src_ptr = *d_src.device_ptr() as u64;
+        let mut sorted_ids_ptr = *d_sorted_ids.device_ptr() as u64;
+        let mut topk_weights_ptr = *d_topk_weights.device_ptr() as u64;
+        let mut hidden_i32 = hidden as i32;
+        let mut m_i32 = m as i32;
+        let mut topk_i32 = topk as i32;
+        let mut total_sorted_i32 = total_sorted as i32;
+        let mut scale = scale_factor;
+
+        unsafe {
+            let threads = std::cmp::min(256, hidden) as u32;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut accum_ptr as *mut _ as *mut _,
+                &mut src_ptr as *mut _ as *mut _,
+                &mut sorted_ids_ptr as *mut _ as *mut _,
+                &mut topk_weights_ptr as *mut _ as *mut _,
+                &mut hidden_i32 as *mut _ as *mut _,
+                &mut m_i32 as *mut _ as *mut _,
+                &mut topk_i32 as *mut _ as *mut _,
+                &mut total_sorted_i32 as *mut _ as *mut _,
+                &mut scale as *mut _ as *mut _,
+            ];
+            launch(kernel, (total_sorted as u32, 1, 1), (threads, 1, 1), 0, ctx.stream(), &mut params).unwrap();
+        }
+        self::cuda_sync();
+
+        let actual = ctx.download_f32(&d_accum);
+        let expected_bytes = expected
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        assert_close_f32(&actual, &expected_bytes, 1e-5, 1e-5, "moe_scatter_weighted_compact_sorted_id_layout");
     }
 
     /// Synchronize the CUDA device (wait for all kernel launches to complete).
