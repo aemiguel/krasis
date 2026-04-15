@@ -853,13 +853,16 @@ def main():
     if validation_components:
         joined = ", ".join(validation_components)
         _warn(
-            "BF16 validation path enabled: "
-            f"{joined}. Use this only for correctness/debugging; production runs "
-            "must use the Rust serving path with quantized configs."
+            "UNVALIDATED BF16 debug path enabled: "
+            f"{joined}. This path likely contains unknown bugs and must not be "
+            "used as a correctness oracle. Use HF Transformers BF16 reference "
+            "data for validation; production runs must use quantized configs."
         )
         logger.warning(
-            "BF16 validation path enabled (%s); production runs must use the "
-            "Rust serving path with quantized configs.",
+            "UNVALIDATED BF16 debug path enabled (%s); this path likely contains "
+            "unknown bugs and must not be used for validation. Use HF "
+            "Transformers BF16 reference data as the oracle; production runs "
+            "must use quantized configs.",
             joined,
         )
 

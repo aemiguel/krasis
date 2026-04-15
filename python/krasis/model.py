@@ -714,6 +714,10 @@ class KrasisModel:
                 print(f"  \033[0;32mAttention resident on GPU ({attn_mb} MB), {free_mb} MB free\033[0m", flush=True)
 
         # Phase 2: Expert weights (Rust engine) — GPU Marlin cache only (CPU cache no longer used)
+        # IMPORTANT: gpu_expert_bits == 16 is an unvalidated debug-only path.
+        # It must not be used as a correctness oracle because loader/layout/math
+        # bugs may still exist there independently of the quantized Rust serving
+        # path we actually care about.
         cpu_start = time.perf_counter()
         gpu_bits = self.quant_cfg.gpu_expert_bits
         cache_dir = cache_dir_for_model(self.cfg.model_path)
