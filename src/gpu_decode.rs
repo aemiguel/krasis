@@ -1899,6 +1899,7 @@ struct GpuDecodeGraph {
     eps: f32,
     intermediate_size: usize,         // max intermediate (for buffer allocation)
     moe_intermediate_size: usize,     // MoE expert intermediate (for expert kernels)
+    shared_expert_intermediate_size: usize, // Shared expert intermediate (may differ from routed)
     group_size: usize,
     /// Expert quantization bits: 4 (INT4 Marlin) or 8 (INT8 Marlin).
     expert_bits: u8,
@@ -2854,7 +2855,7 @@ impl GpuDecodeStore {
     }
 
     /// Initialize the decode graph with model dimensions.
-    #[pyo3(signature = (hidden_size, num_layers, vocab_size, eps, max_experts_per_tok=10, max_intermediate_size=0, max_qkv_size=0, group_size=128, expert_bits=4, moe_intermediate_size=0))]
+    #[pyo3(signature = (hidden_size, num_layers, vocab_size, eps, max_experts_per_tok=10, max_intermediate_size=0, max_qkv_size=0, group_size=128, expert_bits=4, moe_intermediate_size=0, shared_expert_intermediate_size=0))]
     fn configure(
         &mut self,
         hidden_size: usize,
@@ -2867,9 +2868,15 @@ impl GpuDecodeStore {
         group_size: usize,
         expert_bits: u8,
         moe_intermediate_size: usize,
+        shared_expert_intermediate_size: usize,
     ) -> PyResult<()> {
         let intermediate = if max_intermediate_size > 0 { max_intermediate_size } else { hidden_size * 4 };
         let moe_inter = if moe_intermediate_size > 0 { moe_intermediate_size } else { intermediate };
+        let shared_inter = if shared_expert_intermediate_size > 0 {
+            shared_expert_intermediate_size
+        } else {
+            moe_inter
+        };
         let qkv_size = if max_qkv_size > 0 { max_qkv_size } else { hidden_size * 3 };
         let d_hidden = self.device.alloc_zeros::<u16>(hidden_size)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
@@ -2907,14 +2914,17 @@ impl GpuDecodeStore {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
         let d_expert_out = self.device.alloc_zeros::<u16>(hidden_size)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let d_expert_gate_up = self.device.alloc_zeros::<u16>(intermediate * 2)
+        let max_expert_inter = intermediate.max(shared_inter);
+        let d_expert_gate_up = self.device.alloc_zeros::<u16>(max_expert_inter * 2)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let d_expert_scratch = self.device.alloc_zeros::<u16>(intermediate)
+        let d_expert_scratch = self.device.alloc_zeros::<u16>(max_expert_inter)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
 
-        // v2 K-split partial sum buffer: max_k_splits=8, max_N = max(2*intermediate, hidden_size, qkv_size)
-        // qkv_size included so attention projections can also use v2 GEMV
-        let max_n_v2 = (intermediate * 2).max(hidden_size).max(qkv_size);
+        // v2 K-split partial sum buffer: max_k_splits=8, max_N = max(2*expert_intermediate, hidden_size, qkv_size)
+        // qkv_size included so attention projections can also use v2 GEMV.
+        // Shared experts may be wider than routed experts, so size this from the
+        // largest expert intermediate actually configured on the graph.
+        let max_n_v2 = (max_expert_inter * 2).max(hidden_size).max(qkv_size);
         let max_k_splits = 8;
         let d_v2_partial = self.device.alloc_zeros::<f32>(max_k_splits * max_n_v2)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
@@ -3011,6 +3021,7 @@ impl GpuDecodeStore {
             eps,
             intermediate_size: intermediate,
             moe_intermediate_size: moe_inter,
+            shared_expert_intermediate_size: shared_inter,
             group_size,
             expert_bits,
             shared_expert_bits: expert_bits, // default: same as routed; overridden when shared expert is registered
@@ -7085,8 +7096,12 @@ impl GpuDecodeStore {
 
         let mut config = PrefillModelConfig {
             hidden_size: graph.hidden_size,
-            intermediate_size: graph.moe_intermediate_size.max(graph.intermediate_size),
+            intermediate_size: graph
+                .shared_expert_intermediate_size
+                .max(graph.moe_intermediate_size)
+                .max(graph.intermediate_size),
             moe_intermediate_size: graph.moe_intermediate_size,
+            shared_expert_intermediate_size: graph.shared_expert_intermediate_size,
             num_hidden_layers: num_layers,
             num_q_heads,
             num_kv_heads,
@@ -7352,10 +7367,11 @@ impl GpuDecodeStore {
                                     k: shared_inter,
                                 });
                             } else {
+                                let shared_inter = graph.shared_expert_intermediate_size;
                                 lw.shared_w1 = Some(MarlinWeight {
                                     packed: se_vram.w13_packed_ptr(),
                                     scales: se_vram.w13_scales_ptr(),
-                                    n: graph.moe_intermediate_size * 2,
+                                    n: shared_inter * 2,
                                     k: graph.hidden_size,
                                     num_groups: graph.hidden_size / graph.group_size.max(1),
                                     group_size: graph.group_size,
@@ -7365,8 +7381,8 @@ impl GpuDecodeStore {
                                     packed: se_vram.w2_packed_ptr(),
                                     scales: se_vram.w2_scales_ptr(),
                                     n: graph.hidden_size,
-                                    k: graph.moe_intermediate_size,
-                                    num_groups: graph.moe_intermediate_size / graph.group_size.max(1),
+                                    k: shared_inter,
+                                    num_groups: shared_inter / graph.group_size.max(1),
                                     group_size: graph.group_size,
                                     num_bits: bits,
                                 });
@@ -9056,6 +9072,7 @@ impl GpuDecodeStore {
             .ok_or_else(|| "Kernels not cached".to_string())?.clone();
 
         let intermediate = graph.moe_intermediate_size;
+        let shared_intermediate = graph.shared_expert_intermediate_size;
         let gs = graph.group_size;
         // Select inverse weight permutation based on expert quantization bits
         let inv_wp = if graph.expert_bits == 8 {
@@ -9071,6 +9088,7 @@ impl GpuDecodeStore {
 
         // v2 K-split config
         let w13_n = 2 * intermediate;
+        let shared_w13_n = 2 * shared_intermediate;
         let w13_k_tiles = hs / 16;
         let w13_max_ksplits = w13_k_tiles / 16;
         let w13_n_tiles = (w13_n + 15) / 16;
@@ -9240,18 +9258,18 @@ impl GpuDecodeStore {
                             sw13p, sw13s,
                             *graph.d_hidden.device_ptr(),
                             partial_ptr, inv_wp, inv_sp,
-                            hs, w13_n, gs, w13_ksplits, &k, is_int8,
+                            hs, shared_w13_n, gs, w13_ksplits, &k, is_int8,
                         ).map_err(|e| format!("shared w13 v2: {:?}", e))?;
                         self.launch_reduce_ksplits_bf16(
                             *graph.d_expert_gate_up.device_ptr(),
-                            partial_ptr, w13_n, w13_ksplits, &k,
+                            partial_ptr, shared_w13_n, w13_ksplits, &k,
                         ).map_err(|e| format!("shared reduce: {:?}", e))?;
                     } else {
                         self.launch_marlin_gemv_raw(
                             sw13p, sw13s,
                             *graph.d_hidden.device_ptr(),
                             *graph.d_expert_gate_up.device_ptr(),
-                            inv_wp, inv_sp, hs, w13_n, gs, is_int8,
+                            inv_wp, inv_sp, hs, shared_w13_n, gs, is_int8,
                         ).map_err(|e| format!("shared w13 raw: {:?}", e))?;
                     }
 
@@ -9264,7 +9282,7 @@ impl GpuDecodeStore {
                         sw2p, sw2s,
                         *graph.d_expert_gate_up.device_ptr(),
                         *graph.d_moe_out.device_ptr(),
-                        inv_wp, inv_sp, intermediate, hs, gs,
+                        inv_wp, inv_sp, shared_intermediate, hs, gs,
                         1.0, shared_gate_ptr, &k, is_int8,
                     ).map_err(|e| format!("shared silu_accum: {:?}", e))?;
                 }
@@ -14498,6 +14516,7 @@ impl GpuDecodeStore {
         let is_int8 = graph.expert_bits == 8;
 
         let w13_n = 2 * intermediate;
+        let shared_w13_n = 2 * graph.shared_expert_intermediate_size;
         let w13_k_tiles = hs / 16;
         let w13_max_ksplits = w13_k_tiles / 16;
         let w13_ksplits = if w13_max_ksplits > 1 {
@@ -14841,7 +14860,7 @@ impl GpuDecodeStore {
                 self.launch_marlin_gemv_raw(
                     w13p, w13s, hidden_ptr,
                     *graph.d_expert_gate_up.device_ptr(),
-                    inv_wp, inv_sp, hs, 2 * intermediate, gs, is_int8).map_err(|e| format!("{}", e))?;
+                    inv_wp, inv_sp, hs, shared_w13_n, gs, is_int8).map_err(|e| format!("{}", e))?;
 
                 // w2 DMA (if not VRAM resident, first token only)
                 if se_vram.is_none() && t == 0 {
@@ -14871,7 +14890,7 @@ impl GpuDecodeStore {
                     w2p, w2s,
                     *graph.d_expert_gate_up.device_ptr(),
                     accum_ptr, inv_wp, inv_sp,
-                    intermediate, hs, gs,
+                    graph.shared_expert_intermediate_size, hs, gs,
                     shared_weight, gate_weight_ptr, k, is_int8).map_err(|e| format!("{}", e))?;
             }
         }
@@ -17227,7 +17246,7 @@ impl GpuDecodeStore {
         if let Some(ref se) = graph.moe_layers[layer_idx].as_ref().unwrap().shared {
             // Infer shared expert quantization bits from packed weight size.
             // BF16: packed_bytes = k * n * 2, INT8: packed_bytes = k * n, INT4: packed_bytes = k * n / 2
-            let se_n_w13 = graph.moe_intermediate_size * 2; // gated: gate+up
+            let se_n_w13 = graph.shared_expert_intermediate_size * 2; // gated: gate+up
             let se_k_w13 = graph.hidden_size;
             let expected_bf16 = se_k_w13 * se_n_w13 * 2;
             let expected_int8 = se_k_w13 * se_n_w13;
@@ -17235,12 +17254,12 @@ impl GpuDecodeStore {
                 trace_cfg.as_ref(),
                 "setup",
                 &format!(
-                    "phase=shared_expert_bits_detect layer={} packed={} expected_bf16={} expected_int8={} moe_inter={} hidden={}",
+                    "phase=shared_expert_bits_detect layer={} packed={} expected_bf16={} expected_int8={} shared_inter={} hidden={}",
                     layer_idx,
                     se.w13_packed_bytes,
                     expected_bf16,
                     expected_int8,
-                    graph.moe_intermediate_size,
+                    graph.shared_expert_intermediate_size,
                     graph.hidden_size,
                 ),
             );
@@ -19381,7 +19400,7 @@ impl GpuDecodeStore {
                 *graph.d_hidden.device_ptr(),
                 *graph.d_expert_gate_up.device_ptr(),
                 inv_wp, inv_sp,
-                hs, 2 * intermediate, gs, is_int8,
+                hs, 2 * graph.shared_expert_intermediate_size, gs, is_int8,
             )?;
 
             // w2: DMA fallback path needs separate DMA for w2
@@ -19435,7 +19454,7 @@ impl GpuDecodeStore {
                 *graph.d_expert_gate_up.device_ptr(),
                 *graph.d_moe_out.device_ptr(),
                 inv_wp, inv_sp,
-                intermediate, hs, gs,
+                graph.shared_expert_intermediate_size, hs, gs,
                 shared_weight, gate_weight_ptr,
                 k, is_int8,
             )?;
@@ -19681,7 +19700,7 @@ impl GpuDecodeStore {
             self.configure(
                 hidden_size, num_layers, vocab_size, 1e-6,
                 topk, intermediate_size, hidden_size * 3, group_size,
-                store.gpu_num_bits, intermediate_size,
+                store.gpu_num_bits, intermediate_size, config.shared_expert_intermediate_size,
             )?;
         }
 
@@ -20048,7 +20067,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
-            store.gpu_num_bits, intermediate_size,
+            store.gpu_num_bits, intermediate_size, config.shared_expert_intermediate_size,
         )?;
 
         // Step 3: Upload gate weight for the target layer as FP32
@@ -20237,7 +20256,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
-            store.gpu_num_bits, intermediate_size,
+            store.gpu_num_bits, intermediate_size, config.shared_expert_intermediate_size,
         )?;
 
         // Register ALL MoE layers with synthetic gate weights
@@ -21052,7 +21071,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
-            store.gpu_num_bits, intermediate_size,
+            store.gpu_num_bits, intermediate_size, config.shared_expert_intermediate_size,
         )?;
 
         // Step 3: Register ALL MoE layers with synthetic gate weights
@@ -21274,7 +21293,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
-            store.gpu_num_bits, intermediate_size,
+            store.gpu_num_bits, intermediate_size, config.shared_expert_intermediate_size,
         )?;
 
         let mut max_expert_bytes = 0usize;
@@ -21634,7 +21653,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
-            store.gpu_num_bits, intermediate_size,
+            store.gpu_num_bits, intermediate_size, config.shared_expert_intermediate_size,
         )?;
 
         let mut max_expert_bytes = 0usize;

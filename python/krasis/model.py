@@ -3910,7 +3910,7 @@ class KrasisModel:
 
         # Compute max intermediate from actual layer types (not unused config fields)
         has_dense_mlp = any(l.dense_mlp is not None for l in self.layers)
-        max_inter = self.cfg.moe_intermediate_size
+        max_inter = max(self.cfg.moe_intermediate_size, self.cfg.effective_shared_expert_intermediate)
         if has_dense_mlp:
             max_inter = max(max_inter, self.cfg.intermediate_size)
 
@@ -3925,6 +3925,7 @@ class KrasisModel:
             group_size=128,
             expert_bits=self.quant_cfg.gpu_expert_bits,
             moe_intermediate_size=self.cfg.moe_intermediate_size,
+            shared_expert_intermediate_size=self.cfg.effective_shared_expert_intermediate,
         )
 
         # Register embedding
@@ -4867,7 +4868,7 @@ class KrasisModel:
                 max_qkv = max(max_qkv, q_sz + kv_sz * 2)
 
         has_dense_mlp = any(l.dense_mlp is not None for l in self.layers)
-        max_inter = self.cfg.moe_intermediate_size
+        max_inter = max(self.cfg.moe_intermediate_size, self.cfg.effective_shared_expert_intermediate)
         if has_dense_mlp:
             max_inter = max(max_inter, self.cfg.intermediate_size)
 
@@ -4882,6 +4883,7 @@ class KrasisModel:
             group_size=128,
             expert_bits=self.quant_cfg.gpu_expert_bits,
             moe_intermediate_size=self.cfg.moe_intermediate_size,
+            shared_expert_intermediate_size=self.cfg.effective_shared_expert_intermediate,
         )
 
         # Embedding — not needed on aux (segment_skip_embedding=true), but register
