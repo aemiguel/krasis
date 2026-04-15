@@ -4212,7 +4212,10 @@ class KrasisModel:
                     ba_w = attn.in_proj_ba
                     out_w = attn.out_proj
 
-                # AWQ v2: pass per-channel scales for input projections only
+                # AWQ v2: pass per-channel scales for input projections only.
+                # Both LA input projections consume the same post-input-norm hidden
+                # state, so the standard AWQ equivalent transform applies here too:
+                # scale weight columns by s and fold 1/s into the preceding norm.
                 _qkvz_scales = _layer_awq_scales if (
                     _layer_awq_scales is not None and _awq_template is not None
                     and is_awq_scaled_tensor(_awq_template, layer_idx, "in_proj_qkvz")
@@ -4244,16 +4247,15 @@ class KrasisModel:
                     attn.out_proj = MarlinWeight(*mw)
 
                 # AWQ v2: fold 1/s into input_norm_weight.
-                # This makes RMSNorm output X_scaled = X / s, which compensates
-                # for the W * s scaling applied to weight columns above.
-                # Mathematical identity: (X/s) @ (W*s)^T = X @ W^T
+                # This preserves the LA projection outputs exactly:
+                # (RMSNorm(x) / s) @ (W * s)^T == RMSNorm(x) @ W^T
+                # for both input projections fed by the same post-input-norm hidden.
                 if _layer_awq_scales is not None and (_qkvz_scales is not None
                                                        or _ba_scales is not None):
                     s = _layer_awq_scales.to(inp_norm.device)
-                    # In-place modification: norm_weight[j] /= s[j]
                     inp_norm.data.copy_(
                         (inp_norm.float() / s.float()).to(inp_norm.dtype))
-                    logger.debug("AWQ: folded scales into input_norm for layer %d "
+                    logger.debug("AWQ: folded scales into input_norm for LA layer %d "
                                  "(mean_scale=%.4f)", layer_idx, s.mean().item())
 
                 # DIAG: trace input_norm pointer and values at registration time

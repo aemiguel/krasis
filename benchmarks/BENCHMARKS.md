@@ -1,5 +1,99 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-15 (QCN Polar4 AWQ linear-attention AWQ fold review)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3-Coder-Next, 1 GPU, AWQ attention, Polar4 KV, GPU decode, HCS on, timing instrumentation off.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| LA AWQ runtime disabled | 7,233.2 | 94.01 | 16848/24576 (68.6%) | 682 MB | [log](20260415_224343_qcn_polar4_awq_5090_la_awq_runtime_disabled.log) |
+| LA AWQ fold restored | 7,241.5 | 94.65 | 16848/24576 (68.6%) | 682 MB | [log](20260415_224836_qcn_polar4_awq_5090_la_awq_fold_restored.log) |
+
+Notes:
+- Both runs used `./dev speed-test` on branch `gpu-debug-trace`.
+- This pair was run specifically to evaluate whether linear-attention input projections should participate in the same AWQ input-scale-and-fold contract as calibration.
+- Result:
+  - prefill improved slightly: `7233.2 -> 7241.5 tok/s`
+  - internal decode improved slightly: `94.01 -> 94.65 tok/s`
+  - HCS coverage and minimum free VRAM were unchanged
+- Internal prefill runs with fold restored:
+  - `1K`: `520.9 tok/s`
+  - `5K`: `2395.2 tok/s`
+  - `10K`: `4070.0 tok/s`
+  - `20K`: `5832.3 tok/s`
+  - `35K`: `7241.5 tok/s`
+  - `50K`: `6379.7 tok/s`
+- Internal decode runs with fold restored:
+  - `50`: `90.66 tok/s`
+  - `100`: `94.65 tok/s`
+  - `250`: `86.17 tok/s`
+- Round-trip HTTP best with fold restored:
+  - `167.68 tok/s` at `50` tokens
+
+---
+
+## Standard Benchmarks — 2026-04-13 (QCN Polar4 AWQ after BF16 policy / dead TRTLLM cleanup)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3-Coder-Next, 1 GPU, AWQ attention, Polar4 KV, GPU decode, HCS on, timing instrumentation off.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| post BF16 policy cleanup; decode benchmark EOS-early failure | 7,777.2 | FAILED (EOS at 2 tokens) | 16848/24576 (68.6%) | 696 MB | [log](20260413_171619_qcn_polar4_awq_5090_eos_early_decode_failure.log) |
+
+Notes:
+- Run executed via `./dev speed-test` on branch `gpu-debug-trace` after pushing `5e80acb`.
+- Internal prefill runs:
+  - `1K`: `549.1 tok/s`
+  - `5K`: `2680.3 tok/s`
+  - `10K`: `4194.3 tok/s`
+  - `20K`: `6500.0 tok/s`
+  - `35K`: `7777.2 tok/s`
+  - `50K`: `7694.4 tok/s`
+- Internal decode benchmark did not produce a valid throughput number:
+  - `50`: failed, EOS at `2` tokens
+  - `100`: failed, EOS at `2` tokens
+  - `250`: failed, EOS at `2` tokens
+- Round-trip HTTP benchmark also failed the same way:
+  - `50`: failed, EOS at `2` tokens
+  - `100`: failed, EOS at `2` tokens
+  - `250`: failed, EOS at `2` tokens
+- Standard benchmark log archived at `benchmarks/20260413_171619_qcn_polar4_awq_5090_eos_early_decode_failure.log`.
+
+---
+
+## Standard Benchmarks — 2026-04-13 (QCN Polar4 AWQ after capture-box and Nemotron reference fixes)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3-Coder-Next, 1 GPU, AWQ attention, Polar4 KV, GPU decode, HCS on, timing instrumentation off.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| post capture-box hardening and Nemotron compat fixes | 7,554.2 | 92.59 | 16848/24576 (68.6%) | 732 MB | [log](20260413_005327_qcn_polar4_awq_5090.log) |
+
+Notes:
+- Run executed via `./dev speed-test` on branch `gpu-debug-trace` after pushing `9cc7a91`.
+- Internal prefill runs:
+  - `1K`: `510.2 tok/s`
+  - `5K`: `2446.1 tok/s`
+  - `10K`: `4012.7 tok/s`
+  - `20K`: `5810.8 tok/s`
+  - `35K`: `7554.2 tok/s`
+  - `50K`: `6579.1 tok/s`
+- Internal decode runs:
+  - `50`: `92.59 tok/s`
+  - `100`: `87.11 tok/s`
+  - `250`: `91.96 tok/s`
+- Round-trip HTTP best:
+  - `129.55 tok/s` at `50` tokens
+- Standard benchmark log archived at `benchmarks/20260413_005327_qcn_polar4_awq_5090.log`.
+
+---
+
 ## Standard Benchmarks — 2026-04-04 (QCN Polar4 AWQ after HCS async pointer lifetime fix)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
