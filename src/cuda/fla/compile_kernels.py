@@ -102,7 +102,10 @@ KERNEL_SPECS = [
             "K": 128, "V": 128, "BT": 64, "BV": 32,
             "USE_G": True, "USE_GK": False,
             "USE_INITIAL_STATE": True, "STORE_FINAL_STATE": True,
-            "SAVE_NEW_VALUE": True, "USE_EXP2": True,
+            # Keep recurrence on the same natural-log gate contract as the
+            # rest of the vendored FLA forward path (cumsum/kkt/wy/output),
+            # which all use exp rather than exp2 on g.
+            "SAVE_NEW_VALUE": True, "USE_EXP2": False,
             "TRANSPOSE_STATE": False, "IS_VARLEN": False,
         },
         # Autotuner config 1: BV=32, num_warps=2
