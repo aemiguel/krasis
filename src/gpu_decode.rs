@@ -7775,6 +7775,8 @@ impl GpuDecodeStore {
             attn_weight_bufs: None,
             shared_stream,
             shared_event,
+            d_shared_bf16_scratch1: None,  // allocated dynamically in prepare_for_prefill
+            d_shared_bf16_scratch2: None,  // allocated dynamically in prepare_for_prefill
             d_shared_fp32_scratch: None,  // allocated dynamically in prepare_for_prefill
             d_shared_workspace: None,     // allocated dynamically in prepare_for_prefill
             d_fused_expert_w1_a,
@@ -7857,6 +7859,7 @@ impl GpuDecodeStore {
             d_fla_w: None,
             d_fla_u: None,
             d_fla_h: None,
+            d_fla_h0: None,
             d_fla_final_state: None,
             d_fla_v_new: None,
             d_fla_o: None,
