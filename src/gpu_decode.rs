@@ -195,6 +195,14 @@ fn trace_emit_global_mark(
     );
 }
 
+fn find_first_byte_mismatch(actual: &[u8], expected: &[u8]) -> Option<(usize, u8, u8)> {
+    actual
+        .iter()
+        .zip(expected.iter())
+        .enumerate()
+        .find_map(|(idx, (&a, &e))| if a != e { Some((idx, a, e)) } else { None })
+}
+
 fn trace_emit_f32(
     trace: Option<&DecodeTraceConfig>,
     step: usize,
@@ -6892,6 +6900,112 @@ impl GpuDecodeStore {
                 self.single_slot_swaps.len(),
             ),
         );
+        self.trace_verify_traced_la_marlin_slots()?;
+        Ok(())
+    }
+
+    fn trace_verify_traced_la_marlin_slots(&self) -> Result<(), String> {
+        let Some(trace) = self.active_trace() else {
+            return Ok(());
+        };
+        if !trace.allows_component("weights") {
+            return Ok(());
+        }
+        let Some(graph) = self.graph.as_ref() else {
+            return Ok(());
+        };
+
+        for (layer_idx, layer) in graph.layers.iter().enumerate() {
+            if !trace.allows_layer(layer_idx) {
+                continue;
+            }
+            let GpuAttnConfig::LinearAttention { in_proj_qkvz, in_proj_ba, out_proj, .. } = &layer.attn else {
+                continue;
+            };
+            for (label, weight_id) in [
+                ("in_proj_qkvz", *in_proj_qkvz),
+                ("in_proj_ba", *in_proj_ba),
+                ("out_proj", *out_proj),
+            ] {
+                let Some(entry) = self.single_slot_swaps.iter().find(|entry| entry.weight_id == weight_id) else {
+                    trace_emit_global_mark(
+                        Some(trace),
+                        "weights",
+                        &format!(
+                            "phase=swap_to_marlin_verify layer={} tensor={} weight_id={} result=no_single_slot_entry",
+                            layer_idx,
+                            label,
+                            weight_id,
+                        ),
+                    );
+                    continue;
+                };
+
+                let mut packed_gpu = vec![0u8; entry.marlin_packed_host.len()];
+                let mut scales_gpu = vec![0u8; entry.marlin_scales_host.len()];
+                unsafe {
+                    let r = cuda_sys::lib().cuMemcpyDtoH_v2(
+                        packed_gpu.as_mut_ptr() as *mut std::ffi::c_void,
+                        entry.packed_slot_ptr,
+                        packed_gpu.len(),
+                    );
+                    if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!(
+                            "swap_to_marlin verify packed layer={} tensor={}: {:?}",
+                            layer_idx,
+                            label,
+                            r,
+                        ));
+                    }
+                    let r = cuda_sys::lib().cuMemcpyDtoH_v2(
+                        scales_gpu.as_mut_ptr() as *mut std::ffi::c_void,
+                        entry.scales_slot_ptr,
+                        scales_gpu.len(),
+                    );
+                    if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!(
+                            "swap_to_marlin verify scales layer={} tensor={}: {:?}",
+                            layer_idx,
+                            label,
+                            r,
+                        ));
+                    }
+                }
+
+                let packed_mismatch = find_first_byte_mismatch(&packed_gpu, &entry.marlin_packed_host);
+                let scales_mismatch = find_first_byte_mismatch(&scales_gpu, &entry.marlin_scales_host);
+                let packed_match = packed_mismatch.is_none();
+                let scales_match = scales_mismatch.is_none();
+                let packed_detail = packed_mismatch
+                    .map(|(idx, actual, expected)| {
+                        format!("packed_first_mismatch={} actual={} expected={}", idx, actual, expected)
+                    })
+                    .unwrap_or_else(|| "packed_first_mismatch=-".to_string());
+                let scales_detail = scales_mismatch
+                    .map(|(idx, actual, expected)| {
+                        format!("scales_first_mismatch={} actual={} expected={}", idx, actual, expected)
+                    })
+                    .unwrap_or_else(|| "scales_first_mismatch=-".to_string());
+
+                trace_emit_global_mark(
+                    Some(trace),
+                    "weights",
+                    &format!(
+                        "phase=swap_to_marlin_verify layer={} tensor={} weight_id={} packed_match={} scales_match={} {} {} packed_bytes={} scales_bytes={}",
+                        layer_idx,
+                        label,
+                        weight_id,
+                        packed_match,
+                        scales_match,
+                        packed_detail,
+                        scales_detail,
+                        entry.marlin_packed_host.len(),
+                        entry.marlin_scales_host.len(),
+                    ),
+                );
+            }
+        }
+
         Ok(())
     }
 
