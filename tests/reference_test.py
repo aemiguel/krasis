@@ -341,6 +341,15 @@ def compute_prefill_metrics(ref_turn: Dict, prefill_result: Dict) -> Dict:
     """Compare our prefill logits against BF16 reference at sampled positions."""
     ref_logits = ref_turn.get("prefill_logits", {})
     ref_positions = ref_logits.get("positions", [])
+    if not ref_positions:
+        return {
+            "prefill_available": False,
+            "prefill_argmax_match": 0,
+            "prefill_top10_hits": 0,
+            "prefill_total": 0,
+            "prefill_argmax_rate": None,
+            "prefill_containment": None,
+        }
     our_positions = {p["position"]: p for p in prefill_result.get("positions", [])}
 
     argmax_match = 0
@@ -362,11 +371,12 @@ def compute_prefill_metrics(ref_turn: Dict, prefill_result: Dict) -> Dict:
         total += 1
 
     return {
+        "prefill_available": True,
         "prefill_argmax_match": argmax_match,
         "prefill_top10_hits": top10_hits,
         "prefill_total": total,
-        "prefill_argmax_rate": argmax_match / total if total > 0 else 0.0,
-        "prefill_containment": top10_hits / total if total > 0 else 0.0,
+        "prefill_argmax_rate": argmax_match / total if total > 0 else None,
+        "prefill_containment": top10_hits / total if total > 0 else None,
     }
 
 
@@ -482,24 +492,44 @@ def compute_metrics(ref_turn: Dict, engine_result: Dict) -> Dict:
     }
 
 
-def judge_prompt(metrics: Dict, prefill_metrics: Dict) -> str:
+def judge_prompt(metrics: Dict, prefill_metrics: Dict, has_linear_attention: bool = False) -> str:
     """Return PASS, WARN, or FAIL for a single prompt.
 
     Primary metric: prefill top-10 containment (same input, only quant differs).
     Secondary: first-token match and decode match run.
     """
-    pc = prefill_metrics.get("prefill_containment", 0.0)
+    pc = prefill_metrics.get("prefill_containment")
+    if prefill_metrics.get("prefill_total", 0) > 0 and pc is not None:
+        # FAIL: prefill logits badly off — likely a code bug
+        if pc < 0.60:
+            return "FAIL"
 
-    # FAIL: prefill logits badly off — likely a code bug
-    if pc < 0.60:
+        # WARN: prefill is reasonable but not great
+        if pc < 0.80:
+            return "WARN"
+
+        # PASS: prefill logits match well (quantization noise only)
+        return "PASS"
+
+    # Decode-only fallback for artifacts that do not contain prefill snapshots.
+    # Keep this explicit so we do not silently treat missing reference data as 0%.
+    if not metrics.get("first_match", False):
         return "FAIL"
 
-    # WARN: prefill is reasonable but not great
-    if pc < 0.80:
-        return "WARN"
+    containment = metrics.get("containment_rate", 0.0)
+    match_run = metrics.get("match_run", 0)
+    if has_linear_attention:
+        if containment >= 0.60 and match_run >= 16:
+            return "PASS"
+        if containment >= 0.35 or match_run >= 4:
+            return "WARN"
+        return "FAIL"
 
-    # PASS: prefill logits match well (quantization noise only)
-    return "PASS"
+    if containment >= 0.90 and match_run >= 15:
+        return "PASS"
+    if containment >= 0.75 or match_run >= 5:
+        return "WARN"
+    return "FAIL"
 
 
 def judge_overall(prompt_verdicts: List[str]) -> str:
@@ -510,6 +540,12 @@ def judge_overall(prompt_verdicts: List[str]) -> str:
     if warn_count >= 3:
         return "WARN"
     return "PASS"
+
+
+def _format_metric_pct(value: Optional[float], digits: int = 0) -> str:
+    if value is None:
+        return "n/a"
+    return f"{100 * value:.{digits}f}%"
 
 
 # ── Run Single Config ──────────────────────────────────────────────
@@ -586,7 +622,8 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
                             "our_text": f"ERROR: {e}",
                         },
                         "prefill_metrics": {
-                            "prefill_argmax_rate": 0.0, "prefill_containment": 0.0,
+                            "prefill_available": False,
+                            "prefill_argmax_rate": None, "prefill_containment": None,
                             "prefill_argmax_match": 0, "prefill_top10_hits": 0, "prefill_total": 0,
                         },
                         "timing": None,
@@ -597,7 +634,8 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
 
                 # Prefill logits comparison (same input, no divergence)
                 prefill_metrics = {
-                    "prefill_argmax_rate": 0.0, "prefill_containment": 0.0,
+                    "prefill_available": False,
+                    "prefill_argmax_rate": None, "prefill_containment": None,
                     "prefill_argmax_match": 0, "prefill_top10_hits": 0, "prefill_total": 0,
                 }
                 has_ref_logits = bool(turn.get("prefill_logits", {}).get("positions"))
@@ -608,7 +646,7 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
                     except Exception as e:
                         print(f"    (prefill_logits failed: {e})")
 
-                verdict = judge_prompt(metrics, prefill_metrics)
+                verdict = judge_prompt(metrics, prefill_metrics, has_linear_attention=has_la)
                 timing = result.get("timing")
 
                 prompt_results.append({
@@ -624,10 +662,15 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
 
                 # Print summary
                 fm = "MATCH" if metrics["first_match"] else "MISS"
-                pc = prefill_metrics.get("prefill_containment", 0)
-                pa = prefill_metrics.get("prefill_argmax_rate", 0)
+                pc = prefill_metrics.get("prefill_containment")
+                pa = prefill_metrics.get("prefill_argmax_rate")
+                prefill_text = (
+                    f"{_format_metric_pct(pa)}/{_format_metric_pct(pc)}"
+                    if prefill_metrics.get("prefill_total", 0) > 0
+                    else "n/a"
+                )
                 print(f"    {verdict}: first={fm}, run={metrics['match_run']}/{metrics['ref_tokens_count']}, "
-                      f"prefill={100*pa:.0f}%/{100*pc:.0f}%, "
+                      f"prefill={prefill_text}, "
                       f"decode-top-k={100*metrics['containment_rate']:.0f}%")
 
     finally:
@@ -656,8 +699,8 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
         "first_match_rate": sum(1 for r in prompt_results if r["metrics"]["first_match"]) / total_prompts if total_prompts else 0,
         "avg_match_run": sum(r["metrics"]["match_run"] for r in prompt_results) / total_prompts if total_prompts else 0,
         "avg_containment": sum(r["metrics"]["containment_rate"] for r in prompt_results) / total_prompts if total_prompts else 0,
-        "prefill_argmax_rate": total_pf_argmax / total_pf_pos if total_pf_pos > 0 else 0,
-        "prefill_containment": total_pf_top10 / total_pf_pos if total_pf_pos > 0 else 0,
+        "prefill_argmax_rate": total_pf_argmax / total_pf_pos if total_pf_pos > 0 else None,
+        "prefill_containment": total_pf_top10 / total_pf_pos if total_pf_pos > 0 else None,
         "prefill_argmax_count": total_pf_argmax,
         "prefill_top10_count": total_pf_top10,
         "prefill_total_positions": total_pf_pos,
@@ -781,14 +824,16 @@ def _render_prompt_card(pr: Dict, badge_class: Dict, has_linear_attention: bool 
     # Metrics row
     h.append('<div class="metrics-row">')
     pm = pr.get("prefill_metrics", {})
-    pc = pm.get("prefill_containment", 0)
-    pa = pm.get("prefill_argmax_rate", 0)
-    pc_class = "metric-good" if pc >= 0.80 else ("metric-ok" if pc >= 0.60 else "metric-bad")
-    pa_class = "metric-good" if pa >= 0.50 else ("metric-ok" if pa >= 0.30 else "metric-bad")
+    pc = pm.get("prefill_containment")
+    pa = pm.get("prefill_argmax_rate")
+    pc_class = "metric-good" if pc is not None and pc >= 0.80 else ("metric-ok" if pc is not None and pc >= 0.60 else "metric-bad")
+    pa_class = "metric-good" if pa is not None and pa >= 0.50 else ("metric-ok" if pa is not None and pa >= 0.30 else "metric-bad")
+    pa_text = _format_metric_pct(pa)
+    pc_text = _format_metric_pct(pc)
     h.append(f'<div class="metric-item"><span class="metric-label">Prefill argmax: </span>'
-             f'<span class="metric-value {pa_class}">{100*pa:.0f}%</span></div>')
+             f'<span class="metric-value {pa_class}">{pa_text}</span></div>')
     h.append(f'<div class="metric-item"><span class="metric-label">Prefill top-10: </span>'
-             f'<span class="metric-value {pc_class}">{100*pc:.0f}%</span></div>')
+             f'<span class="metric-value {pc_class}">{pc_text}</span></div>')
 
     fm_class = "metric-good" if m["first_match"] else "metric-bad"
     fm_label = "MATCH" if m["first_match"] else "MISMATCH"
@@ -923,8 +968,8 @@ def generate_html_report(
     total_pf_argmax = sum(r.get("prefill_metrics", {}).get("prefill_argmax_match", 0) for r in prompt_results)
     total_pf_top10 = sum(r.get("prefill_metrics", {}).get("prefill_top10_hits", 0) for r in prompt_results)
     total_pf_pos = sum(r.get("prefill_metrics", {}).get("prefill_total", 0) for r in prompt_results)
-    avg_pf_arg = total_pf_argmax / total_pf_pos if total_pf_pos > 0 else 0
-    avg_pf_cont = total_pf_top10 / total_pf_pos if total_pf_pos > 0 else 0
+    avg_pf_arg = total_pf_argmax / total_pf_pos if total_pf_pos > 0 else None
+    avg_pf_cont = total_pf_top10 / total_pf_pos if total_pf_pos > 0 else None
 
     h.append('<table class="dashboard"><thead><tr>')
     h.append('<th>Metric</th><th>Value</th><th>Status</th>')
@@ -933,13 +978,17 @@ def generate_html_report(
     h.append(f'<tr><td><b>Overall</b></td><td>—</td><td><span class="badge {badge_class[overall_verdict]}">{overall_verdict}</span></td></tr>')
 
     # Primary metric: prefill containment
-    h.append(f'<tr><td><b>Prefill argmax match</b></td><td>{total_pf_argmax}/{total_pf_pos} ({100*avg_pf_arg:.0f}%)</td>')
-    pa_status = "PASS" if avg_pf_arg >= 0.50 else ("WARN" if avg_pf_arg >= 0.30 else "FAIL")
-    h.append(f'<td><span class="badge {badge_class[pa_status]}">{pa_status}</span></td></tr>')
+    if total_pf_pos > 0:
+        h.append(f'<tr><td><b>Prefill argmax match</b></td><td>{total_pf_argmax}/{total_pf_pos} ({_format_metric_pct(avg_pf_arg)})</td>')
+        pa_status = "PASS" if avg_pf_arg >= 0.50 else ("WARN" if avg_pf_arg >= 0.30 else "FAIL")
+        h.append(f'<td><span class="badge {badge_class[pa_status]}">{pa_status}</span></td></tr>')
 
-    h.append(f'<tr><td><b>Prefill top-10 containment</b></td><td>{total_pf_top10}/{total_pf_pos} ({100*avg_pf_cont:.0f}%)</td>')
-    pc_status = "PASS" if avg_pf_cont >= 0.80 else ("WARN" if avg_pf_cont >= 0.60 else "FAIL")
-    h.append(f'<td><span class="badge {badge_class[pc_status]}">{pc_status}</span></td></tr>')
+        h.append(f'<tr><td><b>Prefill top-10 containment</b></td><td>{total_pf_top10}/{total_pf_pos} ({_format_metric_pct(avg_pf_cont)})</td>')
+        pc_status = "PASS" if avg_pf_cont >= 0.80 else ("WARN" if avg_pf_cont >= 0.60 else "FAIL")
+        h.append(f'<td><span class="badge {badge_class[pc_status]}">{pc_status}</span></td></tr>')
+    else:
+        h.append('<tr><td><b>Prefill argmax match</b></td><td>n/a</td><td>Reference artifact has no prefill snapshots</td></tr>')
+        h.append('<tr><td><b>Prefill top-10 containment</b></td><td>n/a</td><td>Reference artifact has no prefill snapshots</td></tr>')
 
     h.append(f'<tr><td>First-token match</td><td>{first_match_count}/{total_prompts} ({100*first_match_count/total_prompts:.0f}%)</td>')
     fm_status = "PASS" if first_match_count >= total_prompts - 2 else ("WARN" if first_match_count >= total_prompts // 2 else "FAIL")
@@ -995,12 +1044,15 @@ def generate_html_report(
 
 def generate_comparison_svg(all_results: List[Dict]) -> str:
     """Generate SVG grouped bar chart comparing key metrics across configs."""
-    metrics_defs = [
-        ("Prefill Argmax", "prefill_argmax_rate"),
-        ("Prefill Top-10", "prefill_containment"),
+    metrics_defs = []
+    if any(r["aggregates"].get("prefill_argmax_rate") is not None for r in all_results):
+        metrics_defs.append(("Prefill Argmax", "prefill_argmax_rate"))
+    if any(r["aggregates"].get("prefill_containment") is not None for r in all_results):
+        metrics_defs.append(("Prefill Top-10", "prefill_containment"))
+    metrics_defs.extend([
         ("First-Token", "first_match_rate"),
         ("Decode Top-K", "avg_containment"),
-    ]
+    ])
 
     n_configs = len(all_results)
     n_metrics = len(metrics_defs)
@@ -1036,7 +1088,7 @@ def generate_comparison_svg(all_results: List[Dict]) -> str:
         group_x = ml + gi * group_w + (group_w - total_bar_w) / 2
 
         for ci, result in enumerate(all_results):
-            value = result["aggregates"].get(metric_key, 0)
+            value = result["aggregates"].get(metric_key, 0) or 0
             bar_h = max(chart_h * value, 0)
             bx = group_x + ci * (bar_w + bar_gap)
             by = mt + chart_h - bar_h
@@ -1240,23 +1292,36 @@ def generate_comparative_html_report(
         if not values:
             h.append('</tr>')
             return
-        best = max(values)
+        comparable = [v for v in values if v is not None]
+        best = max(comparable) if comparable else None
         for i, v in enumerate(values):
-            cls = ' class="best"' if v == best and values.count(best) < len(values) else ''
-            display = raw_strs[i] if raw_strs else fmt.format(v * scale)
+            cls = ' class="best"' if best is not None and v == best and comparable.count(best) < len(comparable) else ''
+            display = raw_strs[i] if raw_strs else ("n/a" if v is None else fmt.format(v * scale))
             h.append(f'<td{cls}>{display}</td>')
         h.append('</tr>')
 
     # Prefill argmax
     vals = [r["aggregates"]["prefill_argmax_rate"] for r in all_results]
-    raw = [f'{r["aggregates"]["prefill_argmax_count"]}/{r["aggregates"]["prefill_total_positions"]} '
-           f'({100*r["aggregates"]["prefill_argmax_rate"]:.0f}%)' for r in all_results]
+    raw = [
+        (
+            f'{r["aggregates"]["prefill_argmax_count"]}/{r["aggregates"]["prefill_total_positions"]} '
+            f'({_format_metric_pct(r["aggregates"]["prefill_argmax_rate"])})'
+            if r["aggregates"]["prefill_total_positions"] > 0 else "n/a"
+        )
+        for r in all_results
+    ]
     _metric_row("<b>Prefill argmax match</b>", vals, raw_strs=raw)
 
     # Prefill top-10
     vals = [r["aggregates"]["prefill_containment"] for r in all_results]
-    raw = [f'{r["aggregates"]["prefill_top10_count"]}/{r["aggregates"]["prefill_total_positions"]} '
-           f'({100*r["aggregates"]["prefill_containment"]:.0f}%)' for r in all_results]
+    raw = [
+        (
+            f'{r["aggregates"]["prefill_top10_count"]}/{r["aggregates"]["prefill_total_positions"]} '
+            f'({_format_metric_pct(r["aggregates"]["prefill_containment"])})'
+            if r["aggregates"]["prefill_total_positions"] > 0 else "n/a"
+        )
+        for r in all_results
+    ]
     _metric_row("<b>Prefill top-10 containment</b>", vals, raw_strs=raw)
 
     # First-token match
@@ -1334,11 +1399,15 @@ def generate_comparative_html_report(
             v = pr["verdict"]
             m = pr["metrics"]
             pm = pr.get("prefill_metrics", {})
-            pa = pm.get("prefill_argmax_rate", 0)
-            pc = pm.get("prefill_containment", 0)
+            pa = pm.get("prefill_argmax_rate")
+            pc = pm.get("prefill_containment")
+            prefill_text = (
+                f'pf:{_format_metric_pct(pa)}/{_format_metric_pct(pc)}'
+                if pm.get("prefill_total", 0) > 0 else 'pf:n/a'
+            )
             h.append(f'<td><span class="badge {badge_class[v]}">{v}</span><br>'
                      f'<span style="font-size:11px;color:#8b949e">'
-                     f'pf:{100*pa:.0f}%/{100*pc:.0f}% run:{m["match_run"]}</span></td>')
+                     f'{prefill_text} run:{m["match_run"]}</span></td>')
         h.append('</tr>')
 
     h.append('</tbody></table>')
@@ -1358,7 +1427,7 @@ def generate_comparative_html_report(
                  f'{_html_escape(label)} — '
                  f'{_html_escape(os.path.basename(result["conf_path"]))} '
                  f'({a["n_pass"]}P/{a["n_warn"]}W/{a["n_fail"]}F, '
-                 f'prefill {100*a["prefill_argmax_rate"]:.0f}%/{100*a["prefill_containment"]:.0f}%)'
+                 f'prefill {_format_metric_pct(a["prefill_argmax_rate"])}/{_format_metric_pct(a["prefill_containment"])})'
                  f'</summary>')
         h.append('<div class="detail-body">')
 
@@ -1545,9 +1614,9 @@ def main():
 
         print(f"  {'Overall':<28}" + "".join(f" {r['aggregates']['overall']:>12}" for r in all_results))
         print(f"  {'Prefill argmax':<28}" +
-              "".join(f" {100*r['aggregates']['prefill_argmax_rate']:>11.0f}%" for r in all_results))
+              "".join(f" {_format_metric_pct(r['aggregates']['prefill_argmax_rate']):>12}" for r in all_results))
         print(f"  {'Prefill top-10':<28}" +
-              "".join(f" {100*r['aggregates']['prefill_containment']:>11.0f}%" for r in all_results))
+              "".join(f" {_format_metric_pct(r['aggregates']['prefill_containment']):>12}" for r in all_results))
         print(f"  {'First-token match':<28}" +
               "".join(f" {r['aggregates']['first_match_count']:>4}/{r['aggregates']['total_prompts']:<7}" for r in all_results))
         any_la = any(r.get("has_linear_attention", False) for r in all_results)
@@ -1698,7 +1767,8 @@ def main():
                                 "our_text": f"ERROR: {e}",
                             },
                             "prefill_metrics": {
-                                "prefill_argmax_rate": 0.0, "prefill_containment": 0.0,
+                                "prefill_available": False,
+                                "prefill_argmax_rate": None, "prefill_containment": None,
                                 "prefill_argmax_match": 0, "prefill_top10_hits": 0, "prefill_total": 0,
                             },
                             "timing": None,
@@ -1707,7 +1777,8 @@ def main():
 
                     metrics = compute_metrics(turn, result)
                     prefill_metrics = {
-                        "prefill_argmax_rate": 0.0, "prefill_containment": 0.0,
+                        "prefill_available": False,
+                        "prefill_argmax_rate": None, "prefill_containment": None,
                         "prefill_argmax_match": 0, "prefill_top10_hits": 0, "prefill_total": 0,
                     }
                     has_ref_logits = bool(turn.get("prefill_logits", {}).get("positions"))
@@ -1718,7 +1789,7 @@ def main():
                         except Exception as e:
                             print(f"    (prefill_logits failed: {e})")
 
-                    verdict = judge_prompt(metrics, prefill_metrics)
+                    verdict = judge_prompt(metrics, prefill_metrics, has_linear_attention=has_la)
                     timing = result.get("timing")
 
                     prompt_results.append({
@@ -1729,10 +1800,15 @@ def main():
                     })
 
                     fm = "MATCH" if metrics["first_match"] else "MISS"
-                    pc = prefill_metrics.get("prefill_containment", 0)
-                    pa = prefill_metrics.get("prefill_argmax_rate", 0)
+                    pc = prefill_metrics.get("prefill_containment")
+                    pa = prefill_metrics.get("prefill_argmax_rate")
+                    prefill_text = (
+                        f"{_format_metric_pct(pa)}/{_format_metric_pct(pc)}"
+                        if prefill_metrics.get("prefill_total", 0) > 0
+                        else "n/a"
+                    )
                     print(f"    {verdict}: first={fm}, run={metrics['match_run']}/{metrics['ref_tokens_count']}, "
-                          f"prefill={100*pa:.0f}%/{100*pc:.0f}%, "
+                          f"prefill={prefill_text}, "
                           f"decode-top-k={100*metrics['containment_rate']:.0f}%")
         else:
             # Start server and run
@@ -1783,12 +1859,16 @@ def main():
         total_pf_argmax = sum(r.get("prefill_metrics", {}).get("prefill_argmax_match", 0) for r in prompt_results)
         total_pf_top10 = sum(r.get("prefill_metrics", {}).get("prefill_top10_hits", 0) for r in prompt_results)
         total_pf_pos = sum(r.get("prefill_metrics", {}).get("prefill_total", 0) for r in prompt_results)
-        avg_pf_arg = total_pf_argmax / total_pf_pos if total_pf_pos > 0 else 0
-        avg_pf_cont = total_pf_top10 / total_pf_pos if total_pf_pos > 0 else 0
+        avg_pf_arg = total_pf_argmax / total_pf_pos if total_pf_pos > 0 else None
+        avg_pf_cont = total_pf_top10 / total_pf_pos if total_pf_pos > 0 else None
 
         print(f"  Prompts: {n_pass} PASS, {n_warn} WARN, {n_fail} FAIL (of {len(prompt_results)})")
-        print(f"  Prefill argmax match: {total_pf_argmax}/{total_pf_pos} ({100*avg_pf_arg:.0f}%)")
-        print(f"  Prefill top-10 containment: {total_pf_top10}/{total_pf_pos} ({100*avg_pf_cont:.0f}%)")
+        if total_pf_pos > 0:
+            print(f"  Prefill argmax match: {total_pf_argmax}/{total_pf_pos} ({_format_metric_pct(avg_pf_arg)})")
+            print(f"  Prefill top-10 containment: {total_pf_top10}/{total_pf_pos} ({_format_metric_pct(avg_pf_cont)})")
+        else:
+            print("  Prefill argmax match: n/a (reference artifact has no prefill snapshots)")
+            print("  Prefill top-10 containment: n/a (reference artifact has no prefill snapshots)")
         print(f"  First-token match: {first_match_count}/{len(prompt_results)}")
         mr_note = " (LA model — low match run expected)" if has_la else ""
         print(f"  Avg match run: {avg_run:.1f} tokens{mr_note}")

@@ -1574,7 +1574,9 @@ class KrasisModel:
             return
         cpu_tensors = self._stream_attn_cpu[layer_idx]
         gpu_bufs = self._get_stream_bufs(layer_idx, buf_idx)
-        attn = self.layers[layer_idx].attention
+        layer = self.layers[layer_idx]
+        attn = layer.attention
+        gqa_weights = getattr(layer, "gqa_weights", None)
         for dict_key, gpu_buf in gpu_bufs.items():
             src = cpu_tensors.get(dict_key)
             if src is None:
@@ -1586,7 +1588,14 @@ class KrasisModel:
                 gpu_buf.copy_(src, non_blocking=True)
             # Map weight dict key to the actual attention attribute name
             attr_name = self._WEIGHT_KEY_TO_ATTN_ATTR.get(dict_key, dict_key)
-            setattr(attn, attr_name, gpu_buf)
+            if attn is not None:
+                setattr(attn, attr_name, gpu_buf)
+            elif gqa_weights is not None:
+                gqa_weights[attr_name] = gpu_buf
+            else:
+                raise RuntimeError(
+                    f"stream attention load: layer {layer_idx} has no attention target for {attr_name}"
+                )
         self._stream_attn_loaded[buf_idx] = layer_idx
 
     def _stream_attn_prefetch(self, layer_idx: int, buf_idx: int):
@@ -1626,11 +1635,20 @@ class KrasisModel:
         torch.cuda.current_stream(self.all_devices[0]).wait_stream(self._stream_attn_dma_stream)
         cpu_tensors = self._stream_attn_cpu[layer_idx]
         gpu_bufs = self._get_stream_bufs(layer_idx, buf_idx)
-        attn = self.layers[layer_idx].attention
+        layer = self.layers[layer_idx]
+        attn = layer.attention
+        gqa_weights = getattr(layer, "gqa_weights", None)
         for dict_key, gpu_buf in gpu_bufs.items():
             if dict_key in cpu_tensors:
                 attr_name = self._WEIGHT_KEY_TO_ATTN_ATTR.get(dict_key, dict_key)
-                setattr(attn, attr_name, gpu_buf)
+                if attn is not None:
+                    setattr(attn, attr_name, gpu_buf)
+                elif gqa_weights is not None:
+                    gqa_weights[attr_name] = gpu_buf
+                else:
+                    raise RuntimeError(
+                        f"stream attention sync: layer {layer_idx} has no attention target for {attr_name}"
+                    )
         self._stream_attn_loaded[buf_idx] = layer_idx
 
     @staticmethod

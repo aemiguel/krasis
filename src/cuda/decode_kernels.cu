@@ -2869,8 +2869,8 @@ extern "C" __global__ void marlin_gemv_int4_v2_fused_f32(
     }
     __syncthreads();
 
-    int tn = tid & 15;
-    int k_slice = tid >> 4;
+    int k_slice = tid & 15;
+    int tn = tid >> 4;
     int n_tile = blockIdx.x;
     int ksplit = blockIdx.y;
     int n = n_tile * 16 + tn;
@@ -3006,8 +3006,8 @@ extern "C" __global__ void marlin_gemv_int8_v2(
     }
     __syncthreads();
 
-    int tn = tid & 15;
-    int k_slice = tid >> 4;
+    int k_slice = tid & 15;
+    int tn = tid >> 4;
     int n_tile = blockIdx.x;
     int ksplit = blockIdx.y;
     int n = n_tile * 16 + tn;

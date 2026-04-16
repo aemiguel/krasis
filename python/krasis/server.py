@@ -1853,8 +1853,14 @@ def main():
     # without thinking support would never emit </think>, breaking the budget.
     _hf_tok = _model.tokenizer.tokenizer  # unwrap Tokenizer → HF AutoTokenizer
     _template = getattr(_hf_tok, "chat_template", "") or ""
+    template_supports_enable_thinking = "enable_thinking" in _template
+    if args.enable_thinking and not template_supports_enable_thinking:
+        logger.info(
+            "Model template does not support enable_thinking; forcing server default thinking off"
+        )
+        args.enable_thinking = False
     think_end_id = 0
-    if "enable_thinking" in _template:
+    if template_supports_enable_thinking:
         _raw_id = _hf_tok.convert_tokens_to_ids("</think>")
         if isinstance(_raw_id, int) and _raw_id != _hf_tok.unk_token_id:
             think_end_id = _raw_id

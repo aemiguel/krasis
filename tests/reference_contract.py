@@ -907,6 +907,7 @@ def build_runtime_contract(
     model_path = os.path.expanduser(cfg.get("CFG_MODEL_PATH", ""))
     model_name = os.path.basename(model_path.rstrip("/"))
     config_enable_thinking = _config_bool(cfg, "CFG_ENABLE_THINKING", True)
+    template_supports_enable_thinking = "enable_thinking" in (getattr(tokenizer, "chat_template", "") or "")
     profile_id = effective_profile_id or REFERENCE_PROFILE_RUNTIME
     capture_settings = capture_settings_for_profile(profile_id)
     return build_contract(
@@ -922,7 +923,7 @@ def build_runtime_contract(
         torch_dtype=None,
         extra={
             "config_path": os.path.abspath(conf_path),
-            "server_default_enable_thinking": config_enable_thinking,
+            "server_default_enable_thinking": config_enable_thinking and template_supports_enable_thinking,
             "attention_quant": cfg.get("CFG_ATTENTION_QUANT"),
             "gpu_expert_bits": cfg.get("CFG_GPU_EXPERT_BITS"),
             "cpu_expert_bits": cfg.get("CFG_CPU_EXPERT_BITS"),

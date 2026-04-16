@@ -77,6 +77,11 @@ class Tokenizer:
     def bos_token_id(self) -> Optional[int]:
         return self.tokenizer.bos_token_id
 
+    @property
+    def chat_template_supports_enable_thinking(self) -> bool:
+        template = getattr(self.tokenizer, "chat_template", "") or ""
+        return "enable_thinking" in template
+
     def apply_chat_template(
         self,
         messages: List[Dict[str, str]],
@@ -84,6 +89,15 @@ class Tokenizer:
         **kwargs,
     ) -> List[int]:
         """Format messages using the model's chat template and tokenize."""
+        kwargs = dict(kwargs)
+        requested_enable_thinking = kwargs.get("enable_thinking")
+        if requested_enable_thinking is not None and not self.chat_template_supports_enable_thinking:
+            if requested_enable_thinking:
+                raise ValueError(
+                    "Model chat template does not support enable_thinking; "
+                    "refuse to silently ignore an explicit thinking request"
+                )
+            kwargs.pop("enable_thinking", None)
         try:
             result = self.tokenizer.apply_chat_template(
                 messages,

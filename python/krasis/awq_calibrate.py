@@ -307,12 +307,16 @@ def _get_weight_tensor(model, layer_idx: int, tensor_name: str) -> Optional[torc
     cpu_weights = getattr(model, '_stream_attn_cpu', {})
     layer = model.layers[layer_idx]
     attn = layer.attention
+    gqa_weights = getattr(layer, "gqa_weights", None)
 
     w = None
     if layer_idx in cpu_weights:
         w = cpu_weights[layer_idx].get(tensor_name)
     if w is None:
-        w = getattr(attn, tensor_name, None)
+        if gqa_weights is not None and tensor_name in gqa_weights:
+            w = gqa_weights.get(tensor_name)
+        elif attn is not None:
+            w = getattr(attn, tensor_name, None)
 
     if w is not None and isinstance(w, torch.Tensor):
         return w.cpu().to(torch.bfloat16) if w.is_cuda else w.to(torch.bfloat16)
@@ -652,11 +656,29 @@ def load_template(template_dir: str, model_path: str) -> Optional[Dict]:
     """Load a template for a model, if one exists.
 
     Searches:
+    0. Explicit override from KRASIS_AWQ_TEMPLATE_PATH
     1. Bundled templates in template_dir/<model_hash>/template.json
     2. User cache in ~/.krasis/templates/<model_hash>/template.json
     3. Downloads from GitHub if not found locally
     """
     model_hash = compute_model_hash(model_path)
+    override_path = os.environ.get("KRASIS_AWQ_TEMPLATE_PATH", "").strip()
+
+    if override_path:
+        override_path = os.path.expanduser(override_path)
+        if not os.path.exists(override_path):
+            raise RuntimeError(
+                f"KRASIS_AWQ_TEMPLATE_PATH points to missing file: {override_path}"
+            )
+        with open(override_path) as f:
+            template = json.load(f)
+        if template.get("model_hash") != model_hash:
+            raise RuntimeError(
+                "KRASIS_AWQ_TEMPLATE_PATH hash mismatch "
+                f"(expected {model_hash}, got {template.get('model_hash')})"
+            )
+        logger.info("Using AWQ template override: %s", override_path)
+        return template
 
     search_paths = [
         os.path.join(template_dir, model_hash, "template.json"),
@@ -705,6 +727,7 @@ def get_tensor_decision(template: Dict, layer_idx: int, layer_type: str,
 
     For v2 templates: input projections get "int4" (AWQ-scaled at load time),
     output projections get "int4" (plain), incompatible get "bf16".
+    Unknown tensors are a template contract error and must fail loudly.
 
     For v1 templates: returns per-tensor decision from old format.
     """
@@ -720,7 +743,10 @@ def get_tensor_decision(template: Dict, layer_idx: int, layer_type: str,
             return "int4"
         elif tensor_name in layer_data.get("bf16_projs", []):
             return "bf16"
-        return "int4"  # default to INT4 for unknown tensors
+        raise RuntimeError(
+            "AWQ v2 template missing tensor decision for "
+            f"layer {layer_idx} ({layer_type}) tensor {tensor_name}"
+        )
     else:
         # v1 fallback
         key = f"layers.{layer_idx}.{layer_type}.{tensor_name}"
