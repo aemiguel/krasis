@@ -1,5 +1,44 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-16 (QCN Polar4 AWQ after QK FP32 decision rerun)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3-Coder-Next, 1 GPU, AWQ attention, Polar4 KV, GPU decode, HCS on, timing instrumentation off.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| post QK FP32 decision rerun | 7,308.0 | 95.06 | 16848/24576 (68.6%) | 682 MB | [log](20260416_065456_qcn_polar4_awq_5090_qk_fp32_policy_rerun.log) |
+
+Notes:
+- Run executed via `./dev speed-test` on branch `gpu-debug-trace` at `8e50e32`.
+- Internal prefill runs:
+  - `1K`: `524.9 tok/s`
+  - `5K`: `2372.6 tok/s`
+  - `10K`: `4166.5 tok/s`
+  - `20K`: `5913.7 tok/s`
+  - `35K`: `7308.0 tok/s`
+  - `50K`: `6655.0 tok/s`
+- Internal decode runs:
+  - `50`: `91.84 tok/s`
+  - `100`: `95.06 tok/s`
+  - `250`: `81.76 tok/s`
+- Round-trip HTTP runs:
+  - `50`: `185.41 tok/s`
+  - `100`: `111.49 tok/s`
+  - `250`: `88.65 tok/s`
+- Calibration summary:
+  - short decode probe: `60.7 tok/s`
+  - long decode probe: `49.2 tok/s`
+  - transient deltas: short prefill `23678 MB`, long prefill `26206 MB`, short decode `50 MB`, long decode `2 MB`
+  - worst-case prefill scratch reservation: `26743 MB` at `50000` tokens
+- HCS load summary:
+  - `16848/24576` experts loaded (`68.6%`)
+  - soft HCS footprint `26199.4 MB`
+- Standard benchmark log archived at `benchmarks/20260416_065456_qcn_polar4_awq_5090_qk_fp32_policy_rerun.log`.
+
+---
+
 ## Standard Benchmarks — 2026-04-15 (QCN Polar4 AWQ linear-attention AWQ fold review)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
