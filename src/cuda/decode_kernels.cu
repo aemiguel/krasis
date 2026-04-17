@@ -5851,14 +5851,10 @@ extern "C" __global__ void gqa_attention_polar4(
 
     // Pass 2: shard positions across warps, then reduce per-warp partial V sums.
     float local_sum_exp = 0.0f;
-    float v_acc_lane[8];
-    int lane_dims[8];
-    int lane_dim_count = 0;
     for (int d = lane_id; d < head_dim; d += 32) {
-        lane_dims[lane_dim_count] = d;
-        v_acc_lane[lane_dim_count] = 0.0f;
-        lane_dim_count++;
+        s_partial_v[warp_id * head_dim + d] = 0.0f;
     }
+    __syncwarp();
 
     for (int pos = warp_id; pos < seq_len; pos += num_warps) {
         float score_partial = 0.0f;
@@ -5879,8 +5875,7 @@ extern "C" __global__ void gqa_attention_polar4(
         float w = __expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
         local_sum_exp += w;
 
-        for (int idx = 0; idx < lane_dim_count; idx++) {
-            int d = lane_dims[idx];
+        for (int d = lane_id; d < head_dim; d += 32) {
             int block_idx = block_offset_in_head + (d >> 4);
             float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&v_radius_cache[pos * num_blocks + block_idx]));
             const unsigned char* angs = v_angles_cache + (pos * num_blocks + block_idx) * 8;
@@ -5888,14 +5883,11 @@ extern "C" __global__ void gqa_attention_polar4(
             float v_val = ((d & 1) == 0)
                 ? r * polar4_codebook[p & 0xF]
                 : r * polar4_codebook[p >> 4];
-            v_acc_lane[idx] += w * v_val;
+            s_partial_v[warp_id * head_dim + d] += w * v_val;
         }
     }
 
     if (lane_id == 0) smem_reduce[warp_id] = local_sum_exp;
-    for (int idx = 0; idx < lane_dim_count; idx++) {
-        s_partial_v[warp_id * head_dim + lane_dims[idx]] = v_acc_lane[idx];
-    }
     __syncthreads();
 
     if (tid == 0) {
@@ -6077,14 +6069,10 @@ extern "C" __global__ void gqa_attention_polar4_g(
     float global_max = smem_reduce[0];
 
     float local_sum_exp = 0.0f;
-    float v_acc_lane[8];
-    int lane_dims[8];
-    int lane_dim_count = 0;
     for (int d = lane_id; d < head_dim; d += 32) {
-        lane_dims[lane_dim_count] = d;
-        v_acc_lane[lane_dim_count] = 0.0f;
-        lane_dim_count++;
+        s_partial_v[warp_id * head_dim + d] = 0.0f;
     }
+    __syncwarp();
 
     for (int pos = warp_id; pos < seq_len; pos += num_warps) {
         float score_partial = 0.0f;
@@ -6105,8 +6093,7 @@ extern "C" __global__ void gqa_attention_polar4_g(
         float w = __expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
         local_sum_exp += w;
 
-        for (int idx = 0; idx < lane_dim_count; idx++) {
-            int d = lane_dims[idx];
+        for (int d = lane_id; d < head_dim; d += 32) {
             int block_idx = block_offset_in_head + (d >> 4);
             float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&v_radius_cache[pos * num_blocks + block_idx]));
             const unsigned char* angs = v_angles_cache + (pos * num_blocks + block_idx) * 8;
@@ -6114,14 +6101,11 @@ extern "C" __global__ void gqa_attention_polar4_g(
             float v_val = ((d & 1) == 0)
                 ? r * polar4_codebook[p & 0xF]
                 : r * polar4_codebook[p >> 4];
-            v_acc_lane[idx] += w * v_val;
+            s_partial_v[warp_id * head_dim + d] += w * v_val;
         }
     }
 
     if (lane_id == 0) smem_reduce[warp_id] = local_sum_exp;
-    for (int idx = 0; idx < lane_dim_count; idx++) {
-        s_partial_v[warp_id * head_dim + lane_dims[idx]] = v_acc_lane[idx];
-    }
     __syncthreads();
 
     if (tid == 0) {

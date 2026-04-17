@@ -3323,12 +3323,12 @@ extern "C" __global__ void moe_scatter_fused_kernel(
 
 
 /* Scatter fused MoE w2 output back to per-token FP32 accumulator with topk weights.
- * The fused Marlin w2 kernel writes each valid routed row to its compact sorted_id slot
- * (token*topk+slot), while sorted_ids itself lives in a padded expert-block layout.
- * Iterate the full padded metadata stream so scattered valid entries are visited, but read
- * source rows from the compact sorted_id slot written by the fused GEMM.
+ * The fused Marlin w2 kernel writes compact rows directly at sorted_id = token*topk+slot,
+ * so the routed contribution can be accumulated by iterating the compact [M*topk, hidden]
+ * buffer directly. The padded sorted_ids metadata is still produced for the fused GEMM, but
+ * it is not needed for the final scatter once rows are compact.
  *
- * Grid: (total_sorted, 1, 1), Block: (threads, 1, 1)
+ * Grid: (M*topk, 1, 1), Block: (threads, 1, 1)
  */
 extern "C" __global__ void moe_scatter_weighted_kernel(
     float* __restrict__ accum,              // [M, hidden] FP32 accumulator (pre-zeroed)
@@ -3337,16 +3337,14 @@ extern "C" __global__ void moe_scatter_weighted_kernel(
     const float* __restrict__ topk_weights, // [M * topk] routing weights
     int hidden, int M, int topk, int total_sorted, float scale_factor
 ) {
-    int row = blockIdx.x;  // padded sorted metadata row
-    if (row >= total_sorted) return;
-    int sorted_id = sorted_ids[row];
-    if (sorted_id < 0) return;
-    int token = sorted_id / topk;
-    if (token >= M) return;
-    float w = topk_weights[sorted_id] * scale_factor;
+    int row = blockIdx.x;  // compact sorted_id row = token*topk+slot
+    int m_topk = M * topk;
+    if (row >= m_topk) return;
+    int token = row / topk;
+    float w = topk_weights[row] * scale_factor;
     if (w == 0.0f) return;  // skip zero-weight entries
     for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-        float val = bf16_to_float(src[sorted_id * hidden + i]) * w;
+        float val = bf16_to_float(src[row * hidden + i]) * w;
         atomicAdd(&accum[token * hidden + i], val);
     }
 }
@@ -3427,56 +3425,56 @@ extern "C" __global__ void kv_cache_append_polar4_kernel(
     if (ti >= M) return;
 
     int num_blocks = kv_stride / 16;
-    int block_idx = threadIdx.x; // one thread per 16-elem block
-    if (block_idx >= num_blocks) return;
-
-    int src_offset = ti * kv_stride + block_idx * 16;
     int dst_pos = start_pos + ti;
     if (dst_pos >= max_seq) return;
 
-    float k_local[16], v_local[16];
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        k_local[i] = __bfloat162float(k[src_offset + i]) * polar4_signs_p[i];
-        v_local[i] = __bfloat162float(v[src_offset + i]) * polar4_signs_p[i];
-    }
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int src_offset = ti * kv_stride + block_idx * 16;
 
-    fht16_p(k_local);
-    fht16_p(v_local);
+        float k_local[16], v_local[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            k_local[i] = __bfloat162float(k[src_offset + i]) * polar4_signs_p[i];
+            v_local[i] = __bfloat162float(v[src_offset + i]) * polar4_signs_p[i];
+        }
 
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        k_local[i] *= 0.25f;
-        v_local[i] *= 0.25f;
-    }
+        fht16_p(k_local);
+        fht16_p(v_local);
 
-    float k_r = 0.0f, v_r = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        k_r += k_local[i] * k_local[i];
-        v_r += v_local[i] * v_local[i];
-    }
-    k_r = sqrtf(k_r + 1e-12f);
-    v_r = sqrtf(v_r + 1e-12f);
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            k_local[i] *= 0.25f;
+            v_local[i] *= 0.25f;
+        }
 
-    __nv_bfloat16 k_rb = __float2bfloat16(k_r);
-    __nv_bfloat16 v_rb = __float2bfloat16(v_r);
-    k_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_rb);
-    v_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+        float k_r = 0.0f, v_r = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            k_r += k_local[i] * k_local[i];
+            v_r += v_local[i] * v_local[i];
+        }
+        k_r = sqrtf(k_r + 1e-12f);
+        v_r = sqrtf(v_r + 1e-12f);
 
-    float inv_k_r = 1.0f / k_r;
-    float inv_v_r = 1.0f / v_r;
-    unsigned char* k_ang = k_angles_cache + (dst_pos * num_blocks + block_idx) * 8;
-    unsigned char* v_ang = v_angles_cache + (dst_pos * num_blocks + block_idx) * 8;
+        __nv_bfloat16 k_rb = __float2bfloat16(k_r);
+        __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+        k_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_rb);
+        v_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
 
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        int k0 = quantize_polar4_p(k_local[i*2] * inv_k_r);
-        int k1 = quantize_polar4_p(k_local[i*2+1] * inv_k_r);
-        k_ang[i] = (unsigned char)((k1 << 4) | k0);
-        int v0 = quantize_polar4_p(v_local[i*2] * inv_v_r);
-        int v1 = quantize_polar4_p(v_local[i*2+1] * inv_v_r);
-        v_ang[i] = (unsigned char)((v1 << 4) | v0);
+        float inv_k_r = 1.0f / k_r;
+        float inv_v_r = 1.0f / v_r;
+        unsigned char* k_ang = k_angles_cache + (dst_pos * num_blocks + block_idx) * 8;
+        unsigned char* v_ang = v_angles_cache + (dst_pos * num_blocks + block_idx) * 8;
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int k0 = quantize_polar4_p(k_local[i*2] * inv_k_r);
+            int k1 = quantize_polar4_p(k_local[i*2+1] * inv_k_r);
+            k_ang[i] = (unsigned char)((k1 << 4) | k0);
+            int v0 = quantize_polar4_p(v_local[i*2] * inv_v_r);
+            int v1 = quantize_polar4_p(v_local[i*2+1] * inv_v_r);
+            v_ang[i] = (unsigned char)((v1 << 4) | v0);
+        }
     }
 }
 
@@ -3484,8 +3482,8 @@ extern "C" __global__ void kv_cache_append_polar4_kernel(
  * Reconstructs Polar4 cache [0..cache_len] back to BF16 K/V in the original
  * domain, then copies current-chunk BF16 K/V [0..m] into [cache_len..cache_len+m].
  *
- * Grid: (cache_len + m, 1, 1), Block: (num_blocks, 1, 1)
- * One thread handles one 16-value block within the KV stride.
+ * Grid: (cache_len + m, 1, 1), Block: (threads, 1, 1)
+ * Threads grid-stride over 16-value blocks within the KV stride.
  */
 extern "C" __global__ void kv_cache_dequant_concat_polar4_kernel(
     __nv_bfloat16* __restrict__ out,                /* [cache_len+m, kv_stride] BF16 output */
@@ -3497,41 +3495,40 @@ extern "C" __global__ void kv_cache_dequant_concat_polar4_kernel(
     int kv_stride)                                  /* num_kv_heads * head_dim */
 {
     int ti = blockIdx.x;
-    int block_idx = threadIdx.x;
     int num_blocks = kv_stride / 16;
-    if (block_idx >= num_blocks) return;
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int base = block_idx * 16;
 
-    int base = block_idx * 16;
+        if (ti < cache_len) {
+            float local[16];
+            float r = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(&radius_cache[ti * num_blocks + block_idx])
+            );
+            const unsigned char* ang = angles_cache + (ti * num_blocks + block_idx) * 8;
 
-    if (ti < cache_len) {
-        float local[16];
-        float r = __bfloat162float(
-            *reinterpret_cast<const __nv_bfloat16*>(&radius_cache[ti * num_blocks + block_idx])
-        );
-        const unsigned char* ang = angles_cache + (ti * num_blocks + block_idx) * 8;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                unsigned char p = ang[i];
+                local[i * 2] = r * polar4_codebook_p[p & 0xF];
+                local[i * 2 + 1] = r * polar4_codebook_p[p >> 4];
+            }
 
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            unsigned char p = ang[i];
-            local[i * 2] = r * polar4_codebook_p[p & 0xF];
-            local[i * 2 + 1] = r * polar4_codebook_p[p >> 4];
-        }
-
-        // Inverse SRR: x = S * H(y) / 4
-        fht16_p(local);
-        int64_t dst_off = (int64_t)ti * kv_stride + base;
-        #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            out[dst_off + i] = __float2bfloat16(local[i] * 0.25f * polar4_signs_p[i]);
-        }
-    } else {
-        int ci = ti - cache_len;
-        if (ci < m) {
-            int64_t src_off = (int64_t)ci * kv_stride + base;
+            // Inverse SRR: x = S * H(y) / 4
+            fht16_p(local);
             int64_t dst_off = (int64_t)ti * kv_stride + base;
             #pragma unroll
             for (int i = 0; i < 16; i++) {
-                out[dst_off + i] = kv_new[src_off + i];
+                out[dst_off + i] = __float2bfloat16(local[i] * 0.25f * polar4_signs_p[i]);
+            }
+        } else {
+            int ci = ti - cache_len;
+            if (ci < m) {
+                int64_t src_off = (int64_t)ci * kv_stride + base;
+                int64_t dst_off = (int64_t)ti * kv_stride + base;
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    out[dst_off + i] = kv_new[src_off + i];
+                }
             }
         }
     }
