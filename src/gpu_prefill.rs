@@ -1978,6 +1978,9 @@ pub struct PrefillEngine {
     // CUDA events for double-buffer expert DMA synchronization
     pub dma_event: cuda_sys::CUevent,
     pub compute_event: cuda_sys::CUevent,
+    pub scatter_event: cuda_sys::CUevent,
+    pub shared_launch_event: cuda_sys::CUevent,
+    pub shared_add_input_event: cuda_sys::CUevent,
     // BF16 attention weight streaming: double-buffer for q/k/v/o proj weights
     // These are only used when attention weights are BF16 (not AWQ/INT4).
     // For AWQ attention, weights are small and permanently GPU-resident.
@@ -2116,6 +2119,15 @@ impl Drop for PrefillEngine {
             }
             if !self.compute_event.is_null() {
                 let _ = cuda_sys::lib().cuEventDestroy_v2(self.compute_event);
+            }
+            if !self.scatter_event.is_null() {
+                let _ = cuda_sys::lib().cuEventDestroy_v2(self.scatter_event);
+            }
+            if !self.shared_launch_event.is_null() {
+                let _ = cuda_sys::lib().cuEventDestroy_v2(self.shared_launch_event);
+            }
+            if !self.shared_add_input_event.is_null() {
+                let _ = cuda_sys::lib().cuEventDestroy_v2(self.shared_add_input_event);
             }
             if !self.dma_event.is_null() {
                 let _ = cuda_sys::lib().cuEventDestroy_v2(self.dma_event);
@@ -6262,7 +6274,16 @@ impl PrefillEngine {
 
     // ── Marlin GEMM ──
 
-    fn marlin_gemm(&self, a: u64, w: &MarlinWeight, c: u64, m: usize) -> Result<(), String> {
+    fn marlin_gemm_on_stream(
+        &self,
+        a: u64,
+        w: &MarlinWeight,
+        c: u64,
+        m: usize,
+        stream: cuda_sys::CUstream,
+        fp32_scratch: u64,
+        workspace: u64,
+    ) -> Result<(), String> {
         let f = self.kernels.marlin_mm.ok_or("Marlin GEMM not loaded")?;
         let st = if w.num_bits == 4 {
             &ScalarType::U4B8
@@ -6274,10 +6295,9 @@ impl PrefillEngine {
         // inter-block barrier synchronization (barrier_acquire spins until
         // locks[off] == expected). Stale non-zero values from prior calls cause
         // deadlocks or incorrect sync, producing zeros or garbage.
-        let ws_ptr = *self.scratch.d_workspace.device_ptr();
         let ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
         unsafe {
-            cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
+            cuda_sys::lib().cuMemsetD32Async(workspace, 0, ws_len, stream);
         }
 
         // Zero the C_tmp (FP32 scratch) region used by this GEMM call.
@@ -6285,10 +6305,9 @@ impl PrefillEngine {
         // atomicAdds partial results to C_tmp. Stale values from prior GEMM calls
         // accumulate, inflating output norms. This is critical for sequential
         // expert GEMM dispatch where hundreds of calls share the same C_tmp buffer.
-        let ctmp_ptr = *self.scratch.d_fp32_scratch.device_ptr();
         let ctmp_len = m * w.n; // FP32 elements needed for this call
         unsafe {
-            cuda_sys::lib().cuMemsetD32Async(ctmp_ptr, 0, ctmp_len, self.stream);
+            cuda_sys::lib().cuMemsetD32Async(fp32_scratch, 0, ctmp_len, stream);
         }
 
         unsafe {
@@ -6296,7 +6315,7 @@ impl PrefillEngine {
                 a as *const _,
                 w.packed as *const _,
                 c as *mut _,
-                *self.scratch.d_fp32_scratch.device_ptr() as *mut _,
+                fp32_scratch as *mut _,
                 w.scales as *const _,
                 std::ptr::null(),
                 std::ptr::null(),
@@ -6307,7 +6326,7 @@ impl PrefillEngine {
                 w.n as i32,
                 w.k as i32,
                 w.k as i32,
-                ws_ptr as *mut _,
+                workspace as *mut _,
                 st,
                 false,
                 true,
@@ -6315,7 +6334,7 @@ impl PrefillEngine {
                 w.num_groups as i32,
                 w.group_size as i32,
                 self.config.device_ordinal as i32,
-                self.stream as u64,
+                stream as u64,
                 -1,
                 -1,
                 self.config.sms as i32,
@@ -6325,6 +6344,18 @@ impl PrefillEngine {
             );
         }
         Ok(())
+    }
+
+    fn marlin_gemm(&self, a: u64, w: &MarlinWeight, c: u64, m: usize) -> Result<(), String> {
+        self.marlin_gemm_on_stream(
+            a,
+            w,
+            c,
+            m,
+            self.stream,
+            *self.scratch.d_fp32_scratch.device_ptr(),
+            *self.scratch.d_workspace.device_ptr(),
+        )
     }
 
     /// cuBLAS BF16 GEMM: C = A @ W^T, all BF16, computed in FP32.
@@ -11348,12 +11379,15 @@ impl PrefillEngine {
 
         let force_sync_shared_expert =
             std::env::var("KRASIS_PREFILL_FORCE_SYNC_SHARED_EXPERT").is_ok();
+        let defer_shared_expert_launch =
+            !force_sync_shared_expert
+                && std::env::var("KRASIS_PREFILL_DEFER_SHARED_EXPERT_LAUNCH").is_ok();
 
         // 5. Launch shared expert on dedicated shared_stream (async overlap with fused MoE)
-        if has_shared && !force_sync_shared_expert {
+        if has_shared && !force_sync_shared_expert && !defer_shared_expert_launch {
             unsafe {
-                cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
-                cuda_sys::lib().cuStreamWaitEvent(self.shared_stream, self.compute_event, 0);
+                cuda_sys::lib().cuEventRecord(self.shared_launch_event, self.stream);
+                cuda_sys::lib().cuStreamWaitEvent(self.shared_stream, self.shared_launch_event, 0);
             }
             self.launch_shared_expert_on_shared_stream(layer_idx, m)?;
         }
@@ -12068,8 +12102,8 @@ impl PrefillEngine {
         }
         if use_copy_stream_scatter {
             unsafe {
-                cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
-                cuda_sys::lib().cuStreamWaitEvent(self.stream, self.dma_event, 0);
+                cuda_sys::lib().cuEventRecord(self.scatter_event, self.copy_stream);
+                cuda_sys::lib().cuStreamWaitEvent(self.stream, self.scatter_event, 0);
             }
         }
 
@@ -12731,6 +12765,9 @@ impl PrefillEngine {
         if has_shared {
             let shared_add_on_shared_stream = !force_sync_shared_expert
                 && std::env::var("KRASIS_PREFILL_SHARED_ADD_ON_SHARED_STREAM").is_ok();
+            let shared_expert_use_main_scratch =
+                !force_sync_shared_expert
+                    && std::env::var("KRASIS_PREFILL_SHARED_EXPERT_USE_MAIN_SCRATCH").is_ok();
             if std::env::var("KRASIS_PREFILL_CTX_SYNC_BEFORE_SHARED_ADD").is_ok() {
                 unsafe {
                     cuda_sys::lib().cuCtxSynchronize();
@@ -12749,10 +12786,20 @@ impl PrefillEngine {
                     *self.scratch.d_scratch1.device_ptr(),
                     *self.scratch.d_scratch2.device_ptr(),
                 )?;
+            } else if defer_shared_expert_launch {
+                unsafe {
+                    cuda_sys::lib().cuEventRecord(self.shared_launch_event, self.stream);
+                    cuda_sys::lib().cuStreamWaitEvent(self.shared_stream, self.shared_launch_event, 0);
+                }
+                self.launch_shared_expert_on_shared_stream(layer_idx, m)?;
             } else if shared_add_on_shared_stream {
                 unsafe {
-                    cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
-                    cuda_sys::lib().cuStreamWaitEvent(self.shared_stream, self.compute_event, 0);
+                    cuda_sys::lib().cuEventRecord(self.shared_add_input_event, self.stream);
+                    cuda_sys::lib().cuStreamWaitEvent(
+                        self.shared_stream,
+                        self.shared_add_input_event,
+                        0,
+                    );
                 }
             }
             // Wait for shared expert to complete on shared_stream
@@ -12763,6 +12810,8 @@ impl PrefillEngine {
                 }
             }
             let s1_buf = if force_sync_shared_expert {
+                *self.scratch.d_scratch1.device_ptr()
+            } else if shared_expert_use_main_scratch {
                 *self.scratch.d_scratch1.device_ptr()
             } else {
                 *self
@@ -12888,6 +12937,8 @@ impl PrefillEngine {
 
         if moe_trace_enabled {
             let trace_shared_buf = if force_sync_shared_expert {
+                *self.scratch.d_scratch1.device_ptr()
+            } else if std::env::var("KRASIS_PREFILL_SHARED_EXPERT_USE_MAIN_SCRATCH").is_ok() {
                 *self.scratch.d_scratch1.device_ptr()
             } else {
                 *self
@@ -16522,16 +16573,26 @@ impl PrefillEngine {
         let gated = lw.moe_gated;
         let activation = lw.moe_activation;
         let hidden = *self.scratch.d_hidden.device_ptr();
-        let s1_buf = *self
-            .d_shared_bf16_scratch1
-            .as_ref()
-            .ok_or("d_shared_bf16_scratch1 not allocated")?
-            .device_ptr();
-        let s2_buf = *self
-            .d_shared_bf16_scratch2
-            .as_ref()
-            .ok_or("d_shared_bf16_scratch2 not allocated")?
-            .device_ptr();
+        let use_main_scratch = std::env::var("KRASIS_PREFILL_SHARED_EXPERT_USE_MAIN_SCRATCH")
+            .is_ok();
+        let s1_buf = if use_main_scratch {
+            *self.scratch.d_scratch1.device_ptr()
+        } else {
+            *self
+                .d_shared_bf16_scratch1
+                .as_ref()
+                .ok_or("d_shared_bf16_scratch1 not allocated")?
+                .device_ptr()
+        };
+        let s2_buf = if use_main_scratch {
+            *self.scratch.d_scratch2.device_ptr()
+        } else {
+            *self
+                .d_shared_bf16_scratch2
+                .as_ref()
+                .ok_or("d_shared_bf16_scratch2 not allocated")?
+                .device_ptr()
+        };
         let shared_ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
 
         // BF16 validation mode: reuse the async BF16 method
@@ -16543,61 +16604,35 @@ impl PrefillEngine {
         let sw2 = lw.shared_w2.as_ref().ok_or("missing shared w2")?;
         let shared_inter = sw1.n / (if gated { 2 } else { 1 });
 
-        let st = if sw1.num_bits == 4 {
-            &ScalarType::U4B8
-        } else {
-            &ScalarType::U8B128
-        };
-        let f = self.kernels.marlin_mm.ok_or("Marlin GEMM not loaded")?;
-
         // Use shared_stream + shared workspace to avoid conflicts
-        let shared_scratch = *self
-            .d_shared_fp32_scratch
-            .as_ref()
-            .ok_or("d_shared_fp32_scratch not allocated")?
-            .device_ptr();
-        let shared_ws = *self
-            .d_shared_workspace
-            .as_ref()
-            .ok_or("d_shared_workspace not allocated")?
-            .device_ptr();
+        let shared_scratch = if use_main_scratch {
+            *self.scratch.d_fp32_scratch.device_ptr()
+        } else {
+            *self
+                .d_shared_fp32_scratch
+                .as_ref()
+                .ok_or("d_shared_fp32_scratch not allocated")?
+                .device_ptr()
+        };
+        let shared_ws = if use_main_scratch {
+            *self.scratch.d_workspace.device_ptr()
+        } else {
+            *self
+                .d_shared_workspace
+                .as_ref()
+                .ok_or("d_shared_workspace not allocated")?
+                .device_ptr()
+        };
 
-        // w1 GEMM on shared_stream — zero workspace locks + C_tmp first
-        unsafe {
-            cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
-            cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw1.n, self.shared_stream);
-            f(
-                hidden as *const _,
-                sw1.packed as *const _,
-                s1_buf as *mut _,
-                shared_scratch as *mut _,
-                sw1.scales as *const _,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                m as i32,
-                sw1.n as i32,
-                sw1.k as i32,
-                sw1.k as i32,
-                shared_ws as *mut _,
-                st,
-                false,
-                true,
-                false,
-                sw1.num_groups as i32,
-                sw1.group_size as i32,
-                self.config.device_ordinal as i32,
-                self.shared_stream as u64,
-                -1,
-                -1,
-                self.config.sms as i32,
-                false,
-                true,
-                false,
-            );
-        }
+        self.marlin_gemm_on_stream(
+            hidden,
+            sw1,
+            s1_buf,
+            m,
+            self.shared_stream,
+            shared_scratch,
+            shared_ws,
+        )?;
 
         // Activation
         if gated {
@@ -16624,42 +16659,15 @@ impl PrefillEngine {
                     ],
                 )?;
             }
-            // w2 GEMM on shared_stream — zero workspace locks + C_tmp first
-            unsafe {
-                cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
-                cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw2.n, self.shared_stream);
-                f(
-                    s2_buf as *const _,
-                    sw2.packed as *const _,
-                    s1_buf as *mut _,
-                    shared_scratch as *mut _,
-                    sw2.scales as *const _,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    m as i32,
-                    sw2.n as i32,
-                    sw2.k as i32,
-                    sw2.k as i32,
-                    shared_ws as *mut _,
-                    st,
-                    false,
-                    true,
-                    false,
-                    sw2.num_groups as i32,
-                    sw2.group_size as i32,
-                    self.config.device_ordinal as i32,
-                    self.shared_stream as u64,
-                    -1,
-                    -1,
-                    self.config.sms as i32,
-                    false,
-                    true,
-                    false,
-                );
-            }
+            self.marlin_gemm_on_stream(
+                s2_buf,
+                sw2,
+                s1_buf,
+                m,
+                self.shared_stream,
+                shared_scratch,
+                shared_ws,
+            )?;
         } else {
             let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
             let mut ac0 = s1_buf;
@@ -16679,42 +16687,15 @@ impl PrefillEngine {
                     ],
                 )?;
             }
-            // w2 GEMM on shared_stream — zero workspace locks + C_tmp first
-            unsafe {
-                cuda_sys::lib().cuMemsetD32Async(shared_ws, 0, shared_ws_len, self.shared_stream);
-                cuda_sys::lib().cuMemsetD32Async(shared_scratch, 0, m * sw2.n, self.shared_stream);
-                f(
-                    s1_buf as *const _,
-                    sw2.packed as *const _,
-                    s2_buf as *mut _,
-                    shared_scratch as *mut _,
-                    sw2.scales as *const _,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    m as i32,
-                    sw2.n as i32,
-                    sw2.k as i32,
-                    sw2.k as i32,
-                    shared_ws as *mut _,
-                    st,
-                    false,
-                    true,
-                    false,
-                    sw2.num_groups as i32,
-                    sw2.group_size as i32,
-                    self.config.device_ordinal as i32,
-                    self.shared_stream as u64,
-                    -1,
-                    -1,
-                    self.config.sms as i32,
-                    false,
-                    true,
-                    false,
-                );
-            }
+            self.marlin_gemm_on_stream(
+                s1_buf,
+                sw2,
+                s2_buf,
+                m,
+                self.shared_stream,
+                shared_scratch,
+                shared_ws,
+            )?;
             unsafe {
                 cuda_sys::lib().cuMemcpyDtoDAsync_v2(
                     s1_buf,
