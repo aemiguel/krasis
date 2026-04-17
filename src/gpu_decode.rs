@@ -7626,6 +7626,39 @@ impl GpuDecodeStore {
             }
             event
         };
+        let scatter_event = unsafe {
+            let mut event: cuda_sys::CUevent = std::ptr::null_mut();
+            let err = cuda_sys::lib().cuEventCreate(
+                &mut event,
+                cuda_sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Create scatter event: {:?}", err));
+            }
+            event
+        };
+        let shared_launch_event = unsafe {
+            let mut event: cuda_sys::CUevent = std::ptr::null_mut();
+            let err = cuda_sys::lib().cuEventCreate(
+                &mut event,
+                cuda_sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Create shared launch event: {:?}", err));
+            }
+            event
+        };
+        let shared_add_input_event = unsafe {
+            let mut event: cuda_sys::CUevent = std::ptr::null_mut();
+            let err = cuda_sys::lib().cuEventCreate(
+                &mut event,
+                cuda_sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("Create shared add-input event: {:?}", err));
+            }
+            event
+        };
 
         // Snapshot current HCS state (if available)
         let (hcs_cache_fast, hcs_ne) = if let Some(ref hcs) = graph.hcs {
@@ -7772,6 +7805,9 @@ impl GpuDecodeStore {
             hcs_num_experts_per_layer: hcs_ne,
             dma_event,
             compute_event,
+            scatter_event,
+            shared_launch_event,
+            shared_add_input_event,
             attn_weight_bufs: None,
             shared_stream,
             shared_event,
