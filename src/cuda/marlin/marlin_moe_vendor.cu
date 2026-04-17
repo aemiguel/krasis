@@ -460,3 +460,49 @@ extern "C" void krasis_marlin_moe_mm_bf16(
         use_atomic_add, use_fp32_reduce, is_zp_float,
         B_expert_ptrs, S_expert_ptrs);
 }
+
+__global__ void moe_scatter_weighted_runtime_kernel(
+    float* __restrict__ accum,
+    const nv_bfloat16* __restrict__ src,
+    const float* __restrict__ topk_weights,
+    int hidden,
+    int M,
+    int topk,
+    float scale_factor) {
+    int row = blockIdx.x;
+    int m_topk = M * topk;
+    if (row >= m_topk) return;
+    int token = row / topk;
+    float w = topk_weights[row] * scale_factor;
+    if (w == 0.0f) return;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float val = __bfloat162float(src[row * hidden + i]) * w;
+        atomicAdd(&accum[token * hidden + i], val);
+    }
+}
+
+extern "C" void krasis_moe_zero_and_scatter_weighted_bf16(
+    void* accum,
+    const void* src,
+    const void* topk_weights,
+    int hidden,
+    int M,
+    int topk,
+    float scale_factor,
+    void* stream_ptr) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    int m_topk = M * topk;
+    if (M <= 0 || hidden <= 0) return;
+    cudaMemsetAsync(accum, 0, (size_t)M * (size_t)hidden * sizeof(float), stream);
+    if (m_topk <= 0) return;
+    int threads = min(1024, hidden);
+    threads = ((threads + 31) / 32) * 32;
+    moe_scatter_weighted_runtime_kernel<<<m_topk, threads, 0, stream>>>(
+        reinterpret_cast<float*>(accum),
+        reinterpret_cast<const nv_bfloat16*>(src),
+        reinterpret_cast<const float*>(topk_weights),
+        hidden,
+        M,
+        topk,
+        scale_factor);
+}
