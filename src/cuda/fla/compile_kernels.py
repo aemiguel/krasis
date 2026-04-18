@@ -532,6 +532,17 @@ def main():
         print("ERROR: nvcc not found", file=sys.stderr)
         sys.exit(1)
 
+    cuda_root = Path(nvcc).resolve().parent.parent
+    cuda_stub_dir = None
+    for candidate in [
+        cuda_root / "targets" / "x86_64-linux" / "lib" / "stubs",
+        cuda_root / "lib64" / "stubs",
+        cuda_root / "lib" / "stubs",
+    ]:
+        if (candidate / "libcuda.so").exists():
+            cuda_stub_dir = candidate
+            break
+
     # Compile for each architecture
     for arch in archs:
         print(f"\n{'='*60}")
@@ -585,8 +596,10 @@ def main():
             "-Xcompiler", "-fPIC",
             "-Wno-deprecated-gpu-targets",
             str(c_path),
-            "-lcuda",
         ]
+        if cuda_stub_dir is not None:
+            compile_cmd.extend(["-L", str(cuda_stub_dir)])
+        compile_cmd.append("-lcuda")
         print(f"  Compiling {so_name}...")
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
