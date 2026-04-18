@@ -597,11 +597,22 @@ def main():
             "-Wno-deprecated-gpu-targets",
             str(c_path),
         ]
+        compile_env = os.environ.copy()
         if cuda_stub_dir is not None:
+            stub_path = str(cuda_stub_dir)
             compile_cmd.extend(["-L", str(cuda_stub_dir)])
+            library_path = compile_env.get("LIBRARY_PATH", "")
+            compile_env["LIBRARY_PATH"] = (
+                f"{stub_path}:{library_path}" if library_path else stub_path
+            )
         compile_cmd.append("-lcuda")
         print(f"  Compiling {so_name}...")
-        result = subprocess.run(compile_cmd, capture_output=True, text=True)
+        result = subprocess.run(
+            compile_cmd,
+            capture_output=True,
+            text=True,
+            env=compile_env,
+        )
         if result.returncode != 0:
             print(f"ERROR: nvcc failed:\n{result.stderr}", file=sys.stderr)
             sys.exit(1)
