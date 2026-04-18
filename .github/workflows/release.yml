@@ -38,7 +38,7 @@ jobs:
             # FLA source files import torch at module level but compilation only uses Triton.
             /opt/python/cp312-cp312/bin/pip install triton
             /opt/python/cp312-cp312/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-            PATH="/usr/local/cuda-12.6/bin:$PATH" KRASIS_DEV_SCRIPT=1 \
+            PATH="/usr/local/cuda-12.6/bin:$PATH" KRASIS_DEV_SCRIPT=1 KRASIS_FLA_CROSS_COMPILE=1 \
               /opt/python/cp312-cp312/bin/python src/cuda/fla/compile_kernels.py \
               --output-dir /tmp/fla_build --arch 80 89 90 120
             mkdir -p python/krasis

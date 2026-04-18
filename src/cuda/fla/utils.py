@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 FLA_CACHE_RESULTS = os.getenv('FLA_CACHE_RESULTS', '1') == '1'
 FLA_DISABLE_TENSOR_CACHE = os.getenv('FLA_DISABLE_TENSOR_CACHE', '0') == '1'
+KRASIS_FLA_CROSS_COMPILE = os.getenv("KRASIS_FLA_CROSS_COMPILE") == "1"
 TRITON_ABOVE_3_4_0 = version.parse(triton.__version__) >= version.parse("3.4.0")
 TRITON_ABOVE_3_5_1 = version.parse(triton.__version__) >= version.parse("3.5.1")
 
@@ -449,21 +450,39 @@ def map_triton_backend_to_torch_device() -> str:
 # For AMD GPUs, the triton backend is 'hip', while for Nvidia GPUs, the triton backend is 'cuda'.
 # However, the torch backend is 'cuda' for both Nvidia and AMD GPUs.
 # Therefore, we need to check the triton backend to determine the actual GPU vendor.
-device = get_available_device() if get_available_device() != 'hip' else 'cuda'
-device_torch_lib = getattr(torch, device)
-device_platform = get_available_device()
-device_name = map_triton_backend_to_torch_device()
+if KRASIS_FLA_CROSS_COMPILE:
+    # Offline kernel cross-compilation intentionally runs without an active
+    # Triton runtime driver. Keep import-time capability checks on a pure CPU
+    # path so cross-compilation can still feed explicit GPUTarget values into
+    # triton.compile().
+    device = 'cpu'
+    device_torch_lib = getattr(torch, 'cpu', torch)
+    device_platform = 'cpu'
+    device_name = 'cpu'
+    IS_AMD = False
+    IS_INTEL = False
+    IS_NVIDIA = False
+    IS_INTEL_ALCHEMIST = False
+    IS_NVIDIA_HOPPER = False
+    IS_NVIDIA_BLACKWELL = False
+    USE_CUDA_GRAPH = False
+    IS_TF32_SUPPORTED = False
+else:
+    device = get_available_device() if get_available_device() != 'hip' else 'cuda'
+    device_torch_lib = getattr(torch, device)
+    device_platform = get_available_device()
+    device_name = map_triton_backend_to_torch_device()
 
-IS_AMD = (device_platform == 'hip')
-IS_INTEL = (device_platform == 'xpu')
-IS_NVIDIA = (device_platform == 'cuda')
-IS_INTEL_ALCHEMIST = (IS_INTEL and 'Intel(R) Arc(TM) A' in torch.xpu.get_device_name(0))
-IS_NVIDIA_HOPPER = (IS_NVIDIA and ('NVIDIA H' in torch.cuda.get_device_name(0) or torch.cuda.get_device_capability()[0] >= 9))
-IS_NVIDIA_BLACKWELL = (IS_NVIDIA and torch.cuda.get_device_capability()[0] == 10)
-USE_CUDA_GRAPH = (IS_NVIDIA and os.environ.get('FLA_USE_CUDA_GRAPH', '0') == '1')
+    IS_AMD = (device_platform == 'hip')
+    IS_INTEL = (device_platform == 'xpu')
+    IS_NVIDIA = (device_platform == 'cuda')
+    IS_INTEL_ALCHEMIST = (IS_INTEL and 'Intel(R) Arc(TM) A' in torch.xpu.get_device_name(0))
+    IS_NVIDIA_HOPPER = (IS_NVIDIA and ('NVIDIA H' in torch.cuda.get_device_name(0) or torch.cuda.get_device_capability()[0] >= 9))
+    IS_NVIDIA_BLACKWELL = (IS_NVIDIA and torch.cuda.get_device_capability()[0] == 10)
+    USE_CUDA_GRAPH = (IS_NVIDIA and os.environ.get('FLA_USE_CUDA_GRAPH', '0') == '1')
 
-# Nvidia Ampere or newer, haven't check AMD and intel yet.
-IS_TF32_SUPPORTED = (IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 8)
+    # Nvidia Ampere or newer, haven't check AMD and intel yet.
+    IS_TF32_SUPPORTED = (IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 8)
 IS_GATHER_SUPPORTED = hasattr(triton.language, 'gather')
 IS_TMA_SUPPORTED = (IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 9) \
     and os.environ.get('FLA_USE_TMA', '0') == '1' and \
@@ -519,11 +538,14 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
 
 
 if check_pytorch_version('2.4'):
-    device = 'cuda' if device == 'cpu' else device
+    if not KRASIS_FLA_CROSS_COMPILE:
+        device = 'cuda' if device == 'cpu' else device
     autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=device)
     autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=device)
 
     def custom_device_ctx(index: int):
+        if KRASIS_FLA_CROSS_COMPILE:
+            return contextlib.nullcontext()
         return device_torch_lib.device(index)
 else:
     assert device == 'cuda', 'Only cuda device is supported for PyTorch version < 2.4.0.'
