@@ -534,13 +534,16 @@ def main():
 
     cuda_root = Path(nvcc).resolve().parent.parent
     cuda_stub_dir = None
+    cuda_stub_lib = None
     for candidate in [
         cuda_root / "targets" / "x86_64-linux" / "lib" / "stubs",
         cuda_root / "lib64" / "stubs",
         cuda_root / "lib" / "stubs",
     ]:
-        if (candidate / "libcuda.so").exists():
+        stub_lib = candidate / "libcuda.so"
+        if stub_lib.exists():
             cuda_stub_dir = candidate
+            cuda_stub_lib = stub_lib
             break
 
     # Compile for each architecture
@@ -605,7 +608,10 @@ def main():
             compile_env["LIBRARY_PATH"] = (
                 f"{stub_path}:{library_path}" if library_path else stub_path
             )
-        compile_cmd.append("-lcuda")
+        if cuda_stub_lib is not None:
+            compile_cmd.append(str(cuda_stub_lib))
+        else:
+            compile_cmd.append("-lcuda")
         print(f"  Compiling {so_name}...")
         result = subprocess.run(
             compile_cmd,
