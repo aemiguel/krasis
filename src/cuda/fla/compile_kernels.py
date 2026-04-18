@@ -20,6 +20,7 @@ Must be run with: KRASIS_DEV_SCRIPT=1
 """
 
 import argparse
+import contextlib
 import inspect
 import os
 import re
@@ -284,7 +285,35 @@ def compile_kernel(spec: dict, h_value: int | None, arch: int):
 
     src = ASTSource(**ast_kwargs)
 
-    compiled = triton.compile(src, target=target, options=spec["options"])
+    # Triton 3.2 still consults driver.active for some target-dependent
+    # constexprs during compilation even when an explicit GPUTarget is passed.
+    # Install a minimal temporary driver shim for offline cross-compilation so
+    # those queries resolve to the requested target instead of requiring a live
+    # GPU driver inside manylinux CI.
+    @contextlib.contextmanager
+    def offline_compile_driver():
+        if os.environ.get("KRASIS_FLA_CROSS_COMPILE") != "1":
+            yield
+            return
+
+        from triton.runtime.driver import driver as triton_driver
+
+        class _OfflineCompileDriver:
+            def __init__(self, compile_target):
+                self._target = compile_target
+
+            def get_current_target(self):
+                return self._target
+
+        prev_active = getattr(triton_driver, "_active", None)
+        triton_driver.set_active(_OfflineCompileDriver(target))
+        try:
+            yield
+        finally:
+            triton_driver._active = prev_active
+
+    with offline_compile_driver():
+        compiled = triton.compile(src, target=target, options=spec["options"])
 
     # Extract runtime args from TTIR
     args = extract_kernel_args_from_compiled(compiled)
