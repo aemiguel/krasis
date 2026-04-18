@@ -259,36 +259,14 @@ def compile_kernel(spec: dict, h_value: int | None, arch: int):
     import triton
     from triton.compiler import ASTSource
     from triton.backends.compiler import GPUTarget
-
-    mod_path, kernel_name = spec["import"]
-    jit_fn = import_kernel(mod_path, kernel_name)
-
-    # Build constexprs with H filled in
-    constexprs = dict(spec["constexprs"])
-    if spec["h_dependent"] and h_value is not None:
-        constexprs["H"] = h_value
-
     target = GPUTarget(backend='cuda', arch=arch, warp_size=32)
-    ast_params = inspect.signature(ASTSource).parameters
-    ast_kwargs = {
-        "fn": jit_fn,
-        "signature": spec["signature"],
-    }
-    if "constexprs" in ast_params:
-        ast_kwargs["constexprs"] = constexprs
-    elif "constants" in ast_params:
-        ast_kwargs["constants"] = constexprs
-    else:
-        raise RuntimeError(
-            f"Unsupported Triton ASTSource signature: {inspect.signature(ASTSource)}"
-        )
-
-    src = ASTSource(**ast_kwargs)
 
     # Triton 3.2 still consults driver.active for some target-dependent
     # constexprs during compilation even when an explicit GPUTarget is passed.
-    # Install a minimal temporary driver shim for offline cross-compilation so
-    # those queries resolve to the requested target instead of requiring a live
+    # Some vendored FLA modules also hit Triton's autotuner at import time,
+    # which consults driver.active.get_benchmarker() before we ever reach
+    # triton.compile(). Install the temporary shim before importing kernels so
+    # those lookups resolve to the requested target instead of requiring a live
     # GPU driver inside manylinux CI.
     @contextlib.contextmanager
     def offline_compile_driver():
@@ -297,7 +275,9 @@ def compile_kernel(spec: dict, h_value: int | None, arch: int):
             return
 
         from triton.runtime.driver import driver as triton_driver
-        import triton.runtime.driver as triton_driver_module
+        import importlib
+
+        triton_driver_module = importlib.import_module("triton.runtime.driver")
 
         class _OfflineCompileDriver:
             def __init__(self, compile_target):
@@ -306,21 +286,52 @@ def compile_kernel(spec: dict, h_value: int | None, arch: int):
             def get_current_target(self):
                 return self._target
 
+            def get_benchmarker(self):
+                def _offline_benchmarker(*args, **kwargs):
+                    raise RuntimeError(
+                        "Triton benchmark requested during offline cross-compilation"
+                    )
+
+                return _offline_benchmarker
+
         offline_driver = _OfflineCompileDriver(target)
-        prev_active = getattr(triton_driver, "_active", None)
-        prev_default = getattr(triton_driver, "_default", None)
+        prev_active = triton_driver.active
+        prev_default = triton_driver.default
         prev_create_driver = getattr(triton_driver_module, "_create_driver")
         triton_driver_module._create_driver = lambda: offline_driver
-        triton_driver._default = offline_driver
-        triton_driver.set_active(offline_driver)
+        triton_driver.default = offline_driver
+        triton_driver.active = offline_driver
         try:
             yield
         finally:
             triton_driver_module._create_driver = prev_create_driver
-            triton_driver._default = prev_default
-            triton_driver._active = prev_active
+            triton_driver.default = prev_default
+            triton_driver.active = prev_active
 
     with offline_compile_driver():
+        mod_path, kernel_name = spec["import"]
+        jit_fn = import_kernel(mod_path, kernel_name)
+
+        # Build constexprs with H filled in
+        constexprs = dict(spec["constexprs"])
+        if spec["h_dependent"] and h_value is not None:
+            constexprs["H"] = h_value
+
+        ast_params = inspect.signature(ASTSource).parameters
+        ast_kwargs = {
+            "fn": jit_fn,
+            "signature": spec["signature"],
+        }
+        if "constexprs" in ast_params:
+            ast_kwargs["constexprs"] = constexprs
+        elif "constants" in ast_params:
+            ast_kwargs["constants"] = constexprs
+        else:
+            raise RuntimeError(
+                f"Unsupported Triton ASTSource signature: {inspect.signature(ASTSource)}"
+            )
+
+        src = ASTSource(**ast_kwargs)
         compiled = triton.compile(src, target=target, options=spec["options"])
 
     # Extract runtime args from TTIR
