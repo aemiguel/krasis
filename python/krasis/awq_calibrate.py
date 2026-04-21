@@ -32,10 +32,11 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import numpy as np
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,126 @@ def compute_model_hash(model_path: str) -> str:
     return h.hexdigest()[:16]
 
 
+def _tokenize_without_special_tokens(tokenizer, text: str) -> List[int]:
+    """Tokenize text without BOS/EOS so prefix growth stays boundary-safe."""
+    encoded = tokenizer(text, add_special_tokens=False)
+    if isinstance(encoded, dict):
+        return encoded["input_ids"]
+    return encoded.input_ids
+
+
+def _collect_prefix_from_iterable(
+    text_iter: Iterable[str],
+    tokenizer,
+    raw_target_tokens: int,
+    label: str,
+) -> Tuple[str, List[int]]:
+    """Grow a text prefix until it contains enough raw tokens."""
+    chunks: List[str] = []
+    raw_tokens: List[int] = []
+    total_chars = 0
+
+    for idx, chunk in enumerate(text_iter, start=1):
+        if not chunk:
+            continue
+        chunks.append(chunk)
+        total_chars += len(chunk)
+        prefix_text = "".join(chunks)
+        raw_tokens = _tokenize_without_special_tokens(tokenizer, prefix_text)
+        print(
+            f"\r  Loading {label}: {total_chars / 1e6:.1f}M chars, "
+            f"{len(raw_tokens):,} raw tokens",
+            end="",
+            flush=True,
+        )
+        if len(raw_tokens) >= raw_target_tokens:
+            print()
+            return prefix_text, raw_tokens
+
+    print()
+    prefix_text = "".join(chunks)
+    return prefix_text, raw_tokens
+
+
+def load_calibration_tokens(
+    dataset_name: str,
+    tokenizer,
+    target_tokens: int,
+) -> Tuple[List[int], int]:
+    """Load only the dataset prefix needed to reach the calibration token budget."""
+    if target_tokens <= 0:
+        raise ValueError(f"target_tokens must be positive, got {target_tokens}")
+
+    perplexity_dir = Path(__file__).resolve().parent.parent.parent / "perplexity"
+    sys.path.insert(0, str(perplexity_dir))
+    from measure_ppl import DATASETS, _datasets_dir, load_dataset_text
+
+    if dataset_name not in DATASETS:
+        raise ValueError(
+            f"Unknown dataset '{dataset_name}'. "
+            f"Available: {', '.join(DATASETS.keys())}"
+        )
+
+    info = DATASETS[dataset_name]
+    cache_path = _datasets_dir / info["cache_file"]
+    raw_target_tokens = target_tokens + tokenizer.num_special_tokens_to_add(pair=False)
+
+    prefix_text: str
+    raw_tokens: List[int]
+
+    if cache_path.exists():
+        def _file_chunks() -> Iterable[str]:
+            with cache_path.open("r", encoding="utf-8") as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    yield chunk
+
+        prefix_text, raw_tokens = _collect_prefix_from_iterable(
+            _file_chunks(),
+            tokenizer,
+            raw_target_tokens,
+            f"cached {dataset_name}",
+        )
+    elif info.get("streaming"):
+        try:
+            from datasets import load_dataset as hf_load_dataset
+        except ImportError:
+            print(
+                "ERROR: 'datasets' library required. Install with: pip install datasets",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        split = info.get("hf_split", "test")
+        ds = hf_load_dataset(info["hf_path"], info["hf_name"], split=split, streaming=True)
+
+        def _stream_docs() -> Iterable[str]:
+            for example in ds:
+                text = example.get("text", "")
+                if text:
+                    yield text + "\n\n"
+
+        prefix_text, raw_tokens = _collect_prefix_from_iterable(
+            _stream_docs(),
+            tokenizer,
+            raw_target_tokens,
+            f"streaming {dataset_name}",
+        )
+    else:
+        text = load_dataset_text(dataset_name)
+        prefix_text, raw_tokens = _collect_prefix_from_iterable(
+            [text],
+            tokenizer,
+            raw_target_tokens,
+            dataset_name,
+        )
+
+    cal_tokens = tokenizer.encode(prefix_text)[:target_tokens]
+    return cal_tokens, len(raw_tokens)
+
+
 # ---------------------------------------------------------------------------
 # INT4 quantization simulation (matches Marlin symmetric group quantization)
 # ---------------------------------------------------------------------------
@@ -161,10 +282,124 @@ class ActivationCapture:
 
     def __enter__(self):
         from krasis.layer import TransformerLayer
+        from krasis.layer import _fused_add_rmsnorm, _linear, _rmsnorm
 
         self._orig_forward = TransformerLayer.forward
         self._orig_forward_attn = TransformerLayer.forward_attn
         capture = self
+
+        def _apply_head_rmsnorm(x, weight, eps):
+            variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+            return (x.float() * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
+
+        def _apply_rope(x, positions, rotary_dim, rope_theta):
+            rope_dim = min(rotary_dim, x.shape[-1])
+            if rope_dim <= 0:
+                return x
+            if rope_dim % 2 != 0:
+                rope_dim -= 1
+            if rope_dim <= 0:
+                return x
+
+            rope_part = x[..., :rope_dim].float()
+            rest = x[..., rope_dim:]
+            inv_freq = 1.0 / (
+                rope_theta ** (torch.arange(0, rope_dim, 2, device=x.device, dtype=torch.float32) / rope_dim)
+            )
+            freqs = torch.outer(positions.to(torch.float32), inv_freq)
+            cos = torch.cos(freqs).unsqueeze(1)
+            sin = torch.sin(freqs).unsqueeze(1)
+            even = rope_part[..., ::2]
+            odd = rope_part[..., 1::2]
+            rotated = torch.stack(
+                (even * cos - odd * sin, even * sin + odd * cos),
+                dim=-1,
+            ).reshape_as(rope_part)
+            if rest.numel() == 0:
+                return rotated.to(x.dtype)
+            return torch.cat((rotated.to(x.dtype), rest), dim=-1)
+
+        def _gqa_attn_forward(layer_self, hidden, positions):
+            cfg = layer_self.cfg
+            weights = layer_self.gqa_weights
+            m = hidden.shape[0]
+
+            q = F.linear(hidden, weights["q_proj"])
+            if cfg.gated_attention:
+                q = q.view(m, cfg.num_attention_heads, cfg.gqa_head_dim * 2)
+                q, gate = q.chunk(2, dim=-1)
+            else:
+                q = q.view(m, cfg.num_attention_heads, cfg.gqa_head_dim)
+                gate = None
+            k = F.linear(hidden, weights["k_proj"]).view(m, cfg.num_key_value_heads, cfg.gqa_head_dim)
+            v = F.linear(hidden, weights["v_proj"]).view(m, cfg.num_key_value_heads, cfg.gqa_head_dim)
+
+            q_norm = weights.get("q_norm")
+            k_norm = weights.get("k_norm")
+            if q_norm is not None:
+                q = _apply_head_rmsnorm(q, q_norm, cfg.rms_norm_eps)
+            if k_norm is not None:
+                k = _apply_head_rmsnorm(k, k_norm, cfg.rms_norm_eps)
+
+            q = _apply_rope(q, positions, cfg.rotary_dim, cfg.rope_theta)
+            k = _apply_rope(k, positions, cfg.rotary_dim, cfg.rope_theta)
+
+            heads_per_group = cfg.num_attention_heads // cfg.num_key_value_heads
+            if heads_per_group > 1:
+                k = k.repeat_interleave(heads_per_group, dim=1)
+                v = v.repeat_interleave(heads_per_group, dim=1)
+
+            attn = F.scaled_dot_product_attention(
+                q.transpose(0, 1).float(),
+                k.transpose(0, 1).float(),
+                v.transpose(0, 1).float(),
+                is_causal=True,
+                scale=1.0 / math.sqrt(cfg.gqa_head_dim),
+            ).transpose(0, 1).to(hidden.dtype)
+
+            if gate is not None:
+                attn = attn * torch.sigmoid(gate.float()).to(attn.dtype)
+
+            attn = attn.reshape(m, cfg.num_attention_heads * cfg.gqa_head_dim)
+            return _linear(attn, weights["o_proj"])
+
+        def _forward_attn_gqa(layer_self, hidden, residual, positions):
+            if residual is None:
+                residual = hidden
+                hidden = _rmsnorm(hidden, layer_self.input_norm_weight, layer_self.cfg.rms_norm_eps)
+            else:
+                _fused_add_rmsnorm(
+                    hidden, residual, layer_self.input_norm_weight, layer_self.cfg.rms_norm_eps
+                )
+
+            attn_out = _gqa_attn_forward(layer_self, hidden, positions)
+            _fused_add_rmsnorm(
+                attn_out, residual, layer_self.post_attn_norm_weight, layer_self.cfg.rms_norm_eps
+            )
+            return attn_out, residual
+
+        def _forward_full_gqa(layer_self, hidden, residual, positions, moe_layer_idx=None):
+            if residual is None:
+                residual = hidden
+                hidden = _rmsnorm(hidden, layer_self.input_norm_weight, layer_self.cfg.rms_norm_eps)
+            else:
+                _fused_add_rmsnorm(
+                    hidden, residual, layer_self.input_norm_weight, layer_self.cfg.rms_norm_eps
+                )
+
+            attn_out = _gqa_attn_forward(layer_self, hidden, positions)
+            _fused_add_rmsnorm(
+                attn_out, residual, layer_self.post_attn_norm_weight, layer_self.cfg.rms_norm_eps
+            )
+            hidden = attn_out
+
+            if layer_self.is_moe:
+                mlp_out = layer_self._moe_forward(hidden, moe_layer_idx)
+            elif layer_self.dense_mlp is not None:
+                mlp_out = layer_self._dense_mlp_forward(hidden)
+            else:
+                mlp_out = hidden
+            return mlp_out, residual
 
         def _rms_norm(x, weight, eps):
             """RMSNorm using torch."""
@@ -201,11 +436,20 @@ class ActivationCapture:
 
         def patched_forward(layer_self, hidden, residual, positions, *args, **kwargs):
             _capture_activations(layer_self, hidden, residual)
+            if getattr(layer_self, "gqa_weights", None) is not None and layer_self.attention is None:
+                moe_layer_idx = kwargs.get("moe_layer_idx")
+                if moe_layer_idx is None and len(args) >= 4:
+                    moe_layer_idx = args[3]
+                return _forward_full_gqa(
+                    layer_self, hidden, residual, positions, moe_layer_idx=moe_layer_idx
+                )
             return capture._orig_forward(layer_self, hidden, residual, positions,
                                          *args, **kwargs)
 
         def patched_forward_attn(layer_self, hidden, residual, positions, *args, **kwargs):
             _capture_activations(layer_self, hidden, residual)
+            if getattr(layer_self, "gqa_weights", None) is not None and layer_self.attention is None:
+                return _forward_attn_gqa(layer_self, hidden, residual, positions)
             return capture._orig_forward_attn(layer_self, hidden, residual, positions,
                                               *args, **kwargs)
 
@@ -904,22 +1148,19 @@ def main():
         kv_dtype=kv_dtype,
         layer_group_size=int(cfg.get("layer_group_size", 2)),
         kv_cache_mb=int(cfg.get("kv_cache_mb", 1000)),
-        stream_attention=True,  # Always stream — calibration is one-time, and large models may not fit BF16 attention in VRAM
+        stream_attention=False,  # Calibration needs live attention weights on layers.
     )
     model.load(gpu_only=True)
 
     # Load calibration dataset
     print(f"\n  Loading calibration dataset: {args.dataset}...")
-    perplexity_dir = Path(__file__).resolve().parent.parent.parent / "perplexity"
-    sys.path.insert(0, str(perplexity_dir))
-    from measure_ppl import load_dataset_text
-
-    text = load_dataset_text(args.dataset)
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    all_tokens = tokenizer.encode(text)
-    cal_tokens = all_tokens[:args.tokens]
-    print(f"  Tokenized: {len(all_tokens):,} total, using {len(cal_tokens):,}")
+    cal_tokens, raw_tokenized = load_calibration_tokens(args.dataset, tokenizer, args.tokens)
+    print(
+        f"  Tokenized prefix: {raw_tokenized:,} raw tokens, "
+        f"using {len(cal_tokens):,}"
+    )
 
     model_hash = compute_model_hash(model_path)
     print(f"  Model hash: {model_hash}")
