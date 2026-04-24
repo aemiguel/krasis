@@ -17,6 +17,9 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+from krasis.attention_backend import ATTENTION_QUANT_CHOICES, attention_quant_label
+from krasis.config import GPU_EXPERT_INT4_CALIB_CHOICES
+
 # Terminal handling imports — graceful fallback for non-Unix
 try:
     import termios
@@ -334,6 +337,7 @@ def scan_gguf_files(search_dir: str) -> List[Dict[str, Any]]:
 CONFIG_KEYS = [
     "MODEL_PATH", "CFG_SELECTED_GPUS", "CFG_PP_PARTITION", "CFG_LAYER_GROUP_SIZE",
     "CFG_KV_CACHE_MB", "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS", "CFG_CPU_EXPERT_BITS",
+    "CFG_GPU_EXPERT_INT4_CALIB",
     "CFG_ATTENTION_QUANT", "CFG_SHARED_EXPERT_QUANT", "CFG_DENSE_MLP_QUANT",
     "CFG_LM_HEAD_QUANT", "CFG_KRASIS_THREADS", "CFG_HOST", "CFG_PORT",
     "CFG_GPU_PREFILL_THRESHOLD", "CFG_GGUF_PATH", "CFG_VRAM_SAFETY_MARGIN",
@@ -388,6 +392,7 @@ class LauncherConfig:
         self.kv_cache_mb: int = 1000
         self.kv_dtype: str = "polar4"
         self.gpu_expert_bits: int = 4
+        self.gpu_expert_int4_calib: str = "amax"
         self.cpu_expert_bits: int = 4
         self.attention_quant: str = "bf16"
         self._attention_quant_explicit: bool = False  # set when user/config explicitly chose
@@ -449,6 +454,10 @@ class LauncherConfig:
                 self.gpu_expert_bits = int(saved["CFG_GPU_EXPERT_BITS"])
             except ValueError:
                 pass
+        if "CFG_GPU_EXPERT_INT4_CALIB" in saved:
+            val = saved["CFG_GPU_EXPERT_INT4_CALIB"].strip().lower()
+            if val in GPU_EXPERT_INT4_CALIB_CHOICES:
+                self.gpu_expert_int4_calib = val
         if "CFG_CPU_EXPERT_BITS" in saved:
             try:
                 self.cpu_expert_bits = int(saved["CFG_CPU_EXPERT_BITS"])
@@ -459,7 +468,12 @@ class LauncherConfig:
             if val in ("int4", "int8"):
                 raise ValueError(
                     f"Unsupported saved CFG_ATTENTION_QUANT={val}. "
-                    "Naive int4/int8 attention has been removed; use awq or bf16."
+                    "Naive int4/int8 attention has been removed; use awq, hqq4, or bf16."
+                )
+            if val not in ATTENTION_QUANT_CHOICES:
+                raise ValueError(
+                    f"Unsupported saved CFG_ATTENTION_QUANT={val}. "
+                    f"Use one of: {', '.join(ATTENTION_QUANT_CHOICES)}."
                 )
             self.attention_quant = val
             self._attention_quant_explicit = True
@@ -514,6 +528,7 @@ class LauncherConfig:
             "CFG_KV_CACHE_MB": str(self.kv_cache_mb),
             "CFG_KV_DTYPE": self.kv_dtype,
             "CFG_GPU_EXPERT_BITS": str(self.gpu_expert_bits),
+            "CFG_GPU_EXPERT_INT4_CALIB": self.gpu_expert_int4_calib,
             "CFG_CPU_EXPERT_BITS": str(self.cpu_expert_bits),
             "CFG_ATTENTION_QUANT": self.attention_quant,
             "CFG_SHARED_EXPERT_QUANT": self.shared_expert_quant,
@@ -571,8 +586,10 @@ OPTIONS = [
                  opt_type="number", min_val=200, max_val=65500, step=100, affects_budget=True),
     ConfigOption("Model quantization", "gpu_expert_bits",
                  choices=[4, 8], affects_budget=True),
+    ConfigOption("Expert INT4 calib", "gpu_expert_int4_calib",
+                 choices=list(GPU_EXPERT_INT4_CALIB_CHOICES)),
     ConfigOption("Attention quant", "attention_quant",
-                 choices=["bf16", "awq"], affects_budget=True),
+                 choices=list(ATTENTION_QUANT_CHOICES), affects_budget=True),
     ConfigOption("VRAM safety margin", "vram_safety_margin",
                  opt_type="number", min_val=500, max_val=8000, step=100),
     ConfigOption("Host/Port", "host", opt_type="text"),
@@ -593,11 +610,9 @@ def _format_value(opt: ConfigOption, val: Any) -> str:
     if opt.key == "vram_safety_margin":
         return f"{val:,} MB"
     if opt.key == "attention_quant":
-        labels = {
-            "bf16": "BF16",
-            "awq": "AWQ",
-        }
-        return labels.get(str(val), str(val))
+        return attention_quant_label(str(val))
+    if opt.key == "gpu_expert_int4_calib":
+        return str(val)
     return str(val)
 
 
@@ -636,6 +651,8 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
             return f"{DIM}{native_label} \u2192 int4 \u2014 {YELLOW}slight loss{NC}{DIM}{NC}"
         elif current == "awq":
             return f"{DIM}{native_label} \u2192 AWQ \u2014 {GREEN}calibrated per-tensor{NC}{DIM}{NC}"
+        elif current == "hqq4":
+            return f"{DIM}{native_label} \u2192 HQQ4 \u2014 calibration-free native backend{NC}"
         return f"{DIM}{native_label} \u2192 {current}{NC}"
 
     elif config_key == "gpu_expert_bits":
@@ -1072,7 +1089,7 @@ class Launcher:
 
             # Labels
             expert_label = f"INT{self.cfg.gpu_expert_bits}"
-            attn_label = "AWQ" if self.cfg.attention_quant == "awq" else "BF16"
+            attn_label = attention_quant_label(self.cfg.attention_quant)
 
             # RAM
             ram_experts_gb = b.get('ram_gpu_experts_mb', 0) / 1024
@@ -1454,6 +1471,8 @@ class Launcher:
         print(f"  KV cache:        {self.cfg.kv_cache_mb:,} MB")
         print(f"  KV dtype:        {self.cfg.kv_dtype}")
         print(f"  Quantization:    INT{self.cfg.gpu_expert_bits}")
+        if self.cfg.gpu_expert_bits == 4:
+            print(f"  Expert INT4:     {self.cfg.gpu_expert_int4_calib}")
         print(f"  Attention quant: {self.cfg.attention_quant}")
         print(f"  Shared expert:   {self.cfg.shared_expert_quant}")
         dense_layers = (self.model_info or {}).get("dense_layers", 0)
@@ -1483,7 +1502,7 @@ class Launcher:
             )
             kv_label = "polar4" if self.cfg.kv_dtype == "polar4" else ("fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16")
             print(f"\n  Experts:     {experts_mb:>8,} MB  (INT{self.cfg.gpu_expert_bits})")
-            attn_label = "AWQ" if self.cfg.attention_quant == "awq" else "BF16"
+            attn_label = attention_quant_label(self.cfg.attention_quant)
             print(f"  Attention:   {attention_mb:>8,} MB  ({attn_label})")
             print(f"  Overhead:    {overhead_mb:>8,} MB")
             print(f"  Total: {rank['total_mb']:>8,.0f} / {gpu_vram:,} MB (rank {wr})")
@@ -1615,8 +1634,11 @@ def parse_args() -> argparse.Namespace:
                         help="KV cache dtype: fp8_e4m3, polar4, or bf16")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
                         help="Model quantization: 4 or 8")
+    parser.add_argument("--gpu-expert-int4-calib", default=None,
+                        choices=list(GPU_EXPERT_INT4_CALIB_CHOICES),
+                        help="Offline calibration mode for GPU routed-expert INT4 cache build")
     parser.add_argument("--attention-quant", default=None,
-                        help="Attention weight quant: bf16 or awq")
+                        help="Attention weight quant: bf16, awq, or hqq4")
     parser.add_argument("--shared-expert-quant", default=None,
                         help="Shared expert quant: bf16 or int8")
     parser.add_argument("--dense-mlp-quant", default=None,
@@ -1677,12 +1699,19 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         cfg.kv_dtype = args.kv_dtype
     if args.gpu_expert_bits is not None:
         cfg.gpu_expert_bits = args.gpu_expert_bits
+    if args.gpu_expert_int4_calib is not None:
+        cfg.gpu_expert_int4_calib = args.gpu_expert_int4_calib
     if args.attention_quant is not None:
         val = args.attention_quant
         if val in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported --attention-quant {val}. "
-                "Naive int4/int8 attention has been removed; use awq or bf16."
+                "Naive int4/int8 attention has been removed; use awq, hqq4, or bf16."
+            )
+        if val not in ATTENTION_QUANT_CHOICES:
+            raise ValueError(
+                f"Unsupported --attention-quant {val}. "
+                f"Use one of: {', '.join(ATTENTION_QUANT_CHOICES)}."
             )
         cfg.attention_quant = val
         cfg._attention_quant_explicit = True

@@ -9,13 +9,16 @@
 pub mod marlin;
 pub mod safetensors_io;
 
-use crate::weights::marlin::{quantize_int4, quantize_int8, QuantizedInt4, QuantizedInt8, QuantizedBf16, DEFAULT_GROUP_SIZE};
+use crate::weights::marlin::{
+    bf16_to_f32, f32_to_bf16, quantize_int4, quantize_int8, QuantizedBf16, QuantizedInt4,
+    QuantizedInt8, DEFAULT_GROUP_SIZE,
+};
 use crate::weights::safetensors_io::{MmapSafetensors, Dtype};
 use memmap2::Mmap;
 use pyo3::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
@@ -1189,8 +1192,8 @@ struct SafetensorsIndex {
 //   [24..32] n_routed_experts (u64 LE)
 //   [32..40] num_moe_layers (u64 LE)
 //   [40..48] group_size (u64 LE)
-//   [48..56] config_hash (u64 LE) — FNV-1a of config.json
-//   [56..64] reserved (must be 0)
+//   [48..56] config_hash (u64 LE) — FNV-1a of config.json + Marlin cache knobs
+//   [56..64] packed(u32 n_shared_experts, u32 expert_int4_calib_mode)
 //
 // Body: for each (layer, expert) sequentially:
 //   gate_packed [N_gate * K_gate/8 u32s as bytes]
@@ -1203,7 +1206,7 @@ struct SafetensorsIndex {
 const CACHE_MAGIC: &[u8; 4] = b"KRAS";
 #[allow(dead_code)]
 const CACHE_VERSION: u32 = 1;
-const CACHE_VERSION_MARLIN: u32 = 3;
+const CACHE_VERSION_MARLIN: u32 = 6;
 const CACHE_VERSION_CPU: u32 = 4;
 const CACHE_VERSION_CPU_GGUF: u32 = 5;
 const CACHE_HEADER_SIZE: usize = 64;
@@ -1240,9 +1243,310 @@ fn cache_path(model_dir: &Path, num_bits: u8, group_size: usize) -> PathBuf {
 }
 
 /// Cache file path for Marlin format (GPU-native Marlin INT4/INT8).
-fn cache_path_marlin(model_dir: &Path, group_size: usize, gpu_bits: u8) -> PathBuf {
+fn cache_path_marlin(
+    model_dir: &Path,
+    group_size: usize,
+    gpu_bits: u8,
+    expert_int4_calib_mode: ExpertInt4CalibMode,
+) -> PathBuf {
+    let calib_suffix = if gpu_bits == 4 {
+        format!("_cal{}", expert_int4_calib_mode.cache_token())
+    } else {
+        String::new()
+    };
     cache_dir_for_model(model_dir)
-        .join(format!("experts_marlin_int{gpu_bits}_g{group_size}.bin"))
+        .join(format!(
+            "experts_marlin_int{gpu_bits}_g{group_size}{calib_suffix}.bin"
+        ))
+}
+
+#[derive(Debug)]
+struct MarlinCacheHeader {
+    version: u32,
+    hidden_size: usize,
+    moe_intermediate_size: usize,
+    n_routed_experts: usize,
+    num_moe_layers: usize,
+    group_size: usize,
+    config_hash: u64,
+    n_shared_experts: usize,
+    expert_int4_calib_mode: ExpertInt4CalibMode,
+}
+
+fn read_marlin_cache_header(path: &Path) -> Result<MarlinCacheHeader, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open Marlin cache header: {e}"))?;
+    let mut header = [0u8; CACHE_HEADER_SIZE];
+    file.read_exact(&mut header)
+        .map_err(|e| format!("failed to read Marlin cache header: {e}"))?;
+
+    if &header[0..4] != CACHE_MAGIC {
+        return Err("bad magic".to_string());
+    }
+    let (n_shared_experts, expert_int4_calib_mode) =
+        unpack_marlin_header_tail(u64::from_le_bytes(header[56..64].try_into().unwrap()))?;
+    Ok(MarlinCacheHeader {
+        version: u32::from_le_bytes(header[4..8].try_into().unwrap()),
+        hidden_size: u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize,
+        moe_intermediate_size: u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize,
+        n_routed_experts: u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize,
+        num_moe_layers: u64::from_le_bytes(header[32..40].try_into().unwrap()) as usize,
+        group_size: u64::from_le_bytes(header[40..48].try_into().unwrap()) as usize,
+        config_hash: u64::from_le_bytes(header[48..56].try_into().unwrap()),
+        n_shared_experts,
+        expert_int4_calib_mode,
+    })
+}
+
+fn marlin_cache_filename_calib_mode(name: &str) -> Option<ExpertInt4CalibMode> {
+    if name.contains("_calamax.") || name.contains("_calamax.bin") {
+        Some(ExpertInt4CalibMode::Amax)
+    } else if name.contains("_calsearchrmse.") || name.contains("_calsearchrmse.bin") {
+        Some(ExpertInt4CalibMode::SearchRmse)
+    } else {
+        None
+    }
+}
+
+fn marlin_cache_lock_is_live(lock_path: &Path) -> bool {
+    let Ok(pid_str) = std::fs::read_to_string(lock_path) else {
+        return true;
+    };
+    let Ok(pid) = pid_str.trim().parse::<u32>() else {
+        return true;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn marlin_cache_lock_path_for_tmp(tmp_path: &Path) -> PathBuf {
+    tmp_path.with_extension("lock")
+}
+
+fn remove_marlin_cache_file(path: &Path, reason: &str) {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            log::warn!(
+                "Deleted obsolete Marlin cache file ({} bytes, reason={}): {}",
+                size,
+                reason,
+                path.display(),
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "Failed to delete obsolete Marlin cache file (reason={}): {} ({})",
+                reason,
+                path.display(),
+                e,
+            );
+        }
+    }
+}
+
+fn cleanup_marlin_cache_before_build(
+    model_dir: &Path,
+    config: &ModelConfig,
+    total_moe_layers: usize,
+    config_hash: u64,
+    gpu_bits: u8,
+    expert_int4_calib_mode: ExpertInt4CalibMode,
+) {
+    let cache_dir = cache_dir_for_model(model_dir);
+    let Ok(entries) = std::fs::read_dir(&cache_dir) else {
+        return;
+    };
+
+    let prefix = format!("experts_marlin_int{gpu_bits}_g");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+
+        if name.ends_with(".bin.tmp") {
+            let lock_path = marlin_cache_lock_path_for_tmp(&path);
+            if lock_path.exists() && marlin_cache_lock_is_live(&lock_path) {
+                log::info!(
+                    "Keeping Marlin cache temp file because a live build lock exists: {}",
+                    path.display(),
+                );
+            } else {
+                remove_marlin_cache_file(&path, "stale interrupted Marlin cache build temp file");
+                if lock_path.exists() && !marlin_cache_lock_is_live(&lock_path) {
+                    remove_marlin_cache_file(&lock_path, "stale interrupted Marlin cache build lock");
+                }
+            }
+            continue;
+        }
+        if name.ends_with(".bin.lock") {
+            if marlin_cache_lock_is_live(&path) {
+                log::info!(
+                    "Keeping Marlin cache lock because the holder still appears live: {}",
+                    path.display(),
+                );
+            } else {
+                remove_marlin_cache_file(&path, "stale Marlin cache build lock");
+            }
+            continue;
+        }
+        if !name.ends_with(".bin") {
+            continue;
+        }
+
+        let header = match read_marlin_cache_header(&path) {
+            Ok(header) => header,
+            Err(e) => {
+                remove_marlin_cache_file(&path, &format!("unreadable Marlin cache header: {e}"));
+                continue;
+            }
+        };
+        if header.version != CACHE_VERSION_MARLIN {
+            remove_marlin_cache_file(
+                &path,
+                &format!("Marlin cache version {} != {}", header.version, CACHE_VERSION_MARLIN),
+            );
+            continue;
+        }
+        if header.hidden_size != config.hidden_size
+            || header.moe_intermediate_size != config.moe_intermediate_size
+            || header.n_routed_experts != config.n_routed_experts
+            || header.num_moe_layers != total_moe_layers
+            || header.n_shared_experts != config.n_shared_experts
+        {
+            remove_marlin_cache_file(&path, "Marlin cache header does not match current model dimensions");
+            continue;
+        }
+
+        let expected_size = expected_marlin_cache_size(
+            config,
+            header.group_size,
+            total_moe_layers,
+            config.n_shared_experts,
+            config.shared_expert_intermediate_size,
+            gpu_bits,
+        ) as u64;
+        let actual_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if actual_size != expected_size {
+            remove_marlin_cache_file(
+                &path,
+                &format!("Marlin cache size {actual_size} != expected {expected_size}"),
+            );
+            continue;
+        }
+
+        let filename_calib_mode = marlin_cache_filename_calib_mode(name);
+        if gpu_bits == 4 && filename_calib_mode.is_none() {
+            remove_marlin_cache_file(&path, "legacy unsuffixed INT4 Marlin cache filename is no longer loadable");
+            continue;
+        }
+        if let Some(filename_mode) = filename_calib_mode {
+            if filename_mode != header.expert_int4_calib_mode {
+                remove_marlin_cache_file(&path, "Marlin cache filename calibration mode does not match header");
+                continue;
+            }
+        }
+
+        if gpu_bits != 4 || header.expert_int4_calib_mode == expert_int4_calib_mode {
+            if header.config_hash != config_hash {
+                remove_marlin_cache_file(&path, "Marlin cache config hash does not match requested replacement identity");
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertInt4CalibMode {
+    Amax,
+    SearchRmse,
+}
+
+impl ExpertInt4CalibMode {
+    pub fn from_config_value(raw: &str) -> Result<Self, String> {
+        match raw {
+            "amax" => Ok(Self::Amax),
+            "search_rmse" => Ok(Self::SearchRmse),
+            other => Err(format!(
+                "Unsupported expert INT4 calibration mode '{other}' (expected 'amax' or 'search_rmse')"
+            )),
+        }
+    }
+
+    fn config_value(self) -> &'static str {
+        match self {
+            Self::Amax => "amax",
+            Self::SearchRmse => "search_rmse",
+        }
+    }
+
+    fn cache_token(self) -> &'static str {
+        match self {
+            Self::Amax => "amax",
+            Self::SearchRmse => "searchrmse",
+        }
+    }
+
+    fn header_tag(self) -> u32 {
+        match self {
+            Self::Amax => 0,
+            Self::SearchRmse => 1,
+        }
+    }
+
+    fn from_header_tag(tag: u32) -> Result<Self, String> {
+        match tag {
+            0 => Ok(Self::Amax),
+            1 => Ok(Self::SearchRmse),
+            other => Err(format!("Unsupported Marlin expert INT4 calibration tag {other}")),
+        }
+    }
+}
+
+fn marlin_cache_config_hash(
+    config_str: &str,
+    gpu_bits: u8,
+    expert_int4_calib_mode: ExpertInt4CalibMode,
+    expert_int4_calib_data_hash: Option<u64>,
+) -> u64 {
+    if gpu_bits == 4 {
+        let mut payload = format!(
+            "{config_str}\nmarlin_expert_int4_calib_mode={}",
+            expert_int4_calib_mode.config_value()
+        );
+        if let Some(calib_hash) = expert_int4_calib_data_hash {
+            payload.push_str(&format!("\nmarlin_expert_int4_calib_data_hash={calib_hash:016x}"));
+        }
+        fnv1a(payload.as_bytes())
+    } else {
+        fnv1a(config_str.as_bytes())
+    }
+}
+
+fn pack_marlin_header_tail(
+    n_shared_experts: usize,
+    expert_int4_calib_mode: ExpertInt4CalibMode,
+) -> Result<u64, String> {
+    let n_shared_u32 = u32::try_from(n_shared_experts)
+        .map_err(|_| format!("n_shared_experts {n_shared_experts} exceeds Marlin header capacity"))?;
+    Ok(((expert_int4_calib_mode.header_tag() as u64) << 32) | (n_shared_u32 as u64))
+}
+
+fn unpack_marlin_header_tail(tail: u64) -> Result<(usize, ExpertInt4CalibMode), String> {
+    let n_shared = (tail & 0xffff_ffff) as usize;
+    let calib_tag = (tail >> 32) as u32;
+    let expert_int4_calib_mode = ExpertInt4CalibMode::from_header_tag(calib_tag)?;
+    Ok((n_shared, expert_int4_calib_mode))
 }
 
 /// Cache file path for CPU-optimized transposed format (INT4 or INT8).
@@ -1469,6 +1773,120 @@ fn expected_cache_size(config: &ModelConfig, group_size: usize, num_bits: u8, nu
     CACHE_HEADER_SIZE + num_moe_layers * config.n_routed_experts * per_expert
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ExpertInt4CalibTraceFile {
+    samples: Vec<ExpertInt4CalibSample>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExpertInt4CalibSample {
+    layer_idx: usize,
+    expert_idx: usize,
+    proj_name: String,
+    row_idx: usize,
+    group_idx: usize,
+    active_cols: Vec<usize>,
+    active_vals: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExpertInt4CalibKey {
+    layer_idx: usize,
+    expert_idx: usize,
+    proj_name: String,
+    row_idx: usize,
+    group_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ExpertInt4CalibData {
+    source_path: PathBuf,
+    source_hash: u64,
+    samples_by_key: HashMap<ExpertInt4CalibKey, Vec<ExpertInt4CalibSample>>,
+}
+
+#[derive(Clone, Copy)]
+struct ExpertInt4CalibContext<'a> {
+    samples: &'a [ExpertInt4CalibSample],
+}
+
+impl ExpertInt4CalibData {
+    fn from_env_for_mode(mode: ExpertInt4CalibMode) -> Result<Option<Self>, String> {
+        if mode == ExpertInt4CalibMode::Amax {
+            return Ok(None);
+        }
+        let raw_path = std::env::var("KRASIS_EXPERT_INT4_CALIB_SAMPLES").map_err(|_| {
+            "KRASIS_EXPERT_INT4_CALIB_SAMPLES must point to routed expert calibration samples when gpu_expert_int4_calib=search_rmse".to_string()
+        })?;
+        let source_path = PathBuf::from(&raw_path);
+        let raw = std::fs::read(&source_path).map_err(|e| {
+            format!(
+                "Failed to read KRASIS_EXPERT_INT4_CALIB_SAMPLES {}: {e}",
+                source_path.display()
+            )
+        })?;
+        let parsed: ExpertInt4CalibTraceFile = serde_json::from_slice(&raw).map_err(|e| {
+            format!(
+                "Failed to parse KRASIS_EXPERT_INT4_CALIB_SAMPLES {}: {e}",
+                source_path.display()
+            )
+        })?;
+        if parsed.samples.is_empty() {
+            return Err(format!(
+                "KRASIS_EXPERT_INT4_CALIB_SAMPLES {} contains no samples",
+                source_path.display()
+            ));
+        }
+        let mut samples_by_key: HashMap<ExpertInt4CalibKey, Vec<ExpertInt4CalibSample>> = HashMap::new();
+        for sample in parsed.samples {
+            if sample.active_cols.len() != sample.active_vals.len() {
+                return Err(format!(
+                    "Invalid calibration sample for layer={} expert={} proj={} row={} group={}: active_cols len {} != active_vals len {}",
+                    sample.layer_idx,
+                    sample.expert_idx,
+                    sample.proj_name,
+                    sample.row_idx,
+                    sample.group_idx,
+                    sample.active_cols.len(),
+                    sample.active_vals.len()
+                ));
+            }
+            let key = ExpertInt4CalibKey {
+                layer_idx: sample.layer_idx,
+                expert_idx: sample.expert_idx,
+                proj_name: sample.proj_name.clone(),
+                row_idx: sample.row_idx,
+                group_idx: sample.group_idx,
+            };
+            samples_by_key.entry(key).or_default().push(sample);
+        }
+        Ok(Some(Self {
+            source_path,
+            source_hash: fnv1a(&raw),
+            samples_by_key,
+        }))
+    }
+
+    fn context_for(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+        proj_name: &str,
+        row_idx: usize,
+        group_idx: usize,
+    ) -> Option<ExpertInt4CalibContext<'_>> {
+        self.samples_by_key
+            .get(&ExpertInt4CalibKey {
+                layer_idx,
+                expert_idx,
+                proj_name: proj_name.to_string(),
+                row_idx,
+                group_idx,
+            })
+            .map(|samples| ExpertInt4CalibContext { samples: samples.as_slice() })
+    }
+}
+
 #[pymethods]
 impl WeightStore {
     #[new]
@@ -1523,6 +1941,7 @@ impl WeightStore {
         start_layer: Option<usize>,
         cpu_num_bits: u8,
         gpu_num_bits: u8,
+        expert_int4_calib_mode: ExpertInt4CalibMode,
         gpu_only: bool,
     ) -> Result<Self, String> {
         let start = std::time::Instant::now();
@@ -1568,7 +1987,21 @@ impl WeightStore {
             }
             None => remaining,
         };
-        let config_hash = fnv1a(config_str.as_bytes());
+        let expert_int4_calib_data = ExpertInt4CalibData::from_env_for_mode(expert_int4_calib_mode)?;
+        if let Some(data) = expert_int4_calib_data.as_ref() {
+            log::info!(
+                "Loaded expert INT4 calibration samples from {} (hash={:016x}, keys={})",
+                data.source_path.display(),
+                data.source_hash,
+                data.samples_by_key.len(),
+            );
+        }
+        let config_hash = marlin_cache_config_hash(
+            &config_str,
+            gpu_num_bits,
+            expert_int4_calib_mode,
+            expert_int4_calib_data.as_ref().map(|d| d.source_hash),
+        );
 
         // Detect effective group_size for pre-quantized models (needed for correct cache path)
         let effective_gs_hint = Self::detect_group_size_hint(model_dir, &config);
@@ -1618,10 +2051,11 @@ impl WeightStore {
         let mut gpu_loaded = false;
         for try_gs in &[cache_gs, group_size, 32, 64, 128] {
             if gpu_loaded { break; }
-            let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits);
+            let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits, expert_int4_calib_mode);
             if try_path.exists() {
                 match Self::load_marlin_cache(
                     &try_path, &config, *try_gs, total_moe_layers, config_hash,
+                    expert_int4_calib_mode,
                     moe_start, num_moe_layers, gpu_num_bits,
                 ) {
                     Ok(store) => {
@@ -1645,33 +2079,30 @@ impl WeightStore {
 
         // Build Marlin cache if not found or existing cache is invalid
         if !gpu_loaded {
-            // Delete stale/invalid cache files before rebuilding
-            for try_gs in &[cache_gs, group_size, 32, 64, 128] {
-                let stale_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits);
-                if stale_path.exists() {
-                    log::warn!(
-                        "Deleting stale/invalid Marlin INT{} cache (gs={}): {}",
-                        gpu_num_bits, try_gs, stale_path.display(),
-                    );
-                    if let Err(e) = std::fs::remove_file(&stale_path) {
-                        log::warn!("Failed to delete stale cache: {e}");
-                    }
-                }
-            }
-            let mpath = cache_path_marlin(model_dir, cache_gs, gpu_num_bits);
+            cleanup_marlin_cache_before_build(
+                model_dir,
+                &config,
+                total_moe_layers,
+                config_hash,
+                gpu_num_bits,
+                expert_int4_calib_mode,
+            );
+            let mpath = cache_path_marlin(model_dir, cache_gs, gpu_num_bits, expert_int4_calib_mode);
             log::info!("Building Marlin INT{} cache from safetensors...", gpu_num_bits);
             let built_gs = Self::build_marlin_cache_locked(
-                model_dir, &config, group_size, total_moe_layers, &mpath, config_hash, gpu_num_bits,
+                model_dir, &config, group_size, total_moe_layers, &mpath, config_hash,
+                gpu_num_bits, expert_int4_calib_mode, expert_int4_calib_data.as_ref(),
             )?;
             effective_gs = built_gs;
 
             // Load the just-built cache
             for try_gs in &[built_gs, cache_gs, group_size, 32, 64, 128] {
                 if gpu_loaded { break; }
-                let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits);
+                let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits, expert_int4_calib_mode);
                 if try_path.exists() {
                     match Self::load_marlin_cache(
                         &try_path, &config, *try_gs, total_moe_layers, config_hash,
+                        expert_int4_calib_mode,
                         moe_start, num_moe_layers, gpu_num_bits,
                     ) {
                         Ok(store) => {
@@ -1942,7 +2373,8 @@ impl WeightStore {
                     (g, u, d)
                 } else {
                     load_and_quantize_expert(
-                        &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
+                        layer_idx, eidx, &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
+                        ExpertInt4CalibMode::Amax, None,
                     )?
                 };
 
@@ -1984,7 +2416,8 @@ impl WeightStore {
                 let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
                 let (gate, up, down) = if shared_has_gate {
                     load_and_quantize_expert(
-                        &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
+                        layer_idx, 0, &prefix, &index.weight_map, &shards, effective_group_size, num_bits,
+                        ExpertInt4CalibMode::Amax, None,
                     )?
                 } else {
                     load_and_quantize_expert_ungated(
@@ -2308,7 +2741,8 @@ impl WeightStore {
             let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
             let (gate, up, down) = if experts_gated {
                 load_and_quantize_expert(
-                    &prefix, &index.weight_map, &shards, group_size, num_bits,
+                    layer_idx, 0, &prefix, &index.weight_map, &shards, group_size, num_bits,
+                    ExpertInt4CalibMode::Amax, None,
                 )?
             } else {
                 load_and_quantize_expert_ungated(
@@ -2393,7 +2827,8 @@ impl WeightStore {
                     )?
                 } else {
                     load_and_quantize_expert(
-                        &prefix, &index.weight_map, &shards, 0, 16,
+                        layer_idx, eidx, &prefix, &index.weight_map, &shards, 0, 16,
+                        ExpertInt4CalibMode::Amax, None,
                     )?
                 };
                 let ew = ExpertWeights { gate, up, down };
@@ -2421,7 +2856,8 @@ impl WeightStore {
                 let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
                 let (gate, up, down) = if experts_gated {
                     load_and_quantize_expert(
-                        &prefix, &index.weight_map, &shards, 0, 16,
+                        layer_idx, 0, &prefix, &index.weight_map, &shards, 0, 16,
+                        ExpertInt4CalibMode::Amax, None,
                     )?
                 } else {
                     load_and_quantize_expert_ungated(
@@ -2452,6 +2888,8 @@ impl WeightStore {
         cache_path: &Path,
         config_hash: u64,
         gpu_bits: u8,
+        expert_int4_calib_mode: ExpertInt4CalibMode,
+        expert_int4_calib_data: Option<&ExpertInt4CalibData>,
     ) -> Result<usize, String> {
         eprintln!(
             "  \x1b[1;33m▸ Building GPU INT{} Marlin cache: {} layers from safetensors\x1b[0m",
@@ -2556,8 +2994,14 @@ impl WeightStore {
             .map_err(|e| format!("Failed to create cache file: {e}"))?;
         let mut w = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
 
-        // Write header (version 3 = Marlin format)
-        write_marlin_cache_header(&mut w, config, effective_group_size, num_moe_layers, config_hash)?;
+        write_marlin_cache_header(
+            &mut w,
+            config,
+            effective_group_size,
+            num_moe_layers,
+            config_hash,
+            expert_int4_calib_mode,
+        )?;
 
         // Configure rayon to use physical cores only (hyperthreads hurt on EPYC)
         let physical_cores = detect_physical_cores();
@@ -2635,7 +3079,7 @@ impl WeightStore {
             } else if stacked {
                 load_stacked_layer_experts(
                     layer_idx, &layers_prefix, &index.weight_map, &shards,
-                    config, effective_group_size, gpu_bits,
+                    config, effective_group_size, gpu_bits, expert_int4_calib_mode, expert_int4_calib_data,
                 )?
             } else {
                 let mut data = Vec::with_capacity(config.n_routed_experts);
@@ -2661,7 +3105,8 @@ impl WeightStore {
                             // Pre-quantized INT4 → need to dequant and re-quantize as INT8
                             // For now, load BF16 and quantize fresh (fall through to non-prequant path)
                             load_and_quantize_expert(
-                                &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                                layer_idx, eidx, &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                                ExpertInt4CalibMode::Amax, None,
                             )?
                         } else {
                             let g = QuantWeight::Int4(load_prequantized_weight(
@@ -2677,7 +3122,8 @@ impl WeightStore {
                         }
                     } else {
                         load_and_quantize_expert(
-                            &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                            layer_idx, eidx, &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                            expert_int4_calib_mode, expert_int4_calib_data,
                         )?
                     };
                     data.push(ExpertWeights { gate, up, down });
@@ -2791,7 +3237,8 @@ impl WeightStore {
                 let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
                 let (gate, up, down) = if experts_gated {
                     load_and_quantize_expert(
-                        &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                        layer_idx, 0, &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                        ExpertInt4CalibMode::Amax, None,
                     )?
                 } else {
                     load_and_quantize_expert_ungated(
@@ -2848,6 +3295,8 @@ impl WeightStore {
         cache_path: &Path,
         config_hash: u64,
         gpu_bits: u8,
+        expert_int4_calib_mode: ExpertInt4CalibMode,
+        expert_int4_calib_data: Option<&ExpertInt4CalibData>,
     ) -> Result<usize, String> {
         use std::fs::OpenOptions;
 
@@ -2884,7 +3333,7 @@ impl WeightStore {
 
                 let result = Self::streaming_build_marlin_cache(
                     model_dir, config, group_size, total_moe_layers,
-                    0, cache_path, config_hash, gpu_bits,
+                    0, cache_path, config_hash, gpu_bits, expert_int4_calib_mode, expert_int4_calib_data,
                 );
 
                 log::info!("Releasing Marlin cache build lock: {}", lock_path.display());
@@ -2892,7 +3341,8 @@ impl WeightStore {
 
                 match result {
                     Ok(effective_gs) => {
-                        let expected_path = cache_path_marlin(model_dir, effective_gs, gpu_bits);
+                        let expected_path =
+                            cache_path_marlin(model_dir, effective_gs, gpu_bits, expert_int4_calib_mode);
                         if expected_path != *cache_path {
                             std::fs::rename(cache_path, &expected_path)
                                 .map_err(|e| format!("Failed to rename cache: {e}"))?;
@@ -2920,7 +3370,8 @@ impl WeightStore {
                             let _ = std::fs::remove_file(&tmp_path);
                             // Retry — we'll acquire the lock on the next call
                             return Self::build_marlin_cache_locked(
-                                model_dir, config, group_size, total_moe_layers, cache_path, config_hash, gpu_bits,
+                                model_dir, config, group_size, total_moe_layers, cache_path, config_hash,
+                                gpu_bits, expert_int4_calib_mode, expert_int4_calib_data,
                             );
                         }
                     }
@@ -2944,7 +3395,8 @@ impl WeightStore {
                     std::thread::sleep(std::time::Duration::from_secs(5));
 
                     for try_gs in &[group_size, 32, 64, 128] {
-                        let try_path = cache_path_marlin(model_dir, *try_gs, gpu_bits);
+                        let try_path =
+                            cache_path_marlin(model_dir, *try_gs, gpu_bits, expert_int4_calib_mode);
                         if try_path.exists() {
                             let waited = wait_start.elapsed();
                             log::info!(
@@ -2968,7 +3420,8 @@ impl WeightStore {
                                     let tmp_path = cache_path.with_extension("bin.tmp");
                                     let _ = std::fs::remove_file(&tmp_path);
                                     return Self::build_marlin_cache_locked(
-                                        model_dir, config, group_size, total_moe_layers, cache_path, config_hash, gpu_bits,
+                                        model_dir, config, group_size, total_moe_layers, cache_path, config_hash,
+                                        gpu_bits, expert_int4_calib_mode, expert_int4_calib_data,
                                     );
                                 }
                             }
@@ -3004,6 +3457,7 @@ impl WeightStore {
         group_size: usize,
         total_moe_layers: usize,
         config_hash: u64,
+        expert_int4_calib_mode: ExpertInt4CalibMode,
         start_moe_layer: usize,
         num_layers_to_load: usize,
         gpu_bits: u8,
@@ -3031,7 +3485,8 @@ impl WeightStore {
         let h_num_layers = u64::from_le_bytes(mmap[32..40].try_into().unwrap()) as usize;
         let h_group_size = u64::from_le_bytes(mmap[40..48].try_into().unwrap()) as usize;
         let h_config_hash = u64::from_le_bytes(mmap[48..56].try_into().unwrap());
-        let h_n_shared = u64::from_le_bytes(mmap[56..64].try_into().unwrap()) as usize;
+        let (h_n_shared, h_expert_int4_calib_mode) =
+            unpack_marlin_header_tail(u64::from_le_bytes(mmap[56..64].try_into().unwrap()))?;
 
         if h_hidden != config.hidden_size
             || h_intermediate != config.moe_intermediate_size
@@ -3048,6 +3503,13 @@ impl WeightStore {
         }
         if h_config_hash != config_hash {
             return Err("Config hash mismatch in Marlin cache".to_string());
+        }
+        if h_expert_int4_calib_mode != expert_int4_calib_mode {
+            return Err(format!(
+                "Expert INT4 calibration mode mismatch in Marlin cache: file={}, expected={}",
+                h_expert_int4_calib_mode.config_value(),
+                expert_int4_calib_mode.config_value(),
+            ));
         }
         if h_n_shared != config.n_shared_experts {
             return Err(format!(
@@ -3322,7 +3784,7 @@ impl WeightStore {
             } else if stacked {
                 load_stacked_layer_experts(
                     layer_idx, &layers_prefix, &index.weight_map, &shards,
-                    config, effective_group_size, cpu_num_bits,
+                    config, effective_group_size, cpu_num_bits, ExpertInt4CalibMode::Amax, None,
                 )?
             } else {
                 let mut data = Vec::with_capacity(config.n_routed_experts);
@@ -3360,7 +3822,8 @@ impl WeightStore {
                         (g, u, d)
                     } else {
                         load_and_quantize_expert(
-                            &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                            layer_idx, eidx, &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                            ExpertInt4CalibMode::Amax, None,
                         )?
                     };
                     data.push(ExpertWeights { gate, up, down });
@@ -3429,7 +3892,8 @@ impl WeightStore {
                 let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
                 let (gate, up, down) = if experts_gated {
                     load_and_quantize_expert(
-                        &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                        layer_idx, 0, &prefix, &index.weight_map, &shards, effective_group_size, cpu_num_bits,
+                        ExpertInt4CalibMode::Amax, None,
                     )?
                 } else {
                     load_and_quantize_expert_ungated(
@@ -3958,6 +4422,7 @@ impl WeightStore {
         start_layer: Option<usize>,
         cpu_num_bits: u8,
         gpu_num_bits: u8,
+        expert_int4_calib_mode: ExpertInt4CalibMode,
         gguf_native: bool,
     ) -> Result<Self, String> {
         let start = std::time::Instant::now();
@@ -3988,7 +4453,21 @@ impl WeightStore {
             Some(n) => n.min(remaining),
             None => remaining,
         };
-        let config_hash = fnv1a(config_str.as_bytes());
+        let expert_int4_calib_data = ExpertInt4CalibData::from_env_for_mode(expert_int4_calib_mode)?;
+        if let Some(data) = expert_int4_calib_data.as_ref() {
+            log::info!(
+                "Loaded expert INT4 calibration samples from {} (hash={:016x}, keys={})",
+                data.source_path.display(),
+                data.source_hash,
+                data.samples_by_key.len(),
+            );
+        }
+        let config_hash = marlin_cache_config_hash(
+            &config_str,
+            gpu_num_bits,
+            expert_int4_calib_mode,
+            expert_int4_calib_data.as_ref().map(|d| d.source_hash),
+        );
 
         // Open GGUF file
         log::info!("Opening GGUF: {}", gguf_path.display());
@@ -4011,10 +4490,11 @@ impl WeightStore {
         // Try loading existing Marlin cache
         for try_gs in &[cache_gs, group_size, 32, 64, 128] {
             if gpu_loaded { break; }
-            let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits);
+            let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits, expert_int4_calib_mode);
             if try_path.exists() {
                 match Self::load_marlin_cache(
                     &try_path, &config, *try_gs, total_moe_layers, config_hash,
+                    expert_int4_calib_mode,
                     moe_start, num_moe_layers, gpu_num_bits,
                 ) {
                     Ok(store) => {
@@ -4036,19 +4516,29 @@ impl WeightStore {
 
         // Build Marlin cache if not found
         if !gpu_loaded {
-            let mpath = cache_path_marlin(model_dir, cache_gs, gpu_num_bits);
+            cleanup_marlin_cache_before_build(
+                model_dir,
+                &config,
+                total_moe_layers,
+                config_hash,
+                gpu_num_bits,
+                expert_int4_calib_mode,
+            );
+            let mpath = cache_path_marlin(model_dir, cache_gs, gpu_num_bits, expert_int4_calib_mode);
             log::info!("No Marlin INT{} cache found, building from safetensors...", gpu_num_bits);
             let built_gs = Self::build_marlin_cache_locked(
-                model_dir, &config, group_size, total_moe_layers, &mpath, config_hash, gpu_num_bits,
+                model_dir, &config, group_size, total_moe_layers, &mpath, config_hash,
+                gpu_num_bits, expert_int4_calib_mode, expert_int4_calib_data.as_ref(),
             )?;
             effective_gs = built_gs;
 
             for try_gs in &[built_gs, cache_gs, group_size, 32, 64, 128] {
                 if gpu_loaded { break; }
-                let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits);
+                let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits, expert_int4_calib_mode);
                 if try_path.exists() {
                     if let Ok(store) = Self::load_marlin_cache(
                         &try_path, &config, *try_gs, total_moe_layers, config_hash,
+                        expert_int4_calib_mode,
                         moe_start, num_moe_layers, gpu_num_bits,
                     ) {
                         experts_gpu = store.experts_gpu;
@@ -4818,13 +5308,14 @@ impl WeightStore {
     }
 }
 
-/// Write v3 Marlin cache header (same layout as v2, version=3).
+/// Write Marlin cache header.
 fn write_marlin_cache_header<W: Write>(
     w: &mut W,
     config: &ModelConfig,
     group_size: usize,
     num_moe_layers: usize,
     config_hash: u64,
+    expert_int4_calib_mode: ExpertInt4CalibMode,
 ) -> Result<(), String> {
     w.write_all(CACHE_MAGIC)
         .map_err(|e| format!("Write error: {e}"))?;
@@ -4842,7 +5333,8 @@ fn write_marlin_cache_header<W: Write>(
         .map_err(|e| format!("Write error: {e}"))?;
     w.write_all(&config_hash.to_le_bytes())
         .map_err(|e| format!("Write error: {e}"))?;
-    w.write_all(&(config.n_shared_experts as u64).to_le_bytes())
+    let header_tail = pack_marlin_header_tail(config.n_shared_experts, expert_int4_calib_mode)?;
+    w.write_all(&header_tail.to_le_bytes())
         .map_err(|e| format!("Write error: {e}"))?;
     Ok(())
 }
@@ -6058,13 +6550,226 @@ fn load_and_quantize_weight(
     }
 }
 
+const EXPERT_INT4_RMSE_SCALE_FACTORS: &[f32] = &[1.00, 0.98, 0.95, 0.92, 0.90, 0.87, 0.85, 0.82, 0.80, 0.75];
+
+fn quantize_int4_group_mse(group: &[u16], scale: f32) -> f32 {
+    let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+    let mut sq_err = 0.0f32;
+    for &weight in group {
+        let value = bf16_to_f32(weight);
+        let quantized = (value * inv_scale).round().clamp(-8.0, 7.0);
+        let dequantized = quantized * scale;
+        let err = value - dequantized;
+        sq_err += err * err;
+    }
+    sq_err / group.len() as f32
+}
+
+fn quantize_int4_group_activation_components(
+    group: &[u16],
+    group_start_col: usize,
+    scale: f32,
+    context: ExpertInt4CalibContext<'_>,
+) -> (f32, f32) {
+    let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+    let mut numerator = 0.0f32;
+    let mut denominator = 0.0f32;
+
+    for sample in context.samples {
+        let mut delta_dot = 0.0f32;
+        let mut ref_dot = 0.0f32;
+        for (&col_idx, &act) in sample.active_cols.iter().zip(sample.active_vals.iter()) {
+            if col_idx < group_start_col || col_idx >= group_start_col + group.len() {
+                continue;
+            }
+            let local_idx = col_idx - group_start_col;
+            let value = bf16_to_f32(group[local_idx]);
+            let quantized = (value * inv_scale).round().clamp(-8.0, 7.0);
+            let dequantized = quantized * scale;
+            delta_dot += act * (dequantized - value);
+            ref_dot += act * value;
+        }
+        numerator += delta_dot * delta_dot;
+        denominator += ref_dot * ref_dot;
+    }
+
+    (numerator, denominator)
+}
+
+fn quantize_int4_expert_calibrated(
+    weight_bf16: &[u16],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    mode: ExpertInt4CalibMode,
+    layer_idx: usize,
+    expert_idx: usize,
+    proj_name: &str,
+    calib_data: Option<&ExpertInt4CalibData>,
+) -> QuantizedInt4 {
+    if mode == ExpertInt4CalibMode::Amax {
+        return quantize_int4(weight_bf16, rows, cols, group_size);
+    }
+
+    assert_eq!(weight_bf16.len(), rows * cols);
+    assert!(cols % group_size == 0, "cols ({cols}) must be divisible by group_size ({group_size})");
+    assert!(cols % 8 == 0, "cols ({cols}) must be divisible by 8");
+
+    let num_groups_per_row = cols / group_size;
+    let packed_cols = cols / 8;
+    let mut scales = vec![0u16; rows * num_groups_per_row];
+    let mut packed = vec![0u32; rows * packed_cols];
+
+    let mut base_scales = vec![0.0f32; rows * num_groups_per_row];
+    for row in 0..rows {
+        let row_offset = row * cols;
+        for g in 0..num_groups_per_row {
+            let group_start = row_offset + g * group_size;
+            let group = &weight_bf16[group_start..group_start + group_size];
+
+            let mut amax = 0.0f32;
+            for &weight in group {
+                amax = amax.max(bf16_to_f32(weight).abs());
+            }
+            base_scales[row * num_groups_per_row + g] = if amax == 0.0 { 1.0 } else { amax / 7.0 };
+        }
+    }
+
+    for g in 0..num_groups_per_row {
+        let has_activation_context = calib_data.map_or(false, |data| {
+            (0..rows).any(|row| data.context_for(layer_idx, expert_idx, proj_name, row, g).is_some())
+        });
+
+        if has_activation_context {
+            let mut best_factor = EXPERT_INT4_RMSE_SCALE_FACTORS[0];
+            let mut best_score = f32::INFINITY;
+            for &factor in EXPERT_INT4_RMSE_SCALE_FACTORS {
+                let mut numer = 0.0f32;
+                let mut denom = 0.0f32;
+                for row in 0..rows {
+                    let row_offset = row * cols;
+                    let group_start = row_offset + g * group_size;
+                    let group = &weight_bf16[group_start..group_start + group_size];
+                    if let Some(ctx) = calib_data.and_then(|data| data.context_for(layer_idx, expert_idx, proj_name, row, g)) {
+                        let scale = (base_scales[row * num_groups_per_row + g] * factor).max(f32::EPSILON);
+                        let (row_numer, row_denom) =
+                            quantize_int4_group_activation_components(group, g * group_size, scale, ctx);
+                        numer += row_numer;
+                        denom += row_denom;
+                    }
+                }
+                let score = (numer / denom.max(1e-12)).sqrt();
+                if score < best_score {
+                    best_score = score;
+                    best_factor = factor;
+                }
+            }
+            for row in 0..rows {
+                let best_scale = (base_scales[row * num_groups_per_row + g] * best_factor).max(f32::EPSILON);
+                scales[row * num_groups_per_row + g] = f32_to_bf16(best_scale);
+            }
+        } else {
+            for row in 0..rows {
+                let row_offset = row * cols;
+                let group_start = row_offset + g * group_size;
+                let group = &weight_bf16[group_start..group_start + group_size];
+                let base_scale = base_scales[row * num_groups_per_row + g];
+                let mut best_scale = base_scale;
+                let mut best_mse = quantize_int4_group_mse(group, base_scale);
+                for &factor in EXPERT_INT4_RMSE_SCALE_FACTORS.iter().skip(1) {
+                    let candidate_scale = (base_scale * factor).max(f32::EPSILON);
+                    let candidate_mse = quantize_int4_group_mse(group, candidate_scale);
+                    if candidate_mse < best_mse {
+                        best_mse = candidate_mse;
+                        best_scale = candidate_scale;
+                    }
+                }
+                scales[row * num_groups_per_row + g] = f32_to_bf16(best_scale);
+            }
+        }
+    }
+
+    for row in 0..rows {
+        let row_offset = row * cols;
+        for g in 0..num_groups_per_row {
+            let group_start = row_offset + g * group_size;
+            let scale = bf16_to_f32(scales[row * num_groups_per_row + g]);
+            let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+
+            for i in (0..group_size).step_by(8) {
+                let mut word: u32 = 0;
+                for j in 0..8 {
+                    let value = bf16_to_f32(weight_bf16[group_start + i + j]);
+                    let quantized = (value * inv_scale).round().clamp(-8.0, 7.0) as i8;
+                    let u4 = (quantized + 8) as u8 & 0xF;
+                    word |= (u4 as u32) << (j * 4);
+                }
+                let col_in_row = g * group_size + i;
+                packed[row * packed_cols + col_in_row / 8] = word;
+            }
+        }
+    }
+
+    QuantizedInt4 {
+        packed,
+        scales,
+        rows,
+        cols,
+        group_size,
+    }
+}
+
+fn load_and_quantize_expert_weight_int4(
+    layer_idx: usize,
+    expert_idx: usize,
+    prefix: &str,
+    proj_name: &str,
+    weight_map: &HashMap<String, String>,
+    shards: &HashMap<String, MmapSafetensors>,
+    group_size: usize,
+    mode: ExpertInt4CalibMode,
+    calib_data: Option<&ExpertInt4CalibData>,
+) -> Result<QuantizedInt4, String> {
+    let tensor_name = format!("{prefix}.{proj_name}.weight");
+    let shard_name = weight_map.get(&tensor_name)
+        .ok_or_else(|| format!("Tensor not found in index: {tensor_name}"))?;
+    let shard = shards.get(shard_name)
+        .ok_or_else(|| format!("Shard not loaded: {shard_name}"))?;
+
+    let info = shard.tensor_info(&tensor_name)
+        .ok_or_else(|| format!("Tensor not in shard: {tensor_name}"))?;
+    let rows = info.shape[0];
+    let cols = info.shape[1];
+
+    if info.dtype.is_fp8() {
+        let fp8_data: &[u8] = shard.tensor_as_slice(&tensor_name)
+            .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+        let scale_name = format!("{tensor_name}_scale_inv");
+        let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
+        let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
+        Ok(quantize_int4_expert_calibrated(
+            &bf16_data, rows, cols, group_size, mode, layer_idx, expert_idx, proj_name, calib_data,
+        ))
+    } else {
+        let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
+            .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+        Ok(quantize_int4_expert_calibrated(
+            bf16_data, rows, cols, group_size, mode, layer_idx, expert_idx, proj_name, calib_data,
+        ))
+    }
+}
+
 /// Load a BF16 expert's gate/up/down projections and quantize to INT4, INT8, or keep as BF16.
 fn load_and_quantize_expert(
+    layer_idx: usize,
+    expert_idx: usize,
     prefix: &str,
     weight_map: &HashMap<String, String>,
     shards: &HashMap<String, MmapSafetensors>,
     group_size: usize,
     num_bits: u8,
+    int4_calib_mode: ExpertInt4CalibMode,
+    calib_data: Option<&ExpertInt4CalibData>,
 ) -> Result<(QuantWeight, QuantWeight, QuantWeight), String> {
     if num_bits == 16 {
         // BF16 validation mode: load raw BF16 data, no quantization
@@ -6096,14 +6801,14 @@ fn load_and_quantize_expert(
         let d = load_bf16("down_proj")?;
         Ok((g, u, d))
     } else if num_bits == 4 {
-        let g = QuantWeight::Int4(load_and_quantize_weight(
-            prefix, "gate_proj", weight_map, shards, group_size,
+        let g = QuantWeight::Int4(load_and_quantize_expert_weight_int4(
+            layer_idx, expert_idx, prefix, "gate_proj", weight_map, shards, group_size, int4_calib_mode, calib_data,
         )?);
-        let u = QuantWeight::Int4(load_and_quantize_weight(
-            prefix, "up_proj", weight_map, shards, group_size,
+        let u = QuantWeight::Int4(load_and_quantize_expert_weight_int4(
+            layer_idx, expert_idx, prefix, "up_proj", weight_map, shards, group_size, int4_calib_mode, calib_data,
         )?);
-        let d = QuantWeight::Int4(load_and_quantize_weight(
-            prefix, "down_proj", weight_map, shards, group_size,
+        let d = QuantWeight::Int4(load_and_quantize_expert_weight_int4(
+            layer_idx, expert_idx, prefix, "down_proj", weight_map, shards, group_size, int4_calib_mode, calib_data,
         )?);
         Ok((g, u, d))
     } else {
@@ -6267,6 +6972,8 @@ fn load_stacked_layer_experts(
     config: &ModelConfig,
     group_size: usize,
     num_bits: u8,
+    int4_calib_mode: ExpertInt4CalibMode,
+    calib_data: Option<&ExpertInt4CalibData>,
 ) -> Result<Vec<ExpertWeights>, String> {
     let n_experts = config.n_routed_experts;
     let inter = config.moe_intermediate_size;
@@ -6349,9 +7056,15 @@ fn load_stacked_layer_experts(
 
             if num_bits == 4 {
                 ExpertWeights {
-                    gate: QuantWeight::Int4(quantize_int4(gate_slice, inter, hidden, group_size)),
-                    up: QuantWeight::Int4(quantize_int4(up_slice, inter, hidden, group_size)),
-                    down: QuantWeight::Int4(quantize_int4(&down_bf16, hidden, inter, group_size)),
+                    gate: QuantWeight::Int4(quantize_int4_expert_calibrated(
+                        gate_slice, inter, hidden, group_size, int4_calib_mode, layer_idx, eidx, "gate_proj", calib_data,
+                    )),
+                    up: QuantWeight::Int4(quantize_int4_expert_calibrated(
+                        up_slice, inter, hidden, group_size, int4_calib_mode, layer_idx, eidx, "up_proj", calib_data,
+                    )),
+                    down: QuantWeight::Int4(quantize_int4_expert_calibrated(
+                        &down_bf16, hidden, inter, group_size, int4_calib_mode, layer_idx, eidx, "down_proj", calib_data,
+                    )),
                 }
             } else {
                 ExpertWeights {
@@ -6382,9 +7095,15 @@ fn load_stacked_layer_experts(
 
             if num_bits == 4 {
                 ExpertWeights {
-                    gate: QuantWeight::Int4(quantize_int4(gate_slice, inter, hidden, group_size)),
-                    up: QuantWeight::Int4(quantize_int4(up_slice, inter, hidden, group_size)),
-                    down: QuantWeight::Int4(quantize_int4(down_slice, hidden, inter, group_size)),
+                    gate: QuantWeight::Int4(quantize_int4_expert_calibrated(
+                        gate_slice, inter, hidden, group_size, int4_calib_mode, layer_idx, eidx, "gate_proj", calib_data,
+                    )),
+                    up: QuantWeight::Int4(quantize_int4_expert_calibrated(
+                        up_slice, inter, hidden, group_size, int4_calib_mode, layer_idx, eidx, "up_proj", calib_data,
+                    )),
+                    down: QuantWeight::Int4(quantize_int4_expert_calibrated(
+                        down_slice, hidden, inter, group_size, int4_calib_mode, layer_idx, eidx, "down_proj", calib_data,
+                    )),
                 }
             } else {
                 ExpertWeights {
@@ -6412,7 +7131,16 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, false)
+        let store = WeightStore::load_from_hf(
+            model_dir,
+            DEFAULT_GROUP_SIZE,
+            None,
+            None,
+            4,
+            4,
+            ExpertInt4CalibMode::Amax,
+            false,
+        )
             .expect("Failed to load V2-Lite");
 
         // V2-Lite: 27 layers, layer 0 dense, layers 1-26 MoE = 26 MoE layers
@@ -6477,11 +7205,20 @@ mod tests {
         }
 
         // Load (will use v2 unified cache if available, or v1→convert, or quantize)
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, false)
+        let store = WeightStore::load_from_hf(
+            model_dir,
+            DEFAULT_GROUP_SIZE,
+            None,
+            None,
+            4,
+            4,
+            ExpertInt4CalibMode::Amax,
+            false,
+        )
             .expect("Failed to load V2-Lite");
 
         // Verify Marlin cache file exists (v3 format)
-        let mpath = cache_path_marlin(model_dir, store.group_size, 4);
+        let mpath = cache_path_marlin(model_dir, store.group_size, 4, ExpertInt4CalibMode::Amax);
         assert!(mpath.exists(), "Marlin cache file should exist after load");
 
         let size = std::fs::metadata(&mpath).unwrap().len();

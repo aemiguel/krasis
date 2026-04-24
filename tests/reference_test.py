@@ -551,7 +551,8 @@ def _format_metric_pct(value: Optional[float], digits: int = 0) -> str:
 # ── Run Single Config ──────────────────────────────────────────────
 
 def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
-                    label: Optional[str] = None, verbose: bool = False) -> Optional[Dict]:
+                    label: Optional[str] = None, verbose: bool = False,
+                    startup_timeout: int = 1200) -> Optional[Dict]:
     """Run reference test for one config. Returns results dict or None on failure."""
     cfg = parse_config(conf_path)
     model_name = resolve_model_name(cfg)
@@ -574,8 +575,11 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
         print("Starting server...")
         proc, port = start_server(conf_path, script_dir)
         print(f"Waiting for server on port {port}...")
-        if not wait_for_server(port, timeout=1200):
-            print("ERROR: Server did not start within timeout", file=sys.stderr)
+        if not wait_for_server(port, timeout=startup_timeout):
+            print(
+                f"ERROR: Server did not start within timeout ({startup_timeout}s)",
+                file=sys.stderr,
+            )
             return None
         print("Server ready.")
 
@@ -1467,6 +1471,8 @@ def main():
                         help="Don't start server, connect to already-running one")
     parser.add_argument("--port", type=int, default=0,
                         help="Port override (for --no-server)")
+    parser.add_argument("--startup-timeout", type=int, default=1200,
+                        help="Seconds to wait for server readiness before failing")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1570,8 +1576,14 @@ def main():
                 print("\nCleaning up between configs...")
                 cleanup_between_configs()
 
-            result = run_config_test(conf_path, ref_data, script_dir,
-                                   label=label, verbose=args.verbose)
+            result = run_config_test(
+                conf_path,
+                ref_data,
+                script_dir,
+                label=label,
+                verbose=args.verbose,
+                startup_timeout=args.startup_timeout,
+            )
             if result is not None:
                 all_results.append(result)
             else:
@@ -1812,7 +1824,13 @@ def main():
                           f"decode-top-k={100*metrics['containment_rate']:.0f}%")
         else:
             # Start server and run
-            result = run_config_test(args.config, ref_data, script_dir, verbose=args.verbose)
+            result = run_config_test(
+                args.config,
+                ref_data,
+                script_dir,
+                verbose=args.verbose,
+                startup_timeout=args.startup_timeout,
+            )
             if result is None:
                 print("ERROR: Test failed to run.", file=sys.stderr)
                 sys.exit(1)

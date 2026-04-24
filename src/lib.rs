@@ -5,6 +5,7 @@ pub mod gguf;
 pub mod gguf_kernels;
 pub mod gpu_decode;
 pub mod gpu_prefill;
+pub mod hqq;
 pub mod kernel;
 pub mod moe;
 pub mod numa;
@@ -25,6 +26,10 @@ fn krasis(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<server::RustServer>()?;
     m.add_class::<gpu_decode::GpuDecodeStore>()?;
     m.add_class::<vram_monitor::VramMonitor>()?;
+    m.add_function(wrap_pyfunction!(hqq::hqq4_init_group_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(hqq::hqq4_solve_group_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(hqq::hqq4_rmse_group_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(hqq::hqq4_quantize_tensor_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(syscheck::system_check, m)?)?;
     Ok(())
 }

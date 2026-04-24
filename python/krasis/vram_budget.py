@@ -35,6 +35,11 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional
 
+from krasis.attention_backend import (
+    HQQ_ATTENTION_CACHE_DIRNAME,
+    hqq_attention_cache_layer_bytes,
+)
+
 logger = logging.getLogger(__name__)
 
 # Default CUDA/PyTorch runtime overhead estimate for pre-launch VRAM budgets.
@@ -254,12 +259,13 @@ def _expert_bytes_per_expert(cfg: Dict[str, Any], bits: int = 4) -> int:
 
 
 def _component_weight_bytes(params: int, quant: str) -> int:
-    """Weight bytes for per-component quant ("int4", "int8", "awq", or "bf16").
-    For Marlin formats, includes packed weights + group scales (gs=128).
-    AWQ uses INT4 estimate for budget (most tensors go INT4 after calibration)."""
+    """Weight bytes for per-component quant ("int4", "int8", "awq", or "bf16")."""
+    if quant.startswith("hqq"):
+        raise ValueError(
+            f"HQQ attention bytes must come from validated artifacts, not estimates ({quant})."
+        )
     if quant in ("int4", "awq"):
-        # Marlin INT4: packed = params/2, scales = params/128 * 2
-        # AWQ: per-tensor mix, but budget assumes INT4 (conservative for VRAM)
+        # Marlin INT4 / AWQ estimate.
         return params // 2 + (params // 128) * 2
     if quant == "int8":
         # Marlin INT8: packed = params, scales = params/128 * 2
@@ -368,6 +374,16 @@ def compute_launcher_budget(
             n_heads * head_dim * hidden             # O
         )
 
+    hqq_layer_bytes = None
+    if attention_quant == "hqq4":
+        hqq_layer_bytes = hqq_attention_cache_layer_bytes(model_path)
+        if hqq_layer_bytes is None:
+            raise RuntimeError(
+                "attention_quant=hqq4 requires a complete validated HQQ artifact set. "
+                "No HQQ VRAM estimate is allowed before "
+                f"~/.krasis/cache/<model>/{HQQ_ATTENTION_CACHE_DIRNAME} is complete."
+            )
+
     # Expert buffer bytes per expert (GPU Marlin format)
     expert_buf_bytes = _expert_bytes_per_expert(cfg, gpu_expert_bits) if n_experts > 0 else 0
 
@@ -475,8 +491,11 @@ def compute_launcher_budget(
             streaming = False
 
         # Attention weights: ALL layers permanently on GPU (not capped by group_size)
-        rank_attn_bytes = _component_weight_bytes(attn_params_per_layer, attention_quant) * rank_full_attn
-        rank_attn_bytes += linear_attn_bpl * rank_linear_attn
+        if hqq_layer_bytes is not None:
+            rank_attn_bytes = sum(hqq_layer_bytes.get(i, 0) for i in range(rank_start, rank_end))
+        else:
+            rank_attn_bytes = _component_weight_bytes(attn_params_per_layer, attention_quant) * rank_full_attn
+            rank_attn_bytes += linear_attn_bpl * rank_linear_attn
 
         # Norms and gates are PERMANENT on GPU for ALL layers (not streamed)
         rank_norm_bytes = norm_bytes_all_layers

@@ -22,7 +22,8 @@ use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr};
 use pyo3::prelude::*;
 
 use crate::weights::marlin::{
-    bf16_to_f32, dequantize_marlin, dequantize_marlin_int8, MarlinRepacked,
+    bf16_to_f32, dequantize_marlin, dequantize_marlin_int8, generate_scale_perms,
+    MarlinRepacked,
 };
 
 fn stderr_debug_enabled() -> bool {
@@ -318,6 +319,170 @@ fn format_i32_sample(values: &[i32]) -> String {
         .map(|v| v.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn format_u32_hex_sample(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(|v| format!("{:08x}", v))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_f32_sample(values: &[f32]) -> String {
+    values
+        .iter()
+        .map(|v| format!("{:.6}", v))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_usize_sample(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn top_abs_indices(values: &[f32], take: usize) -> Vec<usize> {
+    let mut ranked = values
+        .iter()
+        .enumerate()
+        .map(|(idx, &value)| (idx, value.abs()))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+        .into_iter()
+        .take(take.min(values.len()))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+fn dequantize_marlin_weight_cpu(weight: &MarlinWeight) -> Result<Vec<f32>, String> {
+    let packed_len = match weight.num_bits {
+        4 => (weight.k / 16) * (weight.n * 2),
+        8 => (weight.k / 16) * (weight.n * 4),
+        other => return Err(format!("unsupported Marlin bit width: {}", other)),
+    };
+    let scales_len = (weight.k / weight.group_size) * weight.n;
+    let packed = download_device_u32(weight.packed, packed_len)?;
+    let scales = download_device_u16(weight.scales, scales_len)?;
+    let repacked = MarlinRepacked {
+        packed,
+        scales,
+        k: weight.k,
+        n: weight.n,
+        group_size: weight.group_size,
+    };
+    match weight.num_bits {
+        4 => Ok(dequantize_marlin(&repacked)),
+        8 => Ok(dequantize_marlin_int8(&repacked)),
+        _ => unreachable!(),
+    }
+}
+
+fn download_marlin_scales_cpu(weight: &MarlinWeight) -> Result<Vec<f32>, String> {
+    match weight.num_bits {
+        4 | 8 => {}
+        other => return Err(format!("unsupported Marlin bit width for scales: {}", other)),
+    }
+    let num_groups_k = weight.k / weight.group_size;
+    let scales_len = num_groups_k * weight.n;
+    let scales = download_device_u16(weight.scales, scales_len)?;
+    let (scale_perm, scale_perm_single) = generate_scale_perms();
+    let is_grouped = weight.group_size < weight.k;
+    let sperm: &[usize] = if is_grouped {
+        &scale_perm
+    } else {
+        &scale_perm_single
+    };
+    let perm_len = sperm.len();
+    let mut scales_transposed = vec![0u16; scales_len];
+    for chunk in 0..(scales_len / perm_len) {
+        let base = chunk * perm_len;
+        for i in 0..perm_len {
+            scales_transposed[base + sperm[i]] = scales[base + i];
+        }
+    }
+    Ok(scales_transposed.into_iter().map(bf16_to_f32).collect())
+}
+
+fn gather_weight_row_slice(
+    weight_rows: &[f32],
+    rows: usize,
+    cols: usize,
+    out_idx: usize,
+    input_idx: &[usize],
+) -> Result<Vec<f32>, String> {
+    if out_idx >= rows {
+        return Err(format!(
+            "weight row index out of range: out_idx={} rows={}",
+            out_idx, rows
+        ));
+    }
+    let row = &weight_rows[out_idx * cols..(out_idx + 1) * cols];
+    let mut out = Vec::with_capacity(input_idx.len());
+    for &idx in input_idx {
+        if idx >= cols {
+            return Err(format!(
+                "weight input index out of range: idx={} cols={}",
+                idx, cols
+            ));
+        }
+        out.push(row[idx]);
+    }
+    Ok(out)
+}
+
+fn gather_group_scale_slice(
+    scales_by_group: &[f32],
+    rows: usize,
+    group_count: usize,
+    out_idx: usize,
+    input_idx: &[usize],
+    group_size: usize,
+) -> Result<Vec<f32>, String> {
+    if out_idx >= rows {
+        return Err(format!(
+            "group scale row index out of range: out_idx={} rows={}",
+            out_idx, rows
+        ));
+    }
+    let expected = group_count * rows;
+    if scales_by_group.len() != expected {
+        return Err(format!(
+            "group scale length mismatch: got {} expected {}",
+            scales_by_group.len(),
+            expected
+        ));
+    }
+    let mut out = Vec::with_capacity(input_idx.len());
+    for &idx in input_idx {
+        let group_idx = idx / group_size;
+        if group_idx >= group_count {
+            return Err(format!(
+                "group scale group index out of range: idx={} group_idx={} group_count={}",
+                idx, group_idx, group_count
+            ));
+        }
+        out.push(scales_by_group[group_idx * rows + out_idx]);
+    }
+    Ok(out)
+}
+
+fn scalar_type_label(st: &ScalarType) -> &'static str {
+    if st.mantissa == ScalarType::U4B8.mantissa && st.bias == ScalarType::U4B8.bias {
+        "U4B8"
+    } else if st.mantissa == ScalarType::U8B128.mantissa && st.bias == ScalarType::U8B128.bias {
+        "U8B128"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+fn is_exact_frozen_trace_sid(sid: usize) -> bool {
+    sid == 2315 || sid == 2319
 }
 
 fn compute_router_topk_cpu_reference(
@@ -1337,6 +1502,7 @@ pub struct PrefillKernels {
     rmsnorm_fp32w: RawCuFunc,
     fused_add_rmsnorm: RawCuFunc,
     embedding: RawCuFunc,
+    hqq4_dequant_bf16: RawCuFunc,
     rope: RawCuFunc,
     silu_mul: RawCuFunc,
     relu2: RawCuFunc,
@@ -1754,6 +1920,92 @@ pub struct Bf16Weight {
     pub k: usize, // input dim
 }
 
+#[derive(Debug, Clone)]
+pub struct HqqTensorExecDescriptor {
+    pub packed_ptr: u64,
+    pub scales_ptr: u64,
+    pub zeros_ptr: u64,
+    pub rows: usize,
+    pub cols: usize,
+    pub group_size: usize,
+    pub axis: usize,
+    pub layout: String,
+    pub packed_dtype: String,
+    pub scales_dtype: String,
+    pub zeros_dtype: String,
+    pub original_dtype: String,
+    pub tensor_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct HqqGqaPrefillDescriptor {
+    pub backend: String,
+    pub format_version: usize,
+    pub nbits: u8,
+    pub q_proj: HqqTensorExecDescriptor,
+    pub k_proj: HqqTensorExecDescriptor,
+    pub v_proj: HqqTensorExecDescriptor,
+    pub o_proj: HqqTensorExecDescriptor,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub sm_scale: f32,
+    pub q_norm_ptr: u64,
+    pub k_norm_ptr: u64,
+    pub gated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct HqqMlaPrefillDescriptor {
+    pub backend: String,
+    pub format_version: usize,
+    pub nbits: u8,
+    pub q_a_proj: Option<HqqTensorExecDescriptor>,
+    pub q_b_proj: Option<HqqTensorExecDescriptor>,
+    pub q_proj: Option<HqqTensorExecDescriptor>,
+    pub kv_a_proj_with_mqa: HqqTensorExecDescriptor,
+    pub o_proj: HqqTensorExecDescriptor,
+    pub num_heads: usize,
+    pub kv_lora_rank: usize,
+    pub ckv_cache_dim: usize,
+    pub qk_nope_dim: usize,
+    pub qk_rope_dim: usize,
+    pub v_head_dim: usize,
+    pub q_lora_rank: usize,
+    pub sm_scale: f32,
+    pub rope_interleave: bool,
+    pub kv_a_norm_ptr: u64,
+    pub w_kc_ptr: u64,
+    pub w_vc_ptr: u64,
+    pub ckv_cache_ptr: u64,
+    pub kpe_cache_ptr: u64,
+    pub q_a_norm_ptr: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HqqLinearAttentionPrefillDescriptor {
+    pub backend: String,
+    pub format_version: usize,
+    pub nbits: u8,
+    pub in_proj_qkvz: HqqTensorExecDescriptor,
+    pub in_proj_ba: HqqTensorExecDescriptor,
+    pub out_proj: HqqTensorExecDescriptor,
+    pub num_k_heads: usize,
+    pub num_v_heads: usize,
+    pub k_head_dim: usize,
+    pub v_head_dim: usize,
+    pub head_ratio: usize,
+    pub kernel_dim: usize,
+    pub conv_dim: usize,
+    pub scale: f32,
+    pub conv_weight_ptr: u64,
+    pub a_log_ptr: u64,
+    pub dt_bias_ptr: u64,
+    pub norm_weight_ptr: u64,
+    pub conv_state_ptr: u64,
+    pub recur_state_ptr: u64,
+}
+
 pub struct PrefillLayerWeights {
     pub input_norm: u64,
     pub post_attn_norm: u64, // 0 = None
@@ -1815,6 +2067,9 @@ pub struct PrefillLayerWeights {
     // QK norm (Qwen3 models): per-head RMSNorm on Q and K after projection, before RoPE
     pub q_norm_ptr: u64, // FP32 [head_dim], 0 = no QK norm
     pub k_norm_ptr: u64, // FP32 [head_dim], 0 = no QK norm
+    pub hqq_gqa: Option<HqqGqaPrefillDescriptor>,
+    pub hqq_mla: Option<HqqMlaPrefillDescriptor>,
+    pub hqq_linear_attention: Option<HqqLinearAttentionPrefillDescriptor>,
 }
 
 /// Expert weight pointers for DMA to GPU (mirrors ExpertDataPtr).
@@ -2048,6 +2303,10 @@ pub struct PrefillEngine {
     // BF16 copies of QK norm weights (converted from FP32 at engine creation)
     // Kept alive here so GPU memory isn't freed.
     pub qk_norm_bf16_bufs: Vec<CudaSlice<u16>>,
+    // BF16 attention weights materialized from HQQ descriptors for the current
+    // prefill engine. These are created once at engine setup and reused by the
+    // prefill compute path.
+    pub hqq_bf16_weight_bufs: Vec<CudaSlice<u16>>,
     // GQA sub-component timing accumulators (Cell for interior mutability in &self methods)
     pub gqa_timing_enabled: Cell<bool>,
     pub t_gqa_proj: Cell<f64>,     // Q/K/V projection GEMMs
@@ -5720,6 +5979,74 @@ impl PrefillEngine {
         })
     }
 
+    pub fn debug_run_gqa_prefill_layer(
+        &mut self,
+        layer_idx: usize,
+        hidden_bf16: &[u16],
+        m: usize,
+        start_pos: usize,
+        capture_kv_cache: bool,
+    ) -> Result<Vec<u16>, String> {
+        self.bind_cuda_context()?;
+        if self
+            .layer_weights
+            .get(layer_idx)
+            .and_then(|layer| layer.hqq_gqa.as_ref())
+            .is_some()
+        {
+            self.materialize_hqq_gqa_prefill_weights()?;
+        }
+        if hidden_bf16.len() != m * self.config.hidden_size {
+            return Err(format!(
+                "debug_run_gqa_prefill_layer expected {} BF16 values, got {}",
+                m * self.config.hidden_size,
+                hidden_bf16.len()
+            ));
+        }
+        self.prepare_for_prefill(m)?;
+        unsafe {
+            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                *self.scratch.d_hidden.device_ptr(),
+                hidden_bf16.as_ptr() as *const std::ffi::c_void,
+                hidden_bf16.len() * 2,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("debug H2D hidden: {:?}", err));
+            }
+            let err = cuda_sys::lib().cuMemsetD8_v2(
+                *self.scratch.d_residual.device_ptr(),
+                0,
+                m * self.config.hidden_size * 2,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("debug memset residual: {:?}", err));
+            }
+            let positions: Vec<i32> = (0..m).map(|i| (start_pos + i) as i32).collect();
+            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                *self.scratch.d_positions.device_ptr(),
+                positions.as_ptr() as *const std::ffi::c_void,
+                positions.len() * std::mem::size_of::<i32>(),
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("debug H2D positions: {:?}", err));
+            }
+        }
+        self.forward_gqa_chunked(layer_idx, m, start_pos, capture_kv_cache)?;
+        self.stream_sync()?;
+        let mut out = vec![0u16; m * self.config.hidden_size];
+        unsafe {
+            let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                out.as_mut_ptr() as *mut std::ffi::c_void,
+                *self.scratch.d_attn_out.device_ptr(),
+                out.len() * 2,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("debug D2H attn_out: {:?}", err));
+            }
+        }
+        Ok(out)
+    }
+
     /// Run prefill and extract top-k logprobs at sampled positions.
     /// Used by the /v1/internal/prefill_logits test endpoint.
     pub fn run_prefill_logits(
@@ -6396,6 +6723,291 @@ impl PrefillEngine {
         Ok(())
     }
 
+    fn validate_hqq4_tensor_desc(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+    ) -> Result<(), String> {
+        if desc.axis != 1 {
+            return Err(format!(
+                "HQQ tensor {} uses unsupported axis {} (expected axis=1)",
+                tensor_name, desc.axis
+            ));
+        }
+        if desc.layout != "row_major_axis1_grouped_uint4_packed" {
+            return Err(format!(
+                "HQQ tensor {} uses unsupported layout {}",
+                tensor_name, desc.layout
+            ));
+        }
+        if desc.packed_dtype != "uint8" {
+            return Err(format!(
+                "HQQ tensor {} uses unsupported packed dtype {}",
+                tensor_name, desc.packed_dtype
+            ));
+        }
+        if desc.scales_dtype != "float32" || desc.zeros_dtype != "float32" {
+            return Err(format!(
+                "HQQ tensor {} uses unsupported scale/zero dtypes {}/{}",
+                tensor_name, desc.scales_dtype, desc.zeros_dtype
+            ));
+        }
+        if desc.group_size == 0 {
+            return Err(format!("HQQ tensor {} has invalid group_size=0", tensor_name));
+        }
+        Ok(())
+    }
+
+    fn hqq4_dequant_to_bf16(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        out_ptr: u64,
+    ) -> Result<(), String> {
+        self.validate_hqq4_tensor_desc(tensor_name, desc)?;
+        let total = desc.rows * desc.cols;
+        if total == 0 {
+            return Ok(());
+        }
+        let threads = 256u32;
+        let blocks = (total as u32).div_ceil(threads);
+        let mut a0 = out_ptr;
+        let mut a1 = desc.packed_ptr;
+        let mut a2 = desc.scales_ptr;
+        let mut a3 = desc.zeros_ptr;
+        let mut a4 = desc.rows as i32;
+        let mut a5 = desc.cols as i32;
+        let mut a6 = desc.group_size as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq4_dequant_bf16,
+                (blocks, 1, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut a0 as *mut _ as *mut std::ffi::c_void,
+                    &mut a1 as *mut _ as *mut std::ffi::c_void,
+                    &mut a2 as *mut _ as *mut std::ffi::c_void,
+                    &mut a3 as *mut _ as *mut std::ffi::c_void,
+                    &mut a4 as *mut _ as *mut std::ffi::c_void,
+                    &mut a5 as *mut _ as *mut std::ffi::c_void,
+                    &mut a6 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn materialize_hqq_gqa_prefill_weights(&mut self) -> Result<(), String> {
+        for layer_idx in 0..self.layer_weights.len() {
+            let Some(desc) = self.layer_weights[layer_idx].hqq_gqa.clone() else {
+                continue;
+            };
+            if desc.nbits != 4 {
+                return Err(format!(
+                    "HQQ prefill GQA only supports nbits=4 today, got {} at layer {}",
+                    desc.nbits, layer_idx
+                ));
+            }
+
+            let ensure_weight_ptr = |engine: &mut Self,
+                                     existing: Option<Bf16Weight>,
+                                     rows: usize,
+                                     cols: usize,
+                                     tensor_name: &str|
+             -> Result<Bf16Weight, String> {
+                if let Some(weight) = existing {
+                    if weight.n != rows || weight.k != cols {
+                        return Err(format!(
+                            "HQQ prefill {} BF16 shape drift at layer {}: existing {}x{} new {}x{}",
+                            tensor_name,
+                            layer_idx,
+                            weight.n,
+                            weight.k,
+                            rows,
+                            cols,
+                        ));
+                    }
+                    return Ok(weight);
+                }
+                let buf = engine
+                    .device
+                    .alloc_zeros::<u16>(rows * cols)
+                    .map_err(|e| format!("alloc HQQ {} BF16 layer {}: {e}", tensor_name, layer_idx))?;
+                let ptr = *buf.device_ptr();
+                engine.hqq_bf16_weight_bufs.push(buf);
+                Ok(Bf16Weight { ptr, n: rows, k: cols })
+            };
+
+            let q_weight = ensure_weight_ptr(
+                self,
+                self.layer_weights[layer_idx]
+                    .q_proj_bf16
+                    .as_ref()
+                    .map(|weight| Bf16Weight { ptr: weight.ptr, n: weight.n, k: weight.k }),
+                desc.q_proj.rows,
+                desc.q_proj.cols,
+                "q_proj",
+            )?;
+            self.hqq4_dequant_to_bf16("q_proj", &desc.q_proj, q_weight.ptr)?;
+
+            let k_weight = ensure_weight_ptr(
+                self,
+                self.layer_weights[layer_idx]
+                    .k_proj_bf16
+                    .as_ref()
+                    .map(|weight| Bf16Weight { ptr: weight.ptr, n: weight.n, k: weight.k }),
+                desc.k_proj.rows,
+                desc.k_proj.cols,
+                "k_proj",
+            )?;
+            self.hqq4_dequant_to_bf16("k_proj", &desc.k_proj, k_weight.ptr)?;
+
+            let v_weight = ensure_weight_ptr(
+                self,
+                self.layer_weights[layer_idx]
+                    .v_proj_bf16
+                    .as_ref()
+                    .map(|weight| Bf16Weight { ptr: weight.ptr, n: weight.n, k: weight.k }),
+                desc.v_proj.rows,
+                desc.v_proj.cols,
+                "v_proj",
+            )?;
+            self.hqq4_dequant_to_bf16("v_proj", &desc.v_proj, v_weight.ptr)?;
+
+            let o_weight = ensure_weight_ptr(
+                self,
+                self.layer_weights[layer_idx]
+                    .o_proj_bf16
+                    .as_ref()
+                    .map(|weight| Bf16Weight { ptr: weight.ptr, n: weight.n, k: weight.k }),
+                desc.o_proj.rows,
+                desc.o_proj.cols,
+                "o_proj",
+            )?;
+            self.hqq4_dequant_to_bf16("o_proj", &desc.o_proj, o_weight.ptr)?;
+
+            {
+                let lw = &mut self.layer_weights[layer_idx];
+                lw.q_proj_bf16 = Some(q_weight);
+                lw.k_proj_bf16 = Some(k_weight);
+                lw.v_proj_bf16 = Some(v_weight);
+                lw.o_proj_bf16 = Some(o_weight);
+                lw.gqa_gated = desc.gated;
+                lw.q_norm_ptr = desc.q_norm_ptr;
+                lw.k_norm_ptr = desc.k_norm_ptr;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn materialize_hqq_linear_attention_prefill_weights(&mut self) -> Result<(), String> {
+        for layer_idx in 0..self.layer_weights.len() {
+            let Some(desc) = self.layer_weights[layer_idx].hqq_linear_attention.clone() else {
+                continue;
+            };
+            if desc.nbits != 4 {
+                return Err(format!(
+                    "HQQ prefill linear attention only supports nbits=4 today, got {} at layer {}",
+                    desc.nbits, layer_idx
+                ));
+            }
+
+            let ensure_weight_ptr = |engine: &mut Self,
+                                     existing: Option<Bf16Weight>,
+                                     rows: usize,
+                                     cols: usize,
+                                     tensor_name: &str|
+             -> Result<Bf16Weight, String> {
+                if let Some(weight) = existing {
+                    if weight.n != rows || weight.k != cols {
+                        return Err(format!(
+                            "HQQ prefill linear-attention {} BF16 shape drift at layer {}: existing {}x{} new {}x{}",
+                            tensor_name,
+                            layer_idx,
+                            weight.n,
+                            weight.k,
+                            rows,
+                            cols,
+                        ));
+                    }
+                    return Ok(weight);
+                }
+                let buf = engine
+                    .device
+                    .alloc_zeros::<u16>(rows * cols)
+                    .map_err(|e| {
+                        format!(
+                            "alloc HQQ linear-attention {} BF16 layer {}: {e}",
+                            tensor_name, layer_idx
+                        )
+                    })?;
+                let ptr = *buf.device_ptr();
+                engine.hqq_bf16_weight_bufs.push(buf);
+                Ok(Bf16Weight { ptr, n: rows, k: cols })
+            };
+
+            let in_proj_qkvz = ensure_weight_ptr(
+                self,
+                self.layer_weights[layer_idx]
+                    .la_in_proj_qkvz_bf16
+                    .as_ref()
+                    .map(|weight| Bf16Weight { ptr: weight.ptr, n: weight.n, k: weight.k }),
+                desc.in_proj_qkvz.rows,
+                desc.in_proj_qkvz.cols,
+                "in_proj_qkvz",
+            )?;
+            self.hqq4_dequant_to_bf16(
+                "in_proj_qkvz",
+                &desc.in_proj_qkvz,
+                in_proj_qkvz.ptr,
+            )?;
+
+            let in_proj_ba = ensure_weight_ptr(
+                self,
+                self.layer_weights[layer_idx]
+                    .la_in_proj_ba_bf16
+                    .as_ref()
+                    .map(|weight| Bf16Weight { ptr: weight.ptr, n: weight.n, k: weight.k }),
+                desc.in_proj_ba.rows,
+                desc.in_proj_ba.cols,
+                "in_proj_ba",
+            )?;
+            self.hqq4_dequant_to_bf16("in_proj_ba", &desc.in_proj_ba, in_proj_ba.ptr)?;
+
+            let out_proj = ensure_weight_ptr(
+                self,
+                self.layer_weights[layer_idx]
+                    .la_out_proj_bf16
+                    .as_ref()
+                    .map(|weight| Bf16Weight { ptr: weight.ptr, n: weight.n, k: weight.k }),
+                desc.out_proj.rows,
+                desc.out_proj.cols,
+                "out_proj",
+            )?;
+            self.hqq4_dequant_to_bf16("out_proj", &desc.out_proj, out_proj.ptr)?;
+
+            let lw = &mut self.layer_weights[layer_idx];
+            lw.la_in_proj_qkvz_bf16 = Some(in_proj_qkvz);
+            lw.la_in_proj_ba_bf16 = Some(in_proj_ba);
+            lw.la_out_proj_bf16 = Some(out_proj);
+            lw.la_conv_weight_ptr = desc.conv_weight_ptr;
+            lw.la_a_log_ptr = desc.a_log_ptr;
+            lw.la_dt_bias_ptr = desc.dt_bias_ptr;
+            lw.la_norm_weight_ptr = desc.norm_weight_ptr;
+            lw.la_conv_state_ptr = desc.conv_state_ptr;
+            lw.la_recur_state_ptr = desc.recur_state_ptr;
+        }
+        Ok(())
+    }
+
+    pub fn materialize_hqq_prefill_weights(&mut self) -> Result<(), String> {
+        self.materialize_hqq_gqa_prefill_weights()?;
+        self.materialize_hqq_linear_attention_prefill_weights()?;
+        Ok(())
+    }
+
     /// Dispatch GEMM: Marlin (INT4/INT8) or cuBLAS BF16 fallback.
     fn la_gemm(
         &self,
@@ -6497,6 +7109,34 @@ impl PrefillEngine {
     ) -> Result<(), String> {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
+        if let Some(hqq) = &lw.hqq_gqa {
+            if lw.q_proj_bf16.is_none()
+                || lw.k_proj_bf16.is_none()
+                || lw.v_proj_bf16.is_none()
+                || lw.o_proj_bf16.is_none()
+            {
+                return Err(format!(
+                    "HQQ prefill GQA weights were not refreshed from the registered slot-backed descriptors before layer {} (backend={} nbits={} format_v{} q_proj_rows={} q_proj_cols={})",
+                    layer_idx,
+                    hqq.backend,
+                    hqq.nbits,
+                    hqq.format_version,
+                    hqq.q_proj.rows,
+                    hqq.q_proj.cols,
+                ));
+            }
+        }
+        if let Some(hqq) = &lw.hqq_mla {
+            return Err(format!(
+                "HQQ prefill MLA execution is not enabled yet at layer {} (slot-backed HQQ runtime prepared; backend={} nbits={} format_v{} kv_a_proj_rows={} kv_a_proj_cols={})",
+                layer_idx,
+                hqq.backend,
+                hqq.nbits,
+                hqq.format_version,
+                hqq.kv_a_proj_with_mqa.rows,
+                hqq.kv_a_proj_with_mqa.cols,
+            ));
+        }
         let gt = self.gqa_timing_enabled.get();
         let trace_step = if self.config.prefill_chunk_size > 0 {
             start_pos / self.config.prefill_chunk_size
@@ -7463,6 +8103,22 @@ impl PrefillEngine {
     fn forward_linear_attention(&self, layer_idx: usize, m: usize) -> Result<(), String> {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
+        if let Some(hqq) = &lw.hqq_linear_attention {
+            if lw.la_in_proj_qkvz_bf16.is_none()
+                || lw.la_in_proj_ba_bf16.is_none()
+                || lw.la_out_proj_bf16.is_none()
+            {
+                return Err(format!(
+                    "HQQ prefill linear-attention weights were not refreshed from the registered slot-backed descriptors before layer {} (backend={} nbits={} format_v{} in_proj_qkvz_rows={} in_proj_qkvz_cols={})",
+                    layer_idx,
+                    hqq.backend,
+                    hqq.nbits,
+                    hqq.format_version,
+                    hqq.in_proj_qkvz.rows,
+                    hqq.in_proj_qkvz.cols,
+                ));
+            }
+        }
         let nk = cfg.la_num_k_heads;
         let nv = cfg.la_num_v_heads;
         let dk = cfg.la_k_head_dim;
@@ -11422,6 +12078,70 @@ impl PrefillEngine {
             }
         }
 
+        let moe_trace_enabled = self.trace.as_ref().map_or(false, |t| {
+            t.should_emit(0, Some(layer_idx), "prefill_layer")
+        });
+        let moe_last_pos = m.saturating_sub(1);
+        if moe_trace_enabled {
+            if m_topk <= 4096 {
+                match (
+                    download_device_u16(fused_input_ptr, m_topk * h),
+                    download_device_f32(topk_weights_ptr, m * topk),
+                    download_device_i32(topk_ids_ptr + ((moe_last_pos * topk * 4) as u64), topk),
+                ) {
+                    (Ok(w1_input_rows_u16), Ok(topk_weights), Ok(last_topk_ids)) => {
+                        let w1_input_rows_bf16: Vec<f32> = w1_input_rows_u16
+                            .iter()
+                            .map(|&bits| bf16_to_f32(bits))
+                            .collect();
+                        for slot in 0..topk {
+                            let sid = moe_last_pos * topk + slot;
+                            if !is_exact_frozen_trace_sid(sid) {
+                                continue;
+                            }
+                            let wt =
+                                topk_weights.get(sid).copied().unwrap_or(0.0) * scale_factor;
+                            let row_l2 = if sid < m_topk {
+                                diag_l2_norm(&w1_input_rows_bf16[sid * h..(sid + 1) * h])
+                            } else {
+                                0.0
+                            };
+                            trace_emit_prefill_mark(
+                                self.trace.as_ref(),
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                &format!(
+                                    "phase=moe_last_token_w1_input_row slot={} sorted_id={} expert={} weight={:.6} row_l2={:.6}",
+                                    slot,
+                                    sid,
+                                    last_topk_ids.get(slot).copied().unwrap_or(-1),
+                                    wt,
+                                    row_l2,
+                                ),
+                            );
+                        }
+                    }
+                    (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            0,
+                            moe_last_pos,
+                            0,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            &format!(
+                                "phase=moe_last_token_w1_input_row_download_failed error={}",
+                                err
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
         // 7. Call MarlinDefault for w1 (gate_up projection)
         // Both w1 and w2 use top_k=1 trick: sorted_id is used as direct index.
         // For w1: A = fused_input (replicated), kernel reads A[sorted_id] directly.
@@ -11456,6 +12176,162 @@ impl PrefillEngine {
         let w1s_b_param = if use_ptr_table { 0 } else { w1s_base };
         let w2_b_param = if use_ptr_table { 0 } else { w2_base };
         let w2s_b_param = if use_ptr_table { 0 } else { w2s_base };
+
+        if moe_trace_enabled {
+            if m_topk <= 4096 {
+                match (
+                    download_device_f32(topk_weights_ptr, m * topk),
+                    download_device_i32(topk_ids_ptr + ((moe_last_pos * topk * 4) as u64), topk),
+                ) {
+                    (Ok(topk_weights), Ok(last_topk_ids)) => {
+                        let q_type_label = scalar_type_label(&self.q_type);
+                        let packed_len = match bits {
+                            4 => (h / 16) * (w1_n * 2),
+                            8 => (h / 16) * (w1_n * 4),
+                            other => {
+                                trace_emit_prefill_mark(
+                                    self.trace.as_ref(),
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    &format!(
+                                        "phase=moe_last_token_w1_launch_inputs_failed error=unsupported_bits:{}",
+                                        other
+                                    ),
+                                );
+                                0
+                            }
+                        };
+                        let scales_len = (h / self.config.group_size) * w1_n;
+                        if packed_len > 0 {
+                            for slot in 0..topk {
+                                let sid = moe_last_pos * topk + slot;
+                                if sid != 2315 && sid != 2319 {
+                                    continue;
+                                }
+                                let expert = last_topk_ids.get(slot).copied().unwrap_or(-1);
+                                let wt =
+                                    topk_weights.get(sid).copied().unwrap_or(0.0) * scale_factor;
+                                let (packed_ptr, scales_ptr) = if expert >= 0 {
+                                    let eid = expert as usize;
+                                    if use_ptr_table {
+                                        (
+                                            self.h_expert_w1_ptrs.get(eid).copied().unwrap_or(0),
+                                            self.h_expert_w1s_ptrs.get(eid).copied().unwrap_or(0),
+                                        )
+                                    } else {
+                                        (
+                                            w1_base + (eid * self.w1_packed_per_expert) as u64,
+                                            w1s_base + (eid * self.w1_scales_per_expert) as u64,
+                                        )
+                                    }
+                                } else {
+                                    (0, 0)
+                                };
+                                if packed_ptr == 0 || scales_ptr == 0 {
+                                    trace_emit_prefill_mark(
+                                        self.trace.as_ref(),
+                                        0,
+                                        moe_last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        &format!(
+                                            "phase=moe_last_token_w1_launch_inputs_missing slot={} sorted_id={} expert={} weight={:.6} use_ptr_table={} q_type={} bits={} packed_ptr=0x{:x} scales_ptr=0x{:x}",
+                                            slot,
+                                            sid,
+                                            expert,
+                                            wt,
+                                            use_ptr_table,
+                                            q_type_label,
+                                            bits,
+                                            packed_ptr,
+                                            scales_ptr,
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                match (
+                                    download_device_u32(packed_ptr, std::cmp::min(8, packed_len)),
+                                    download_device_u16(scales_ptr, scales_len),
+                                ) {
+                                    (Ok(packed_sample), Ok(scale_bits)) => {
+                                        let scales_f32: Vec<f32> =
+                                            scale_bits.iter().map(|&v| bf16_to_f32(v)).collect();
+                                        let scales_l2 = diag_l2_norm(&scales_f32);
+                                        let scale_sample_len = std::cmp::min(4, scales_f32.len());
+                                        trace_emit_prefill_mark(
+                                            self.trace.as_ref(),
+                                            0,
+                                            moe_last_pos,
+                                            0,
+                                            Some(layer_idx),
+                                            "prefill_layer",
+                                            &format!(
+                                                "phase=moe_last_token_w1_launch_inputs slot={} sorted_id={} expert={} weight={:.6} use_ptr_table={} q_type={} bits={} group_size={} num_groups={} size_m={} size_n={} size_k={} top_k=1 mul_topk_weights=false packed_ptr=0x{:x} scales_ptr=0x{:x} packed_sample=[{}] scale_sample=[{}] scales_l2={:.6}",
+                                                slot,
+                                                sid,
+                                                expert,
+                                                wt,
+                                                use_ptr_table,
+                                                q_type_label,
+                                                bits,
+                                                self.config.group_size,
+                                                num_groups_w1,
+                                                m_topk,
+                                                w1_n,
+                                                h,
+                                                packed_ptr,
+                                                scales_ptr,
+                                                format_u32_hex_sample(&packed_sample),
+                                                format_f32_sample(&scales_f32[..scale_sample_len]),
+                                                scales_l2,
+                                            ),
+                                        );
+                                    }
+                                    (Err(err), _) | (_, Err(err)) => {
+                                        trace_emit_prefill_mark(
+                                            self.trace.as_ref(),
+                                            0,
+                                            moe_last_pos,
+                                            0,
+                                            Some(layer_idx),
+                                            "prefill_layer",
+                                            &format!(
+                                                "phase=moe_last_token_w1_launch_inputs_failed slot={} sorted_id={} expert={} weight={:.6} packed_ptr=0x{:x} scales_ptr=0x{:x} error={}",
+                                                slot,
+                                                sid,
+                                                expert,
+                                                wt,
+                                                packed_ptr,
+                                                scales_ptr,
+                                                err,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (Err(err), _) | (_, Err(err)) => {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            0,
+                            moe_last_pos,
+                            0,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            &format!(
+                                "phase=moe_last_token_w1_launch_inputs_failed error={}",
+                                err
+                            ),
+                        );
+                    }
+                }
+            }
+        }
 
         // w1: A = fused_input (replicated [m*topk, h]), top_k=1 so kernel reads A[sorted_id] directly
         //     C written at sorted_id positions (token*topk+slot), range [0, m*topk)
@@ -11511,6 +12387,331 @@ impl PrefillEngine {
                     std::ptr::null()
                 }, // S_expert_ptrs
             );
+        }
+        if moe_trace_enabled {
+            if m_topk <= 4096 {
+                match (
+                    download_device_u16(fused_input_ptr, m_topk * h),
+                    download_device_u16(fused_inter_ptr, m_topk * w1_n),
+                    download_device_f32(topk_weights_ptr, m * topk),
+                    download_device_i32(topk_ids_ptr + ((moe_last_pos * topk * 4) as u64), topk),
+                ) {
+                    (Ok(w1_input_rows_u16), Ok(w1_rows_u16), Ok(topk_weights), Ok(last_topk_ids)) => {
+                        let w1_rows_bf16: Vec<f32> =
+                            w1_rows_u16.iter().map(|&bits| bf16_to_f32(bits)).collect();
+                        for slot in 0..topk {
+                            let sid = moe_last_pos * topk + slot;
+                            if !is_exact_frozen_trace_sid(sid) {
+                                continue;
+                            }
+                            let expert = last_topk_ids.get(slot).copied().unwrap_or(-1);
+                            let wt =
+                                topk_weights.get(sid).copied().unwrap_or(0.0) * scale_factor;
+                            let (row_l2, row_sample) = if sid < m_topk {
+                                let row = &w1_rows_bf16[sid * w1_n..(sid + 1) * w1_n];
+                                (
+                                    diag_l2_norm(row),
+                                    format_f32_sample(&row[..std::cmp::min(4, row.len())]),
+                                )
+                            } else {
+                                (0.0, String::new())
+                            };
+                            trace_emit_prefill_mark(
+                                self.trace.as_ref(),
+                                0,
+                                moe_last_pos,
+                                0,
+                                Some(layer_idx),
+                                "prefill_layer",
+                                &format!(
+                                    "phase=moe_last_token_w1_row slot={} sorted_id={} expert={} weight={:.6} row_l2={:.6} row_sample=[{}]",
+                                    slot,
+                                    sid,
+                                    expert,
+                                    wt,
+                                    row_l2,
+                                    row_sample,
+                                ),
+                            );
+
+                            let (packed_ptr, scales_ptr) = if expert >= 0 {
+                                let eid = expert as usize;
+                                if use_ptr_table {
+                                    (
+                                        self.h_expert_w1_ptrs.get(eid).copied().unwrap_or(0),
+                                        self.h_expert_w1s_ptrs.get(eid).copied().unwrap_or(0),
+                                    )
+                                } else {
+                                    (
+                                        w1_base + (eid * self.w1_packed_per_expert) as u64,
+                                        w1s_base + (eid * self.w1_scales_per_expert) as u64,
+                                    )
+                                }
+                            } else {
+                                (0, 0)
+                            };
+                            if packed_ptr == 0 || (bits != 16 && scales_ptr == 0) {
+                                trace_emit_prefill_mark(
+                                    self.trace.as_ref(),
+                                    0,
+                                    moe_last_pos,
+                                    0,
+                                    Some(layer_idx),
+                                    "prefill_layer",
+                                    &format!(
+                                        "phase=moe_last_token_w1_cpu_ref_failed slot={} sorted_id={} expert={} weight={:.6} packed_ptr=0x{:x} scales_ptr=0x{:x} error=missing_active_weight_ptrs",
+                                        slot, sid, expert, wt, packed_ptr, scales_ptr,
+                                    ),
+                                );
+                                continue;
+                            }
+                            let input_row = &w1_input_rows_u16[sid * h..(sid + 1) * h];
+                            let cpu_ref_result = if bits == 16 {
+                                compute_bf16_gemm_row_cpu_reference(input_row, packed_ptr, w1_n, h)
+                            } else {
+                                let ref_w13 = MarlinWeight {
+                                    packed: packed_ptr,
+                                    scales: scales_ptr,
+                                    n: w1_n,
+                                    k: h,
+                                    num_groups: h / self.config.group_size,
+                                    group_size: self.config.group_size,
+                                    num_bits: bits,
+                                };
+                                compute_marlin_gemm_row_cpu_reference(input_row, &ref_w13)
+                            };
+                            match cpu_ref_result {
+                                Ok(ref_row) => {
+                                    let ref_row_l2 = diag_l2_norm(&ref_row);
+                                    let ref_sample =
+                                        format_f32_sample(&ref_row[..std::cmp::min(4, ref_row.len())]);
+                                    let fused_row = &w1_rows_bf16[sid * w1_n..(sid + 1) * w1_n];
+                                    let delta_l2 = fused_row
+                                        .iter()
+                                        .zip(ref_row.iter())
+                                        .map(|(fused, reference)| {
+                                            let d = fused - reference;
+                                            d * d
+                                        })
+                                        .sum::<f32>()
+                                        .sqrt();
+                                    trace_emit_prefill_mark(
+                                        self.trace.as_ref(),
+                                        0,
+                                        moe_last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        &format!(
+                                            "phase=moe_last_token_w1_cpu_ref_row slot={} sorted_id={} expert={} weight={:.6} row_l2={:.6} row_sample=[{}] delta_l2_vs_fused={:.6}",
+                                            slot,
+                                            sid,
+                                            expert,
+                                            wt,
+                                            ref_row_l2,
+                                            ref_sample,
+                                            delta_l2,
+                                        ),
+                                    );
+
+                                    let input_row_f32: Vec<f32> =
+                                        input_row.iter().map(|&v| bf16_to_f32(v)).collect();
+                                    let input_top_idx =
+                                        top_abs_indices(&input_row_f32, std::cmp::min(8, h));
+                                    let input_top_vals = input_top_idx
+                                        .iter()
+                                        .map(|&idx| input_row_f32[idx])
+                                        .collect::<Vec<_>>();
+                                    let input_group_idx = input_top_idx
+                                        .iter()
+                                        .map(|&idx| idx / self.config.group_size)
+                                        .collect::<Vec<_>>();
+                                    let slice_out = std::cmp::min(4, ref_row.len());
+                                    let weight_rows_result: Result<Vec<f32>, String> = if bits == 16 {
+                                        download_device_u16(packed_ptr, w1_n * h).map(|rows_u16| {
+                                            rows_u16
+                                                .into_iter()
+                                                .map(bf16_to_f32)
+                                                .collect::<Vec<f32>>()
+                                        })
+                                    } else {
+                                        let ref_w13 = MarlinWeight {
+                                            packed: packed_ptr,
+                                            scales: scales_ptr,
+                                            n: w1_n,
+                                            k: h,
+                                            num_groups: h / self.config.group_size,
+                                            group_size: self.config.group_size,
+                                            num_bits: bits,
+                                        };
+                                        dequantize_marlin_weight_cpu(&ref_w13)
+                                    };
+                                    let group_scales_result: Result<Option<Vec<f32>>, String> =
+                                        if bits == 16 {
+                                            Ok(None)
+                                        } else {
+                                            let ref_w13 = MarlinWeight {
+                                                packed: packed_ptr,
+                                                scales: scales_ptr,
+                                                n: w1_n,
+                                                k: h,
+                                                num_groups: h / self.config.group_size,
+                                                group_size: self.config.group_size,
+                                                num_bits: bits,
+                                            };
+                                            download_marlin_scales_cpu(&ref_w13).map(Some)
+                                        };
+                                    match (weight_rows_result, group_scales_result) {
+                                        (Ok(weight_rows), Ok(group_scales)) => {
+                                            let mut slice_parts = Vec::with_capacity(slice_out);
+                                            let mut partial_dots = Vec::with_capacity(slice_out);
+                                            let mut scale_parts = Vec::with_capacity(slice_out);
+                                            for out_idx in 0..slice_out {
+                                                match gather_weight_row_slice(
+                                                    &weight_rows,
+                                                    w1_n,
+                                                    h,
+                                                    out_idx,
+                                                    &input_top_idx,
+                                                ) {
+                                                    Ok(weight_slice) => {
+                                                        let partial_dot = weight_slice
+                                                            .iter()
+                                                            .zip(input_top_vals.iter())
+                                                            .map(|(w, x)| w * x)
+                                                            .sum::<f32>();
+                                                        partial_dots.push(partial_dot);
+                                                        slice_parts.push(format!(
+                                                            "{}:{}",
+                                                            out_idx,
+                                                            format_f32_sample(&weight_slice)
+                                                        ));
+                                                        if let Some(scales_by_group) =
+                                                            group_scales.as_ref()
+                                                        {
+                                                            match gather_group_scale_slice(
+                                                                scales_by_group,
+                                                                w1_n,
+                                                                h / self.config.group_size,
+                                                                out_idx,
+                                                                &input_top_idx,
+                                                                self.config.group_size,
+                                                            ) {
+                                                                Ok(scale_slice) => {
+                                                                    scale_parts.push(format!(
+                                                                        "{}:{}",
+                                                                        out_idx,
+                                                                        format_f32_sample(
+                                                                            &scale_slice
+                                                                        )
+                                                                    ));
+                                                                }
+                                                                Err(err) => {
+                                                                    trace_emit_prefill_mark(
+                                                                        self.trace.as_ref(),
+                                                                        0,
+                                                                        moe_last_pos,
+                                                                        0,
+                                                                        Some(layer_idx),
+                                                                        "prefill_layer",
+                                                                        &format!(
+                                                                            "phase=moe_last_token_w1_weight_slice_failed slot={} sorted_id={} expert={} weight={:.6} out_idx={} error={}",
+                                                                            slot, sid, expert, wt, out_idx, err
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        trace_emit_prefill_mark(
+                                                            self.trace.as_ref(),
+                                                            0,
+                                                            moe_last_pos,
+                                                            0,
+                                                            Some(layer_idx),
+                                                            "prefill_layer",
+                                                            &format!(
+                                                                "phase=moe_last_token_w1_weight_slice_failed slot={} sorted_id={} expert={} weight={:.6} out_idx={} error={}",
+                                                                slot, sid, expert, wt, out_idx, err
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            trace_emit_prefill_mark(
+                                                self.trace.as_ref(),
+                                                0,
+                                                moe_last_pos,
+                                                0,
+                                                Some(layer_idx),
+                                                "prefill_layer",
+                                                &format!(
+                                                    "phase=moe_last_token_w1_weight_slice slot={} sorted_id={} expert={} weight={:.6} bits={} top_input_idx=[{}] top_input_group_idx=[{}] top_input_vals=[{}] out_idx=[{}] partial_dot=[{}] weight_slice=[{}] group_scale=[{}]",
+                                                    slot,
+                                                    sid,
+                                                    expert,
+                                                    wt,
+                                                    bits,
+                                                    format_usize_sample(&input_top_idx),
+                                                    format_usize_sample(&input_group_idx),
+                                                    format_f32_sample(&input_top_vals),
+                                                    format_usize_sample(&(0..slice_out).collect::<Vec<usize>>()),
+                                                    format_f32_sample(&partial_dots),
+                                                    slice_parts.join("|"),
+                                                    scale_parts.join("|"),
+                                                ),
+                                            );
+                                        }
+                                        (Err(err), _) | (_, Err(err)) => {
+                                            trace_emit_prefill_mark(
+                                                self.trace.as_ref(),
+                                                0,
+                                                moe_last_pos,
+                                                0,
+                                                Some(layer_idx),
+                                                "prefill_layer",
+                                                &format!(
+                                                    "phase=moe_last_token_w1_weight_slice_failed slot={} sorted_id={} expert={} weight={:.6} bits={} packed_ptr=0x{:x} scales_ptr=0x{:x} error={}",
+                                                    slot, sid, expert, wt, bits, packed_ptr, scales_ptr, err
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    trace_emit_prefill_mark(
+                                        self.trace.as_ref(),
+                                        0,
+                                        moe_last_pos,
+                                        0,
+                                        Some(layer_idx),
+                                        "prefill_layer",
+                                        &format!(
+                                            "phase=moe_last_token_w1_cpu_ref_failed slot={} sorted_id={} expert={} weight={:.6} packed_ptr=0x{:x} scales_ptr=0x{:x} error={}",
+                                            slot, sid, expert, wt, packed_ptr, scales_ptr, err,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    (Err(err), _, _, _)
+                    | (_, Err(err), _, _)
+                    | (_, _, Err(err), _)
+                    | (_, _, _, Err(err)) => {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            0,
+                            moe_last_pos,
+                            0,
+                            Some(layer_idx),
+                            "prefill_layer",
+                            &format!("phase=moe_last_token_w1_row_download_failed error={}", err),
+                        );
+                    }
+                }
+            }
         }
         // DIAG: Compare fused MoE w1 output against a direct regular Marlin GEMM
         // using the exact active expert device pointers for this layer.
@@ -12107,10 +13308,6 @@ impl PrefillEngine {
             }
         }
 
-        let moe_trace_enabled = self.trace.as_ref().map_or(false, |t| {
-            t.should_emit(0, Some(layer_idx), "prefill_layer")
-        });
-        let moe_last_pos = m.saturating_sub(1);
         let mut traced_routed_accum_last_cpu: Option<Vec<f32>> = None;
         let mut traced_routed_accum_last_vendor: Option<Vec<f32>> = None;
         let mut traced_routed_accum_full_vendor: Option<Vec<f32>> = None;
@@ -17210,6 +18407,7 @@ impl PrefillKernels {
                     "rmsnorm_batched_fp32w_kernel",
                     "fused_add_rmsnorm_batched_kernel",
                     "embedding_batched_kernel",
+                    "hqq4_dequant_bf16_kernel",
                     "rope_batched_kernel",
                     "silu_mul_batched_kernel",
                     "relu2_batched_kernel",
@@ -17334,6 +18532,7 @@ impl PrefillKernels {
             rmsnorm_fp32w: get("rmsnorm_batched_fp32w_kernel")?,
             fused_add_rmsnorm: get("fused_add_rmsnorm_batched_kernel")?,
             embedding: get("embedding_batched_kernel")?,
+            hqq4_dequant_bf16: get("hqq4_dequant_bf16_kernel")?,
             rope: get("rope_batched_kernel")?,
             silu_mul: get("silu_mul_batched_kernel")?,
             relu2: get("relu2_batched_kernel")?,

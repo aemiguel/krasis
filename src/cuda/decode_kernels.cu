@@ -28,6 +28,34 @@ __device__ __forceinline__ float silu(float x) {
     return x / (1.0f + __expf(-x));
 }
 
+// ── HQQ4 Dequant ───────────────────────────────────────────────────────
+
+extern "C" __global__ void hqq4_dequant_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const unsigned char* __restrict__ packed,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    int rows,
+    int cols,
+    int group_size
+) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = rows * cols;
+    if (idx >= total) return;
+
+    int row = idx / cols;
+    int col = idx - row * cols;
+    int groups = (cols + group_size - 1) / group_size;
+    int packed_cols = (groups * group_size) / 2;
+    int group = col / group_size;
+    int packed_idx = row * packed_cols + (col >> 1);
+    unsigned char byte = packed[packed_idx];
+    int q = (col & 1) ? (int)(byte >> 4) : (int)(byte & 0x0F);
+    float scale = scales[row * groups + group];
+    float zero = zeros[row * groups + group];
+    out[idx] = f32_to_bf16((float(q) - zero) * scale);
+}
+
 // ── Embedding Lookup ───────────────────────────────────────────────────
 
 // Copy one row from embedding table [vocab, hidden] BF16 into hidden state BF16.
@@ -4781,6 +4809,188 @@ extern "C" __global__ void simple_int4_gemv_bf16(
         float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
         float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k + 1]));
         acc += scale * ((float)lo * x0 + (float)hi * x1);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (lane == 0) {
+        __nv_bfloat16 result = __float2bfloat16(acc);
+        output[row] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
+extern "C" __global__ void hqq4_decode_gemv_f32(
+    const unsigned char* __restrict__ packed_w,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    const unsigned short* __restrict__ input,
+    float* __restrict__ output,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes
+) {
+    extern __shared__ unsigned short s_input[];
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < cols; i += 256) {
+        s_input[i] = input[i];
+    }
+    __syncthreads();
+
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int row = blockIdx.x * 8 + warp_id;
+    if (row >= rows) return;
+
+    const unsigned char* w_row = packed_w + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)zeros + (long long)row * zeros_row_stride_bytes);
+
+    int groups = (cols + group_size - 1) / group_size;
+    int packed_cols = (cols + 1) >> 1;
+    const unsigned int* w_row_u32 = (const unsigned int*)w_row;
+    int packed_per_row = packed_cols >> 2;
+    float acc = 0.0f;
+
+    for (int ki = lane; ki < packed_per_row; ki += 32) {
+        unsigned int packed4 = __ldg(w_row_u32 + ki);
+        int base_k = ki << 3;
+
+        float local_sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int col0 = base_k + i * 2;
+            if (col0 >= cols) break;
+            int byte_val = (packed4 >> (i * 8)) & 0xFF;
+            int q0 = byte_val & 0xF;
+            int group0 = col0 / group_size;
+            float w0 = (float(q0) - z_row[group0]) * s_row[group0];
+            float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[col0]));
+            local_sum += w0 * x0;
+
+            int col1 = col0 + 1;
+            if (col1 < cols) {
+                int q1 = byte_val >> 4;
+                int group1 = col1 / group_size;
+                float w1 = (float(q1) - z_row[group1]) * s_row[group1];
+                float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[col1]));
+                local_sum += w1 * x1;
+            }
+        }
+        acc += local_sum;
+    }
+
+    int vec_cols = packed_per_row << 3;
+    for (int k = vec_cols + lane * 2; k < cols; k += 64) {
+        unsigned char packed = w_row[k >> 1];
+        int q0 = packed & 0xF;
+        int g0 = k / group_size;
+        float w0 = (float(q0) - z_row[g0]) * s_row[g0];
+        float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+        acc += w0 * x0;
+        int k1 = k + 1;
+        if (k1 < cols) {
+            int q1 = packed >> 4;
+            int g1 = k1 / group_size;
+            float w1 = (float(q1) - z_row[g1]) * s_row[g1];
+            float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k1]));
+            acc += w1 * x1;
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (lane == 0) {
+        output[row] = acc;
+    }
+}
+
+extern "C" __global__ void hqq4_decode_gemv_bf16(
+    const unsigned char* __restrict__ packed_w,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    const unsigned short* __restrict__ input,
+    unsigned short* __restrict__ output,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes
+) {
+    extern __shared__ unsigned short s_input[];
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < cols; i += 256) {
+        s_input[i] = input[i];
+    }
+    __syncthreads();
+
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int row = blockIdx.x * 8 + warp_id;
+    if (row >= rows) return;
+
+    const unsigned char* w_row = packed_w + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)zeros + (long long)row * zeros_row_stride_bytes);
+
+    int packed_cols = (cols + 1) >> 1;
+    const unsigned int* w_row_u32 = (const unsigned int*)w_row;
+    int packed_per_row = packed_cols >> 2;
+    float acc = 0.0f;
+
+    for (int ki = lane; ki < packed_per_row; ki += 32) {
+        unsigned int packed4 = __ldg(w_row_u32 + ki);
+        int base_k = ki << 3;
+
+        float local_sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int col0 = base_k + i * 2;
+            if (col0 >= cols) break;
+            int byte_val = (packed4 >> (i * 8)) & 0xFF;
+            int q0 = byte_val & 0xF;
+            int group0 = col0 / group_size;
+            float w0 = (float(q0) - z_row[group0]) * s_row[group0];
+            float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[col0]));
+            local_sum += w0 * x0;
+
+            int col1 = col0 + 1;
+            if (col1 < cols) {
+                int q1 = byte_val >> 4;
+                int group1 = col1 / group_size;
+                float w1 = (float(q1) - z_row[group1]) * s_row[group1];
+                float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[col1]));
+                local_sum += w1 * x1;
+            }
+        }
+        acc += local_sum;
+    }
+
+    int vec_cols = packed_per_row << 3;
+    for (int k = vec_cols + lane * 2; k < cols; k += 64) {
+        unsigned char packed = w_row[k >> 1];
+        int q0 = packed & 0xF;
+        int g0 = k / group_size;
+        float w0 = (float(q0) - z_row[g0]) * s_row[g0];
+        float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+        acc += w0 * x0;
+        int k1 = k + 1;
+        if (k1 < cols) {
+            int q1 = packed >> 4;
+            int g1 = k1 / group_size;
+            float w1 = (float(q1) - z_row[g1]) * s_row[g1];
+            float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k1]));
+            acc += w1 * x1;
+        }
     }
 
     for (int offset = 16; offset > 0; offset >>= 1) {

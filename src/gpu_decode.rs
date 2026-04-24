@@ -13,7 +13,7 @@
 //! into the CUDA module at init time.
 
 use pyo3::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 
@@ -39,6 +39,7 @@ struct DecodeTraceConfig {
     steps: Option<TraceRange>,
     layers: Option<TraceRange>,
     components: Option<HashSet<String>>,
+    experts: Option<HashSet<usize>>,
     sample_values: usize,
     max_elems: usize,
     dump_dir: Option<String>,
@@ -68,6 +69,7 @@ impl DecodeTraceConfig {
             steps: parse_trace_range(std::env::var("KRASIS_TRACE_STEPS").ok().as_deref()),
             layers: parse_trace_range(std::env::var("KRASIS_TRACE_LAYERS").ok().as_deref()),
             components,
+            experts: parse_trace_id_set(std::env::var("KRASIS_TRACE_EXPERTS").ok().as_deref()),
             sample_values: std::env::var("KRASIS_TRACE_VALUES")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -117,6 +119,13 @@ impl DecodeTraceConfig {
             .map(|filters| filters.contains(&component.to_ascii_lowercase()))
             .unwrap_or(false)
     }
+
+    fn allows_expert(&self, expert: usize) -> bool {
+        self.experts
+            .as_ref()
+            .map(|experts| experts.contains(&expert))
+            .unwrap_or(true)
+    }
 }
 
 fn parse_trace_range(raw: Option<&str>) -> Option<TraceRange> {
@@ -131,6 +140,18 @@ fn parse_trace_range(raw: Option<&str>) -> Option<TraceRange> {
     }
     let value = raw.parse::<usize>().ok()?;
     Some(TraceRange { start: value, end: value })
+}
+
+fn parse_trace_id_set(raw: Option<&str>) -> Option<HashSet<usize>> {
+    let raw = raw?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    let set: HashSet<usize> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .collect();
+    if set.is_empty() { None } else { Some(set) }
 }
 
 fn trace_format_sample(values: &[f32]) -> String {
@@ -475,6 +496,7 @@ const KERNEL_NAMES: &[&str] = &[
     "embedding_lookup",
     "fused_add_rmsnorm",
     "rmsnorm",
+    "hqq4_dequant_bf16",
     "silu_mul",
     "sigmoid_topk",
     "softmax_topk",
@@ -513,6 +535,8 @@ const KERNEL_NAMES: &[&str] = &[
     "sigmoid_gate_inplace_bf16",
     "simple_int4_gemv_f32",
     "simple_int4_gemv_bf16",
+    "hqq4_decode_gemv_f32",
+    "hqq4_decode_gemv_bf16",
     "marlin_gemv_int4_v2_batched",
     "marlin_gemv_int8_v2_batched",
     "reduce_ksplits_bf16_batched",
@@ -1584,6 +1608,34 @@ struct GpuWeight {
     simple_scales_f32_ptr: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct GqaDecodeDiagCapture {
+    layer_idx: usize,
+    position: usize,
+    pre_attn_hidden: Vec<f32>,
+    q_proj_raw: Vec<f32>,
+    k_proj_raw: Vec<f32>,
+    v_proj_raw: Vec<f32>,
+    q_after_split: Vec<f32>,
+    q_after_rope: Vec<f32>,
+    k_after_rope: Vec<f32>,
+    v_after_rope: Vec<f32>,
+    gate_after_split: Vec<f32>,
+    attn_out: Vec<f32>,
+    o_proj_input: Vec<f32>,
+    o_proj_out: Vec<f32>,
+    post_attn_norm_hidden: Vec<f32>,
+    post_attn_norm_residual: Vec<f32>,
+    post_mlp_hidden: Vec<f32>,
+    post_mlp_residual: Vec<f32>,
+    final_pre_norm_hidden: Vec<f32>,
+    final_pre_norm_residual: Vec<f32>,
+    final_post_norm: Vec<f32>,
+    final_logits: Vec<f32>,
+    kv_k_cache: Vec<f32>,
+    kv_v_cache: Vec<f32>,
+}
+
 impl GpuWeight {
     /// Create a standard weight (BF16/FP32/FP16/FP8).
     fn new(ptr: u64, rows: usize, cols: usize, dtype: u8) -> Self {
@@ -1648,7 +1700,1307 @@ struct GpuDecodeLayer {
     post_attn_norm_ptr: u64,
     post_attn_norm_size: usize,
     attn: GpuAttnConfig,
+    hqq: Option<HqqLayerRegistration>,
+    hqq_exec: Option<HqqExecutionDescriptor>,
     mlp: GpuMlpConfig,
+}
+
+#[derive(Debug, Clone)]
+struct HqqTensorRegistration {
+    packed_ptr: u64,
+    scales_ptr: u64,
+    zeros_ptr: u64,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    axis: usize,
+    layout: String,
+    packed_dtype: String,
+    scales_dtype: String,
+    zeros_dtype: String,
+    original_dtype: String,
+    tensor_bytes: usize,
+    runtime_stage: String,
+    runtime_kind: String,
+    packed_row_stride_bytes: usize,
+    scales_row_stride_bytes: usize,
+    zeros_row_stride_bytes: usize,
+    rows_per_tile: usize,
+    row_blocks: usize,
+    kernel_ready: bool,
+}
+
+#[derive(Debug, Clone)]
+enum HqqLayerMetadata {
+    Gqa {
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sm_scale: f32,
+        q_norm_ptr: u64,
+        k_norm_ptr: u64,
+        gated: bool,
+    },
+    Mla {
+        num_heads: usize,
+        kv_lora_rank: usize,
+        ckv_cache_dim: usize,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        q_lora_rank: usize,
+        sm_scale: f32,
+        rope_interleave: bool,
+        kv_a_norm_ptr: u64,
+        w_kc_ptr: u64,
+        w_vc_ptr: u64,
+        ckv_cache_ptr: u64,
+        kpe_cache_ptr: u64,
+        q_a_norm_ptr: u64,
+    },
+    LinearAttention {
+        num_k_heads: usize,
+        num_v_heads: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        head_ratio: usize,
+        kernel_dim: usize,
+        conv_dim: usize,
+        scale: f32,
+        conv_weight_ptr: u64,
+        a_log_ptr: u64,
+        dt_bias_ptr: u64,
+        norm_weight_ptr: u64,
+        conv_state_ptr: u64,
+        recur_state_ptr: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct HqqLayerRegistration {
+    backend: String,
+    layer_kind: String,
+    format_version: usize,
+    nbits: u8,
+    metadata: HqqLayerMetadata,
+    tensors: HashMap<String, HqqTensorRegistration>,
+}
+
+#[derive(Debug, Clone)]
+struct HqqTensorExecDescriptor {
+    packed_ptr: u64,
+    scales_ptr: u64,
+    zeros_ptr: u64,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    axis: usize,
+    layout: String,
+    packed_dtype: String,
+    scales_dtype: String,
+    zeros_dtype: String,
+    original_dtype: String,
+    tensor_bytes: usize,
+    runtime_stage: String,
+    runtime_kind: String,
+    packed_row_stride_bytes: usize,
+    scales_row_stride_bytes: usize,
+    zeros_row_stride_bytes: usize,
+    rows_per_tile: usize,
+    row_blocks: usize,
+    logical_rows: usize,
+    gated_split_interleaved: bool,
+    kernel_ready: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HqqDecodeTimingEntry {
+    layer_idx: usize,
+    token_id: usize,
+    position: usize,
+    tensor_name: String,
+    output_mode: String,
+    duration_ms: f64,
+}
+
+#[derive(Debug, Clone)]
+struct HqqGqaExecutionDescriptor {
+    backend: String,
+    format_version: usize,
+    nbits: u8,
+    q_proj: HqqTensorExecDescriptor,
+    k_proj: HqqTensorExecDescriptor,
+    v_proj: HqqTensorExecDescriptor,
+    fused_qkv: Option<HqqTensorExecDescriptor>,
+    o_proj: HqqTensorExecDescriptor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sm_scale: f32,
+    q_norm_ptr: u64,
+    k_norm_ptr: u64,
+    gated: bool,
+    gated_q_rows: usize,
+    gated_gate_rows: usize,
+    fused_q_rows: usize,
+    fused_k_rows: usize,
+    fused_v_rows: usize,
+    gated_gate_uses_la_qkvz: bool,
+    gated_uses_bf16_o_proj: bool,
+    gated_bf16_o_proj_wid: usize,
+}
+
+#[derive(Debug, Clone)]
+struct HqqMlaExecutionDescriptor {
+    backend: String,
+    format_version: usize,
+    nbits: u8,
+    q_a_proj: Option<HqqTensorExecDescriptor>,
+    q_b_proj: Option<HqqTensorExecDescriptor>,
+    q_proj: Option<HqqTensorExecDescriptor>,
+    kv_a_proj_with_mqa: HqqTensorExecDescriptor,
+    o_proj: HqqTensorExecDescriptor,
+    num_heads: usize,
+    kv_lora_rank: usize,
+    ckv_cache_dim: usize,
+    qk_nope_dim: usize,
+    qk_rope_dim: usize,
+    v_head_dim: usize,
+    q_lora_rank: usize,
+    sm_scale: f32,
+    rope_interleave: bool,
+    kv_a_norm_ptr: u64,
+    w_kc_ptr: u64,
+    w_vc_ptr: u64,
+    ckv_cache_ptr: u64,
+    kpe_cache_ptr: u64,
+    q_a_norm_ptr: u64,
+}
+
+#[derive(Debug, Clone)]
+struct HqqLinearAttentionExecutionDescriptor {
+    backend: String,
+    format_version: usize,
+    nbits: u8,
+    in_proj_qkvz: HqqTensorExecDescriptor,
+    in_proj_ba: HqqTensorExecDescriptor,
+    out_proj: HqqTensorExecDescriptor,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    head_ratio: usize,
+    kernel_dim: usize,
+    conv_dim: usize,
+    scale: f32,
+    conv_weight_ptr: u64,
+    a_log_ptr: u64,
+    dt_bias_ptr: u64,
+    norm_weight_ptr: u64,
+    conv_state_ptr: u64,
+    recur_state_ptr: u64,
+}
+
+#[derive(Debug, Clone)]
+enum HqqExecutionDescriptor {
+    Gqa(HqqGqaExecutionDescriptor),
+    Mla(HqqMlaExecutionDescriptor),
+    LinearAttention(HqqLinearAttentionExecutionDescriptor),
+}
+
+impl GpuDecodeLayer {
+    fn placeholder() -> Self {
+        Self {
+            input_norm_ptr: 0,
+            input_norm_size: 0,
+            post_attn_norm_ptr: 0,
+            post_attn_norm_size: 0,
+            attn: GpuAttnConfig::GQA {
+                q_proj: 0, k_proj: 0, v_proj: 0, o_proj: 0, fused_qkv: None,
+                num_heads: 0, num_kv_heads: 0, head_dim: 0, sm_scale: 0.0,
+                q_norm_ptr: 0, k_norm_ptr: 0, gated: false,
+            },
+            hqq: None,
+            hqq_exec: None,
+            mlp: GpuMlpConfig::None,
+        }
+    }
+}
+
+impl From<&HqqTensorRegistration> for HqqTensorExecDescriptor {
+    fn from(value: &HqqTensorRegistration) -> Self {
+        Self {
+            packed_ptr: value.packed_ptr,
+            scales_ptr: value.scales_ptr,
+            zeros_ptr: value.zeros_ptr,
+            rows: value.rows,
+            cols: value.cols,
+            group_size: value.group_size,
+            axis: value.axis,
+            layout: value.layout.clone(),
+            packed_dtype: value.packed_dtype.clone(),
+            scales_dtype: value.scales_dtype.clone(),
+            zeros_dtype: value.zeros_dtype.clone(),
+            original_dtype: value.original_dtype.clone(),
+            tensor_bytes: value.tensor_bytes,
+            runtime_stage: value.runtime_stage.clone(),
+            runtime_kind: value.runtime_kind.clone(),
+            packed_row_stride_bytes: value.packed_row_stride_bytes,
+            scales_row_stride_bytes: value.scales_row_stride_bytes,
+            zeros_row_stride_bytes: value.zeros_row_stride_bytes,
+            rows_per_tile: value.rows_per_tile,
+            row_blocks: value.row_blocks,
+            logical_rows: value.rows,
+            gated_split_interleaved: false,
+            kernel_ready: value.kernel_ready,
+        }
+    }
+}
+
+fn required_hqq_tensor_exec(
+    tensors: &HashMap<String, HqqTensorRegistration>,
+    layer_idx: usize,
+    layer_kind: &str,
+    tensor_name: &str,
+) -> PyResult<HqqTensorExecDescriptor> {
+    tensors
+        .get(tensor_name)
+        .map(HqqTensorExecDescriptor::from)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ {} layer {} missing required tensor '{}'",
+                layer_kind, layer_idx, tensor_name
+            ))
+        })
+}
+
+fn optional_hqq_tensor_exec(
+    tensors: &HashMap<String, HqqTensorRegistration>,
+    tensor_name: &str,
+) -> Option<HqqTensorExecDescriptor> {
+    tensors.get(tensor_name).map(HqqTensorExecDescriptor::from)
+}
+
+fn hqq_tensor_exec_json(desc: &HqqTensorExecDescriptor, tensor_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "tensor_name": tensor_name,
+        "packed_ptr": desc.packed_ptr,
+        "scales_ptr": desc.scales_ptr,
+        "zeros_ptr": desc.zeros_ptr,
+        "orig_shape": [desc.rows, desc.cols],
+        "group_size": desc.group_size,
+        "axis": desc.axis,
+        "layout": desc.layout,
+        "packed_dtype": desc.packed_dtype,
+        "scales_dtype": desc.scales_dtype,
+        "zeros_dtype": desc.zeros_dtype,
+        "original_dtype": desc.original_dtype,
+        "tensor_bytes": desc.tensor_bytes,
+        "runtime_stage": desc.runtime_stage,
+        "runtime_kind": desc.runtime_kind,
+        "packed_row_stride_bytes": desc.packed_row_stride_bytes,
+        "scales_row_stride_bytes": desc.scales_row_stride_bytes,
+        "zeros_row_stride_bytes": desc.zeros_row_stride_bytes,
+        "rows_per_tile": desc.rows_per_tile,
+        "row_blocks": desc.row_blocks,
+        "logical_rows": desc.logical_rows,
+        "gated_split_interleaved": desc.gated_split_interleaved,
+        "kernel_ready": desc.kernel_ready,
+    })
+}
+
+fn hqq_runtime_format_json(desc: &HqqRuntimeFormatDescriptor) -> serde_json::Value {
+    serde_json::json!({
+        "stage": desc.stage,
+        "kind": desc.kind.as_str(),
+        "layout": desc.layout.clone(),
+        "packed_dtype": desc.packed_dtype.clone(),
+        "scales_dtype": desc.scales_dtype.clone(),
+        "zeros_dtype": desc.zeros_dtype.clone(),
+        "host_bytes": desc.host_bytes(),
+        "packed_bytes": desc.packed_bytes(),
+        "scales_bytes": desc.scales_bytes(),
+        "zeros_bytes": desc.zeros_bytes(),
+        "packed_component_bytes": desc.packed_component_bytes,
+        "scales_component_bytes": desc.scales_component_bytes,
+        "zeros_component_bytes": desc.zeros_component_bytes,
+        "row_blocks": desc.row_blocks,
+        "rows_per_tile": desc.rows_per_tile,
+        "packed_row_stride_bytes": desc.packed_row_stride_bytes,
+        "scales_row_stride_bytes": desc.scales_row_stride_bytes,
+        "zeros_row_stride_bytes": desc.zeros_row_stride_bytes,
+        "build_ms": desc.build_ms,
+        "kernel_ready": desc.kernel_ready,
+    })
+}
+
+fn hqq_runtime_slot_json(slot: &HqqRuntimeSlotEntry) -> serde_json::Value {
+    serde_json::json!({
+        "layer_idx": slot.layer_idx,
+        "tensor_name": slot.tensor_name,
+        "backend": slot.backend,
+        "format_version": slot.format_version,
+        "nbits": slot.nbits,
+        "rows": slot.rows,
+        "cols": slot.cols,
+        "group_size": slot.group_size,
+        "axis": slot.axis,
+        "layout": slot.layout.clone(),
+        "packed_dtype": slot.packed_dtype.clone(),
+        "scales_dtype": slot.scales_dtype.clone(),
+        "zeros_dtype": slot.zeros_dtype.clone(),
+        "packed_slot_bytes": slot.packed_slot_bytes,
+        "scales_slot_bytes": slot.scales_slot_bytes,
+        "zeros_slot_bytes": slot.zeros_slot_bytes,
+        "packed_slot_ptr": slot.packed_slot_ptr,
+        "scales_slot_ptr": slot.scales_slot_ptr,
+        "zeros_slot_ptr": slot.zeros_slot_ptr,
+        "registered": slot.is_registered(),
+        "registered_ms": slot.registered_ms,
+        "current_stage": slot.current_stage.clone(),
+        "last_swap_ms": slot.last_swap_ms,
+        "last_packed_memcpy_bytes": slot.last_packed_memcpy_bytes,
+        "last_scales_memcpy_bytes": slot.last_scales_memcpy_bytes,
+        "last_zeros_memcpy_bytes": slot.last_zeros_memcpy_bytes,
+        "prefill": hqq_runtime_format_json(&slot.prefill),
+        "decode": hqq_runtime_format_json(&slot.decode),
+    })
+}
+
+fn hqq_prefill_tensor_exec_json(
+    desc: &crate::gpu_prefill::HqqTensorExecDescriptor,
+    tensor_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tensor_name": tensor_name,
+        "packed_ptr": desc.packed_ptr,
+        "scales_ptr": desc.scales_ptr,
+        "zeros_ptr": desc.zeros_ptr,
+        "orig_shape": [desc.rows, desc.cols],
+        "group_size": desc.group_size,
+        "axis": desc.axis,
+        "layout": desc.layout,
+        "packed_dtype": desc.packed_dtype,
+        "scales_dtype": desc.scales_dtype,
+        "zeros_dtype": desc.zeros_dtype,
+        "original_dtype": desc.original_dtype,
+        "tensor_bytes": desc.tensor_bytes,
+    })
+}
+
+fn hqq_execution_json_value(exec: &HqqExecutionDescriptor) -> serde_json::Value {
+    match exec {
+        HqqExecutionDescriptor::Gqa(desc) => {
+            let mut tensors = vec![hqq_tensor_exec_json(&desc.o_proj, "o_proj")];
+            let projection_mode = if let Some(fused_qkv) = &desc.fused_qkv {
+                tensors.insert(0, hqq_tensor_exec_json(fused_qkv, "fused_qkv"));
+                "fused_qkv"
+            } else {
+                tensors.insert(0, hqq_tensor_exec_json(&desc.v_proj, "v_proj"));
+                tensors.insert(0, hqq_tensor_exec_json(&desc.k_proj, "k_proj"));
+                tensors.insert(0, hqq_tensor_exec_json(&desc.q_proj, "q_proj"));
+                "split_qkv"
+            };
+            serde_json::json!({
+                "layer_kind": "gqa",
+                "backend": desc.backend,
+                "format_version": desc.format_version,
+                "nbits": desc.nbits,
+                "metadata": {
+                    "projection_mode": projection_mode,
+                    "num_heads": desc.num_heads,
+                    "num_kv_heads": desc.num_kv_heads,
+                    "head_dim": desc.head_dim,
+                    "sm_scale": desc.sm_scale,
+                    "q_norm_ptr": desc.q_norm_ptr,
+                    "k_norm_ptr": desc.k_norm_ptr,
+                    "gated": desc.gated,
+                    "gated_q_rows": desc.gated_q_rows,
+                    "gated_gate_rows": desc.gated_gate_rows,
+                    "fused_q_rows": desc.fused_q_rows,
+                    "fused_k_rows": desc.fused_k_rows,
+                    "fused_v_rows": desc.fused_v_rows,
+                    "gated_gate_uses_la_qkvz": desc.gated_gate_uses_la_qkvz,
+                    "gated_uses_bf16_o_proj": desc.gated_uses_bf16_o_proj,
+                    "gated_bf16_o_proj_wid": desc.gated_bf16_o_proj_wid,
+                },
+                "tensors": tensors,
+            })
+        }
+        HqqExecutionDescriptor::Mla(desc) => {
+            let mut tensors = vec![
+                hqq_tensor_exec_json(&desc.kv_a_proj_with_mqa, "kv_a_proj_with_mqa"),
+                hqq_tensor_exec_json(&desc.o_proj, "o_proj"),
+            ];
+            if let Some(q_a_proj) = &desc.q_a_proj {
+                tensors.push(hqq_tensor_exec_json(q_a_proj, "q_a_proj"));
+            }
+            if let Some(q_b_proj) = &desc.q_b_proj {
+                tensors.push(hqq_tensor_exec_json(q_b_proj, "q_b_proj"));
+            }
+            if let Some(q_proj) = &desc.q_proj {
+                tensors.push(hqq_tensor_exec_json(q_proj, "q_proj"));
+            }
+            serde_json::json!({
+                "layer_kind": "mla",
+                "backend": desc.backend,
+                "format_version": desc.format_version,
+                "nbits": desc.nbits,
+                "metadata": {
+                    "num_heads": desc.num_heads,
+                    "kv_lora_rank": desc.kv_lora_rank,
+                    "ckv_cache_dim": desc.ckv_cache_dim,
+                    "qk_nope_dim": desc.qk_nope_dim,
+                    "qk_rope_dim": desc.qk_rope_dim,
+                    "v_head_dim": desc.v_head_dim,
+                    "q_lora_rank": desc.q_lora_rank,
+                    "sm_scale": desc.sm_scale,
+                    "rope_interleave": desc.rope_interleave,
+                    "kv_a_norm_ptr": desc.kv_a_norm_ptr,
+                    "w_kc_ptr": desc.w_kc_ptr,
+                    "w_vc_ptr": desc.w_vc_ptr,
+                    "ckv_cache_ptr": desc.ckv_cache_ptr,
+                    "kpe_cache_ptr": desc.kpe_cache_ptr,
+                    "q_a_norm_ptr": desc.q_a_norm_ptr,
+                },
+                "tensors": tensors,
+            })
+        }
+        HqqExecutionDescriptor::LinearAttention(desc) => serde_json::json!({
+            "layer_kind": "linear_attention",
+            "backend": desc.backend,
+            "format_version": desc.format_version,
+            "nbits": desc.nbits,
+            "metadata": {
+                "num_k_heads": desc.num_k_heads,
+                "num_v_heads": desc.num_v_heads,
+                "k_head_dim": desc.k_head_dim,
+                "v_head_dim": desc.v_head_dim,
+                "head_ratio": desc.head_ratio,
+                "kernel_dim": desc.kernel_dim,
+                "conv_dim": desc.conv_dim,
+                "scale": desc.scale,
+                "conv_weight_ptr": desc.conv_weight_ptr,
+                "a_log_ptr": desc.a_log_ptr,
+                "dt_bias_ptr": desc.dt_bias_ptr,
+                "norm_weight_ptr": desc.norm_weight_ptr,
+                "conv_state_ptr": desc.conv_state_ptr,
+                "recur_state_ptr": desc.recur_state_ptr,
+            },
+            "tensors": [
+                hqq_tensor_exec_json(&desc.in_proj_qkvz, "in_proj_qkvz"),
+                hqq_tensor_exec_json(&desc.in_proj_ba, "in_proj_ba"),
+                hqq_tensor_exec_json(&desc.out_proj, "out_proj"),
+            ],
+        }),
+    }
+}
+
+fn hqq_decode_dispatch_error(
+    layer_idx: usize,
+    expected_kind: &str,
+    exec: &HqqExecutionDescriptor,
+    requested_projection_mode: Option<&str>,
+) -> String {
+    match exec {
+        HqqExecutionDescriptor::Gqa(desc) => {
+            let projection_mode = requested_projection_mode.unwrap_or_else(|| {
+                if desc.fused_qkv.is_some() {
+                    "fused_qkv"
+                } else {
+                    "split_qkv"
+                }
+            });
+            if projection_mode == "fused_qkv" {
+                let fused_qkv = desc.fused_qkv.as_ref();
+                format!(
+                    "HQQ decode {} execution is not enabled for the current fused GQA path at layer {} (slot-backed decode runtime prepared; backend={} nbits={} format_v{} fused_qkv_present={} fused_qkv_kind={} fused_qkv_kernel_ready={} fused_qkv_rows={} fused_qkv_cols={} fused_q_rows={} fused_k_rows={} fused_v_rows={} o_proj_kind={} o_proj_kernel_ready={} gated={} gated_q_rows={} gated_gate_rows={} gated_gate_uses_la_qkvz={} gated_uses_bf16_o_proj={} gated_bf16_o_proj_wid={})",
+                    expected_kind,
+                    layer_idx,
+                    desc.backend,
+                    desc.nbits,
+                    desc.format_version,
+                    fused_qkv.is_some(),
+                    fused_qkv.map(|tensor| tensor.runtime_kind.as_str()).unwrap_or("missing"),
+                    fused_qkv.map(|tensor| tensor.kernel_ready).unwrap_or(false),
+                    fused_qkv.map(|tensor| tensor.rows).unwrap_or(0),
+                    fused_qkv.map(|tensor| tensor.cols).unwrap_or(0),
+                    desc.fused_q_rows,
+                    desc.fused_k_rows,
+                    desc.fused_v_rows,
+                    desc.o_proj.runtime_kind,
+                    desc.o_proj.kernel_ready,
+                    desc.gated,
+                    desc.gated_q_rows,
+                    desc.gated_gate_rows,
+                    desc.gated_gate_uses_la_qkvz,
+                    desc.gated_uses_bf16_o_proj,
+                    desc.gated_bf16_o_proj_wid
+                )
+            } else {
+                format!(
+                    "HQQ decode {} execution is not enabled for the current split GQA path at layer {} (slot-backed decode runtime prepared; backend={} nbits={} format_v{} q_proj_kind={} q_proj_kernel_ready={} o_proj_kind={} o_proj_kernel_ready={} gated={} q_proj_rows={} q_proj_cols={} gated_q_rows={} gated_gate_rows={} gated_gate_uses_la_qkvz={} gated_uses_bf16_o_proj={} gated_bf16_o_proj_wid={})",
+                    expected_kind, layer_idx, desc.backend, desc.nbits, desc.format_version, desc.q_proj.runtime_kind, desc.q_proj.kernel_ready, desc.o_proj.runtime_kind, desc.o_proj.kernel_ready, desc.gated, desc.q_proj.rows, desc.q_proj.cols, desc.gated_q_rows, desc.gated_gate_rows, desc.gated_gate_uses_la_qkvz, desc.gated_uses_bf16_o_proj, desc.gated_bf16_o_proj_wid
+                )
+            }
+        }
+        HqqExecutionDescriptor::Mla(desc) => format!(
+            "HQQ decode {} execution is not enabled yet at layer {} (slot-backed HQQ runtime prepared; registered kind=mla backend={} nbits={} format_v{} kv_a_proj_rows={} kv_a_proj_cols={})",
+            expected_kind, layer_idx, desc.backend, desc.nbits, desc.format_version, desc.kv_a_proj_with_mqa.rows, desc.kv_a_proj_with_mqa.cols
+        ),
+        HqqExecutionDescriptor::LinearAttention(desc) => format!(
+            "HQQ decode {} execution is not enabled yet at layer {} (slot-backed HQQ runtime prepared; registered kind=linear_attention backend={} nbits={} format_v{} in_proj_qkvz_rows={} in_proj_qkvz_cols={})",
+            expected_kind, layer_idx, desc.backend, desc.nbits, desc.format_version, desc.in_proj_qkvz.rows, desc.in_proj_qkvz.cols
+        ),
+    }
+}
+
+fn hqq_gqa_split_decode_ready(
+    desc: &HqqGqaExecutionDescriptor,
+    gated: bool,
+    num_heads: usize,
+    head_dim: usize,
+) -> bool {
+    desc.q_proj.kernel_ready
+        && desc.k_proj.kernel_ready
+        && desc.v_proj.kernel_ready
+        && desc.o_proj.kernel_ready
+        && ((!gated && !desc.gated)
+            || (gated
+                && desc.gated
+                && desc.q_proj.gated_split_interleaved
+                && desc.q_proj.logical_rows == num_heads * head_dim
+                && desc.gated_q_rows == num_heads * head_dim
+                && desc.gated_gate_rows == num_heads * head_dim
+                && desc.gated_gate_uses_la_qkvz
+                && !desc.gated_uses_bf16_o_proj))
+}
+
+fn hqq_gqa_fused_decode_ready(
+    desc: &HqqGqaExecutionDescriptor,
+    gated: bool,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> bool {
+    let Some(fused_qkv) = desc.fused_qkv.as_ref() else {
+        return false;
+    };
+    let q_rows = num_heads
+        .checked_mul(head_dim)
+        .and_then(|value| value.checked_mul(if gated { 2 } else { 1 }));
+    let kv_rows = num_kv_heads.checked_mul(head_dim);
+    matches!(
+        (q_rows, kv_rows),
+        (Some(expected_q_rows), Some(expected_kv_rows))
+            if desc.gated == gated
+                && fused_qkv.kernel_ready
+                && desc.o_proj.kernel_ready
+                && !desc.gated_uses_bf16_o_proj
+                && !fused_qkv.gated_split_interleaved
+                && fused_qkv.logical_rows == fused_qkv.rows
+                && desc.fused_q_rows == expected_q_rows
+                && desc.fused_k_rows == expected_kv_rows
+                && desc.fused_v_rows == expected_kv_rows
+                && fused_qkv.rows
+                    == expected_q_rows
+                        .checked_add(expected_kv_rows)
+                        .and_then(|value| value.checked_add(expected_kv_rows))
+                        .unwrap_or(usize::MAX)
+                && ((!gated && desc.gated_q_rows == 0 && desc.gated_gate_rows == 0)
+                    || (gated
+                        && desc.gated_q_rows == num_heads * head_dim
+                        && desc.gated_gate_rows == num_heads * head_dim
+                        && desc.gated_gate_uses_la_qkvz))
+    )
+}
+
+fn hqq_linear_attention_decode_ready(desc: &HqqLinearAttentionExecutionDescriptor) -> bool {
+    desc.in_proj_qkvz.kernel_ready && desc.in_proj_ba.kernel_ready && desc.out_proj.kernel_ready
+}
+
+fn validate_hqq4_tensor_desc(
+    tensor_name: &str,
+    desc: &HqqTensorExecDescriptor,
+) -> Result<(), String> {
+    validate_hqq4_tensor_desc_for_layout(
+        tensor_name,
+        desc,
+        "row_major_axis1_grouped_uint4_packed",
+        false,
+    )
+}
+
+fn validate_hqq4_tensor_desc_for_layout(
+    tensor_name: &str,
+    desc: &HqqTensorExecDescriptor,
+    expected_layout: &str,
+    require_kernel_ready: bool,
+) -> Result<(), String> {
+    if desc.axis != 1 {
+        return Err(format!(
+            "HQQ tensor {} uses unsupported axis {} (expected axis=1)",
+            tensor_name, desc.axis
+        ));
+    }
+    if desc.layout != expected_layout {
+        return Err(format!(
+            "HQQ tensor {} uses unsupported layout {} (expected {})",
+            tensor_name, desc.layout, expected_layout
+        ));
+    }
+    if desc.packed_dtype != "uint8" {
+        return Err(format!(
+            "HQQ tensor {} uses unsupported packed dtype {}",
+            tensor_name, desc.packed_dtype
+        ));
+    }
+    if desc.scales_dtype != "float32" || desc.zeros_dtype != "float32" {
+        return Err(format!(
+            "HQQ tensor {} uses unsupported scale/zero dtypes {}/{}",
+            tensor_name, desc.scales_dtype, desc.zeros_dtype
+        ));
+    }
+    if desc.group_size == 0 {
+        return Err(format!("HQQ tensor {} has invalid group_size=0", tensor_name));
+    }
+    if require_kernel_ready && !desc.kernel_ready {
+        return Err(format!(
+            "HQQ tensor {} decode runtime is not kernel-ready (stage={} kind={})",
+            tensor_name, desc.runtime_stage, desc.runtime_kind
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_hqq_tensors(
+    layer_idx: usize,
+    tensor_names: Vec<String>,
+    packed_ptrs: Vec<usize>,
+    scales_ptrs: Vec<usize>,
+    zeros_ptrs: Vec<usize>,
+    orig_rows: Vec<usize>,
+    orig_cols: Vec<usize>,
+    group_sizes: Vec<usize>,
+    axes: Vec<usize>,
+    layouts: Vec<String>,
+    packed_dtypes: Vec<String>,
+    scales_dtypes: Vec<String>,
+    zeros_dtypes: Vec<String>,
+    original_dtypes: Vec<String>,
+    tensor_bytes: Vec<usize>,
+) -> PyResult<HashMap<String, HqqTensorRegistration>> {
+    let tensor_count = tensor_names.len();
+    let lengths = [
+        packed_ptrs.len(),
+        scales_ptrs.len(),
+        zeros_ptrs.len(),
+        orig_rows.len(),
+        orig_cols.len(),
+        group_sizes.len(),
+        axes.len(),
+        layouts.len(),
+        packed_dtypes.len(),
+        scales_dtypes.len(),
+        zeros_dtypes.len(),
+        original_dtypes.len(),
+        tensor_bytes.len(),
+    ];
+    if lengths.iter().any(|&len| len != tensor_count) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "HQQ layer {} tensor descriptor field length mismatch",
+            layer_idx
+        )));
+    }
+    if tensor_count == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "HQQ layer {} has no tensor descriptors",
+            layer_idx
+        )));
+    }
+
+    let mut tensors = HashMap::new();
+    for idx in 0..tensor_count {
+        let tensor_name = tensor_names[idx].clone();
+        if tensor_name.trim().is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ layer {} has an empty tensor name",
+                layer_idx
+            )));
+        }
+        if packed_ptrs[idx] == 0 || scales_ptrs[idx] == 0 || zeros_ptrs[idx] == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ layer {} tensor '{}' has null pointer(s)",
+                layer_idx, tensor_name
+            )));
+        }
+        if orig_rows[idx] == 0 || orig_cols[idx] == 0 || group_sizes[idx] == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ layer {} tensor '{}' has invalid shape/group metadata ({}, {}, gs={})",
+                layer_idx, tensor_name, orig_rows[idx], orig_cols[idx], group_sizes[idx]
+            )));
+        }
+        if layouts[idx].trim().is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ layer {} tensor '{}' has empty layout tag",
+                layer_idx, tensor_name
+            )));
+        }
+        if tensors.contains_key(&tensor_name) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Duplicate HQQ tensor '{}' for layer {}",
+                tensor_name, layer_idx
+            )));
+        }
+        tensors.insert(
+            tensor_name,
+            HqqTensorRegistration {
+                packed_ptr: packed_ptrs[idx] as u64,
+                scales_ptr: scales_ptrs[idx] as u64,
+                zeros_ptr: zeros_ptrs[idx] as u64,
+                rows: orig_rows[idx],
+                cols: orig_cols[idx],
+                group_size: group_sizes[idx],
+                axis: axes[idx],
+                layout: layouts[idx].clone(),
+                packed_dtype: packed_dtypes[idx].clone(),
+                scales_dtype: scales_dtypes[idx].clone(),
+                zeros_dtype: zeros_dtypes[idx].clone(),
+                original_dtype: original_dtypes[idx].clone(),
+                tensor_bytes: tensor_bytes[idx],
+                runtime_stage: "canonical".to_string(),
+                runtime_kind: "canonical".to_string(),
+                packed_row_stride_bytes: orig_cols[idx].div_ceil(2),
+                scales_row_stride_bytes: orig_cols[idx].div_ceil(group_sizes[idx]) * std::mem::size_of::<f32>(),
+                zeros_row_stride_bytes: orig_cols[idx].div_ceil(group_sizes[idx]) * std::mem::size_of::<f32>(),
+                rows_per_tile: 1,
+                row_blocks: orig_rows[idx],
+                kernel_ready: false,
+            },
+        );
+    }
+
+    Ok(tensors)
+}
+
+fn derive_hqq_gqa_tensor_exec(
+    tensor_name: &str,
+    tensor: &HqqTensorExecDescriptor,
+    gated: bool,
+    num_heads: usize,
+    head_dim: usize,
+) -> PyResult<HqqTensorExecDescriptor> {
+    let mut desc = tensor.clone();
+    desc.logical_rows = desc.rows;
+    desc.gated_split_interleaved = false;
+    if gated && tensor_name == "q_proj" {
+        let expected_rows = num_heads
+            .checked_mul(head_dim)
+            .and_then(|value| value.checked_mul(2))
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "HQQ gated q_proj row count overflow for heads={} head_dim={}",
+                    num_heads, head_dim
+                ))
+            })?;
+        if desc.rows != expected_rows {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ gated q_proj rows mismatch: got {} expected {} (heads={} head_dim={})",
+                desc.rows, expected_rows, num_heads, head_dim
+            )));
+        }
+        desc.logical_rows = num_heads * head_dim;
+        desc.gated_split_interleaved = true;
+    }
+    Ok(desc)
+}
+
+fn derive_hqq_gqa_fused_qkv_exec(
+    tensor: &HqqTensorExecDescriptor,
+    gated: bool,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> PyResult<(HqqTensorExecDescriptor, usize, usize, usize)> {
+    let q_rows = num_heads
+        .checked_mul(head_dim)
+        .and_then(|value| value.checked_mul(if gated { 2 } else { 1 }))
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ fused_qkv q rows overflow for heads={} kv_heads={} head_dim={} gated={}",
+                num_heads, num_kv_heads, head_dim, gated
+            ))
+        })?;
+    let k_rows = num_kv_heads.checked_mul(head_dim).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "HQQ fused_qkv k/v rows overflow for heads={} kv_heads={} head_dim={}",
+            num_heads, num_kv_heads, head_dim
+        ))
+    })?;
+    let expected_rows = q_rows
+        .checked_add(k_rows)
+        .and_then(|value| value.checked_add(k_rows))
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ fused_qkv total rows overflow for heads={} kv_heads={} head_dim={} gated={}",
+                num_heads, num_kv_heads, head_dim, gated
+            ))
+        })?;
+    if tensor.rows != expected_rows {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "HQQ fused_qkv rows mismatch: got {} expected {} (q_rows={} k_rows={} v_rows={} heads={} kv_heads={} head_dim={} gated={})",
+            tensor.rows, expected_rows, q_rows, k_rows, k_rows, num_heads, num_kv_heads, head_dim, gated
+        )));
+    }
+
+    let mut desc = tensor.clone();
+    desc.logical_rows = desc.rows;
+    desc.gated_split_interleaved = false;
+    Ok((desc, q_rows, k_rows, k_rows))
+}
+
+fn register_hqq_attention_layer_common(
+    graph: &mut GpuDecodeGraph,
+    layer_idx: usize,
+    layer_kind: &str,
+    input_norm_ptr: usize,
+    input_norm_size: usize,
+    post_attn_norm_ptr: usize,
+    post_attn_norm_size: usize,
+    backend: &str,
+    nbits: usize,
+    format_version: usize,
+    metadata: HqqLayerMetadata,
+    tensors: HashMap<String, HqqTensorRegistration>,
+) -> PyResult<()> {
+    if nbits != 4 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Native HQQ registration only accepts nbits=4 today, got {}",
+            nbits
+        )));
+    }
+    match layer_kind {
+        "linear_attention" | "gqa" | "mla" => {}
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unsupported HQQ layer kind '{}'",
+                layer_kind
+            )))
+        }
+    }
+    if backend.trim().is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "HQQ backend tag must not be empty",
+        ));
+    }
+
+    while graph.layers.len() <= layer_idx {
+        graph.layers.push(GpuDecodeLayer::placeholder());
+    }
+    let existing_gqa_o_proj_wid = match &graph.layers[layer_idx].attn {
+        GpuAttnConfig::GQA { o_proj, .. } if *o_proj != 0 => Some(*o_proj),
+        _ => None,
+    };
+
+    let hqq_exec = match &metadata {
+        HqqLayerMetadata::Gqa {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale,
+            q_norm_ptr,
+            k_norm_ptr,
+            gated,
+        } => {
+            let q_proj =
+                required_hqq_tensor_exec(&tensors, layer_idx, layer_kind, "q_proj")?;
+            let k_proj =
+                required_hqq_tensor_exec(&tensors, layer_idx, layer_kind, "k_proj")?;
+            let v_proj =
+                required_hqq_tensor_exec(&tensors, layer_idx, layer_kind, "v_proj")?;
+            let o_proj =
+                required_hqq_tensor_exec(&tensors, layer_idx, layer_kind, "o_proj")?;
+            let fused_qkv = optional_hqq_tensor_exec(&tensors, "fused_qkv");
+            let q_proj = derive_hqq_gqa_tensor_exec("q_proj", &q_proj, *gated, *num_heads, *head_dim)?;
+            let k_proj = derive_hqq_gqa_tensor_exec("k_proj", &k_proj, *gated, *num_heads, *head_dim)?;
+            let v_proj = derive_hqq_gqa_tensor_exec("v_proj", &v_proj, *gated, *num_heads, *head_dim)?;
+            let o_proj = derive_hqq_gqa_tensor_exec("o_proj", &o_proj, *gated, *num_heads, *head_dim)?;
+            let (fused_qkv, fused_q_rows, fused_k_rows, fused_v_rows) =
+                if let Some(fused_qkv) = fused_qkv.as_ref() {
+                    let (desc, q_rows, k_rows, v_rows) = derive_hqq_gqa_fused_qkv_exec(
+                        fused_qkv,
+                        *gated,
+                        *num_heads,
+                        *num_kv_heads,
+                        *head_dim,
+                    )?;
+                    (Some(desc), q_rows, k_rows, v_rows)
+                } else {
+                    (None, 0, 0, 0)
+                };
+            HqqExecutionDescriptor::Gqa(HqqGqaExecutionDescriptor {
+                backend: backend.to_string(),
+                format_version,
+                nbits: nbits as u8,
+                q_proj,
+                k_proj,
+                v_proj,
+                fused_qkv,
+                o_proj,
+                num_heads: *num_heads,
+                num_kv_heads: *num_kv_heads,
+                head_dim: *head_dim,
+                sm_scale: *sm_scale,
+                q_norm_ptr: *q_norm_ptr,
+                k_norm_ptr: *k_norm_ptr,
+                gated: *gated,
+                gated_q_rows: if *gated { num_heads * head_dim } else { 0 },
+                gated_gate_rows: if *gated { num_heads * head_dim } else { 0 },
+                fused_q_rows,
+                fused_k_rows,
+                fused_v_rows,
+                gated_gate_uses_la_qkvz: *gated,
+                gated_uses_bf16_o_proj: false,
+                gated_bf16_o_proj_wid: existing_gqa_o_proj_wid.unwrap_or(0),
+            })
+        }
+        HqqLayerMetadata::Mla {
+            num_heads,
+            kv_lora_rank,
+            ckv_cache_dim,
+            qk_nope_dim,
+            qk_rope_dim,
+            v_head_dim,
+            q_lora_rank,
+            sm_scale,
+            rope_interleave,
+            kv_a_norm_ptr,
+            w_kc_ptr,
+            w_vc_ptr,
+            ckv_cache_ptr,
+            kpe_cache_ptr,
+            q_a_norm_ptr,
+        } => HqqExecutionDescriptor::Mla(HqqMlaExecutionDescriptor {
+            backend: backend.to_string(),
+            format_version,
+            nbits: nbits as u8,
+            q_a_proj: optional_hqq_tensor_exec(&tensors, "q_a_proj"),
+            q_b_proj: optional_hqq_tensor_exec(&tensors, "q_b_proj"),
+            q_proj: optional_hqq_tensor_exec(&tensors, "q_proj"),
+            kv_a_proj_with_mqa: required_hqq_tensor_exec(
+                &tensors,
+                layer_idx,
+                layer_kind,
+                "kv_a_proj_with_mqa",
+            )?,
+            o_proj: required_hqq_tensor_exec(&tensors, layer_idx, layer_kind, "o_proj")?,
+            num_heads: *num_heads,
+            kv_lora_rank: *kv_lora_rank,
+            ckv_cache_dim: *ckv_cache_dim,
+            qk_nope_dim: *qk_nope_dim,
+            qk_rope_dim: *qk_rope_dim,
+            v_head_dim: *v_head_dim,
+            q_lora_rank: *q_lora_rank,
+            sm_scale: *sm_scale,
+            rope_interleave: *rope_interleave,
+            kv_a_norm_ptr: *kv_a_norm_ptr,
+            w_kc_ptr: *w_kc_ptr,
+            w_vc_ptr: *w_vc_ptr,
+            ckv_cache_ptr: *ckv_cache_ptr,
+            kpe_cache_ptr: *kpe_cache_ptr,
+            q_a_norm_ptr: *q_a_norm_ptr,
+        }),
+        HqqLayerMetadata::LinearAttention {
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            head_ratio,
+            kernel_dim,
+            conv_dim,
+            scale,
+            conv_weight_ptr,
+            a_log_ptr,
+            dt_bias_ptr,
+            norm_weight_ptr,
+            conv_state_ptr,
+            recur_state_ptr,
+        } => HqqExecutionDescriptor::LinearAttention(HqqLinearAttentionExecutionDescriptor {
+            backend: backend.to_string(),
+            format_version,
+            nbits: nbits as u8,
+            in_proj_qkvz: required_hqq_tensor_exec(
+                &tensors,
+                layer_idx,
+                layer_kind,
+                "in_proj_qkvz",
+            )?,
+            in_proj_ba: required_hqq_tensor_exec(
+                &tensors,
+                layer_idx,
+                layer_kind,
+                "in_proj_ba",
+            )?,
+            out_proj: required_hqq_tensor_exec(&tensors, layer_idx, layer_kind, "out_proj")?,
+            num_k_heads: *num_k_heads,
+            num_v_heads: *num_v_heads,
+            k_head_dim: *k_head_dim,
+            v_head_dim: *v_head_dim,
+            head_ratio: *head_ratio,
+            kernel_dim: *kernel_dim,
+            conv_dim: *conv_dim,
+            scale: *scale,
+            conv_weight_ptr: *conv_weight_ptr,
+            a_log_ptr: *a_log_ptr,
+            dt_bias_ptr: *dt_bias_ptr,
+            norm_weight_ptr: *norm_weight_ptr,
+            conv_state_ptr: *conv_state_ptr,
+            recur_state_ptr: *recur_state_ptr,
+        }),
+    };
+
+    graph.layers[layer_idx].input_norm_ptr = input_norm_ptr as u64;
+    graph.layers[layer_idx].input_norm_size = input_norm_size;
+    graph.layers[layer_idx].post_attn_norm_ptr = post_attn_norm_ptr as u64;
+    graph.layers[layer_idx].post_attn_norm_size = post_attn_norm_size;
+    graph.layers[layer_idx].attn = match (&graph.layers[layer_idx].attn, &metadata) {
+        (
+            GpuAttnConfig::GQA {
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                fused_qkv,
+                ..
+            },
+            HqqLayerMetadata::Gqa {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                sm_scale,
+                q_norm_ptr,
+                k_norm_ptr,
+                gated,
+            },
+        ) => GpuAttnConfig::GQA {
+            q_proj: *q_proj,
+            k_proj: *k_proj,
+            v_proj: *v_proj,
+            o_proj: *o_proj,
+            fused_qkv: *fused_qkv,
+            num_heads: *num_heads,
+            num_kv_heads: *num_kv_heads,
+            head_dim: *head_dim,
+            sm_scale: *sm_scale,
+            q_norm_ptr: *q_norm_ptr,
+            k_norm_ptr: *k_norm_ptr,
+            gated: *gated,
+        },
+        (
+            GpuAttnConfig::MLA {
+                q_a_proj,
+                q_b_proj,
+                q_proj,
+                kv_a_proj,
+                o_proj,
+                ..
+            },
+            HqqLayerMetadata::Mla {
+                num_heads,
+                kv_lora_rank,
+                ckv_cache_dim,
+                qk_nope_dim,
+                qk_rope_dim,
+                v_head_dim,
+                q_lora_rank,
+                sm_scale,
+                rope_interleave,
+                kv_a_norm_ptr,
+                w_kc_ptr,
+                w_vc_ptr,
+                ckv_cache_ptr,
+                kpe_cache_ptr,
+                q_a_norm_ptr,
+            },
+        ) => GpuAttnConfig::MLA {
+            q_a_proj: *q_a_proj,
+            q_b_proj: *q_b_proj,
+            q_a_norm_ptr: *q_a_norm_ptr,
+            q_proj: *q_proj,
+            kv_a_proj: *kv_a_proj,
+            kv_a_norm_ptr: *kv_a_norm_ptr,
+            w_kc_ptr: *w_kc_ptr,
+            w_vc_ptr: *w_vc_ptr,
+            o_proj: *o_proj,
+            num_heads: *num_heads,
+            kv_lora_rank: *kv_lora_rank,
+            ckv_cache_dim: *ckv_cache_dim,
+            qk_nope_dim: *qk_nope_dim,
+            qk_rope_dim: *qk_rope_dim,
+            v_head_dim: *v_head_dim,
+            q_lora_rank: *q_lora_rank,
+            sm_scale: *sm_scale,
+            rope_interleave: *rope_interleave,
+            ckv_cache_ptr: *ckv_cache_ptr,
+            kpe_cache_ptr: *kpe_cache_ptr,
+        },
+        (
+            GpuAttnConfig::LinearAttention {
+                in_proj_qkvz,
+                in_proj_ba,
+                out_proj,
+                ..
+            },
+            HqqLayerMetadata::LinearAttention {
+                num_k_heads,
+                num_v_heads,
+                k_head_dim,
+                v_head_dim,
+                head_ratio,
+                kernel_dim,
+                conv_dim,
+                scale,
+                conv_weight_ptr,
+                a_log_ptr,
+                dt_bias_ptr,
+                norm_weight_ptr,
+                conv_state_ptr,
+                recur_state_ptr,
+            },
+        ) => GpuAttnConfig::LinearAttention {
+            in_proj_qkvz: *in_proj_qkvz,
+            in_proj_ba: *in_proj_ba,
+            out_proj: *out_proj,
+            conv_weight_ptr: *conv_weight_ptr,
+            a_log_ptr: *a_log_ptr,
+            dt_bias_ptr: *dt_bias_ptr,
+            norm_weight_ptr: *norm_weight_ptr,
+            nk: *num_k_heads,
+            nv: *num_v_heads,
+            dk: *k_head_dim,
+            dv: *v_head_dim,
+            hr: *head_ratio,
+            kernel_dim: *kernel_dim,
+            conv_dim: *conv_dim,
+            scale: *scale,
+            conv_state_ptr: *conv_state_ptr,
+            recur_state_ptr: *recur_state_ptr,
+        },
+        (_, HqqLayerMetadata::Gqa {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale,
+            q_norm_ptr,
+            k_norm_ptr,
+            gated,
+        }) => GpuAttnConfig::GQA {
+            q_proj: 0,
+            k_proj: 0,
+            v_proj: 0,
+            o_proj: if *gated { existing_gqa_o_proj_wid.unwrap_or(0) } else { 0 },
+            fused_qkv: None,
+            num_heads: *num_heads,
+            num_kv_heads: *num_kv_heads,
+            head_dim: *head_dim,
+            sm_scale: *sm_scale,
+            q_norm_ptr: *q_norm_ptr,
+            k_norm_ptr: *k_norm_ptr,
+            gated: *gated,
+        },
+        (_, HqqLayerMetadata::Mla {
+            num_heads,
+            kv_lora_rank,
+            ckv_cache_dim,
+            qk_nope_dim,
+            qk_rope_dim,
+            v_head_dim,
+            q_lora_rank,
+            sm_scale,
+            rope_interleave,
+            kv_a_norm_ptr,
+            w_kc_ptr,
+            w_vc_ptr,
+            ckv_cache_ptr,
+            kpe_cache_ptr,
+            q_a_norm_ptr,
+        }) => GpuAttnConfig::MLA {
+            q_a_proj: None,
+            q_b_proj: None,
+            q_a_norm_ptr: *q_a_norm_ptr,
+            q_proj: None,
+            kv_a_proj: 0,
+            kv_a_norm_ptr: *kv_a_norm_ptr,
+            w_kc_ptr: *w_kc_ptr,
+            w_vc_ptr: *w_vc_ptr,
+            o_proj: 0,
+            num_heads: *num_heads,
+            kv_lora_rank: *kv_lora_rank,
+            ckv_cache_dim: *ckv_cache_dim,
+            qk_nope_dim: *qk_nope_dim,
+            qk_rope_dim: *qk_rope_dim,
+            v_head_dim: *v_head_dim,
+            q_lora_rank: *q_lora_rank,
+            sm_scale: *sm_scale,
+            rope_interleave: *rope_interleave,
+            ckv_cache_ptr: *ckv_cache_ptr,
+            kpe_cache_ptr: *kpe_cache_ptr,
+        },
+        (_, HqqLayerMetadata::LinearAttention {
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            head_ratio,
+            kernel_dim,
+            conv_dim,
+            scale,
+            conv_weight_ptr,
+            a_log_ptr,
+            dt_bias_ptr,
+            norm_weight_ptr,
+            conv_state_ptr,
+            recur_state_ptr,
+        }) => GpuAttnConfig::LinearAttention {
+            in_proj_qkvz: 0,
+            in_proj_ba: 0,
+            out_proj: 0,
+            conv_weight_ptr: *conv_weight_ptr,
+            a_log_ptr: *a_log_ptr,
+            dt_bias_ptr: *dt_bias_ptr,
+            norm_weight_ptr: *norm_weight_ptr,
+            nk: *num_k_heads,
+            nv: *num_v_heads,
+            dk: *k_head_dim,
+            dv: *v_head_dim,
+            hr: *head_ratio,
+            kernel_dim: *kernel_dim,
+            conv_dim: *conv_dim,
+            scale: *scale,
+            conv_state_ptr: *conv_state_ptr,
+            recur_state_ptr: *recur_state_ptr,
+        },
+    };
+    graph.layers[layer_idx].hqq = Some(HqqLayerRegistration {
+        backend: backend.to_string(),
+        layer_kind: layer_kind.to_string(),
+        format_version,
+        nbits: nbits as u8,
+        metadata,
+        tensors,
+    });
+    graph.layers[layer_idx].hqq_exec = Some(hqq_exec);
+    log::info!(
+        "GpuDecodeStore: registered HQQ layer {} kind={} tensors={} backend={} nbits={} format_v{}",
+        layer_idx,
+        layer_kind,
+        graph.layers[layer_idx].hqq.as_ref().map(|v| v.tensors.len()).unwrap_or(0),
+        backend,
+        nbits,
+        format_version,
+    );
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -2352,6 +3704,213 @@ struct SingleSlotSwapEntry {
     simple_scales_host: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+enum HqqRuntimeFormatKind {
+    PrefillRowMajorV1,
+    DecodeRowAlignedV1,
+}
+
+impl HqqRuntimeFormatKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::PrefillRowMajorV1 => "prefill_row_major_v1",
+            Self::DecodeRowAlignedV1 => "decode_row_aligned_v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HqqRuntimeFormatDescriptor {
+    stage: &'static str,
+    kind: HqqRuntimeFormatKind,
+    layout: String,
+    packed_dtype: String,
+    scales_dtype: String,
+    zeros_dtype: String,
+    packed_host: Vec<u8>,
+    scales_host: Vec<u8>,
+    zeros_host: Vec<u8>,
+    packed_component_bytes: usize,
+    scales_component_bytes: usize,
+    zeros_component_bytes: usize,
+    row_blocks: usize,
+    rows_per_tile: usize,
+    packed_row_stride_bytes: usize,
+    scales_row_stride_bytes: usize,
+    zeros_row_stride_bytes: usize,
+    build_ms: f64,
+    kernel_ready: bool,
+}
+
+impl HqqRuntimeFormatDescriptor {
+    fn host_bytes(&self) -> usize {
+        self.packed_host.len() + self.scales_host.len() + self.zeros_host.len()
+    }
+
+    fn packed_bytes(&self) -> usize {
+        self.packed_host.len()
+    }
+
+    fn scales_bytes(&self) -> usize {
+        self.scales_host.len()
+    }
+
+    fn zeros_bytes(&self) -> usize {
+        self.zeros_host.len()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct HqqRuntimeStagingStats {
+    tensor_count: usize,
+    total_build_ms: f64,
+    total_host_bytes: usize,
+    prefill_host_bytes: usize,
+    decode_host_bytes: usize,
+    packed_slot_bytes: usize,
+    scales_slot_bytes: usize,
+    zeros_slot_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HqqRuntimeRegistrationStats {
+    slot_count: usize,
+    total_registration_ms: f64,
+    total_device_slot_bytes: usize,
+    packed_slot_bytes: usize,
+    scales_slot_bytes: usize,
+    zeros_slot_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HqqRuntimeSwapStats {
+    stage: String,
+    swap_count: usize,
+    total_swap_ms: f64,
+    total_host_bytes: usize,
+    packed_memcpy_bytes: usize,
+    scales_memcpy_bytes: usize,
+    zeros_memcpy_bytes: usize,
+}
+
+struct HqqRuntimeDeviceBuffers {
+    packed: CudaSlice<u8>,
+    scales: CudaSlice<u8>,
+    zeros: CudaSlice<u8>,
+}
+
+struct HqqRuntimeSlotEntry {
+    layer_idx: usize,
+    tensor_name: String,
+    backend: String,
+    format_version: usize,
+    nbits: u8,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    axis: usize,
+    layout: String,
+    packed_dtype: String,
+    scales_dtype: String,
+    zeros_dtype: String,
+    prefill: HqqRuntimeFormatDescriptor,
+    decode: HqqRuntimeFormatDescriptor,
+    packed_slot_bytes: usize,
+    scales_slot_bytes: usize,
+    zeros_slot_bytes: usize,
+    packed_slot_ptr: u64,
+    scales_slot_ptr: u64,
+    zeros_slot_ptr: u64,
+    registered_ms: f64,
+    current_stage: String,
+    last_swap_ms: f64,
+    last_packed_memcpy_bytes: usize,
+    last_scales_memcpy_bytes: usize,
+    last_zeros_memcpy_bytes: usize,
+    device_buffers: Option<HqqRuntimeDeviceBuffers>,
+}
+
+impl HqqRuntimeSlotEntry {
+    fn is_registered(&self) -> bool {
+        self.device_buffers.is_some()
+    }
+}
+
+impl Default for HqqRuntimeSlotEntry {
+    fn default() -> Self {
+        Self {
+            layer_idx: 0,
+            tensor_name: String::new(),
+            backend: String::new(),
+            format_version: 0,
+            nbits: 0,
+            rows: 0,
+            cols: 0,
+            group_size: 0,
+            axis: 0,
+            layout: String::new(),
+            packed_dtype: String::new(),
+            scales_dtype: String::new(),
+            zeros_dtype: String::new(),
+            prefill: HqqRuntimeFormatDescriptor {
+                stage: "",
+                kind: HqqRuntimeFormatKind::PrefillRowMajorV1,
+                layout: String::new(),
+                packed_dtype: String::new(),
+                scales_dtype: String::new(),
+                zeros_dtype: String::new(),
+                packed_host: Vec::new(),
+                scales_host: Vec::new(),
+                zeros_host: Vec::new(),
+                packed_component_bytes: 0,
+                scales_component_bytes: 0,
+                zeros_component_bytes: 0,
+                row_blocks: 0,
+                rows_per_tile: 0,
+                packed_row_stride_bytes: 0,
+                scales_row_stride_bytes: 0,
+                zeros_row_stride_bytes: 0,
+                build_ms: 0.0,
+                kernel_ready: false,
+            },
+            decode: HqqRuntimeFormatDescriptor {
+                stage: "",
+                kind: HqqRuntimeFormatKind::DecodeRowAlignedV1,
+                layout: String::new(),
+                packed_dtype: String::new(),
+                scales_dtype: String::new(),
+                zeros_dtype: String::new(),
+                packed_host: Vec::new(),
+                scales_host: Vec::new(),
+                zeros_host: Vec::new(),
+                packed_component_bytes: 0,
+                scales_component_bytes: 0,
+                zeros_component_bytes: 0,
+                row_blocks: 0,
+                rows_per_tile: 0,
+                packed_row_stride_bytes: 0,
+                scales_row_stride_bytes: 0,
+                zeros_row_stride_bytes: 0,
+                build_ms: 0.0,
+                kernel_ready: false,
+            },
+            packed_slot_bytes: 0,
+            scales_slot_bytes: 0,
+            zeros_slot_bytes: 0,
+            packed_slot_ptr: 0,
+            scales_slot_ptr: 0,
+            zeros_slot_ptr: 0,
+            registered_ms: 0.0,
+            current_stage: "unregistered".to_string(),
+            last_swap_ms: 0.0,
+            last_packed_memcpy_bytes: 0,
+            last_scales_memcpy_bytes: 0,
+            last_zeros_memcpy_bytes: 0,
+            device_buffers: None,
+        }
+    }
+}
+
 // ── PyO3 wrapper ───────────────────────────────────────────────────────
 
 #[pyclass]
@@ -2435,12 +3994,24 @@ pub struct GpuDecodeStore {
     /// Single-slot AWQ: swap entries for each attention weight. Host copies of both
     /// Marlin and simple INT4 formats, plus the fixed GPU slot addresses.
     single_slot_swaps: Vec<SingleSlotSwapEntry>,
+    /// HQQ runtime staging entries. These mirror AWQ's slot model at the metadata
+    /// level only: both stage-specific formats are built in host RAM, sized into
+    /// shared fixed slots, and kept explicitly non-executable until fused kernels exist.
+    hqq_runtime_slots: Vec<HqqRuntimeSlotEntry>,
+    hqq_runtime_staging_stats: HqqRuntimeStagingStats,
+    hqq_runtime_registration_stats: HqqRuntimeRegistrationStats,
+    hqq_runtime_last_swap: HqqRuntimeSwapStats,
+    hqq_decode_timing_entries: Vec<HqqDecodeTimingEntry>,
     #[cfg(feature = "gpu-debug")]
     debug_stop_layer: usize,
     #[cfg(feature = "gpu-debug")]
     debug_capture_layers: bool,
     #[cfg(feature = "gpu-debug")]
     debug_layer_captures: Vec<Vec<u16>>,
+    debug_gqa_diag_layer: Option<usize>,
+    debug_gqa_diag_capture: Option<GqaDecodeDiagCapture>,
+    /// HQQ decode materialization buffers kept alive for BF16 decode projections.
+    hqq_bf16_weight_bufs: Vec<CudaSlice<u16>>,
     /// Pre-allocated Rust prefill engine.
     /// Created early (before HCS) to claim scratch VRAM while it's still available.
     prefill_engine_slot: Option<crate::gpu_prefill::PrefillEngine>,
@@ -2454,6 +4025,524 @@ pub struct GpuDecodeStore {
 }
 
 impl GpuDecodeStore {
+    fn align_up(value: usize, align: usize) -> usize {
+        if align == 0 {
+            return value;
+        }
+        value.div_ceil(align) * align
+    }
+
+    fn recompute_hqq_runtime_staging_stats(&mut self) {
+        let mut stats = HqqRuntimeStagingStats::default();
+        for slot in &self.hqq_runtime_slots {
+            stats.tensor_count += 1;
+            stats.total_build_ms += slot.prefill.build_ms + slot.decode.build_ms;
+            stats.total_host_bytes += slot.prefill.host_bytes() + slot.decode.host_bytes();
+            stats.prefill_host_bytes += slot.prefill.host_bytes();
+            stats.decode_host_bytes += slot.decode.host_bytes();
+            stats.packed_slot_bytes += slot.packed_slot_bytes;
+            stats.scales_slot_bytes += slot.scales_slot_bytes;
+            stats.zeros_slot_bytes += slot.zeros_slot_bytes;
+        }
+        self.hqq_runtime_staging_stats = stats;
+    }
+
+    fn copy_host_bytes(src_ptr: usize, byte_len: usize, field: &str) -> PyResult<Vec<u8>> {
+        if src_ptr == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ staging field '{}' has null host pointer",
+                field
+            )));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(src_ptr as *const u8, byte_len) };
+        Ok(bytes.to_vec())
+    }
+
+    fn decode_host_f32(field: &str, bytes: &[u8], expected: usize) -> Result<Vec<f32>, String> {
+        let expected_bytes = expected * std::mem::size_of::<f32>();
+        if bytes.len() != expected_bytes {
+            return Err(format!(
+                "HQQ staging field '{}' byte count mismatch: got {} expected {}",
+                field,
+                bytes.len(),
+                expected_bytes,
+            ));
+        }
+        let mut out = Vec::with_capacity(expected);
+        for chunk in bytes.chunks_exact(4) {
+            out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(out)
+    }
+
+    fn encode_host_f32(values: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn build_hqq_runtime_tensors(
+        &self,
+        layer_idx: usize,
+        tensor_names: &[String],
+    ) -> Result<HashMap<String, HqqTensorRegistration>, String> {
+        if tensor_names.is_empty() {
+            return Err(format!("HQQ runtime layer {} has no tensor names", layer_idx));
+        }
+        let mut tensors = HashMap::new();
+        for tensor_name in tensor_names {
+            let slot = self
+                .hqq_runtime_slots
+                .iter()
+                .find(|slot| slot.layer_idx == layer_idx && slot.tensor_name == *tensor_name)
+                .ok_or_else(|| {
+                    format!(
+                        "HQQ runtime slot not found for layer {} tensor {}",
+                        layer_idx, tensor_name
+                    )
+                })?;
+            if !slot.is_registered() {
+                return Err(format!(
+                    "HQQ runtime slot not registered for layer {} tensor {}",
+                    layer_idx, tensor_name
+                ));
+            }
+            if slot.packed_slot_ptr == 0 || slot.scales_slot_ptr == 0 || slot.zeros_slot_ptr == 0 {
+                return Err(format!(
+                    "HQQ runtime slot has null device pointers for layer {} tensor {}",
+                    layer_idx, tensor_name
+                ));
+            }
+            if tensors.contains_key(tensor_name) {
+                return Err(format!(
+                    "Duplicate HQQ runtime tensor {} for layer {}",
+                    tensor_name, layer_idx
+                ));
+            }
+            tensors.insert(
+                tensor_name.clone(),
+                HqqTensorRegistration {
+                    packed_ptr: slot.packed_slot_ptr,
+                    scales_ptr: slot.scales_slot_ptr,
+                    zeros_ptr: slot.zeros_slot_ptr,
+                    rows: slot.rows,
+                    cols: slot.cols,
+                    group_size: slot.group_size,
+                    axis: slot.axis,
+                    layout: slot.decode.layout.clone(),
+                    packed_dtype: slot.decode.packed_dtype.clone(),
+                    scales_dtype: slot.decode.scales_dtype.clone(),
+                    zeros_dtype: slot.decode.zeros_dtype.clone(),
+                    original_dtype: format!(
+                        "slot_backed_runtime:{}:{}",
+                        slot.decode.stage,
+                        slot.decode.kind.as_str()
+                    ),
+                    tensor_bytes: slot.decode.packed_bytes()
+                        + slot.decode.scales_bytes()
+                        + slot.decode.zeros_bytes(),
+                    runtime_stage: slot.decode.stage.to_string(),
+                    runtime_kind: slot.decode.kind.as_str().to_string(),
+                    packed_row_stride_bytes: slot.decode.packed_row_stride_bytes,
+                    scales_row_stride_bytes: slot.decode.scales_row_stride_bytes,
+                    zeros_row_stride_bytes: slot.decode.zeros_row_stride_bytes,
+                    rows_per_tile: slot.decode.rows_per_tile,
+                    row_blocks: slot.decode.row_blocks,
+                    kernel_ready: slot.decode.kernel_ready,
+                },
+            );
+        }
+        Ok(tensors)
+    }
+
+    fn hqq_runtime_decode_exec_desc_for_tensor(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+    ) -> Result<HqqTensorExecDescriptor, String> {
+        let slot = self
+            .hqq_runtime_slots
+            .iter()
+            .find(|slot| slot.layer_idx == layer_idx && slot.tensor_name == tensor_name)
+            .ok_or_else(|| {
+                format!(
+                    "HQQ runtime decode slot not found for layer {} tensor {}",
+                    layer_idx, tensor_name
+                )
+            })?;
+        if !slot.is_registered() {
+            return Err(format!(
+                "HQQ runtime decode slot not registered for layer {} tensor {}",
+                layer_idx, tensor_name
+            ));
+        }
+        Ok(HqqTensorExecDescriptor {
+            packed_ptr: slot.packed_slot_ptr,
+            scales_ptr: slot.scales_slot_ptr,
+            zeros_ptr: slot.zeros_slot_ptr,
+            rows: slot.rows,
+            cols: slot.cols,
+            group_size: slot.group_size,
+            axis: slot.axis,
+            layout: slot.decode.layout.clone(),
+            packed_dtype: slot.decode.packed_dtype.clone(),
+            scales_dtype: slot.decode.scales_dtype.clone(),
+            zeros_dtype: slot.decode.zeros_dtype.clone(),
+            original_dtype: format!(
+                "slot_backed_runtime:{}:{}",
+                slot.decode.stage,
+                slot.decode.kind.as_str()
+            ),
+            tensor_bytes: slot.decode.packed_bytes() + slot.decode.scales_bytes() + slot.decode.zeros_bytes(),
+            runtime_stage: slot.decode.stage.to_string(),
+            runtime_kind: slot.decode.kind.as_str().to_string(),
+            packed_row_stride_bytes: slot.decode.packed_row_stride_bytes,
+            scales_row_stride_bytes: slot.decode.scales_row_stride_bytes,
+            zeros_row_stride_bytes: slot.decode.zeros_row_stride_bytes,
+            rows_per_tile: slot.decode.rows_per_tile,
+            row_blocks: slot.decode.row_blocks,
+            logical_rows: slot.rows,
+            gated_split_interleaved: false,
+            kernel_ready: slot.decode.kernel_ready,
+        })
+    }
+
+    fn hqq_runtime_prefill_exec_desc_for_tensor(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+    ) -> Result<HqqTensorExecDescriptor, String> {
+        let slot = self
+            .hqq_runtime_slots
+            .iter()
+            .find(|slot| slot.layer_idx == layer_idx && slot.tensor_name == tensor_name)
+            .ok_or_else(|| {
+                format!(
+                    "HQQ runtime prefill slot not found for layer {} tensor {}",
+                    layer_idx, tensor_name
+                )
+            })?;
+        if !slot.is_registered() {
+            return Err(format!(
+                "HQQ runtime prefill slot not registered for layer {} tensor {}",
+                layer_idx, tensor_name
+            ));
+        }
+        Ok(HqqTensorExecDescriptor {
+            packed_ptr: slot.packed_slot_ptr,
+            scales_ptr: slot.scales_slot_ptr,
+            zeros_ptr: slot.zeros_slot_ptr,
+            rows: slot.rows,
+            cols: slot.cols,
+            group_size: slot.group_size,
+            axis: slot.axis,
+            layout: slot.prefill.layout.clone(),
+            packed_dtype: slot.prefill.packed_dtype.clone(),
+            scales_dtype: slot.prefill.scales_dtype.clone(),
+            zeros_dtype: slot.prefill.zeros_dtype.clone(),
+            original_dtype: format!(
+                "slot_backed_runtime:{}:{}",
+                slot.prefill.stage,
+                slot.prefill.kind.as_str()
+            ),
+            tensor_bytes: slot.prefill.packed_bytes()
+                + slot.prefill.scales_bytes()
+                + slot.prefill.zeros_bytes(),
+            runtime_stage: slot.prefill.stage.to_string(),
+            runtime_kind: slot.prefill.kind.as_str().to_string(),
+            packed_row_stride_bytes: slot.prefill.packed_row_stride_bytes,
+            scales_row_stride_bytes: slot.prefill.scales_row_stride_bytes,
+            zeros_row_stride_bytes: slot.prefill.zeros_row_stride_bytes,
+            rows_per_tile: slot.prefill.rows_per_tile,
+            row_blocks: slot.prefill.row_blocks,
+            logical_rows: slot.rows,
+            gated_split_interleaved: false,
+            kernel_ready: true,
+        })
+    }
+
+    fn build_hqq_prefill_runtime_format(
+        packed_host: &[u8],
+        scales_host: &[u8],
+        zeros_host: &[u8],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<HqqRuntimeFormatDescriptor, String> {
+        let t0 = std::time::Instant::now();
+        let groups = cols.div_ceil(group_size);
+        let padded_cols = groups * group_size;
+        let packed_cols = padded_cols.div_ceil(2);
+        let canonical_packed_bytes = rows * packed_cols;
+        if packed_host.len() != canonical_packed_bytes {
+            return Err(format!(
+                "HQQ canonical packed bytes mismatch: got {} expected {} (rows={} packed_cols={})",
+                packed_host.len(),
+                canonical_packed_bytes,
+                rows,
+                packed_cols,
+            ));
+        }
+        Ok(HqqRuntimeFormatDescriptor {
+            stage: "prefill",
+            kind: HqqRuntimeFormatKind::PrefillRowMajorV1,
+            layout: "row_major_axis1_grouped_uint4_packed".to_string(),
+            packed_dtype: "uint8".to_string(),
+            scales_dtype: "float32".to_string(),
+            zeros_dtype: "float32".to_string(),
+            packed_host: packed_host.to_vec(),
+            scales_host: scales_host.to_vec(),
+            zeros_host: zeros_host.to_vec(),
+            packed_component_bytes: packed_cols,
+            scales_component_bytes: groups * std::mem::size_of::<f32>(),
+            zeros_component_bytes: groups * std::mem::size_of::<f32>(),
+            row_blocks: rows,
+            rows_per_tile: 1,
+            packed_row_stride_bytes: packed_cols,
+            scales_row_stride_bytes: groups * std::mem::size_of::<f32>(),
+            zeros_row_stride_bytes: groups * std::mem::size_of::<f32>(),
+            build_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            kernel_ready: true,
+        })
+    }
+
+    fn build_hqq_decode_runtime_format(
+        packed_host: &[u8],
+        scales_host: &[u8],
+        zeros_host: &[u8],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<HqqRuntimeFormatDescriptor, String> {
+        let t0 = std::time::Instant::now();
+        let groups = cols.div_ceil(group_size);
+        let padded_cols = groups * group_size;
+        let packed_cols = padded_cols.div_ceil(2);
+        let canonical_packed_bytes = rows * packed_cols;
+        if packed_host.len() != canonical_packed_bytes {
+            return Err(format!(
+                "HQQ canonical packed bytes mismatch: got {} expected {} (rows={} packed_cols={})",
+                packed_host.len(),
+                canonical_packed_bytes,
+                rows,
+                packed_cols,
+            ));
+        }
+        let scales = Self::decode_host_f32("scales", scales_host, rows * groups)?;
+        let zeros = Self::decode_host_f32("zeros", zeros_host, rows * groups)?;
+        let packed_row_stride_bytes = Self::align_up(packed_cols, 16);
+        let groups_aligned = Self::align_up(groups, 8);
+        let scales_row_stride_values = groups_aligned;
+        let zeros_row_stride_values = groups_aligned;
+        let scales_row_stride_bytes = scales_row_stride_values * std::mem::size_of::<f32>();
+        let zeros_row_stride_bytes = zeros_row_stride_values * std::mem::size_of::<f32>();
+        let mut packed = vec![0u8; rows * packed_row_stride_bytes];
+        let mut scales_aligned = vec![0.0f32; rows * scales_row_stride_values];
+        let mut zeros_aligned = vec![0.0f32; rows * zeros_row_stride_values];
+        for row in 0..rows {
+            let packed_src = row * packed_cols;
+            let packed_dst = row * packed_row_stride_bytes;
+            packed[packed_dst..packed_dst + packed_cols]
+                .copy_from_slice(&packed_host[packed_src..packed_src + packed_cols]);
+            let group_src = row * groups;
+            let scale_dst = row * scales_row_stride_values;
+            scales_aligned[scale_dst..scale_dst + groups]
+                .copy_from_slice(&scales[group_src..group_src + groups]);
+            zeros_aligned[scale_dst..scale_dst + groups]
+                .copy_from_slice(&zeros[group_src..group_src + groups]);
+        }
+
+        Ok(HqqRuntimeFormatDescriptor {
+            stage: "decode",
+            kind: HqqRuntimeFormatKind::DecodeRowAlignedV1,
+            layout: "row_aligned_grouped_uint4_decode_v1".to_string(),
+            packed_dtype: "uint8".to_string(),
+            scales_dtype: "float32".to_string(),
+            zeros_dtype: "float32".to_string(),
+            packed_host: packed,
+            scales_host: Self::encode_host_f32(&scales_aligned),
+            zeros_host: Self::encode_host_f32(&zeros_aligned),
+            packed_component_bytes: packed_row_stride_bytes,
+            scales_component_bytes: scales_row_stride_bytes,
+            zeros_component_bytes: zeros_row_stride_bytes,
+            row_blocks: rows,
+            rows_per_tile: 1,
+            packed_row_stride_bytes,
+            scales_row_stride_bytes,
+            zeros_row_stride_bytes,
+            build_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            kernel_ready: true,
+        })
+    }
+
+    fn hqq_runtime_zero_slot_tail(slot_ptr: u64, filled_bytes: usize, slot_bytes: usize) -> Result<(), String> {
+        if slot_bytes <= filled_bytes {
+            return Ok(());
+        }
+        unsafe {
+            let err = cuda_sys::lib().cuMemsetD8_v2(
+                slot_ptr + filled_bytes as u64,
+                0,
+                (slot_bytes - filled_bytes) as usize,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!(
+                    "HQQ slot tail memset failed ptr={:#x} filled={} slot={} err={:?}",
+                    slot_ptr, filled_bytes, slot_bytes, err
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn hqq_runtime_copy_component(
+        slot_ptr: u64,
+        slot_bytes: usize,
+        host_bytes: &[u8],
+        component_name: &str,
+    ) -> Result<usize, String> {
+        if host_bytes.len() > slot_bytes {
+            return Err(format!(
+                "HQQ {} host bytes exceed slot capacity: host={} slot={}",
+                component_name,
+                host_bytes.len(),
+                slot_bytes,
+            ));
+        }
+        if !host_bytes.is_empty() {
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    slot_ptr,
+                    host_bytes.as_ptr() as *const std::ffi::c_void,
+                    host_bytes.len(),
+                );
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!(
+                        "HQQ {} HtoD failed ptr={:#x} bytes={} err={:?}",
+                        component_name, slot_ptr, host_bytes.len(), err
+                    ));
+                }
+            }
+        }
+        Self::hqq_runtime_zero_slot_tail(slot_ptr, host_bytes.len(), slot_bytes)?;
+        Ok(host_bytes.len())
+    }
+
+    fn hqq_runtime_stage_desc<'a>(
+        slot: &'a HqqRuntimeSlotEntry,
+        stage: &str,
+    ) -> Result<&'a HqqRuntimeFormatDescriptor, String> {
+        match stage {
+            "prefill" => Ok(&slot.prefill),
+            "decode" => Ok(&slot.decode),
+            other => Err(format!("Unsupported HQQ runtime stage '{}'", other)),
+        }
+    }
+
+    fn download_device_f32(&self, ptr: u64, count: usize) -> Result<Vec<f32>, String> {
+        let mut out = vec![0.0f32; count];
+        unsafe {
+            let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                out.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr,
+                count * std::mem::size_of::<f32>(),
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("D2H f32 ptr={:#x} count={}: {:?}", ptr, count, err));
+            }
+        }
+        Ok(out)
+    }
+
+    fn download_device_bf16_as_f32(&self, ptr: u64, count: usize) -> Result<Vec<f32>, String> {
+        let mut raw = vec![0u16; count];
+        unsafe {
+            let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                raw.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr,
+                count * std::mem::size_of::<u16>(),
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("D2H bf16 ptr={:#x} count={}: {:?}", ptr, count, err));
+            }
+        }
+        Ok(raw
+            .into_iter()
+            .map(crate::weights::marlin::bf16_to_f32)
+            .collect())
+    }
+
+    fn capture_gqa_decode_diag(
+        &self,
+        graph: &GpuDecodeGraph,
+        layer_idx: usize,
+        position: usize,
+        pre_attn_hidden: Vec<f32>,
+        q_proj_raw: Vec<f32>,
+        k_proj_raw: Vec<f32>,
+        v_proj_raw: Vec<f32>,
+        q_after_split: Vec<f32>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        gated: bool,
+        o_size: usize,
+        kv_stride: usize,
+    ) -> Result<GqaDecodeDiagCapture, String> {
+        if self.debug_gqa_diag_layer != Some(layer_idx) {
+            return Err("GQA decode diagnostics not enabled for this layer".to_string());
+        }
+        let seq_len = position + 1;
+        let mut capture = GqaDecodeDiagCapture {
+            layer_idx,
+            position,
+            pre_attn_hidden,
+            q_proj_raw,
+            k_proj_raw,
+            v_proj_raw,
+            q_after_split,
+            q_after_rope: Vec::new(),
+            k_after_rope: Vec::new(),
+            v_after_rope: Vec::new(),
+            gate_after_split: Vec::new(),
+            attn_out: Vec::new(),
+            o_proj_input: Vec::new(),
+            o_proj_out: Vec::new(),
+            post_attn_norm_hidden: Vec::new(),
+            post_attn_norm_residual: Vec::new(),
+            post_mlp_hidden: Vec::new(),
+            post_mlp_residual: Vec::new(),
+            final_pre_norm_hidden: Vec::new(),
+            final_pre_norm_residual: Vec::new(),
+            final_post_norm: Vec::new(),
+            final_logits: Vec::new(),
+            kv_k_cache: Vec::new(),
+            kv_v_cache: Vec::new(),
+        };
+        capture.q_after_rope = self.download_device_f32(*graph.d_gqa_q.device_ptr(), num_heads * head_dim)?;
+        capture.k_after_rope = self.download_device_f32(*graph.d_gqa_k.device_ptr(), num_kv_heads * head_dim)?;
+        capture.v_after_rope = self.download_device_f32(*graph.d_gqa_v.device_ptr(), num_kv_heads * head_dim)?;
+        if gated {
+            capture.gate_after_split = self.download_device_f32(*graph.d_la_qkvz.device_ptr(), num_heads * head_dim)?;
+        }
+        capture.attn_out = self.download_device_f32(*graph.d_gqa_out.device_ptr(), o_size)?;
+        capture.o_proj_input = self.download_device_bf16_as_f32(*graph.d_scratch.device_ptr(), o_size)?;
+        capture.o_proj_out = self.download_device_bf16_as_f32(*graph.d_hidden.device_ptr(), graph.hidden_size)?;
+        if graph.kv_format == 0
+            && layer_idx < graph.kv_k_ptrs.len()
+            && graph.kv_k_ptrs[layer_idx] != 0
+            && graph.kv_v_ptrs[layer_idx] != 0
+        {
+            capture.kv_k_cache =
+                self.download_device_bf16_as_f32(graph.kv_k_ptrs[layer_idx], seq_len * kv_stride)?;
+            capture.kv_v_cache =
+                self.download_device_bf16_as_f32(graph.kv_v_ptrs[layer_idx], seq_len * kv_stride)?;
+        }
+        Ok(capture)
+    }
+
     fn refresh_trace_config(&mut self) {
         self.trace_config = DecodeTraceConfig::from_env();
     }
@@ -2490,6 +4579,264 @@ impl GpuDecodeStore {
             .unwrap_or(fallback);
         graph.trace_request_label = label.clone();
         (graph.trace_request_seq, label)
+    }
+
+    fn hqq4_dequant_to_bf16(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        out_ptr: u64,
+    ) -> Result<(), String> {
+        validate_hqq4_tensor_desc(tensor_name, desc)?;
+        let total = desc.rows * desc.cols;
+        if total == 0 {
+            return Ok(());
+        }
+        let kernel = self
+            .device
+            .get_func(MODULE_NAME, "hqq4_dequant_bf16")
+            .ok_or_else(|| "decode kernel hqq4_dequant_bf16 not loaded".to_string())?;
+        unsafe {
+            kernel
+                .launch(
+                    LaunchConfig::for_num_elems(total as u32),
+                    (
+                        out_ptr,
+                        desc.packed_ptr,
+                        desc.scales_ptr,
+                        desc.zeros_ptr,
+                        desc.rows as i32,
+                        desc.cols as i32,
+                        desc.group_size as i32,
+                    ),
+                )
+                .map_err(|e| format!("hqq4_dequant_bf16 {tensor_name}: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    fn launch_hqq4_decode_gemv_f32(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        validate_hqq4_tensor_desc_for_layout(
+            tensor_name,
+            desc,
+            "row_aligned_grouped_uint4_decode_v1",
+            true,
+        )?;
+        let rows = desc.rows;
+        let cols = desc.cols;
+        let blocks = ((rows + 7) / 8) as u32;
+        let smem = (cols as u32) * 2;
+        let kernel = self
+            .device
+            .get_func(MODULE_NAME, "hqq4_decode_gemv_f32")
+            .ok_or_else(|| "hqq4_decode_gemv_f32 kernel not found".to_string())?;
+        unsafe {
+            kernel
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (blocks, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    },
+                    (
+                        desc.packed_ptr,
+                        desc.scales_ptr,
+                        desc.zeros_ptr,
+                        input_ptr,
+                        output_ptr,
+                        rows as i32,
+                        cols as i32,
+                        desc.group_size as i32,
+                        desc.packed_row_stride_bytes as i32,
+                        desc.scales_row_stride_bytes as i32,
+                        desc.zeros_row_stride_bytes as i32,
+                    ),
+                )
+                .map_err(|e| format!("hqq4_decode_gemv_f32 {tensor_name}: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    fn launch_fp32_to_bf16(
+        &self,
+        output_ptr: u64,
+        input_ptr: u64,
+        size: usize,
+    ) -> Result<(), String> {
+        let kernel = self
+            .device
+            .get_func(MODULE_NAME, "fp32_to_bf16")
+            .ok_or_else(|| "fp32_to_bf16 kernel not found".to_string())?;
+        unsafe {
+            kernel
+                .launch(
+                    LaunchConfig::for_num_elems(size as u32),
+                    (output_ptr, input_ptr, size as i32),
+                )
+                .map_err(|e| format!("fp32_to_bf16: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    fn launch_hqq4_decode_gemv_bf16(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        validate_hqq4_tensor_desc_for_layout(
+            tensor_name,
+            desc,
+            "row_aligned_grouped_uint4_decode_v1",
+            true,
+        )?;
+        let rows = desc.rows;
+        let cols = desc.cols;
+        let blocks = ((rows + 7) / 8) as u32;
+        let smem = (cols as u32) * 2;
+        let kernel = self
+            .device
+            .get_func(MODULE_NAME, "hqq4_decode_gemv_bf16")
+            .ok_or_else(|| "hqq4_decode_gemv_bf16 kernel not found".to_string())?;
+        unsafe {
+            kernel
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (blocks, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    },
+                    (
+                        desc.packed_ptr,
+                        desc.scales_ptr,
+                        desc.zeros_ptr,
+                        input_ptr,
+                        output_ptr,
+                        rows as i32,
+                        cols as i32,
+                        desc.group_size as i32,
+                        desc.packed_row_stride_bytes as i32,
+                        desc.scales_row_stride_bytes as i32,
+                        desc.zeros_row_stride_bytes as i32,
+                    ),
+                )
+                .map_err(|e| format!("hqq4_decode_gemv_bf16 {tensor_name}: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    fn record_hqq_decode_timing(
+        device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+        entries: &mut Vec<HqqDecodeTimingEntry>,
+        layer_idx: usize,
+        token_id: usize,
+        position: usize,
+        tensor_name: &str,
+        output_mode: &str,
+        start: std::time::Instant,
+        timing_enabled: bool,
+    ) -> Result<(), String> {
+        if !timing_enabled {
+            return Ok(());
+        }
+        device
+            .synchronize()
+            .map_err(|e| format!("hqq timing sync {}: {:?}", tensor_name, e))?;
+        entries.push(HqqDecodeTimingEntry {
+            layer_idx,
+            token_id,
+            position,
+            tensor_name: tensor_name.to_string(),
+            output_mode: output_mode.to_string(),
+            duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+        });
+        Ok(())
+    }
+
+    fn materialize_hqq_gqa_decode_weights(&mut self, layer_idx: usize) -> Result<(), String> {
+        let exec = self
+            .graph
+            .as_ref()
+            .ok_or_else(|| "Call configure first".to_string())?
+            .layers
+            .get(layer_idx)
+            .and_then(|layer| layer.hqq_exec.as_ref())
+            .ok_or_else(|| format!("HQQ layer {} not registered", layer_idx))?
+            .clone();
+        let HqqExecutionDescriptor::Gqa(desc) = exec else {
+            return Err(format!(
+                "HQQ decode BF16 materialization only supports GQA layers, got layer {}",
+                layer_idx
+            ));
+        };
+        if desc.nbits != 4 {
+            return Err(format!(
+                "HQQ decode GQA only supports nbits=4 today, got {} at layer {}",
+                desc.nbits, layer_idx
+            ));
+        }
+
+        let t0 = std::time::Instant::now();
+        let make_weight = |rows: usize, cols: usize, ptr: u64| GpuWeight::new(ptr, rows, cols, 0);
+        let mut staged_weights: Vec<GpuWeight> = Vec::with_capacity(4);
+        let mut alloc_and_stage = |tensor_name: &str, tensor: &HqqTensorExecDescriptor| -> Result<(), String> {
+            let buf = self
+                .device
+                .alloc_zeros::<u16>(tensor.rows * tensor.cols)
+                .map_err(|e| format!("alloc HQQ decode {} BF16 layer {}: {:?}", tensor_name, layer_idx, e))?;
+            let ptr = *buf.device_ptr();
+            self.hqq4_dequant_to_bf16(tensor_name, tensor, ptr)?;
+            self.hqq_bf16_weight_bufs.push(buf);
+            staged_weights.push(make_weight(tensor.rows, tensor.cols, ptr));
+            Ok(())
+        };
+
+        alloc_and_stage("q_proj", &desc.q_proj)?;
+        alloc_and_stage("k_proj", &desc.k_proj)?;
+        alloc_and_stage("v_proj", &desc.v_proj)?;
+        alloc_and_stage("o_proj", &desc.o_proj)?;
+
+        self.device
+            .synchronize()
+            .map_err(|e| format!("sync HQQ decode materialization layer {}: {:?}", layer_idx, e))?;
+
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or_else(|| "Call configure first".to_string())?;
+        let base_wid = graph.weights.len();
+        graph.weights.extend(staged_weights);
+        graph.layers[layer_idx].attn = GpuAttnConfig::GQA {
+            q_proj: base_wid,
+            k_proj: base_wid + 1,
+            v_proj: base_wid + 2,
+            o_proj: base_wid + 3,
+            fused_qkv: None,
+            num_heads: desc.num_heads,
+            num_kv_heads: desc.num_kv_heads,
+            head_dim: desc.head_dim,
+            sm_scale: desc.sm_scale,
+            q_norm_ptr: desc.q_norm_ptr,
+            k_norm_ptr: desc.k_norm_ptr,
+            gated: desc.gated,
+        };
+
+        log::info!(
+            "GpuDecodeStore: materialized HQQ GQA decode BF16 weights for layer {} in {:.3} ms (backend={} nbits={} bytes={})",
+            layer_idx,
+            t0.elapsed().as_secs_f64() * 1000.0,
+            desc.backend,
+            desc.nbits,
+            desc.q_proj.tensor_bytes + desc.k_proj.tensor_bytes + desc.v_proj.tensor_bytes + desc.o_proj.tensor_bytes,
+        );
+        Ok(())
     }
 }
 
@@ -2740,12 +5087,20 @@ impl GpuDecodeStore {
             think_suppress_count: 0,
             pending_simple_int4: Vec::new(),
             single_slot_swaps: Vec::new(),
+            hqq_runtime_slots: Vec::new(),
+            hqq_runtime_staging_stats: HqqRuntimeStagingStats::default(),
+            hqq_runtime_registration_stats: HqqRuntimeRegistrationStats::default(),
+            hqq_runtime_last_swap: HqqRuntimeSwapStats::default(),
+            hqq_decode_timing_entries: Vec::new(),
             #[cfg(feature = "gpu-debug")]
             debug_stop_layer: 0,
             #[cfg(feature = "gpu-debug")]
             debug_capture_layers: false,
             #[cfg(feature = "gpu-debug")]
             debug_layer_captures: Vec::new(),
+            debug_gqa_diag_layer: None,
+            debug_gqa_diag_capture: None,
+            hqq_bf16_weight_bufs: Vec::new(),
             prefill_engine_slot: None,
             prefill_scratch_info: None,
             trace_config: DecodeTraceConfig::from_env(),
@@ -2804,7 +5159,8 @@ impl GpuDecodeStore {
             let (cache_fast, ne) = self.export_hcs_snapshot();
             (cache_fast.to_vec(), ne)
         };
-        self.swap_to_marlin_rust().map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        self.prepare_runtime_for_prefill_rust()
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         let prefill_hcs_guard_store_addr = self as *mut Self as usize;
         let (first_token, prompt_len, kv_overflow) = {
@@ -2815,19 +5171,26 @@ impl GpuDecodeStore {
             })?;
 
             let kv_overflow = prompt_len > engine.kv_max_seq;
-            engine.update_hcs_snapshot(&cache_fast_snapshot, ne);
-            engine.set_prefill_hcs_guard_store_addr(prefill_hcs_guard_store_addr);
+                engine.update_hcs_snapshot(&cache_fast_snapshot, ne);
+                engine.set_prefill_hcs_guard_store_addr(prefill_hcs_guard_store_addr);
+                if let Err(e) = engine.materialize_hqq_prefill_weights() {
+                    engine.clear_prefill_hcs_guard_store_addr();
+                    let _ = self.prepare_runtime_for_decode_rust();
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
+                }
 
-            if let Err(e) = engine.prepare_for_prefill(prompt_len) {
-                engine.clear_prefill_hcs_guard_store_addr();
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
-            }
+                if let Err(e) = engine.prepare_for_prefill(prompt_len) {
+                    engine.clear_prefill_hcs_guard_store_addr();
+                    let _ = self.prepare_runtime_for_decode_rust();
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
+                }
 
             let prefill_result = match engine.run_prefill(&token_ids, temperature, &[]) {
                 Ok(r) => r,
                 Err(e) => {
                     engine.clear_prefill_hcs_guard_store_addr();
                     let _ = engine.release_scratch();
+                    let _ = self.prepare_runtime_for_decode_rust();
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
                 }
             };
@@ -2856,7 +5219,7 @@ impl GpuDecodeStore {
         };
 
         self.set_kv_position_rust(prompt_len);
-        self.swap_to_simple_int4_rust()
+        self.prepare_runtime_for_decode_rust()
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         Ok((first_token, prompt_len, kv_overflow))
@@ -3633,6 +5996,376 @@ impl GpuDecodeStore {
         Ok(id)
     }
 
+    #[pyo3(signature = (
+        layer_idx,
+        tensor_name,
+        backend,
+        nbits,
+        format_version,
+        packed_ptr,
+        packed_bytes,
+        scales_ptr,
+        scales_bytes,
+        zeros_ptr,
+        zeros_bytes,
+        rows,
+        cols,
+        group_size,
+        axis,
+        layout,
+        packed_dtype,
+        scales_dtype,
+        zeros_dtype
+    ))]
+    fn stage_hqq_runtime_tensor_formats(
+        &mut self,
+        layer_idx: usize,
+        tensor_name: &str,
+        backend: &str,
+        nbits: usize,
+        format_version: usize,
+        packed_ptr: usize,
+        packed_bytes: usize,
+        scales_ptr: usize,
+        scales_bytes: usize,
+        zeros_ptr: usize,
+        zeros_bytes: usize,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        axis: usize,
+        layout: &str,
+        packed_dtype: &str,
+        scales_dtype: &str,
+        zeros_dtype: &str,
+    ) -> PyResult<()> {
+        if rows == 0 || cols == 0 || group_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ runtime staging invalid shape metadata for layer {} tensor {}: rows={} cols={} group_size={}",
+                layer_idx, tensor_name, rows, cols, group_size
+            )));
+        }
+        if layout.trim().is_empty()
+            || packed_dtype.trim().is_empty()
+            || scales_dtype.trim().is_empty()
+            || zeros_dtype.trim().is_empty()
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ runtime staging missing layout/dtype metadata for layer {} tensor {}",
+                layer_idx, tensor_name
+            )));
+        }
+        if axis > 1 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ runtime staging unsupported axis={} for layer {} tensor {}",
+                axis, layer_idx, tensor_name
+            )));
+        }
+        let canonical_packed = Self::copy_host_bytes(packed_ptr, packed_bytes, "packed")?;
+        let canonical_scales = Self::copy_host_bytes(scales_ptr, scales_bytes, "scales")?;
+        let canonical_zeros = Self::copy_host_bytes(zeros_ptr, zeros_bytes, "zeros")?;
+
+        let prefill = Self::build_hqq_prefill_runtime_format(
+            &canonical_packed,
+            &canonical_scales,
+            &canonical_zeros,
+            rows,
+            cols,
+            group_size,
+        ).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let decode = Self::build_hqq_decode_runtime_format(
+            &canonical_packed,
+            &canonical_scales,
+            &canonical_zeros,
+            rows,
+            cols,
+            group_size,
+        ).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+        let packed_slot_bytes = prefill.packed_bytes().max(decode.packed_bytes());
+        let scales_slot_bytes = prefill.scales_bytes().max(decode.scales_bytes());
+        let zeros_slot_bytes = prefill.zeros_bytes().max(decode.zeros_bytes());
+        let total_host_bytes = prefill.host_bytes() + decode.host_bytes();
+
+        trace_emit_global_mark(
+            self.active_trace(),
+            "weights",
+            &format!(
+                "phase=hqq_stage_tensor layer={} tensor={} prefill_ms={:.3} decode_ms={:.3} host_mb={:.3} slot_kb=({:.1},{:.1},{:.1})",
+                layer_idx,
+                tensor_name,
+                prefill.build_ms,
+                decode.build_ms,
+                total_host_bytes as f64 / 1024.0 / 1024.0,
+                packed_slot_bytes as f64 / 1024.0,
+                scales_slot_bytes as f64 / 1024.0,
+                zeros_slot_bytes as f64 / 1024.0,
+            ),
+        );
+        log::info!(
+            "HQQ runtime staging: layer={} tensor={} prefill(kind={} layout={} ms={:.3} packed={} scales={} zeros={}) decode(kind={} layout={} ms={:.3} packed={} scales={} zeros={}) host_mb={:.3} slots=(packed {:.1} KB, scales {:.1} KB, zeros {:.1} KB) backend={} nbits={} format_v{}",
+            layer_idx,
+            tensor_name,
+            prefill.kind.as_str(),
+            prefill.layout,
+            prefill.build_ms,
+            prefill.packed_bytes(),
+            prefill.scales_bytes(),
+            prefill.zeros_bytes(),
+            decode.kind.as_str(),
+            decode.layout,
+            decode.build_ms,
+            decode.packed_bytes(),
+            decode.scales_bytes(),
+            decode.zeros_bytes(),
+            total_host_bytes as f64 / 1024.0 / 1024.0,
+            packed_slot_bytes as f64 / 1024.0,
+            scales_slot_bytes as f64 / 1024.0,
+            zeros_slot_bytes as f64 / 1024.0,
+            backend,
+            nbits,
+            format_version,
+        );
+        let existing_slot_idx = self
+            .hqq_runtime_slots
+            .iter()
+            .position(|slot| slot.layer_idx == layer_idx && slot.tensor_name == tensor_name);
+        if let Some(slot_idx) = existing_slot_idx {
+            let slot = &mut self.hqq_runtime_slots[slot_idx];
+            if slot.is_registered()
+                && (slot.packed_slot_bytes != packed_slot_bytes
+                    || slot.scales_slot_bytes != scales_slot_bytes
+                    || slot.zeros_slot_bytes != zeros_slot_bytes)
+            {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "HQQ restaging changed slot capacity for layer {} tensor {}: existing=({},{},{}) new=({},{},{})",
+                    layer_idx,
+                    tensor_name,
+                    slot.packed_slot_bytes,
+                    slot.scales_slot_bytes,
+                    slot.zeros_slot_bytes,
+                    packed_slot_bytes,
+                    scales_slot_bytes,
+                    zeros_slot_bytes,
+                )));
+            }
+            let preserved_registration = slot.is_registered();
+            let preserved_registered_ms = slot.registered_ms;
+            let preserved_packed_slot_ptr = slot.packed_slot_ptr;
+            let preserved_scales_slot_ptr = slot.scales_slot_ptr;
+            let preserved_zeros_slot_ptr = slot.zeros_slot_ptr;
+            let preserved_device_buffers = slot.device_buffers.take();
+            *slot = HqqRuntimeSlotEntry {
+                layer_idx,
+                tensor_name: tensor_name.to_string(),
+                backend: backend.to_string(),
+                format_version,
+                nbits: nbits as u8,
+                rows,
+                cols,
+                group_size,
+                axis,
+                layout: layout.to_string(),
+                packed_dtype: packed_dtype.to_string(),
+                scales_dtype: scales_dtype.to_string(),
+                zeros_dtype: zeros_dtype.to_string(),
+                prefill,
+                decode,
+                packed_slot_bytes,
+                scales_slot_bytes,
+                zeros_slot_bytes,
+                packed_slot_ptr: preserved_packed_slot_ptr,
+                scales_slot_ptr: preserved_scales_slot_ptr,
+                zeros_slot_ptr: preserved_zeros_slot_ptr,
+                registered_ms: preserved_registered_ms,
+                current_stage: if preserved_registration {
+                    "registered_unloaded".to_string()
+                } else {
+                    "staged_host_only".to_string()
+                },
+                last_swap_ms: 0.0,
+                last_packed_memcpy_bytes: 0,
+                last_scales_memcpy_bytes: 0,
+                last_zeros_memcpy_bytes: 0,
+                device_buffers: preserved_device_buffers,
+            };
+            let packed_slot_ptr = slot.packed_slot_ptr;
+            let scales_slot_ptr = slot.scales_slot_ptr;
+            let zeros_slot_ptr = slot.zeros_slot_ptr;
+            drop(slot);
+            self.recompute_hqq_runtime_staging_stats();
+            log::info!(
+                "HQQ runtime restaging reused existing slot: layer={} tensor={} ptrs=({:#x},{:#x},{:#x}) registered={}",
+                layer_idx,
+                tensor_name,
+                packed_slot_ptr,
+                scales_slot_ptr,
+                zeros_slot_ptr,
+                preserved_registration,
+            );
+            return Ok(());
+        }
+
+        self.hqq_runtime_slots.push(HqqRuntimeSlotEntry {
+            layer_idx,
+            tensor_name: tensor_name.to_string(),
+            backend: backend.to_string(),
+            format_version,
+            nbits: nbits as u8,
+            rows,
+            cols,
+            group_size,
+            axis,
+            layout: layout.to_string(),
+            packed_dtype: packed_dtype.to_string(),
+            scales_dtype: scales_dtype.to_string(),
+            zeros_dtype: zeros_dtype.to_string(),
+            prefill,
+            decode,
+            packed_slot_bytes,
+            scales_slot_bytes,
+            zeros_slot_bytes,
+            packed_slot_ptr: 0,
+            scales_slot_ptr: 0,
+            zeros_slot_ptr: 0,
+            registered_ms: 0.0,
+            current_stage: "staged_host_only".to_string(),
+            last_swap_ms: 0.0,
+            last_packed_memcpy_bytes: 0,
+            last_scales_memcpy_bytes: 0,
+            last_zeros_memcpy_bytes: 0,
+            device_buffers: None,
+        });
+        self.recompute_hqq_runtime_staging_stats();
+        Ok(())
+    }
+
+    fn register_hqq_runtime_slots(&mut self) -> PyResult<()> {
+        if self.hqq_runtime_slots.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "No staged HQQ runtime tensors to register",
+            ));
+        }
+        self.device.bind_to_thread()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("register_hqq_runtime_slots bind_to_thread: {:?}", e)))?;
+
+        let mut registered = 0usize;
+        let mut total_ms = 0.0f64;
+        let mut total_slot_bytes = 0usize;
+        let mut packed_slot_bytes = 0usize;
+        let mut scales_slot_bytes = 0usize;
+        let mut zeros_slot_bytes = 0usize;
+        let trace = self.active_trace_owned();
+
+        for slot in &mut self.hqq_runtime_slots {
+            if slot.is_registered() {
+                continue;
+            }
+            let t0 = std::time::Instant::now();
+            let packed = self.device.alloc_zeros::<u8>(slot.packed_slot_bytes)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("HQQ register packed slot layer={} tensor={}: {:?}", slot.layer_idx, slot.tensor_name, e)))?;
+            let scales = self.device.alloc_zeros::<u8>(slot.scales_slot_bytes)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("HQQ register scales slot layer={} tensor={}: {:?}", slot.layer_idx, slot.tensor_name, e)))?;
+            let zeros = self.device.alloc_zeros::<u8>(slot.zeros_slot_bytes)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("HQQ register zeros slot layer={} tensor={}: {:?}", slot.layer_idx, slot.tensor_name, e)))?;
+            slot.packed_slot_ptr = *packed.device_ptr();
+            slot.scales_slot_ptr = *scales.device_ptr();
+            slot.zeros_slot_ptr = *zeros.device_ptr();
+            slot.registered_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            slot.current_stage = "registered_unloaded".to_string();
+            slot.device_buffers = Some(HqqRuntimeDeviceBuffers { packed, scales, zeros });
+
+            registered += 1;
+            total_ms += slot.registered_ms;
+            total_slot_bytes += slot.packed_slot_bytes + slot.scales_slot_bytes + slot.zeros_slot_bytes;
+            packed_slot_bytes += slot.packed_slot_bytes;
+            scales_slot_bytes += slot.scales_slot_bytes;
+            zeros_slot_bytes += slot.zeros_slot_bytes;
+            trace_emit_global_mark(
+                trace.as_ref(),
+                "weights",
+                &format!(
+                    "phase=hqq_register_slot layer={} tensor={} reg_ms={:.3} slot_kb=({:.1},{:.1},{:.1}) ptrs=({:#x},{:#x},{:#x})",
+                    slot.layer_idx,
+                    slot.tensor_name,
+                    slot.registered_ms,
+                    slot.packed_slot_bytes as f64 / 1024.0,
+                    slot.scales_slot_bytes as f64 / 1024.0,
+                    slot.zeros_slot_bytes as f64 / 1024.0,
+                    slot.packed_slot_ptr,
+                    slot.scales_slot_ptr,
+                    slot.zeros_slot_ptr,
+                ),
+            );
+        }
+
+        self.hqq_runtime_registration_stats.slot_count += registered;
+        self.hqq_runtime_registration_stats.total_registration_ms += total_ms;
+        self.hqq_runtime_registration_stats.total_device_slot_bytes += total_slot_bytes;
+        self.hqq_runtime_registration_stats.packed_slot_bytes += packed_slot_bytes;
+        self.hqq_runtime_registration_stats.scales_slot_bytes += scales_slot_bytes;
+        self.hqq_runtime_registration_stats.zeros_slot_bytes += zeros_slot_bytes;
+
+        log::info!(
+            "HQQ runtime slot registration: new_slots={} reg_ms={:.3} device_mb={:.3} packed_mb={:.3} scales_mb={:.3} zeros_mb={:.3}",
+            registered,
+            total_ms,
+            total_slot_bytes as f64 / 1024.0 / 1024.0,
+            packed_slot_bytes as f64 / 1024.0 / 1024.0,
+            scales_slot_bytes as f64 / 1024.0 / 1024.0,
+            zeros_slot_bytes as f64 / 1024.0 / 1024.0,
+        );
+        Ok(())
+    }
+
+    fn swap_hqq_runtime_to_prefill(&mut self) -> PyResult<()> {
+        self.swap_hqq_runtime_to_prefill_rust()
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    fn swap_hqq_runtime_to_decode(&mut self) -> PyResult<()> {
+        self.swap_hqq_runtime_to_decode_rust()
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    fn hqq_runtime_staging_json(&self) -> PyResult<String> {
+        let slots: Vec<serde_json::Value> = self.hqq_runtime_slots.iter().map(hqq_runtime_slot_json).collect();
+        Ok(serde_json::json!({
+            "summary": {
+                "tensor_count": self.hqq_runtime_staging_stats.tensor_count,
+                "total_build_ms": self.hqq_runtime_staging_stats.total_build_ms,
+                "total_host_bytes": self.hqq_runtime_staging_stats.total_host_bytes,
+                "prefill_host_bytes": self.hqq_runtime_staging_stats.prefill_host_bytes,
+                "decode_host_bytes": self.hqq_runtime_staging_stats.decode_host_bytes,
+                "packed_slot_bytes": self.hqq_runtime_staging_stats.packed_slot_bytes,
+                "scales_slot_bytes": self.hqq_runtime_staging_stats.scales_slot_bytes,
+                "zeros_slot_bytes": self.hqq_runtime_staging_stats.zeros_slot_bytes,
+            },
+            "registration": {
+                "slot_count": self.hqq_runtime_registration_stats.slot_count,
+                "total_registration_ms": self.hqq_runtime_registration_stats.total_registration_ms,
+                "total_device_slot_bytes": self.hqq_runtime_registration_stats.total_device_slot_bytes,
+                "packed_slot_bytes": self.hqq_runtime_registration_stats.packed_slot_bytes,
+                "scales_slot_bytes": self.hqq_runtime_registration_stats.scales_slot_bytes,
+                "zeros_slot_bytes": self.hqq_runtime_registration_stats.zeros_slot_bytes,
+            },
+            "last_swap": {
+                "stage": self.hqq_runtime_last_swap.stage.clone(),
+                "swap_count": self.hqq_runtime_last_swap.swap_count,
+                "total_swap_ms": self.hqq_runtime_last_swap.total_swap_ms,
+                "total_host_bytes": self.hqq_runtime_last_swap.total_host_bytes,
+                "packed_memcpy_bytes": self.hqq_runtime_last_swap.packed_memcpy_bytes,
+                "scales_memcpy_bytes": self.hqq_runtime_last_swap.scales_memcpy_bytes,
+                "zeros_memcpy_bytes": self.hqq_runtime_last_swap.zeros_memcpy_bytes,
+            },
+            "slots": slots,
+        }).to_string())
+    }
+
     /// Remove single-slot swap entries for weights NOT used by the decode segment.
     /// Called after set_decode_segment() in multi-GPU mode. Returns count of entries removed.
     /// After this, swap_to_simple_int4/swap_to_marlin only touch decode-segment weights.
@@ -3682,6 +6415,37 @@ impl GpuDecodeStore {
         if removed > 0 {
             log::info!("restrict_swaps_to_decode_segment: removed {} swap entries for layers outside [{}, {}), {} remain",
                        removed, start, end, self.single_slot_swaps.len());
+        }
+
+        Ok(removed)
+    }
+
+    /// Remove staged HQQ runtime slots for layers outside the decode segment.
+    /// Called after set_decode_segment() and before HQQ runtime slot registration.
+    /// After this, HQQ runtime slot allocation/register/swap only touches decode-segment layers.
+    fn restrict_hqq_runtime_slots_to_decode_segment(&mut self) -> PyResult<usize> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+
+        let start = graph.decode_layer_start;
+        let end = graph.decode_layer_end;
+
+        let before = self.hqq_runtime_slots.len();
+        self.hqq_runtime_slots
+            .retain(|slot| start <= slot.layer_idx && slot.layer_idx < end);
+        let removed = before - self.hqq_runtime_slots.len();
+        if removed > 0 {
+            self.recompute_hqq_runtime_staging_stats();
+        }
+
+        if removed > 0 {
+            log::info!(
+                "restrict_hqq_runtime_slots_to_decode_segment: removed {} HQQ runtime slots for layers outside [{}, {}), {} remain",
+                removed,
+                start,
+                end,
+                self.hqq_runtime_slots.len()
+            );
         }
 
         Ok(removed)
@@ -3933,6 +6697,17 @@ impl GpuDecodeStore {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         graph.lm_head_wid = weight_id;
         Ok(())
+    }
+
+    fn debug_gpu_decode_step(&mut self, token_id: usize, position: usize) -> PyResult<()> {
+        self.gpu_decode_step(token_id, position)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    fn download_logits_f32(&self) -> PyResult<Vec<f32>> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        Ok(graph.h_logits.clone())
     }
 
     /// BF16 GEMV: output[N] = weight[N,K] @ input[K]
@@ -4874,6 +7649,84 @@ impl GpuDecodeStore {
         Ok(out)
     }
 
+    #[pyo3(signature = (layer_idx=None))]
+    fn set_debug_gqa_diag_layer(&mut self, layer_idx: Option<usize>) {
+        self.debug_gqa_diag_layer = layer_idx;
+        self.debug_gqa_diag_capture = None;
+    }
+
+    fn debug_gqa_diag_json(&self) -> PyResult<String> {
+        let capture = self
+            .debug_gqa_diag_capture
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("No GQA decode diagnostics captured"))?;
+        Ok(serde_json::json!({
+            "layer_idx": capture.layer_idx,
+            "position": capture.position,
+            "pre_attn_hidden": capture.pre_attn_hidden,
+            "q_proj_raw": capture.q_proj_raw,
+            "k_proj_raw": capture.k_proj_raw,
+            "v_proj_raw": capture.v_proj_raw,
+            "q_after_split": capture.q_after_split,
+            "q_after_rope": capture.q_after_rope,
+            "k_after_rope": capture.k_after_rope,
+            "v_after_rope": capture.v_after_rope,
+            "gate_after_split": capture.gate_after_split,
+            "attn_out": capture.attn_out,
+            "o_proj_input": capture.o_proj_input,
+            "o_proj_out": capture.o_proj_out,
+            "post_attn_norm_hidden": capture.post_attn_norm_hidden,
+            "post_attn_norm_residual": capture.post_attn_norm_residual,
+            "post_mlp_hidden": capture.post_mlp_hidden,
+            "post_mlp_residual": capture.post_mlp_residual,
+            "final_pre_norm_hidden": capture.final_pre_norm_hidden,
+            "final_pre_norm_residual": capture.final_pre_norm_residual,
+            "final_post_norm": capture.final_post_norm,
+            "final_logits": capture.final_logits,
+            "kv_k_cache": capture.kv_k_cache,
+            "kv_v_cache": capture.kv_v_cache,
+        }).to_string())
+    }
+
+    fn download_gqa_layer_weights_json(&self, layer_idx: usize) -> PyResult<String> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let layer = graph.layers.get(layer_idx)
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(format!("Invalid layer {}", layer_idx)))?;
+        let (q_proj, k_proj, v_proj, o_proj) = match &layer.attn {
+            GpuAttnConfig::GQA { q_proj, k_proj, v_proj, o_proj, fused_qkv, .. } => {
+                if fused_qkv.is_some() {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("Layer {} uses fused_qkv; diagnostic weight dump expects separate GQA projections", layer_idx)
+                    ));
+                }
+                (*q_proj, *k_proj, *v_proj, *o_proj)
+            }
+            _ => return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("Layer {} is not GQA", layer_idx))),
+        };
+        let read_weight = |wid: usize| -> Result<serde_json::Value, String> {
+            let w = graph.weights.get(wid)
+                .ok_or_else(|| format!("Invalid weight id {}", wid))?;
+            if w.dtype != 0 {
+                return Err(format!("Weight {} is not BF16 (dtype={})", wid, w.dtype));
+            }
+            let vals = self.download_device_bf16_as_f32(w.ptr, w.rows * w.cols)?;
+            Ok(serde_json::json!({
+                "weight_id": wid,
+                "rows": w.rows,
+                "cols": w.cols,
+                "values": vals,
+            }))
+        };
+        let payload = serde_json::json!({
+            "q_proj": read_weight(q_proj).map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
+            "k_proj": read_weight(k_proj).map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
+            "v_proj": read_weight(v_proj).map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
+            "o_proj": read_weight(o_proj).map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
+        });
+        Ok(payload.to_string())
+    }
+
     /// One-time setup: configure GPU decode from a loaded KrasisEngine.
     ///
     /// This reads the WeightStore (expert GPU weights in system RAM) and
@@ -5544,23 +8397,14 @@ impl GpuDecodeStore {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         while graph.layers.len() <= layer_idx {
-            graph.layers.push(GpuDecodeLayer {
-                input_norm_ptr: 0,
-                input_norm_size: 0,
-                post_attn_norm_ptr: 0,
-                post_attn_norm_size: 0,
-                attn: GpuAttnConfig::GQA {
-                    q_proj: 0, k_proj: 0, v_proj: 0, o_proj: 0, fused_qkv: None,
-                    num_heads: 0, num_kv_heads: 0, head_dim: 0, sm_scale: 0.0,
-                    q_norm_ptr: 0, k_norm_ptr: 0, gated: false,
-                },
-                mlp: GpuMlpConfig::None,
-            });
+            graph.layers.push(GpuDecodeLayer::placeholder());
         }
         graph.layers[layer_idx].input_norm_ptr = input_norm_ptr as u64;
         graph.layers[layer_idx].input_norm_size = input_norm_size;
         graph.layers[layer_idx].post_attn_norm_ptr = post_attn_norm_ptr as u64;
         graph.layers[layer_idx].post_attn_norm_size = post_attn_norm_size;
+        graph.layers[layer_idx].hqq = None;
+        graph.layers[layer_idx].hqq_exec = None;
         graph.layers[layer_idx].attn = GpuAttnConfig::LinearAttention {
             in_proj_qkvz: in_proj_qkvz_wid,
             in_proj_ba: in_proj_ba_wid,
@@ -5626,23 +8470,14 @@ impl GpuDecodeStore {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         while graph.layers.len() <= layer_idx {
-            graph.layers.push(GpuDecodeLayer {
-                input_norm_ptr: 0,
-                input_norm_size: 0,
-                post_attn_norm_ptr: 0,
-                post_attn_norm_size: 0,
-                attn: GpuAttnConfig::GQA {
-                    q_proj: 0, k_proj: 0, v_proj: 0, o_proj: 0, fused_qkv: None,
-                    num_heads: 0, num_kv_heads: 0, head_dim: 0, sm_scale: 0.0,
-                    q_norm_ptr: 0, k_norm_ptr: 0, gated: false,
-                },
-                mlp: GpuMlpConfig::None,
-            });
+            graph.layers.push(GpuDecodeLayer::placeholder());
         }
         graph.layers[layer_idx].input_norm_ptr = input_norm_ptr as u64;
         graph.layers[layer_idx].input_norm_size = input_norm_size;
         graph.layers[layer_idx].post_attn_norm_ptr = post_attn_norm_ptr as u64;
         graph.layers[layer_idx].post_attn_norm_size = post_attn_norm_size;
+        graph.layers[layer_idx].hqq = None;
+        graph.layers[layer_idx].hqq_exec = None;
         graph.layers[layer_idx].attn = GpuAttnConfig::GQA {
             q_proj: q_proj_wid,
             k_proj: k_proj_wid,
@@ -5696,27 +8531,14 @@ impl GpuDecodeStore {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         while graph.layers.len() <= layer_idx {
-            graph.layers.push(GpuDecodeLayer {
-                input_norm_ptr: 0,
-                input_norm_size: 0,
-                post_attn_norm_ptr: 0,
-                post_attn_norm_size: 0,
-                attn: GpuAttnConfig::MLA {
-                    q_a_proj: None, q_b_proj: None, q_a_norm_ptr: 0,
-                    q_proj: None, kv_a_proj: 0, kv_a_norm_ptr: 0,
-                    w_kc_ptr: 0, w_vc_ptr: 0, o_proj: 0,
-                    num_heads: 0, kv_lora_rank: 0, ckv_cache_dim: 0,
-                    qk_nope_dim: 0, qk_rope_dim: 0, v_head_dim: 0,
-                    q_lora_rank: 0, sm_scale: 0.0, rope_interleave: true,
-                    ckv_cache_ptr: 0, kpe_cache_ptr: 0,
-                },
-                mlp: GpuMlpConfig::None,
-            });
+            graph.layers.push(GpuDecodeLayer::placeholder());
         }
         graph.layers[layer_idx].input_norm_ptr = input_norm_ptr as u64;
         graph.layers[layer_idx].input_norm_size = input_norm_size;
         graph.layers[layer_idx].post_attn_norm_ptr = post_attn_norm_ptr as u64;
         graph.layers[layer_idx].post_attn_norm_size = post_attn_norm_size;
+        graph.layers[layer_idx].hqq = None;
+        graph.layers[layer_idx].hqq_exec = None;
         graph.layers[layer_idx].attn = GpuAttnConfig::MLA {
             q_a_proj: q_a_proj_wid,
             q_b_proj: q_b_proj_wid,
@@ -5763,23 +8585,14 @@ impl GpuDecodeStore {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         let conv_dim = expand * head_dim * num_heads;
         while graph.layers.len() <= layer_idx {
-            graph.layers.push(GpuDecodeLayer {
-                input_norm_ptr: 0,
-                input_norm_size: 0,
-                post_attn_norm_ptr: 0,
-                post_attn_norm_size: 0,
-                attn: GpuAttnConfig::GQA {
-                    q_proj: 0, k_proj: 0, v_proj: 0, o_proj: 0, fused_qkv: None,
-                    num_heads: 0, num_kv_heads: 0, head_dim: 0, sm_scale: 0.0,
-                    q_norm_ptr: 0, k_norm_ptr: 0, gated: false,
-                },
-                mlp: GpuMlpConfig::None,
-            });
+            graph.layers.push(GpuDecodeLayer::placeholder());
         }
         graph.layers[layer_idx].input_norm_ptr = input_norm_ptr as u64;
         graph.layers[layer_idx].input_norm_size = input_norm_size;
         graph.layers[layer_idx].post_attn_norm_ptr = post_attn_norm_ptr as u64;
         graph.layers[layer_idx].post_attn_norm_size = post_attn_norm_size;
+        graph.layers[layer_idx].hqq = None;
+        graph.layers[layer_idx].hqq_exec = None;
         graph.layers[layer_idx].attn = GpuAttnConfig::Mamba2 {
             in_proj: in_proj_wid,
             out_proj: out_proj_wid,
@@ -5806,6 +8619,981 @@ impl GpuDecodeStore {
         log::info!("GpuDecodeStore: registered Mamba2 layer {} (heads={}, hd={}, state={}, conv_dim={}), total_layers={}",
             layer_idx, num_heads, head_dim, state_size, conv_dim, graph.layers.len());
         Ok(())
+    }
+
+    #[pyo3(signature = (
+        layer_idx,
+        input_norm_ptr,
+        input_norm_size,
+        post_attn_norm_ptr,
+        post_attn_norm_size,
+        backend,
+        nbits,
+        format_version,
+        tensor_names,
+        packed_ptrs,
+        scales_ptrs,
+        zeros_ptrs,
+        orig_rows,
+        orig_cols,
+        group_sizes,
+        axes,
+        layouts,
+        packed_dtypes,
+        scales_dtypes,
+        zeros_dtypes,
+        original_dtypes,
+        tensor_bytes,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
+        q_norm_ptr=0,
+        k_norm_ptr=0,
+        gated=false
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_hqq_gqa_layer(
+        &mut self,
+        layer_idx: usize,
+        input_norm_ptr: usize,
+        input_norm_size: usize,
+        post_attn_norm_ptr: usize,
+        post_attn_norm_size: usize,
+        backend: &str,
+        nbits: usize,
+        format_version: usize,
+        tensor_names: Vec<String>,
+        packed_ptrs: Vec<usize>,
+        scales_ptrs: Vec<usize>,
+        zeros_ptrs: Vec<usize>,
+        orig_rows: Vec<usize>,
+        orig_cols: Vec<usize>,
+        group_sizes: Vec<usize>,
+        axes: Vec<usize>,
+        layouts: Vec<String>,
+        packed_dtypes: Vec<String>,
+        scales_dtypes: Vec<String>,
+        zeros_dtypes: Vec<String>,
+        original_dtypes: Vec<String>,
+        tensor_bytes: Vec<usize>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sm_scale: f32,
+        q_norm_ptr: usize,
+        k_norm_ptr: usize,
+        gated: bool,
+    ) -> PyResult<()> {
+        let _ = (
+            tensor_names,
+            packed_ptrs,
+            scales_ptrs,
+            zeros_ptrs,
+            orig_rows,
+            orig_cols,
+            group_sizes,
+            axes,
+            layouts,
+            packed_dtypes,
+            scales_dtypes,
+            zeros_dtypes,
+            original_dtypes,
+            tensor_bytes,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale,
+            q_norm_ptr,
+            k_norm_ptr,
+            gated,
+            input_norm_ptr,
+            input_norm_size,
+            post_attn_norm_ptr,
+            post_attn_norm_size,
+            backend,
+            nbits,
+            format_version,
+            layer_idx,
+        );
+        Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Direct canonical HQQ registration is disabled. Use register_hqq_runtime_gqa_layer with staged runtime slots.",
+        ))
+    }
+
+    #[pyo3(signature = (
+        layer_idx,
+        input_norm_ptr,
+        input_norm_size,
+        post_attn_norm_ptr,
+        post_attn_norm_size,
+        backend,
+        nbits,
+        format_version,
+        tensor_names,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
+        q_norm_ptr=0,
+        k_norm_ptr=0,
+        gated=false
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_hqq_runtime_gqa_layer(
+        &mut self,
+        layer_idx: usize,
+        input_norm_ptr: usize,
+        input_norm_size: usize,
+        post_attn_norm_ptr: usize,
+        post_attn_norm_size: usize,
+        backend: &str,
+        nbits: usize,
+        format_version: usize,
+        tensor_names: Vec<String>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sm_scale: f32,
+        q_norm_ptr: usize,
+        k_norm_ptr: usize,
+        gated: bool,
+    ) -> PyResult<()> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        if layer_idx < graph.decode_layer_start || layer_idx >= graph.decode_layer_end {
+            return Ok(());
+        }
+        let tensors = self
+            .build_hqq_runtime_tensors(layer_idx, &tensor_names)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let metadata = HqqLayerMetadata::Gqa {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale,
+            q_norm_ptr: q_norm_ptr as u64,
+            k_norm_ptr: k_norm_ptr as u64,
+            gated,
+        };
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        register_hqq_attention_layer_common(
+            graph,
+            layer_idx,
+            "gqa",
+            input_norm_ptr,
+            input_norm_size,
+            post_attn_norm_ptr,
+            post_attn_norm_size,
+            backend,
+            nbits,
+            format_version,
+            metadata,
+            tensors,
+        )
+    }
+
+    #[pyo3(signature = (
+        layer_idx,
+        input_norm_ptr,
+        input_norm_size,
+        post_attn_norm_ptr,
+        post_attn_norm_size,
+        backend,
+        nbits,
+        format_version,
+        tensor_names,
+        packed_ptrs,
+        scales_ptrs,
+        zeros_ptrs,
+        orig_rows,
+        orig_cols,
+        group_sizes,
+        axes,
+        layouts,
+        packed_dtypes,
+        scales_dtypes,
+        zeros_dtypes,
+        original_dtypes,
+        tensor_bytes,
+        num_heads,
+        kv_lora_rank,
+        ckv_cache_dim,
+        qk_nope_dim,
+        qk_rope_dim,
+        v_head_dim,
+        q_lora_rank,
+        sm_scale,
+        kv_a_norm_ptr,
+        w_kc_ptr,
+        w_vc_ptr,
+        ckv_cache_ptr,
+        kpe_cache_ptr,
+        rope_interleave=true,
+        q_a_norm_ptr=0
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_hqq_mla_layer(
+        &mut self,
+        layer_idx: usize,
+        input_norm_ptr: usize,
+        input_norm_size: usize,
+        post_attn_norm_ptr: usize,
+        post_attn_norm_size: usize,
+        backend: &str,
+        nbits: usize,
+        format_version: usize,
+        tensor_names: Vec<String>,
+        packed_ptrs: Vec<usize>,
+        scales_ptrs: Vec<usize>,
+        zeros_ptrs: Vec<usize>,
+        orig_rows: Vec<usize>,
+        orig_cols: Vec<usize>,
+        group_sizes: Vec<usize>,
+        axes: Vec<usize>,
+        layouts: Vec<String>,
+        packed_dtypes: Vec<String>,
+        scales_dtypes: Vec<String>,
+        zeros_dtypes: Vec<String>,
+        original_dtypes: Vec<String>,
+        tensor_bytes: Vec<usize>,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        ckv_cache_dim: usize,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        q_lora_rank: usize,
+        sm_scale: f32,
+        kv_a_norm_ptr: usize,
+        w_kc_ptr: usize,
+        w_vc_ptr: usize,
+        ckv_cache_ptr: usize,
+        kpe_cache_ptr: usize,
+        rope_interleave: bool,
+        q_a_norm_ptr: usize,
+    ) -> PyResult<()> {
+        let _ = (
+            layer_idx,
+            input_norm_ptr,
+            input_norm_size,
+            post_attn_norm_ptr,
+            post_attn_norm_size,
+            backend,
+            nbits,
+            format_version,
+            tensor_names,
+            packed_ptrs,
+            scales_ptrs,
+            zeros_ptrs,
+            orig_rows,
+            orig_cols,
+            group_sizes,
+            axes,
+            layouts,
+            packed_dtypes,
+            scales_dtypes,
+            zeros_dtypes,
+            original_dtypes,
+            tensor_bytes,
+            num_heads,
+            kv_lora_rank,
+            ckv_cache_dim,
+            qk_nope_dim,
+            qk_rope_dim,
+            v_head_dim,
+            q_lora_rank,
+            sm_scale,
+            kv_a_norm_ptr,
+            w_kc_ptr,
+            w_vc_ptr,
+            ckv_cache_ptr,
+            kpe_cache_ptr,
+            rope_interleave,
+            q_a_norm_ptr,
+        );
+        Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Direct canonical HQQ registration is disabled. Use register_hqq_runtime_mla_layer with staged runtime slots.",
+        ))
+    }
+
+    #[pyo3(signature = (
+        layer_idx,
+        input_norm_ptr,
+        input_norm_size,
+        post_attn_norm_ptr,
+        post_attn_norm_size,
+        backend,
+        nbits,
+        format_version,
+        tensor_names,
+        num_heads,
+        kv_lora_rank,
+        ckv_cache_dim,
+        qk_nope_dim,
+        qk_rope_dim,
+        v_head_dim,
+        q_lora_rank,
+        sm_scale,
+        kv_a_norm_ptr,
+        w_kc_ptr,
+        w_vc_ptr,
+        ckv_cache_ptr,
+        kpe_cache_ptr,
+        rope_interleave=true,
+        q_a_norm_ptr=0
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_hqq_runtime_mla_layer(
+        &mut self,
+        layer_idx: usize,
+        input_norm_ptr: usize,
+        input_norm_size: usize,
+        post_attn_norm_ptr: usize,
+        post_attn_norm_size: usize,
+        backend: &str,
+        nbits: usize,
+        format_version: usize,
+        tensor_names: Vec<String>,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        ckv_cache_dim: usize,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        q_lora_rank: usize,
+        sm_scale: f32,
+        kv_a_norm_ptr: usize,
+        w_kc_ptr: usize,
+        w_vc_ptr: usize,
+        ckv_cache_ptr: usize,
+        kpe_cache_ptr: usize,
+        rope_interleave: bool,
+        q_a_norm_ptr: usize,
+    ) -> PyResult<()> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        if layer_idx < graph.decode_layer_start || layer_idx >= graph.decode_layer_end {
+            return Ok(());
+        }
+        let tensors = self
+            .build_hqq_runtime_tensors(layer_idx, &tensor_names)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let metadata = HqqLayerMetadata::Mla {
+            num_heads,
+            kv_lora_rank,
+            ckv_cache_dim,
+            qk_nope_dim,
+            qk_rope_dim,
+            v_head_dim,
+            q_lora_rank,
+            sm_scale,
+            rope_interleave,
+            kv_a_norm_ptr: kv_a_norm_ptr as u64,
+            w_kc_ptr: w_kc_ptr as u64,
+            w_vc_ptr: w_vc_ptr as u64,
+            ckv_cache_ptr: ckv_cache_ptr as u64,
+            kpe_cache_ptr: kpe_cache_ptr as u64,
+            q_a_norm_ptr: q_a_norm_ptr as u64,
+        };
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        register_hqq_attention_layer_common(
+            graph,
+            layer_idx,
+            "mla",
+            input_norm_ptr,
+            input_norm_size,
+            post_attn_norm_ptr,
+            post_attn_norm_size,
+            backend,
+            nbits,
+            format_version,
+            metadata,
+            tensors,
+        )
+    }
+
+    #[pyo3(signature = (
+        layer_idx,
+        input_norm_ptr,
+        input_norm_size,
+        post_attn_norm_ptr,
+        post_attn_norm_size,
+        backend,
+        nbits,
+        format_version,
+        tensor_names,
+        packed_ptrs,
+        scales_ptrs,
+        zeros_ptrs,
+        orig_rows,
+        orig_cols,
+        group_sizes,
+        axes,
+        layouts,
+        packed_dtypes,
+        scales_dtypes,
+        zeros_dtypes,
+        original_dtypes,
+        tensor_bytes,
+        num_k_heads,
+        num_v_heads,
+        k_head_dim,
+        v_head_dim,
+        head_ratio,
+        kernel_dim,
+        conv_dim,
+        scale,
+        conv_weight_ptr,
+        a_log_ptr,
+        dt_bias_ptr,
+        norm_weight_ptr,
+        conv_state_ptr,
+        recur_state_ptr
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_hqq_linear_attention_layer(
+        &mut self,
+        layer_idx: usize,
+        input_norm_ptr: usize,
+        input_norm_size: usize,
+        post_attn_norm_ptr: usize,
+        post_attn_norm_size: usize,
+        backend: &str,
+        nbits: usize,
+        format_version: usize,
+        tensor_names: Vec<String>,
+        packed_ptrs: Vec<usize>,
+        scales_ptrs: Vec<usize>,
+        zeros_ptrs: Vec<usize>,
+        orig_rows: Vec<usize>,
+        orig_cols: Vec<usize>,
+        group_sizes: Vec<usize>,
+        axes: Vec<usize>,
+        layouts: Vec<String>,
+        packed_dtypes: Vec<String>,
+        scales_dtypes: Vec<String>,
+        zeros_dtypes: Vec<String>,
+        original_dtypes: Vec<String>,
+        tensor_bytes: Vec<usize>,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        head_ratio: usize,
+        kernel_dim: usize,
+        conv_dim: usize,
+        scale: f32,
+        conv_weight_ptr: usize,
+        a_log_ptr: usize,
+        dt_bias_ptr: usize,
+        norm_weight_ptr: usize,
+        conv_state_ptr: usize,
+        recur_state_ptr: usize,
+    ) -> PyResult<()> {
+        let _ = (
+            layer_idx,
+            input_norm_ptr,
+            input_norm_size,
+            post_attn_norm_ptr,
+            post_attn_norm_size,
+            backend,
+            nbits,
+            format_version,
+            tensor_names,
+            packed_ptrs,
+            scales_ptrs,
+            zeros_ptrs,
+            orig_rows,
+            orig_cols,
+            group_sizes,
+            axes,
+            layouts,
+            packed_dtypes,
+            scales_dtypes,
+            zeros_dtypes,
+            original_dtypes,
+            tensor_bytes,
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            head_ratio,
+            kernel_dim,
+            conv_dim,
+            scale,
+            conv_weight_ptr,
+            a_log_ptr,
+            dt_bias_ptr,
+            norm_weight_ptr,
+            conv_state_ptr,
+            recur_state_ptr,
+        );
+        Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Direct canonical HQQ registration is disabled. Use register_hqq_runtime_linear_attention_layer with staged runtime slots.",
+        ))
+    }
+
+    #[pyo3(signature = (
+        layer_idx,
+        input_norm_ptr,
+        input_norm_size,
+        post_attn_norm_ptr,
+        post_attn_norm_size,
+        backend,
+        nbits,
+        format_version,
+        tensor_names,
+        num_k_heads,
+        num_v_heads,
+        k_head_dim,
+        v_head_dim,
+        head_ratio,
+        kernel_dim,
+        conv_dim,
+        scale,
+        conv_weight_ptr,
+        a_log_ptr,
+        dt_bias_ptr,
+        norm_weight_ptr,
+        conv_state_ptr,
+        recur_state_ptr
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_hqq_runtime_linear_attention_layer(
+        &mut self,
+        layer_idx: usize,
+        input_norm_ptr: usize,
+        input_norm_size: usize,
+        post_attn_norm_ptr: usize,
+        post_attn_norm_size: usize,
+        backend: &str,
+        nbits: usize,
+        format_version: usize,
+        tensor_names: Vec<String>,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        head_ratio: usize,
+        kernel_dim: usize,
+        conv_dim: usize,
+        scale: f32,
+        conv_weight_ptr: usize,
+        a_log_ptr: usize,
+        dt_bias_ptr: usize,
+        norm_weight_ptr: usize,
+        conv_state_ptr: usize,
+        recur_state_ptr: usize,
+    ) -> PyResult<()> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        if layer_idx < graph.decode_layer_start || layer_idx >= graph.decode_layer_end {
+            return Ok(());
+        }
+        let tensors = self
+            .build_hqq_runtime_tensors(layer_idx, &tensor_names)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let metadata = HqqLayerMetadata::LinearAttention {
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            head_ratio,
+            kernel_dim,
+            conv_dim,
+            scale,
+            conv_weight_ptr: conv_weight_ptr as u64,
+            a_log_ptr: a_log_ptr as u64,
+            dt_bias_ptr: dt_bias_ptr as u64,
+            norm_weight_ptr: norm_weight_ptr as u64,
+            conv_state_ptr: conv_state_ptr as u64,
+            recur_state_ptr: recur_state_ptr as u64,
+        };
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        register_hqq_attention_layer_common(
+            graph,
+            layer_idx,
+            "linear_attention",
+            input_norm_ptr,
+            input_norm_size,
+            post_attn_norm_ptr,
+            post_attn_norm_size,
+            backend,
+            nbits,
+            format_version,
+            metadata,
+            tensors,
+        )
+    }
+
+    fn hqq_registration_json(&self, layer_idx: usize) -> PyResult<String> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let layer = graph.layers.get(layer_idx)
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Layer {} not registered", layer_idx),
+            ))?;
+        let hqq = layer.hqq.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Layer {} has no HQQ registration", layer_idx),
+            ))?;
+
+        let mut tensor_names: Vec<_> = hqq.tensors.keys().cloned().collect();
+        tensor_names.sort();
+        let tensors: Vec<_> = tensor_names.into_iter().map(|name| {
+            let desc = &hqq.tensors[&name];
+            serde_json::json!({
+                "tensor_name": name,
+                "packed_ptr": desc.packed_ptr,
+                "scales_ptr": desc.scales_ptr,
+                "zeros_ptr": desc.zeros_ptr,
+                "orig_shape": [desc.rows, desc.cols],
+                "group_size": desc.group_size,
+                "axis": desc.axis,
+                "layout": desc.layout,
+                "packed_dtype": desc.packed_dtype,
+                "scales_dtype": desc.scales_dtype,
+                "zeros_dtype": desc.zeros_dtype,
+                "original_dtype": desc.original_dtype,
+                "tensor_bytes": desc.tensor_bytes,
+                "runtime_stage": desc.runtime_stage,
+                "runtime_kind": desc.runtime_kind,
+                "packed_row_stride_bytes": desc.packed_row_stride_bytes,
+                "scales_row_stride_bytes": desc.scales_row_stride_bytes,
+                "zeros_row_stride_bytes": desc.zeros_row_stride_bytes,
+                "rows_per_tile": desc.rows_per_tile,
+                "row_blocks": desc.row_blocks,
+                "kernel_ready": desc.kernel_ready,
+            })
+        }).collect();
+        let metadata = match &hqq.metadata {
+            HqqLayerMetadata::Gqa {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                sm_scale,
+                q_norm_ptr,
+                k_norm_ptr,
+                gated,
+            } => serde_json::json!({
+                "kind": "gqa",
+                "num_heads": num_heads,
+                "num_kv_heads": num_kv_heads,
+                "head_dim": head_dim,
+                "sm_scale": sm_scale,
+                "q_norm_ptr": q_norm_ptr,
+                "k_norm_ptr": k_norm_ptr,
+                "gated": gated,
+            }),
+            HqqLayerMetadata::Mla {
+                num_heads,
+                kv_lora_rank,
+                ckv_cache_dim,
+                qk_nope_dim,
+                qk_rope_dim,
+                v_head_dim,
+                q_lora_rank,
+                sm_scale,
+                rope_interleave,
+                kv_a_norm_ptr,
+                w_kc_ptr,
+                w_vc_ptr,
+                ckv_cache_ptr,
+                kpe_cache_ptr,
+                q_a_norm_ptr,
+            } => serde_json::json!({
+                "kind": "mla",
+                "num_heads": num_heads,
+                "kv_lora_rank": kv_lora_rank,
+                "ckv_cache_dim": ckv_cache_dim,
+                "qk_nope_dim": qk_nope_dim,
+                "qk_rope_dim": qk_rope_dim,
+                "v_head_dim": v_head_dim,
+                "q_lora_rank": q_lora_rank,
+                "sm_scale": sm_scale,
+                "rope_interleave": rope_interleave,
+                "kv_a_norm_ptr": kv_a_norm_ptr,
+                "w_kc_ptr": w_kc_ptr,
+                "w_vc_ptr": w_vc_ptr,
+                "ckv_cache_ptr": ckv_cache_ptr,
+                "kpe_cache_ptr": kpe_cache_ptr,
+                "q_a_norm_ptr": q_a_norm_ptr,
+            }),
+            HqqLayerMetadata::LinearAttention {
+                num_k_heads,
+                num_v_heads,
+                k_head_dim,
+                v_head_dim,
+                head_ratio,
+                kernel_dim,
+                conv_dim,
+                scale,
+                conv_weight_ptr,
+                a_log_ptr,
+                dt_bias_ptr,
+                norm_weight_ptr,
+                conv_state_ptr,
+                recur_state_ptr,
+            } => serde_json::json!({
+                "kind": "linear_attention",
+                "num_k_heads": num_k_heads,
+                "num_v_heads": num_v_heads,
+                "k_head_dim": k_head_dim,
+                "v_head_dim": v_head_dim,
+                "head_ratio": head_ratio,
+                "kernel_dim": kernel_dim,
+                "conv_dim": conv_dim,
+                "scale": scale,
+                "conv_weight_ptr": conv_weight_ptr,
+                "a_log_ptr": a_log_ptr,
+                "dt_bias_ptr": dt_bias_ptr,
+                "norm_weight_ptr": norm_weight_ptr,
+                "conv_state_ptr": conv_state_ptr,
+                "recur_state_ptr": recur_state_ptr,
+            }),
+        };
+
+        Ok(serde_json::json!({
+            "layer_idx": layer_idx,
+            "layer_kind": hqq.layer_kind,
+            "backend": hqq.backend,
+            "format_version": hqq.format_version,
+            "nbits": hqq.nbits,
+            "metadata": metadata,
+            "input_norm_ptr": layer.input_norm_ptr,
+            "input_norm_size": layer.input_norm_size,
+            "post_attn_norm_ptr": layer.post_attn_norm_ptr,
+            "post_attn_norm_size": layer.post_attn_norm_size,
+            "tensor_count": tensors.len(),
+            "tensors": tensors,
+        }).to_string())
+    }
+
+    fn hqq_execution_json(&self, layer_idx: usize) -> PyResult<String> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let layer = graph.layers.get(layer_idx)
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Layer {} not registered", layer_idx),
+            ))?;
+        let exec = layer.hqq_exec.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Layer {} has no HQQ execution descriptor", layer_idx),
+            ))?;
+        Ok(hqq_execution_json_value(exec).to_string())
+    }
+
+    fn hqq_decode_timing_json(&self) -> PyResult<String> {
+        Ok(serde_json::json!({
+            "entries": self.hqq_decode_timing_entries.iter().map(|entry| {
+                serde_json::json!({
+                    "layer_idx": entry.layer_idx,
+                    "token_id": entry.token_id,
+                    "position": entry.position,
+                    "tensor_name": entry.tensor_name,
+                    "output_mode": entry.output_mode,
+                    "duration_ms": entry.duration_ms,
+                })
+            }).collect::<Vec<_>>()
+        }).to_string())
+    }
+
+    fn debug_run_hqq_decode_gemv_f32(
+        &mut self,
+        layer_idx: usize,
+        tensor_name: &str,
+        input_ptr: usize,
+    ) -> PyResult<Vec<f32>> {
+        self.device.bind_to_thread()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("debug_run_hqq_decode_gemv_f32 bind_to_thread: {:?}", e)))?;
+        let desc = self
+            .hqq_runtime_decode_exec_desc_for_tensor(layer_idx, tensor_name)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let output = self.device.alloc_zeros::<f32>(desc.rows)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("debug_run_hqq_decode_gemv_f32 alloc output: {:?}", e)))?;
+        self.launch_hqq4_decode_gemv_f32(
+            tensor_name,
+            &desc,
+            input_ptr as u64,
+            *output.device_ptr(),
+        ).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        self.device.synchronize()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("debug_run_hqq_decode_gemv_f32 sync: {:?}", e)))?;
+        self.download_device_f32(*output.device_ptr(), desc.rows)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    fn debug_run_hqq_decode_gemv_bf16(
+        &mut self,
+        layer_idx: usize,
+        tensor_name: &str,
+        input_ptr: usize,
+    ) -> PyResult<Vec<f32>> {
+        self.device.bind_to_thread()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("debug_run_hqq_decode_gemv_bf16 bind_to_thread: {:?}", e)))?;
+        let desc = self
+            .hqq_runtime_decode_exec_desc_for_tensor(layer_idx, tensor_name)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let output = self.device.alloc_zeros::<u16>(desc.rows)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("debug_run_hqq_decode_gemv_bf16 alloc output: {:?}", e)))?;
+        self.launch_hqq4_decode_gemv_bf16(
+            tensor_name,
+            &desc,
+            input_ptr as u64,
+            *output.device_ptr(),
+        ).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        self.device.synchronize()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("debug_run_hqq_decode_gemv_bf16 sync: {:?}", e)))?;
+        self.download_device_bf16_as_f32(*output.device_ptr(), desc.rows)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    fn hqq_prefill_descriptor_json(&self, layer_idx: usize) -> PyResult<String> {
+        let engine = self.prefill_engine_slot.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Prefill engine not allocated yet"
+            ))?;
+        let layer = engine.layer_weights.get(layer_idx)
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Prefill layer {} not available", layer_idx),
+            ))?;
+        let payload = if let Some(desc) = &layer.hqq_gqa {
+            serde_json::json!({
+                "layer_kind": "gqa",
+                "backend": desc.backend,
+                "format_version": desc.format_version,
+                "nbits": desc.nbits,
+                "metadata": {
+                    "num_heads": desc.num_heads,
+                    "num_kv_heads": desc.num_kv_heads,
+                    "head_dim": desc.head_dim,
+                    "sm_scale": desc.sm_scale,
+                    "q_norm_ptr": desc.q_norm_ptr,
+                    "k_norm_ptr": desc.k_norm_ptr,
+                    "gated": desc.gated,
+                },
+                "tensors": [
+                    hqq_prefill_tensor_exec_json(&desc.q_proj, "q_proj"),
+                    hqq_prefill_tensor_exec_json(&desc.k_proj, "k_proj"),
+                    hqq_prefill_tensor_exec_json(&desc.v_proj, "v_proj"),
+                    hqq_prefill_tensor_exec_json(&desc.o_proj, "o_proj"),
+                ],
+            })
+        } else if let Some(desc) = &layer.hqq_mla {
+            let mut tensors = vec![
+                hqq_prefill_tensor_exec_json(&desc.kv_a_proj_with_mqa, "kv_a_proj_with_mqa"),
+                hqq_prefill_tensor_exec_json(&desc.o_proj, "o_proj"),
+            ];
+            if let Some(q_a_proj) = &desc.q_a_proj {
+                tensors.push(hqq_prefill_tensor_exec_json(q_a_proj, "q_a_proj"));
+            }
+            if let Some(q_b_proj) = &desc.q_b_proj {
+                tensors.push(hqq_prefill_tensor_exec_json(q_b_proj, "q_b_proj"));
+            }
+            if let Some(q_proj) = &desc.q_proj {
+                tensors.push(hqq_prefill_tensor_exec_json(q_proj, "q_proj"));
+            }
+            serde_json::json!({
+                "layer_kind": "mla",
+                "backend": desc.backend,
+                "format_version": desc.format_version,
+                "nbits": desc.nbits,
+                "metadata": {
+                    "num_heads": desc.num_heads,
+                    "kv_lora_rank": desc.kv_lora_rank,
+                    "ckv_cache_dim": desc.ckv_cache_dim,
+                    "qk_nope_dim": desc.qk_nope_dim,
+                    "qk_rope_dim": desc.qk_rope_dim,
+                    "v_head_dim": desc.v_head_dim,
+                    "q_lora_rank": desc.q_lora_rank,
+                    "sm_scale": desc.sm_scale,
+                    "rope_interleave": desc.rope_interleave,
+                    "kv_a_norm_ptr": desc.kv_a_norm_ptr,
+                    "w_kc_ptr": desc.w_kc_ptr,
+                    "w_vc_ptr": desc.w_vc_ptr,
+                    "ckv_cache_ptr": desc.ckv_cache_ptr,
+                    "kpe_cache_ptr": desc.kpe_cache_ptr,
+                    "q_a_norm_ptr": desc.q_a_norm_ptr,
+                },
+                "tensors": tensors,
+            })
+        } else if let Some(desc) = &layer.hqq_linear_attention {
+            serde_json::json!({
+                "layer_kind": "linear_attention",
+                "backend": desc.backend,
+                "format_version": desc.format_version,
+                "nbits": desc.nbits,
+                "metadata": {
+                    "num_k_heads": desc.num_k_heads,
+                    "num_v_heads": desc.num_v_heads,
+                    "k_head_dim": desc.k_head_dim,
+                    "v_head_dim": desc.v_head_dim,
+                    "head_ratio": desc.head_ratio,
+                    "kernel_dim": desc.kernel_dim,
+                    "conv_dim": desc.conv_dim,
+                    "scale": desc.scale,
+                    "conv_weight_ptr": desc.conv_weight_ptr,
+                    "a_log_ptr": desc.a_log_ptr,
+                    "dt_bias_ptr": desc.dt_bias_ptr,
+                    "norm_weight_ptr": desc.norm_weight_ptr,
+                    "conv_state_ptr": desc.conv_state_ptr,
+                    "recur_state_ptr": desc.recur_state_ptr,
+                },
+                "tensors": [
+                    hqq_prefill_tensor_exec_json(&desc.in_proj_qkvz, "in_proj_qkvz"),
+                    hqq_prefill_tensor_exec_json(&desc.in_proj_ba, "in_proj_ba"),
+                    hqq_prefill_tensor_exec_json(&desc.out_proj, "out_proj"),
+                ],
+            })
+        } else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Prefill layer {} has no HQQ execution descriptor",
+                layer_idx
+            )));
+        };
+        Ok(payload.to_string())
+    }
+
+    #[pyo3(signature = (layer_idx, hidden_bf16, m, start_pos=0, capture_kv_cache=false))]
+    fn debug_run_gqa_prefill_layer(
+        &mut self,
+        layer_idx: usize,
+        hidden_bf16: Vec<u16>,
+        m: usize,
+        start_pos: usize,
+        capture_kv_cache: bool,
+    ) -> PyResult<Vec<u16>> {
+        let engine = self.prefill_engine_slot.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Prefill engine not allocated yet")
+        })?;
+        engine
+            .debug_run_gqa_prefill_layer(layer_idx, &hidden_bf16, m, start_pos, capture_kv_cache)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    fn decode_timing_json(&self) -> PyResult<String> {
+        let graph = self.graph.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Call configure first")
+        })?;
+        Ok(serde_json::json!({
+            "timing_enabled": graph.timing_enabled,
+            "timing_step_count": graph.timing_step_count,
+            "t_total_s": graph.t_total,
+            "t_attn_gqa_s": graph.t_attn_gqa,
+            "t_gqa_proj_s": graph.t_gqa_proj,
+            "t_gqa_attn_s": graph.t_gqa_attn,
+            "t_gqa_out_s": graph.t_gqa_out,
+        }).to_string())
     }
 
     /// Set Mamba2 n_groups parameter (shared across all Mamba2 layers).
@@ -6028,6 +9816,19 @@ impl GpuDecodeStore {
             graph.gqa_num_q_heads = max_nh;
             graph.gqa_head_dim = max_hd;
         }
+        Ok(())
+    }
+
+    #[pyo3(signature = (kv_ptrs, max_seq))]
+    fn set_kv_cache_ptrs_bf16(
+        &mut self,
+        kv_ptrs: Vec<(usize, usize, usize)>,
+        max_seq: usize,
+    ) -> PyResult<()> {
+        self.set_kv_cache_ptrs(kv_ptrs, max_seq)?;
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        graph.kv_format = 0;
         Ok(())
     }
 
@@ -6825,6 +10626,122 @@ impl GpuDecodeStore {
         (&[], 0)
     }
 
+    pub fn has_hqq_runtime_slots(&self) -> bool {
+        !self.hqq_runtime_slots.is_empty()
+    }
+
+    pub fn swap_hqq_runtime_to_prefill_rust(&mut self) -> Result<(), String> {
+        self.swap_hqq_runtime_stage_rust("prefill")
+    }
+
+    pub fn swap_hqq_runtime_to_decode_rust(&mut self) -> Result<(), String> {
+        self.swap_hqq_runtime_stage_rust("decode")
+    }
+
+    pub fn prepare_runtime_for_prefill_rust(&mut self) -> Result<bool, String> {
+        self.swap_to_marlin_rust()?;
+        let has_hqq_runtime_slots = self.has_hqq_runtime_slots();
+        if has_hqq_runtime_slots {
+            self.swap_hqq_runtime_to_prefill_rust()?;
+        }
+        Ok(has_hqq_runtime_slots)
+    }
+
+    pub fn prepare_runtime_for_decode_rust(&mut self) -> Result<(), String> {
+        if self.has_hqq_runtime_slots() {
+            self.swap_hqq_runtime_to_decode_rust()?;
+        }
+        self.swap_to_simple_int4_rust()
+    }
+
+    fn swap_hqq_runtime_stage_rust(&mut self, stage: &str) -> Result<(), String> {
+        if self.hqq_runtime_slots.is_empty() {
+            return Ok(());
+        }
+        self.device.bind_to_thread()
+            .map_err(|e| format!("swap_hqq_runtime_stage bind_to_thread: {:?}", e))?;
+
+        let t0 = std::time::Instant::now();
+        let mut swap_count = 0usize;
+        let mut total_host_bytes = 0usize;
+        let mut packed_memcpy_bytes = 0usize;
+        let mut scales_memcpy_bytes = 0usize;
+        let mut zeros_memcpy_bytes = 0usize;
+
+        for slot in &mut self.hqq_runtime_slots {
+            if !slot.is_registered() {
+                return Err(format!(
+                    "HQQ runtime slot for layer {} tensor {} is not registered",
+                    slot.layer_idx, slot.tensor_name
+                ));
+            }
+            let desc = Self::hqq_runtime_stage_desc(slot, stage)?;
+            let packed_bytes = Self::hqq_runtime_copy_component(
+                slot.packed_slot_ptr,
+                slot.packed_slot_bytes,
+                &desc.packed_host,
+                "packed",
+            )?;
+            let scales_bytes = Self::hqq_runtime_copy_component(
+                slot.scales_slot_ptr,
+                slot.scales_slot_bytes,
+                &desc.scales_host,
+                "scales",
+            )?;
+            let zeros_bytes = Self::hqq_runtime_copy_component(
+                slot.zeros_slot_ptr,
+                slot.zeros_slot_bytes,
+                &desc.zeros_host,
+                "zeros",
+            )?;
+            slot.current_stage = stage.to_string();
+            slot.last_packed_memcpy_bytes = packed_bytes;
+            slot.last_scales_memcpy_bytes = scales_bytes;
+            slot.last_zeros_memcpy_bytes = zeros_bytes;
+            swap_count += 1;
+            packed_memcpy_bytes += packed_bytes;
+            scales_memcpy_bytes += scales_bytes;
+            zeros_memcpy_bytes += zeros_bytes;
+            total_host_bytes += packed_bytes + scales_bytes + zeros_bytes;
+        }
+        let total_swap_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        for slot in &mut self.hqq_runtime_slots {
+            if slot.current_stage == stage {
+                slot.last_swap_ms = total_swap_ms;
+            }
+        }
+        self.hqq_runtime_last_swap = HqqRuntimeSwapStats {
+            stage: stage.to_string(),
+            swap_count,
+            total_swap_ms,
+            total_host_bytes,
+            packed_memcpy_bytes,
+            scales_memcpy_bytes,
+            zeros_memcpy_bytes,
+        };
+        trace_emit_global_mark(
+            self.active_trace(),
+            "weights",
+            &format!(
+                "phase=hqq_swap stage={} tensors={} swap_ms={:.3} memcpy_mb={:.3}",
+                stage,
+                swap_count,
+                total_swap_ms,
+                total_host_bytes as f64 / 1024.0 / 1024.0,
+            ),
+        );
+        log::info!(
+            "HQQ runtime swap: stage={} tensors={} swap_ms={:.3} packed_mb={:.3} scales_mb={:.3} zeros_mb={:.3}",
+            stage,
+            swap_count,
+            total_swap_ms,
+            packed_memcpy_bytes as f64 / 1024.0 / 1024.0,
+            scales_memcpy_bytes as f64 / 1024.0 / 1024.0,
+            zeros_memcpy_bytes as f64 / 1024.0 / 1024.0,
+        );
+        Ok(())
+    }
+
     /// Swap GPU weight slots from Marlin format to simple INT4 format for decode.
     /// Must be called after prefill and before decode when using AWQ single-slot weights.
     pub fn swap_to_simple_int4_rust(&mut self) -> Result<(), String> {
@@ -7329,60 +11246,267 @@ impl GpuDecodeStore {
                 la_conv_weight_ptr: 0, la_a_log_ptr: 0, la_dt_bias_ptr: 0,
                 la_norm_weight_ptr: 0, la_conv_state_ptr: 0, la_recur_state_ptr: 0,
                 q_norm_ptr: 0, k_norm_ptr: 0,
+                hqq_gqa: None, hqq_mla: None, hqq_linear_attention: None,
             };
 
-            match &l.attn {
-                GpuAttnConfig::GQA { q_proj, k_proj, v_proj, o_proj, gated,
-                                     q_norm_ptr, k_norm_ptr, .. } => {
-                    lw.q_proj = extract_marlin(*q_proj);
-                    lw.k_proj = extract_marlin(*k_proj);
-                    lw.v_proj = extract_marlin(*v_proj);
-                    lw.o_proj = extract_marlin(*o_proj);
-                    // BF16 fallback for attention_quant="bf16"
-                    if lw.q_proj.is_none() { lw.q_proj_bf16 = extract_bf16(*q_proj); }
-                    if lw.k_proj.is_none() { lw.k_proj_bf16 = extract_bf16(*k_proj); }
-                    if lw.v_proj.is_none() { lw.v_proj_bf16 = extract_bf16(*v_proj); }
-                    if lw.o_proj.is_none() { lw.o_proj_bf16 = extract_bf16(*o_proj); }
-                    lw.gqa_gated = *gated;
-                    lw.q_norm_ptr = *q_norm_ptr;
-                    lw.k_norm_ptr = *k_norm_ptr;
-                }
-                GpuAttnConfig::Mamba2 { in_proj, out_proj,
-                    conv_weight_ptr, a_ptr, d_ptr, dt_bias_ptr, norm_weight_ptr, .. } =>
-                {
-                    lw.mamba2_in_proj = extract_marlin(*in_proj);
-                    lw.mamba2_out_proj = extract_marlin(*out_proj);
-                    lw.mamba2_conv_weight = *conv_weight_ptr;
-                    lw.mamba2_A = *a_ptr;
-                    lw.mamba2_D = *d_ptr;
-                    lw.mamba2_dt_bias = *dt_bias_ptr;
-                    lw.mamba2_norm = *norm_weight_ptr;
-                }
-                GpuAttnConfig::LinearAttention { in_proj_qkvz, in_proj_ba, out_proj,
-                    conv_weight_ptr, a_log_ptr, dt_bias_ptr, norm_weight_ptr,
-                    conv_state_ptr, recur_state_ptr, .. } =>
-                {
-                    lw.la_in_proj_qkvz = extract_marlin(*in_proj_qkvz);
-                    lw.la_in_proj_ba = extract_marlin(*in_proj_ba);
-                    lw.la_out_proj = extract_marlin(*out_proj);
-                    // BF16 fallback for attention_quant="bf16"
-                    if lw.la_in_proj_qkvz.is_none() {
-                        lw.la_in_proj_qkvz_bf16 = extract_bf16(*in_proj_qkvz);
+            if let Some(hqq_exec) = &l.hqq_exec {
+                match hqq_exec {
+                    HqqExecutionDescriptor::Gqa(desc) => {
+                        let q_proj = self.hqq_runtime_prefill_exec_desc_for_tensor(i, "q_proj")?;
+                        let k_proj = self.hqq_runtime_prefill_exec_desc_for_tensor(i, "k_proj")?;
+                        let v_proj = self.hqq_runtime_prefill_exec_desc_for_tensor(i, "v_proj")?;
+                        let o_proj = self.hqq_runtime_prefill_exec_desc_for_tensor(i, "o_proj")?;
+                        lw.gqa_gated = desc.gated;
+                        lw.q_norm_ptr = desc.q_norm_ptr;
+                        lw.k_norm_ptr = desc.k_norm_ptr;
+                        lw.hqq_gqa = Some(crate::gpu_prefill::HqqGqaPrefillDescriptor {
+                            backend: desc.backend.clone(),
+                            format_version: desc.format_version,
+                            nbits: desc.nbits,
+                            q_proj: crate::gpu_prefill::HqqTensorExecDescriptor {
+                                packed_ptr: q_proj.packed_ptr,
+                                scales_ptr: q_proj.scales_ptr,
+                                zeros_ptr: q_proj.zeros_ptr,
+                                rows: q_proj.rows,
+                                cols: q_proj.cols,
+                                group_size: q_proj.group_size,
+                                axis: q_proj.axis,
+                                layout: q_proj.layout,
+                                packed_dtype: q_proj.packed_dtype,
+                                scales_dtype: q_proj.scales_dtype,
+                                zeros_dtype: q_proj.zeros_dtype,
+                                original_dtype: q_proj.original_dtype,
+                                tensor_bytes: q_proj.tensor_bytes,
+                            },
+                            k_proj: crate::gpu_prefill::HqqTensorExecDescriptor {
+                                packed_ptr: k_proj.packed_ptr,
+                                scales_ptr: k_proj.scales_ptr,
+                                zeros_ptr: k_proj.zeros_ptr,
+                                rows: k_proj.rows,
+                                cols: k_proj.cols,
+                                group_size: k_proj.group_size,
+                                axis: k_proj.axis,
+                                layout: k_proj.layout,
+                                packed_dtype: k_proj.packed_dtype,
+                                scales_dtype: k_proj.scales_dtype,
+                                zeros_dtype: k_proj.zeros_dtype,
+                                original_dtype: k_proj.original_dtype,
+                                tensor_bytes: k_proj.tensor_bytes,
+                            },
+                            v_proj: crate::gpu_prefill::HqqTensorExecDescriptor {
+                                packed_ptr: v_proj.packed_ptr,
+                                scales_ptr: v_proj.scales_ptr,
+                                zeros_ptr: v_proj.zeros_ptr,
+                                rows: v_proj.rows,
+                                cols: v_proj.cols,
+                                group_size: v_proj.group_size,
+                                axis: v_proj.axis,
+                                layout: v_proj.layout,
+                                packed_dtype: v_proj.packed_dtype,
+                                scales_dtype: v_proj.scales_dtype,
+                                zeros_dtype: v_proj.zeros_dtype,
+                                original_dtype: v_proj.original_dtype,
+                                tensor_bytes: v_proj.tensor_bytes,
+                            },
+                            o_proj: crate::gpu_prefill::HqqTensorExecDescriptor {
+                                packed_ptr: o_proj.packed_ptr,
+                                scales_ptr: o_proj.scales_ptr,
+                                zeros_ptr: o_proj.zeros_ptr,
+                                rows: o_proj.rows,
+                                cols: o_proj.cols,
+                                group_size: o_proj.group_size,
+                                axis: o_proj.axis,
+                                layout: o_proj.layout,
+                                packed_dtype: o_proj.packed_dtype,
+                                scales_dtype: o_proj.scales_dtype,
+                                zeros_dtype: o_proj.zeros_dtype,
+                                original_dtype: o_proj.original_dtype,
+                                tensor_bytes: o_proj.tensor_bytes,
+                            },
+                            num_heads: desc.num_heads,
+                            num_kv_heads: desc.num_kv_heads,
+                            head_dim: desc.head_dim,
+                            sm_scale: desc.sm_scale,
+                            q_norm_ptr: desc.q_norm_ptr,
+                            k_norm_ptr: desc.k_norm_ptr,
+                            gated: desc.gated,
+                        });
                     }
-                    if lw.la_in_proj_ba.is_none() {
-                        lw.la_in_proj_ba_bf16 = extract_bf16(*in_proj_ba);
+                    HqqExecutionDescriptor::Mla(desc) => {
+                        let to_prefill = |tensor: &crate::gpu_decode::HqqTensorExecDescriptor| crate::gpu_prefill::HqqTensorExecDescriptor {
+                            packed_ptr: tensor.packed_ptr,
+                            scales_ptr: tensor.scales_ptr,
+                            zeros_ptr: tensor.zeros_ptr,
+                            rows: tensor.rows,
+                            cols: tensor.cols,
+                            group_size: tensor.group_size,
+                            axis: tensor.axis,
+                            layout: tensor.layout.clone(),
+                            packed_dtype: tensor.packed_dtype.clone(),
+                            scales_dtype: tensor.scales_dtype.clone(),
+                            zeros_dtype: tensor.zeros_dtype.clone(),
+                            original_dtype: tensor.original_dtype.clone(),
+                            tensor_bytes: tensor.tensor_bytes,
+                        };
+                        lw.hqq_mla = Some(crate::gpu_prefill::HqqMlaPrefillDescriptor {
+                            backend: desc.backend.clone(),
+                            format_version: desc.format_version,
+                            nbits: desc.nbits,
+                            q_a_proj: desc.q_a_proj.as_ref().map(|tensor| to_prefill(tensor)),
+                            q_b_proj: desc.q_b_proj.as_ref().map(|tensor| to_prefill(tensor)),
+                            q_proj: desc.q_proj.as_ref().map(|tensor| to_prefill(tensor)),
+                            kv_a_proj_with_mqa: to_prefill(&desc.kv_a_proj_with_mqa),
+                            o_proj: to_prefill(&desc.o_proj),
+                            num_heads: desc.num_heads,
+                            kv_lora_rank: desc.kv_lora_rank,
+                            ckv_cache_dim: desc.ckv_cache_dim,
+                            qk_nope_dim: desc.qk_nope_dim,
+                            qk_rope_dim: desc.qk_rope_dim,
+                            v_head_dim: desc.v_head_dim,
+                            q_lora_rank: desc.q_lora_rank,
+                            sm_scale: desc.sm_scale,
+                            rope_interleave: desc.rope_interleave,
+                            kv_a_norm_ptr: desc.kv_a_norm_ptr,
+                            w_kc_ptr: desc.w_kc_ptr,
+                            w_vc_ptr: desc.w_vc_ptr,
+                            ckv_cache_ptr: desc.ckv_cache_ptr,
+                            kpe_cache_ptr: desc.kpe_cache_ptr,
+                            q_a_norm_ptr: desc.q_a_norm_ptr,
+                        });
                     }
-                    if lw.la_out_proj.is_none() {
-                        lw.la_out_proj_bf16 = extract_bf16(*out_proj);
+                    HqqExecutionDescriptor::LinearAttention(desc) => {
+                        lw.la_conv_weight_ptr = desc.conv_weight_ptr;
+                        lw.la_a_log_ptr = desc.a_log_ptr;
+                        lw.la_dt_bias_ptr = desc.dt_bias_ptr;
+                        lw.la_norm_weight_ptr = desc.norm_weight_ptr;
+                        lw.la_conv_state_ptr = desc.conv_state_ptr;
+                        lw.la_recur_state_ptr = desc.recur_state_ptr;
+                        let in_proj_qkvz =
+                            self.hqq_runtime_prefill_exec_desc_for_tensor(i, "in_proj_qkvz")?;
+                        let in_proj_ba =
+                            self.hqq_runtime_prefill_exec_desc_for_tensor(i, "in_proj_ba")?;
+                        let out_proj =
+                            self.hqq_runtime_prefill_exec_desc_for_tensor(i, "out_proj")?;
+                        lw.hqq_linear_attention = Some(crate::gpu_prefill::HqqLinearAttentionPrefillDescriptor {
+                            backend: desc.backend.clone(),
+                            format_version: desc.format_version,
+                            nbits: desc.nbits,
+                            in_proj_qkvz: crate::gpu_prefill::HqqTensorExecDescriptor {
+                                packed_ptr: in_proj_qkvz.packed_ptr,
+                                scales_ptr: in_proj_qkvz.scales_ptr,
+                                zeros_ptr: in_proj_qkvz.zeros_ptr,
+                                rows: in_proj_qkvz.rows,
+                                cols: in_proj_qkvz.cols,
+                                group_size: in_proj_qkvz.group_size,
+                                axis: in_proj_qkvz.axis,
+                                layout: in_proj_qkvz.layout,
+                                packed_dtype: in_proj_qkvz.packed_dtype,
+                                scales_dtype: in_proj_qkvz.scales_dtype,
+                                zeros_dtype: in_proj_qkvz.zeros_dtype,
+                                original_dtype: in_proj_qkvz.original_dtype,
+                                tensor_bytes: in_proj_qkvz.tensor_bytes,
+                            },
+                            in_proj_ba: crate::gpu_prefill::HqqTensorExecDescriptor {
+                                packed_ptr: in_proj_ba.packed_ptr,
+                                scales_ptr: in_proj_ba.scales_ptr,
+                                zeros_ptr: in_proj_ba.zeros_ptr,
+                                rows: in_proj_ba.rows,
+                                cols: in_proj_ba.cols,
+                                group_size: in_proj_ba.group_size,
+                                axis: in_proj_ba.axis,
+                                layout: in_proj_ba.layout,
+                                packed_dtype: in_proj_ba.packed_dtype,
+                                scales_dtype: in_proj_ba.scales_dtype,
+                                zeros_dtype: in_proj_ba.zeros_dtype,
+                                original_dtype: in_proj_ba.original_dtype,
+                                tensor_bytes: in_proj_ba.tensor_bytes,
+                            },
+                            out_proj: crate::gpu_prefill::HqqTensorExecDescriptor {
+                                packed_ptr: out_proj.packed_ptr,
+                                scales_ptr: out_proj.scales_ptr,
+                                zeros_ptr: out_proj.zeros_ptr,
+                                rows: out_proj.rows,
+                                cols: out_proj.cols,
+                                group_size: out_proj.group_size,
+                                axis: out_proj.axis,
+                                layout: out_proj.layout,
+                                packed_dtype: out_proj.packed_dtype,
+                                scales_dtype: out_proj.scales_dtype,
+                                zeros_dtype: out_proj.zeros_dtype,
+                                original_dtype: out_proj.original_dtype,
+                                tensor_bytes: out_proj.tensor_bytes,
+                            },
+                            num_k_heads: desc.num_k_heads,
+                            num_v_heads: desc.num_v_heads,
+                            k_head_dim: desc.k_head_dim,
+                            v_head_dim: desc.v_head_dim,
+                            head_ratio: desc.head_ratio,
+                            kernel_dim: desc.kernel_dim,
+                            conv_dim: desc.conv_dim,
+                            scale: desc.scale,
+                            conv_weight_ptr: desc.conv_weight_ptr,
+                            a_log_ptr: desc.a_log_ptr,
+                            dt_bias_ptr: desc.dt_bias_ptr,
+                            norm_weight_ptr: desc.norm_weight_ptr,
+                            conv_state_ptr: desc.conv_state_ptr,
+                            recur_state_ptr: desc.recur_state_ptr,
+                        });
                     }
-                    lw.la_conv_weight_ptr = *conv_weight_ptr;
-                    lw.la_a_log_ptr = *a_log_ptr;
-                    lw.la_dt_bias_ptr = *dt_bias_ptr;
-                    lw.la_norm_weight_ptr = *norm_weight_ptr;
-                    lw.la_conv_state_ptr = *conv_state_ptr;
-                    lw.la_recur_state_ptr = *recur_state_ptr;
                 }
-                _ => {} // MLA: TODO
+            } else {
+                match &l.attn {
+                    GpuAttnConfig::GQA { q_proj, k_proj, v_proj, o_proj, gated,
+                                         q_norm_ptr, k_norm_ptr, .. } => {
+                        lw.q_proj = extract_marlin(*q_proj);
+                        lw.k_proj = extract_marlin(*k_proj);
+                        lw.v_proj = extract_marlin(*v_proj);
+                        lw.o_proj = extract_marlin(*o_proj);
+                        // BF16 fallback for attention_quant="bf16"
+                        if lw.q_proj.is_none() { lw.q_proj_bf16 = extract_bf16(*q_proj); }
+                        if lw.k_proj.is_none() { lw.k_proj_bf16 = extract_bf16(*k_proj); }
+                        if lw.v_proj.is_none() { lw.v_proj_bf16 = extract_bf16(*v_proj); }
+                        if lw.o_proj.is_none() { lw.o_proj_bf16 = extract_bf16(*o_proj); }
+                        lw.gqa_gated = *gated;
+                        lw.q_norm_ptr = *q_norm_ptr;
+                        lw.k_norm_ptr = *k_norm_ptr;
+                    }
+                    GpuAttnConfig::Mamba2 { in_proj, out_proj,
+                        conv_weight_ptr, a_ptr, d_ptr, dt_bias_ptr, norm_weight_ptr, .. } =>
+                    {
+                        lw.mamba2_in_proj = extract_marlin(*in_proj);
+                        lw.mamba2_out_proj = extract_marlin(*out_proj);
+                        lw.mamba2_conv_weight = *conv_weight_ptr;
+                        lw.mamba2_A = *a_ptr;
+                        lw.mamba2_D = *d_ptr;
+                        lw.mamba2_dt_bias = *dt_bias_ptr;
+                        lw.mamba2_norm = *norm_weight_ptr;
+                    }
+                    GpuAttnConfig::LinearAttention { in_proj_qkvz, in_proj_ba, out_proj,
+                        conv_weight_ptr, a_log_ptr, dt_bias_ptr, norm_weight_ptr,
+                        conv_state_ptr, recur_state_ptr, .. } =>
+                    {
+                        lw.la_in_proj_qkvz = extract_marlin(*in_proj_qkvz);
+                        lw.la_in_proj_ba = extract_marlin(*in_proj_ba);
+                        lw.la_out_proj = extract_marlin(*out_proj);
+                        // BF16 fallback for attention_quant="bf16"
+                        if lw.la_in_proj_qkvz.is_none() {
+                            lw.la_in_proj_qkvz_bf16 = extract_bf16(*in_proj_qkvz);
+                        }
+                        if lw.la_in_proj_ba.is_none() {
+                            lw.la_in_proj_ba_bf16 = extract_bf16(*in_proj_ba);
+                        }
+                        if lw.la_out_proj.is_none() {
+                            lw.la_out_proj_bf16 = extract_bf16(*out_proj);
+                        }
+                        lw.la_conv_weight_ptr = *conv_weight_ptr;
+                        lw.la_a_log_ptr = *a_log_ptr;
+                        lw.la_dt_bias_ptr = *dt_bias_ptr;
+                        lw.la_norm_weight_ptr = *norm_weight_ptr;
+                        lw.la_conv_state_ptr = *conv_state_ptr;
+                        lw.la_recur_state_ptr = *recur_state_ptr;
+                    }
+                    _ => {} // MLA: TODO
+                }
             }
 
             // MoE config
@@ -7758,7 +11882,7 @@ impl GpuDecodeStore {
         } else {
             crate::gpu_prefill::ScalarType::U4B8
         };
-        Ok(PrefillEngine {
+        let mut engine = PrefillEngine {
             device: self.device.clone(),
             kernels,
             trace: None,
@@ -7862,6 +11986,7 @@ impl GpuDecodeStore {
             max_cold_experts: actual_max_cold,
             q_type,
             qk_norm_bf16_bufs,
+            hqq_bf16_weight_bufs: Vec::new(),
             gqa_timing_enabled: std::cell::Cell::new(false),
             t_gqa_proj: std::cell::Cell::new(0.0),
             t_gqa_norm: std::cell::Cell::new(0.0),
@@ -7904,7 +12029,8 @@ impl GpuDecodeStore {
                 .map(|cal| cal.safety_margin_mb as usize)
                 .unwrap_or(crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB),
             prefill_hcs_store_addr: 0,
-        })
+        };
+        Ok(engine)
     }
 
     /// Upload Marlin INT8 repacked weights to GPU and register.
@@ -8470,15 +12596,54 @@ impl GpuDecodeStore {
                         nk, nv, dk, dv, hr, kernel_dim, conv_dim, scale,
                         conv_state_ptr, recur_state_ptr,
                     } => {
+                        let hqq_la_exec = match &layer.hqq_exec {
+                            Some(HqqExecutionDescriptor::LinearAttention(desc))
+                                if hqq_linear_attention_decode_ready(desc) =>
+                            {
+                                Some(desc.clone())
+                            }
+                            Some(exec) => {
+                                return Err(hqq_decode_dispatch_error(
+                                    layer_idx,
+                                    "linear_attention",
+                                    exec,
+                                    None,
+                                ));
+                            }
+                            None => None,
+                        };
                         let nk_ = *nk; let nv_ = *nv; let dk_ = *dk; let dv_ = *dv;
                         let hr_ = *hr; let cd = *conv_dim; let kd = *kernel_dim;
                         let key_dim = nk_ * dk_;
 
                         // Projections
-                        let qkvz_w = &graph.weights[*in_proj_qkvz];
-                        let ba_w = &graph.weights[*in_proj_ba];
-                        self.gemv_bf16_to_f32(qkvz_w, *graph.d_hidden.device_ptr(), *graph.d_la_qkvz.device_ptr())?;
-                        self.gemv_bf16_to_f32(ba_w, *graph.d_hidden.device_ptr(), *graph.d_la_ba.device_ptr())?;
+                        if let Some(hqq_exec) = hqq_la_exec.as_ref() {
+                            self.launch_hqq4_decode_gemv_f32(
+                                "in_proj_qkvz",
+                                &hqq_exec.in_proj_qkvz,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_la_qkvz.device_ptr(),
+                            )?;
+                            self.launch_hqq4_decode_gemv_f32(
+                                "in_proj_ba",
+                                &hqq_exec.in_proj_ba,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_la_ba.device_ptr(),
+                            )?;
+                        } else {
+                            let qkvz_w = &graph.weights[*in_proj_qkvz];
+                            let ba_w = &graph.weights[*in_proj_ba];
+                            self.gemv_bf16_to_f32(
+                                qkvz_w,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_la_qkvz.device_ptr(),
+                            )?;
+                            self.gemv_bf16_to_f32(
+                                ba_w,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_la_ba.device_ptr(),
+                            )?;
+                        }
 
                         // Uninterleave
                         {
@@ -9503,23 +13668,60 @@ impl GpuDecodeStore {
 
                 // Attention (LA or GQA)
                 match &layer.attn {
-                    GpuAttnConfig::LinearAttention {
+                GpuAttnConfig::LinearAttention {
                         in_proj_qkvz, in_proj_ba, out_proj,
                         conv_weight_ptr, a_log_ptr, dt_bias_ptr, norm_weight_ptr,
                         nk, nv, dk, dv, hr, kernel_dim, conv_dim, scale,
                         conv_state_ptr, recur_state_ptr,
                     } => {
+                        let hqq_la_exec = match &layer.hqq_exec {
+                            Some(HqqExecutionDescriptor::LinearAttention(desc))
+                                if hqq_linear_attention_decode_ready(desc) =>
+                            {
+                                Some(desc.clone())
+                            }
+                            Some(exec) => {
+                                return Err(hqq_decode_dispatch_error(
+                                    layer_idx,
+                                    "linear_attention",
+                                    exec,
+                                    None,
+                                ));
+                            }
+                            None => None,
+                        };
                         let nk_ = *nk; let nv_ = *nv; let dk_ = *dk; let dv_ = *dv;
                         let hr_ = *hr; let cd = *conv_dim; let kd = *kernel_dim;
                         let key_dim = nk_ * dk_;
 
                         // LA projections (cuBLAS)
-                        let qkvz_w = &graph.weights[*in_proj_qkvz];
-                        let ba_w = &graph.weights[*in_proj_ba];
-                        self.gemv_bf16_to_f32(qkvz_w, *graph.d_hidden.device_ptr(),
-                            *graph.d_la_qkvz.device_ptr())?;
-                        self.gemv_bf16_to_f32(ba_w, *graph.d_hidden.device_ptr(),
-                            *graph.d_la_ba.device_ptr())?;
+                        if let Some(hqq_exec) = hqq_la_exec.as_ref() {
+                            self.launch_hqq4_decode_gemv_f32(
+                                "in_proj_qkvz",
+                                &hqq_exec.in_proj_qkvz,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_la_qkvz.device_ptr(),
+                            )?;
+                            self.launch_hqq4_decode_gemv_f32(
+                                "in_proj_ba",
+                                &hqq_exec.in_proj_ba,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_la_ba.device_ptr(),
+                            )?;
+                        } else {
+                            let qkvz_w = &graph.weights[*in_proj_qkvz];
+                            let ba_w = &graph.weights[*in_proj_ba];
+                            self.gemv_bf16_to_f32(
+                                qkvz_w,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_la_qkvz.device_ptr(),
+                            )?;
+                            self.gemv_bf16_to_f32(
+                                ba_w,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_la_ba.device_ptr(),
+                            )?;
+                        }
 
                         // Un-interleave QKVZ
                         {
@@ -9615,9 +13817,26 @@ impl GpuDecodeStore {
                         }
 
                         // Output projection
-                        let o_w = &graph.weights[*out_proj];
-                        self.gemv_bf16_internal(o_w, *graph.d_scratch.device_ptr(),
-                            *graph.d_hidden.device_ptr())?;
+                        if let Some(hqq_exec) = hqq_la_exec.as_ref() {
+                            self.launch_hqq4_decode_gemv_f32(
+                                "out_proj",
+                                &hqq_exec.out_proj,
+                                *graph.d_scratch.device_ptr(),
+                                *graph.d_gqa_out.device_ptr(),
+                            )?;
+                            self.launch_fp32_to_bf16(
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_gqa_out.device_ptr(),
+                                hs,
+                            )?;
+                        } else {
+                            let o_w = &graph.weights[*out_proj];
+                            self.gemv_bf16_internal(
+                                o_w,
+                                *graph.d_scratch.device_ptr(),
+                                *graph.d_hidden.device_ptr(),
+                            )?;
+                        }
                     }
 
                     GpuAttnConfig::GQA {
@@ -10947,6 +15166,8 @@ impl GpuDecodeStore {
         let hs = graph.hidden_size;
         let eps = graph.eps;
         let timing = graph.timing_enabled;
+        self.hqq_decode_timing_entries.clear();
+        let mut hqq_decode_timing_entries = Vec::new();
 
         // Validate position doesn't exceed KV cache
         if position >= graph.kv_max_seq {
@@ -11034,6 +15255,7 @@ impl GpuDecodeStore {
                 &self.device,
             );
         };
+        let mut pending_gqa_diag_capture: Option<GqaDecodeDiagCapture> = None;
 
         // ── Multi-GPU segment config ──
         let seg_skip_emb = graph.segment_skip_embedding;
@@ -11090,6 +15312,26 @@ impl GpuDecodeStore {
 
             // ── Pre-attention norm (fused residual add + RMSNorm) ──
             {
+                trace_emit_mark(
+                    trace.as_ref(),
+                    decode_step_counter,
+                    position,
+                    token_id,
+                    Some(layer_idx),
+                    "prefill_layer",
+                    &format!(
+                        "phase=input_norm_launch hidden_ptr=0x{:x} residual_ptr=0x{:x} input_norm_ptr=0x{:x} input_norm_size={} eps={:.8} first_residual={}",
+                        *graph.d_hidden.device_ptr(),
+                        *graph.d_residual.device_ptr(),
+                        layer.input_norm_ptr,
+                        layer.input_norm_size,
+                        eps,
+                        if first_residual { 1 } else { 0 },
+                    ),
+                );
+                trace_bf16("prefill_layer", Some(layer_idx), "input_norm_hidden_in", *graph.d_hidden.device_ptr(), hs);
+                trace_bf16("prefill_layer", Some(layer_idx), "input_norm_residual_in", *graph.d_residual.device_ptr(), hs);
+                trace_bf16("prefill_layer", Some(layer_idx), "input_norm_weight", layer.input_norm_ptr, layer.input_norm_size);
                 let smem = (hs as u32) * 4; // FP32 per element
                 let threads = 256u32.min(hs as u32);
                 let cfg = LaunchConfig {
@@ -11107,6 +15349,8 @@ impl GpuDecodeStore {
                         if first_residual { 1i32 } else { 0i32 },
                     )).map_err(|e| format!("fused_add_rmsnorm[{}]: {:?}", layer_idx, e))?;
                 }
+                trace_bf16("prefill_layer", Some(layer_idx), "input_norm_hidden_out", *graph.d_hidden.device_ptr(), hs);
+                trace_bf16("prefill_layer", Some(layer_idx), "input_norm_residual_out", *graph.d_residual.device_ptr(), hs);
             }
             first_residual = false;
             trace_bf16("post_pre_attn_norm", Some(layer_idx), "d_hidden", *graph.d_hidden.device_ptr(), hs);
@@ -11125,20 +15369,51 @@ impl GpuDecodeStore {
                     nk, nv, dk, dv, hr, kernel_dim, conv_dim, scale,
                     conv_state_ptr, recur_state_ptr,
                 } => {
+                    let hqq_la_exec = match &layer.hqq_exec {
+                        Some(HqqExecutionDescriptor::LinearAttention(desc))
+                            if hqq_linear_attention_decode_ready(desc) =>
+                        {
+                            Some(desc.clone())
+                        }
+                        Some(exec) => {
+                            return Err(hqq_decode_dispatch_error(
+                                layer_idx,
+                                "linear_attention",
+                                exec,
+                                None,
+                            ));
+                        }
+                        None => None,
+                    };
                     let nk_ = *nk; let nv_ = *nv; let dk_ = *dk; let dv_ = *dv;
                     let hr_ = *hr; let cd = *conv_dim; let kd = *kernel_dim;
                     let key_dim = nk_ * dk_;
 
                     // ── LA Step 1: Projections (cuBLAS GEMV) ──
                     let t_la_s1 = Instant::now();
-                    let qkvz_w = &graph.weights[*in_proj_qkvz];
-                    let ba_w = &graph.weights[*in_proj_ba];
-                    self.gemv_bf16_to_f32(
-                        qkvz_w, *graph.d_hidden.device_ptr(),
-                        *graph.d_la_qkvz.device_ptr())?;
-                    self.gemv_bf16_to_f32(
-                        ba_w, *graph.d_hidden.device_ptr(),
-                        *graph.d_la_ba.device_ptr())?;
+                    if let Some(hqq_exec) = hqq_la_exec.as_ref() {
+                        self.launch_hqq4_decode_gemv_f32(
+                            "in_proj_qkvz",
+                            &hqq_exec.in_proj_qkvz,
+                            *graph.d_hidden.device_ptr(),
+                            *graph.d_la_qkvz.device_ptr(),
+                        )?;
+                        self.launch_hqq4_decode_gemv_f32(
+                            "in_proj_ba",
+                            &hqq_exec.in_proj_ba,
+                            *graph.d_hidden.device_ptr(),
+                            *graph.d_la_ba.device_ptr(),
+                        )?;
+                    } else {
+                        let qkvz_w = &graph.weights[*in_proj_qkvz];
+                        let ba_w = &graph.weights[*in_proj_ba];
+                        self.gemv_bf16_to_f32(
+                            qkvz_w, *graph.d_hidden.device_ptr(),
+                            *graph.d_la_qkvz.device_ptr())?;
+                        self.gemv_bf16_to_f32(
+                            ba_w, *graph.d_hidden.device_ptr(),
+                            *graph.d_la_ba.device_ptr())?;
+                    }
                     trace_f32("la_qkvz_proj", Some(layer_idx), "d_la_qkvz", *graph.d_la_qkvz.device_ptr(), 64);
                     trace_f32("la_ba_proj", Some(layer_idx), "d_la_ba", *graph.d_la_ba.device_ptr(), 64);
 
@@ -11421,30 +15696,61 @@ impl GpuDecodeStore {
                     let t_la_s8 = Instant::now();
 
                     // ── LA Step 9: Output projection ──
-                    let out_w = &graph.weights[*out_proj];
-                    trace_emit_mark(
-                        trace.as_ref(),
-                        decode_step_counter,
-                        position,
-                        token_id,
-                        Some(layer_idx),
-                        "la_out_proj",
-                        &format!(
-                            "dtype={} rows={} cols={} marlin_int4={} simple_int4={} ptr=0x{:x}",
-                            out_w.dtype,
-                            out_w.rows,
-                            out_w.cols,
-                            out_w.is_marlin_int4(),
-                            out_w.has_simple_int4(),
-                            out_w.ptr,
-                        ),
-                    );
-                    trace_bf16("la_out_proj_input", Some(layer_idx), "d_scratch", *graph.d_scratch.device_ptr(), 64);
-                    self.gemv_bf16_internal(
-                        out_w,
-                        *graph.d_scratch.device_ptr(),
-                        *graph.d_hidden.device_ptr(),
-                    )?;
+                    if let Some(hqq_exec) = hqq_la_exec.as_ref() {
+                        trace_emit_mark(
+                            trace.as_ref(),
+                            decode_step_counter,
+                            position,
+                            token_id,
+                            Some(layer_idx),
+                            "la_out_proj",
+                            &format!(
+                                "backend={} format_v{} rows={} cols={} kernel_ready={}",
+                                hqq_exec.backend,
+                                hqq_exec.format_version,
+                                hqq_exec.out_proj.rows,
+                                hqq_exec.out_proj.cols,
+                                hqq_exec.out_proj.kernel_ready,
+                            ),
+                        );
+                        trace_bf16("la_out_proj_input", Some(layer_idx), "d_scratch", *graph.d_scratch.device_ptr(), 64);
+                        self.launch_hqq4_decode_gemv_f32(
+                            "out_proj",
+                            &hqq_exec.out_proj,
+                            *graph.d_scratch.device_ptr(),
+                            *graph.d_gqa_out.device_ptr(),
+                        )?;
+                        self.launch_fp32_to_bf16(
+                            *graph.d_hidden.device_ptr(),
+                            *graph.d_gqa_out.device_ptr(),
+                            hs,
+                        )?;
+                    } else {
+                        let out_w = &graph.weights[*out_proj];
+                        trace_emit_mark(
+                            trace.as_ref(),
+                            decode_step_counter,
+                            position,
+                            token_id,
+                            Some(layer_idx),
+                            "la_out_proj",
+                            &format!(
+                                "dtype={} rows={} cols={} marlin_int4={} simple_int4={} ptr=0x{:x}",
+                                out_w.dtype,
+                                out_w.rows,
+                                out_w.cols,
+                                out_w.is_marlin_int4(),
+                                out_w.has_simple_int4(),
+                                out_w.ptr,
+                            ),
+                        );
+                        trace_bf16("la_out_proj_input", Some(layer_idx), "d_scratch", *graph.d_scratch.device_ptr(), 64);
+                        self.gemv_bf16_internal(
+                            out_w,
+                            *graph.d_scratch.device_ptr(),
+                            *graph.d_hidden.device_ptr(),
+                        )?;
+                    }
                     trace_bf16("la_out_proj", Some(layer_idx), "d_hidden", *graph.d_hidden.device_ptr(), hs);
                     if timing {
                         self.device.synchronize().map_err(|e| format!("la out sync: {:?}", e))?;
@@ -11458,6 +15764,38 @@ impl GpuDecodeStore {
                     num_heads, num_kv_heads, head_dim, sm_scale,
                     q_norm_ptr, k_norm_ptr, gated,
                 } => {
+                    let hqq_gqa_exec = match graph.layers[layer_idx].hqq_exec.as_ref() {
+                        Some(HqqExecutionDescriptor::Gqa(desc))
+                            if (fused_qkv.is_some()
+                                && hqq_gqa_fused_decode_ready(
+                                    desc,
+                                    *gated,
+                                    *num_heads,
+                                    *num_kv_heads,
+                                    *head_dim,
+                                ))
+                                || (fused_qkv.is_none()
+                                    && hqq_gqa_split_decode_ready(
+                                        desc,
+                                        *gated,
+                                        *num_heads,
+                                        *head_dim,
+                                    )) =>
+                        {
+                            Some(desc.clone())
+                        }
+                        Some(exec) => {
+                            let requested_projection_mode =
+                                if fused_qkv.is_some() { Some("fused_qkv") } else { Some("split_qkv") };
+                            return Err(hqq_decode_dispatch_error(
+                                layer_idx,
+                                "gqa",
+                                exec,
+                                requested_projection_mode,
+                            ));
+                        }
+                        None => None,
+                    };
                     let nh = *num_heads;
                     let nkv = *num_kv_heads;
                     let hd = *head_dim;
@@ -11473,7 +15811,107 @@ impl GpuDecodeStore {
                     let t_gqa_s1 = Instant::now();
 
                     // ── GQA: Q/K/V projections ──
-                    if let Some(fid) = fused_qkv {
+                    if let Some(hqq_exec) = hqq_gqa_exec.as_ref() {
+                        if let Some(fused_desc) = hqq_exec.fused_qkv.as_ref() {
+                            let t_qkv = Instant::now();
+                            self.launch_hqq4_decode_gemv_f32(
+                                "fused_qkv",
+                                fused_desc,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_gqa_q.device_ptr(),
+                            )?;
+                            Self::record_hqq_decode_timing(
+                                &self.device,
+                                &mut hqq_decode_timing_entries,
+                                layer_idx,
+                                token_id,
+                                position,
+                                "fused_qkv",
+                                "f32",
+                                t_qkv,
+                                timing,
+                            )?;
+                            let k_offset = hqq_exec.fused_q_rows;
+                            let v_offset = k_offset + hqq_exec.fused_k_rows;
+                            unsafe {
+                                let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                                    *graph.d_gqa_k.device_ptr(),
+                                    (*graph.d_gqa_q.device_ptr() as *const f32).add(k_offset) as u64,
+                                    hqq_exec.fused_k_rows * 4,
+                                );
+                                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                    return Err(format!("D2D HQQ fused K split[{}]: {:?}", layer_idx, err));
+                                }
+                                let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                                    *graph.d_gqa_v.device_ptr(),
+                                    (*graph.d_gqa_q.device_ptr() as *const f32).add(v_offset) as u64,
+                                    hqq_exec.fused_v_rows * 4,
+                                );
+                                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                    return Err(format!("D2D HQQ fused V split[{}]: {:?}", layer_idx, err));
+                                }
+                            }
+                        } else {
+                            let t_q = Instant::now();
+                            self.launch_hqq4_decode_gemv_f32(
+                                "q_proj",
+                                &hqq_exec.q_proj,
+                                *graph.d_hidden.device_ptr(),
+                                if *gated {
+                                    *graph.d_gqa_out.device_ptr()
+                                } else {
+                                    *graph.d_gqa_q.device_ptr()
+                                },
+                            )?;
+                            Self::record_hqq_decode_timing(
+                                &self.device,
+                                &mut hqq_decode_timing_entries,
+                                layer_idx,
+                                token_id,
+                                position,
+                                "q_proj",
+                                "f32",
+                                t_q,
+                                timing,
+                            )?;
+                            let t_k = Instant::now();
+                            self.launch_hqq4_decode_gemv_f32(
+                                "k_proj",
+                                &hqq_exec.k_proj,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_gqa_k.device_ptr(),
+                            )?;
+                            Self::record_hqq_decode_timing(
+                                &self.device,
+                                &mut hqq_decode_timing_entries,
+                                layer_idx,
+                                token_id,
+                                position,
+                                "k_proj",
+                                "f32",
+                                t_k,
+                                timing,
+                            )?;
+                            let t_v = Instant::now();
+                            self.launch_hqq4_decode_gemv_f32(
+                                "v_proj",
+                                &hqq_exec.v_proj,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_gqa_v.device_ptr(),
+                            )?;
+                            Self::record_hqq_decode_timing(
+                                &self.device,
+                                &mut hqq_decode_timing_entries,
+                                layer_idx,
+                                token_id,
+                                position,
+                                "v_proj",
+                                "f32",
+                                t_v,
+                                timing,
+                            )?;
+                        }
+                    } else if let Some(fid) = fused_qkv {
                         let fw = &graph.weights[*fid];
                         self.gemv_bf16_to_f32(fw, *graph.d_hidden.device_ptr(),
                             *graph.d_gqa_q.device_ptr())?;
@@ -11507,6 +15945,41 @@ impl GpuDecodeStore {
                         self.gemv_bf16_to_f32(vw, *graph.d_hidden.device_ptr(),
                             *graph.d_gqa_v.device_ptr())?;
                     }
+                    let gated_q_raw_rows = if *gated {
+                        hqq_gqa_exec
+                            .as_ref()
+                            .map(|exec| {
+                                if exec.fused_qkv.is_some() {
+                                    exec.fused_q_rows
+                                } else {
+                                    exec.q_proj.rows
+                                }
+                            })
+                            .unwrap_or(nh * hd * 2)
+                    } else {
+                        nh * hd
+                    };
+                    let gated_q_raw_ptr = if *gated
+                        && hqq_gqa_exec
+                            .as_ref()
+                            .map(|exec| exec.fused_qkv.is_none())
+                            .unwrap_or(false)
+                    {
+                        *graph.d_gqa_out.device_ptr()
+                    } else {
+                        *graph.d_gqa_q.device_ptr()
+                    };
+                    let diag_raw_gqa = if self.debug_gqa_diag_layer == Some(layer_idx) {
+                        Some((
+                            self.download_device_bf16_as_f32(*graph.d_hidden.device_ptr(), hs)?,
+                            self.download_device_f32(gated_q_raw_ptr, gated_q_raw_rows)?,
+                            self.download_device_f32(*graph.d_gqa_k.device_ptr(), nkv * hd)?,
+                            self.download_device_f32(*graph.d_gqa_v.device_ptr(), nkv * hd)?,
+                        ))
+                    } else {
+                        None
+                    };
+                    let mut diag_q_after_split: Option<Vec<f32>> = None;
 
                     // ── GQA: Split gated Q into Q[nh*hd] and gate[nh*hd] ──
                     // Q proj output for gated attn is [nh, 2*hd] = [head0_q(hd), head0_gate(hd), ...]
@@ -11517,15 +15990,17 @@ impl GpuDecodeStore {
                     // cross-block read/write aliasing has no ordering guarantee.
                     if *gated {
                         // Diagnostic: dump raw Q proj output BEFORE split
-                        trace_f32("gqa_gated_q_pre_split", Some(layer_idx), "d_gqa_q", *graph.d_gqa_q.device_ptr(), nh * hd * 2);
-                        let gated_q_size = nh * hd * 2; // Q + gate interleaved
-                        unsafe {
-                            let err = cuda_sys::lib().cuMemcpyDtoD_v2(
-                                *graph.d_gqa_out.device_ptr(),
-                                *graph.d_gqa_q.device_ptr(),
-                                gated_q_size * 4);
-                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                                return Err(format!("D2D gated_q copy[{}]: {:?}", layer_idx, err));
+                        trace_f32("gqa_gated_q_pre_split", Some(layer_idx), "gated_q_pre_split", gated_q_raw_ptr, gated_q_raw_rows);
+                        if hqq_gqa_exec.is_none() {
+                            let gated_q_size = nh * hd * 2; // Q + gate interleaved
+                            unsafe {
+                                let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                                    *graph.d_gqa_out.device_ptr(),
+                                    *graph.d_gqa_q.device_ptr(),
+                                    gated_q_size * 4);
+                                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                    return Err(format!("D2D gated_q copy[{}]: {:?}", layer_idx, err));
+                                }
                             }
                         }
                         let total = (nh * hd) as u32;
@@ -11550,6 +16025,10 @@ impl GpuDecodeStore {
                         // Diagnostic: dump Q and gate AFTER split
                         trace_f32("gqa_q_post_split", Some(layer_idx), "d_gqa_q", *graph.d_gqa_q.device_ptr(), nh * hd);
                         trace_f32("gqa_gate_post_split", Some(layer_idx), "d_la_qkvz", *graph.d_la_qkvz.device_ptr(), nh * hd);
+                        if self.debug_gqa_diag_layer == Some(layer_idx) {
+                            diag_q_after_split =
+                                Some(self.download_device_f32(*graph.d_gqa_q.device_ptr(), nh * hd)?);
+                        }
                     }
 
                     // ── GQA: QK norm (if enabled) ──
@@ -11858,15 +16337,54 @@ impl GpuDecodeStore {
                     trace_bf16("gqa_post_gate", Some(layer_idx), "d_scratch", *graph.d_scratch.device_ptr(), o_size);
 
                     // ── GQA: O projection ──
-                    let ow = &graph.weights[*o_proj];
-                    self.gemv_bf16_internal(
-                        ow,
-                        *graph.d_scratch.device_ptr(),
-                        *graph.d_hidden.device_ptr(),
-                    )?;
+                    if let Some(hqq_exec) = hqq_gqa_exec.as_ref() {
+                        let t_o = Instant::now();
+                        self.launch_hqq4_decode_gemv_bf16(
+                            "o_proj",
+                            &hqq_exec.o_proj,
+                            *graph.d_scratch.device_ptr(),
+                            *graph.d_hidden.device_ptr(),
+                        )?;
+                        Self::record_hqq_decode_timing(
+                            &self.device,
+                            &mut hqq_decode_timing_entries,
+                            layer_idx,
+                            token_id,
+                            position,
+                            "o_proj",
+                            "bf16",
+                            t_o,
+                            timing,
+                        )?;
+                    } else {
+                        let ow = &graph.weights[*o_proj];
+                        self.gemv_bf16_internal(
+                            ow,
+                            *graph.d_scratch.device_ptr(),
+                            *graph.d_hidden.device_ptr(),
+                        )?;
+                    }
 
                     // Diagnostic: check d_hidden (BF16 output of O proj) = attention contribution to residual
                     trace_bf16("gqa_o_proj", Some(layer_idx), "d_hidden", *graph.d_hidden.device_ptr(), hs);
+                    if let Some((pre_attn_hidden, q_raw, k_raw, v_raw)) = diag_raw_gqa {
+                        pending_gqa_diag_capture = Some(self.capture_gqa_decode_diag(
+                            graph,
+                            layer_idx,
+                            position,
+                            pre_attn_hidden,
+                            q_raw,
+                            k_raw,
+                            v_raw,
+                            diag_q_after_split.unwrap_or_default(),
+                            nh,
+                            nkv,
+                            hd,
+                            *gated,
+                            o_size,
+                            kv_stride,
+                        )?);
+                    }
 
                     if timing {
                         self.device.synchronize().map_err(|e| format!("gqa out sync: {:?}", e))?;
@@ -11886,6 +16404,9 @@ impl GpuDecodeStore {
                     q_lora_rank, sm_scale, rope_interleave,
                     ckv_cache_ptr, kpe_cache_ptr,
                 } => {
+                    if let Some(exec) = &graph.layers[layer_idx].hqq_exec {
+                        return Err(hqq_decode_dispatch_error(layer_idx, "mla", exec, None));
+                    }
                     let nh = *num_heads;
                     let klr = *kv_lora_rank;     // real kv_lora_rank (e.g. 256 for Mistral)
                     let ccd = *ckv_cache_dim;    // padded ckv dim in cache (≥512)
@@ -12331,6 +16852,12 @@ impl GpuDecodeStore {
             }
 
             trace_bf16("post_post_attn_norm", Some(layer_idx), "d_hidden", *graph.d_hidden.device_ptr(), hs);
+            if let Some(capture) = pending_gqa_diag_capture.as_mut() {
+                capture.post_attn_norm_hidden =
+                    self.download_device_bf16_as_f32(*graph.d_hidden.device_ptr(), hs)?;
+                capture.post_attn_norm_residual =
+                    self.download_device_bf16_as_f32(*graph.d_residual.device_ptr(), hs)?;
+            }
 
             // Timing: after post-attn norm, before MLP/MoE
             let t_mlp_start = if timing {
@@ -12461,6 +16988,12 @@ impl GpuDecodeStore {
                     *graph.d_hidden.device_ptr())?;
             }
             // GpuMlpConfig::None → skip (layer 0 in QCN is dense but registered separately)
+            if let Some(capture) = pending_gqa_diag_capture.as_mut() {
+                capture.post_mlp_hidden =
+                    self.download_device_bf16_as_f32(*graph.d_hidden.device_ptr(), hs)?;
+                capture.post_mlp_residual =
+                    self.download_device_bf16_as_f32(*graph.d_residual.device_ptr(), hs)?;
+            }
 
             // Timing: after MLP/MoE
             if timing {
@@ -12529,6 +17062,12 @@ impl GpuDecodeStore {
         // Diagnostic: dump d_hidden and d_residual before final norm
         trace_bf16("final_pre_norm_hidden", None, "d_hidden", *graph.d_hidden.device_ptr(), hs);
         trace_bf16("final_pre_norm_residual", None, "d_residual", *graph.d_residual.device_ptr(), hs);
+        if let Some(capture) = pending_gqa_diag_capture.as_mut() {
+            capture.final_pre_norm_hidden =
+                self.download_device_bf16_as_f32(*graph.d_hidden.device_ptr(), hs)?;
+            capture.final_pre_norm_residual =
+                self.download_device_bf16_as_f32(*graph.d_residual.device_ptr(), hs)?;
+        }
         {
             let smem = (hs as u32) * 4;
             let threads = 256u32.min(hs as u32);
@@ -12550,6 +17089,10 @@ impl GpuDecodeStore {
         }
         // After final norm, d_hidden is the normed output for LM head
         trace_bf16("final_post_norm", None, "d_hidden", *graph.d_hidden.device_ptr(), hs);
+        if let Some(capture) = pending_gqa_diag_capture.as_mut() {
+            capture.final_post_norm =
+                self.download_device_bf16_as_f32(*graph.d_hidden.device_ptr(), hs)?;
+        }
         if let Some(trace_cfg) = trace.as_ref() {
             if trace_cfg.should_emit(decode_step_counter, None, "final_post_norm") {
                 if let Some(dir) = trace_cfg.dump_dir.as_ref() {
@@ -12639,6 +17182,9 @@ impl GpuDecodeStore {
                 return Err(format!("D2H logits: {:?}", err));
             }
         }
+        if let Some(capture) = pending_gqa_diag_capture.as_mut() {
+            capture.final_logits = graph.h_logits.clone();
+        }
 
         #[cfg(feature = "gpu-debug")]
         {
@@ -12650,6 +17196,8 @@ impl GpuDecodeStore {
         }
 
 
+        self.debug_gqa_diag_capture = pending_gqa_diag_capture;
+        self.hqq_decode_timing_entries = hqq_decode_timing_entries;
         Ok(())
     }
 
@@ -13873,37 +18421,73 @@ impl GpuDecodeStore {
                     nk, nv, dk, dv, hr, kernel_dim, conv_dim, scale,
                     conv_state_ptr, recur_state_ptr,
                 } => {
+                    let hqq_la_exec = match &graph.layers[layer_idx].hqq_exec {
+                        Some(HqqExecutionDescriptor::LinearAttention(desc))
+                            if hqq_linear_attention_decode_ready(desc) =>
+                        {
+                            Some(desc.clone())
+                        }
+                        Some(exec) => {
+                            return Err(hqq_decode_dispatch_error(
+                                layer_idx,
+                                "linear_attention",
+                                exec,
+                                None,
+                            ));
+                        }
+                        None => None,
+                    };
                     let nk_ = *nk; let nv_ = *nv; let dk_ = *dk; let dv_ = *dv;
                     let hr_ = *hr; let cd = *conv_dim; let kd = *kernel_dim;
                     let key_dim = nk_ * dk_;
                     let gated_size = nv_ * dv_;
 
                     // C1. Batch GEMM: qkvz_w × batch_hidden → batch_proj_a (weights loaded ONCE)
-                    let qkvz_w = &graph.weights[*in_proj_qkvz];
-                    let qkvz_dim = qkvz_w.rows;
-                    self.gemm_bf16_to_f32_batch(
-                        qkvz_w, d_bh_ptr, d_bpa_ptr,
-                        batch_size, hs, qkvz_dim)?;
+                    let mut qkvz_dim = 0usize;
+                    let mut ba_dim = 0usize;
+                    if hqq_la_exec.is_none() {
+                        let qkvz_w = &graph.weights[*in_proj_qkvz];
+                        qkvz_dim = qkvz_w.rows;
+                        self.gemm_bf16_to_f32_batch(
+                            qkvz_w, d_bh_ptr, d_bpa_ptr,
+                            batch_size, hs, qkvz_dim)?;
 
-                    // C2. Batch GEMM: ba_w × batch_hidden → batch_proj_b (weights loaded ONCE)
-                    let ba_w = &graph.weights[*in_proj_ba];
-                    let ba_dim = ba_w.rows;
-                    self.gemm_bf16_to_f32_batch(
-                        ba_w, d_bh_ptr, d_bpb_ptr,
-                        batch_size, hs, ba_dim)?;
+                        // C2. Batch GEMM: ba_w × batch_hidden → batch_proj_b (weights loaded ONCE)
+                        let ba_w = &graph.weights[*in_proj_ba];
+                        ba_dim = ba_w.rows;
+                        self.gemm_bf16_to_f32_batch(
+                            ba_w, d_bh_ptr, d_bpb_ptr,
+                            batch_size, hs, ba_dim)?;
+                    }
 
                     // D. Per-token LA processing (reads from batch_proj, tiny compute)
                     for t in 0..batch_size {
-                        // Copy this token's projection outputs to single-token scratch
-                        unsafe {
-                            cuda_sys::lib().cuMemcpyDtoD_v2(
+                        if let Some(hqq_exec) = hqq_la_exec.as_ref() {
+                            let hidden_ptr = d_bh_ptr + (t * hs * 2) as u64;
+                            self.launch_hqq4_decode_gemv_f32(
+                                "in_proj_qkvz",
+                                &hqq_exec.in_proj_qkvz,
+                                hidden_ptr,
                                 *graph.d_la_qkvz.device_ptr(),
-                                d_bpa_ptr + (t * qkvz_dim) as u64 * 4,
-                                qkvz_dim * 4);
-                            cuda_sys::lib().cuMemcpyDtoD_v2(
+                            )?;
+                            self.launch_hqq4_decode_gemv_f32(
+                                "in_proj_ba",
+                                &hqq_exec.in_proj_ba,
+                                hidden_ptr,
                                 *graph.d_la_ba.device_ptr(),
-                                d_bpb_ptr + (t * ba_dim) as u64 * 4,
-                                ba_dim * 4);
+                            )?;
+                        } else {
+                            // Copy this token's projection outputs to single-token scratch
+                            unsafe {
+                                cuda_sys::lib().cuMemcpyDtoD_v2(
+                                    *graph.d_la_qkvz.device_ptr(),
+                                    d_bpa_ptr + (t * qkvz_dim) as u64 * 4,
+                                    qkvz_dim * 4);
+                                cuda_sys::lib().cuMemcpyDtoD_v2(
+                                    *graph.d_la_ba.device_ptr(),
+                                    d_bpb_ptr + (t * ba_dim) as u64 * 4,
+                                    ba_dim * 4);
+                            }
                         }
 
                         // Uninterleave
@@ -14040,17 +18624,34 @@ impl GpuDecodeStore {
                                     LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
                                     (out_ptr, *graph.d_la_ba.device_ptr(),
                                      *graph.d_la_gated_out.device_ptr(), *norm_weight_ptr, eps,
-                                     nv_ as i32, dv_ as i32),
+                                    nv_ as i32, dv_ as i32),
                                 ).map_err(|e| format!("batch gated_norm_bf16[{}][{}]: {:?}", layer_idx, t, e))?;
                             }
                         }
+                        if let Some(hqq_exec) = hqq_la_exec.as_ref() {
+                            let out_ptr = d_bao_ptr + (t * gated_size * 2) as u64;
+                            let hidden_ptr = d_bh_ptr + (t * hs * 2) as u64;
+                            self.launch_hqq4_decode_gemv_f32(
+                                "out_proj",
+                                &hqq_exec.out_proj,
+                                out_ptr,
+                                *graph.d_gqa_out.device_ptr(),
+                            )?;
+                            self.launch_fp32_to_bf16(
+                                hidden_ptr,
+                                *graph.d_gqa_out.device_ptr(),
+                                hs,
+                            )?;
+                        }
                     } // end per-token LA loop
 
-                    // E. Batch output projection GEMM (weights loaded ONCE)
-                    let out_w = &graph.weights[*out_proj];
-                    self.gemm_bf16_batch(
-                        out_w, d_bao_ptr, d_bh_ptr,
-                        batch_size, gated_size, hs)?;
+                    if hqq_la_exec.is_none() {
+                        // E. Batch output projection GEMM (weights loaded ONCE)
+                        let out_w = &graph.weights[*out_proj];
+                        self.gemm_bf16_batch(
+                            out_w, d_bao_ptr, d_bh_ptr,
+                            batch_size, gated_size, hs)?;
+                    }
                 }
 
                 GpuAttnConfig::GQA {
@@ -14059,6 +18660,24 @@ impl GpuDecodeStore {
                     num_heads, num_kv_heads, head_dim, sm_scale,
                     q_norm_ptr, k_norm_ptr, gated,
                 } => {
+                    if let Some(exec) = &graph.layers[layer_idx].hqq_exec {
+                        match exec {
+                            HqqExecutionDescriptor::Gqa(_) => {
+                                return Err(hqq_decode_dispatch_error(
+                                    layer_idx,
+                                    "gqa",
+                                    exec,
+                                    if fused_qkv.is_some() { Some("fused_qkv") } else { Some("split_qkv") },
+                                ));
+                            }
+                            _ => return Err(hqq_decode_dispatch_error(
+                                layer_idx,
+                                "gqa",
+                                exec,
+                                if fused_qkv.is_some() { Some("fused_qkv") } else { Some("split_qkv") },
+                            )),
+                        }
+                    }
                     let nh = *num_heads;
                     let nkv = *num_kv_heads;
                     let hd = *head_dim;
@@ -14080,6 +18699,7 @@ impl GpuDecodeStore {
                         let q_size = if is_gated { nh * hd * 2 } else { nh * hd };
                         let k_offset = q_size;
                         let v_offset = k_offset + kv_stride;
+                        let mut diag_raw_gqa_batch: Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = None;
 
                         // D. Per-token GQA processing
                         for t in 0..batch_size {
@@ -14098,6 +18718,20 @@ impl GpuDecodeStore {
                                     *graph.d_gqa_v.device_ptr(),
                                     proj_ptr + (v_offset * 4) as u64,
                                     kv_stride * 4);
+                            }
+                            let diag_raw_gqa = if self.debug_gqa_diag_layer == Some(layer_idx) && batch_size == 1 {
+                                let hidden_ptr = d_bh_ptr + (t * hs * 2) as u64;
+                                Some((
+                                    self.download_device_bf16_as_f32(hidden_ptr, hs)?,
+                                    self.download_device_f32(*graph.d_gqa_q.device_ptr(), nh * hd)?,
+                                    self.download_device_f32(*graph.d_gqa_k.device_ptr(), nkv * hd)?,
+                                    self.download_device_f32(*graph.d_gqa_v.device_ptr(), nkv * hd)?,
+                                ))
+                            } else {
+                                None
+                            };
+                            if diag_raw_gqa_batch.is_none() {
+                                diag_raw_gqa_batch = diag_raw_gqa;
                             }
 
                             // Split gated Q (use d_gqa_out as temp to avoid aliased read/write)
@@ -14267,11 +18901,31 @@ impl GpuDecodeStore {
                         self.gemm_bf16_batch(
                             ow, d_bao_ptr, d_bh_ptr,
                             batch_size, o_size, hs)?;
+                        if let Some((pre_attn_hidden, q_raw, k_raw, v_raw)) = diag_raw_gqa_batch {
+                            let capture = self.capture_gqa_decode_diag(
+                                graph,
+                                layer_idx,
+                                positions[0],
+                                pre_attn_hidden,
+                                q_raw,
+                                k_raw,
+                                v_raw,
+                                Vec::new(),
+                                nh,
+                                nkv,
+                                hd,
+                                *gated,
+                                o_size,
+                                kv_stride,
+                            )?;
+                            self.debug_gqa_diag_capture = Some(capture);
+                        }
                     } else {
                         // Non-fused Q/K/V: fall back to per-token GEMV
                         let qw = &graph.weights[*q_proj];
                         let kw = &graph.weights[*k_proj];
                         let vw = &graph.weights[*v_proj];
+                        let mut diag_raw_gqa_batch: Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = None;
 
                         for t in 0..batch_size {
                             let position = positions[t];
@@ -14280,6 +18934,14 @@ impl GpuDecodeStore {
                             self.gemv_bf16_to_f32(qw, hidden_ptr, *graph.d_gqa_q.device_ptr())?;
                             self.gemv_bf16_to_f32(kw, hidden_ptr, *graph.d_gqa_k.device_ptr())?;
                             self.gemv_bf16_to_f32(vw, hidden_ptr, *graph.d_gqa_v.device_ptr())?;
+                            if diag_raw_gqa_batch.is_none() && self.debug_gqa_diag_layer == Some(layer_idx) && batch_size == 1 {
+                                diag_raw_gqa_batch = Some((
+                                    self.download_device_bf16_as_f32(hidden_ptr, hs)?,
+                                    self.download_device_f32(*graph.d_gqa_q.device_ptr(), nh * hd)?,
+                                    self.download_device_f32(*graph.d_gqa_k.device_ptr(), nkv * hd)?,
+                                    self.download_device_f32(*graph.d_gqa_v.device_ptr(), nkv * hd)?,
+                                ));
+                            }
 
                             // Split gated Q (use d_gqa_out as temp to avoid aliased read/write)
                             if is_gated {
@@ -14448,10 +19110,32 @@ impl GpuDecodeStore {
                                 self.gemv_bf16_internal(ow, *graph.d_scratch.device_ptr(), hidden_ptr)?;
                             }
                         } // end per-token non-fused GQA loop
+                        if let Some((pre_attn_hidden, q_raw, k_raw, v_raw)) = diag_raw_gqa_batch {
+                            let capture = self.capture_gqa_decode_diag(
+                                graph,
+                                layer_idx,
+                                positions[0],
+                                pre_attn_hidden,
+                                q_raw,
+                                k_raw,
+                                v_raw,
+                                Vec::new(),
+                                nh,
+                                nkv,
+                                hd,
+                                *gated,
+                                o_size,
+                                kv_stride,
+                            )?;
+                            self.debug_gqa_diag_capture = Some(capture);
+                        }
                     }
                 }
 
                 GpuAttnConfig::MLA { .. } => {
+                    if let Some(exec) = &graph.layers[layer_idx].hqq_exec {
+                        return Err(hqq_decode_dispatch_error(layer_idx, "mla", exec, None));
+                    }
                     return Err("MLA not implemented for batched decode".to_string());
                 }
 
@@ -18877,6 +23561,7 @@ impl GpuDecodeStore {
         let mut hcs_hit_ids: Vec<usize> = Vec::new();
         let mut apfl_hit_ids: Vec<usize> = Vec::new();
         let mut dma_ids: Vec<usize> = Vec::new();
+        let mut batch_expert_ids: Vec<usize> = Vec::with_capacity(graph.max_experts_per_tok);
 
         for i in 0..topk {
             let eid = graph.h_topk_ids[i];
@@ -18904,6 +23589,7 @@ impl GpuDecodeStore {
                     graph.h_batch_w2_packed_ptrs[hcs_batch_count] = w2p;
                     graph.h_batch_w2_scales_ptrs[hcs_batch_count] = w2s;
                     graph.h_batch_weights[hcs_batch_count] = weight;
+                    batch_expert_ids.push(eid);
                     hcs_batch_count += 1;
                     hcs_hits += 1;
                     hcs_hit_ids.push(eid);
@@ -18947,6 +23633,7 @@ impl GpuDecodeStore {
                         graph.h_batch_w2_packed_ptrs[hcs_batch_count] = w2p;
                         graph.h_batch_w2_scales_ptrs[hcs_batch_count] = w2s;
                         graph.h_batch_weights[hcs_batch_count] = weight;
+                        batch_expert_ids.push(eid);
                         hcs_batch_count += 1;
                         apfl_hits += 1;
                         apfl_hit_ids.push(eid);
@@ -19157,6 +23844,134 @@ impl GpuDecodeStore {
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("batched w2: {:?}", e)))?;
+            }
+
+            if let Some(trace_cfg) = graph.decode_trace.as_ref() {
+                if trace_cfg.should_emit(graph.decode_step_counter, Some(layer_idx), "moe_expert") {
+                    let gate_stride = intermediate * 2;
+                    let expert_stride = expert_hs;
+                    let gate_sample = gate_stride.min(trace_cfg.max_elems.max(2)) & !1usize;
+                    let expert_sample = expert_hs.min(trace_cfg.max_elems.max(1));
+                    for bi in 0..hcs_batch_count {
+                        let Some(&eid) = batch_expert_ids.get(bi) else { continue; };
+                        if !trace_cfg.allows_expert(eid) {
+                            continue;
+                        }
+                        let weight = graph.h_batch_weights[bi];
+                        trace_emit_mark(
+                            Some(trace_cfg),
+                            graph.decode_step_counter,
+                            graph.kv_current_pos,
+                            0,
+                            Some(layer_idx),
+                            "moe_expert",
+                            &format!("phase=expert_compute slot={} expert={} weight={:.6}", bi, eid, weight),
+                        );
+                        trace_emit_bf16(
+                            Some(trace_cfg),
+                            graph.decode_step_counter,
+                            graph.kv_current_pos,
+                            0,
+                            Some(layer_idx),
+                            "moe_expert",
+                            &format!("expert{}_input_hidden", eid),
+                            expert_input_ptr,
+                            expert_sample,
+                            device,
+                        );
+                        trace_emit_bf16(
+                            Some(trace_cfg),
+                            graph.decode_step_counter,
+                            graph.kv_current_pos,
+                            0,
+                            Some(layer_idx),
+                            "moe_expert",
+                            &format!("expert{}_gate_up", eid),
+                            *graph.d_batch_gate_ups.device_ptr() + (bi * gate_stride * 2) as u64,
+                            gate_sample,
+                            device,
+                        );
+                        let mut gate_raw = vec![0u16; gate_sample];
+                        device.synchronize().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                            format!("moe_expert sync gate_up: {:?}", e)))?;
+                        unsafe {
+                            let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                                gate_raw.as_mut_ptr() as *mut std::ffi::c_void,
+                                *graph.d_batch_gate_ups.device_ptr() + (bi * gate_stride * 2) as u64,
+                                gate_raw.len() * 2,
+                            );
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!("moe_expert gate_up d2h[{}]: {:?}", eid, err)));
+                            }
+                        }
+                        let gate_vals: Vec<f32> = gate_raw
+                            .into_iter()
+                            .map(|bits| f32::from_bits((bits as u32) << 16))
+                            .collect();
+                        let half = gate_vals.len() / 2;
+                        if half > 0 {
+                            let mut activated = Vec::with_capacity(half.min(trace_cfg.sample_values.max(1)));
+                            for idx in 0..half.min(trace_cfg.max_elems.max(1)) {
+                                let g = gate_vals[idx];
+                                let u = gate_vals[idx + half];
+                                let silu_g = g / (1.0 + (-g).exp());
+                                activated.push(silu_g * u);
+                            }
+                            trace_emit_values(
+                                Some(trace_cfg),
+                                graph.decode_step_counter,
+                                graph.kv_current_pos,
+                                0,
+                                Some(layer_idx),
+                                "moe_expert",
+                                &format!("expert{}_activated_up_derived", eid),
+                                &activated,
+                            );
+                        }
+                        let expert_out_ptr = *graph.d_batch_expert_outs.device_ptr() + (bi * expert_stride * 2) as u64;
+                        trace_emit_bf16(
+                            Some(trace_cfg),
+                            graph.decode_step_counter,
+                            graph.kv_current_pos,
+                            0,
+                            Some(layer_idx),
+                            "moe_expert",
+                            &format!("expert{}_w2_out", eid),
+                            expert_out_ptr,
+                            expert_sample,
+                            device,
+                        );
+                        let mut expert_raw = vec![0u16; expert_sample];
+                        device.synchronize().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                            format!("moe_expert sync expert_out: {:?}", e)))?;
+                        unsafe {
+                            let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                                expert_raw.as_mut_ptr() as *mut std::ffi::c_void,
+                                expert_out_ptr,
+                                expert_raw.len() * 2,
+                            );
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!("moe_expert expert_out d2h[{}]: {:?}", eid, err)));
+                            }
+                        }
+                        let weighted: Vec<f32> = expert_raw
+                            .into_iter()
+                            .map(|bits| f32::from_bits((bits as u32) << 16) * weight)
+                            .collect();
+                        trace_emit_values(
+                            Some(trace_cfg),
+                            graph.decode_step_counter,
+                            graph.kv_current_pos,
+                            0,
+                            Some(layer_idx),
+                            "moe_expert",
+                            &format!("expert{}_weighted_contrib_derived", eid),
+                            &weighted,
+                        );
+                    }
+                }
             }
 
             // Multi-expert weighted add: sum all expert outputs into moe_out
@@ -20176,7 +24991,14 @@ impl GpuDecodeStore {
         // Step 1: Load model weights (GPU Marlin format only, cpu_bits=4 gpu_bits=4)
         let t0 = Instant::now();
         let store = WeightStore::load_from_hf(
-            Path::new(model_dir), 128, None, None, 4, 4, false,
+            Path::new(model_dir),
+            128,
+            None,
+            None,
+            4,
+            4,
+            crate::weights::ExpertInt4CalibMode::Amax,
+            false,
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
             format!("Failed to load model: {}", e)))?;
 
@@ -20365,7 +25187,14 @@ impl GpuDecodeStore {
         // Load model
         let t0 = Instant::now();
         let store = crate::weights::WeightStore::load_from_hf(
-            Path::new(model_dir), 128, None, None, 4, 4, false,
+            Path::new(model_dir),
+            128,
+            None,
+            None,
+            4,
+            4,
+            crate::weights::ExpertInt4CalibMode::Amax,
+            false,
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
             format!("Failed to load model: {}", e)))?;
 
@@ -21180,7 +26009,14 @@ impl GpuDecodeStore {
         // Step 1: Load model weights
         let t0 = Instant::now();
         let store = crate::weights::WeightStore::load_from_hf(
-            Path::new(model_dir), 128, None, None, 4, 4, false,
+            Path::new(model_dir),
+            128,
+            None,
+            None,
+            4,
+            4,
+            crate::weights::ExpertInt4CalibMode::Amax,
+            false,
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
             format!("Failed to load model: {}", e)))?;
 
@@ -21396,7 +26232,14 @@ impl GpuDecodeStore {
         // Step 1: Load model
         let t0 = Instant::now();
         let store = crate::weights::WeightStore::load_from_hf(
-            Path::new(model_dir), 128, None, None, 4, 4, false,
+            Path::new(model_dir),
+            128,
+            None,
+            None,
+            4,
+            4,
+            crate::weights::ExpertInt4CalibMode::Amax,
+            false,
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
             format!("Failed to load model: {}", e)))?;
 
@@ -21735,7 +26578,14 @@ impl GpuDecodeStore {
 
         let t0 = Instant::now();
         let store = crate::weights::WeightStore::load_from_hf(
-            Path::new(model_dir), 128, None, None, 4, 4, false,
+            Path::new(model_dir),
+            128,
+            None,
+            None,
+            4,
+            4,
+            crate::weights::ExpertInt4CalibMode::Amax,
+            false,
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
             format!("Failed to load model: {}", e)))?;
 

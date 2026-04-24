@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from krasis.attention_backend import ATTENTION_QUANT_CHOICES, attention_quant_label
 from krasis.run_paths import get_run_dir
 
 # Pre-scan config file for CFG_SELECTED_GPUS to set CUDA_VISIBLE_DEVICES
@@ -41,7 +42,12 @@ def _prescan_selected_gpus():
                     break
 _prescan_selected_gpus()
 
-from krasis.config import QuantConfig, cache_dir_for_model
+from krasis.config import (
+    GPU_EXPERT_INT4_CALIB_CHOICES,
+    QuantConfig,
+    cache_dir_for_model,
+    marlin_cache_basename,
+)
 from krasis.model import KrasisModel
 
 logger = logging.getLogger("krasis.server")
@@ -548,6 +554,7 @@ def main():
             "CFG_LAYER_GROUP_SIZE": "layer_group_size",
             "CFG_KV_DTYPE": "kv_dtype",
             "CFG_GPU_EXPERT_BITS": "gpu_expert_bits",
+            "CFG_GPU_EXPERT_INT4_CALIB": "gpu_expert_int4_calib",
             "CFG_CPU_EXPERT_BITS": "cpu_expert_bits",
             "CFG_ATTENTION_QUANT": "attention_quant",
             "CFG_SHARED_EXPERT_QUANT": "shared_expert_quant",
@@ -618,7 +625,7 @@ def main():
         if config_defaults.get("attention_quant") in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported attention_quant={config_defaults['attention_quant']} in {config_path}. "
-                "Naive int4/int8 attention has been removed; use 'awq' or 'bf16'."
+                "Naive int4/int8 attention has been removed; use 'awq', 'hqq4', or 'bf16'."
             )
         # Expand ~ in model_path
         if "model_path" in config_defaults and isinstance(config_defaults["model_path"], str):
@@ -644,10 +651,12 @@ def main():
                         help="Path to expert_heatmap.json for HCS init")
     parser.add_argument("--gpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Marlin quantization bits for GPU prefill experts")
+    parser.add_argument("--gpu-expert-int4-calib", default="amax", choices=list(GPU_EXPERT_INT4_CALIB_CHOICES),
+                        help="Offline calibration mode for GPU routed-expert INT4 cache build")
     parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bits for CPU decode experts")
-    parser.add_argument("--attention-quant", default="bf16", choices=["bf16", "awq"],
-                        help="Attention weight precision: bf16 (default), awq (calibrated per-tensor via AWQ)")
+    parser.add_argument("--attention-quant", default="bf16", choices=list(ATTENTION_QUANT_CHOICES),
+                        help="Attention weight precision: bf16 (default), awq (calibrated per-tensor via AWQ), or hqq4")
     parser.add_argument("--shared-expert-quant", default="int8", choices=["bf16", "int8"],
                         help="Quantization for shared expert weights")
     parser.add_argument("--dense-mlp-quant", default="int8", choices=["bf16", "int8"],
@@ -808,6 +817,7 @@ def main():
         shared_expert=args.shared_expert_quant,
         dense_mlp=args.dense_mlp_quant,
         gpu_expert_bits=args.gpu_expert_bits,
+        gpu_expert_int4_calib=args.gpu_expert_int4_calib,
         cpu_expert_bits=args.cpu_expert_bits,
         kv_cache_format=args.kv_dtype,
     )
@@ -836,7 +846,10 @@ def main():
     # ── Configuration summary ──
     _status(f"Krasis — {_model_name}")
     _detail(f"Decode: GPU  |  HCS: {'on' if args.hcs else 'off'}  |  GPUs: {num_gpus_available}")
-    _detail(f"Experts: GPU INT{args.gpu_expert_bits}  |  Attention: {args.attention_quant}  |  KV: {args.kv_dtype}")
+    expert_detail = f"Experts: GPU INT{args.gpu_expert_bits}"
+    if args.gpu_expert_bits == 4:
+        expert_detail += f" ({args.gpu_expert_int4_calib})"
+    _detail(f"{expert_detail}  |  Attention: {args.attention_quant}  |  KV: {args.kv_dtype}")
     _detail(f"Layer groups: {args.layer_group_size}  |  KV cache: {args.kv_cache_mb} MB  |  Threads: {args.krasis_threads}")
     _dim("GPU-only mode: CPU expert weights and CPU decoder skipped")
     validation_components = []
@@ -913,7 +926,14 @@ def main():
         import glob as _glob
         _cache_dir = cache_dir_for_model(args.model_path)
         gpu_bits = args.gpu_expert_bits
-        has_gpu = bool(_glob.glob(os.path.join(_cache_dir, f"experts_marlin_int{gpu_bits}_g*.bin")))
+        has_gpu = bool(
+            _glob.glob(
+                os.path.join(
+                    _cache_dir,
+                    marlin_cache_basename(gpu_bits, "*", args.gpu_expert_int4_calib),
+                )
+            )
+        )
         _status("Cache build complete")
         _detail(f"GPU Marlin INT{gpu_bits}: {'exists' if has_gpu else 'MISSING'}")
         print("BUILD CACHE COMPLETE", flush=True)
@@ -1587,6 +1607,7 @@ def main():
         config = {
             "model_path": args.model_path,
             "gpu_expert_bits": args.gpu_expert_bits,
+            "gpu_expert_int4_calib": args.gpu_expert_int4_calib,
             "cpu_expert_bits": args.cpu_expert_bits,
             "attention_quant": args.attention_quant,
             "lm_head_quant": args.lm_head_quant,
@@ -1821,7 +1842,8 @@ def main():
                         po_bytes += mw.scales.nelement() * mw.scales.element_size()
                     po_mb = po_bytes / (1024 * 1024)
                     _detail(f"  GPU{gpu_i} (cuda:{idx}): layers [{seg_start}..{seg_end}) = {n_layers} ({la_count}LA+{gqa_count}GQA, {moe_count}MoE)")
-                    _detail(f"    Attention (decode segment): {seg_attn_mb:.0f} MB (permanent, AWQ simple INT4)")
+                    attn_desc = attention_quant_label(args.attention_quant)
+                    _detail(f"    Attention (decode segment): {seg_attn_mb:.0f} MB (permanent, {attn_desc})")
                     _detail(f"    Attention (prefill-only):   {po_mb:.0f} MB (freed after prefill, reclaimed for HCS)")
                     _detail(f"    HCS:   {hcs_type} = {hcs_total:,} MB total")
                     _detail(f"    VRAM:  {used:,.0f} MB used / {total_vram:,} MB total ({current_free:,.0f} MB free)")
@@ -1832,7 +1854,7 @@ def main():
                     _detail(f"    VRAM:  {used:,.0f} MB used / {total_vram:,} MB total ({current_free:,.0f} MB free)")
             else:
                 aux_hcs_budget = gpu_hcs_budgets[gpu_i]
-                attn_type = "AWQ simple INT4" if args.attention_quant == "awq" else "BF16"
+                attn_type = attention_quant_label(args.attention_quant)
                 _detail(f"  GPU{gpu_i} (cuda:{idx}): layers [{seg_start}..{seg_end}) = {n_layers} ({la_count}LA+{gqa_count}GQA, {moe_count}MoE)")
                 _detail(f"    Attention: {seg_attn_mb:.0f} MB ({attn_type}, permanent)")
                 _detail(f"    HCS:   {aux_hcs_budget:,.0f} MB (100% hard, no prefill)")

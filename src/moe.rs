@@ -1710,10 +1710,13 @@ impl KrasisEngine {
     ///              building from safetensors. GPU Marlin cache still from safetensors.
     /// `gguf_native`: If true, use raw GGUF blocks for CPU decode (slower but no conversion).
     ///                 Default false: dequant GGUF → re-quantize to fast AVX2 transposed format.
-    #[pyo3(signature = (model_dir, group_size=None, max_layers=None, start_layer=None, num_bits=None, cpu_num_bits=None, gpu_num_bits=None, gguf_path=None, gguf_native=false, gpu_only=None))]
-    pub fn load(&mut self, model_dir: &str, group_size: Option<usize>, max_layers: Option<usize>, start_layer: Option<usize>, num_bits: Option<u8>, cpu_num_bits: Option<u8>, gpu_num_bits: Option<u8>, gguf_path: Option<&str>, gguf_native: bool, gpu_only: Option<bool>) -> PyResult<()> {
+    #[pyo3(signature = (model_dir, group_size=None, max_layers=None, start_layer=None, num_bits=None, cpu_num_bits=None, gpu_num_bits=None, expert_int4_calib=None, gguf_path=None, gguf_native=false, gpu_only=None))]
+    pub fn load(&mut self, model_dir: &str, group_size: Option<usize>, max_layers: Option<usize>, start_layer: Option<usize>, num_bits: Option<u8>, cpu_num_bits: Option<u8>, gpu_num_bits: Option<u8>, expert_int4_calib: Option<&str>, gguf_path: Option<&str>, gguf_native: bool, gpu_only: Option<bool>) -> PyResult<()> {
         let cpu_bits = cpu_num_bits.or(num_bits).unwrap_or(4);
         let gpu_bits = gpu_num_bits.unwrap_or(4);
+        let expert_int4_calib_mode = crate::weights::ExpertInt4CalibMode::from_config_value(
+            expert_int4_calib.unwrap_or("amax")
+        ).map_err(pyo3::exceptions::PyValueError::new_err)?;
         if cpu_bits != 4 && cpu_bits != 8 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("cpu_num_bits must be 4 or 8, got {cpu_bits}")
@@ -1772,7 +1775,8 @@ impl KrasisEngine {
             log::info!("[DIAG-RUST] Loading CPU experts from GGUF: {} (native={})", gguf, gguf_native);
             crate::syscheck::log_memory_usage("[DIAG-RUST] before load_from_gguf");
             let s = WeightStore::load_from_gguf(
-                path, Path::new(gguf), gs, max_layers, start_layer, cpu_bits, gpu_bits, gguf_native,
+                path, Path::new(gguf), gs, max_layers, start_layer, cpu_bits, gpu_bits,
+                expert_int4_calib_mode, gguf_native,
             ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
             log::info!("[DIAG-RUST] WeightStore::load_from_gguf completed OK");
             crate::syscheck::log_memory_usage("[DIAG-RUST] after load_from_gguf");
@@ -1781,7 +1785,16 @@ impl KrasisEngine {
             let skip_cpu = gpu_only.unwrap_or(false);
             log::info!("[DIAG-RUST] Calling WeightStore::load_from_hf (cpu_bits={}, gpu_bits={}, gpu_only={})...", cpu_bits, gpu_bits, skip_cpu);
             crate::syscheck::log_memory_usage("[DIAG-RUST] before load_from_hf");
-            let s = WeightStore::load_from_hf(path, gs, max_layers, start_layer, cpu_bits, gpu_bits, skip_cpu)
+            let s = WeightStore::load_from_hf(
+                path,
+                gs,
+                max_layers,
+                start_layer,
+                cpu_bits,
+                gpu_bits,
+                expert_int4_calib_mode,
+                skip_cpu,
+            )
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
             log::info!("[DIAG-RUST] WeightStore::load_from_hf completed OK");
             crate::syscheck::log_memory_usage("[DIAG-RUST] after load_from_hf");
@@ -3734,7 +3747,7 @@ mod tests {
         }
 
         // Load just enough to test one expert
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, false)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, crate::weights::ExpertInt4CalibMode::Amax, false)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -3797,7 +3810,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, false)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, crate::weights::ExpertInt4CalibMode::Amax, false)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -3873,7 +3886,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, false)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, crate::weights::ExpertInt4CalibMode::Amax, false)
             .expect("Failed to load");
 
         assert!(store.has_unified(), "Store should have unified format");
@@ -3952,7 +3965,7 @@ mod tests {
         }
 
         // Load just 1 MoE layer (384 experts × 1 layer ≈ 9.5 GB)
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, Some(1), None, 4, 4, false)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, Some(1), None, 4, 4, crate::weights::ExpertInt4CalibMode::Amax, false)
             .expect("Failed to load Kimi K2.5");
 
         assert_eq!(store.num_moe_layers(), 1);
@@ -4026,7 +4039,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, false)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, crate::weights::ExpertInt4CalibMode::Amax, false)
             .expect("Failed to load");
 
         let hidden = store.config.hidden_size;
@@ -4174,7 +4187,7 @@ mod tests {
             return;
         }
 
-        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, false)
+        let store = WeightStore::load_from_hf(model_dir, DEFAULT_GROUP_SIZE, None, None, 4, 4, crate::weights::ExpertInt4CalibMode::Amax, false)
             .expect("Failed to load");
 
         // V2-Lite has 2 shared experts with routed_scaling_factor=1.0

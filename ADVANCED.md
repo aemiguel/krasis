@@ -72,7 +72,7 @@ Config files use `KEY=VALUE` format. CLI flags override config file values.
 |------|---------|-------------|
 | `--gpu-expert-bits` | 4 | GPU Marlin expert bits: `4` or `8` |
 | `--cpu-expert-bits` | 4 | CPU decode expert bits: `4` or `8` |
-| `--attention-quant` | bf16 | Attention weight precision: `bf16` or `awq` |
+| `--attention-quant` | bf16 | Attention weight precision: `bf16`, `awq`, or `hqq4` |
 | `--shared-expert-quant` | int8 | Shared expert quant: `int8` or `bf16` |
 | `--dense-mlp-quant` | int8 | Dense MLP quant: `int8` or `bf16` |
 | `--lm-head-quant` | int8 | LM head quant: `int8` or `bf16` |
@@ -140,7 +140,7 @@ Krasis lets you quantize each component independently. The defaults are a good s
 |-----------|---------|---------|
 | GPU experts | INT4, INT8 | INT4 |
 | CPU experts | INT4, INT8 | INT4 |
-| Attention | AWQ, BF16 | BF16 |
+| Attention | AWQ, HQQ4, BF16 | BF16 |
 | Shared expert | INT8, BF16 | INT8 |
 | Dense MLP | INT8, BF16 | INT8 |
 | LM head | INT8, BF16 | INT8 |
@@ -148,4 +148,4 @@ Krasis lets you quantize each component independently. The defaults are a good s
 
 Embeddings, norms, and routing gates are always kept at BF16.
 
-AWQ attention uses calibrated per-tensor quantization (run `./dev awq-calibrate <config>` to generate the template). BF16 is full precision with no calibration needed.
+AWQ attention uses calibrated per-tensor quantization (run `./dev awq-calibrate <config>` to generate the template). `hqq4` is the native HQQ INT4 backend: artifacts live under the normal model cache tree and the runtime restores staged prefill/decode descriptors from that cache. Remaining HQQ work is parity closure against AWQ operational details such as cached-stage generation strategy, slot-reuse policy, and wider product validation. BF16 is full precision with no calibration needed.

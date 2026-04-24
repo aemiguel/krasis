@@ -123,6 +123,18 @@ struct HttpRequest {
     body: String,
 }
 
+fn prepare_store_for_rust_prefill(store: &mut GpuDecodeStore) -> Result<bool, String> {
+    store.prepare_runtime_for_prefill_rust()
+}
+
+fn restore_store_after_rust_prefill(
+    store: &mut GpuDecodeStore,
+    prompt_len: usize,
+) -> Result<(), String> {
+    store.set_kv_position_rust(prompt_len);
+    store.prepare_runtime_for_decode_rust()
+}
+
 /// Parse an HTTP request from a TCP stream.
 fn parse_request(stream: &mut BufReader<TcpStream>) -> std::io::Result<HttpRequest> {
     // Request line
@@ -691,19 +703,33 @@ fn handle_chat_completion(
         let kv_max_seq = engine.kv_max_seq;
         let kv_overflow = token_ids.len() > kv_max_seq;
 
-        // Swap AWQ weights from simple INT4 (decode) back to Marlin format (prefill)
-        {
+        let has_hqq_runtime_slots = {
             let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-            if let Err(e) = store.swap_to_marlin_rust() {
-                log::error!("Failed to swap to Marlin for prefill: {}", e);
+            match prepare_store_for_rust_prefill(store) {
+                Ok(has_hqq) => has_hqq,
+                Err(e) => {
+                    let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill prepare failed: {}"}}"#, e));
+                    return;
+                }
             }
-        }
+        };
 
         engine.set_prefill_hcs_guard_store_addr(state.gpu_store_addr);
+        if has_hqq_runtime_slots {
+            if let Err(e) = engine.materialize_hqq_prefill_weights() {
+                engine.clear_prefill_hcs_guard_store_addr();
+                let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+                let _ = store.prepare_runtime_for_decode_rust();
+                let _ = send_json(stream, 500, &format!(r#"{{"error":"HQQ prefill refresh failed: {}"}}"#, e));
+                return;
+            }
+        }
 
         // Dynamically allocate scratch sized for this prompt
         if let Err(e) = engine.prepare_for_prefill(token_ids.len()) {
             engine.clear_prefill_hcs_guard_store_addr();
+            let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+            let _ = store.prepare_runtime_for_decode_rust();
             let _ = send_json(stream, 500, &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e));
             return;
         }
@@ -739,14 +765,16 @@ fn handle_chat_completion(
             Ok(r) => {
                 // Set KV cache position on decode store so decode knows where to continue
                 let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-                store.set_kv_position_rust(r.prompt_len);
-                // Swap AWQ weights from Marlin format (prefill) to simple INT4 (decode)
-                if let Err(e) = store.swap_to_simple_int4_rust() {
-                    log::error!("Failed to swap to simple INT4 for decode: {}", e);
+                if let Err(e) = restore_store_after_rust_prefill(store, r.prompt_len) {
+                    log::error!("Failed to restore decode runtime after prefill: {}", e);
                 }
                 Ok((r.first_token as usize, r.prompt_len, stop_ids, kv_overflow))
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+                let _ = store.prepare_runtime_for_decode_rust();
+                Err(e)
+            }
         }
     };
 
@@ -983,17 +1011,31 @@ fn handle_prefill_logits(
         engine.update_hcs_snapshot(cache_fast, ne);
     }
 
-    // Swap AWQ weights to Marlin for prefill
-    {
+    let has_hqq_runtime_slots = {
         let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-        if let Err(e) = store.swap_to_marlin_rust() {
-            log::error!("Failed to swap to Marlin for prefill_logits: {}", e);
+        match prepare_store_for_rust_prefill(store) {
+            Ok(has_hqq) => has_hqq,
+            Err(e) => {
+                let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill prepare failed: {}"}}"#, e));
+                return;
+            }
+        }
+    };
+
+    if has_hqq_runtime_slots {
+        if let Err(e) = engine.materialize_hqq_prefill_weights() {
+            let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+            let _ = store.prepare_runtime_for_decode_rust();
+            let _ = send_json(stream, 500, &format!(r#"{{"error":"HQQ prefill refresh failed: {}"}}"#, e));
+            return;
         }
     }
 
     // Dynamically allocate scratch for this prompt
     // run_prefill_logits needs scratch sized for all tokens (no chunking)
     if let Err(e) = engine.prepare_for_prefill(token_ids.len()) {
+        let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+        let _ = store.prepare_runtime_for_decode_rust();
         let _ = send_json(stream, 500, &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e));
         return;
     }
@@ -1004,6 +1046,7 @@ fn handle_prefill_logits(
             // Release scratch even on error
             let _ = engine.release_scratch();
             let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+            let _ = store.prepare_runtime_for_decode_rust();
             let _ = store.hcs_reload_after_prefill_async(token_ids.len());
             let _ = store.hcs_sync_soft_reload();
             Python::with_gil(|py| {
@@ -1022,6 +1065,7 @@ fn handle_prefill_logits(
     // Restore evicted soft HCS so the next decode/reference request starts
     // from the normal steady-state cache residency.
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+    let _ = store.prepare_runtime_for_decode_rust();
     let _ = store.hcs_reload_after_prefill_async(token_ids.len());
     let _ = store.hcs_sync_soft_reload();
 
@@ -1113,16 +1157,30 @@ fn handle_reference_test(
         engine.update_hcs_snapshot(cache_fast, ne);
     }
 
-    // Swap to Marlin for prefill
-    {
+    let has_hqq_runtime_slots = {
         let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-        if let Err(e) = store.swap_to_marlin_rust() {
-            log::error!("reference_test: Failed to swap to Marlin: {}", e);
+        match prepare_store_for_rust_prefill(store) {
+            Ok(has_hqq) => has_hqq,
+            Err(e) => {
+                let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill prepare failed: {}"}}"#, e));
+                return;
+            }
+        }
+    };
+
+    if has_hqq_runtime_slots {
+        if let Err(e) = engine.materialize_hqq_prefill_weights() {
+            let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+            let _ = store.prepare_runtime_for_decode_rust();
+            let _ = send_json(stream, 500, &format!(r#"{{"error":"HQQ prefill refresh failed: {}"}}"#, e));
+            return;
         }
     }
 
     // Dynamically allocate scratch for this prompt
     if let Err(e) = engine.prepare_for_prefill(input_token_ids.len()) {
+        let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+        let _ = store.prepare_runtime_for_decode_rust();
         let _ = send_json(stream, 500, &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e));
         return;
     }
@@ -1146,6 +1204,8 @@ fn handle_reference_test(
         ),
         Err(e) => {
             let _ = engine.release_scratch();
+            let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+            let _ = store.prepare_runtime_for_decode_rust();
             let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill failed: {}"}}"#, e));
             Python::with_gil(|py| {
                 let _ = state.py_model.call_method0(py, "server_cleanup");
@@ -1162,9 +1222,8 @@ fn handle_reference_test(
     // Set KV position and swap to simple INT4 for decode
     {
         let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-        store.set_kv_position_rust(prompt_len);
-        if let Err(e) = store.swap_to_simple_int4_rust() {
-            log::error!("reference_test: Failed to swap to simple INT4: {}", e);
+        if let Err(e) = restore_store_after_rust_prefill(store, prompt_len) {
+            log::error!("reference_test: Failed to restore decode runtime: {}", e);
         }
     }
 
@@ -2162,16 +2221,23 @@ impl RustServer {
 
         let kv_overflow = token_ids.len() > engine.kv_max_seq;
 
-        // Swap AWQ weights to Marlin for prefill
-        if let Err(e) = store.swap_to_marlin_rust() {
-            log::error!("Failed to swap to Marlin for prefill: {}", e);
-        }
+        let has_hqq_runtime_slots = prepare_store_for_rust_prefill(store)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to prepare runtime for prefill: {}", e)))?;
 
         engine.set_prefill_hcs_guard_store_addr(self.gpu_store_addr);
+        if has_hqq_runtime_slots {
+            engine.materialize_hqq_prefill_weights().map_err(|e| {
+                let _ = store.prepare_runtime_for_decode_rust();
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Rust HQQ prefill refresh failed: {}", e))
+            })?;
+        }
 
         // Dynamically allocate scratch for this prompt
         if let Err(e) = engine.prepare_for_prefill(token_ids.len()) {
             engine.clear_prefill_hcs_guard_store_addr();
+            let _ = store.prepare_runtime_for_decode_rust();
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 format!("Scratch alloc failed: {}", e)));
         }
@@ -2183,6 +2249,7 @@ impl RustServer {
             &suppress_tokens,
         ).map_err(|e| {
             engine.clear_prefill_hcs_guard_store_addr();
+            let _ = store.prepare_runtime_for_decode_rust();
             pyo3::exceptions::PyRuntimeError::new_err(
                 format!("Rust prefill failed: {}", e))
         })?;
@@ -2218,11 +2285,8 @@ impl RustServer {
             ids
         };
 
-        // Set KV cache position on decode store
-        store.set_kv_position_rust(prompt_len);
-        // Swap AWQ weights to simple INT4 for decode
-        if let Err(e) = store.swap_to_simple_int4_rust() {
-            log::error!("Failed to swap to simple INT4 for decode: {}", e);
+        if let Err(e) = restore_store_after_rust_prefill(store, prompt_len) {
+            log::error!("Failed to restore decode runtime after prefill: {}", e);
         }
 
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;

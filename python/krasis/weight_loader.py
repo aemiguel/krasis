@@ -22,6 +22,34 @@ from krasis.config import ModelConfig, PPRankConfig, QuantConfig
 logger = logging.getLogger(__name__)
 
 
+def _emit_real_model_timing(payload: dict) -> None:
+    if os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1":
+        print(json.dumps({"hqq_real_model_timing": payload}, sort_keys=True), flush=True)
+
+
+def _timed_bf16_load(
+    loader: "WeightLoader",
+    *,
+    layer_idx: int,
+    tensor_name: str,
+    device: torch.device,
+    step: str,
+) -> torch.Tensor:
+    started = time.perf_counter()
+    tensor = loader._load_bf16(tensor_name, device)
+    _emit_real_model_timing(
+        {
+            "phase": "load_tensor",
+            "layer_idx": int(layer_idx),
+            "step": step,
+            "tensor_name": tensor_name,
+            "device": str(device),
+            "elapsed_s": time.perf_counter() - started,
+        }
+    )
+    return tensor
+
+
 def quantize_to_int8(
     weight_bf16: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -114,10 +142,25 @@ class WeightLoader:
 
         # Load safetensors index
         index_path = os.path.join(self.model_path, "model.safetensors.index.json")
-        with open(index_path) as f:
-            index = json.load(f)
-        self._weight_map: Dict[str, str] = index["weight_map"]
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                index = json.load(f)
+            self._weight_map: Dict[str, str] = index["weight_map"]
+        else:
+            single_path = os.path.join(self.model_path, "model.safetensors")
+            if not os.path.isfile(single_path):
+                raise FileNotFoundError(
+                    f"Expected either {index_path} or {single_path}"
+                )
+            with safe_open(single_path, framework="pt", device="cpu") as handle:
+                self._weight_map = {name: "model.safetensors" for name in handle.keys()}
         self._handles: Dict[str, object] = {}
+
+    @staticmethod
+    def _memory_allocated_mb(device: torch.device) -> float:
+        if device.type != "cuda":
+            return 0.0
+        return torch.cuda.memory_allocated(device) / (1024**2)
 
     def _get_handle(self, shard_name: str):
         """Get or open a safetensors file handle (cached)."""
@@ -290,17 +333,59 @@ class WeightLoader:
 
         if self.cfg.has_q_lora:
             for proj in ["q_a_proj", "q_b_proj"]:
-                weights[proj] = load_proj(f"{prefix}.{proj}.weight", device)
-            weights["q_a_layernorm"] = self._load_bf16(f"{prefix}.q_a_layernorm.weight", device)
+                name = f"{prefix}.{proj}.weight"
+                weights[proj] = _timed_bf16_load(
+                    self,
+                    layer_idx=layer_idx,
+                    tensor_name=name,
+                    device=device,
+                    step=f"mla.{proj}",
+                )
+            weights["q_a_layernorm"] = _timed_bf16_load(
+                self,
+                layer_idx=layer_idx,
+                tensor_name=f"{prefix}.q_a_layernorm.weight",
+                device=device,
+                step="mla.q_a_layernorm",
+            )
         else:
-            weights["q_proj"] = load_proj(f"{prefix}.q_proj.weight", device)
+            weights["q_proj"] = _timed_bf16_load(
+                self,
+                layer_idx=layer_idx,
+                tensor_name=f"{prefix}.q_proj.weight",
+                device=device,
+                step="mla.q_proj",
+            )
 
-        weights["kv_a_proj_with_mqa"] = load_proj(
-            f"{prefix}.kv_a_proj_with_mqa.weight", device)
-        weights["o_proj"] = load_proj(f"{prefix}.o_proj.weight", device)
-        weights["kv_a_layernorm"] = self._load_bf16(f"{prefix}.kv_a_layernorm.weight", device)
+        weights["kv_a_proj_with_mqa"] = _timed_bf16_load(
+            self,
+            layer_idx=layer_idx,
+            tensor_name=f"{prefix}.kv_a_proj_with_mqa.weight",
+            device=device,
+            step="mla.kv_a_proj_with_mqa",
+        )
+        weights["o_proj"] = _timed_bf16_load(
+            self,
+            layer_idx=layer_idx,
+            tensor_name=f"{prefix}.o_proj.weight",
+            device=device,
+            step="mla.o_proj",
+        )
+        weights["kv_a_layernorm"] = _timed_bf16_load(
+            self,
+            layer_idx=layer_idx,
+            tensor_name=f"{prefix}.kv_a_layernorm.weight",
+            device=device,
+            step="mla.kv_a_layernorm",
+        )
 
-        kv_b = self._load_bf16(f"{prefix}.kv_b_proj.weight", device)
+        kv_b = _timed_bf16_load(
+            self,
+            layer_idx=layer_idx,
+            tensor_name=f"{prefix}.kv_b_proj.weight",
+            device=device,
+            step="mla.kv_b_proj",
+        )
         n_heads = self.cfg.num_attention_heads
         qk_nope = self.cfg.qk_nope_head_dim
         v_head = self.cfg.v_head_dim
@@ -335,28 +420,58 @@ class WeightLoader:
         load_proj = self._load_bf16
 
         for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-            weights[proj] = load_proj(f"{prefix}.{proj}.weight", proj_device)
+            weights[proj] = _timed_bf16_load(
+                self,
+                layer_idx=layer_idx,
+                tensor_name=f"{prefix}.{proj}.weight",
+                device=proj_device,
+                step=f"gqa.{proj}",
+            )
             # Load bias if present (GLM-4.7) — biases are small, always on GPU
             bias_name = f"{prefix}.{proj}.bias"
             if bias_name in self._weight_map:
-                weights[f"{proj}_bias"] = self._load_bf16(bias_name, device)
+                weights[f"{proj}_bias"] = _timed_bf16_load(
+                    self,
+                    layer_idx=layer_idx,
+                    tensor_name=bias_name,
+                    device=device,
+                    step=f"gqa.{proj}_bias",
+                )
 
         # QK-Norm (Qwen3 and GLM-4.7 use RMSNorm on Q and K)
         q_norm_name = f"{prefix}.q_norm.weight"
         k_norm_name = f"{prefix}.k_norm.weight"
         if q_norm_name in self._weight_map:
-            w = self._load_bf16(q_norm_name, device)
+            w = _timed_bf16_load(
+                self,
+                layer_idx=layer_idx,
+                tensor_name=q_norm_name,
+                device=device,
+                step="gqa.q_norm",
+            )
             w = self._maybe_apply_delta_rms_bias(w, q_norm_name)
             weights["q_norm"] = w
         if k_norm_name in self._weight_map:
-            w = self._load_bf16(k_norm_name, device)
+            w = _timed_bf16_load(
+                self,
+                layer_idx=layer_idx,
+                tensor_name=k_norm_name,
+                device=device,
+                step="gqa.k_norm",
+            )
             w = self._maybe_apply_delta_rms_bias(w, k_norm_name)
             weights["k_norm"] = w
 
         # Attention sinks (GPT OSS: learnable logits for attention normalization)
         sinks_name = f"{prefix}.sinks"
         if sinks_name in self._weight_map:
-            weights["sinks"] = self._load_bf16(sinks_name, device)
+            weights["sinks"] = _timed_bf16_load(
+                self,
+                layer_idx=layer_idx,
+                tensor_name=sinks_name,
+                device=device,
+                step="gqa.sinks",
+            )
 
         return weights
 
@@ -650,25 +765,66 @@ class WeightLoader:
             "is_moe": self.cfg.is_moe_layer(layer_idx),
             "layer_type": layer_type,
         }
+        norms_elapsed = time.perf_counter() - start
+        _emit_real_model_timing(
+            {
+                "phase": "load_layer_step",
+                "layer_idx": int(layer_idx),
+                "step": "norms",
+                "elapsed_s": norms_elapsed,
+            }
+        )
 
         # Load attention weights based on layer type
         # Linear attention is NOT affected by AWQ (AWQ only applies to GQA layers),
         # so linear attention always loads to the primary GPU device.
+        attention_started = time.perf_counter()
         if is_linear:
             result["linear_attention"] = self.load_linear_attention_weights(layer_idx, device)
         else:
             result["attention"] = self.load_attention_weights(
                 layer_idx, device, proj_device=attn_device)
+        attention_elapsed = time.perf_counter() - attention_started
+        _emit_real_model_timing(
+            {
+                "phase": "load_layer_step",
+                "layer_idx": int(layer_idx),
+                "step": "attention",
+                "elapsed_s": attention_elapsed,
+            }
+        )
 
+        mlp_started = time.perf_counter()
         if result["is_moe"]:
             result["gate"] = self.load_moe_gate(layer_idx, device)
             if self.cfg.n_shared_experts > 0:
                 result["shared_expert"] = self.load_shared_expert(layer_idx, device)
         else:
             result["dense_mlp"] = self.load_dense_mlp(layer_idx, device)
+        mlp_elapsed = time.perf_counter() - mlp_started
+        _emit_real_model_timing(
+            {
+                "phase": "load_layer_step",
+                "layer_idx": int(layer_idx),
+                "step": "mlp_gate",
+                "elapsed_s": mlp_elapsed,
+            }
+        )
 
         elapsed = time.perf_counter() - start
-        alloc_mb = torch.cuda.memory_allocated(device) / (1024**2)
+        alloc_mb = self._memory_allocated_mb(device)
+        _emit_real_model_timing(
+            {
+                "phase": "load_layer",
+                "layer_idx": int(layer_idx),
+                "layer_type": layer_type,
+                "is_moe": bool(result["is_moe"]),
+                "norms_s": norms_elapsed,
+                "attention_s": attention_elapsed,
+                "mlp_gate_s": mlp_elapsed,
+                "total_s": elapsed,
+            }
+        )
         logger.info(
             "Layer %d loaded in %.1fs (GPU alloc: %.0f MB, moe=%s, type=%s)",
             layer_idx, elapsed, alloc_mb, result["is_moe"], layer_type,
@@ -714,7 +870,7 @@ class WeightLoader:
             raise ValueError(f"Unknown Nemotron layer type: {layer_type}")
 
         elapsed = time.perf_counter() - start
-        alloc_mb = torch.cuda.memory_allocated(device) / (1024**2)
+        alloc_mb = self._memory_allocated_mb(device)
         logger.info(
             "Layer %d loaded in %.1fs (GPU alloc: %.0f MB, type=%s)",
             layer_idx, elapsed, alloc_mb, layer_type,

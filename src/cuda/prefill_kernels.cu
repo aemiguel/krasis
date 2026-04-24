@@ -204,6 +204,58 @@ extern "C" void krasis_embedding_batched(
         (const int*)token_ids, D);
 }
 
+/* ── HQQ4 Dequant ─────────────────────────────────────────────────────── */
+
+extern "C" __global__ void hqq4_dequant_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const unsigned char* __restrict__ packed,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    int rows,
+    int cols,
+    int group_size)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = rows * cols;
+    if (idx >= total) return;
+
+    int row = idx / cols;
+    int col = idx - row * cols;
+    int groups = (cols + group_size - 1) / group_size;
+    int packed_cols = (groups * group_size) / 2;
+    int group = col / group_size;
+    int packed_idx = row * packed_cols + (col >> 1);
+    unsigned char byte = packed[packed_idx];
+    int q = (col & 1) ? (int)(byte >> 4) : (int)(byte & 0x0F);
+    float scale = scales[row * groups + group];
+    float zero = zeros[row * groups + group];
+    out[idx] = float_to_bf16((float(q) - zero) * scale);
+}
+
+extern "C" void krasis_hqq4_dequant_bf16(
+    void* out,
+    const void* packed,
+    const void* scales,
+    const void* zeros,
+    int rows,
+    int cols,
+    int group_size,
+    void* stream)
+{
+    int total = rows * cols;
+    if (total <= 0) return;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    hqq4_dequant_bf16_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        (__nv_bfloat16*)out,
+        (const unsigned char*)packed,
+        (const float*)scales,
+        (const float*)zeros,
+        rows,
+        cols,
+        group_size);
+}
+
 /* ── RoPE (Rotary Position Embedding) ─────────────────────────────────── */
 
 /* Apply RoPE to Q and K tensors in-place.

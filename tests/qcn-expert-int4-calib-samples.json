@@ -1,0 +1,748 @@
+{
+  "samples": [
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 11,
+      "active_cols": [
+        1450
+      ],
+      "active_vals": [
+        -6.28125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 15,
+      "active_cols": [
+        1971,
+        2030
+      ],
+      "active_vals": [
+        4.90625,
+        2.703125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 12,
+      "active_cols": [
+        1606
+      ],
+      "active_vals": [
+        2.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 4,
+      "active_cols": [
+        522
+      ],
+      "active_vals": [
+        -1.835938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 10,
+      "active_cols": [
+        1407
+      ],
+      "active_vals": [
+        1.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 9,
+      "active_cols": [
+        1152
+      ],
+      "active_vals": [
+        1.757812
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 2,
+      "active_cols": [
+        323
+      ],
+      "active_vals": [
+        -1.585938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 11,
+      "active_cols": [
+        1450
+      ],
+      "active_vals": [
+        -6.28125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 15,
+      "active_cols": [
+        1971,
+        2030
+      ],
+      "active_vals": [
+        4.90625,
+        2.703125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 12,
+      "active_cols": [
+        1606
+      ],
+      "active_vals": [
+        2.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 4,
+      "active_cols": [
+        522
+      ],
+      "active_vals": [
+        -1.835938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 10,
+      "active_cols": [
+        1407
+      ],
+      "active_vals": [
+        1.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 9,
+      "active_cols": [
+        1152
+      ],
+      "active_vals": [
+        1.757812
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 2,
+      "active_cols": [
+        323
+      ],
+      "active_vals": [
+        -1.585938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 11,
+      "active_cols": [
+        1450
+      ],
+      "active_vals": [
+        -6.28125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 15,
+      "active_cols": [
+        1971,
+        2030
+      ],
+      "active_vals": [
+        4.90625,
+        2.703125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 12,
+      "active_cols": [
+        1606
+      ],
+      "active_vals": [
+        2.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 4,
+      "active_cols": [
+        522
+      ],
+      "active_vals": [
+        -1.835938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 10,
+      "active_cols": [
+        1407
+      ],
+      "active_vals": [
+        1.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 9,
+      "active_cols": [
+        1152
+      ],
+      "active_vals": [
+        1.757812
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 2,
+      "active_cols": [
+        323
+      ],
+      "active_vals": [
+        -1.585938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 11,
+      "active_cols": [
+        1450
+      ],
+      "active_vals": [
+        -6.28125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 15,
+      "active_cols": [
+        1971,
+        2030
+      ],
+      "active_vals": [
+        4.90625,
+        2.703125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 12,
+      "active_cols": [
+        1606
+      ],
+      "active_vals": [
+        2.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 4,
+      "active_cols": [
+        522
+      ],
+      "active_vals": [
+        -1.835938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 10,
+      "active_cols": [
+        1407
+      ],
+      "active_vals": [
+        1.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 9,
+      "active_cols": [
+        1152
+      ],
+      "active_vals": [
+        1.757812
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 37,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 2,
+      "active_cols": [
+        323
+      ],
+      "active_vals": [
+        -1.585938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 11,
+      "active_cols": [
+        1450
+      ],
+      "active_vals": [
+        -6.28125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 15,
+      "active_cols": [
+        1971,
+        2030
+      ],
+      "active_vals": [
+        4.90625,
+        2.703125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 12,
+      "active_cols": [
+        1606
+      ],
+      "active_vals": [
+        2.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 4,
+      "active_cols": [
+        522
+      ],
+      "active_vals": [
+        -1.835938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 10,
+      "active_cols": [
+        1407
+      ],
+      "active_vals": [
+        1.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 9,
+      "active_cols": [
+        1152
+      ],
+      "active_vals": [
+        1.757812
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 0,
+      "group_idx": 2,
+      "active_cols": [
+        323
+      ],
+      "active_vals": [
+        -1.585938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 11,
+      "active_cols": [
+        1450
+      ],
+      "active_vals": [
+        -6.28125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 15,
+      "active_cols": [
+        1971,
+        2030
+      ],
+      "active_vals": [
+        4.90625,
+        2.703125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 12,
+      "active_cols": [
+        1606
+      ],
+      "active_vals": [
+        2.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 4,
+      "active_cols": [
+        522
+      ],
+      "active_vals": [
+        -1.835938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 10,
+      "active_cols": [
+        1407
+      ],
+      "active_vals": [
+        1.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 9,
+      "active_cols": [
+        1152
+      ],
+      "active_vals": [
+        1.757812
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 1,
+      "group_idx": 2,
+      "active_cols": [
+        323
+      ],
+      "active_vals": [
+        -1.585938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 11,
+      "active_cols": [
+        1450
+      ],
+      "active_vals": [
+        -6.28125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 15,
+      "active_cols": [
+        1971,
+        2030
+      ],
+      "active_vals": [
+        4.90625,
+        2.703125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 12,
+      "active_cols": [
+        1606
+      ],
+      "active_vals": [
+        2.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 4,
+      "active_cols": [
+        522
+      ],
+      "active_vals": [
+        -1.835938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 10,
+      "active_cols": [
+        1407
+      ],
+      "active_vals": [
+        1.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 9,
+      "active_cols": [
+        1152
+      ],
+      "active_vals": [
+        1.757812
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 2,
+      "group_idx": 2,
+      "active_cols": [
+        323
+      ],
+      "active_vals": [
+        -1.585938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 11,
+      "active_cols": [
+        1450
+      ],
+      "active_vals": [
+        -6.28125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 15,
+      "active_cols": [
+        1971,
+        2030
+      ],
+      "active_vals": [
+        4.90625,
+        2.703125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 12,
+      "active_cols": [
+        1606
+      ],
+      "active_vals": [
+        2.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 4,
+      "active_cols": [
+        522
+      ],
+      "active_vals": [
+        -1.835938
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 10,
+      "active_cols": [
+        1407
+      ],
+      "active_vals": [
+        1.78125
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 9,
+      "active_cols": [
+        1152
+      ],
+      "active_vals": [
+        1.757812
+      ]
+    },
+    {
+      "layer_idx": 0,
+      "expert_idx": 153,
+      "proj_name": "gate_proj",
+      "row_idx": 3,
+      "group_idx": 2,
+      "active_cols": [
+        323
+      ],
+      "active_vals": [
+        -1.585938
+      ]
+    }
+  ]
+}

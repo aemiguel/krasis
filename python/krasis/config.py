@@ -3,7 +3,11 @@
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+
+
+ATTENTION_QUANT_CHOICES = ("bf16", "awq", "hqq4")
+GPU_EXPERT_INT4_CALIB_CHOICES = ("amax", "search_rmse")
 
 
 def cache_dir_for_model(model_path: str) -> str:
@@ -33,6 +37,13 @@ def cache_dir_for_model(model_path: str) -> str:
         os.rmdir(old_dir)
         print(f"\033[33m▸ Migrated cache: {old_dir} → {new_dir}\033[0m", flush=True)
     return new_dir
+
+
+def marlin_cache_basename(gpu_bits: int, group_size: Union[int, str], gpu_expert_int4_calib: str = "amax") -> str:
+    calib_suffix = ""
+    if gpu_bits == 4:
+        calib_suffix = f"_cal{gpu_expert_int4_calib.replace('_', '')}"
+    return f"experts_marlin_int{gpu_bits}_g{group_size}{calib_suffix}.bin"
 
 
 def _collect_eos_ids(raw: dict, cfg: dict, gen_cfg: dict) -> list:
@@ -222,10 +233,11 @@ class QuantConfig:
     layernorms, gate weight. These are either too quality-critical or too small.
     """
     lm_head: str = "int8"          # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
-    attention: str = "bf16" # "bf16" or "awq" (calibrated per-tensor; "bf16" is debug-oriented, not an oracle)
+    attention: str = "bf16" # "bf16", "awq", or "hqq4" (native HQQ INT4; "bf16" is debug-oriented, not an oracle)
     shared_expert: str = "int8"    # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
     dense_mlp: str = "int8"        # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
     gpu_expert_bits: int = 4       # 4, 8 (Marlin), or 16 (UNVALIDATED BF16 debug-only path; do not use for validation)
+    gpu_expert_int4_calib: str = "amax"  # "amax" or "search_rmse" for routed-expert GPU INT4 cache build
     cpu_expert_bits: int = 4       # 4 or 8 for CPU expert quantization
     kv_cache_format: str = "fp8"   # "bf16", "fp8", or "polar4"
 
@@ -247,7 +259,18 @@ class QuantConfig:
         if self.attention in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported attention quant '{self.attention}'. "
-                "Naive int4/int8 attention has been removed; use 'awq' or 'bf16'."
+                "Naive int4/int8 attention has been removed; use 'awq', 'hqq4', or 'bf16'."
+            )
+        if self.attention not in ATTENTION_QUANT_CHOICES:
+            raise ValueError(
+                f"Unsupported attention quant '{self.attention}'. "
+                f"Use one of: {', '.join(ATTENTION_QUANT_CHOICES)}."
+            )
+        self.gpu_expert_int4_calib = self.gpu_expert_int4_calib.lower()
+        if self.gpu_expert_int4_calib not in GPU_EXPERT_INT4_CALIB_CHOICES:
+            raise ValueError(
+                f"Unsupported gpu_expert_int4_calib '{self.gpu_expert_int4_calib}'. "
+                f"Use one of: {', '.join(GPU_EXPERT_INT4_CALIB_CHOICES)}."
             )
 
 
@@ -648,6 +671,8 @@ class ModelConfig:
         if self.is_nemotron_h:
             # Nemotron: only MoE layers have experts. Attention and Mamba2 layers do not.
             return self.layer_types[layer_idx] == "moe"
+        if self.n_routed_experts <= 0:
+            return False
         return layer_idx >= self.first_k_dense_replace
 
 

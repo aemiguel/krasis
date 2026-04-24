@@ -11,6 +11,7 @@ Each layer performs:
 For MoE layers, shared expert and routed experts overlap on GPU and CPU respectively.
 """
 
+import json
 import logging
 import os
 import time
@@ -82,6 +83,8 @@ class TransformerLayer:
         gpu_prefill_manager=None,
         gpu_prefill_threshold: int = 300,
     ):
+        timing_enabled = os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1"
+        started = time.perf_counter() if timing_enabled else 0.0
         self.cfg = cfg
         self.layer_idx = layer_idx
         self.device = device
@@ -188,13 +191,30 @@ class TransformerLayer:
 
         # CUDA stream for overlapping shared expert with routed expert dispatch
         self._shared_stream = None
-        if self.is_moe and self.shared_expert_gate is not None:
+        if self.is_moe and self.shared_expert_gate is not None and device.type == "cuda":
             self._shared_stream = torch.cuda.Stream(device=device)
 
         # CUDA graph for shared expert (M=1 decode): replaces 6+ kernel launches with 1 graph replay
         self._se_graph = None
         self._se_input = None
         self._se_output = None
+
+        if timing_enabled:
+            print(
+                json.dumps(
+                    {
+                        "hqq_real_model_timing": {
+                            "phase": "transformer_layer_init",
+                            "layer_idx": int(layer_idx),
+                            "layer_type": self.layer_type,
+                            "is_moe": bool(self.is_moe),
+                            "elapsed_s": time.perf_counter() - started,
+                        }
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     def pre_attn_norm(
         self,

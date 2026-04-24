@@ -10,8 +10,11 @@ Loading sequence:
   Phase 2: CPU expert weights (Krasis Rust engine, INT4)
 """
 
+import gc
 import logging
 import os
+import json
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,9 +24,37 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 
+from krasis.attention_backend import (
+    attention_quant_nbits,
+    HQQ_ATTENTION_CACHE_VERSION,
+    hqq_attention_cache_dir,
+    hqq_attention_cache_total_bytes,
+    hqq_backend_name,
+    hqq_attention_manifest_path,
+    hqq_attention_pending_manifest_path,
+    init_hqq_attention_manifest,
+    is_hqq_attention,
+    is_quantized_attention,
+    delete_hqq_attention_pending_manifest,
+    load_hqq_attention_artifact,
+    load_hqq_attention_manifest,
+    load_hqq_attention_pending_manifest,
+    save_hqq_attention_manifest,
+    save_hqq_attention_pending_manifest,
+    validate_hqq_nbits,
+    write_hqq_attention_artifact,
+)
 from krasis.timing import TIMING
 
-from krasis.config import ModelConfig, PPRankConfig, QuantConfig, build_pp_ranks, compute_pp_partition, cache_dir_for_model
+from krasis.config import (
+    ModelConfig,
+    PPRankConfig,
+    QuantConfig,
+    build_pp_ranks,
+    cache_dir_for_model,
+    compute_pp_partition,
+    marlin_cache_basename,
+)
 from krasis.weight_loader import WeightLoader, int8_linear
 from krasis.layer import TransformerLayer
 from krasis.kv_cache import PagedKVCache, SequenceKVState
@@ -539,7 +570,7 @@ class KrasisModel:
         self.force_load = force_load
         # When attention is quantized, it's permanently VRAM-resident (much smaller),
         # so streaming from CPU is unnecessary and would overwrite MarlinWeight attrs.
-        if stream_attention and quant_cfg.attention != "bf16":
+        if stream_attention and is_quantized_attention(quant_cfg.attention):
             logger.info("Disabling stream_attention: quantized attention (%s) is permanently VRAM-resident",
                         quant_cfg.attention)
             stream_attention = False
@@ -621,6 +652,10 @@ class KrasisModel:
 
         # Detect shared_expert_gate from weight map (Qwen3-Next)
         self._has_shared_expert_gate = self._detect_shared_expert_gate()
+        self._hqq_attention_cache_bytes = 0
+        self._hqq_attention_runtime = {}
+        self._hqq_attention_runtime_nbits: Optional[int] = None
+        self._hqq_attention_loaded_tensors = 0
 
     def _detect_shared_expert_gate(self) -> bool:
         """Check if model has shared_expert_gate weights (Qwen3-Next sigmoid gate)."""
@@ -706,6 +741,18 @@ class KrasisModel:
                 logger.info("Attention on CPU (AWQ: will quantize and upload in decode setup), GPU free: %d MB",
                             free_mb)
                 print(f"  \033[0;32mAttention on CPU (AWQ pending), {free_mb} MB free\033[0m", flush=True)
+            elif is_hqq_attention(self.quant_cfg.attention):
+                attn_mb = self._hqq_attention_cache_bytes >> 20
+                logger.info(
+                    "HQQ attention artifacts validated from cache: %d MB, GPU free: %d MB "
+                    "(runtime descriptors will be restored during decode-store setup)",
+                    attn_mb, free_mb,
+                )
+                print(
+                    f"  \033[0;32mHQQ attention artifacts validated ({attn_mb} MB cached), "
+                    f"{free_mb} MB free\033[0m",
+                    flush=True,
+                )
             else:
                 # BF16: attention weights permanently resident on GPU
                 attn_mb = self._estimate_attention_vram() >> 20
@@ -735,7 +782,16 @@ class KrasisModel:
                 "BF16 reference data plus quantized Krasis runs."
             )
         else:
-            has_gpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_marlin_int{gpu_bits}_g128.bin"))
+            has_gpu_cache = os.path.isfile(
+                os.path.join(
+                    cache_dir,
+                    marlin_cache_basename(
+                        gpu_bits,
+                        128,
+                        self.quant_cfg.gpu_expert_int4_calib,
+                    ),
+                )
+            )
             if has_gpu_cache:
                 print(f"\n\033[1m\033[36m▸ Loading GPU expert weights from cache\033[0m", flush=True)
             else:
@@ -796,7 +852,6 @@ class KrasisModel:
 
     def warmup_cuda_runtime(self, devices: List[torch.device]):
         """Trigger ALL lazy CUDA runtime allocations on ALL devices before HCS expert loading."""
-        import gc
         from krasis.triton_moe import triton_moe_decode, inverse_marlin_repack, inverse_scale_permute
 
         logger.info("Warming up CUDA runtime on all devices: %s", [str(d) for d in devices])
@@ -1073,6 +1128,816 @@ class KrasisModel:
                 result[k] = v
         return result
 
+    def _build_hqq_fused_qkv_artifact_weight(
+        self,
+        layer_type: str,
+        weights: dict,
+    ) -> Optional[torch.Tensor]:
+        if (
+            layer_type not in ("full_attention", "sliding_attention")
+            or self.cfg.is_mla
+        ):
+            return None
+        fused_qkv = weights.get("fused_qkv")
+        if isinstance(fused_qkv, torch.Tensor):
+            return fused_qkv
+
+        q_proj = weights.get("q_proj")
+        k_proj = weights.get("k_proj")
+        v_proj = weights.get("v_proj")
+        if not all(isinstance(t, torch.Tensor) for t in (q_proj, k_proj, v_proj)):
+            return None
+        if any(t.dim() != 2 for t in (q_proj, k_proj, v_proj)):
+            raise RuntimeError(
+                "HQQ fused_qkv artifact construction requires 2D q/k/v projection weights."
+            )
+        if q_proj.shape[1] != k_proj.shape[1] or q_proj.shape[1] != v_proj.shape[1]:
+            raise RuntimeError(
+                "HQQ fused_qkv artifact construction requires q/k/v projection weights "
+                "to share the same input width."
+            )
+        if q_proj.dtype != k_proj.dtype or q_proj.dtype != v_proj.dtype:
+            raise RuntimeError(
+                "HQQ fused_qkv artifact construction requires q/k/v projection weights "
+                "to share the same dtype."
+            )
+        if q_proj.device != k_proj.device or q_proj.device != v_proj.device:
+            raise RuntimeError(
+                "HQQ fused_qkv artifact construction requires q/k/v projection weights "
+                "to reside on the same device."
+            )
+        return torch.cat((q_proj, k_proj, v_proj), dim=0).contiguous()
+
+    def _hqq_attention_tensor_map(self, layer_type: str, weights: dict) -> dict:
+        if layer_type == "linear_attention":
+            ordered = ("in_proj_qkvz", "in_proj_ba", "out_proj")
+        elif layer_type in ("full_attention", "sliding_attention"):
+            if self.cfg.is_mla:
+                ordered = ("q_a_proj", "q_b_proj", "q_proj", "kv_a_proj_with_mqa", "o_proj")
+            else:
+                ordered = ("q_proj", "k_proj", "v_proj", "o_proj")
+        else:
+            return {}
+
+        result = {}
+        for name in ordered:
+            tensor = weights.get(name)
+            if isinstance(tensor, torch.Tensor):
+                result[name] = tensor
+        if (
+            layer_type in ("full_attention", "sliding_attention")
+            and not self.cfg.is_mla
+        ):
+            fused_qkv = weights.get("fused_qkv")
+            if isinstance(fused_qkv, torch.Tensor):
+                result["fused_qkv"] = fused_qkv
+        return result
+
+    def _prepare_hqq_attention_cache(self) -> None:
+        nbits = attention_quant_nbits(self.quant_cfg.attention)
+        if nbits is None:
+            raise RuntimeError(
+                f"HQQ attention backend must declare nbits, got {self.quant_cfg.attention}"
+            )
+        validate_hqq_nbits(nbits)
+        cache_dir = hqq_attention_cache_dir(self.cfg.model_path)
+        manifest = init_hqq_attention_manifest(
+            self.cfg.model_path,
+            num_hidden_layers=self.cfg.num_hidden_layers,
+            nbits=nbits,
+        )
+        existing = load_hqq_attention_manifest(self.cfg.model_path)
+        pending = load_hqq_attention_pending_manifest(self.cfg.model_path)
+        self._hqq_rebuild = True
+        self._hqq_finalize_pending_manifest = False
+
+        def _compatible(candidate: dict) -> bool:
+            return (
+                candidate.get("format_version") == manifest["format_version"]
+                and candidate.get("backend") == manifest["backend"]
+                and candidate.get("num_hidden_layers") == manifest["num_hidden_layers"]
+                and candidate.get("group_size") == manifest["group_size"]
+                and candidate.get("axis") == manifest["axis"]
+                and candidate.get("layout") == manifest["layout"]
+            )
+
+        def _pending_has_all_layer_artifacts(candidate: dict) -> bool:
+            entries = candidate.get("tensors", [])
+            if not entries:
+                return False
+            seen_layers = set()
+            for entry in entries:
+                try:
+                    layer_idx = int(entry["layer_idx"])
+                except (KeyError, TypeError, ValueError):
+                    return False
+                if layer_idx < 0 or layer_idx >= self.cfg.num_hidden_layers:
+                    return False
+                file_name = entry.get("file")
+                if not file_name:
+                    return False
+                artifact_path = os.path.join(cache_dir, file_name)
+                if not os.path.isfile(artifact_path):
+                    return False
+                seen_layers.add(layer_idx)
+            return len(seen_layers) == self.cfg.num_hidden_layers
+
+        if existing:
+            if _compatible(existing) and existing.get("complete"):
+                manifest = existing
+                self._hqq_rebuild = False
+        if self._hqq_rebuild and pending and _compatible(pending):
+            if _pending_has_all_layer_artifacts(pending):
+                manifest = pending
+                self._hqq_rebuild = False
+                self._hqq_finalize_pending_manifest = True
+                logger.info(
+                    "Recovering complete pending HQQ attention manifest from %s",
+                    hqq_attention_pending_manifest_path(self.cfg.model_path),
+                )
+        if self._hqq_rebuild:
+            if os.path.isdir(cache_dir):
+                shutil.rmtree(cache_dir)
+            os.makedirs(cache_dir, exist_ok=True)
+            incomplete_manifest_path = hqq_attention_manifest_path(self.cfg.model_path)
+            if os.path.isfile(incomplete_manifest_path):
+                os.remove(incomplete_manifest_path)
+            delete_hqq_attention_pending_manifest(self.cfg.model_path)
+            save_hqq_attention_pending_manifest(self.cfg.model_path, manifest)
+        self._hqq_manifest = manifest
+
+    def _maybe_write_hqq_attention_artifacts(self, layer_idx: int, layer_type: str, weights: dict) -> None:
+        if not getattr(self, "_hqq_rebuild", False):
+            return
+        nbits = attention_quant_nbits(self.quant_cfg.attention)
+        if nbits is None:
+            raise RuntimeError(
+                f"HQQ attention backend must declare nbits, got {self.quant_cfg.attention}"
+            )
+        timing_enabled = os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1"
+        timing_entries = []
+        timing_started = time.perf_counter() if timing_enabled else 0.0
+
+        tensor_map = self._hqq_attention_tensor_map(layer_type, weights)
+        for tensor_name, tensor in tensor_map.items():
+            tensor_started = time.perf_counter() if timing_enabled else 0.0
+            if timing_enabled:
+                print(
+                    json.dumps(
+                        {
+                            "hqq_real_model_timing": {
+                                "phase": "artifact_write_tensor_start",
+                                "layer_idx": int(layer_idx),
+                                "layer_type": layer_type,
+                                "tensor_name": tensor_name,
+                            }
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            record = write_hqq_attention_artifact(
+                self.cfg.model_path,
+                layer_idx=layer_idx,
+                layer_type=layer_type,
+                tensor_name=tensor_name,
+                weight=tensor,
+                nbits=nbits,
+            )
+            self._hqq_manifest["tensors"].append(record)
+            self._hqq_manifest["totals"]["tensor_bytes"] += record["tensor_bytes"]
+            self._hqq_manifest["totals"]["num_tensors"] += 1
+            if timing_enabled:
+                elapsed_s = time.perf_counter() - tensor_started
+                timing_entries.append(
+                    {
+                        "tensor_name": tensor_name,
+                        "elapsed_s": elapsed_s,
+                        "tensor_bytes": int(record["tensor_bytes"]),
+                    }
+                )
+                print(
+                    json.dumps(
+                        {
+                            "hqq_real_model_timing": {
+                                "phase": "artifact_write_tensor_done",
+                                "layer_idx": int(layer_idx),
+                                "layer_type": layer_type,
+                                "tensor_name": tensor_name,
+                                "elapsed_s": elapsed_s,
+                                "tensor_bytes": int(record["tensor_bytes"]),
+                            }
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+        if "fused_qkv" not in tensor_map:
+            fused_build_started = time.perf_counter() if timing_enabled else 0.0
+            fused_qkv = self._build_hqq_fused_qkv_artifact_weight(layer_type, weights)
+            if fused_qkv is not None:
+                fused_write_started = time.perf_counter() if timing_enabled else 0.0
+                if timing_enabled:
+                    print(
+                        json.dumps(
+                            {
+                                "hqq_real_model_timing": {
+                                    "phase": "artifact_write_tensor_start",
+                                    "layer_idx": int(layer_idx),
+                                    "layer_type": layer_type,
+                                    "tensor_name": "fused_qkv",
+                                    "build_elapsed_s": fused_write_started - fused_build_started,
+                                }
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                record = write_hqq_attention_artifact(
+                    self.cfg.model_path,
+                    layer_idx=layer_idx,
+                    layer_type=layer_type,
+                    tensor_name="fused_qkv",
+                    weight=fused_qkv,
+                    nbits=nbits,
+                )
+                self._hqq_manifest["tensors"].append(record)
+                self._hqq_manifest["totals"]["tensor_bytes"] += record["tensor_bytes"]
+                self._hqq_manifest["totals"]["num_tensors"] += 1
+                if timing_enabled:
+                    elapsed_s = time.perf_counter() - fused_write_started
+                    timing_entries.append(
+                        {
+                            "tensor_name": "fused_qkv",
+                            "build_elapsed_s": fused_write_started - fused_build_started,
+                            "elapsed_s": elapsed_s,
+                            "tensor_bytes": int(record["tensor_bytes"]),
+                        }
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "hqq_real_model_timing": {
+                                    "phase": "artifact_write_tensor_done",
+                                    "layer_idx": int(layer_idx),
+                                    "layer_type": layer_type,
+                                    "tensor_name": "fused_qkv",
+                                    "build_elapsed_s": fused_write_started - fused_build_started,
+                                    "elapsed_s": elapsed_s,
+                                    "tensor_bytes": int(record["tensor_bytes"]),
+                                }
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+        save_hqq_attention_pending_manifest(self.cfg.model_path, self._hqq_manifest)
+        if timing_enabled:
+            print(
+                json.dumps(
+                    {
+                        "hqq_real_model_timing": {
+                            "phase": "artifact_write",
+                            "layer_idx": int(layer_idx),
+                            "layer_type": layer_type,
+                            "elapsed_s": time.perf_counter() - timing_started,
+                            "entries": timing_entries,
+                        }
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    def _validate_hqq_attention_cache(self) -> None:
+        nbits = attention_quant_nbits(self.quant_cfg.attention)
+        if nbits is None:
+            raise RuntimeError(
+                f"HQQ attention backend must declare nbits, got {self.quant_cfg.attention}"
+            )
+        validate_hqq_nbits(nbits)
+        rebuilding = getattr(self, "_hqq_rebuild", False)
+        finalize_pending = getattr(self, "_hqq_finalize_pending_manifest", False)
+        manifest = (
+            load_hqq_attention_pending_manifest(self.cfg.model_path)
+            if rebuilding or finalize_pending
+            else load_hqq_attention_manifest(self.cfg.model_path)
+        )
+        if manifest is None:
+            expected_path = (
+                hqq_attention_pending_manifest_path(self.cfg.model_path)
+                if rebuilding or finalize_pending
+                else hqq_attention_manifest_path(self.cfg.model_path)
+            )
+            raise RuntimeError(
+                "attention_quant=hqq4 requested but no HQQ attention manifest exists. "
+                f"Expected {expected_path}"
+            )
+        expected_backend = hqq_backend_name(nbits)
+        if (
+            manifest.get("format_version") != HQQ_ATTENTION_CACHE_VERSION
+            or manifest.get("backend") != expected_backend
+        ):
+            raise RuntimeError(
+                "HQQ attention cache manifest is incompatible with this build. "
+                f"Found format_version={manifest.get('format_version')} backend={manifest.get('backend')}"
+            )
+
+        expected = []
+        for layer_idx, layer in enumerate(self.layers):
+            layer_weights = self._extract_layer_weights(layer, layer.device)
+            layer_type = layer_weights.get("layer_type", "full_attention")
+            attn_key = "linear_attention" if layer_type == "linear_attention" else "attention"
+            attn_weights = layer_weights.get(attn_key, {})
+            expected_tensor_names = list(self._hqq_attention_tensor_map(layer_type, attn_weights))
+            if (
+                layer_type in ("full_attention", "sliding_attention")
+                and not self.cfg.is_mla
+                and "fused_qkv" not in expected_tensor_names
+                and all(isinstance(attn_weights.get(name), torch.Tensor) for name in ("q_proj", "k_proj", "v_proj"))
+            ):
+                expected_tensor_names.append("fused_qkv")
+            for tensor_name in expected_tensor_names:
+                expected.append((layer_idx, tensor_name))
+
+        entries = {}
+        duplicates = []
+        for entry in manifest.get("tensors", []):
+            key = (entry["layer_idx"], entry["tensor_name"])
+            if key in entries:
+                duplicates.append(f"layer {key[0]} {key[1]}")
+            entries[key] = entry
+        if duplicates:
+            raise RuntimeError(
+                "HQQ attention cache manifest has duplicate artifacts: "
+                + ", ".join(duplicates[:8])
+                + ("..." if len(duplicates) > 8 else "")
+            )
+        expected_set = set(expected)
+        extras = [f"layer {idx} {name}" for idx, name in entries if (idx, name) not in expected_set]
+        if extras:
+            raise RuntimeError(
+                "HQQ attention cache manifest has unexpected artifacts: "
+                + ", ".join(extras[:8])
+                + ("..." if len(extras) > 8 else "")
+            )
+        missing = [f"layer {idx} {name}" for idx, name in expected if (idx, name) not in entries]
+        if missing:
+            raise RuntimeError(
+                "HQQ attention cache is incomplete. Missing artifacts: "
+                + ", ".join(missing[:8])
+                + ("..." if len(missing) > 8 else "")
+            )
+
+        total_bytes = 0
+        for layer_idx, tensor_name in expected:
+            entry = entries[(layer_idx, tensor_name)]
+            if "structure" not in entry or "quality" not in entry:
+                raise RuntimeError(
+                    "HQQ attention cache is missing measured structure/quality metadata. "
+                    f"Rebuild required for layer {layer_idx} {tensor_name}."
+                )
+            artifact = load_hqq_attention_artifact(
+                self.cfg.model_path,
+                entry,
+                expected_nbits=nbits,
+                device="cpu",
+            )
+            if artifact["tensor_bytes"] != entry["tensor_bytes"]:
+                raise RuntimeError(
+                    f"HQQ artifact byte mismatch for layer {layer_idx} {tensor_name}: "
+                    f"manifest={entry['tensor_bytes']} actual={artifact['tensor_bytes']}"
+                )
+            total_bytes += artifact["tensor_bytes"]
+        manifest["complete"] = True
+        manifest["totals"]["tensor_bytes"] = total_bytes
+        manifest["totals"]["num_tensors"] = len(expected)
+        save_hqq_attention_manifest(self.cfg.model_path, manifest)
+        delete_hqq_attention_pending_manifest(self.cfg.model_path)
+        self._hqq_manifest = manifest
+        self._hqq_attention_cache_bytes = total_bytes
+
+    def _load_hqq_attention_runtime_state(self) -> None:
+        nbits = attention_quant_nbits(self.quant_cfg.attention)
+        if nbits is None:
+            raise RuntimeError(
+                f"HQQ attention backend must declare nbits, got {self.quant_cfg.attention}"
+            )
+        validate_hqq_nbits(nbits)
+        manifest = getattr(self, "_hqq_manifest", None)
+        if not manifest or not manifest.get("complete"):
+            raise RuntimeError(
+                "HQQ attention runtime load requires a complete validated manifest."
+            )
+
+        runtime_layers = {}
+        loaded_tensors = 0
+        loaded_bytes = 0
+        for entry in manifest.get("tensors", []):
+            layer_idx = entry["layer_idx"]
+            tensor_name = entry["tensor_name"]
+            artifact = load_hqq_attention_artifact(
+                self.cfg.model_path,
+                entry,
+                expected_nbits=nbits,
+                device="cpu",
+            )
+            if artifact["tensor_bytes"] != entry["tensor_bytes"]:
+                raise RuntimeError(
+                    f"HQQ artifact byte mismatch for layer {layer_idx} {tensor_name}: "
+                    f"manifest={entry['tensor_bytes']} actual={artifact['tensor_bytes']}"
+                )
+            if artifact["structure"] != entry.get("structure"):
+                raise RuntimeError(
+                    f"HQQ artifact structure mismatch for layer {layer_idx} {tensor_name}: "
+                    f"manifest={entry.get('structure')} actual={artifact['structure']}"
+                )
+
+            tensors = artifact["tensors"]
+            group_size = int(tensors["group_size"][0].item())
+            axis = int(tensors["axis"][0].item())
+            stored_nbits = int(tensors["nbits"][0].item())
+            if stored_nbits != nbits:
+                raise RuntimeError(
+                    f"HQQ artifact tensor nbits mismatch for layer {layer_idx} {tensor_name}: "
+                    f"stored={stored_nbits} expected={nbits}"
+                )
+
+            runtime_entry = {
+                "backend": manifest["backend"],
+                "format_version": int(manifest["format_version"]),
+                "nbits": stored_nbits,
+                "layout": entry["layout"],
+                "group_size": group_size,
+                "axis": axis,
+                "orig_shape": tuple(int(v) for v in tensors["orig_shape"].tolist()),
+                "packed": tensors["packed"],
+                "scales": tensors["scales"],
+                "zeros": tensors["zeros"],
+                "packed_dtype": str(tensors["packed"].dtype).replace("torch.", ""),
+                "scales_dtype": str(tensors["scales"].dtype).replace("torch.", ""),
+                "zeros_dtype": str(tensors["zeros"].dtype).replace("torch.", ""),
+                "original_dtype": entry.get("original_dtype", artifact["metadata"].get("dtype", "")),
+                "path": artifact["path"],
+                "tensor_bytes": artifact["tensor_bytes"],
+            }
+            runtime_layers.setdefault(layer_idx, {})[tensor_name] = runtime_entry
+            loaded_tensors += 1
+            loaded_bytes += artifact["tensor_bytes"]
+
+        if loaded_bytes != self._hqq_attention_cache_bytes:
+            raise RuntimeError(
+                f"HQQ runtime byte mismatch after load: loaded={loaded_bytes} "
+                f"validated={self._hqq_attention_cache_bytes}"
+            )
+
+        self._hqq_attention_runtime = runtime_layers
+        self._hqq_attention_runtime_nbits = nbits
+        self._hqq_attention_loaded_tensors = loaded_tensors
+        for layer_idx, layer in enumerate(self.layers):
+            setattr(layer, "_hqq_attention_runtime", runtime_layers.get(layer_idx, {}))
+
+    @staticmethod
+    def _hqq_layer_kind(layer: TransformerLayer) -> str:
+        if layer.layer_type == "linear_attention":
+            return "linear_attention"
+        attn = layer.attention
+        if attn is not None and hasattr(attn, "kv_a_proj"):
+            return "mla"
+        return "gqa"
+
+    @staticmethod
+    def _move_hqq_tensor_to_device(
+        tensor: torch.Tensor, device: torch.device, keepalive: list
+    ) -> torch.Tensor:
+        if tensor.device == device:
+            return tensor
+        moved = tensor.to(device, non_blocking=True)
+        keepalive.append(moved)
+        return moved
+
+    def _hqq_layer_meta(
+        self,
+        layer_idx: int,
+        layer: TransformerLayer,
+        target_device: torch.device,
+        keepalive: list,
+    ) -> dict:
+        layer_kind = self._hqq_layer_kind(layer)
+        if layer_kind == "gqa":
+            gqa_w = layer.gqa_weights if hasattr(layer, "gqa_weights") else None
+            q_norm_src = gqa_w.get("q_norm") if gqa_w else None
+            k_norm_src = gqa_w.get("k_norm") if gqa_w else None
+            if q_norm_src is not None:
+                q_norm = self._move_hqq_tensor_to_device(
+                    q_norm_src.float().contiguous(), target_device, keepalive
+                )
+                q_norm_ptr = q_norm.data_ptr()
+            else:
+                q_norm_ptr = 0
+            if k_norm_src is not None:
+                k_norm = self._move_hqq_tensor_to_device(
+                    k_norm_src.float().contiguous(), target_device, keepalive
+                )
+                k_norm_ptr = k_norm.data_ptr()
+            else:
+                k_norm_ptr = 0
+            head_dim = self.cfg.gqa_head_dim or self.cfg.head_dim
+            sm_scale = 1.0 / (head_dim ** 0.5)
+            gated = hasattr(self.cfg, "gated_attention") and self.cfg.gated_attention
+            return {
+                "num_heads": int(self.cfg.num_attention_heads),
+                "num_kv_heads": int(self.cfg.num_key_value_heads),
+                "head_dim": int(head_dim),
+                "sm_scale": float(sm_scale),
+                "q_norm_ptr": int(q_norm_ptr),
+                "k_norm_ptr": int(k_norm_ptr),
+                "gated": bool(gated),
+            }
+
+        attn = layer.attention
+        if attn is None:
+            raise RuntimeError(
+                f"HQQ layer {layer_idx} has no attention object for kind {layer_kind}"
+            )
+
+        if layer_kind == "mla":
+            attn._hqq_kv_a_norm = self._move_hqq_tensor_to_device(
+                attn.kv_a_norm_weight.float().contiguous(), target_device, keepalive
+            )
+            attn._hqq_w_kc = self._move_hqq_tensor_to_device(
+                attn.w_kc.contiguous(), target_device, keepalive
+            )
+            attn._hqq_w_vc = self._move_hqq_tensor_to_device(
+                attn.w_vc.contiguous(), target_device, keepalive
+            )
+            cache = self.kv_caches[0]
+            if not hasattr(self, "_hqq_mla_cache_offset"):
+                self._hqq_mla_cache_offset = 0
+            mla_offset = self._hqq_mla_cache_offset
+            self._hqq_mla_cache_offset += 1
+            ckv_layer = cache.ckv_cache[mla_offset]
+            kpe_layer = cache.kpe_cache[mla_offset]
+            ckv_cache = self._move_hqq_tensor_to_device(
+                ckv_layer, target_device, keepalive
+            )
+            kpe_cache = self._move_hqq_tensor_to_device(
+                kpe_layer, target_device, keepalive
+            )
+            q_a_norm_ptr = 0
+            if attn.has_q_lora:
+                attn._hqq_q_a_norm = self._move_hqq_tensor_to_device(
+                    attn.q_a_norm_weight.float().contiguous(), target_device, keepalive
+                )
+                q_a_norm_ptr = attn._hqq_q_a_norm.data_ptr()
+            return {
+                "num_heads": int(attn.num_heads),
+                "kv_lora_rank": int(attn.kv_lora_rank),
+                "ckv_cache_dim": int(attn.ckv_dim),
+                "qk_nope_dim": int(attn.qk_nope_dim),
+                "qk_rope_dim": int(attn.qk_rope_dim),
+                "v_head_dim": int(attn.v_head_dim),
+                "q_lora_rank": int(attn.q_lora_rank if attn.has_q_lora else 0),
+                "sm_scale": float(attn.sm_scale),
+                "rope_interleave": bool(getattr(self.cfg, "rope_interleave", True)),
+                "kv_a_norm_ptr": int(attn._hqq_kv_a_norm.data_ptr()),
+                "w_kc_ptr": int(attn._hqq_w_kc.data_ptr()),
+                "w_vc_ptr": int(attn._hqq_w_vc.data_ptr()),
+                "ckv_cache_ptr": int(ckv_cache.data_ptr()),
+                "kpe_cache_ptr": int(kpe_cache.data_ptr()),
+                "q_a_norm_ptr": int(q_a_norm_ptr),
+            }
+
+        if layer_kind == "linear_attention":
+            conv_weight = attn.conv1d_weight
+            if conv_weight.dim() == 3:
+                conv_weight = conv_weight.squeeze(1)
+            attn._init_state(batch_size=1)
+            attn._hqq_conv_weight = self._move_hqq_tensor_to_device(
+                conv_weight.float().contiguous(), target_device, keepalive
+            )
+            attn._hqq_a_log = self._move_hqq_tensor_to_device(
+                attn.A_log.float().contiguous(), target_device, keepalive
+            )
+            attn._hqq_dt_bias = self._move_hqq_tensor_to_device(
+                attn.dt_bias.float().contiguous(), target_device, keepalive
+            )
+            attn._hqq_norm_weight = self._move_hqq_tensor_to_device(
+                attn.norm_weight.float().contiguous(), target_device, keepalive
+            )
+            attn._hqq_conv_state = self._move_hqq_tensor_to_device(
+                attn._conv_state.squeeze(0).float().contiguous(), target_device, keepalive
+            )
+            attn._hqq_recur_state = self._move_hqq_tensor_to_device(
+                attn._recurrent_state.squeeze(0).float().contiguous(), target_device, keepalive
+            )
+            return {
+                "num_k_heads": int(attn.num_k_heads),
+                "num_v_heads": int(attn.num_v_heads),
+                "k_head_dim": int(attn.k_head_dim),
+                "v_head_dim": int(attn.v_head_dim),
+                "head_ratio": int(attn.head_ratio),
+                "kernel_dim": int(attn.kernel_dim),
+                "conv_dim": int(attn.conv_dim),
+                "scale": float(attn.scale),
+                "conv_weight_ptr": int(attn._hqq_conv_weight.data_ptr()),
+                "a_log_ptr": int(attn._hqq_a_log.data_ptr()),
+                "dt_bias_ptr": int(attn._hqq_dt_bias.data_ptr()),
+                "norm_weight_ptr": int(attn._hqq_norm_weight.data_ptr()),
+                "conv_state_ptr": int(attn._hqq_conv_state.data_ptr()),
+                "recur_state_ptr": int(attn._hqq_recur_state.data_ptr()),
+            }
+
+        raise RuntimeError(f"Unsupported HQQ layer kind {layer_kind} for layer {layer_idx}")
+
+    def _register_hqq_attention_layers_on_store(
+        self,
+        store,
+        target_device: torch.device,
+        keepalive: list,
+    ) -> int:
+        manifest = getattr(self, "_hqq_manifest", None)
+        if not manifest or not manifest.get("complete"):
+            raise RuntimeError("HQQ registration requires a complete validated manifest.")
+        nbits = self._hqq_attention_runtime_nbits
+        if nbits is None:
+            raise RuntimeError("HQQ registration requires loaded runtime state.")
+        validate_hqq_nbits(nbits)
+
+        registered_layers = 0
+        staged_runtime_tensors = 0
+        pending_layers = []
+        for layer_idx, layer in enumerate(self.layers):
+            runtime = self._hqq_attention_runtime.get(layer_idx)
+            if not runtime:
+                continue
+
+            inp_norm = self._move_hqq_tensor_to_device(
+                layer.input_norm_weight, target_device, keepalive
+            )
+            post_norm = layer.post_attn_norm_weight
+            if post_norm is not None:
+                post_norm = self._move_hqq_tensor_to_device(
+                    post_norm, target_device, keepalive
+                )
+                post_norm_ptr = post_norm.data_ptr()
+                post_norm_size = post_norm.numel()
+            else:
+                post_norm_ptr = 0
+                post_norm_size = 0
+
+            layer_kind = self._hqq_layer_kind(layer)
+            layer_meta = self._hqq_layer_meta(
+                layer_idx, layer, target_device, keepalive
+            )
+
+            tensor_names = []
+            for tensor_name in sorted(runtime.keys()):
+                desc = runtime[tensor_name]
+                store.stage_hqq_runtime_tensor_formats(
+                    layer_idx=layer_idx,
+                    tensor_name=tensor_name,
+                    backend=manifest["backend"],
+                    nbits=nbits,
+                    format_version=int(manifest["format_version"]),
+                    packed_ptr=int(desc["packed"].data_ptr()),
+                    packed_bytes=int(desc["packed"].numel() * desc["packed"].element_size()),
+                    scales_ptr=int(desc["scales"].data_ptr()),
+                    scales_bytes=int(desc["scales"].numel() * desc["scales"].element_size()),
+                    zeros_ptr=int(desc["zeros"].data_ptr()),
+                    zeros_bytes=int(desc["zeros"].numel() * desc["zeros"].element_size()),
+                    rows=int(desc["orig_shape"][0]),
+                    cols=int(desc["orig_shape"][1]),
+                    group_size=int(desc["group_size"]),
+                    axis=int(desc["axis"]),
+                    layout=desc["layout"],
+                    packed_dtype=desc["packed_dtype"],
+                    scales_dtype=desc["scales_dtype"],
+                    zeros_dtype=desc["zeros_dtype"],
+                )
+                staged_runtime_tensors += 1
+                tensor_names.append(tensor_name)
+            pending_layers.append(
+                dict(
+                    layer_idx=layer_idx,
+                    layer_kind=layer_kind,
+                    layer_meta=layer_meta,
+                    tensor_names=tensor_names,
+                    common_args=dict(
+                        layer_idx=layer_idx,
+                        input_norm_ptr=inp_norm.data_ptr(),
+                        input_norm_size=inp_norm.numel(),
+                        post_attn_norm_ptr=post_norm_ptr,
+                        post_attn_norm_size=post_norm_size,
+                        backend=manifest["backend"],
+                        nbits=nbits,
+                        format_version=int(manifest["format_version"]),
+                        tensor_names=tensor_names,
+                    ),
+                )
+            )
+
+        if staged_runtime_tensors > 0:
+            removed = store.restrict_hqq_runtime_slots_to_decode_segment()
+            if removed > 0:
+                logger.info(
+                    "HQQ attention runtime scoping removed %d staged tensors outside the active decode segment on this store.",
+                    removed,
+                )
+            store.register_hqq_runtime_slots()
+            store.swap_hqq_runtime_to_prefill()
+            store.swap_hqq_runtime_to_decode()
+        for pending in pending_layers:
+            layer_kind = pending["layer_kind"]
+            layer_meta = pending["layer_meta"]
+            common_args = pending["common_args"]
+            if layer_kind == "gqa":
+                store.register_hqq_runtime_gqa_layer(
+                    **common_args,
+                    num_heads=int(layer_meta["num_heads"]),
+                    num_kv_heads=int(layer_meta["num_kv_heads"]),
+                    head_dim=int(layer_meta["head_dim"]),
+                    sm_scale=float(layer_meta["sm_scale"]),
+                    q_norm_ptr=int(layer_meta["q_norm_ptr"]),
+                    k_norm_ptr=int(layer_meta["k_norm_ptr"]),
+                    gated=bool(layer_meta["gated"]),
+                )
+            elif layer_kind == "mla":
+                store.register_hqq_runtime_mla_layer(
+                    **common_args,
+                    num_heads=int(layer_meta["num_heads"]),
+                    kv_lora_rank=int(layer_meta["kv_lora_rank"]),
+                    ckv_cache_dim=int(layer_meta["ckv_cache_dim"]),
+                    qk_nope_dim=int(layer_meta["qk_nope_dim"]),
+                    qk_rope_dim=int(layer_meta["qk_rope_dim"]),
+                    v_head_dim=int(layer_meta["v_head_dim"]),
+                    q_lora_rank=int(layer_meta["q_lora_rank"]),
+                    sm_scale=float(layer_meta["sm_scale"]),
+                    rope_interleave=bool(layer_meta["rope_interleave"]),
+                    kv_a_norm_ptr=int(layer_meta["kv_a_norm_ptr"]),
+                    w_kc_ptr=int(layer_meta["w_kc_ptr"]),
+                    w_vc_ptr=int(layer_meta["w_vc_ptr"]),
+                    ckv_cache_ptr=int(layer_meta["ckv_cache_ptr"]),
+                    kpe_cache_ptr=int(layer_meta["kpe_cache_ptr"]),
+                    q_a_norm_ptr=int(layer_meta["q_a_norm_ptr"]),
+                )
+            elif layer_kind == "linear_attention":
+                store.register_hqq_runtime_linear_attention_layer(
+                    **common_args,
+                    num_k_heads=int(layer_meta["num_k_heads"]),
+                    num_v_heads=int(layer_meta["num_v_heads"]),
+                    k_head_dim=int(layer_meta["k_head_dim"]),
+                    v_head_dim=int(layer_meta["v_head_dim"]),
+                    head_ratio=int(layer_meta["head_ratio"]),
+                    kernel_dim=int(layer_meta["kernel_dim"]),
+                    conv_dim=int(layer_meta["conv_dim"]),
+                    scale=float(layer_meta["scale"]),
+                    conv_weight_ptr=int(layer_meta["conv_weight_ptr"]),
+                    a_log_ptr=int(layer_meta["a_log_ptr"]),
+                    dt_bias_ptr=int(layer_meta["dt_bias_ptr"]),
+                    norm_weight_ptr=int(layer_meta["norm_weight_ptr"]),
+                    conv_state_ptr=int(layer_meta["conv_state_ptr"]),
+                    recur_state_ptr=int(layer_meta["recur_state_ptr"]),
+                )
+            else:
+                raise RuntimeError(
+                    f"Unsupported HQQ layer kind {layer_kind} for registration"
+                )
+            registered_layers += 1
+
+        if registered_layers == 0:
+            raise RuntimeError("No HQQ attention layers were registered on the decode store.")
+        if staged_runtime_tensors > 0:
+            staging = json.loads(store.hqq_runtime_staging_json())
+            summary = staging["summary"]
+            registration = staging["registration"]
+            last_swap = staging["last_swap"]
+            logger.info(
+                "HQQ runtime staging prepared: tensors=%d host_mb=%.2f prefill_mb=%.2f decode_mb=%.2f slot_mb=(packed %.2f, scales %.2f, zeros %.2f) build_ms=%.3f reg_ms=%.3f device_mb=%.2f decode_swap_ms=%.3f decode_swap_mb=%.2f",
+                summary["tensor_count"],
+                summary["total_host_bytes"] / (1024.0 * 1024.0),
+                summary["prefill_host_bytes"] / (1024.0 * 1024.0),
+                summary["decode_host_bytes"] / (1024.0 * 1024.0),
+                summary["packed_slot_bytes"] / (1024.0 * 1024.0),
+                summary["scales_slot_bytes"] / (1024.0 * 1024.0),
+                summary["zeros_slot_bytes"] / (1024.0 * 1024.0),
+                summary["total_build_ms"],
+                registration["total_registration_ms"],
+                registration["total_device_slot_bytes"] / (1024.0 * 1024.0),
+                last_swap["total_swap_ms"],
+                last_swap["total_host_bytes"] / (1024.0 * 1024.0),
+            )
+            _python_trace(
+                "weights",
+                "phase=hqq_runtime_staging "
+                f"tensors={summary['tensor_count']} "
+                f"host_mb={summary['total_host_bytes'] / (1024.0 * 1024.0):.3f} "
+                f"build_ms={summary['total_build_ms']:.3f} "
+                f"reg_ms={registration['total_registration_ms']:.3f} "
+                f"decode_swap_ms={last_swap['total_swap_ms']:.3f}",
+            )
+        return registered_layers
+
     def _load_gpu_weights(self, loader: WeightLoader):
         """Stream-load GPU weights: all attention on GPU0.
 
@@ -1104,6 +1969,9 @@ class KrasisModel:
         # ── Load layers ──
         logger.info("Loading full base model to %s...", primary_dev)
         self.embedding = loader.load_embedding(primary_dev)
+        hqq_active = is_hqq_attention(self.quant_cfg.attention)
+        if hqq_active:
+            self._prepare_hqq_attention_cache()
 
         if self.stream_attention:
             # Incremental load: attention goes directly to CPU (never touches GPU),
@@ -1115,6 +1983,14 @@ class KrasisModel:
             _cpu = _torch.device('cpu')
             for layer_idx in range(L):
                 weights = loader.load_layer(layer_idx, primary_dev, attn_device=_cpu)
+                if hqq_active:
+                    layer_type = weights.get("layer_type", "full_attention")
+                    attn_key = "linear_attention" if layer_type == "linear_attention" else "attention"
+                    self._maybe_write_hqq_attention_artifacts(
+                        layer_idx,
+                        layer_type,
+                        weights.get(attn_key, {}),
+                    )
                 layer = TransformerLayer(
                     self.cfg, layer_idx, weights, primary_dev,
                     krasis_engine=None,
@@ -1163,6 +2039,9 @@ class KrasisModel:
                     logger.info("Layer %d/%d loaded+offloaded (GPU alloc: %.0f MB)",
                                 layer_idx + 1, L, alloc_mb)
             self._attn_offloaded = True
+            if hqq_active:
+                self._validate_hqq_attention_cache()
+                self._load_hqq_attention_runtime_state()
             logger.info("Incremental attention offload: %d layers, peak VRAM bounded to ~1 layer", L)
         else:
             # When AWQ is configured, load attention weights to CPU (not GPU).
@@ -1170,9 +2049,17 @@ class KrasisModel:
             # in setup_gpu_decode_store(). Loading BF16 to GPU first wastes VRAM and
             # risks OOM on large models (e.g. Q235B: ~12.8 GB BF16 attention).
             awq_active = self.quant_cfg.attention == "awq"
-            _attn_dev = torch.device('cpu') if awq_active else None
+            _attn_dev = torch.device('cpu') if (awq_active or hqq_active) else None
             for layer_idx in range(L):
                 weights = loader.load_layer(layer_idx, primary_dev, attn_device=_attn_dev)
+                if hqq_active:
+                    layer_type = weights.get("layer_type", "full_attention")
+                    attn_key = "linear_attention" if layer_type == "linear_attention" else "attention"
+                    self._maybe_write_hqq_attention_artifacts(
+                        layer_idx,
+                        layer_type,
+                        weights.get(attn_key, {}),
+                    )
                 layer = TransformerLayer(
                     self.cfg, layer_idx, weights, primary_dev,
                     krasis_engine=None,
@@ -1180,6 +2067,9 @@ class KrasisModel:
                     gpu_prefill_threshold=self.gpu_prefill_threshold,
                 )
                 self.layers.append(layer)
+            if hqq_active:
+                self._validate_hqq_attention_cache()
+                self._load_hqq_attention_runtime_state()
 
         self.final_norm = loader.load_final_norm(primary_dev)
         self.lm_head_data = loader.load_lm_head(primary_dev)
@@ -1716,11 +2606,18 @@ class KrasisModel:
                 self.cfg.model_path,
                 cpu_num_bits=cpu_bits,
                 gpu_num_bits=gpu_bits,
+                expert_int4_calib=self.quant_cfg.gpu_expert_int4_calib,
                 gguf_path=self.gguf_path,
                 gguf_native=self.gguf_native,
             )
         else:
-            engine.load(self.cfg.model_path, cpu_num_bits=cpu_bits, gpu_num_bits=gpu_bits, gpu_only=gpu_only)
+            engine.load(
+                self.cfg.model_path,
+                cpu_num_bits=cpu_bits,
+                gpu_num_bits=gpu_bits,
+                expert_int4_calib=self.quant_cfg.gpu_expert_int4_calib,
+                gpu_only=gpu_only,
+            )
 
         self.krasis_engine = engine
 
@@ -3985,6 +4882,19 @@ class KrasisModel:
         self._rust_decode_weights = []  # prevent GC of permanent GPU copies
 
         attn_quant = self.quant_cfg.attention  # "bf16" or "awq"
+        hqq_active = is_hqq_attention(attn_quant)
+        if hqq_active:
+            registered_layers = self._register_hqq_attention_layers_on_store(
+                store, device, self._rust_decode_weights
+            )
+            cache_bytes = hqq_attention_cache_total_bytes(self.cfg.model_path) or 0
+            logger.info(
+                "HQQ attention registration completed on cuda:%d: %d layers, %d MB validated cache, %d tensors loaded. Runtime execution descriptors are active on the decode store.",
+                gpu_idx,
+                registered_layers,
+                cache_bytes >> 20,
+                self._hqq_attention_loaded_tensors,
+            )
         marlin_gs = 128  # Marlin group size for both INT8 and INT4
 
         # AWQ template: per-layer channel scales from calibration
@@ -4723,6 +5633,16 @@ class KrasisModel:
             logger.info("MLA-only KV cache: max_seq=%d (%d pages × %d)",
                         max_seq, cache.max_pages, cache.page_size)
 
+        if hqq_active:
+            registered_layers = self._register_hqq_attention_layers_on_store(
+                store, device, self._rust_decode_weights
+            )
+            logger.info(
+                "HQQ attention execution descriptors restored after shared decode setup on cuda:%d: %d layers registered.",
+                gpu_idx,
+                registered_layers,
+            )
+
         self._gpu_decode_store = store
 
         # Enable per-component timing if KRASIS_DECODE_TIMING=1
@@ -4905,6 +5825,12 @@ class KrasisModel:
             moe_intermediate_size=self.cfg.moe_intermediate_size,
             shared_expert_intermediate_size=self.cfg.effective_shared_expert_intermediate,
         )
+
+        hqq_active = is_hqq_attention(self.quant_cfg.attention)
+        if hqq_active:
+            if not hasattr(self, '_aux_decode_weights_all'):
+                self._aux_decode_weights_all = []
+            self._aux_decode_weights = []
 
         # Embedding — not needed on aux (segment_skip_embedding=true), but register
         # a dummy so configure doesn't complain. Use primary embedding ptr (not accessed).
@@ -5501,6 +6427,16 @@ class KrasisModel:
         if not hasattr(self, '_aux_gpu_decode_stores'):
             self._aux_gpu_decode_stores = []
         self._aux_gpu_decode_stores.append(store)
+        if hqq_active:
+            registered_layers = self._register_hqq_attention_layers_on_store(
+                store, aux_device, self._aux_decode_weights
+            )
+            logger.info(
+                "HQQ aux execution descriptors restored after shared decode setup on cuda:%d: %d layers registered.",
+                gpu_idx,
+                registered_layers,
+            )
+
         self._aux_decode_weights_all.extend(self._aux_decode_weights)
         self._aux_shared_gate_refs_all.extend(self._aux_shared_gate_refs)
 
