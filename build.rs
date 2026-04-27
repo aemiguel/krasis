@@ -39,7 +39,11 @@ fn main() {
 }
 
 fn is_output_fresh(inputs: &[&str], outputs: &[&str]) -> bool {
-    if outputs.is_empty() || outputs.iter().any(|path| !std::path::Path::new(path).exists()) {
+    if outputs.is_empty()
+        || outputs
+            .iter()
+            .any(|path| !std::path::Path::new(path).exists())
+    {
         return false;
     }
 
@@ -84,6 +88,15 @@ fn run_command_with_failure_output(
     Ok(output.status)
 }
 
+fn nvcc_host_compiler_args() -> Vec<String> {
+    match std::env::var("KRASIS_NVCC_CCBIN") {
+        Ok(path) if !path.trim().is_empty() => {
+            vec!["-ccbin".to_string(), path]
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn vendor_python_sidecar(so_path: &str) {
     let src = std::path::Path::new(so_path);
     if !src.exists() {
@@ -96,7 +109,10 @@ fn vendor_python_sidecar(so_path: &str) {
     };
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let dst = std::path::Path::new(&manifest_dir).join("python").join("krasis").join(name);
+    let dst = std::path::Path::new(&manifest_dir)
+        .join("python")
+        .join("krasis")
+        .join(name);
     if let Some(parent) = dst.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             println!(
@@ -125,7 +141,10 @@ fn vendor_python_sidecar(so_path: &str) {
     };
 
     if !should_copy {
-        println!("cargo:warning=Vendored sidecar already current at {}", dst.display());
+        println!(
+            "cargo:warning=Vendored sidecar already current at {}",
+            dst.display()
+        );
         return;
     }
 
@@ -169,17 +188,19 @@ fn compile_cuda_kernels() {
     }
 
     // Compile .cu to .ptx targeting sm_80 (works on Ampere, Ada, Hopper)
-    let status = std::process::Command::new(&nvcc)
-        .args([
-            "-ptx",
-            "-allow-unsupported-compiler",
-            "-arch=sm_80",
-            "-O3",
-            "--use_fast_math",
-            "-o", &ptx_path,
-            cu_src,
-        ])
-        .status();
+    let mut cmd = std::process::Command::new(&nvcc);
+    cmd.args([
+        "-ptx",
+        "-allow-unsupported-compiler",
+        "-arch=sm_80",
+        "-O3",
+        "--use_fast_math",
+        "-o",
+        &ptx_path,
+        cu_src,
+    ])
+    .args(nvcc_host_compiler_args());
+    let status = cmd.status();
 
     match status {
         Ok(s) if s.success() => {
@@ -220,17 +241,19 @@ fn compile_prefill_kernels() {
         return;
     }
 
-    let status = std::process::Command::new(&nvcc)
-        .args([
-            "-ptx",
-            "-allow-unsupported-compiler",
-            "-arch=sm_80",
-            "-O3",
-            "--use_fast_math",
-            "-o", &ptx_path,
-            cu_src,
-        ])
-        .status();
+    let mut cmd = std::process::Command::new(&nvcc);
+    cmd.args([
+        "-ptx",
+        "-allow-unsupported-compiler",
+        "-arch=sm_80",
+        "-O3",
+        "--use_fast_math",
+        "-o",
+        &ptx_path,
+        cu_src,
+    ])
+    .args(nvcc_host_compiler_args());
+    let status = cmd.status();
 
     match status {
         Ok(s) if s.success() => {
@@ -284,7 +307,10 @@ fn compile_marlin_kernels() {
     let obj_moe = format!("{out_dir}/marlin_moe_vendor.o");
     let so_path = format!("{out_dir}/libkrasis_marlin.so");
 
-    if is_output_fresh(tracked_inputs.as_slice(), &[&obj_regular, &obj_moe, &so_path]) {
+    if is_output_fresh(
+        tracked_inputs.as_slice(),
+        &[&obj_regular, &obj_moe, &so_path],
+    ) {
         println!("cargo:rustc-cfg=has_marlin_kernels");
         println!("cargo:warning=Reusing cached vendored Marlin kernels at {so_path}");
         vendor_python_sidecar(&so_path);
@@ -294,18 +320,22 @@ fn compile_marlin_kernels() {
     let common_args = [
         "--expt-relaxed-constexpr",
         "-allow-unsupported-compiler",
-        "-Xcompiler", "-fPIC",
+        "-Xcompiler",
+        "-fPIC",
         "-arch=sm_80",
         "-O3",
         "--use_fast_math",
-        "-I", marlin_dir,
+        "-I",
+        marlin_dir,
     ];
 
     // Compile regular Marlin
     let mut cmd = std::process::Command::new(&nvcc);
     cmd.arg("-c")
-        .arg("-o").arg(&obj_regular)
+        .arg("-o")
+        .arg(&obj_regular)
         .args(&common_args)
+        .args(nvcc_host_compiler_args())
         .arg(&src_regular);
     let status = run_command_with_failure_output(cmd, "nvcc regular Marlin compile");
 
@@ -324,8 +354,10 @@ fn compile_marlin_kernels() {
     // Compile MoE Marlin
     let mut cmd = std::process::Command::new(&nvcc);
     cmd.arg("-c")
-        .arg("-o").arg(&obj_moe)
+        .arg("-o")
+        .arg(&obj_moe)
         .args(&common_args)
+        .args(nvcc_host_compiler_args())
         .arg(&src_moe);
     let status = run_command_with_failure_output(cmd, "nvcc MoE Marlin compile");
 
@@ -344,7 +376,8 @@ fn compile_marlin_kernels() {
     // Link into shared library
     let status = std::process::Command::new(&nvcc)
         .arg("-shared")
-        .arg("-o").arg(&so_path)
+        .arg("-o")
+        .arg(&so_path)
         .arg(&obj_regular)
         .arg(&obj_moe)
         .arg("-Wno-deprecated-gpu-targets")
@@ -426,7 +459,8 @@ fn compile_flash_attn_kernels() {
         "--expt-relaxed-constexpr".to_string(),
         "--expt-extended-lambda".to_string(),
         "-allow-unsupported-compiler".to_string(),
-        "-Xcompiler".to_string(), "-fPIC".to_string(),
+        "-Xcompiler".to_string(),
+        "-fPIC".to_string(),
         "-arch=sm_80".to_string(),
         "-O3".to_string(),
         "--use_fast_math".to_string(),
@@ -496,8 +530,10 @@ fn compile_flash_attn_kernels() {
 
         let mut cmd = std::process::Command::new(&nvcc);
         cmd.arg("-c")
-            .arg("-o").arg(&obj_path)
+            .arg("-o")
+            .arg(&obj_path)
             .args(&common_args)
+            .args(nvcc_host_compiler_args())
             .arg(&src_path);
         let status =
             run_command_with_failure_output(cmd, &format!("nvcc FlashAttention compile {cu_file}"));
@@ -519,8 +555,7 @@ fn compile_flash_attn_kernels() {
 
     // Link all .o files into shared library
     let mut link_cmd = std::process::Command::new(&nvcc);
-    link_cmd.arg("-shared")
-        .arg("-o").arg(&so_path);
+    link_cmd.arg("-shared").arg("-o").arg(&so_path);
     for obj in &obj_files {
         link_cmd.arg(obj);
     }

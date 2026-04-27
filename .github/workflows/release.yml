@@ -35,6 +35,14 @@ jobs:
                 dnf install -y --nogpgcheck cuda-nvcc-12-6 cuda-cudart-devel-12-6 cuda-driver-devel-12-6 2>/dev/null || true
               ls -la /usr/local/cuda-12.6/bin/nvcc 2>/dev/null && echo "nvcc installed OK" || echo "WARNING: nvcc install failed"
             fi
+            yum install -y gcc-toolset-13-gcc-c++ 2>/dev/null || dnf install -y gcc-toolset-13-gcc-c++ 2>/dev/null || true
+            export KRASIS_NVCC_CCBIN="/opt/rh/gcc-toolset-13/root/usr/bin/g++"
+            if [ ! -x "$KRASIS_NVCC_CCBIN" ]; then
+              echo "ERROR: required release NVCC host compiler not found: $KRASIS_NVCC_CCBIN" >&2
+              find /opt/rh -path '*/bin/g++' -print 2>/dev/null || true
+              exit 1
+            fi
+            "$KRASIS_NVCC_CCBIN" --version | head -n 1
             if [ ! -f /usr/local/cuda-12.6/targets/x86_64-linux/lib/stubs/libcuda.so ] && \
                [ ! -f /usr/local/cuda-12.6/lib64/stubs/libcuda.so ]; then
               yum install -y --nogpgcheck cuda-driver-devel-12-6 2>/dev/null || \
@@ -50,7 +58,7 @@ jobs:
             # FLA source files import torch at module level but compilation only uses Triton.
             /opt/python/cp312-cp312/bin/pip install 'triton>=3.5.1,<3.6'
             /opt/python/cp312-cp312/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-            PATH="/usr/local/cuda-12.6/bin:$PATH" KRASIS_DEV_SCRIPT=1 KRASIS_FLA_CROSS_COMPILE=1 KRASIS_FLA_REQUIRE_ALL_ARCHS=1 \
+            PATH="/usr/local/cuda-12.6/bin:$PATH" KRASIS_DEV_SCRIPT=1 KRASIS_FLA_CROSS_COMPILE=1 KRASIS_FLA_REQUIRE_ALL_ARCHS=1 KRASIS_NVCC_CCBIN="$KRASIS_NVCC_CCBIN" \
               /opt/python/cp312-cp312/bin/python src/cuda/fla/compile_kernels.py \
               --output-dir /tmp/fla_build --arch 80 89 90 120
             mkdir -p python/krasis
@@ -60,7 +68,7 @@ jobs:
             # the cargo build, after maturin has already collected Python
             # package data. Prebuild once here so they are present before
             # maturin packages each wheel.
-            PATH="/usr/local/cuda-12.6/bin:$PATH" cargo build --release --features pyo3/extension-module,cuda
+            PATH="/usr/local/cuda-12.6/bin:$PATH" KRASIS_NVCC_CCBIN="$KRASIS_NVCC_CCBIN" cargo build --release --features pyo3/extension-module,cuda
             ls -la python/krasis/libkrasis_marlin.so python/krasis/libkrasis_flash_attn.so
 
       - name: Inject vendored sidecars into wheels

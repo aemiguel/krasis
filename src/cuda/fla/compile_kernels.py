@@ -611,10 +611,11 @@ def main():
         # Compile to .so
         so_name = f"libkrasis_fla_sm{arch}.so"
         so_path = arch_dir / so_name
+        ccbin = os.environ.get("KRASIS_NVCC_CCBIN", "/usr/bin/g++")
         compile_cmd = [
             nvcc, "-shared",
             "-allow-unsupported-compiler",
-            "-ccbin", "/usr/bin/g++",
+            "-ccbin", ccbin,
             "-o", str(so_path),
             "-Xcompiler", "-fPIC",
             "-Wno-deprecated-gpu-targets",
