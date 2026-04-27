@@ -62,6 +62,28 @@ fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
+fn run_command_with_failure_output(
+    mut cmd: std::process::Command,
+    label: &str,
+) -> Result<std::process::ExitStatus, std::io::Error> {
+    let output = cmd.output()?;
+    if !output.status.success() {
+        if !output.stdout.is_empty() {
+            println!(
+                "cargo:warning={label} stdout:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        if !output.stderr.is_empty() {
+            println!(
+                "cargo:warning={label} stderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    Ok(output.status)
+}
+
 fn vendor_python_sidecar(so_path: &str) {
     let src = std::path::Path::new(so_path);
     if !src.exists() {
@@ -283,12 +305,12 @@ fn compile_marlin_kernels() {
     ];
 
     // Compile regular Marlin
-    let status = std::process::Command::new(&nvcc)
-        .arg("-c")
+    let mut cmd = std::process::Command::new(&nvcc);
+    cmd.arg("-c")
         .arg("-o").arg(&obj_regular)
         .args(&common_args)
-        .arg(&src_regular)
-        .status();
+        .arg(&src_regular);
+    let status = run_command_with_failure_output(cmd, "nvcc regular Marlin compile");
 
     match status {
         Ok(s) if s.success() => {}
@@ -303,12 +325,12 @@ fn compile_marlin_kernels() {
     }
 
     // Compile MoE Marlin
-    let status = std::process::Command::new(&nvcc)
-        .arg("-c")
+    let mut cmd = std::process::Command::new(&nvcc);
+    cmd.arg("-c")
         .arg("-o").arg(&obj_moe)
         .args(&common_args)
-        .arg(&src_moe)
-        .status();
+        .arg(&src_moe);
+    let status = run_command_with_failure_output(cmd, "nvcc MoE Marlin compile");
 
     match status {
         Ok(s) if s.success() => {}
@@ -476,12 +498,13 @@ fn compile_flash_attn_kernels() {
 
         println!("cargo:rerun-if-changed={src_path}");
 
-        let status = std::process::Command::new(&nvcc)
-            .arg("-c")
+        let mut cmd = std::process::Command::new(&nvcc);
+        cmd.arg("-c")
             .arg("-o").arg(&obj_path)
             .args(&common_args)
-            .arg(&src_path)
-            .status();
+            .arg(&src_path);
+        let status =
+            run_command_with_failure_output(cmd, &format!("nvcc FlashAttention compile {cu_file}"));
 
         match status {
             Ok(s) if s.success() => {
