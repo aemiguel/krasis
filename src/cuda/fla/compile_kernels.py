@@ -546,6 +546,15 @@ def main():
             cuda_stub_lib = stub_lib
             break
 
+    if os.environ.get("KRASIS_FLA_CROSS_COMPILE") == "1" and cuda_stub_lib is None:
+        print(
+            "ERROR: CUDA driver stub libcuda.so not found. Install the CUDA "
+            "driver development package, e.g. cuda-driver-devel-12-6, before "
+            "cross-compiling FLA sidecars.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Compile for each architecture
     for arch in archs:
         print(f"\n{'='*60}")

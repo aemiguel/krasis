@@ -24,15 +24,27 @@ jobs:
             # numactl for libnuma
             yum install -y numactl-devel 2>/dev/null || dnf install -y numactl-devel 2>/dev/null || apt-get install -y libnuma-dev 2>/dev/null || true
             # CUDA toolkit for nvcc (decode kernels compiled to PTX at build time)
+            # and libcuda.so stubs (FLA sidecars link against the CUDA driver API,
+            # but release CI has no real GPU driver installed).
             # build.rs checks /usr/local/cuda-12.6/bin/nvcc directly
             if [ ! -f /usr/local/cuda-12.6/bin/nvcc ]; then
               yum install -y yum-utils 2>/dev/null || true
               yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo 2>/dev/null || \
                 dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo 2>/dev/null || true
-              yum install -y --nogpgcheck cuda-nvcc-12-6 cuda-cudart-devel-12-6 2>/dev/null || \
-                dnf install -y --nogpgcheck cuda-nvcc-12-6 cuda-cudart-devel-12-6 2>/dev/null || true
+              yum install -y --nogpgcheck cuda-nvcc-12-6 cuda-cudart-devel-12-6 cuda-driver-devel-12-6 2>/dev/null || \
+                dnf install -y --nogpgcheck cuda-nvcc-12-6 cuda-cudart-devel-12-6 cuda-driver-devel-12-6 2>/dev/null || true
               ls -la /usr/local/cuda-12.6/bin/nvcc 2>/dev/null && echo "nvcc installed OK" || echo "WARNING: nvcc install failed"
             fi
+            if [ ! -f /usr/local/cuda-12.6/targets/x86_64-linux/lib/stubs/libcuda.so ] && \
+               [ ! -f /usr/local/cuda-12.6/lib64/stubs/libcuda.so ]; then
+              yum install -y --nogpgcheck cuda-driver-devel-12-6 2>/dev/null || \
+                dnf install -y --nogpgcheck cuda-driver-devel-12-6 2>/dev/null || true
+            fi
+            find /usr/local/cuda-12.6 -path '*/stubs/libcuda.so' -print -quit | grep -q . || {
+              echo "ERROR: CUDA driver stub libcuda.so not found under /usr/local/cuda-12.6" >&2
+              find /usr/local/cuda-12.6 -maxdepth 5 -name 'libcuda.so*' -print 2>/dev/null || true
+              exit 1
+            }
             # FLA kernel cross-compilation (no GPU needed — uses Triton cross-compile)
             # CPU-only torch keeps download small (~200MB vs ~2.7GB for CUDA torch).
             # FLA source files import torch at module level but compilation only uses Triton.
