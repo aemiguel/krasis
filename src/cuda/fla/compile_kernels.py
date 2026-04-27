@@ -295,18 +295,18 @@ def compile_kernel(spec: dict, h_value: int | None, arch: int):
                 return _offline_benchmarker
 
         offline_driver = _OfflineCompileDriver(target)
-        prev_active = triton_driver.active
-        prev_default = triton_driver.default
+        prev_active = getattr(triton_driver, "_active", None)
+        prev_default = getattr(triton_driver, "_default", None)
         prev_create_driver = getattr(triton_driver_module, "_create_driver")
         triton_driver_module._create_driver = lambda: offline_driver
-        triton_driver.default = offline_driver
-        triton_driver.active = offline_driver
+        triton_driver._default = offline_driver
+        triton_driver.set_active(offline_driver)
         try:
             yield
         finally:
             triton_driver_module._create_driver = prev_create_driver
-            triton_driver.default = prev_default
-            triton_driver.active = prev_active
+            triton_driver._default = prev_default
+            triton_driver._active = prev_active
 
     with offline_compile_driver():
         mod_path, kernel_name = spec["import"]
