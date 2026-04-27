@@ -1,0 +1,263 @@
+{
+  "cache": {
+    "sidecar_dir": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bh_qcn_qkvz_g12_int8_exception/int8_exception",
+    "sidecar_manifest_path": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bh_qcn_qkvz_g12_int8_exception/int8_exception/sidecar_manifest.json",
+    "target_cache_profile": "selfcal_v1"
+  },
+  "complete": true,
+  "created_at": "2026-04-26T18:19:51Z",
+  "format": "krasis_hqq_int8_exception_manifest_write",
+  "format_version": 1,
+  "loadable_hqq_manifest": false,
+  "model_path": "/home/main/.krasis/models/Qwen3-Coder-Next",
+  "runtime_ready": true,
+  "sidecar_manifest": {
+    "artifacts": [
+      {
+        "decode_fma_per_token": 1572864,
+        "entries": [
+          {
+            "benefit_score": 0.05360580678097904,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 1664,
+            "group": 12,
+            "hqq_dequant_group_sha256": "5ab05140939a8d71aa55ceae0334bd3260fe45978ba33e0693815602b7cc3714",
+            "int8_dequant_group_sha256": "f3a656d1cf40b3952b46f08feed22e61ca0df88f86c8a69476967f65da15f83c",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 13552.001953125,
+                  "max_abs": 0.8374099731445312,
+                  "mean_abs": 0.0393880270421505,
+                  "rms": 0.057084374129772186,
+                  "samples": 28,
+                  "signed_sum": 987.0982055664062
+                },
+                "int8_exception": {
+                  "abs_sum": 881.3682250976562,
+                  "max_abs": 0.03711660951375961,
+                  "mean_abs": 0.0025616404600441456,
+                  "rms": 0.003478567348793149,
+                  "samples": 28,
+                  "signed_sum": 7.1606855392456055
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.0650360166819795,
+                  "abs_sum_reduction_fraction": 0.9349639833180206,
+                  "max_abs_ratio": 0.044323104219053215,
+                  "max_abs_reduction_fraction": 0.9556768957809468,
+                  "rms_ratio": 0.06093729504479077,
+                  "rms_reduction_fraction": 0.9390627049552093
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 9904.75390625,
+                  "max_abs": 0.6248627305030823,
+                  "mean_abs": 0.03663867712020874,
+                  "rms": 0.05236029624938965,
+                  "samples": 22,
+                  "signed_sum": 741.7349853515625
+                },
+                "int8_exception": {
+                  "abs_sum": 644.4849853515625,
+                  "max_abs": 0.03380236774682999,
+                  "mean_abs": 0.0023840146604925394,
+                  "rms": 0.003204526612535119,
+                  "samples": 22,
+                  "signed_sum": 4.093662261962891
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.06506824818180348,
+                  "abs_sum_reduction_fraction": 0.9349317518181965,
+                  "max_abs_ratio": 0.054095669491466415,
+                  "max_abs_reduction_fraction": 0.9459043305085336,
+                  "rms_ratio": 0.06120146068830681,
+                  "rms_reduction_fraction": 0.9387985393116932
+                }
+              }
+            },
+            "risk_score": 0.058968753422175835,
+            "row_count": 12288,
+            "source_group_sha256": "7957247c916581919b3cc6b1b72ac251754d92a235abf1139a8ae5d3f3082cbc",
+            "start_col": 1536,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          }
+        ],
+        "exception_group_count": 1,
+        "file": "layer_000_in_proj_qkvz_phase2bh_qcn_qkvz_g12_int8_exception_int8_exception.safetensors",
+        "hqq_artifact_file": "layer_000_in_proj_qkvz_hqq4.safetensors",
+        "hqq_artifact_sha256": "9e5f1b559f4fb0bc5d0c570e169b8ac31e5951ed248f140d7584a763d13f7b2b",
+        "layer": 0,
+        "metadata_bytes": 245760,
+        "row_group_count": 12288,
+        "sha256": "2f49fcbd76417c0ffa8e645f9a4a0d75287f8e0d1f6415737cc7b62c97a6cb3b",
+        "source_contract": {
+          "artifact_sha256": "9e5f1b559f4fb0bc5d0c570e169b8ac31e5951ed248f140d7584a763d13f7b2b",
+          "artifact_sha256_unavailable_reason": null,
+          "fallback_allowed": false,
+          "fused_vs_split": "direct_fused",
+          "layer": 0,
+          "missing_contract_fields": [],
+          "model_id": "Qwen3-Coder-Next",
+          "ready": true,
+          "recipe": "direct_fused_qkvz",
+          "reconstructed_source_sha256": "5138053ffe294b6ee8b6164b865e8308eac36314c4e4685e84940f7ba4beac16",
+          "reconstructed_source_sha256_unavailable_reason": null,
+          "reconstructed_source_shape": [
+            12288,
+            2048
+          ],
+          "resolver_kind": "qcn_model_layers_direct_fused",
+          "resolver_ready": true,
+          "resolver_unavailable_reason": null,
+          "row_column_layout": "direct source rows must already match cached qkvz row order; columns are axis-1 HQQ groups",
+          "source_dtypes": [
+            "BF16"
+          ],
+          "source_shape": [
+            12288,
+            2048
+          ],
+          "source_tensors": [
+            {
+              "dtype": "BF16",
+              "exists": true,
+              "name": "model.layers.0.linear_attn.in_proj_qkvz.weight",
+              "shape": [
+                12288,
+                2048
+              ],
+              "shard": "model-00001-of-00040.safetensors",
+              "source_file": "model-00001-of-00040.safetensors",
+              "source_path": "/home/main/.krasis/models/Qwen3-Coder-Next/model-00001-of-00040.safetensors",
+              "source_sha256": "5138053ffe294b6ee8b6164b865e8308eac36314c4e4685e84940f7ba4beac16",
+              "source_sha256_unavailable_reason": null
+            }
+          ],
+          "target_file": "layer_000_in_proj_qkvz_hqq4.safetensors",
+          "target_path": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5/layer_000_in_proj_qkvz_hqq4.safetensors",
+          "target_tensor": "in_proj_qkvz"
+        },
+        "source_contract_validation": {
+          "artifact_hash_valid": true,
+          "contract_embedded": true,
+          "generation_ready": true,
+          "resolver_valid": true,
+          "runtime_ready": false,
+          "runtime_ready_reason": "offline contract only; runtime sidecar enablement remains explicit and out of scope",
+          "shape_valid": true,
+          "source_hash_valid": true
+        },
+        "tensor": "in_proj_qkvz",
+        "weight_bytes": 1572864
+      }
+    ],
+    "cache": {
+      "sidecar_dir": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bh_qcn_qkvz_g12_int8_exception/int8_exception",
+      "sidecar_manifest_path": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bh_qcn_qkvz_g12_int8_exception/int8_exception/sidecar_manifest.json",
+      "target_cache_profile": "selfcal_v1"
+    },
+    "complete": true,
+    "created_at": "2026-04-26T18:19:51Z",
+    "decode_application_implemented": false,
+    "exception_semantics": "replace selected HQQ-dequantized BF16 blocks with per-output-row symmetric INT8 dequantized source values before existing prefill matmul",
+    "format": "krasis_hqq_selfcal_sidecar_manifest",
+    "format_version": 1,
+    "loadable_hqq_manifest": false,
+    "main_int4_path": "unchanged regular HQQ INT4",
+    "model_path": "/home/main/.krasis/models/Qwen3-Coder-Next",
+    "not_loadable_reason": "This is an explicit runtime sidecar manifest, not a calibrated HQQ cache manifest.",
+    "runtime_application_implemented": true,
+    "runtime_ready": true,
+    "selection": {
+      "group_filter": [
+        "0:in_proj_qkvz:12"
+      ],
+      "selected_groups": [
+        {
+          "group": 12,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        }
+      ],
+      "top_groups": null
+    },
+    "sidecar_mode": "int8_exception",
+    "source": {
+      "baseline_manifest_path": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5/manifest.json",
+      "baseline_manifest_sha256": "079c76e33c75e9e947e2e14e1760944930e37e52322b487bdeb8a1b40a8ba3b4",
+      "cache_profile": "baseline",
+      "int8_exception_candidates_path": "logs/manual/phase2bg_qcn_int8_exception_candidates_20260426.json",
+      "int8_exception_candidates_sha256": "6e2f8c6ced906e41aa3ed5e82e242ff4b2b498224a3d82f4b07f0c3fb0452d43"
+    },
+    "status": "experimental_int8_exception_manifest",
+    "summary": {
+      "artifact_count": 1,
+      "decode_fma_per_token": 1572864,
+      "exception_group_count": 1,
+      "row_group_count": 12288,
+      "sidecar_metadata_bytes": 245760,
+      "sidecar_total_bytes": 1818624,
+      "sidecar_weight_bytes": 1572864,
+      "source_contract": {
+        "artifact_hash_valid": 1,
+        "contract_embedded": 1,
+        "fallback_allowed": false,
+        "generation_ready": 1,
+        "resolver_valid": 1,
+        "runtime_enablement_changed": false,
+        "runtime_ready": 0,
+        "shape_valid": 1,
+        "source_hash_valid": 1,
+        "target_count": 1
+      }
+    },
+    "switchability": {
+      "fallback_to_baseline": false,
+      "runtime_enabled_by_default": false,
+      "selection": "loaded only when explicitly referenced by hqq_sidecar_manifest"
+    },
+    "variant_name": "phase2bh_qcn_qkvz_g12_int8_exception"
+  },
+  "source": {
+    "baseline_manifest_path": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5/manifest.json",
+    "baseline_manifest_sha256": "079c76e33c75e9e947e2e14e1760944930e37e52322b487bdeb8a1b40a8ba3b4",
+    "cache_profile": "baseline",
+    "int8_exception_candidates_path": "logs/manual/phase2bg_qcn_int8_exception_candidates_20260426.json",
+    "int8_exception_candidates_sha256": "6e2f8c6ced906e41aa3ed5e82e242ff4b2b498224a3d82f4b07f0c3fb0452d43"
+  },
+  "status": "int8_exception_manifest_written",
+  "summary": {
+    "artifact_count": 1,
+    "decode_fma_per_token": 1572864,
+    "exception_group_count": 1,
+    "row_group_count": 12288,
+    "sidecar_metadata_bytes": 245760,
+    "sidecar_total_bytes": 1818624,
+    "sidecar_weight_bytes": 1572864,
+    "source_contract": {
+      "artifact_hash_valid": 1,
+      "contract_embedded": 1,
+      "fallback_allowed": false,
+      "generation_ready": 1,
+      "resolver_valid": 1,
+      "runtime_enablement_changed": false,
+      "runtime_ready": 0,
+      "shape_valid": 1,
+      "source_hash_valid": 1,
+      "target_count": 1
+    }
+  },
+  "variant_name": "phase2bh_qcn_qkvz_g12_int8_exception"
+}

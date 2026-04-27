@@ -179,6 +179,40 @@ def list_available_references(script_dir: str) -> List[str]:
     return sorted(os.listdir(ref_base))
 
 
+def reference_runtime_name(ref_data: Dict[str, Any]) -> str:
+    """Return the declared producer runtime for a stored reference artifact."""
+    contract = ref_data.get("contract")
+    if isinstance(contract, dict):
+        runtime = contract.get("runtime")
+        if isinstance(runtime, dict) and runtime.get("name"):
+            return str(runtime["name"]).lower()
+    runtime = ref_data.get("runtime")
+    return str(runtime).lower() if runtime else "unknown"
+
+
+def require_non_archived_reference(ref_data: Dict[str, Any], ref_path: str) -> None:
+    """Block archived HF artifacts while allowing future non-HF witness artifacts."""
+    runtime_name = reference_runtime_name(ref_data)
+    if runtime_name != "transformers":
+        return
+    if os.environ.get("KRASIS_ALLOW_ARCHIVED_HF_REFERENCE") == "1":
+        print(
+            "WARNING: Using archived HF/Transformers reference artifact because "
+            "KRASIS_ALLOW_ARCHIVED_HF_REFERENCE=1 is set.",
+            file=sys.stderr,
+        )
+        return
+    print("ERROR: Reference artifact is HF/Transformers-backed and archived.", file=sys.stderr)
+    print(f"  artifact: {ref_path}", file=sys.stderr)
+    print("  Use a llama-witness/non-HF reference artifact for normal comparison.", file=sys.stderr)
+    print(
+        "  For forensic reruns only, set KRASIS_ALLOW_ARCHIVED_HF_REFERENCE=1 "
+        "and document the reason in krasis-internal.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def load_tokenizer_for_config(conf_path: str):
     cfg = parse_config(conf_path)
     model_path = os.path.expanduser(cfg.get("CFG_MODEL_PATH", ""))
@@ -233,7 +267,7 @@ def start_server(conf_path: str, script_dir: str) -> Tuple[subprocess.Popen, int
     # Redirect server output to a file instead of PIPE to avoid pipe-buffer
     # deadlock: the server writes diagnostic output to stdout/stderr, and if
     # the pipe buffer fills up (64KB) and nobody drains it, the server blocks.
-    log_dir = os.path.join(script_dir, "logs")
+    log_dir = os.environ.get("KRASIS_RUN_DIR") or os.path.join(script_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
     server_log_path = os.path.join(log_dir, "reference_test_server.log")
     server_log_file = open(server_log_path, "w")
@@ -246,7 +280,37 @@ def start_server(conf_path: str, script_dir: str) -> Tuple[subprocess.Popen, int
         cwd=script_dir,
     )
     proc._server_log_file = server_log_file  # keep reference to close later
+    proc._server_log_path = server_log_path
     return proc, port
+
+
+def write_reference_case_boundary(
+    proc: Optional[subprocess.Popen],
+    *,
+    phase: str,
+    conv_idx: int,
+    turn_idx: int,
+    prompt_sequence_index: int,
+    input_token_ids: List[int],
+    prompt_text: str,
+) -> None:
+    """Write non-production case span markers into the preserved server log."""
+    if proc is None:
+        return
+    server_log_file = getattr(proc, "_server_log_file", None)
+    if server_log_file is None or server_log_file.closed:
+        return
+    trace = build_trace_input_row_map(conv_idx, turn_idx, input_token_ids, prompt_text)
+    positions = ",".join(str(pos) for pos in trace.get("positions", []))
+    prompt_prefix = str(trace.get("prompt_prefix", "")).replace("\t", " ").replace("\n", "\\n")
+    server_log_file.write(
+        "[KRASIS-TRACE] event=reference_case_boundary "
+        f"phase={phase} case_key={trace['case_key']} conv_idx={conv_idx} "
+        f"turn={turn_idx + 1} prompt_sequence_index={prompt_sequence_index} "
+        f"input_tokens_count={len(input_token_ids)} positions=[{positions}] "
+        f"prompt_prefix={json.dumps(prompt_prefix, ensure_ascii=True)}\n"
+    )
+    server_log_file.flush()
 
 
 def wait_for_server(port: int, timeout: int = 600) -> bool:
@@ -316,6 +380,64 @@ def call_reference_test(port: int, input_token_ids: List[int], max_tokens: int,
         raise RuntimeError(f"reference_test endpoint returned {resp.status}: {body}")
 
     return json.loads(body)
+
+
+def build_trace_input_row_map(
+    conv_idx: int,
+    turn_idx: int,
+    input_token_ids: List[int],
+    prompt_text: str,
+) -> Dict[str, Any]:
+    """Case mapping for trace-gated layer-0 input-row captures."""
+    final_pos = max(len(input_token_ids) - 1, 0)
+    selected_positions = selected_trace_input_row_positions(len(input_token_ids))
+    return {
+        "case_key": f"{conv_idx}:{turn_idx}",
+        "conv_idx": conv_idx,
+        "turn_idx": turn_idx,
+        "layer": 0,
+        "tensor": "la_input_row_for_qkvz_last",
+        "requested_layers": os.environ.get("KRASIS_TRACE_INPUT_ROW_LAYERS", "0"),
+        "requested_tensors": os.environ.get(
+            "KRASIS_TRACE_INPUT_ROW_TENSORS",
+            "la_input_row_for_qkvz_last",
+        ),
+        "pos": final_pos,
+        "positions": selected_positions,
+        "input_tokens_count": len(input_token_ids),
+        "prompt_prefix": prompt_text[:120],
+    }
+
+
+def selected_trace_input_row_positions(input_tokens_count: int) -> List[int]:
+    """Absolute positions requested by KRASIS_TRACE_INPUT_ROW_POSITIONS for this case."""
+    if input_tokens_count <= 0:
+        return []
+    raw = os.environ.get("KRASIS_TRACE_INPUT_ROW_POSITIONS")
+    if not raw:
+        target = os.environ.get("KRASIS_TRACE_TARGET_POS")
+        if target is None:
+            return [input_tokens_count - 1]
+        try:
+            pos = int(target.strip())
+        except ValueError:
+            return []
+        return [pos] if 0 <= pos < input_tokens_count else []
+    raw = raw.strip()
+    if raw.lower() == "all" or raw == "*":
+        return list(range(input_tokens_count))
+    positions = []
+    seen = set()
+    for part in raw.split(","):
+        try:
+            pos = int(part.strip())
+        except ValueError:
+            continue
+        if 0 <= pos < input_tokens_count and pos not in seen:
+            seen.add(pos)
+            positions.append(pos)
+    positions.sort()
+    return positions
 
 
 def call_prefill_logits(port: int, input_token_ids: List[int], top_k: int = 10,
@@ -412,6 +534,7 @@ def compute_metrics(ref_turn: Dict, engine_result: Dict) -> Dict:
         containment_total += 1
 
     containment_rate = containment_hits / containment_total if containment_total > 0 else 0.0
+    first_token_diagnostic = compute_first_token_diagnostic(ref_per_token, our_per_token)
 
     # 4. Divergence info
     divergence_pos = match_run if match_run < min_len else None
@@ -484,11 +607,121 @@ def compute_metrics(ref_turn: Dict, engine_result: Dict) -> Dict:
         "containment_rate": containment_rate,
         "containment_hits": containment_hits,
         "containment_total": containment_total,
+        "first_token_diagnostic": first_token_diagnostic,
         "divergence_pos": divergence_pos,
         "divergence_info": divergence_info,
         "token_table": token_table,
         "ref_text": ref_turn.get("text", "")[:500],
         "our_text": engine_result.get("text", "")[:500],
+    }
+
+
+def _entry_logprob(entry: Dict[str, Any]) -> Optional[float]:
+    raw = entry.get("log_prob", entry.get("logprob"))
+    return float(raw) if isinstance(raw, (int, float)) else None
+
+
+def _normalize_topk(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized = []
+    for rank, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        token_id = entry.get("token_id")
+        if token_id is None:
+            continue
+        normalized.append({
+            "rank": rank,
+            "token_id": token_id,
+            "logprob": _entry_logprob(entry),
+        })
+    return normalized
+
+
+def _top1_top2_margin(entries: List[Dict[str, Any]]) -> Optional[float]:
+    normalized = _normalize_topk(entries)
+    if len(normalized) < 2:
+        return None
+    first = normalized[0].get("logprob")
+    second = normalized[1].get("logprob")
+    if first is None or second is None:
+        return None
+    return first - second
+
+
+def compute_first_token_diagnostic(ref_per_token: List[Dict], our_per_token: List[Dict]) -> Dict[str, Any]:
+    """Compare the first recorded decision distribution when both sides expose it."""
+    if not ref_per_token or not our_per_token:
+        return {
+            "available": False,
+            "reason": "missing per_token_data",
+        }
+
+    ref0 = ref_per_token[0]
+    our0 = our_per_token[0]
+    ref_top = ref0.get("top_k", []) if isinstance(ref0, dict) else []
+    our_top = our0.get("top_k", []) if isinstance(our0, dict) else []
+    ref_top_k = _normalize_topk(ref_top)
+    our_top_k = _normalize_topk(our_top)
+    ref_ids = [entry.get("token_id") for entry in ref_top if isinstance(entry, dict)]
+    our_ids = [entry.get("token_id") for entry in our_top if isinstance(entry, dict)]
+    ref_map = {entry.get("token_id"): _entry_logprob(entry) for entry in ref_top if isinstance(entry, dict)}
+    our_map = {entry.get("token_id"): _entry_logprob(entry) for entry in our_top if isinstance(entry, dict)}
+    overlap_ids = [tid for tid in ref_ids if tid in set(our_ids)]
+    common_logprob_deltas = []
+    for tid in overlap_ids:
+        ref_lp = ref_map.get(tid)
+        our_lp = our_map.get(tid)
+        if ref_lp is None or our_lp is None:
+            continue
+        common_logprob_deltas.append({
+            "token_id": tid,
+            "ref_logprob": ref_lp,
+            "our_logprob": our_lp,
+            "abs_delta": abs(ref_lp - our_lp),
+        })
+    logprob_deltas = [entry["abs_delta"] for entry in common_logprob_deltas]
+    ref_token = ref0.get("token_id")
+    our_token = our0.get("token_id")
+    ref_token_our_rank = our_ids.index(ref_token) + 1 if ref_token in our_ids else None
+    ref_token_ref_rank = ref_ids.index(ref_token) + 1 if ref_token in ref_ids else None
+    our_token_our_rank = our_ids.index(our_token) + 1 if our_token in our_ids else None
+    our_token_ref_rank = ref_ids.index(our_token) + 1 if our_token in ref_ids else None
+    selected_ref_lp = _entry_logprob(ref0)
+    selected_our_lp = _entry_logprob(our0)
+    return {
+        "available": True,
+        "ref_first_token": ref_token,
+        "our_first_token": our_token,
+        "first_token_match": ref_token == our_token,
+        "ref_top_ids": ref_ids,
+        "our_top_ids": our_ids,
+        "ref_top_k": ref_top_k,
+        "our_top_k": our_top_k,
+        "top_ids_exact": ref_ids == our_ids,
+        "top_overlap_count": len(overlap_ids),
+        "top_overlap_ids": overlap_ids,
+        "ref_top1_top2_logprob_margin": _top1_top2_margin(ref_top),
+        "our_top1_top2_logprob_margin": _top1_top2_margin(our_top),
+        "ref_token_rank_in_ref_topk": ref_token_ref_rank,
+        "ref_token_rank_in_our_topk": ref_token_our_rank,
+        "our_token_rank_in_our_topk": our_token_our_rank,
+        "our_token_rank_in_ref_topk": our_token_ref_rank,
+        "selected_token_stayed_rank1": (
+            ref_token == our_token
+            and ref_token_ref_rank == 1
+            and our_token_our_rank == 1
+        ),
+        "selected_ref_logprob": selected_ref_lp,
+        "selected_our_logprob": selected_our_lp,
+        "selected_logprob_delta": (
+            abs(selected_ref_lp - selected_our_lp)
+            if selected_ref_lp is not None and selected_our_lp is not None else None
+        ),
+        "common_logprob_deltas": common_logprob_deltas,
+        "mean_common_logprob_delta": (
+            sum(logprob_deltas) / len(logprob_deltas) if logprob_deltas else None
+        ),
+        "max_common_logprob_delta": max(logprob_deltas) if logprob_deltas else None,
     }
 
 
@@ -599,6 +832,16 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
                 if len(turns) > 1:
                     turn_label += f" Turn {turn_idx+1}"
                 print(f"  {turn_label}: {n_input} input tokens, prompt: {prompt_text[:60]}...")
+                prompt_sequence_index = len(prompt_results)
+                write_reference_case_boundary(
+                    proc,
+                    phase="start",
+                    conv_idx=conv_idx,
+                    turn_idx=turn_idx,
+                    prompt_sequence_index=prompt_sequence_index,
+                    input_token_ids=input_token_ids,
+                    prompt_text=prompt_text,
+                )
 
                 try:
                     result = call_reference_test(
@@ -615,6 +858,9 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
                         "turn": turn_idx + 1,
                         "multi_turn": len(turns) > 1,
                         "prompt": prompt_text,
+                        "trace_input_row": build_trace_input_row_map(
+                            conv_idx, turn_idx, input_token_ids, prompt_text
+                        ),
                         "verdict": "FAIL",
                         "metrics": {
                             "first_match": False, "match_run": 0,
@@ -632,6 +878,15 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
                         },
                         "timing": None,
                     })
+                    write_reference_case_boundary(
+                        proc,
+                        phase="error",
+                        conv_idx=conv_idx,
+                        turn_idx=turn_idx,
+                        prompt_sequence_index=prompt_sequence_index,
+                        input_token_ids=input_token_ids,
+                        prompt_text=prompt_text,
+                    )
                     continue
 
                 metrics = compute_metrics(turn, result)
@@ -652,12 +907,24 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
 
                 verdict = judge_prompt(metrics, prefill_metrics, has_linear_attention=has_la)
                 timing = result.get("timing")
+                write_reference_case_boundary(
+                    proc,
+                    phase="end",
+                    conv_idx=conv_idx,
+                    turn_idx=turn_idx,
+                    prompt_sequence_index=prompt_sequence_index,
+                    input_token_ids=input_token_ids,
+                    prompt_text=prompt_text,
+                )
 
                 prompt_results.append({
                     "conv_idx": conv_idx,
                     "turn": turn_idx + 1,
                     "multi_turn": len(turns) > 1,
                     "prompt": prompt_text,
+                    "trace_input_row": build_trace_input_row_map(
+                        conv_idx, turn_idx, input_token_ids, prompt_text
+                    ),
                     "verdict": verdict,
                     "metrics": metrics,
                     "prefill_metrics": prefill_metrics,
@@ -676,6 +943,14 @@ def run_config_test(conf_path: str, ref_data: Dict, script_dir: str,
                 print(f"    {verdict}: first={fm}, run={metrics['match_run']}/{metrics['ref_tokens_count']}, "
                       f"prefill={prefill_text}, "
                       f"decode-top-k={100*metrics['containment_rate']:.0f}%")
+                diag = metrics.get("first_token_diagnostic", {})
+                if diag.get("available"):
+                    print(
+                        "    first-token diagnostic: "
+                        f"top_ids_exact={diag.get('top_ids_exact')} "
+                        f"overlap={diag.get('top_overlap_count')}/{len(diag.get('ref_top_ids', []))} "
+                        f"selected_logprob_delta={diag.get('selected_logprob_delta')}"
+                    )
 
     finally:
         if proc:
@@ -1534,6 +1809,8 @@ def main():
         with open(ref_path) as f:
             ref_data = json.load(f)
 
+        require_non_archived_reference(ref_data, ref_path)
+
         if ref_data.get("format_version", 0) < 3:
             print(f"ERROR: Reference data format_version must be >= 3, got {ref_data.get('format_version')}", file=sys.stderr)
             sys.exit(1)
@@ -1701,6 +1978,8 @@ def main():
         with open(ref_path) as f:
             ref_data = json.load(f)
 
+        require_non_archived_reference(ref_data, ref_path)
+
         if ref_data.get("format_version", 0) < 3:
             print(f"ERROR: Reference data format_version must be >= 3, got {ref_data.get('format_version')}", file=sys.stderr)
             sys.exit(1)
@@ -1766,8 +2045,13 @@ def main():
                     except Exception as e:
                         print(f"    ERROR: {e}", file=sys.stderr)
                         prompt_results.append({
-                            "conv_idx": conv_idx, "turn": turn_idx + 1,
-                            "multi_turn": len(turns) > 1, "prompt": prompt_text,
+                            "conv_idx": conv_idx,
+                            "turn": turn_idx + 1,
+                            "multi_turn": len(turns) > 1,
+                            "prompt": prompt_text,
+                            "trace_input_row": build_trace_input_row_map(
+                                conv_idx, turn_idx, input_token_ids, prompt_text
+                            ),
                             "verdict": "FAIL",
                             "metrics": {
                                 "first_match": False, "match_run": 0,
@@ -1805,10 +2089,17 @@ def main():
                     timing = result.get("timing")
 
                     prompt_results.append({
-                        "conv_idx": conv_idx, "turn": turn_idx + 1,
-                        "multi_turn": len(turns) > 1, "prompt": prompt_text,
-                        "verdict": verdict, "metrics": metrics,
-                        "prefill_metrics": prefill_metrics, "timing": timing,
+                        "conv_idx": conv_idx,
+                        "turn": turn_idx + 1,
+                        "multi_turn": len(turns) > 1,
+                        "prompt": prompt_text,
+                        "trace_input_row": build_trace_input_row_map(
+                            conv_idx, turn_idx, input_token_ids, prompt_text
+                        ),
+                        "verdict": verdict,
+                        "metrics": metrics,
+                        "prefill_metrics": prefill_metrics,
+                        "timing": timing,
                     })
 
                     fm = "MATCH" if metrics["first_match"] else "MISS"
@@ -1860,6 +2151,15 @@ def main():
 
         with open(report_path, "w") as f:
             f.write(html)
+        summary_path = os.path.join(get_run_dir("reference-test"), "reference_test_summary.json")
+        with open(summary_path, "w") as f:
+            json.dump({
+                "model": model_name,
+                "config": args.config,
+                "reference_path": ref_path,
+                "overall": overall,
+                "prompt_results": prompt_results,
+            }, f, indent=2)
 
         # Print summary
         print()
@@ -1893,6 +2193,7 @@ def main():
         print(f"  Avg decode top-k: {100*avg_cont:.1f}%")
         print(f"  Duration: {total_duration:.1f}s")
         print(f"  Report: {report_path}")
+        print(f"  Summary JSON: {summary_path}")
         print()
 
         if overall == "FAIL":

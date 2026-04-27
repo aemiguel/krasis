@@ -18,6 +18,11 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from krasis.attention_backend import ATTENTION_QUANT_CHOICES, attention_quant_label
+from krasis.config import (
+    cache_dir_for_model,
+    HQQ_CACHE_PROFILE_BASELINE,
+    HQQ_CACHE_PROFILE_CHOICES,
+)
 from krasis.config import GPU_EXPERT_INT4_CALIB_CHOICES
 
 # Terminal handling imports — graceful fallback for non-Unix
@@ -44,6 +49,9 @@ NC = "\033[0m"  # reset
 
 import re
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+INTERACTIVE_ATTENTION_QUANT_CHOICES = ("hqq8", "hqq4")
 
 
 def _visible_len(s: str) -> int:
@@ -338,7 +346,8 @@ CONFIG_KEYS = [
     "MODEL_PATH", "CFG_SELECTED_GPUS", "CFG_PP_PARTITION", "CFG_LAYER_GROUP_SIZE",
     "CFG_KV_CACHE_MB", "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS", "CFG_CPU_EXPERT_BITS",
     "CFG_GPU_EXPERT_INT4_CALIB",
-    "CFG_ATTENTION_QUANT", "CFG_SHARED_EXPERT_QUANT", "CFG_DENSE_MLP_QUANT",
+    "CFG_ATTENTION_QUANT", "CFG_HQQ_CACHE_PROFILE", "CFG_HQQ_SIDECAR_MANIFEST",
+    "CFG_SHARED_EXPERT_QUANT", "CFG_DENSE_MLP_QUANT",
     "CFG_LM_HEAD_QUANT", "CFG_KRASIS_THREADS", "CFG_HOST", "CFG_PORT",
     "CFG_GPU_PREFILL_THRESHOLD", "CFG_GGUF_PATH", "CFG_VRAM_SAFETY_MARGIN",
     "CFG_FORCE_LOAD", "CFG_ENABLE_THINKING",
@@ -394,8 +403,11 @@ class LauncherConfig:
         self.gpu_expert_bits: int = 4
         self.gpu_expert_int4_calib: str = "amax"
         self.cpu_expert_bits: int = 4
-        self.attention_quant: str = "bf16"
+        self.attention_quant: str = "hqq8"
         self._attention_quant_explicit: bool = False  # set when user/config explicitly chose
+        self.hqq_cache_profile: str = HQQ_CACHE_PROFILE_BASELINE
+        self._hqq_cache_profile_explicit: bool = False
+        self.hqq_sidecar_manifest: str = ""
         self.shared_expert_quant: str = "int8"
         self.dense_mlp_quant: str = "int8"
         self.lm_head_quant: str = "int8"
@@ -468,7 +480,7 @@ class LauncherConfig:
             if val in ("int4", "int8"):
                 raise ValueError(
                     f"Unsupported saved CFG_ATTENTION_QUANT={val}. "
-                    "Naive int4/int8 attention has been removed; use awq, hqq4, or bf16."
+                    "Naive int4/int8 attention has been removed; use hqq8, hqq4, awq, or bf16."
                 )
             if val not in ATTENTION_QUANT_CHOICES:
                 raise ValueError(
@@ -477,6 +489,17 @@ class LauncherConfig:
                 )
             self.attention_quant = val
             self._attention_quant_explicit = True
+        if "CFG_HQQ_CACHE_PROFILE" in saved and saved["CFG_HQQ_CACHE_PROFILE"]:
+            val = saved["CFG_HQQ_CACHE_PROFILE"].strip().lower()
+            if val not in HQQ_CACHE_PROFILE_CHOICES:
+                raise ValueError(
+                    f"Unsupported saved CFG_HQQ_CACHE_PROFILE={val}. "
+                    f"Use one of: {', '.join(HQQ_CACHE_PROFILE_CHOICES)}."
+                )
+            self.hqq_cache_profile = val
+            self._hqq_cache_profile_explicit = True
+        if "CFG_HQQ_SIDECAR_MANIFEST" in saved and saved["CFG_HQQ_SIDECAR_MANIFEST"]:
+            self.hqq_sidecar_manifest = os.path.expanduser(saved["CFG_HQQ_SIDECAR_MANIFEST"])
         if "CFG_SHARED_EXPERT_QUANT" in saved:
             self.shared_expert_quant = saved["CFG_SHARED_EXPERT_QUANT"]
         if "CFG_DENSE_MLP_QUANT" in saved:
@@ -531,6 +554,8 @@ class LauncherConfig:
             "CFG_GPU_EXPERT_INT4_CALIB": self.gpu_expert_int4_calib,
             "CFG_CPU_EXPERT_BITS": str(self.cpu_expert_bits),
             "CFG_ATTENTION_QUANT": self.attention_quant,
+            "CFG_HQQ_CACHE_PROFILE": self.hqq_cache_profile,
+            "CFG_HQQ_SIDECAR_MANIFEST": self.hqq_sidecar_manifest,
             "CFG_SHARED_EXPERT_QUANT": self.shared_expert_quant,
             "CFG_DENSE_MLP_QUANT": self.dense_mlp_quant,
             "CFG_LM_HEAD_QUANT": self.lm_head_quant,
@@ -589,7 +614,7 @@ OPTIONS = [
     ConfigOption("Expert INT4 calib", "gpu_expert_int4_calib",
                  choices=list(GPU_EXPERT_INT4_CALIB_CHOICES)),
     ConfigOption("Attention quant", "attention_quant",
-                 choices=list(ATTENTION_QUANT_CHOICES), affects_budget=True),
+                 choices=list(INTERACTIVE_ATTENTION_QUANT_CHOICES), affects_budget=True),
     ConfigOption("VRAM safety margin", "vram_safety_margin",
                  opt_type="number", min_val=500, max_val=8000, step=100),
     ConfigOption("Host/Port", "host", opt_type="text"),
@@ -610,6 +635,8 @@ def _format_value(opt: ConfigOption, val: Any) -> str:
     if opt.key == "vram_safety_margin":
         return f"{val:,} MB"
     if opt.key == "attention_quant":
+        if str(val) == "hqq4":
+            return "HQQ4SC"
         return attention_quant_label(str(val))
     if opt.key == "gpu_expert_int4_calib":
         return str(val)
@@ -652,7 +679,9 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
         elif current == "awq":
             return f"{DIM}{native_label} \u2192 AWQ \u2014 {GREEN}calibrated per-tensor{NC}{DIM}{NC}"
         elif current == "hqq4":
-            return f"{DIM}{native_label} \u2192 HQQ4 \u2014 calibration-free native backend{NC}"
+            return f"{DIM}{native_label} \u2192 HQQ4SC \u2014 low-memory self-correcting HQQ4{NC}"
+        elif current == "hqq8":
+            return f"{DIM}{native_label} \u2192 HQQ8 \u2014 recommended native backend{NC}"
         return f"{DIM}{native_label} \u2192 {current}{NC}"
 
     elif config_key == "gpu_expert_bits":
@@ -942,6 +971,95 @@ class Launcher:
         self.selected_gpus = [best]
         self.cfg.selected_gpu_indices = [best["index"]]
 
+    def _discover_hqq4sc_manifest(self) -> Optional[str]:
+        """Find the current model's explicit INT8-exception HQQ4SC manifest."""
+        if not self.cfg.model_path:
+            return None
+        sidecars_root = os.path.join(
+            cache_dir_for_model(self.cfg.model_path),
+            "attention_hqq_v5_calib_selfcal_v1",
+            "sidecars",
+        )
+        if not os.path.isdir(sidecars_root):
+            return None
+        expected_model = os.path.abspath(os.path.expanduser(self.cfg.model_path))
+        candidates = []
+        for root, _dirs, files in os.walk(sidecars_root):
+            if "sidecar_manifest.json" not in files:
+                continue
+            path = os.path.join(root, "sidecar_manifest.json")
+            try:
+                with open(path, encoding="utf-8") as f:
+                    manifest = json.load(f)
+            except Exception:
+                continue
+            if manifest.get("format") != "krasis_hqq_selfcal_sidecar_manifest":
+                continue
+            if not manifest.get("complete"):
+                continue
+            if manifest.get("sidecar_mode") != "int8_exception":
+                continue
+            manifest_model = os.path.abspath(os.path.expanduser(str(manifest.get("model_path", ""))))
+            if manifest_model != expected_model:
+                continue
+            source_profile = str(manifest.get("source", {}).get("cache_profile", "")).strip().lower()
+            if source_profile and source_profile != HQQ_CACHE_PROFILE_BASELINE:
+                continue
+            summary = manifest.get("summary", {})
+            group_count = int(summary.get("exception_group_count", 0) or 0)
+            if group_count <= 0:
+                continue
+            variant_name = str(manifest.get("variant_name", ""))
+            total_bytes = int(summary.get("sidecar_total_bytes", 0) or 0)
+            top4_rank = 0 if group_count == 4 else 1
+            name_rank = 0 if "top4" in variant_name else 1
+            candidates.append((top4_rank, name_rank, group_count, total_bytes, path))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][4]
+
+    def _set_interactive_attention_quant(self, value: str) -> bool:
+        """Apply an interactive attention preset.
+
+        The TUI exposes only HQQ8 and HQQ4SC.  HQQ4SC is represented by the
+        runtime as HQQ4 plus an explicit INT8-exception sidecar manifest.
+        """
+        if value == "hqq8":
+            self.cfg.attention_quant = "hqq8"
+            self.cfg.hqq_cache_profile = HQQ_CACHE_PROFILE_BASELINE
+            self.cfg.hqq_sidecar_manifest = ""
+            return True
+        if value == "hqq4":
+            sidecar = self._discover_hqq4sc_manifest()
+            if not sidecar:
+                return False
+            self.cfg.attention_quant = "hqq4"
+            self.cfg.hqq_cache_profile = HQQ_CACHE_PROFILE_BASELINE
+            self.cfg.hqq_sidecar_manifest = sidecar
+            return True
+        return False
+
+    def _ensure_interactive_attention_ready(self) -> bool:
+        if self.cfg.attention_quant == "hqq4":
+            if self.cfg.hqq_sidecar_manifest:
+                return True
+            return self._set_interactive_attention_quant("hqq4")
+        if self.cfg.attention_quant != "hqq8":
+            return self._set_interactive_attention_quant("hqq8")
+        return True
+
+    def _show_attention_unavailable(self) -> None:
+        _clear_screen()
+        sys.stdout.write(
+            f"\n  {RED}HQQ4SC is unavailable for this model.{NC}\n\n"
+            "  No complete INT8-exception sidecar manifest was found under the model cache.\n"
+            "  Use HQQ8, or build an explicit HQQ4SC sidecar before selecting HQQ4SC.\n\n"
+            f"  {DIM}[Any key] Back{NC}\n"
+        )
+        sys.stdout.flush()
+        _read_key()
+
     def _compute_budget(self) -> Optional[Dict[str, Any]]:
         """Compute VRAM/RAM budget from current config."""
         if not self.cfg.model_path:
@@ -963,6 +1081,7 @@ class Launcher:
                 kv_dtype=self.cfg.kv_dtype,
                 gpu_expert_bits=self.cfg.gpu_expert_bits,
                 attention_quant=self.cfg.attention_quant,
+                hqq_cache_profile=self.cfg.hqq_cache_profile,
                 shared_expert_quant=self.cfg.shared_expert_quant,
                 dense_mlp_quant=self.cfg.dense_mlp_quant,
                 lm_head_quant=self.cfg.lm_head_quant,
@@ -1089,7 +1208,7 @@ class Launcher:
 
             # Labels
             expert_label = f"INT{self.cfg.gpu_expert_bits}"
-            attn_label = attention_quant_label(self.cfg.attention_quant)
+            attn_label = "HQQ4SC" if self.cfg.attention_quant == "hqq4" else attention_quant_label(self.cfg.attention_quant)
 
             # RAM
             ram_experts_gb = b.get('ram_gpu_experts_mb', 0) / 1024
@@ -1219,6 +1338,21 @@ class Launcher:
         val = getattr(self.cfg, opt.key)
 
         if opt.opt_type == "cycle" and opt.choices:
+            if opt.key == "attention_quant":
+                choices = [
+                    choice for choice in INTERACTIVE_ATTENTION_QUANT_CHOICES
+                    if choice == "hqq8" or self._discover_hqq4sc_manifest()
+                ]
+                if not choices:
+                    choices = ["hqq8"]
+                try:
+                    idx = choices.index(val)
+                except ValueError:
+                    idx = 0
+                idx = (idx + direction) % len(choices)
+                if not self._set_interactive_attention_quant(choices[idx]):
+                    self._show_attention_unavailable()
+                return
             choices = opt.choices
             try:
                 idx = choices.index(val)
@@ -1270,8 +1404,9 @@ class Launcher:
             self.cfg.model_path = selected["path"]
             self.model_info = selected
 
-        # Default to AWQ if a calibration template exists (user can still toggle in TUI)
-        self._default_awq_if_template()
+        # Default new interactive installs to the recommended native HQQ path.
+        if not self.cfg._attention_quant_explicit:
+            self._set_interactive_attention_quant("hqq8")
 
         # Step 2: GPU selection (always shown, pre-selects saved GPUs)
         if self.hw["gpus"]:
@@ -1373,6 +1508,10 @@ class Launcher:
                 elif key in ("s", "S"):
                     self._save_config_screen()
                 elif key == KEY_ENTER:
+                    if not self._ensure_interactive_attention_ready():
+                        self._show_attention_unavailable()
+                        self.budget = self._compute_budget()
+                        continue
                     return True
                 elif key == KEY_QUIT or key == KEY_ESCAPE:
                     return False
@@ -1443,22 +1582,6 @@ class Launcher:
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
 
-    def _default_awq_if_template(self) -> None:
-        """Default attention_quant to AWQ if a calibration template exists for this model."""
-        if not self.cfg.model_path or self.cfg.attention_quant == "awq":
-            return
-        if self.cfg._attention_quant_explicit:
-            return
-        try:
-            from krasis.awq_calibrate import load_template
-            template_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__)))), "templates", "attention")
-            tmpl = load_template(template_dir, self.cfg.model_path)
-            if tmpl is not None:
-                self.cfg.attention_quant = "awq"
-        except Exception:
-            pass
-
     def print_summary(self) -> None:
         """Print non-interactive launch summary."""
         model_name = os.path.basename(self.cfg.model_path)
@@ -1473,7 +1596,12 @@ class Launcher:
         print(f"  Quantization:    INT{self.cfg.gpu_expert_bits}")
         if self.cfg.gpu_expert_bits == 4:
             print(f"  Expert INT4:     {self.cfg.gpu_expert_int4_calib}")
-        print(f"  Attention quant: {self.cfg.attention_quant}")
+        attn_display = "hqq4sc" if self.cfg.attention_quant == "hqq4" and self.cfg.hqq_sidecar_manifest else self.cfg.attention_quant
+        print(f"  Attention quant: {attn_display}")
+        if self.cfg.attention_quant == "hqq4" and self.cfg.hqq_cache_profile != HQQ_CACHE_PROFILE_BASELINE:
+            print(f"  HQQ profile:     {self.cfg.hqq_cache_profile}")
+        if self.cfg.attention_quant == "hqq4" and self.cfg.hqq_sidecar_manifest:
+            print(f"  HQQ sidecar:     {self.cfg.hqq_sidecar_manifest}")
         print(f"  Shared expert:   {self.cfg.shared_expert_quant}")
         dense_layers = (self.model_info or {}).get("dense_layers", 0)
         if dense_layers > 0:
@@ -1502,7 +1630,7 @@ class Launcher:
             )
             kv_label = "polar4" if self.cfg.kv_dtype == "polar4" else ("fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16")
             print(f"\n  Experts:     {experts_mb:>8,} MB  (INT{self.cfg.gpu_expert_bits})")
-            attn_label = attention_quant_label(self.cfg.attention_quant)
+            attn_label = "HQQ4SC" if self.cfg.attention_quant == "hqq4" and self.cfg.hqq_sidecar_manifest else attention_quant_label(self.cfg.attention_quant)
             print(f"  Attention:   {attention_mb:>8,} MB  ({attn_label})")
             print(f"  Overhead:    {overhead_mb:>8,} MB")
             print(f"  Total: {rank['total_mb']:>8,.0f} / {gpu_vram:,} MB (rank {wr})")
@@ -1542,6 +1670,10 @@ class Launcher:
             sys.executable, "-m", "krasis.server",
             "--config", config_path,
         ]
+        if self.cfg.hqq_cache_profile != HQQ_CACHE_PROFILE_BASELINE:
+            cmd_args.extend(["--hqq-cache-profile", self.cfg.hqq_cache_profile])
+        if self.cfg.hqq_sidecar_manifest:
+            cmd_args.extend(["--hqq-sidecar-manifest", self.cfg.hqq_sidecar_manifest])
 
         if benchmark or benchmark_only:
             cmd_args.append("--benchmark")
@@ -1638,7 +1770,11 @@ def parse_args() -> argparse.Namespace:
                         choices=list(GPU_EXPERT_INT4_CALIB_CHOICES),
                         help="Offline calibration mode for GPU routed-expert INT4 cache build")
     parser.add_argument("--attention-quant", default=None,
-                        help="Attention weight quant: bf16, awq, or hqq4")
+                        help="Attention weight quant: hqq8 recommended; bf16, awq, and hqq4 remain explicit legacy/debug modes")
+    parser.add_argument("--hqq-cache-profile", default=None,
+                        help="HQQ attention cache profile: baseline or selfcal_v1")
+    parser.add_argument("--hqq-sidecar-manifest", default=None,
+                        help="Explicit HQQ4-only sidecar manifest; HQQ8 rejects sidecar/self-correction")
     parser.add_argument("--shared-expert-quant", default=None,
                         help="Shared expert quant: bf16 or int8")
     parser.add_argument("--dense-mlp-quant", default=None,
@@ -1706,7 +1842,7 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         if val in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported --attention-quant {val}. "
-                "Naive int4/int8 attention has been removed; use awq, hqq4, or bf16."
+                "Naive int4/int8 attention has been removed; use hqq8, hqq4, awq, or bf16."
             )
         if val not in ATTENTION_QUANT_CHOICES:
             raise ValueError(
@@ -1715,6 +1851,17 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
             )
         cfg.attention_quant = val
         cfg._attention_quant_explicit = True
+    if args.hqq_cache_profile is not None:
+        val = args.hqq_cache_profile.strip().lower()
+        if val not in HQQ_CACHE_PROFILE_CHOICES:
+            raise ValueError(
+                f"Unsupported --hqq-cache-profile {val}. "
+                f"Use one of: {', '.join(HQQ_CACHE_PROFILE_CHOICES)}."
+            )
+        cfg.hqq_cache_profile = val
+        cfg._hqq_cache_profile_explicit = True
+    if args.hqq_sidecar_manifest is not None:
+        cfg.hqq_sidecar_manifest = os.path.expanduser(args.hqq_sidecar_manifest)
     if args.shared_expert_quant is not None:
         cfg.shared_expert_quant = args.shared_expert_quant
     if args.dense_mlp_quant is not None:
@@ -1962,7 +2109,8 @@ def main():
                 sys.exit(1)
 
         launcher._read_model_info()
-        launcher._default_awq_if_template()
+        if not launcher.cfg._attention_quant_explicit:
+            launcher._set_interactive_attention_quant("hqq8")
         launcher._resolve_selected_gpus()
 
         # Set/recompute PP if not specified, GPU count mismatch, or layer sum mismatch

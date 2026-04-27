@@ -20,24 +20,56 @@ from pathlib import Path
 from typing import List, Optional
 
 from krasis.attention_backend import ATTENTION_QUANT_CHOICES, attention_quant_label
+from krasis.config import HQQ_CACHE_PROFILE_CHOICES
 from krasis.run_paths import get_run_dir
 
-# Pre-scan config file for CFG_SELECTED_GPUS to set CUDA_VISIBLE_DEVICES
+def _normalize_selected_gpus(raw: Optional[str], source: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        raise SystemExit(f"{source} selected GPU list is empty")
+    seen = set()
+    values = []
+    for part in text.split(","):
+        gpu = part.strip()
+        if not gpu:
+            continue
+        if not gpu.isdigit():
+            raise SystemExit(f"{source} selected GPU list contains non-integer entry: {gpu!r}")
+        if gpu in seen:
+            raise SystemExit(f"{source} selected GPU list contains duplicate GPU index: {gpu}")
+        seen.add(gpu)
+        values.append(gpu)
+    if not values:
+        raise SystemExit(f"{source} selected GPU list is empty")
+    return ",".join(values)
+
+
+def _argv_has_option(argv: list[str], option: str) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in argv)
+
+
+# Pre-scan config file / CLI for selected GPUs to set CUDA_VISIBLE_DEVICES
 # BEFORE any torch/CUDA imports, since CUDA init happens at import time.
 def _prescan_selected_gpus():
     import argparse as _ap
     _pre = _ap.ArgumentParser(add_help=False)
     _pre.add_argument("--config", default=None)
+    _pre.add_argument("--selected-gpus", default=None)
     _pre_args, _ = _pre.parse_known_args()
+    if _pre_args.selected_gpus is not None:
+        _gpus = _normalize_selected_gpus(_pre_args.selected_gpus, "--selected-gpus")
+        os.environ["CUDA_VISIBLE_DEVICES"] = _gpus
+        print(f"Pre-scan: set CUDA_VISIBLE_DEVICES={_gpus} (--selected-gpus override)")
+        return
     if _pre_args.config and os.path.isfile(_pre_args.config):
         with open(_pre_args.config) as _f:
             for _line in _f:
                 _line = _line.strip()
                 if _line.startswith("CFG_SELECTED_GPUS="):
                     _val = _line.split("=", 1)[1].strip().strip('"').strip("'")
-                    _gpus = [x.strip() for x in _val.split(",") if x.strip()]
-                    if _gpus:
-                        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(_gpus)
+                    if _val.strip():
+                        _gpus = _normalize_selected_gpus(_val, "CFG_SELECTED_GPUS")
+                        os.environ["CUDA_VISIBLE_DEVICES"] = _gpus
                         print(f"Pre-scan: set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
                     break
 _prescan_selected_gpus()
@@ -538,9 +570,17 @@ def main():
     pre.add_argument("--config", default=None,
                      help="Path to config file (KEY=VALUE format). "
                           "CLI args override config file values.")
+    pre.add_argument("--selected-gpus", default=None,
+                     help="Explicit physical GPU indices to expose, overriding CFG_SELECTED_GPUS "
+                          "(comma-separated, e.g. 0 or 0,1).")
     pre_args, remaining_argv = pre.parse_known_args()
+    explicit_selected_gpus = None
+    if pre_args.selected_gpus is not None:
+        explicit_selected_gpus = _normalize_selected_gpus(pre_args.selected_gpus, "--selected-gpus")
+    explicit_num_gpus = _argv_has_option(remaining_argv, "--num-gpus")
 
     config_defaults = {}
+    config_selected_gpus = None
     if pre_args.config:
         config_path = pre_args.config
         if not os.path.isfile(config_path):
@@ -557,6 +597,8 @@ def main():
             "CFG_GPU_EXPERT_INT4_CALIB": "gpu_expert_int4_calib",
             "CFG_CPU_EXPERT_BITS": "cpu_expert_bits",
             "CFG_ATTENTION_QUANT": "attention_quant",
+            "CFG_HQQ_CACHE_PROFILE": "hqq_cache_profile",
+            "CFG_HQQ_SIDECAR_MANIFEST": "hqq_sidecar_manifest",
             "CFG_SHARED_EXPERT_QUANT": "shared_expert_quant",
             "CFG_DENSE_MLP_QUANT": "dense_mlp_quant",
             "CFG_LM_HEAD_QUANT": "lm_head_quant",
@@ -597,8 +639,11 @@ def main():
                     if key == "CFG_SELECTED_GPUS":
                         # Convert comma-separated GPU indices to num_gpus count
                         # CUDA_VISIBLE_DEVICES is set earlier in _prescan_selected_gpus()
-                        gpu_list = [x.strip() for x in val.split(",") if x.strip()]
+                        selected = _normalize_selected_gpus(val, "CFG_SELECTED_GPUS")
+                        config_selected_gpus = selected
+                        gpu_list = [x.strip() for x in selected.split(",") if x.strip()]
                         if gpu_list:
+                            config_defaults["selected_gpus"] = selected
                             config_defaults["num_gpus"] = len(gpu_list)
                         continue
                     if key in ("CFG_FORCE_LOAD", "CFG_ENABLE_THINKING", "CFG_SESSION_ENABLED", "CFG_HCS", "CFG_MULTI_GPU_HCS", "CFG_CPU_DECODE"):
@@ -630,7 +675,13 @@ def main():
         # Expand ~ in model_path
         if "model_path" in config_defaults and isinstance(config_defaults["model_path"], str):
             config_defaults["model_path"] = os.path.expanduser(config_defaults["model_path"])
+        if explicit_selected_gpus is not None:
+            config_defaults["selected_gpus"] = explicit_selected_gpus
+            config_defaults["num_gpus"] = len(explicit_selected_gpus.split(","))
         print(f"Loaded config from {config_path}: {config_defaults}")
+    elif explicit_selected_gpus is not None:
+        config_defaults["selected_gpus"] = explicit_selected_gpus
+        config_defaults["num_gpus"] = len(explicit_selected_gpus.split(","))
 
     parser = argparse.ArgumentParser(description="Krasis standalone LLM server",
                                      parents=[pre])
@@ -656,7 +707,11 @@ def main():
     parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bits for CPU decode experts")
     parser.add_argument("--attention-quant", default="bf16", choices=list(ATTENTION_QUANT_CHOICES),
-                        help="Attention weight precision: bf16 (default), awq (calibrated per-tensor via AWQ), or hqq4")
+                        help="Attention weight precision: bf16 (default), awq, hqq4, or hqq8")
+    parser.add_argument("--hqq-cache-profile", default="baseline", choices=list(HQQ_CACHE_PROFILE_CHOICES),
+                        help="HQQ attention cache profile: baseline (default) or an explicit calibrated profile")
+    parser.add_argument("--hqq-sidecar-manifest", default=None,
+                        help="Explicit HQQ4-only sidecar manifest; HQQ8 rejects sidecar/self-correction")
     parser.add_argument("--shared-expert-quant", default="int8", choices=["bf16", "int8"],
                         help="Quantization for shared expert weights")
     parser.add_argument("--dense-mlp-quant", default="int8", choices=["bf16", "int8"],
@@ -723,6 +778,25 @@ def main():
     if config_defaults:
         parser.set_defaults(**config_defaults)
     args = parser.parse_args(remaining_argv)
+    if explicit_selected_gpus is not None:
+        selected_count = len(explicit_selected_gpus.split(","))
+        if explicit_num_gpus and args.num_gpus is not None and args.num_gpus != selected_count:
+            print(
+                "Error: --selected-gpus implies "
+                f"--num-gpus {selected_count}, but --num-gpus {args.num_gpus} was also supplied",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        args.selected_gpus = explicit_selected_gpus
+        args.num_gpus = selected_count
+        args.selected_gpus_source = "cli"
+    elif getattr(args, "selected_gpus", None):
+        args.selected_gpus = _normalize_selected_gpus(args.selected_gpus, "CFG_SELECTED_GPUS")
+        args.num_gpus = len(args.selected_gpus.split(","))
+        args.selected_gpus_source = "config"
+    else:
+        args.selected_gpus = None
+        args.selected_gpus_source = "auto"
     _default_run_type = "server-run"
     if args.benchmark_only:
         _default_run_type = "server-benchmark"
@@ -799,6 +873,12 @@ def main():
     logger.info("=== Resolved arguments ===")
     for _k, _v in sorted(vars(args).items()):
         logger.info("  %s = %r", _k, _v)
+    logger.info(
+        "Effective selected GPUs: %s (source=%s, CUDA_VISIBLE_DEVICES=%s)",
+        args.selected_gpus or "auto",
+        args.selected_gpus_source,
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    )
 
     global _model, _model_name
     import torch
@@ -814,6 +894,8 @@ def main():
     quant_cfg = QuantConfig(
         lm_head=args.lm_head_quant,
         attention=args.attention_quant,
+        hqq_cache_profile=args.hqq_cache_profile,
+        hqq_sidecar_manifest=args.hqq_sidecar_manifest,
         shared_expert=args.shared_expert_quant,
         dense_mlp=args.dense_mlp_quant,
         gpu_expert_bits=args.gpu_expert_bits,
@@ -846,6 +928,11 @@ def main():
     # ── Configuration summary ──
     _status(f"Krasis — {_model_name}")
     _detail(f"Decode: GPU  |  HCS: {'on' if args.hcs else 'off'}  |  GPUs: {num_gpus_available}")
+    if args.selected_gpus:
+        _detail(
+            f"Selected physical GPUs: {args.selected_gpus} "
+            f"({args.selected_gpus_source}; CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')})"
+        )
     expert_detail = f"Experts: GPU INT{args.gpu_expert_bits}"
     if args.gpu_expert_bits == 4:
         expert_detail += f" ({args.gpu_expert_int4_calib})"

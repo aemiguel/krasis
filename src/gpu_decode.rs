@@ -537,6 +537,10 @@ const KERNEL_NAMES: &[&str] = &[
     "simple_int4_gemv_bf16",
     "hqq4_decode_gemv_f32",
     "hqq4_decode_gemv_bf16",
+    "hqq8_decode_gemv_f32",
+    "hqq8_decode_gemv_bf16",
+    "hqq_decode_int8_exception_delta_f32",
+    "hqq_decode_int8_exception_delta_bf16",
     "marlin_gemv_int4_v2_batched",
     "marlin_gemv_int8_v2_batched",
     "reduce_ksplits_bf16_batched",
@@ -1702,7 +1706,29 @@ struct GpuDecodeLayer {
     attn: GpuAttnConfig,
     hqq: Option<HqqLayerRegistration>,
     hqq_exec: Option<HqqExecutionDescriptor>,
+    hqq_prefill_sidecars: Vec<HqqPrefillSidecarRegistration>,
     mlp: GpuMlpConfig,
+}
+
+#[derive(Debug, Clone)]
+struct HqqPrefillSidecarRegistration {
+    tensor_name: String,
+    mode: String,
+    variant_name: String,
+    correction_ptr: u64,
+    correction_bytes: usize,
+    scales_ptr: u64,
+    scales_bytes: usize,
+    output_rows_ptr: u64,
+    output_rows_bytes: usize,
+    groups_ptr: u64,
+    groups_bytes: usize,
+    start_cols_ptr: u64,
+    start_cols_bytes: usize,
+    widths_ptr: u64,
+    widths_bytes: usize,
+    row_group_count: usize,
+    max_width: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1811,6 +1837,7 @@ struct HqqTensorExecDescriptor {
     logical_rows: usize,
     gated_split_interleaved: bool,
     kernel_ready: bool,
+    decode_sidecars: Vec<HqqPrefillSidecarRegistration>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1922,6 +1949,7 @@ impl GpuDecodeLayer {
             },
             hqq: None,
             hqq_exec: None,
+            hqq_prefill_sidecars: Vec::new(),
             mlp: GpuMlpConfig::None,
         }
     }
@@ -1953,6 +1981,7 @@ impl From<&HqqTensorRegistration> for HqqTensorExecDescriptor {
             logical_rows: value.rows,
             gated_split_interleaved: false,
             kernel_ready: value.kernel_ready,
+            decode_sidecars: Vec::new(),
         }
     }
 }
@@ -2331,6 +2360,16 @@ fn validate_hqq4_tensor_desc(
     )
 }
 
+fn hqq_expected_layout(nbits: u8, stage: &str) -> Result<&'static str, String> {
+    match (nbits, stage) {
+        (4, "prefill") => Ok("row_major_axis1_grouped_uint4_packed"),
+        (4, "decode") => Ok("row_aligned_grouped_uint4_decode_v1"),
+        (8, "prefill") => Ok("row_major_axis1_grouped_uint8"),
+        (8, "decode") => Ok("row_aligned_grouped_uint8_decode_v1"),
+        _ => Err(format!("Unsupported HQQ nbits={} stage={}", nbits, stage)),
+    }
+}
+
 fn validate_hqq4_tensor_desc_for_layout(
     tensor_name: &str,
     desc: &HqqTensorExecDescriptor,
@@ -2371,6 +2410,56 @@ fn validate_hqq4_tensor_desc_for_layout(
         ));
     }
     Ok(())
+}
+
+fn validate_hqq_tensor_desc_for_layout(
+    tensor_name: &str,
+    desc: &HqqTensorExecDescriptor,
+    nbits: u8,
+    expected_layout: &str,
+    require_kernel_ready: bool,
+) -> Result<(), String> {
+    if desc.axis != 1 {
+        return Err(format!(
+            "HQQ tensor {} uses unsupported axis {} (expected axis=1)",
+            tensor_name, desc.axis
+        ));
+    }
+    if desc.layout != expected_layout {
+        return Err(format!(
+            "HQQ{} tensor {} uses unsupported layout {} (expected {})",
+            nbits, tensor_name, desc.layout, expected_layout
+        ));
+    }
+    if desc.packed_dtype != "uint8" {
+        return Err(format!(
+            "HQQ{} tensor {} uses unsupported packed dtype {}",
+            nbits, tensor_name, desc.packed_dtype
+        ));
+    }
+    if desc.scales_dtype != "float32" || desc.zeros_dtype != "float32" {
+        return Err(format!(
+            "HQQ{} tensor {} uses unsupported scale/zero dtypes {}/{}",
+            nbits, tensor_name, desc.scales_dtype, desc.zeros_dtype
+        ));
+    }
+    if desc.group_size == 0 {
+        return Err(format!("HQQ{} tensor {} has invalid group_size=0", nbits, tensor_name));
+    }
+    if require_kernel_ready && !desc.kernel_ready {
+        return Err(format!("HQQ{} tensor {} is not kernel_ready", nbits, tensor_name));
+    }
+    Ok(())
+}
+
+fn hqq_nbits_from_desc(desc: &HqqTensorExecDescriptor) -> Result<u8, String> {
+    if desc.layout.contains("uint4") {
+        Ok(4)
+    } else if desc.layout.contains("uint8") {
+        Ok(8)
+    } else {
+        Err(format!("Cannot infer HQQ nbits from layout {}", desc.layout))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2560,6 +2649,48 @@ fn derive_hqq_gqa_fused_qkv_exec(
     Ok((desc, q_rows, k_rows, k_rows))
 }
 
+fn attach_hqq_decode_sidecars(
+    exec: &mut HqqExecutionDescriptor,
+    sidecars: &[HqqPrefillSidecarRegistration],
+) {
+    let for_tensor = |tensor_name: &str| -> Vec<HqqPrefillSidecarRegistration> {
+        sidecars
+            .iter()
+            .filter(|sidecar| sidecar.mode == "int8_exception" && sidecar.tensor_name == tensor_name)
+            .cloned()
+            .collect()
+    };
+    match exec {
+        HqqExecutionDescriptor::Gqa(desc) => {
+            desc.q_proj.decode_sidecars = for_tensor("q_proj");
+            desc.k_proj.decode_sidecars = for_tensor("k_proj");
+            desc.v_proj.decode_sidecars = for_tensor("v_proj");
+            if let Some(fused_qkv) = desc.fused_qkv.as_mut() {
+                fused_qkv.decode_sidecars = for_tensor("fused_qkv");
+            }
+            desc.o_proj.decode_sidecars = for_tensor("o_proj");
+        }
+        HqqExecutionDescriptor::Mla(desc) => {
+            if let Some(q_a_proj) = desc.q_a_proj.as_mut() {
+                q_a_proj.decode_sidecars = for_tensor("q_a_proj");
+            }
+            if let Some(q_b_proj) = desc.q_b_proj.as_mut() {
+                q_b_proj.decode_sidecars = for_tensor("q_b_proj");
+            }
+            if let Some(q_proj) = desc.q_proj.as_mut() {
+                q_proj.decode_sidecars = for_tensor("q_proj");
+            }
+            desc.kv_a_proj_with_mqa.decode_sidecars = for_tensor("kv_a_proj_with_mqa");
+            desc.o_proj.decode_sidecars = for_tensor("o_proj");
+        }
+        HqqExecutionDescriptor::LinearAttention(desc) => {
+            desc.in_proj_qkvz.decode_sidecars = for_tensor("in_proj_qkvz");
+            desc.in_proj_ba.decode_sidecars = for_tensor("in_proj_ba");
+            desc.out_proj.decode_sidecars = for_tensor("out_proj");
+        }
+    }
+}
+
 fn register_hqq_attention_layer_common(
     graph: &mut GpuDecodeGraph,
     layer_idx: usize,
@@ -2574,9 +2705,9 @@ fn register_hqq_attention_layer_common(
     metadata: HqqLayerMetadata,
     tensors: HashMap<String, HqqTensorRegistration>,
 ) -> PyResult<()> {
-    if nbits != 4 {
+    if nbits != 4 && nbits != 8 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Native HQQ registration only accepts nbits=4 today, got {}",
+            "Native HQQ registration only accepts nbits=4 or nbits=8 today, got {}",
             nbits
         )));
     }
@@ -2603,7 +2734,7 @@ fn register_hqq_attention_layer_common(
         _ => None,
     };
 
-    let hqq_exec = match &metadata {
+    let mut hqq_exec = match &metadata {
         HqqLayerMetadata::Gqa {
             num_heads,
             num_kv_heads,
@@ -2759,6 +2890,28 @@ fn register_hqq_attention_layer_common(
             recur_state_ptr: *recur_state_ptr,
         }),
     };
+
+    let decode_sidecars = graph.layers[layer_idx].hqq_prefill_sidecars.clone();
+    attach_hqq_decode_sidecars(&mut hqq_exec, &decode_sidecars);
+    let decode_int8_exception_rows: usize = decode_sidecars
+        .iter()
+        .filter(|sidecar| sidecar.mode == "int8_exception")
+        .map(|sidecar| sidecar.row_group_count)
+        .sum();
+    if decode_int8_exception_rows > 0 {
+        let tensors: Vec<String> = decode_sidecars
+            .iter()
+            .filter(|sidecar| sidecar.mode == "int8_exception")
+            .map(|sidecar| sidecar.tensor_name.clone())
+            .collect();
+        log::info!(
+            "HQQ decode INT8 exception sidecars active: layer={} kind={} tensors={} row_groups={}",
+            layer_idx,
+            layer_kind,
+            tensors.join(","),
+            decode_int8_exception_rows,
+        );
+    }
 
     graph.layers[layer_idx].input_norm_ptr = input_norm_ptr as u64;
     graph.layers[layer_idx].input_norm_size = input_norm_size;
@@ -4157,6 +4310,27 @@ impl GpuDecodeStore {
         Ok(tensors)
     }
 
+    fn hqq_decode_sidecars_for_tensor(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+    ) -> Vec<HqqPrefillSidecarRegistration> {
+        self.graph
+            .as_ref()
+            .and_then(|graph| graph.layers.get(layer_idx))
+            .map(|layer| {
+                layer
+                    .hqq_prefill_sidecars
+                    .iter()
+                    .filter(|sidecar| {
+                        sidecar.mode == "int8_exception" && sidecar.tensor_name == tensor_name
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn hqq_runtime_decode_exec_desc_for_tensor(
         &self,
         layer_idx: usize,
@@ -4206,6 +4380,7 @@ impl GpuDecodeStore {
             logical_rows: slot.rows,
             gated_split_interleaved: false,
             kernel_ready: slot.decode.kernel_ready,
+            decode_sidecars: self.hqq_decode_sidecars_for_tensor(layer_idx, tensor_name),
         })
     }
 
@@ -4260,6 +4435,7 @@ impl GpuDecodeStore {
             logical_rows: slot.rows,
             gated_split_interleaved: false,
             kernel_ready: true,
+            decode_sidecars: Vec::new(),
         })
     }
 
@@ -4270,11 +4446,15 @@ impl GpuDecodeStore {
         rows: usize,
         cols: usize,
         group_size: usize,
+        nbits: usize,
     ) -> Result<HqqRuntimeFormatDescriptor, String> {
         let t0 = std::time::Instant::now();
+        if nbits != 4 && nbits != 8 {
+            return Err(format!("Unsupported HQQ prefill nbits={}", nbits));
+        }
         let groups = cols.div_ceil(group_size);
         let padded_cols = groups * group_size;
-        let packed_cols = padded_cols.div_ceil(2);
+        let packed_cols = if nbits == 4 { padded_cols.div_ceil(2) } else { padded_cols };
         let canonical_packed_bytes = rows * packed_cols;
         if packed_host.len() != canonical_packed_bytes {
             return Err(format!(
@@ -4288,7 +4468,7 @@ impl GpuDecodeStore {
         Ok(HqqRuntimeFormatDescriptor {
             stage: "prefill",
             kind: HqqRuntimeFormatKind::PrefillRowMajorV1,
-            layout: "row_major_axis1_grouped_uint4_packed".to_string(),
+            layout: hqq_expected_layout(nbits as u8, "prefill")?.to_string(),
             packed_dtype: "uint8".to_string(),
             scales_dtype: "float32".to_string(),
             zeros_dtype: "float32".to_string(),
@@ -4315,11 +4495,15 @@ impl GpuDecodeStore {
         rows: usize,
         cols: usize,
         group_size: usize,
+        nbits: usize,
     ) -> Result<HqqRuntimeFormatDescriptor, String> {
         let t0 = std::time::Instant::now();
+        if nbits != 4 && nbits != 8 {
+            return Err(format!("Unsupported HQQ decode nbits={}", nbits));
+        }
         let groups = cols.div_ceil(group_size);
         let padded_cols = groups * group_size;
-        let packed_cols = padded_cols.div_ceil(2);
+        let packed_cols = if nbits == 4 { padded_cols.div_ceil(2) } else { padded_cols };
         let canonical_packed_bytes = rows * packed_cols;
         if packed_host.len() != canonical_packed_bytes {
             return Err(format!(
@@ -4357,7 +4541,7 @@ impl GpuDecodeStore {
         Ok(HqqRuntimeFormatDescriptor {
             stage: "decode",
             kind: HqqRuntimeFormatKind::DecodeRowAlignedV1,
-            layout: "row_aligned_grouped_uint4_decode_v1".to_string(),
+            layout: hqq_expected_layout(nbits as u8, "decode")?.to_string(),
             packed_dtype: "uint8".to_string(),
             scales_dtype: "float32".to_string(),
             zeros_dtype: "float32".to_string(),
@@ -4660,6 +4844,57 @@ impl GpuDecodeStore {
                 )
                 .map_err(|e| format!("hqq4_decode_gemv_f32 {tensor_name}: {:?}", e))?;
         }
+        self.apply_hqq_decode_int8_exceptions_f32(tensor_name, desc, input_ptr, output_ptr)?;
+        Ok(())
+    }
+
+    fn launch_hqq8_decode_gemv_f32(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        validate_hqq_tensor_desc_for_layout(
+            tensor_name,
+            desc,
+            8,
+            hqq_expected_layout(8, "decode")?,
+            true,
+        )?;
+        let rows = desc.rows;
+        let cols = desc.cols;
+        let blocks = ((rows + 7) / 8) as u32;
+        let smem = (cols as u32) * 2;
+        let kernel = self
+            .device
+            .get_func(MODULE_NAME, "hqq8_decode_gemv_f32")
+            .ok_or_else(|| "hqq8_decode_gemv_f32 kernel not found".to_string())?;
+        unsafe {
+            kernel
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (blocks, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    },
+                    (
+                        desc.packed_ptr,
+                        desc.scales_ptr,
+                        desc.zeros_ptr,
+                        input_ptr,
+                        output_ptr,
+                        rows as i32,
+                        cols as i32,
+                        desc.group_size as i32,
+                        desc.packed_row_stride_bytes as i32,
+                        desc.scales_row_stride_bytes as i32,
+                        desc.zeros_row_stride_bytes as i32,
+                    ),
+                )
+                .map_err(|e| format!("hqq8_decode_gemv_f32 {tensor_name}: {:?}", e))?;
+        }
+        self.apply_hqq_decode_int8_exceptions_f32(tensor_name, desc, input_ptr, output_ptr)?;
         Ok(())
     }
 
@@ -4728,6 +4963,204 @@ impl GpuDecodeStore {
                     ),
                 )
                 .map_err(|e| format!("hqq4_decode_gemv_bf16 {tensor_name}: {:?}", e))?;
+        }
+        self.apply_hqq_decode_int8_exceptions_bf16(tensor_name, desc, input_ptr, output_ptr)?;
+        Ok(())
+    }
+
+    fn launch_hqq_decode_gemv_f32(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        let nbits = hqq_nbits_from_desc(desc)?;
+        match nbits {
+            4 => self.launch_hqq4_decode_gemv_f32(tensor_name, desc, input_ptr, output_ptr),
+            8 => self.launch_hqq8_decode_gemv_f32(tensor_name, desc, input_ptr, output_ptr),
+            _ => Err(format!("Unsupported HQQ decode nbits={}", nbits)),
+        }
+    }
+
+    fn launch_hqq8_decode_gemv_bf16(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        validate_hqq_tensor_desc_for_layout(
+            tensor_name,
+            desc,
+            8,
+            hqq_expected_layout(8, "decode")?,
+            true,
+        )?;
+        let rows = desc.rows;
+        let cols = desc.cols;
+        let blocks = ((rows + 7) / 8) as u32;
+        let smem = (cols as u32) * 2;
+        let kernel = self
+            .device
+            .get_func(MODULE_NAME, "hqq8_decode_gemv_bf16")
+            .ok_or_else(|| "hqq8_decode_gemv_bf16 kernel not found".to_string())?;
+        unsafe {
+            kernel
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (blocks, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    },
+                    (
+                        desc.packed_ptr,
+                        desc.scales_ptr,
+                        desc.zeros_ptr,
+                        input_ptr,
+                        output_ptr,
+                        rows as i32,
+                        cols as i32,
+                        desc.group_size as i32,
+                        desc.packed_row_stride_bytes as i32,
+                        desc.scales_row_stride_bytes as i32,
+                        desc.zeros_row_stride_bytes as i32,
+                    ),
+                )
+                .map_err(|e| format!("hqq8_decode_gemv_bf16 {tensor_name}: {:?}", e))?;
+        }
+        self.apply_hqq_decode_int8_exceptions_bf16(tensor_name, desc, input_ptr, output_ptr)?;
+        Ok(())
+    }
+
+    fn launch_hqq_decode_gemv_bf16(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        let nbits = hqq_nbits_from_desc(desc)?;
+        match nbits {
+            4 => self.launch_hqq4_decode_gemv_bf16(tensor_name, desc, input_ptr, output_ptr),
+            8 => self.launch_hqq8_decode_gemv_bf16(tensor_name, desc, input_ptr, output_ptr),
+            _ => Err(format!("Unsupported HQQ decode nbits={}", nbits)),
+        }
+    }
+
+    fn apply_hqq_decode_int8_exceptions_f32(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        self.apply_hqq_decode_int8_exceptions(tensor_name, desc, input_ptr, output_ptr, false)
+    }
+
+    fn apply_hqq_decode_int8_exceptions_bf16(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        self.apply_hqq_decode_int8_exceptions(tensor_name, desc, input_ptr, output_ptr, true)
+    }
+
+    fn apply_hqq_decode_int8_exceptions(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+        output_bf16: bool,
+    ) -> Result<(), String> {
+        if desc.decode_sidecars.is_empty() {
+            return Ok(());
+        }
+        validate_hqq4_tensor_desc_for_layout(
+            tensor_name,
+            desc,
+            "row_aligned_grouped_uint4_decode_v1",
+            true,
+        )?;
+        let kernel_name = if output_bf16 {
+            "hqq_decode_int8_exception_delta_bf16"
+        } else {
+            "hqq_decode_int8_exception_delta_f32"
+        };
+        let kernel = self
+            .device
+            .get_func(MODULE_NAME, kernel_name)
+            .ok_or_else(|| format!("{kernel_name} kernel not found"))?;
+        let threads = 256u32;
+        let smem = threads * std::mem::size_of::<f32>() as u32;
+        for sidecar in &desc.decode_sidecars {
+            if sidecar.mode != "int8_exception" {
+                return Err(format!(
+                    "HQQ decode sidecar only supports int8_exception, got {} for tensor {}",
+                    sidecar.mode, tensor_name
+                ));
+            }
+            if sidecar.tensor_name != tensor_name {
+                return Err(format!(
+                    "HQQ decode sidecar tensor mismatch: descriptor={} sidecar={}",
+                    tensor_name, sidecar.tensor_name
+                ));
+            }
+            if sidecar.row_group_count == 0 || sidecar.max_width == 0 {
+                continue;
+            }
+            let mut a0 = sidecar.correction_ptr;
+            let mut a1 = sidecar.scales_ptr;
+            let mut a2 = sidecar.output_rows_ptr;
+            let mut a3 = sidecar.start_cols_ptr;
+            let mut a4 = sidecar.widths_ptr;
+            let mut a5 = desc.packed_ptr;
+            let mut a6 = desc.scales_ptr;
+            let mut a7 = desc.zeros_ptr;
+            let mut a8 = input_ptr;
+            let mut a9 = output_ptr;
+            let mut a10 = sidecar.row_group_count as i32;
+            let mut a11 = desc.cols as i32;
+            let mut a12 = desc.group_size as i32;
+            let mut a13 = sidecar.max_width as i32;
+            let mut a14 = desc.packed_row_stride_bytes as i32;
+            let mut a15 = desc.scales_row_stride_bytes as i32;
+            let mut a16 = desc.zeros_row_stride_bytes as i32;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut a0 as *mut _ as *mut std::ffi::c_void,
+                &mut a1 as *mut _ as *mut std::ffi::c_void,
+                &mut a2 as *mut _ as *mut std::ffi::c_void,
+                &mut a3 as *mut _ as *mut std::ffi::c_void,
+                &mut a4 as *mut _ as *mut std::ffi::c_void,
+                &mut a5 as *mut _ as *mut std::ffi::c_void,
+                &mut a6 as *mut _ as *mut std::ffi::c_void,
+                &mut a7 as *mut _ as *mut std::ffi::c_void,
+                &mut a8 as *mut _ as *mut std::ffi::c_void,
+                &mut a9 as *mut _ as *mut std::ffi::c_void,
+                &mut a10 as *mut _ as *mut std::ffi::c_void,
+                &mut a11 as *mut _ as *mut std::ffi::c_void,
+                &mut a12 as *mut _ as *mut std::ffi::c_void,
+                &mut a13 as *mut _ as *mut std::ffi::c_void,
+                &mut a14 as *mut _ as *mut std::ffi::c_void,
+                &mut a15 as *mut _ as *mut std::ffi::c_void,
+                &mut a16 as *mut _ as *mut std::ffi::c_void,
+            ];
+            unsafe {
+                kernel
+                    .clone()
+                    .launch(
+                        LaunchConfig {
+                            grid_dim: (sidecar.row_group_count as u32, 1, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: smem,
+                        },
+                        &mut params,
+                    )
+                    .map_err(|e| format!("{kernel_name} {tensor_name}: {:?}", e))?;
+            }
         }
         Ok(())
     }
@@ -5173,12 +5606,6 @@ impl GpuDecodeStore {
             let kv_overflow = prompt_len > engine.kv_max_seq;
                 engine.update_hcs_snapshot(&cache_fast_snapshot, ne);
                 engine.set_prefill_hcs_guard_store_addr(prefill_hcs_guard_store_addr);
-                if let Err(e) = engine.materialize_hqq_prefill_weights() {
-                    engine.clear_prefill_hcs_guard_store_addr();
-                    let _ = self.prepare_runtime_for_decode_rust();
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
-                }
-
                 if let Err(e) = engine.prepare_for_prefill(prompt_len) {
                     engine.clear_prefill_hcs_guard_store_addr();
                     let _ = self.prepare_runtime_for_decode_rust();
@@ -6072,6 +6499,7 @@ impl GpuDecodeStore {
             rows,
             cols,
             group_size,
+            nbits,
         ).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let decode = Self::build_hqq_decode_runtime_format(
             &canonical_packed,
@@ -6080,6 +6508,7 @@ impl GpuDecodeStore {
             rows,
             cols,
             group_size,
+            nbits,
         ).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         let packed_slot_bytes = prefill.packed_bytes().max(decode.packed_bytes());
@@ -6237,6 +6666,145 @@ impl GpuDecodeStore {
             device_buffers: None,
         });
         self.recompute_hqq_runtime_staging_stats();
+        Ok(())
+    }
+
+    #[pyo3(signature = (
+        layer_idx,
+        tensor_name,
+        mode,
+        variant_name,
+        correction_ptr,
+        correction_bytes,
+        scales_ptr,
+        scales_bytes,
+        output_rows_ptr,
+        output_rows_bytes,
+        groups_ptr,
+        groups_bytes,
+        start_cols_ptr,
+        start_cols_bytes,
+        widths_ptr,
+        widths_bytes,
+        row_group_count,
+        max_width
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn stage_hqq_prefill_sidecar_tensor(
+        &mut self,
+        layer_idx: usize,
+        tensor_name: &str,
+        mode: &str,
+        variant_name: &str,
+        correction_ptr: usize,
+        correction_bytes: usize,
+        scales_ptr: usize,
+        scales_bytes: usize,
+        output_rows_ptr: usize,
+        output_rows_bytes: usize,
+        groups_ptr: usize,
+        groups_bytes: usize,
+        start_cols_ptr: usize,
+        start_cols_bytes: usize,
+        widths_ptr: usize,
+        widths_bytes: usize,
+        row_group_count: usize,
+        max_width: usize,
+    ) -> PyResult<()> {
+        if mode != "int8_symmetric" && mode != "exact_bf16" && mode != "int8_exception" {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unsupported HQQ prefill sidecar mode {mode:?}"
+            )));
+        }
+        if tensor_name.trim().is_empty() || variant_name.trim().is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "HQQ prefill sidecar requires tensor_name and variant_name",
+            ));
+        }
+        if row_group_count == 0 || max_width == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ prefill sidecar invalid shape: row_group_count={} max_width={}",
+                row_group_count, max_width
+            )));
+        }
+        let expected_i32_bytes = row_group_count * std::mem::size_of::<i32>();
+        if output_rows_bytes != expected_i32_bytes
+            || groups_bytes != expected_i32_bytes
+            || start_cols_bytes != expected_i32_bytes
+            || widths_bytes != expected_i32_bytes
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ prefill sidecar metadata byte mismatch for layer {} tensor {}: rows={} groups={} starts={} widths={} expected={}",
+                layer_idx,
+                tensor_name,
+                output_rows_bytes,
+                groups_bytes,
+                start_cols_bytes,
+                widths_bytes,
+                expected_i32_bytes
+            )));
+        }
+        let expected_scales_bytes = row_group_count * std::mem::size_of::<f32>();
+        if scales_bytes != expected_scales_bytes {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ prefill sidecar scales byte mismatch for layer {} tensor {}: got {} expected {}",
+                layer_idx, tensor_name, scales_bytes, expected_scales_bytes
+            )));
+        }
+        if correction_ptr == 0
+            || scales_ptr == 0
+            || output_rows_ptr == 0
+            || groups_ptr == 0
+            || start_cols_ptr == 0
+            || widths_ptr == 0
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ prefill sidecar contains null pointer for layer {} tensor {}",
+                layer_idx, tensor_name
+            )));
+        }
+        let min_correction_bytes = row_group_count * max_width
+            * if mode == "exact_bf16" { std::mem::size_of::<u16>() } else { std::mem::size_of::<i8>() };
+        if correction_bytes < min_correction_bytes {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ prefill sidecar correction byte mismatch for layer {} tensor {}: got {} expected at least {}",
+                layer_idx, tensor_name, correction_bytes, min_correction_bytes
+            )));
+        }
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        while graph.layers.len() <= layer_idx {
+            graph.layers.push(GpuDecodeLayer::placeholder());
+        }
+        graph.layers[layer_idx].hqq_prefill_sidecars.push(HqqPrefillSidecarRegistration {
+            tensor_name: tensor_name.to_string(),
+            mode: mode.to_string(),
+            variant_name: variant_name.to_string(),
+            correction_ptr: correction_ptr as u64,
+            correction_bytes,
+            scales_ptr: scales_ptr as u64,
+            scales_bytes,
+            output_rows_ptr: output_rows_ptr as u64,
+            output_rows_bytes,
+            groups_ptr: groups_ptr as u64,
+            groups_bytes,
+            start_cols_ptr: start_cols_ptr as u64,
+            start_cols_bytes,
+            widths_ptr: widths_ptr as u64,
+            widths_bytes,
+            row_group_count,
+            max_width,
+        });
+        log::info!(
+            "HQQ prefill sidecar staged: layer={} tensor={} mode={} variant={} row_groups={} max_width={} bytes={}",
+            layer_idx,
+            tensor_name,
+            mode,
+            variant_name,
+            row_group_count,
+            max_width,
+            correction_bytes + scales_bytes + output_rows_bytes + groups_bytes + start_cols_bytes + widths_bytes,
+        );
         Ok(())
     }
 
@@ -9417,7 +9985,7 @@ impl GpuDecodeStore {
         let output = self.device.alloc_zeros::<f32>(desc.rows)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("debug_run_hqq_decode_gemv_f32 alloc output: {:?}", e)))?;
-        self.launch_hqq4_decode_gemv_f32(
+        self.launch_hqq_decode_gemv_f32(
             tensor_name,
             &desc,
             input_ptr as u64,
@@ -9445,7 +10013,7 @@ impl GpuDecodeStore {
         let output = self.device.alloc_zeros::<u16>(desc.rows)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("debug_run_hqq_decode_gemv_bf16 alloc output: {:?}", e)))?;
-        self.launch_hqq4_decode_gemv_bf16(
+        self.launch_hqq_decode_gemv_bf16(
             tensor_name,
             &desc,
             input_ptr as u64,
@@ -11247,6 +11815,20 @@ impl GpuDecodeStore {
                 la_norm_weight_ptr: 0, la_conv_state_ptr: 0, la_recur_state_ptr: 0,
                 q_norm_ptr: 0, k_norm_ptr: 0,
                 hqq_gqa: None, hqq_mla: None, hqq_linear_attention: None,
+                hqq_prefill_sidecars: l.hqq_prefill_sidecars.iter().map(|sidecar| {
+                    crate::gpu_prefill::HqqPrefillSidecarDescriptor {
+                        tensor_name: sidecar.tensor_name.clone(),
+                        mode: sidecar.mode.clone(),
+                        variant_name: sidecar.variant_name.clone(),
+                        correction_ptr: sidecar.correction_ptr,
+                        scales_ptr: sidecar.scales_ptr,
+                        output_rows_ptr: sidecar.output_rows_ptr,
+                        start_cols_ptr: sidecar.start_cols_ptr,
+                        widths_ptr: sidecar.widths_ptr,
+                        row_group_count: sidecar.row_group_count,
+                        max_width: sidecar.max_width,
+                    }
+                }).collect(),
             };
 
             if let Some(hqq_exec) = &l.hqq_exec {
@@ -11921,6 +12503,9 @@ impl GpuDecodeStore {
             cublas_handle,
             shared_cublas_handle,
             h_logits: Vec::new(),
+            reference_debug_trace_enabled: false,
+            last_reference_debug_trace: None,
+            reference_prefill_stage_snapshots: std::cell::RefCell::new(Vec::new()),
             h_topk_ids: vec![0i32; max_possible_chunk * topk],
             h_topk_weights: vec![0.0f32; max_possible_chunk * topk],
             h_gather_src_map: Vec::new(),
@@ -12618,13 +13203,13 @@ impl GpuDecodeStore {
 
                         // Projections
                         if let Some(hqq_exec) = hqq_la_exec.as_ref() {
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "in_proj_qkvz",
                                 &hqq_exec.in_proj_qkvz,
                                 *graph.d_hidden.device_ptr(),
                                 *graph.d_la_qkvz.device_ptr(),
                             )?;
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "in_proj_ba",
                                 &hqq_exec.in_proj_ba,
                                 *graph.d_hidden.device_ptr(),
@@ -13696,13 +14281,13 @@ impl GpuDecodeStore {
 
                         // LA projections (cuBLAS)
                         if let Some(hqq_exec) = hqq_la_exec.as_ref() {
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "in_proj_qkvz",
                                 &hqq_exec.in_proj_qkvz,
                                 *graph.d_hidden.device_ptr(),
                                 *graph.d_la_qkvz.device_ptr(),
                             )?;
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "in_proj_ba",
                                 &hqq_exec.in_proj_ba,
                                 *graph.d_hidden.device_ptr(),
@@ -13818,7 +14403,7 @@ impl GpuDecodeStore {
 
                         // Output projection
                         if let Some(hqq_exec) = hqq_la_exec.as_ref() {
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "out_proj",
                                 &hqq_exec.out_proj,
                                 *graph.d_scratch.device_ptr(),
@@ -15392,13 +15977,13 @@ impl GpuDecodeStore {
                     // ── LA Step 1: Projections (cuBLAS GEMV) ──
                     let t_la_s1 = Instant::now();
                     if let Some(hqq_exec) = hqq_la_exec.as_ref() {
-                        self.launch_hqq4_decode_gemv_f32(
+                        self.launch_hqq_decode_gemv_f32(
                             "in_proj_qkvz",
                             &hqq_exec.in_proj_qkvz,
                             *graph.d_hidden.device_ptr(),
                             *graph.d_la_qkvz.device_ptr(),
                         )?;
-                        self.launch_hqq4_decode_gemv_f32(
+                        self.launch_hqq_decode_gemv_f32(
                             "in_proj_ba",
                             &hqq_exec.in_proj_ba,
                             *graph.d_hidden.device_ptr(),
@@ -15714,7 +16299,7 @@ impl GpuDecodeStore {
                             ),
                         );
                         trace_bf16("la_out_proj_input", Some(layer_idx), "d_scratch", *graph.d_scratch.device_ptr(), 64);
-                        self.launch_hqq4_decode_gemv_f32(
+                        self.launch_hqq_decode_gemv_f32(
                             "out_proj",
                             &hqq_exec.out_proj,
                             *graph.d_scratch.device_ptr(),
@@ -15814,7 +16399,7 @@ impl GpuDecodeStore {
                     if let Some(hqq_exec) = hqq_gqa_exec.as_ref() {
                         if let Some(fused_desc) = hqq_exec.fused_qkv.as_ref() {
                             let t_qkv = Instant::now();
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "fused_qkv",
                                 fused_desc,
                                 *graph.d_hidden.device_ptr(),
@@ -15853,7 +16438,7 @@ impl GpuDecodeStore {
                             }
                         } else {
                             let t_q = Instant::now();
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "q_proj",
                                 &hqq_exec.q_proj,
                                 *graph.d_hidden.device_ptr(),
@@ -15875,7 +16460,7 @@ impl GpuDecodeStore {
                                 timing,
                             )?;
                             let t_k = Instant::now();
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "k_proj",
                                 &hqq_exec.k_proj,
                                 *graph.d_hidden.device_ptr(),
@@ -15893,7 +16478,7 @@ impl GpuDecodeStore {
                                 timing,
                             )?;
                             let t_v = Instant::now();
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "v_proj",
                                 &hqq_exec.v_proj,
                                 *graph.d_hidden.device_ptr(),
@@ -15991,7 +16576,11 @@ impl GpuDecodeStore {
                     if *gated {
                         // Diagnostic: dump raw Q proj output BEFORE split
                         trace_f32("gqa_gated_q_pre_split", Some(layer_idx), "gated_q_pre_split", gated_q_raw_ptr, gated_q_raw_rows);
-                        if hqq_gqa_exec.is_none() {
+                        let qg_input_already_in_split_buffer = hqq_gqa_exec
+                            .as_ref()
+                            .map(|exec| exec.fused_qkv.is_none())
+                            .unwrap_or(false);
+                        if !qg_input_already_in_split_buffer {
                             let gated_q_size = nh * hd * 2; // Q + gate interleaved
                             unsafe {
                                 let err = cuda_sys::lib().cuMemcpyDtoD_v2(
@@ -16339,7 +16928,7 @@ impl GpuDecodeStore {
                     // ── GQA: O projection ──
                     if let Some(hqq_exec) = hqq_gqa_exec.as_ref() {
                         let t_o = Instant::now();
-                        self.launch_hqq4_decode_gemv_bf16(
+                        self.launch_hqq_decode_gemv_bf16(
                             "o_proj",
                             &hqq_exec.o_proj,
                             *graph.d_scratch.device_ptr(),
@@ -18464,13 +19053,13 @@ impl GpuDecodeStore {
                     for t in 0..batch_size {
                         if let Some(hqq_exec) = hqq_la_exec.as_ref() {
                             let hidden_ptr = d_bh_ptr + (t * hs * 2) as u64;
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "in_proj_qkvz",
                                 &hqq_exec.in_proj_qkvz,
                                 hidden_ptr,
                                 *graph.d_la_qkvz.device_ptr(),
                             )?;
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "in_proj_ba",
                                 &hqq_exec.in_proj_ba,
                                 hidden_ptr,
@@ -18631,7 +19220,7 @@ impl GpuDecodeStore {
                         if let Some(hqq_exec) = hqq_la_exec.as_ref() {
                             let out_ptr = d_bao_ptr + (t * gated_size * 2) as u64;
                             let hidden_ptr = d_bh_ptr + (t * hs * 2) as u64;
-                            self.launch_hqq4_decode_gemv_f32(
+                            self.launch_hqq_decode_gemv_f32(
                                 "out_proj",
                                 &hqq_exec.out_proj,
                                 out_ptr,

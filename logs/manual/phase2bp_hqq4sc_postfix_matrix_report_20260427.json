@@ -1,0 +1,75 @@
+{
+  "phase": "2BP",
+  "date": "2026-04-27",
+  "purpose": "Rerun HQQ4SC after the gated-GQA fused-QKV decode fix because the Phase 2BN HQQ4SC divergence numbers were stale.",
+  "command": "./dev witness-compare logs/manual/phase2bm_qcn_accuracy_hqq4sc_20260426.conf --profile phase2bn_qcn_64tok",
+  "run_dir": "logs/reference-test_20260427_093541",
+  "config": "logs/manual/phase2bm_qcn_accuracy_hqq4sc_20260426.conf",
+  "reference_profile": "phase2bn_qcn_64tok",
+  "controlled_settings": {
+    "model": "Qwen3-Coder-Next",
+    "kv_dtype": "polar4",
+    "gpu_expert_bits": 8,
+    "cpu_expert_bits": 8,
+    "shared_expert_quant": "int8",
+    "dense_mlp_quant": "int8",
+    "lm_head_quant": "int8",
+    "attention_quant": "hqq4",
+    "sidecar": "top4_int8_exception"
+  },
+  "metrics": {
+    "awq": {
+      "first_token": "14/14",
+      "selected_sum": 0.372141474328,
+      "top10_overlap": "123/140",
+      "avg_exact_prefix": 14.57,
+      "worst_prefix": 4,
+      "full_matches": "4/14",
+      "avg_decode_topk_percent": 55.0
+    },
+    "bf16": {
+      "first_token": "14/14",
+      "selected_sum": 0.13235183463,
+      "top10_overlap": "135/140",
+      "avg_exact_prefix": 17.14,
+      "worst_prefix": 4,
+      "full_matches": "5/14",
+      "avg_decode_topk_percent": 61.4
+    },
+    "hqq4_fixed": {
+      "first_token": "13/14",
+      "selected_sum": 0.383182601676,
+      "top10_overlap": "128/140",
+      "avg_exact_prefix": 11.79,
+      "worst_prefix": 0,
+      "full_matches": "4/14",
+      "avg_decode_topk_percent": 51.5
+    },
+    "hqq4sc_fixed": {
+      "first_token": "13/14",
+      "selected_sum": 0.380880880659,
+      "top10_overlap": "129/140",
+      "avg_exact_prefix": 14.29,
+      "worst_prefix": 0,
+      "full_matches": "4/14",
+      "avg_decode_topk_percent": 53.3,
+      "match_runs": [12, 4, 17, 9, 11, 11, 22, 17, 29, 4, 26, 0, 31, 7],
+      "first_token_miss_prompts": [12]
+    },
+    "hqq8_fixed": {
+      "first_token": "14/14",
+      "selected_sum": 0.065985003411,
+      "top10_overlap": "134/140",
+      "avg_exact_prefix": 16.43,
+      "worst_prefix": 2,
+      "full_matches": "4/14",
+      "avg_decode_topk_percent": 59.1
+    }
+  },
+  "interpretation": [
+    "HQQ4SC is now meaningfully better than fixed plain HQQ4 on exact-prefix divergence.",
+    "HQQ4SC still does not catch HQQ8 or BF16 overall in this controlled 64-token matrix.",
+    "The remaining prompt-12 first-token miss is shared with fixed HQQ4 and keeps HQQ4SC at 13/14 first-token."
+  ],
+  "speed_benchmark_run": false
+}

@@ -12,7 +12,7 @@
 //! All memory managed via cudarc (CUDA driver API).
 //! Kernels loaded from PTX (simple ops) or dlopen'd from vendored libkrasis_marlin.so (Marlin).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -236,6 +236,417 @@ fn download_device_u16(ptr: u64, len: usize) -> Result<Vec<u16>, String> {
         );
         if err != cuda_sys::CUresult::CUDA_SUCCESS {
             return Err(format!("cuMemcpyDtoH u16 failed: {:?}", err));
+        }
+    }
+    Ok(out)
+}
+
+fn fnv1a_u16_hash(values: &[u16]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &value in values {
+        for byte in value.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn fnv1a_f32_hash(values: &[f32]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &value in values {
+        for byte in value.to_bits().to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn fnv1a_i32_hash(values: &[i32]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &value in values {
+        for byte in value.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn unique_sample_indices(hidden_size: usize, selected_token: Option<usize>) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let stable = [
+        0usize,
+        1,
+        2,
+        3,
+        hidden_size / 8,
+        hidden_size / 4,
+        hidden_size / 2,
+        hidden_size.saturating_mul(3) / 4,
+        hidden_size.saturating_sub(4),
+        hidden_size.saturating_sub(3),
+        hidden_size.saturating_sub(2),
+        hidden_size.saturating_sub(1),
+    ];
+    for idx in stable {
+        if idx < hidden_size && !indices.contains(&idx) {
+            indices.push(idx);
+        }
+    }
+    if let Some(token) = selected_token {
+        let selected = [
+            token % hidden_size.max(1),
+            token.wrapping_mul(17).wrapping_add(13) % hidden_size.max(1),
+            token.wrapping_mul(31).wrapping_add(7) % hidden_size.max(1),
+            token.wrapping_mul(131).wrapping_add(53) % hidden_size.max(1),
+        ];
+        for idx in selected {
+            if idx < hidden_size && !indices.contains(&idx) {
+                indices.push(idx);
+            }
+        }
+    }
+    indices
+}
+
+fn reference_hidden_trace_json(
+    hidden_bf16: &[u16],
+    hidden_size: usize,
+    selected_token: Option<usize>,
+    device_ptr: u64,
+    stream_synced_before_download: bool,
+) -> serde_json::Value {
+    reference_hidden_trace_json_with_source(
+        hidden_bf16,
+        hidden_size,
+        selected_token,
+        device_ptr,
+        stream_synced_before_download,
+        "prefill_engine.scratch.d_hidden_last_position_before_lm_head",
+    )
+}
+
+fn reference_hidden_trace_json_with_source(
+    hidden_bf16: &[u16],
+    hidden_size: usize,
+    selected_token: Option<usize>,
+    device_ptr: u64,
+    stream_synced_before_download: bool,
+    source: &str,
+) -> serde_json::Value {
+    if hidden_bf16.is_empty() {
+        return serde_json::json!({
+            "available": false,
+            "reason": "empty_hidden",
+        });
+    }
+
+    let mut finite_count = 0usize;
+    let mut nan_count = 0usize;
+    let mut pos_inf_count = 0usize;
+    let mut neg_inf_count = 0usize;
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut min_value = f32::INFINITY;
+    let mut min_index = 0usize;
+    let mut max_value = f32::NEG_INFINITY;
+    let mut max_index = 0usize;
+
+    for (idx, &bits) in hidden_bf16.iter().enumerate() {
+        let value = bf16_to_f32(bits);
+        if value.is_nan() {
+            nan_count += 1;
+            continue;
+        }
+        if value == f32::INFINITY {
+            pos_inf_count += 1;
+        } else if value == f32::NEG_INFINITY {
+            neg_inf_count += 1;
+        } else {
+            finite_count += 1;
+            sum += value as f64;
+            sum_sq += (value as f64) * (value as f64);
+        }
+        if value < min_value {
+            min_value = value;
+            min_index = idx;
+        }
+        if value > max_value {
+            max_value = value;
+            max_index = idx;
+        }
+    }
+
+    let sample_indices = unique_sample_indices(hidden_size, None);
+    let stable_samples: Vec<serde_json::Value> = sample_indices
+        .iter()
+        .filter_map(|&idx| {
+            hidden_bf16.get(idx).map(|&bits| {
+                serde_json::json!({
+                    "index": idx,
+                    "bf16_bits": format!("0x{:04x}", bits),
+                    "value": bf16_to_f32(bits) as f64,
+                })
+            })
+        })
+        .collect();
+
+    let selected_sample_indices = selected_token
+        .map(|token| {
+            unique_sample_indices(hidden_size, Some(token))
+                .into_iter()
+                .filter(|idx| !sample_indices.contains(idx))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let selected_token_samples: Vec<serde_json::Value> = selected_sample_indices
+        .iter()
+        .filter_map(|&idx| {
+            hidden_bf16.get(idx).map(|&bits| {
+                serde_json::json!({
+                    "index": idx,
+                    "bf16_bits": format!("0x{:04x}", bits),
+                    "value": bf16_to_f32(bits) as f64,
+                })
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "available": true,
+        "source": source,
+        "dtype": "bf16",
+        "device": "cuda",
+        "shape": [1usize, hidden_size],
+        "device_ptr": format!("0x{:x}", device_ptr),
+        "stream_synced_before_download": stream_synced_before_download,
+        "hash_fnv1a64_bf16_bits": format!("0x{:016x}", fnv1a_u16_hash(hidden_bf16)),
+        "finite_count": finite_count,
+        "nan_count": nan_count,
+        "pos_inf_count": pos_inf_count,
+        "neg_inf_count": neg_inf_count,
+        "mean": if finite_count > 0 { sum / finite_count as f64 } else { f64::NAN },
+        "l2": sum_sq.sqrt(),
+        "min": {"index": min_index, "value": min_value as f64},
+        "max": {"index": max_index, "value": max_value as f64},
+        "stable_index_samples": stable_samples,
+        "selected_token_id": selected_token,
+        "selected_token_index_samples": selected_token_samples,
+    })
+}
+
+fn reference_f32_trace_json(values: &[f32], source: &str) -> serde_json::Value {
+    if values.is_empty() {
+        return serde_json::json!({
+            "available": false,
+            "reason": "empty_f32_vector",
+        });
+    }
+
+    let mut finite_count = 0usize;
+    let mut nan_count = 0usize;
+    let mut pos_inf_count = 0usize;
+    let mut neg_inf_count = 0usize;
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut min_value = f32::INFINITY;
+    let mut min_index = 0usize;
+    let mut max_value = f32::NEG_INFINITY;
+    let mut max_index = 0usize;
+
+    for (idx, &value) in values.iter().enumerate() {
+        if value.is_nan() {
+            nan_count += 1;
+            continue;
+        }
+        if value == f32::INFINITY {
+            pos_inf_count += 1;
+        } else if value == f32::NEG_INFINITY {
+            neg_inf_count += 1;
+        } else {
+            finite_count += 1;
+            sum += value as f64;
+            sum_sq += (value as f64) * (value as f64);
+        }
+        if value < min_value {
+            min_value = value;
+            min_index = idx;
+        }
+        if value > max_value {
+            max_value = value;
+            max_index = idx;
+        }
+    }
+
+    let sample_indices = unique_sample_indices(values.len(), None);
+    let stable_samples: Vec<serde_json::Value> = sample_indices
+        .iter()
+        .filter_map(|&idx| {
+            values.get(idx).map(|&value| {
+                serde_json::json!({
+                    "index": idx,
+                    "f32_bits": format!("0x{:08x}", value.to_bits()),
+                    "value": value as f64,
+                })
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "available": true,
+        "source": source,
+        "dtype": "f32",
+        "device": "cpu_derived",
+        "shape": [1usize, values.len()],
+        "hash_fnv1a64_f32_bits": format!("0x{:016x}", fnv1a_f32_hash(values)),
+        "finite_count": finite_count,
+        "nan_count": nan_count,
+        "pos_inf_count": pos_inf_count,
+        "neg_inf_count": neg_inf_count,
+        "mean": if finite_count > 0 { sum / finite_count as f64 } else { f64::NAN },
+        "l2": sum_sq.sqrt(),
+        "min": {"index": min_index, "value": min_value as f64},
+        "max": {"index": max_index, "value": max_value as f64},
+        "stable_index_samples": stable_samples,
+    })
+}
+
+fn reference_bf16_bits_trace_json(bits: &[u16], source: &str) -> serde_json::Value {
+    reference_hidden_trace_json_with_source(bits, bits.len(), None, 0, true, source)
+}
+
+fn compare_bf16_rows_json(actual: &[u16], expected: &[u16], source: &str) -> serde_json::Value {
+    let len = actual.len().min(expected.len());
+    let mut max_abs = 0.0f32;
+    let mut max_abs_index = 0usize;
+    let mut mismatch_count = 0usize;
+    let mut l2 = 0.0f64;
+    let mut first_mismatches = Vec::new();
+    for idx in 0..len {
+        if actual[idx] != expected[idx] {
+            mismatch_count += 1;
+            if first_mismatches.len() < 8 {
+                first_mismatches.push(serde_json::json!({
+                    "index": idx,
+                    "actual_bf16_bits": format!("0x{:04x}", actual[idx]),
+                    "expected_bf16_bits": format!("0x{:04x}", expected[idx]),
+                    "actual": bf16_to_f32(actual[idx]) as f64,
+                    "expected": bf16_to_f32(expected[idx]) as f64,
+                }));
+            }
+        }
+        let diff = (bf16_to_f32(actual[idx]) - bf16_to_f32(expected[idx])).abs();
+        l2 += (diff as f64) * (diff as f64);
+        if diff > max_abs {
+            max_abs = diff;
+            max_abs_index = idx;
+        }
+    }
+    serde_json::json!({
+        "available": true,
+        "source": source,
+        "compared_len": len,
+        "actual_hash_fnv1a64_bf16_bits": format!("0x{:016x}", fnv1a_u16_hash(&actual[..len])),
+        "expected_hash_fnv1a64_bf16_bits": format!("0x{:016x}", fnv1a_u16_hash(&expected[..len])),
+        "mismatch_count": mismatch_count,
+        "max_abs": max_abs as f64,
+        "max_abs_index": max_abs_index,
+        "actual_at_max": actual.get(max_abs_index).map(|&v| bf16_to_f32(v) as f64),
+        "expected_at_max": expected.get(max_abs_index).map(|&v| bf16_to_f32(v) as f64),
+        "l2_diff": l2.sqrt(),
+        "first_mismatches": first_mismatches,
+    })
+}
+
+fn reference_lm_head_logit_trace_json(
+    logits: &[f32],
+    vocab_size: usize,
+    selected_token: usize,
+    top_n: usize,
+) -> serde_json::Value {
+    let vocab_size = vocab_size.min(logits.len());
+    if vocab_size == 0 {
+        return serde_json::json!({
+            "available": false,
+            "reason": "empty_logits",
+        });
+    }
+
+    let mut max_logit = f32::NEG_INFINITY;
+    let mut max_token = 0usize;
+    for (idx, &value) in logits[..vocab_size].iter().enumerate() {
+        if !value.is_nan() && value > max_logit {
+            max_logit = value;
+            max_token = idx;
+        }
+    }
+    let sum_exp: f64 = logits[..vocab_size]
+        .iter()
+        .filter(|v| !v.is_nan())
+        .map(|&x| ((x - max_logit) as f64).exp())
+        .sum();
+    let logsumexp = max_logit as f64 + sum_exp.ln();
+    let selected_raw = logits.get(selected_token).copied().unwrap_or(f32::NAN);
+
+    let mut top_logits: Vec<(usize, f32)> = Vec::with_capacity(top_n);
+    for (idx, &value) in logits[..vocab_size].iter().enumerate() {
+        if value.is_nan() {
+            continue;
+        }
+        if top_logits.len() < top_n {
+            top_logits.push((idx, value));
+            if top_logits.len() == top_n {
+                top_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        } else if top_n > 0 && value > top_logits[top_n - 1].1 {
+            top_logits[top_n - 1] = (idx, value);
+            top_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    top_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let top_entries: Vec<serde_json::Value> = top_logits
+        .iter()
+        .enumerate()
+        .map(|(rank, &(token_id, raw_logit))| {
+            serde_json::json!({
+                "rank": rank + 1,
+                "token_id": token_id,
+                "raw_logit": raw_logit as f64,
+                "logprob": raw_logit as f64 - logsumexp,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "available": true,
+        "source": "prefill_engine.scratch.d_logits_after_lm_head_before_suppression",
+        "dtype": "f32",
+        "device_before_download": "cuda",
+        "vocab_size": vocab_size,
+        "selected_token_id": selected_token,
+        "selected_raw_logit": selected_raw as f64,
+        "selected_logprob_from_raw": selected_raw as f64 - logsumexp,
+        "max_logit": max_logit as f64,
+        "max_token_id": max_token,
+        "sum_exp_shifted": sum_exp,
+        "logsumexp": logsumexp,
+        "top_logits_before_logprob": top_entries,
+    })
+}
+
+fn download_device_u8(ptr: u64, len: usize) -> Result<Vec<u8>, String> {
+    let mut out = vec![0u8; len];
+    unsafe {
+        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+            out.as_mut_ptr() as *mut std::ffi::c_void,
+            ptr,
+            len,
+        );
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!("cuMemcpyDtoH u8 failed: {:?}", err));
         }
     }
     Ok(out)
@@ -562,6 +973,434 @@ fn compute_router_topk_cpu_reference(
                 out_i.push(idx as i32);
             }
             Ok((out_w, out_i))
+        }
+        other => Err(format!("unsupported router scoring_func {}", other)),
+    }
+}
+
+fn compute_router_topk_cpu_debug(
+    logits: &[f32],
+    topk: usize,
+    scoring_func: u8,
+    gate_bias: Option<&[f32]>,
+    e_score_corr: Option<&[f32]>,
+) -> Result<(Vec<f32>, Vec<i32>, serde_json::Value), String> {
+    let mut scores = logits.to_vec();
+    if let Some(bias) = gate_bias {
+        if bias.len() != scores.len() {
+            return Err(format!(
+                "router gate bias length mismatch: got {} expected {}",
+                bias.len(),
+                scores.len(),
+            ));
+        }
+        for (score, &b) in scores.iter_mut().zip(bias.iter()) {
+            *score += b;
+        }
+    }
+    if let Some(corr) = e_score_corr {
+        if corr.len() != scores.len() {
+            return Err(format!(
+                "router e_score correction length mismatch: got {} expected {}",
+                corr.len(),
+                scores.len(),
+            ));
+        }
+        for (score, &c) in scores.iter_mut().zip(corr.iter()) {
+            *score += c;
+        }
+    }
+
+    match scoring_func {
+        0 => {
+            let max_val = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exp_scores = scores
+                .iter()
+                .map(|&v| (v - max_val).exp())
+                .collect::<Vec<_>>();
+            let exp_sum = exp_scores.iter().copied().sum::<f32>();
+            let inv_sum = if exp_sum > 0.0 { 1.0 / exp_sum } else { 0.0 };
+            let probs = exp_scores.iter().map(|&v| v * inv_sum).collect::<Vec<_>>();
+            let mut ranked = probs.iter().copied().enumerate().collect::<Vec<_>>();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let take = topk.min(ranked.len());
+            let top = ranked.into_iter().take(take).collect::<Vec<_>>();
+            let topk_prob_sum = top.iter().map(|(_, value)| *value).sum::<f32>();
+            let inv_topk_sum = if topk_prob_sum > 0.0 {
+                1.0 / topk_prob_sum
+            } else {
+                0.0
+            };
+            let mut out_w = Vec::with_capacity(take);
+            let mut out_i = Vec::with_capacity(take);
+            let selected = top
+                .iter()
+                .map(|(idx, prob)| {
+                    serde_json::json!({
+                        "expert_id": *idx,
+                        "score_after_bias_or_corr": scores[*idx],
+                        "exp_score_minus_max": exp_scores[*idx],
+                        "softmax_probability": *prob,
+                        "topk_normalized_weight": *prob * inv_topk_sum,
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (idx, value) in top {
+                out_w.push(value * inv_topk_sum);
+                out_i.push(idx as i32);
+            }
+            Ok((
+                out_w,
+                out_i,
+                serde_json::json!({
+                    "scoring_func": "softmax",
+                    "max_score": max_val,
+                    "exp_sum": exp_sum,
+                    "topk_probability_sum": topk_prob_sum,
+                    "normalization": "softmax_all_experts_then_renormalize_topk",
+                    "gate_bias_present": gate_bias.is_some(),
+                    "e_score_corr_present": e_score_corr.is_some(),
+                    "selected_experts": selected,
+                }),
+            ))
+        }
+        1 => {
+            let mut ranked = scores
+                .iter()
+                .copied()
+                .map(|v| 1.0 / (1.0 + (-v).exp()))
+                .enumerate()
+                .collect::<Vec<_>>();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let take = topk.min(ranked.len());
+            let top = ranked.into_iter().take(take).collect::<Vec<_>>();
+            let mut out_w = Vec::with_capacity(take);
+            let mut out_i = Vec::with_capacity(take);
+            let selected = top
+                .iter()
+                .map(|(idx, value)| {
+                    serde_json::json!({
+                        "expert_id": *idx,
+                        "score_after_bias_or_corr": scores[*idx],
+                        "sigmoid_score": *value,
+                        "topk_weight": *value,
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (idx, value) in top {
+                out_w.push(value);
+                out_i.push(idx as i32);
+            }
+            Ok((
+                out_w,
+                out_i,
+                serde_json::json!({
+                    "scoring_func": "sigmoid",
+                    "normalization": "sigmoid_scores_no_topk_renormalization",
+                    "gate_bias_present": gate_bias.is_some(),
+                    "e_score_corr_present": e_score_corr.is_some(),
+                    "selected_experts": selected,
+                }),
+            ))
+        }
+        other => Err(format!("unsupported router scoring_func {}", other)),
+    }
+}
+
+fn f32_sum_in_order(values: impl IntoIterator<Item = f32>) -> f32 {
+    let mut sum = 0.0f32;
+    for value in values {
+        sum += value;
+    }
+    sum
+}
+
+#[derive(Clone, Debug)]
+struct RouterTopkKernelMathDebug {
+    metadata: serde_json::Value,
+    envelope_min: Vec<f32>,
+    envelope_max: Vec<f32>,
+    envelope_midpoint: Vec<f32>,
+}
+
+fn deterministic_reduction_orders(thread_count: usize) -> Vec<(&'static str, Vec<usize>)> {
+    let threads = thread_count.max(1);
+    let asc = (0..threads).collect::<Vec<_>>();
+    let desc = (0..threads).rev().collect::<Vec<_>>();
+    let even_odd = (0..threads)
+        .step_by(2)
+        .chain((1..threads).step_by(2))
+        .collect::<Vec<_>>();
+    let odd_even = (1..threads)
+        .step_by(2)
+        .chain((0..threads).step_by(2))
+        .collect::<Vec<_>>();
+    let mut bit_reverse = (0..threads).collect::<Vec<_>>();
+    let bits = usize::BITS - (threads.saturating_sub(1)).leading_zeros();
+    bit_reverse.sort_by_key(|&idx| idx.reverse_bits() >> (usize::BITS - bits));
+    vec![
+        ("thread_asc", asc),
+        ("thread_desc", desc),
+        ("thread_even_odd", even_odd),
+        ("thread_odd_even", odd_even),
+        ("thread_bit_reverse", bit_reverse),
+    ]
+}
+
+fn envelope_compare_json(actual: &[f32], min_values: &[f32], max_values: &[f32]) -> serde_json::Value {
+    let mut outside_max_abs = 0.0f32;
+    let mut outside_l2 = 0.0f64;
+    let mut outside_count = 0usize;
+    let mut first_outside_idx: Option<usize> = None;
+    for (idx, &value) in actual.iter().enumerate() {
+        let Some(&lo) = min_values.get(idx) else { continue };
+        let Some(&hi) = max_values.get(idx) else { continue };
+        let outside = if value < lo {
+            lo - value
+        } else if value > hi {
+            value - hi
+        } else {
+            0.0
+        };
+        if outside > 0.0 {
+            outside_count += 1;
+            if first_outside_idx.is_none() {
+                first_outside_idx = Some(idx);
+            }
+            outside_max_abs = outside_max_abs.max(outside);
+            let outside64 = outside as f64;
+            outside_l2 += outside64 * outside64;
+        }
+    }
+    serde_json::json!({
+        "all_actual_values_within_envelope": outside_count == 0,
+        "outside_count": outside_count,
+        "first_outside_idx": first_outside_idx,
+        "outside_max_abs": outside_max_abs,
+        "outside_l2": outside_l2.sqrt(),
+    })
+}
+
+fn compute_router_topk_kernel_math_debug(
+    logits: &[f32],
+    topk: usize,
+    scoring_func: u8,
+    gate_bias: Option<&[f32]>,
+    e_score_corr: Option<&[f32]>,
+    thread_count: usize,
+) -> Result<RouterTopkKernelMathDebug, String> {
+    let mut scores = logits.to_vec();
+    if let Some(bias) = gate_bias {
+        if bias.len() != scores.len() {
+            return Err(format!(
+                "router gate bias length mismatch: got {} expected {}",
+                bias.len(),
+                scores.len(),
+            ));
+        }
+        for (score, &b) in scores.iter_mut().zip(bias.iter()) {
+            *score += b;
+        }
+    }
+    if let Some(corr) = e_score_corr {
+        if corr.len() != scores.len() {
+            return Err(format!(
+                "router e_score correction length mismatch: got {} expected {}",
+                corr.len(),
+                scores.len(),
+            ));
+        }
+        for (score, &c) in scores.iter_mut().zip(corr.iter()) {
+            *score += c;
+        }
+    }
+
+    let take = topk.min(scores.len());
+    if take == 0 {
+        return Ok(RouterTopkKernelMathDebug {
+            metadata: serde_json::json!({
+                "scoring_func": scoring_func,
+                "topk": topk,
+                "selected_experts": [],
+            }),
+            envelope_min: Vec::new(),
+            envelope_max: Vec::new(),
+            envelope_midpoint: Vec::new(),
+        });
+    }
+
+    match scoring_func {
+        0 => {
+            let max_val = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exp_scores = scores
+                .iter()
+                .map(|&value| (value - max_val).exp())
+                .collect::<Vec<_>>();
+            let mut ranked = exp_scores.iter().copied().enumerate().collect::<Vec<_>>();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let top = ranked.into_iter().take(take).collect::<Vec<_>>();
+
+            let exact_top_sum = f32_sum_in_order(top.iter().map(|(_, value)| *value));
+            let exact_selected_weights = top
+                .iter()
+                .map(|(_, value)| if exact_top_sum > 0.0 { *value / exact_top_sum } else { 0.0 })
+                .collect::<Vec<_>>();
+
+            let seq_sum = f32_sum_in_order(exp_scores.iter().copied());
+            let threads = thread_count.max(1);
+            let mut per_thread = vec![0.0f32; threads];
+            for tid in 0..threads {
+                let mut local = 0.0f32;
+                let mut idx = tid;
+                while idx < exp_scores.len() {
+                    local += exp_scores[idx];
+                    idx += threads;
+                }
+                per_thread[tid] = local;
+            }
+            let thread_asc_sum = f32_sum_in_order(per_thread.iter().copied());
+            let thread_desc_sum = f32_sum_in_order(per_thread.iter().rev().copied());
+
+            let two_stage_weights = |denom: f32| -> Vec<f32> {
+                let inv_sum = if denom > 0.0 { 1.0f32 / denom } else { 0.0 };
+                let probs = top
+                    .iter()
+                    .map(|(_, value)| *value * inv_sum)
+                    .collect::<Vec<_>>();
+                let top_sum = f32_sum_in_order(probs.iter().copied());
+                let inv_top = if top_sum > 0.0 { 1.0f32 / top_sum } else { 0.0 };
+                probs.iter().map(|value| *value * inv_top).collect::<Vec<_>>()
+            };
+
+            let mut variants: Vec<(String, f32, Vec<f32>)> = vec![
+                (
+                    "rust_sequential_all_experts".to_string(),
+                    seq_sum,
+                    two_stage_weights(seq_sum),
+                ),
+                (
+                    "thread_asc_atomic_sum".to_string(),
+                    thread_asc_sum,
+                    two_stage_weights(thread_asc_sum),
+                ),
+                (
+                    "thread_desc_atomic_sum".to_string(),
+                    thread_desc_sum,
+                    two_stage_weights(thread_desc_sum),
+                ),
+            ];
+            for (label, order) in deterministic_reduction_orders(threads) {
+                let denom = f32_sum_in_order(order.iter().filter_map(|&idx| per_thread.get(idx).copied()));
+                variants.push((label.to_string(), denom, two_stage_weights(denom)));
+            }
+            let mut envelope_min = vec![f32::INFINITY; take];
+            let mut envelope_max = vec![f32::NEG_INFINITY; take];
+            for (_, _, weights) in &variants {
+                for idx in 0..take {
+                    envelope_min[idx] = envelope_min[idx].min(weights[idx]);
+                    envelope_max[idx] = envelope_max[idx].max(weights[idx]);
+                }
+            }
+            let envelope_midpoint = envelope_min
+                .iter()
+                .zip(envelope_max.iter())
+                .map(|(&lo, &hi)| lo + (hi - lo) * 0.5)
+                .collect::<Vec<_>>();
+            let envelope_spread = envelope_min
+                .iter()
+                .zip(envelope_max.iter())
+                .map(|(&lo, &hi)| hi - lo)
+                .collect::<Vec<_>>();
+            let envelope_spread_l2 = diag_l2_norm(&envelope_spread);
+            let variant_json = variants
+                .iter()
+                .map(|(label, denom, weights)| {
+                    serde_json::json!({
+                        "label": label,
+                        "denominator": *denom,
+                        "weights": weights,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let selected = top
+                .iter()
+                .zip(exact_selected_weights.iter())
+                .map(|((idx, exp_value), &weight)| {
+                    serde_json::json!({
+                        "expert_id": *idx,
+                        "score_after_bias_or_corr": scores[*idx],
+                        "exp_score_minus_max": *exp_value,
+                        "exact_selected_logit_normalized_weight": weight,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            Ok(RouterTopkKernelMathDebug {
+                metadata: serde_json::json!({
+                "scoring_func": "softmax",
+                "max_score": max_val,
+                "thread_count": threads,
+                "exp_sum_rust_sequential": seq_sum,
+                "exp_sum_thread_asc": thread_asc_sum,
+                "exp_sum_thread_desc": thread_desc_sum,
+                "exp_sum_thread_order_spread": (thread_asc_sum - thread_desc_sum).abs(),
+                "topk_exp_sum": exact_top_sum,
+                "selected_experts": selected,
+                "weights_exact_selected_logit_normalization": exact_selected_weights,
+                "weights_two_stage_rust_sequential_sum": two_stage_weights(seq_sum),
+                "weights_two_stage_thread_asc_sum": two_stage_weights(thread_asc_sum),
+                "weights_two_stage_thread_desc_sum": two_stage_weights(thread_desc_sum),
+                "same_logit_reduction_order_variants": variant_json,
+                "same_logit_reduction_order_envelope_min": envelope_min,
+                "same_logit_reduction_order_envelope_max": envelope_max,
+                "same_logit_reduction_order_envelope_midpoint": envelope_midpoint,
+                "same_logit_reduction_order_envelope_spread": envelope_spread,
+                "same_logit_reduction_order_envelope_spread_l2": envelope_spread_l2,
+                "same_logit_reduction_order_variant_count": variants.len(),
+                "normalization": "softmax_kernel_uses_full_sum_then_topk_renormalization; exact_selected_variant_cancels_full_sum",
+                "gate_bias_present": gate_bias.is_some(),
+                "e_score_corr_present": e_score_corr.is_some(),
+                }),
+                envelope_min,
+                envelope_max,
+                envelope_midpoint,
+            })
+        }
+        1 => {
+            let mut ranked = scores
+                .iter()
+                .copied()
+                .map(|value| 1.0f32 / (1.0f32 + (-value).exp()))
+                .enumerate()
+                .collect::<Vec<_>>();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let top = ranked.into_iter().take(take).collect::<Vec<_>>();
+            let selected = top
+                .iter()
+                .map(|(idx, value)| {
+                    serde_json::json!({
+                        "expert_id": *idx,
+                        "score_after_bias_or_corr": scores[*idx],
+                        "sigmoid_score": *value,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let weights = top.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+            Ok(RouterTopkKernelMathDebug {
+                metadata: serde_json::json!({
+                    "scoring_func": "sigmoid",
+                    "selected_experts": selected,
+                    "normalization": "sigmoid_scores_no_topk_renormalization",
+                    "same_logit_reduction_order_variant_count": 1,
+                    "same_logit_reduction_order_envelope_spread_l2": 0.0,
+                    "gate_bias_present": gate_bias.is_some(),
+                    "e_score_corr_present": e_score_corr.is_some(),
+                }),
+                envelope_min: weights.clone(),
+                envelope_max: weights.clone(),
+                envelope_midpoint: weights,
+            })
         }
         other => Err(format!("unsupported router scoring_func {}", other)),
     }
@@ -1503,12 +2342,18 @@ pub struct PrefillKernels {
     fused_add_rmsnorm: RawCuFunc,
     embedding: RawCuFunc,
     hqq4_dequant_bf16: RawCuFunc,
+    hqq4_prefill_gemm_bf16: RawCuFunc,
+    hqq8_prefill_gemm_bf16: RawCuFunc,
+    hqq_prefill_int8_exception_delta_bf16: RawCuFunc,
+    hqq_apply_sidecar_bf16: RawCuFunc,
     rope: RawCuFunc,
     silu_mul: RawCuFunc,
     relu2: RawCuFunc,
     sigmoid_mul: RawCuFunc, // gated GQA: out = attn * sigmoid(gate)
     sigmoid_topk: RawCuFunc,
     softmax_topk: RawCuFunc,
+    softmax_topk_sum_probe: RawCuFunc,
+    softmax_topk_selected_probe: RawCuFunc,
     moe_sum_reduce: RawCuFunc,
     gqa_prefill: RawCuFunc,
     kv_cache_append: RawCuFunc,
@@ -1938,6 +2783,20 @@ pub struct HqqTensorExecDescriptor {
 }
 
 #[derive(Debug, Clone)]
+pub struct HqqPrefillSidecarDescriptor {
+    pub tensor_name: String,
+    pub mode: String,
+    pub variant_name: String,
+    pub correction_ptr: u64,
+    pub scales_ptr: u64,
+    pub output_rows_ptr: u64,
+    pub start_cols_ptr: u64,
+    pub widths_ptr: u64,
+    pub row_group_count: usize,
+    pub max_width: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct HqqGqaPrefillDescriptor {
     pub backend: String,
     pub format_version: usize,
@@ -2070,6 +2929,7 @@ pub struct PrefillLayerWeights {
     pub hqq_gqa: Option<HqqGqaPrefillDescriptor>,
     pub hqq_mla: Option<HqqMlaPrefillDescriptor>,
     pub hqq_linear_attention: Option<HqqLinearAttentionPrefillDescriptor>,
+    pub hqq_prefill_sidecars: Vec<HqqPrefillSidecarDescriptor>,
 }
 
 /// Expert weight pointers for DMA to GPU (mirrors ExpertDataPtr).
@@ -2221,6 +3081,9 @@ pub struct PrefillEngine {
     pub cublas_handle: cudarc::cublas::sys::cublasHandle_t,
     pub shared_cublas_handle: cudarc::cublas::sys::cublasHandle_t,
     pub h_logits: Vec<f32>,
+    pub reference_debug_trace_enabled: bool,
+    pub last_reference_debug_trace: Option<serde_json::Value>,
+    pub reference_prefill_stage_snapshots: RefCell<Vec<serde_json::Value>>,
     // Host staging buffers for routing results
     pub h_topk_ids: Vec<i32>,
     pub h_topk_weights: Vec<f32>,
@@ -2415,6 +3278,649 @@ impl PrefillEngine {
         self.safety_margin_mb = margin_mb.max(PREFILL_SAFETY_MARGIN_MB);
     }
 
+    pub fn set_reference_debug_trace_enabled(&mut self, enabled: bool) {
+        self.reference_debug_trace_enabled = enabled;
+        self.last_reference_debug_trace = None;
+        self.reference_prefill_stage_snapshots.borrow_mut().clear();
+    }
+
+    pub fn take_reference_debug_trace(&mut self) -> Option<serde_json::Value> {
+        self.last_reference_debug_trace.take()
+    }
+
+    fn push_reference_stage_snapshot(
+        &self,
+        stage: &str,
+        layer_idx: Option<usize>,
+        chunk_idx: usize,
+        absolute_position: usize,
+        token_id: usize,
+        ptr: u64,
+        row_idx: usize,
+        width: usize,
+    ) {
+        if !self.reference_debug_trace_enabled || width == 0 {
+            return;
+        }
+        let row_ptr = ptr + ((row_idx * width * std::mem::size_of::<u16>()) as u64);
+        let synced = self.stream_sync().is_ok();
+        match download_device_u16(row_ptr, width) {
+            Ok(values) => {
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": row_idx,
+                    "token_id": token_id,
+                    "trace": reference_hidden_trace_json_with_source(
+                        &values,
+                        width,
+                        None,
+                        row_ptr,
+                        synced,
+                        stage,
+                    ),
+                }));
+            }
+            Err(err) => {
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": row_idx,
+                    "token_id": token_id,
+                    "available": false,
+                    "error": err,
+                }));
+            }
+        }
+    }
+
+    fn push_reference_stage_bf16_chunk_snapshot(
+        &self,
+        stage: &str,
+        layer_idx: Option<usize>,
+        chunk_idx: usize,
+        absolute_position: usize,
+        token_id: usize,
+        ptr: u64,
+        row_count: usize,
+        row_width: usize,
+        absolute_row_start: usize,
+    ) {
+        if !self.reference_debug_trace_enabled || row_count == 0 || row_width == 0 {
+            return;
+        }
+        let value_count = row_count.saturating_mul(row_width);
+        let synced = self.stream_sync().is_ok();
+        match download_device_u16(ptr, value_count) {
+            Ok(values) => {
+                let row_summaries: Vec<serde_json::Value> = values
+                    .chunks(row_width)
+                    .enumerate()
+                    .map(|(row, row_values)| {
+                        let mut sum = 0.0f64;
+                        let mut sum_sq = 0.0f64;
+                        let mut min_value = f32::INFINITY;
+                        let mut max_value = f32::NEG_INFINITY;
+                        for &bits in row_values {
+                            let value = bf16_to_f32(bits);
+                            if value.is_finite() {
+                                sum += value as f64;
+                                sum_sq += (value as f64) * (value as f64);
+                            }
+                            if value < min_value {
+                                min_value = value;
+                            }
+                            if value > max_value {
+                                max_value = value;
+                            }
+                        }
+                        serde_json::json!({
+                            "row_index_in_trace_chunk": row,
+                            "absolute_row": absolute_row_start + row,
+                            "hash_fnv1a64_bf16_bits": format!("0x{:016x}", fnv1a_u16_hash(row_values)),
+                            "mean": if row_values.is_empty() { f64::NAN } else { sum / row_values.len() as f64 },
+                            "l2": sum_sq.sqrt(),
+                            "min": min_value as f64,
+                            "max": max_value as f64,
+                        })
+                    })
+                    .collect();
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": absolute_row_start,
+                    "token_id": token_id,
+                    "row_count": row_count,
+                    "row_width": row_width,
+                    "absolute_row_start": absolute_row_start,
+                    "trace": reference_hidden_trace_json_with_source(
+                        &values,
+                        value_count,
+                        None,
+                        ptr,
+                        synced,
+                        stage,
+                    ),
+                    "row_summaries": row_summaries,
+                }));
+            }
+            Err(err) => {
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": absolute_row_start,
+                    "token_id": token_id,
+                    "row_count": row_count,
+                    "row_width": row_width,
+                    "absolute_row_start": absolute_row_start,
+                    "available": false,
+                    "error": err,
+                }));
+            }
+        }
+    }
+
+    fn push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+        &self,
+        stage: &str,
+        layer_idx: Option<usize>,
+        chunk_idx: usize,
+        absolute_position: usize,
+        token_id: usize,
+        ptr: u64,
+        row_count: usize,
+        row_width: usize,
+        absolute_row_start: usize,
+        watched_absolute_rows: &[usize],
+        segment_width: usize,
+    ) {
+        if !self.reference_debug_trace_enabled
+            || row_count == 0
+            || row_width == 0
+            || watched_absolute_rows.is_empty()
+            || segment_width == 0
+        {
+            return;
+        }
+        let value_count = row_count.saturating_mul(row_width);
+        let synced = self.stream_sync().is_ok();
+        match download_device_u16(ptr, value_count) {
+            Ok(values) => {
+                let watched: std::collections::HashSet<usize> =
+                    watched_absolute_rows.iter().copied().collect();
+                let row_column_segments: Vec<serde_json::Value> = values
+                    .chunks(row_width)
+                    .enumerate()
+                    .filter_map(|(row, row_values)| {
+                        let absolute_row = absolute_row_start + row;
+                        if !watched.contains(&absolute_row) {
+                            return None;
+                        }
+                        let segments: Vec<serde_json::Value> = row_values
+                            .chunks(segment_width)
+                            .enumerate()
+                            .map(|(seg_idx, seg_values)| {
+                                let col_start = seg_idx * segment_width;
+                                let col_end = col_start + seg_values.len();
+                                let mut sum = 0.0f64;
+                                let mut sum_sq = 0.0f64;
+                                let mut min_value = f32::INFINITY;
+                                let mut max_value = f32::NEG_INFINITY;
+                                for &bits in seg_values {
+                                    let value = bf16_to_f32(bits);
+                                    if value.is_finite() {
+                                        sum += value as f64;
+                                        sum_sq += (value as f64) * (value as f64);
+                                    }
+                                    if value < min_value {
+                                        min_value = value;
+                                    }
+                                    if value > max_value {
+                                        max_value = value;
+                                    }
+                                }
+                                serde_json::json!({
+                                    "col_start": col_start,
+                                    "col_end": col_end,
+                                    "width": seg_values.len(),
+                                    "hash_fnv1a64_bf16_bits": format!("0x{:016x}", fnv1a_u16_hash(seg_values)),
+                                    "mean": if seg_values.is_empty() { f64::NAN } else { sum / seg_values.len() as f64 },
+                                    "l2": sum_sq.sqrt(),
+                                    "min": min_value as f64,
+                                    "max": max_value as f64,
+                                })
+                            })
+                            .collect();
+                        Some(serde_json::json!({
+                            "absolute_row": absolute_row,
+                            "row_index_in_trace_chunk": row,
+                            "segment_width": segment_width,
+                            "segments": segments,
+                        }))
+                    })
+                    .collect();
+
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": absolute_row_start,
+                    "token_id": token_id,
+                    "row_count": row_count,
+                    "row_width": row_width,
+                    "absolute_row_start": absolute_row_start,
+                    "watched_absolute_rows": watched_absolute_rows,
+                    "trace": reference_hidden_trace_json_with_source(
+                        &values,
+                        value_count,
+                        None,
+                        ptr,
+                        synced,
+                        stage,
+                    ),
+                    "row_column_segments": row_column_segments,
+                }));
+            }
+            Err(err) => {
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": absolute_row_start,
+                    "token_id": token_id,
+                    "row_count": row_count,
+                    "row_width": row_width,
+                    "absolute_row_start": absolute_row_start,
+                    "watched_absolute_rows": watched_absolute_rows,
+                    "available": false,
+                    "error": err,
+                }));
+            }
+        }
+    }
+
+    fn push_reference_stage_f32_chunk_snapshot(
+        &self,
+        stage: &str,
+        layer_idx: Option<usize>,
+        chunk_idx: usize,
+        absolute_position: usize,
+        token_id: usize,
+        ptr: u64,
+        row_count: usize,
+        row_width: usize,
+        absolute_row_start: usize,
+    ) {
+        if !self.reference_debug_trace_enabled || row_count == 0 || row_width == 0 {
+            return;
+        }
+        let value_count = row_count.saturating_mul(row_width);
+        let synced = self.stream_sync().is_ok();
+        match download_device_f32(ptr, value_count) {
+            Ok(values) => {
+                let row_summaries: Vec<serde_json::Value> = values
+                    .chunks(row_width)
+                    .enumerate()
+                    .map(|(row, row_values)| {
+                        let mut finite_count = 0usize;
+                        let mut sum = 0.0f64;
+                        let mut sum_sq = 0.0f64;
+                        let mut min_value = f32::INFINITY;
+                        let mut max_value = f32::NEG_INFINITY;
+                        for &value in row_values {
+                            if value.is_finite() {
+                                finite_count += 1;
+                                sum += value as f64;
+                                sum_sq += (value as f64) * (value as f64);
+                            }
+                            if value < min_value {
+                                min_value = value;
+                            }
+                            if value > max_value {
+                                max_value = value;
+                            }
+                        }
+                        serde_json::json!({
+                            "row_index_in_trace_chunk": row,
+                            "absolute_row": absolute_row_start + row,
+                            "hash_fnv1a64_f32_bits": format!("0x{:016x}", fnv1a_f32_hash(row_values)),
+                            "mean": if finite_count == 0 { f64::NAN } else { sum / finite_count as f64 },
+                            "l2": sum_sq.sqrt(),
+                            "min": min_value as f64,
+                            "max": max_value as f64,
+                        })
+                    })
+                    .collect();
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": absolute_row_start,
+                    "token_id": token_id,
+                    "row_count": row_count,
+                    "row_width": row_width,
+                    "absolute_row_start": absolute_row_start,
+                    "trace": reference_f32_trace_json(&values, stage),
+                    "trace_device_ptr": format!("0x{:x}", ptr),
+                    "stream_sync_before_download_success": synced,
+                    "row_summaries": row_summaries,
+                }));
+            }
+            Err(err) => {
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": absolute_row_start,
+                    "token_id": token_id,
+                    "row_count": row_count,
+                    "row_width": row_width,
+                    "absolute_row_start": absolute_row_start,
+                    "available": false,
+                    "error": err,
+                }));
+            }
+        }
+    }
+
+    fn push_reference_stage_f32_chunk_snapshot_with_column_segments(
+        &self,
+        stage: &str,
+        layer_idx: Option<usize>,
+        chunk_idx: usize,
+        absolute_position: usize,
+        token_id: usize,
+        ptr: u64,
+        row_count: usize,
+        row_width: usize,
+        absolute_row_start: usize,
+        watched_absolute_rows: &[usize],
+        segment_width: usize,
+    ) {
+        if !self.reference_debug_trace_enabled
+            || row_count == 0
+            || row_width == 0
+            || watched_absolute_rows.is_empty()
+            || segment_width == 0
+        {
+            return;
+        }
+        let value_count = row_count.saturating_mul(row_width);
+        let synced = self.stream_sync().is_ok();
+        match download_device_f32(ptr, value_count) {
+            Ok(values) => {
+                let watched: std::collections::HashSet<usize> =
+                    watched_absolute_rows.iter().copied().collect();
+                let row_column_segments: Vec<serde_json::Value> = values
+                    .chunks(row_width)
+                    .enumerate()
+                    .filter_map(|(row, row_values)| {
+                        let absolute_row = absolute_row_start + row;
+                        if !watched.contains(&absolute_row) {
+                            return None;
+                        }
+                        let segments: Vec<serde_json::Value> = row_values
+                            .chunks(segment_width)
+                            .enumerate()
+                            .map(|(seg_idx, seg_values)| {
+                                let col_start = seg_idx * segment_width;
+                                let col_end = col_start + seg_values.len();
+                                let mut finite_count = 0usize;
+                                let mut sum = 0.0f64;
+                                let mut sum_sq = 0.0f64;
+                                let mut min_value = f32::INFINITY;
+                                let mut max_value = f32::NEG_INFINITY;
+                                for &value in seg_values {
+                                    if value.is_finite() {
+                                        finite_count += 1;
+                                        sum += value as f64;
+                                        sum_sq += (value as f64) * (value as f64);
+                                    }
+                                    if value < min_value {
+                                        min_value = value;
+                                    }
+                                    if value > max_value {
+                                        max_value = value;
+                                    }
+                                }
+                                serde_json::json!({
+                                    "col_start": col_start,
+                                    "col_end": col_end,
+                                    "width": seg_values.len(),
+                                    "hash_fnv1a64_f32_bits": format!("0x{:016x}", fnv1a_f32_hash(seg_values)),
+                                    "mean": if finite_count == 0 { f64::NAN } else { sum / finite_count as f64 },
+                                    "l2": sum_sq.sqrt(),
+                                    "min": min_value as f64,
+                                    "max": max_value as f64,
+                                })
+                            })
+                            .collect();
+                        Some(serde_json::json!({
+                            "absolute_row": absolute_row,
+                            "row_index_in_trace_chunk": row,
+                            "segment_width": segment_width,
+                            "segments": segments,
+                        }))
+                    })
+                    .collect();
+
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": absolute_row_start,
+                    "token_id": token_id,
+                    "row_count": row_count,
+                    "row_width": row_width,
+                    "absolute_row_start": absolute_row_start,
+                    "watched_absolute_rows": watched_absolute_rows,
+                    "trace": reference_f32_trace_json(&values, stage),
+                    "trace_device_ptr": format!("0x{:x}", ptr),
+                    "stream_sync_before_download_success": synced,
+                    "row_column_segments": row_column_segments,
+                }));
+            }
+            Err(err) => {
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": absolute_row_start,
+                    "token_id": token_id,
+                    "row_count": row_count,
+                    "row_width": row_width,
+                    "absolute_row_start": absolute_row_start,
+                    "watched_absolute_rows": watched_absolute_rows,
+                    "available": false,
+                    "error": err,
+                }));
+            }
+        }
+    }
+
+    fn push_reference_stage_i32_chunk_snapshot(
+        &self,
+        stage: &str,
+        layer_idx: Option<usize>,
+        chunk_idx: usize,
+        absolute_position: usize,
+        token_id: usize,
+        ptr: u64,
+        row_count: usize,
+        row_width: usize,
+        absolute_row_start: usize,
+    ) {
+        if !self.reference_debug_trace_enabled || row_count == 0 || row_width == 0 {
+            return;
+        }
+        let value_count = row_count.saturating_mul(row_width);
+        let synced = self.stream_sync().is_ok();
+        match download_device_i32(ptr, value_count) {
+            Ok(values) => {
+                let row_summaries: Vec<serde_json::Value> = values
+                    .chunks(row_width)
+                    .enumerate()
+                    .map(|(row, row_values)| {
+                        let min_value = row_values.iter().copied().min().unwrap_or_default();
+                        let max_value = row_values.iter().copied().max().unwrap_or_default();
+                        serde_json::json!({
+                            "row_index_in_trace_chunk": row,
+                            "absolute_row": absolute_row_start + row,
+                            "hash_fnv1a64_i32_bits": format!("0x{:016x}", fnv1a_i32_hash(row_values)),
+                            "min": min_value,
+                            "max": max_value,
+                            "values": row_values,
+                        })
+                    })
+                    .collect();
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": absolute_row_start,
+                    "token_id": token_id,
+                    "row_count": row_count,
+                    "row_width": row_width,
+                    "absolute_row_start": absolute_row_start,
+                    "trace": {
+                        "available": true,
+                        "source": stage,
+                        "dtype": "i32",
+                        "device": "cuda_download",
+                        "shape": [row_count, row_width],
+                        "hash_fnv1a64_i32_bits": format!("0x{:016x}", fnv1a_i32_hash(&values)),
+                        "trace_device_ptr": format!("0x{:x}", ptr),
+                        "stream_sync_before_download_success": synced,
+                    },
+                    "row_summaries": row_summaries,
+                }));
+            }
+            Err(err) => {
+                self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                    "stage": stage,
+                    "layer": layer_idx,
+                    "chunk": chunk_idx,
+                    "absolute_position": absolute_position,
+                    "row_index_in_chunk": absolute_row_start,
+                    "token_id": token_id,
+                    "row_count": row_count,
+                    "row_width": row_width,
+                    "absolute_row_start": absolute_row_start,
+                    "available": false,
+                    "error": err,
+                }));
+            }
+        }
+    }
+
+    fn push_reference_stage_f32_snapshot(
+        &self,
+        stage: &str,
+        layer_idx: Option<usize>,
+        chunk_idx: usize,
+        absolute_position: usize,
+        token_id: usize,
+        values: &[f32],
+    ) {
+        if !self.reference_debug_trace_enabled {
+            return;
+        }
+        self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+            "stage": stage,
+            "layer": layer_idx,
+            "chunk": chunk_idx,
+            "absolute_position": absolute_position,
+            "token_id": token_id,
+            "trace": reference_f32_trace_json(values, stage),
+        }));
+    }
+
+    fn push_reference_stage_bf16_bits_snapshot(
+        &self,
+        stage: &str,
+        layer_idx: Option<usize>,
+        chunk_idx: usize,
+        absolute_position: usize,
+        token_id: usize,
+        values: &[u16],
+        metadata: serde_json::Value,
+    ) {
+        if !self.reference_debug_trace_enabled {
+            return;
+        }
+        self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+            "stage": stage,
+            "layer": layer_idx,
+            "chunk": chunk_idx,
+            "absolute_position": absolute_position,
+            "token_id": token_id,
+            "metadata": metadata,
+            "trace": reference_bf16_bits_trace_json(values, stage),
+        }));
+    }
+
+    fn push_reference_stage_bf16_compare(
+        &self,
+        stage: &str,
+        layer_idx: Option<usize>,
+        chunk_idx: usize,
+        absolute_position: usize,
+        token_id: usize,
+        actual: &[u16],
+        expected: &[u16],
+        metadata: serde_json::Value,
+    ) {
+        if !self.reference_debug_trace_enabled {
+            return;
+        }
+        self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+            "stage": stage,
+            "layer": layer_idx,
+            "chunk": chunk_idx,
+            "absolute_position": absolute_position,
+            "token_id": token_id,
+            "metadata": metadata,
+            "trace": compare_bf16_rows_json(actual, expected, stage),
+        }));
+    }
+
+    fn push_reference_stage_metadata(
+        &self,
+        stage: &str,
+        layer_idx: Option<usize>,
+        chunk_idx: usize,
+        absolute_position: usize,
+        token_id: usize,
+        metadata: serde_json::Value,
+    ) {
+        if !self.reference_debug_trace_enabled {
+            return;
+        }
+        self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+            "stage": stage,
+            "layer": layer_idx,
+            "chunk": chunk_idx,
+            "absolute_position": absolute_position,
+            "token_id": token_id,
+            "metadata": metadata,
+        }));
+    }
+
     fn refresh_trace_config(&mut self) {
         self.trace = PrefillTraceConfig::from_env();
     }
@@ -2513,6 +4019,862 @@ impl PrefillEngine {
         let row_ptr = base_ptr + (row_idx * row_elems * 2) as u64;
         self.trace_emit_bf16(
             step, position, token_id, layer, component, tensor, row_ptr, row_elems,
+        );
+    }
+
+    fn trace_prefill_layer_summary_enabled(&self, step: usize, layer_idx: usize) -> bool {
+        if Self::trace_prefill_input_rows_only() {
+            return false;
+        }
+        self.trace.as_ref().map_or(false, |trace| {
+            trace.should_emit(step, Some(layer_idx), "prefill_layer_summary")
+        })
+    }
+
+    fn trace_prefill_la_projection_summary_enabled(&self, step: usize, layer_idx: usize) -> bool {
+        layer_idx == 0 && self.trace_prefill_layer_summary_enabled(step, layer_idx)
+    }
+
+    fn trace_target_position_matches(position: usize) -> bool {
+        match std::env::var("KRASIS_TRACE_TARGET_POS") {
+            Ok(raw) => raw.trim().parse::<usize>().map_or(false, |target| target == position),
+            Err(_) => true,
+        }
+    }
+
+    fn trace_prefill_input_rows_only() -> bool {
+        matches!(
+            std::env::var("KRASIS_TRACE_INPUT_ROWS_ONLY"),
+            Ok(raw) if raw.trim() == "1" || raw.trim().eq_ignore_ascii_case("true")
+        )
+    }
+
+    fn trace_input_row_position_matches(position: usize) -> bool {
+        let Ok(raw) = std::env::var("KRASIS_TRACE_INPUT_ROW_POSITIONS") else {
+            return Self::trace_target_position_matches(position);
+        };
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("all") || trimmed == "*" {
+            return true;
+        }
+        trimmed
+            .split(',')
+            .filter_map(|part| part.trim().parse::<usize>().ok())
+            .any(|target| target == position)
+    }
+
+    fn trace_input_row_positions_for_chunk(chunk_start: usize, m: usize) -> Vec<(usize, usize)> {
+        if m == 0 {
+            return Vec::new();
+        }
+        let chunk_end = chunk_start.saturating_add(m);
+        let Ok(raw) = std::env::var("KRASIS_TRACE_INPUT_ROW_POSITIONS") else {
+            return match std::env::var("KRASIS_TRACE_TARGET_POS")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+            {
+                Some(pos) if pos >= chunk_start && pos < chunk_end => {
+                    vec![(pos, pos - chunk_start)]
+                }
+                Some(_) => Vec::new(),
+                None => vec![(chunk_end - 1, m - 1)],
+            };
+        };
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("all") || trimmed == "*" {
+            return (0..m)
+                .map(|row_idx| (chunk_start + row_idx, row_idx))
+                .collect();
+        }
+        let mut positions = trimmed
+            .split(',')
+            .filter_map(|part| part.trim().parse::<usize>().ok())
+            .filter(|&pos| pos >= chunk_start && pos < chunk_end)
+            .map(|pos| (pos, pos - chunk_start))
+            .collect::<Vec<_>>();
+        positions.sort_unstable_by_key(|&(pos, _)| pos);
+        positions.dedup_by_key(|(pos, _)| *pos);
+        positions
+    }
+
+    fn trace_input_row_layer_matches(layer_idx: usize) -> bool {
+        let Ok(raw) = std::env::var("KRASIS_TRACE_INPUT_ROW_LAYERS") else {
+            return layer_idx == 0;
+        };
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("all") || trimmed == "*" {
+            return true;
+        }
+        trimmed
+            .split(',')
+            .filter_map(|part| part.trim().parse::<usize>().ok())
+            .any(|target| target == layer_idx)
+    }
+
+    fn trace_input_row_tensor_matches(tensor: &str) -> bool {
+        let Ok(raw) = std::env::var("KRASIS_TRACE_INPUT_ROW_TENSORS") else {
+            return true;
+        };
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("all") || trimmed == "*" {
+            return true;
+        }
+        trimmed
+            .split(',')
+            .map(|part| part.trim())
+            .any(|target| target == tensor)
+    }
+
+    fn trace_prefill_input_row_full_enabled(
+        &self,
+        step: usize,
+        layer_idx: usize,
+        position: usize,
+        tensor: &str,
+    ) -> bool {
+        Self::trace_input_row_layer_matches(layer_idx)
+            && Self::trace_input_row_tensor_matches(tensor)
+            && self.trace.as_ref().map_or(false, |trace| {
+                trace.should_emit(step, Some(layer_idx), "prefill_layer_summary")
+            })
+            && Self::trace_input_row_position_matches(position)
+    }
+
+    fn trace_emit_bf16_weight_slice_summary_from_bits(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer_idx: usize,
+        backend: &str,
+        tensor: &str,
+        slice: &str,
+        bits: &[u16],
+        cols: usize,
+        nk: usize,
+        group_offset: usize,
+        group_rows: usize,
+        group_dim: usize,
+    ) {
+        let Some(trace) = self.trace.as_ref() else {
+            return;
+        };
+        if cols == 0
+            || nk == 0
+            || group_rows == 0
+            || !trace.should_emit(step, Some(layer_idx), "prefill_layer_summary")
+        {
+            return;
+        }
+
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut l2 = 0.0f64;
+        let mut nan = 0usize;
+        let mut inf = 0usize;
+        let mut hash = 0xcbf29ce484222325u64;
+        let mut sample = Vec::with_capacity(trace.sample_values);
+        let mut count = 0usize;
+
+        for head in 0..nk {
+            let start_row = head * group_dim + group_offset;
+            for row in start_row..start_row + group_rows {
+                let start = row * cols;
+                let end = start + cols;
+                if end > bits.len() {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        step,
+                        position,
+                        token_id,
+                        Some(layer_idx),
+                        "prefill_layer_summary",
+                        &format!(
+                            "phase=weight_slice_oob backend={} tensor={} slice={} row={} cols={} bits_len={}",
+                            backend,
+                            tensor,
+                            slice,
+                            row,
+                            cols,
+                            bits.len()
+                        ),
+                    );
+                    return;
+                }
+                for &raw in &bits[start..end] {
+                    hash ^= raw as u64;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                    let value = bf16_to_f32(raw);
+                    if sample.len() < trace.sample_values {
+                        sample.push(value);
+                    }
+                    count += 1;
+                    if value.is_nan() {
+                        nan += 1;
+                        continue;
+                    }
+                    if value.is_infinite() {
+                        inf += 1;
+                        continue;
+                    }
+                    min_v = min_v.min(value);
+                    max_v = max_v.max(value);
+                    let vf = value as f64;
+                    sum += vf;
+                    l2 += vf * vf;
+                }
+            }
+        }
+
+        let finite = count.saturating_sub(nan + inf);
+        let (mean, l2_norm, min_out, max_out) = if finite > 0 {
+            (sum / finite as f64, l2.sqrt(), min_v as f64, max_v as f64)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        eprintln!(
+            "[KRASIS-TRACE] event=weight_surface_summary step={} pos={} tok={} layer={} component=prefill_layer_summary backend={} tensor={} slice={} dtype=bf16 rows={} cols={} full_n={} hash64=0x{:016x} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6} nan={} inf={}",
+            step,
+            position,
+            token_id,
+            layer_idx,
+            backend,
+            tensor,
+            slice,
+            nk * group_rows,
+            cols,
+            count,
+            hash,
+            trace_format_sample(&sample),
+            l2_norm,
+            mean,
+            min_out,
+            max_out,
+            nan,
+            inf,
+        );
+    }
+
+    fn trace_emit_bf16_row_full_words(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer_idx: usize,
+        tensor: &str,
+        base_ptr: u64,
+        row_idx: usize,
+        row_elems: usize,
+    ) {
+        if self.trace.is_none() {
+            return;
+        };
+        if row_elems == 0
+            || !self.trace_prefill_input_row_full_enabled(step, layer_idx, position, tensor)
+        {
+            return;
+        }
+        let _ = self.stream_sync();
+        let row_ptr = base_ptr + (row_idx * row_elems * 2) as u64;
+        let words = match download_device_u16(row_ptr, row_elems) {
+            Ok(v) => v,
+            Err(err) => {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    step,
+                    position,
+                    token_id,
+                    Some(layer_idx),
+                    "prefill_layer_summary",
+                    &format!(
+                        "phase=input_row_full_download_failed tensor={} error={}",
+                        tensor, err
+                    ),
+                );
+                return;
+            }
+        };
+        let mut hash = 0xcbf29ce484222325u64;
+        for &word in &words {
+            hash ^= word as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let mut encoded = String::with_capacity(words.len() * 7);
+        for (idx, word) in words.iter().enumerate() {
+            if idx > 0 {
+                encoded.push(',');
+            }
+            encoded.push_str(&format!("{:04x}", word));
+        }
+        eprintln!(
+            "[KRASIS-TRACE] event=input_row_full step={} pos={} tok={} layer={} component=prefill_layer_summary tensor={} dtype=bf16 n={} hash64=0x{:016x} bf16_hex=[{}]",
+            step,
+            position,
+            token_id,
+            layer_idx,
+            tensor,
+            words.len(),
+            hash,
+            encoded,
+        );
+    }
+
+    fn trace_emit_hqq_source_slice_summary(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer_idx: usize,
+        desc: &HqqTensorExecDescriptor,
+        slice: &str,
+        component_name: &str,
+        nk: usize,
+        group_offset: usize,
+        group_rows: usize,
+        group_dim: usize,
+    ) {
+        let Some(trace) = self.trace.as_ref() else {
+            return;
+        };
+        if desc.cols == 0
+            || nk == 0
+            || group_rows == 0
+            || !trace.should_emit(step, Some(layer_idx), "prefill_layer_summary")
+        {
+            return;
+        }
+
+        let groups = desc.cols.div_ceil(desc.group_size);
+        let packed_cols = (groups * desc.group_size).div_ceil(2);
+        let mut hash = 0xcbf29ce484222325u64;
+        let mut count = 0usize;
+
+        match component_name {
+            "packed" => {
+                let bytes = match download_device_u8(desc.packed_ptr, desc.rows * packed_cols) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            step,
+                            position,
+                            token_id,
+                            Some(layer_idx),
+                            "prefill_layer_summary",
+                            &format!("phase=hqq_packed_download_failed tensor=in_proj_qkvz error={}", err),
+                        );
+                        return;
+                    }
+                };
+                let mut sample = Vec::with_capacity(trace.sample_values);
+                for head in 0..nk {
+                    let start_row = head * group_dim + group_offset;
+                    for row in start_row..start_row + group_rows {
+                        let start = row * packed_cols;
+                        let end = start + packed_cols;
+                        if end > bytes.len() {
+                            return;
+                        }
+                        for &byte in &bytes[start..end] {
+                            hash ^= byte as u64;
+                            hash = hash.wrapping_mul(0x100000001b3);
+                            if sample.len() < trace.sample_values {
+                                sample.push(byte);
+                            }
+                            count += 1;
+                        }
+                    }
+                }
+                let sample_s = sample
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!(
+                    "[KRASIS-TRACE] event=hqq_source_slice_summary step={} pos={} tok={} layer={} component=prefill_layer_summary tensor=in_proj_qkvz slice={} source=packed dtype=u8 rows={} packed_cols={} full_n={} hash64=0x{:016x} sample=[{}]",
+                    step,
+                    position,
+                    token_id,
+                    layer_idx,
+                    slice,
+                    nk * group_rows,
+                    packed_cols,
+                    count,
+                    hash,
+                    sample_s,
+                );
+            }
+            "scales" | "zeros" => {
+                let ptr = if component_name == "scales" {
+                    desc.scales_ptr
+                } else {
+                    desc.zeros_ptr
+                };
+                let values = match download_device_f32(ptr, desc.rows * groups) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        trace_emit_prefill_mark(
+                            self.trace.as_ref(),
+                            step,
+                            position,
+                            token_id,
+                            Some(layer_idx),
+                            "prefill_layer_summary",
+                            &format!(
+                                "phase=hqq_{}_download_failed tensor=in_proj_qkvz error={}",
+                                component_name, err
+                            ),
+                        );
+                        return;
+                    }
+                };
+                let mut min_v = f32::INFINITY;
+                let mut max_v = f32::NEG_INFINITY;
+                let mut sum = 0.0f64;
+                let mut l2 = 0.0f64;
+                let mut sample = Vec::with_capacity(trace.sample_values);
+                for head in 0..nk {
+                    let start_row = head * group_dim + group_offset;
+                    for row in start_row..start_row + group_rows {
+                        let start = row * groups;
+                        let end = start + groups;
+                        if end > values.len() {
+                            return;
+                        }
+                        for &value in &values[start..end] {
+                            hash ^= value.to_bits() as u64;
+                            hash = hash.wrapping_mul(0x100000001b3);
+                            if sample.len() < trace.sample_values {
+                                sample.push(value);
+                            }
+                            min_v = min_v.min(value);
+                            max_v = max_v.max(value);
+                            let vf = value as f64;
+                            sum += vf;
+                            l2 += vf * vf;
+                            count += 1;
+                        }
+                    }
+                }
+                let mean = if count > 0 { sum / count as f64 } else { 0.0 };
+                eprintln!(
+                    "[KRASIS-TRACE] event=hqq_source_slice_summary step={} pos={} tok={} layer={} component=prefill_layer_summary tensor=in_proj_qkvz slice={} source={} dtype=f32 rows={} groups={} full_n={} hash64=0x{:016x} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6}",
+                    step,
+                    position,
+                    token_id,
+                    layer_idx,
+                    slice,
+                    component_name,
+                    nk * group_rows,
+                    groups,
+                    count,
+                    hash,
+                    trace_format_sample(&sample),
+                    l2.sqrt(),
+                    mean,
+                    min_v,
+                    max_v,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn trace_emit_la_qkvz_weight_provenance(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer_idx: usize,
+        backend: &str,
+        weight: &Bf16Weight,
+        hqq_desc: Option<&HqqTensorExecDescriptor>,
+        nk: usize,
+        dk: usize,
+        hr: usize,
+        dv: usize,
+    ) {
+        let Some(trace) = self.trace.as_ref() else {
+            return;
+        };
+        if !trace.should_emit(step, Some(layer_idx), "prefill_layer_summary")
+            || !Self::trace_target_position_matches(position)
+        {
+            return;
+        }
+        let group_dim = 2 * dk + 2 * hr * dv;
+        let value_rows = hr * dv;
+        let slices = [
+            ("q", 0usize, dk),
+            ("k", dk, dk),
+            ("v", 2 * dk, value_rows),
+            ("z", 2 * dk + value_rows, value_rows),
+        ];
+
+        let _ = self.stream_sync();
+        let bits = match download_device_u16(weight.ptr, weight.n * weight.k) {
+            Ok(v) => v,
+            Err(err) => {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    step,
+                    position,
+                    token_id,
+                    Some(layer_idx),
+                    "prefill_layer_summary",
+                    &format!(
+                        "phase=weight_surface_download_failed backend={} tensor=in_proj_qkvz error={}",
+                        backend, err
+                    ),
+                );
+                return;
+            }
+        };
+
+        eprintln!(
+            "[KRASIS-TRACE] event=weight_provenance_metadata step={} pos={} tok={} layer={} component=prefill_layer_summary backend={} tensor=in_proj_qkvz materialized_dtype=bf16 rows={} cols={} nk={} dk={} hr={} dv={} group_dim={} ptr=0x{:x}",
+            step,
+            position,
+            token_id,
+            layer_idx,
+            backend,
+            weight.n,
+            weight.k,
+            nk,
+            dk,
+            hr,
+            dv,
+            group_dim,
+            weight.ptr,
+        );
+
+        for &(slice, offset, rows) in &slices {
+            self.trace_emit_bf16_weight_slice_summary_from_bits(
+                step, position, token_id, layer_idx, backend, "in_proj_qkvz", slice,
+                &bits, weight.k, nk, offset, rows, group_dim,
+            );
+        }
+
+        if let Some(desc) = hqq_desc {
+            let groups = desc.cols.div_ceil(desc.group_size);
+            let packed_cols = (groups * desc.group_size).div_ceil(2);
+            eprintln!(
+                "[KRASIS-TRACE] event=hqq_source_metadata step={} pos={} tok={} layer={} component=prefill_layer_summary tensor=in_proj_qkvz backend=hqq4 rows={} cols={} group_size={} groups={} packed_cols={} axis={} layout={} packed_dtype={} scales_dtype={} zeros_dtype={} original_dtype={} tensor_bytes={} packed_ptr=0x{:x} scales_ptr=0x{:x} zeros_ptr=0x{:x}",
+                step,
+                position,
+                token_id,
+                layer_idx,
+                desc.rows,
+                desc.cols,
+                desc.group_size,
+                groups,
+                packed_cols,
+                desc.axis,
+                desc.layout,
+                desc.packed_dtype,
+                desc.scales_dtype,
+                desc.zeros_dtype,
+                desc.original_dtype,
+                desc.tensor_bytes,
+                desc.packed_ptr,
+                desc.scales_ptr,
+                desc.zeros_ptr,
+            );
+            for &(slice, offset, rows) in &slices {
+                self.trace_emit_hqq_source_slice_summary(
+                    step, position, token_id, layer_idx, desc, slice, "packed", nk, offset, rows, group_dim,
+                );
+                self.trace_emit_hqq_source_slice_summary(
+                    step, position, token_id, layer_idx, desc, slice, "scales", nk, offset, rows, group_dim,
+                );
+                self.trace_emit_hqq_source_slice_summary(
+                    step, position, token_id, layer_idx, desc, slice, "zeros", nk, offset, rows, group_dim,
+                );
+            }
+        }
+    }
+
+    fn trace_emit_la_qkvz_projection_check(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer_idx: usize,
+        backend: &str,
+        input_ptr: u64,
+        input_row: usize,
+        weight: &Bf16Weight,
+        output_ptr: u64,
+        output_row: usize,
+    ) {
+        let Some(trace) = self.trace.as_ref() else {
+            return;
+        };
+        if !trace.should_emit(step, Some(layer_idx), "prefill_layer_summary")
+            || !Self::trace_target_position_matches(position)
+        {
+            return;
+        }
+        let check_rows = trace.sample_values.max(1).min(8).min(weight.n);
+        let _ = self.stream_sync();
+        let input_bits = match download_device_u16(input_ptr + (input_row * weight.k * 2) as u64, weight.k) {
+            Ok(v) => v,
+            Err(err) => {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    step,
+                    position,
+                    token_id,
+                    Some(layer_idx),
+                    "prefill_layer_summary",
+                    &format!("phase=projection_check_input_download_failed backend={} error={}", backend, err),
+                );
+                return;
+            }
+        };
+        let weight_bits = match download_device_u16(weight.ptr, check_rows * weight.k) {
+            Ok(v) => v,
+            Err(err) => {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    step,
+                    position,
+                    token_id,
+                    Some(layer_idx),
+                    "prefill_layer_summary",
+                    &format!("phase=projection_check_weight_download_failed backend={} error={}", backend, err),
+                );
+                return;
+            }
+        };
+        let actual_bits = match download_device_u16(output_ptr + (output_row * weight.n * 2) as u64, check_rows) {
+            Ok(v) => v,
+            Err(err) => {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    step,
+                    position,
+                    token_id,
+                    Some(layer_idx),
+                    "prefill_layer_summary",
+                    &format!("phase=projection_check_output_download_failed backend={} error={}", backend, err),
+                );
+                return;
+            }
+        };
+
+        let input_f32 = input_bits.iter().map(|&v| bf16_to_f32(v)).collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; check_rows];
+        for row in 0..check_rows {
+            let row_slice = &weight_bits[row * weight.k..(row + 1) * weight.k];
+            let mut acc = 0.0f32;
+            for col in 0..weight.k {
+                acc += bf16_to_f32(row_slice[col]) * input_f32[col];
+            }
+            expected[row] = acc;
+        }
+        let expected_bf16 = round_f32_slice_to_bf16(&expected);
+        let actual = actual_bits.iter().map(|&v| bf16_to_f32(v)).collect::<Vec<_>>();
+        let diff = summarize_trace_diff(&actual, &expected_bf16);
+        eprintln!(
+            "[KRASIS-TRACE] event=projection_check step={} pos={} tok={} layer={} component=prefill_layer_summary backend={} tensor=in_proj_qkvz rows={} cols={} expected_bf16=[{}] actual_bf16=[{}] max_abs={:.6} max_abs_idx={} actual_at_max={:.6} expected_at_max={:.6} l2={:.6} mean_abs={:.6}",
+            step,
+            position,
+            token_id,
+            layer_idx,
+            backend,
+            check_rows,
+            weight.k,
+            trace_format_sample(&expected_bf16),
+            trace_format_sample(&actual),
+            diff.max_abs,
+            diff.max_abs_idx,
+            diff.actual_at_max,
+            diff.expected_at_max,
+            diff.l2,
+            diff.mean_abs,
+        );
+    }
+
+    fn trace_emit_bf16_row_summary(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer_idx: usize,
+        tensor: &str,
+        base_ptr: u64,
+        row_idx: usize,
+        row_elems: usize,
+    ) {
+        let Some(trace) = self.trace.as_ref() else {
+            return;
+        };
+        if row_elems == 0
+            || !trace.should_emit(step, Some(layer_idx), "prefill_layer_summary")
+        {
+            return;
+        }
+        let _ = self.stream_sync();
+        let row_ptr = base_ptr + (row_idx * row_elems * 2) as u64;
+        let bits = match download_device_u16(row_ptr, row_elems) {
+            Ok(v) => v,
+            Err(err) => {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    step,
+                    position,
+                    token_id,
+                    Some(layer_idx),
+                    "prefill_layer_summary",
+                    &format!("phase=row_summary_download_failed tensor={} error={}", tensor, err),
+                );
+                return;
+            }
+        };
+
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut l2 = 0.0f64;
+        let mut nan = 0usize;
+        let mut inf = 0usize;
+        let mut hash = 0xcbf29ce484222325u64;
+        let mut sample = Vec::with_capacity(bits.len().min(trace.sample_values));
+        for (idx, &raw) in bits.iter().enumerate() {
+            hash ^= raw as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+            let value = bf16_to_f32(raw);
+            if idx < trace.sample_values {
+                sample.push(value);
+            }
+            if value.is_nan() {
+                nan += 1;
+                continue;
+            }
+            if value.is_infinite() {
+                inf += 1;
+                continue;
+            }
+            min_v = min_v.min(value);
+            max_v = max_v.max(value);
+            let vf = value as f64;
+            sum += vf;
+            l2 += vf * vf;
+        }
+        let finite = row_elems.saturating_sub(nan + inf);
+        let (mean, l2_norm, min_out, max_out) = if finite > 0 {
+            (sum / finite as f64, l2.sqrt(), min_v as f64, max_v as f64)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        eprintln!(
+            "[KRASIS-TRACE] event=tensor_summary step={} pos={} tok={} layer={} component=prefill_layer_summary tensor={} dtype=bf16 full_n={} hash64=0x{:016x} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6} nan={} inf={}",
+            step,
+            position,
+            token_id,
+            layer_idx,
+            tensor,
+            row_elems,
+            hash,
+            trace_format_sample(&sample),
+            l2_norm,
+            mean,
+            min_out,
+            max_out,
+            nan,
+            inf,
+        );
+    }
+
+    fn trace_emit_f32_row_summary(
+        &self,
+        step: usize,
+        position: usize,
+        token_id: usize,
+        layer_idx: usize,
+        tensor: &str,
+        base_ptr: u64,
+        row_idx: usize,
+        row_elems: usize,
+    ) {
+        let Some(trace) = self.trace.as_ref() else {
+            return;
+        };
+        if row_elems == 0
+            || !trace.should_emit(step, Some(layer_idx), "prefill_layer_summary")
+        {
+            return;
+        }
+        let _ = self.stream_sync();
+        let row_ptr = base_ptr + (row_idx * row_elems * 4) as u64;
+        let values = match download_device_f32(row_ptr, row_elems) {
+            Ok(v) => v,
+            Err(err) => {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    step,
+                    position,
+                    token_id,
+                    Some(layer_idx),
+                    "prefill_layer_summary",
+                    &format!("phase=row_summary_download_failed tensor={} error={}", tensor, err),
+                );
+                return;
+            }
+        };
+
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut l2 = 0.0f64;
+        let mut nan = 0usize;
+        let mut inf = 0usize;
+        let mut hash = 0xcbf29ce484222325u64;
+        let mut sample = Vec::with_capacity(values.len().min(trace.sample_values));
+        for (idx, &value) in values.iter().enumerate() {
+            hash ^= value.to_bits() as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+            if idx < trace.sample_values {
+                sample.push(value);
+            }
+            if value.is_nan() {
+                nan += 1;
+                continue;
+            }
+            if value.is_infinite() {
+                inf += 1;
+                continue;
+            }
+            min_v = min_v.min(value);
+            max_v = max_v.max(value);
+            let vf = value as f64;
+            sum += vf;
+            l2 += vf * vf;
+        }
+        let finite = row_elems.saturating_sub(nan + inf);
+        let (mean, l2_norm, min_out, max_out) = if finite > 0 {
+            (sum / finite as f64, l2.sqrt(), min_v as f64, max_v as f64)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        eprintln!(
+            "[KRASIS-TRACE] event=tensor_summary step={} pos={} tok={} layer={} component=prefill_layer_summary tensor={} dtype=f32 full_n={} hash64=0x{:016x} sample=[{}] l2={:.6} mean={:.6} min={:.6} max={:.6} nan={} inf={}",
+            step,
+            position,
+            token_id,
+            layer_idx,
+            tensor,
+            row_elems,
+            hash,
+            trace_format_sample(&sample),
+            l2_norm,
+            mean,
+            min_out,
+            max_out,
+            nan,
+            inf,
         );
     }
 
@@ -3000,6 +5362,315 @@ impl PrefillEngine {
         );
     }
 
+    fn trace_prefill_layer_enabled(&self, step: usize, layer_idx: usize) -> bool {
+        self.trace
+            .as_ref()
+            .map_or(false, |t| t.should_emit(step, Some(layer_idx), "prefill_layer"))
+    }
+
+    fn trace_emit_gqa_weight_surfaces(
+        &self,
+        step: usize,
+        position: usize,
+        layer_idx: usize,
+        lw: &PrefillLayerWeights,
+    ) {
+        if !self.trace_prefill_layer_enabled(step, layer_idx) {
+            return;
+        }
+        let backend = if lw.hqq_gqa.is_some() { "hqq4_dequant_bf16" } else { "bf16" };
+        trace_emit_prefill_mark(
+            self.trace.as_ref(),
+            step,
+            position,
+            0,
+            Some(layer_idx),
+            "prefill_layer",
+            &format!(
+                "phase=gqa_attention_diag backend={} gated={} q_norm={} k_norm={}",
+                backend,
+                lw.gqa_gated,
+                lw.q_norm_ptr != 0,
+                lw.k_norm_ptr != 0,
+            ),
+        );
+        if let Some(weight) = lw.q_proj_bf16.as_ref() {
+            self.trace_emit_bf16(
+                step,
+                position,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "q_proj_weight_bf16",
+                weight.ptr,
+                weight.n * weight.k,
+            );
+        }
+        if let Some(weight) = lw.k_proj_bf16.as_ref() {
+            self.trace_emit_bf16(
+                step,
+                position,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "k_proj_weight_bf16",
+                weight.ptr,
+                weight.n * weight.k,
+            );
+        }
+        if let Some(weight) = lw.v_proj_bf16.as_ref() {
+            self.trace_emit_bf16(
+                step,
+                position,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "v_proj_weight_bf16",
+                weight.ptr,
+                weight.n * weight.k,
+            );
+        }
+        if let Some(weight) = lw.o_proj_bf16.as_ref() {
+            self.trace_emit_bf16(
+                step,
+                position,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "o_proj_weight_bf16",
+                weight.ptr,
+                weight.n * weight.k,
+            );
+        }
+        if lw.q_norm_ptr != 0 {
+            self.trace_emit_f32(
+                step,
+                position,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "q_norm_weight_f32",
+                lw.q_norm_ptr,
+                self.config.head_dim,
+            );
+        }
+        if lw.k_norm_ptr != 0 {
+            self.trace_emit_f32(
+                step,
+                position,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "k_norm_weight_f32",
+                lw.k_norm_ptr,
+                self.config.head_dim,
+            );
+        }
+    }
+
+    fn trace_emit_gqa_attention_cpu_diag(
+        &self,
+        step: usize,
+        position: usize,
+        layer_idx: usize,
+        q_ptr: u64,
+        k_ptr: u64,
+        v_ptr: u64,
+        attn_out_ptr: u64,
+        m: usize,
+        start_pos: usize,
+    ) {
+        if !self.trace_prefill_layer_enabled(step, layer_idx) {
+            return;
+        }
+        let cfg = &self.config;
+        if start_pos != 0 {
+            trace_emit_prefill_mark(
+                self.trace.as_ref(),
+                step,
+                position,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                &format!(
+                    "phase=gqa_attention_cpu_diag_skipped reason=cross_chunk start_pos={} m={}",
+                    start_pos, m
+                ),
+            );
+            return;
+        }
+        if m == 0 || cfg.num_q_heads == 0 || cfg.num_kv_heads == 0 || cfg.head_dim == 0 {
+            return;
+        }
+
+        let _ = self.stream_sync();
+        let last_pos = m - 1;
+        let q_head = 0usize;
+        let kv_head = q_head * cfg.num_kv_heads / cfg.num_q_heads;
+        let q_stride = cfg.num_q_heads * cfg.head_dim;
+        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+        let q_offset = last_pos * q_stride + q_head * cfg.head_dim;
+        let context_offset = last_pos * q_stride + q_head * cfg.head_dim;
+
+        let q_bits = match download_device_u16(q_ptr + (q_offset * 2) as u64, cfg.head_dim) {
+            Ok(v) => v,
+            Err(err) => {
+                trace_emit_prefill_mark(
+                    self.trace.as_ref(),
+                    step,
+                    position,
+                    0,
+                    Some(layer_idx),
+                    "prefill_layer",
+                    &format!("phase=gqa_attention_cpu_diag_failed tensor=q error={}", err),
+                );
+                return;
+            }
+        };
+        let context_bits =
+            match download_device_u16(attn_out_ptr + (context_offset * 2) as u64, cfg.head_dim) {
+                Ok(v) => v,
+                Err(err) => {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        step,
+                        position,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        &format!(
+                            "phase=gqa_attention_cpu_diag_failed tensor=context error={}",
+                            err
+                        ),
+                    );
+                    return;
+                }
+            };
+
+        let q = q_bits.iter().map(|&bits| bf16_to_f32(bits)).collect::<Vec<_>>();
+        let context_vendor = context_bits
+            .iter()
+            .map(|&bits| bf16_to_f32(bits))
+            .collect::<Vec<_>>();
+        let mut scores = vec![0.0f32; m];
+        let mut v_rows = vec![0.0f32; m * cfg.head_dim];
+        let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+
+        for pos in 0..m {
+            let kv_offset = pos * kv_stride + kv_head * cfg.head_dim;
+            let k_bits = match download_device_u16(k_ptr + (kv_offset * 2) as u64, cfg.head_dim) {
+                Ok(v) => v,
+                Err(err) => {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        step,
+                        position,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        &format!("phase=gqa_attention_cpu_diag_failed tensor=k error={}", err),
+                    );
+                    return;
+                }
+            };
+            let v_bits = match download_device_u16(v_ptr + (kv_offset * 2) as u64, cfg.head_dim) {
+                Ok(v) => v,
+                Err(err) => {
+                    trace_emit_prefill_mark(
+                        self.trace.as_ref(),
+                        step,
+                        position,
+                        0,
+                        Some(layer_idx),
+                        "prefill_layer",
+                        &format!("phase=gqa_attention_cpu_diag_failed tensor=v error={}", err),
+                    );
+                    return;
+                }
+            };
+            let mut dot = 0.0f32;
+            for dim in 0..cfg.head_dim {
+                dot += q[dim] * bf16_to_f32(k_bits[dim]);
+                v_rows[pos * cfg.head_dim + dim] = bf16_to_f32(v_bits[dim]);
+            }
+            scores[pos] = dot * scale;
+        }
+
+        let max_score = scores
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, |acc, v| acc.max(v));
+        let mut probs = vec![0.0f32; m];
+        let mut sum_exp = 0.0f32;
+        for pos in 0..m {
+            let value = (scores[pos] - max_score).exp();
+            probs[pos] = value;
+            sum_exp += value;
+        }
+        if sum_exp > 0.0 {
+            for prob in &mut probs {
+                *prob /= sum_exp;
+            }
+        }
+
+        let mut context_cpu = vec![0.0f32; cfg.head_dim];
+        for pos in 0..m {
+            let prob = probs[pos];
+            for dim in 0..cfg.head_dim {
+                context_cpu[dim] += prob * v_rows[pos * cfg.head_dim + dim];
+            }
+        }
+
+        self.trace_emit_f32_values(
+            step,
+            position,
+            0,
+            Some(layer_idx),
+            "prefill_layer",
+            "attention_scores_last_head0_cpu",
+            &scores,
+        );
+        self.trace_emit_f32_values(
+            step,
+            position,
+            0,
+            Some(layer_idx),
+            "prefill_layer",
+            "attention_probs_last_head0_cpu",
+            &probs,
+        );
+        self.trace_emit_f32_values(
+            step,
+            position,
+            0,
+            Some(layer_idx),
+            "prefill_layer",
+            "attention_context_last_head0_cpu",
+            &context_cpu,
+        );
+        self.trace_emit_f32_values(
+            step,
+            position,
+            0,
+            Some(layer_idx),
+            "prefill_layer",
+            "attention_context_last_head0_vendor",
+            &context_vendor,
+        );
+        self.trace_emit_compare_summary(
+            step,
+            position,
+            0,
+            Some(layer_idx),
+            "prefill_layer",
+            "attention_context_head0",
+            "attention_context_last_head0_vendor",
+            "attention_context_last_head0_cpu",
+            &context_vendor,
+            &context_cpu,
+        );
+    }
+
     /// Update HCS snapshot from the decode store's current HCS state.
     /// Must be called before each prefill so we know which experts are GPU-resident.
     pub fn update_hcs_snapshot(&mut self, cache_fast: &[[u64; 4]], num_experts_per_layer: usize) {
@@ -3329,6 +6000,36 @@ impl PrefillEngine {
             .map(|(&r, &w)| half::bf16::from_f32(r * rms_inv * w).to_f32())
             .collect::<Vec<_>>();
         (residual_out, out)
+    }
+
+    fn diag_compute_fused_add_rmsnorm_row_cpu_bits(
+        &self,
+        residual_row_bits: &[u16],
+        hidden_row_bits: &[u16],
+        weight_bits: &[u16],
+    ) -> (Vec<u16>, Vec<u16>, f32) {
+        let d = residual_row_bits
+            .len()
+            .min(hidden_row_bits.len())
+            .min(weight_bits.len());
+        let mut residual_out_bits = vec![0u16; d];
+        let mut sum_sq = 0.0f64;
+        for i in 0..d {
+            let added = bf16_to_f32(residual_row_bits[i]) + bf16_to_f32(hidden_row_bits[i]);
+            let rounded_bits = half::bf16::from_f32(added).to_bits();
+            residual_out_bits[i] = rounded_bits;
+            let v = bf16_to_f32(rounded_bits) as f64;
+            sum_sq += v * v;
+        }
+        let rms_inv = (sum_sq / d as f64 + self.config.rms_norm_eps as f64)
+            .sqrt()
+            .recip() as f32;
+        let mut output_bits = vec![0u16; d];
+        for i in 0..d {
+            let out = bf16_to_f32(residual_out_bits[i]) * rms_inv * bf16_to_f32(weight_bits[i]);
+            output_bits[i] = half::bf16::from_f32(out).to_bits();
+        }
+        (residual_out_bits, output_bits, rms_inv)
     }
 
     fn diag_compute_residual_add_last_cpu(
@@ -4737,6 +7438,16 @@ impl PrefillEngine {
             // 2. Embedding lookup
             self.launch_embedding(m)
                 .map_err(|e| format!("embedding chunk {} m={}: {}", chunk_idx, m, e))?;
+            self.push_reference_stage_snapshot(
+                "embedding_hidden_last",
+                None,
+                chunk_idx,
+                chunk_last_pos,
+                chunk_last_tok,
+                *self.scratch.d_hidden.device_ptr(),
+                m.saturating_sub(1),
+                h,
+            );
             if self
                 .trace
                 .as_ref()
@@ -4841,6 +7552,238 @@ impl PrefillEngine {
 
                 // Pre-attention RMSNorm
                 let tn0 = Instant::now();
+                let reference_layer0_to_layer1_handoff_trace =
+                    self.reference_debug_trace_enabled && (layer_idx == 0 || layer_idx == 1);
+                let reference_layer1_input_norm_trace =
+                    self.reference_debug_trace_enabled && layer_idx == 1;
+                let trace_norm_row = m.saturating_sub(1);
+                let trace_norm_bt: usize = 64;
+                let trace_norm_chunk_start = (trace_norm_row / trace_norm_bt) * trace_norm_bt;
+                let trace_norm_chunk_rows = trace_norm_bt.min(m.saturating_sub(trace_norm_chunk_start));
+                let trace_norm_full_chunk_start = 0usize;
+                let trace_norm_full_chunk_rows = m;
+                let input_norm_recompute_rows = [394usize, 395usize, 429usize];
+                let mut input_norm_cpu_rows: Vec<(usize, Vec<u16>, Vec<u16>)> = Vec::new();
+                let mut input_norm_weight_bits: Vec<u16> = Vec::new();
+                if reference_layer1_input_norm_trace {
+                    let norm_threads =
+                        std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32);
+                    let norm_kernel = if !has_residual {
+                        "rmsnorm"
+                    } else {
+                        "fused_add_rmsnorm"
+                    };
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer1_input_norm_residual_pre_call_chunk",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_residual.device_ptr()
+                            + ((trace_norm_chunk_start * h * 2) as u64),
+                        trace_norm_chunk_rows,
+                        h,
+                        trace_norm_chunk_start,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer1_pre_rmsnorm_residual_full_chunk",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_residual.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                        "layer1_pre_rmsnorm_residual_full_chunk_column_segments",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_residual.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                        &[395, 429],
+                        128,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer1_input_norm_hidden_pre_call_chunk",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_hidden.device_ptr()
+                            + ((trace_norm_chunk_start * h * 2) as u64),
+                        trace_norm_chunk_rows,
+                        h,
+                        trace_norm_chunk_start,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer1_pre_rmsnorm_hidden_full_chunk",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_hidden.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                        "layer1_pre_rmsnorm_hidden_full_chunk_column_segments",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_hidden.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                        &[395, 429],
+                        128,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                        "layer1_input_norm_hidden_pre_call_chunk_column_segments",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_hidden.device_ptr()
+                            + ((trace_norm_chunk_start * h * 2) as u64),
+                        trace_norm_chunk_rows,
+                        h,
+                        trace_norm_chunk_start,
+                        &[395usize, 429usize],
+                        256,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer1_input_norm_weight_sample",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        self.layer_weights[layer_idx].input_norm,
+                        1,
+                        h,
+                        0,
+                    );
+                    let _ = self.stream_sync();
+                    input_norm_weight_bits =
+                        download_device_u16(self.layer_weights[layer_idx].input_norm, h)
+                            .unwrap_or_default();
+                    for &absolute_row in &input_norm_recompute_rows {
+                        if absolute_row >= m {
+                            continue;
+                        }
+                        let row_offset_bytes = (absolute_row * h * 2) as u64;
+                        let residual_bits = download_device_u16(
+                            *self.scratch.d_residual.device_ptr() + row_offset_bytes,
+                            h,
+                        )
+                        .unwrap_or_default();
+                        let hidden_bits = download_device_u16(
+                            *self.scratch.d_hidden.device_ptr() + row_offset_bytes,
+                            h,
+                        )
+                        .unwrap_or_default();
+                        if residual_bits.len() != h || hidden_bits.len() != h {
+                            continue;
+                        }
+                        self.push_reference_stage_bf16_bits_snapshot(
+                            &format!(
+                                "layer1_fused_add_rmsnorm_residual_pre_call_row{}",
+                                absolute_row
+                            ),
+                            Some(layer_idx),
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            &residual_bits,
+                            serde_json::json!({
+                                "absolute_row": absolute_row,
+                                "row_width": h,
+                                "source_ptr": format!(
+                                    "0x{:x}",
+                                    *self.scratch.d_residual.device_ptr() + row_offset_bytes
+                                ),
+                            }),
+                        );
+                        self.push_reference_stage_bf16_bits_snapshot(
+                            &format!(
+                                "layer1_fused_add_rmsnorm_hidden_pre_call_row{}",
+                                absolute_row
+                            ),
+                            Some(layer_idx),
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            &hidden_bits,
+                            serde_json::json!({
+                                "absolute_row": absolute_row,
+                                "row_width": h,
+                                "source_ptr": format!(
+                                    "0x{:x}",
+                                    *self.scratch.d_hidden.device_ptr() + row_offset_bytes
+                                ),
+                            }),
+                        );
+                        self.push_reference_stage_bf16_bits_snapshot(
+                            &format!(
+                                "layer1_fused_add_rmsnorm_output_pre_call_row{}",
+                                absolute_row
+                            ),
+                            Some(layer_idx),
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            &hidden_bits,
+                            serde_json::json!({
+                                "absolute_row": absolute_row,
+                                "row_width": h,
+                                "source_ptr": format!(
+                                    "0x{:x}",
+                                    *self.scratch.d_hidden.device_ptr() + row_offset_bytes
+                                ),
+                                "aliases_hidden_input": true,
+                            }),
+                        );
+                        input_norm_cpu_rows.push((absolute_row, residual_bits, hidden_bits));
+                    }
+                    self.push_reference_stage_metadata(
+                        "layer1_input_norm_call_metadata_pre",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        serde_json::json!({
+                            "kernel": norm_kernel,
+                            "residual_ptr": format!("0x{:x}", *self.scratch.d_residual.device_ptr()),
+                            "hidden_input_output_ptr": format!("0x{:x}", *self.scratch.d_hidden.device_ptr()),
+                            "norm_weight_ptr": format!("0x{:x}", self.layer_weights[layer_idx].input_norm),
+                            "m": m,
+                            "hidden_size": h,
+                            "dtype": "bf16",
+                            "weight_dtype": "bf16",
+                            "epsilon": self.config.rms_norm_eps,
+                            "grid": [m, 1usize, 1usize],
+                            "block_threads": norm_threads,
+                            "shared_mem_bytes": norm_threads * 4,
+                            "input_layout": "row_major_m_by_hidden",
+                            "output_layout": "row_major_m_by_hidden",
+                            "row_stride_elems": h,
+                            "trace_chunk_start": trace_norm_chunk_start,
+                            "trace_chunk_rows": trace_norm_chunk_rows,
+                            "watched_rows": [395usize, 429usize],
+                            "host_recompute_rows": input_norm_recompute_rows,
+                            "host_recompute_control_row": 394usize,
+                            "column_segment_width": 256usize,
+                            "stream_ptr": format!("0x{:x}", self.stream as usize),
+                        }),
+                    );
+                }
                 if !has_residual {
                     self.memcpy_d2d(
                         *self.scratch.d_residual.device_ptr(),
@@ -4867,10 +7810,210 @@ impl PrefillEngine {
                     )
                     .map_err(|e| format!("fused_add_rmsnorm layer {}: {}", layer_idx, e))?;
                 }
+                let input_norm_sync_success = if reference_layer1_input_norm_trace {
+                    self.stream_sync().is_ok()
+                } else {
+                    true
+                };
+                if reference_layer1_input_norm_trace {
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer1_input_norm_residual_post_call_chunk",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_residual.device_ptr()
+                            + ((trace_norm_chunk_start * h * 2) as u64),
+                        trace_norm_chunk_rows,
+                        h,
+                        trace_norm_chunk_start,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer1_input_norm_output_post_call_chunk",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_hidden.device_ptr()
+                            + ((trace_norm_chunk_start * h * 2) as u64),
+                        trace_norm_chunk_rows,
+                        h,
+                        trace_norm_chunk_start,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                        "layer1_input_norm_output_post_call_chunk_column_segments",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_hidden.device_ptr()
+                            + ((trace_norm_chunk_start * h * 2) as u64),
+                        trace_norm_chunk_rows,
+                        h,
+                        trace_norm_chunk_start,
+                        &[395usize, 429usize],
+                        256,
+                    );
+                    for (absolute_row, residual_pre_bits, hidden_pre_bits) in &input_norm_cpu_rows {
+                        if input_norm_weight_bits.len() != h {
+                            continue;
+                        }
+                        let row_offset_bytes = (*absolute_row * h * 2) as u64;
+                        let residual_post_bits = download_device_u16(
+                            *self.scratch.d_residual.device_ptr() + row_offset_bytes,
+                            h,
+                        )
+                        .unwrap_or_default();
+                        let output_post_bits = download_device_u16(
+                            *self.scratch.d_hidden.device_ptr() + row_offset_bytes,
+                            h,
+                        )
+                        .unwrap_or_default();
+                        if residual_post_bits.len() != h || output_post_bits.len() != h {
+                            continue;
+                        }
+                        let (expected_residual_bits, expected_output_bits, rms_inv) =
+                            self.diag_compute_fused_add_rmsnorm_row_cpu_bits(
+                                residual_pre_bits,
+                                hidden_pre_bits,
+                                &input_norm_weight_bits,
+                            );
+                        let row_metadata = serde_json::json!({
+                            "absolute_row": absolute_row,
+                            "row_width": h,
+                            "rms_inv_cpu": rms_inv as f64,
+                            "epsilon": self.config.rms_norm_eps,
+                            "residual_ptr": format!(
+                                "0x{:x}",
+                                *self.scratch.d_residual.device_ptr() + row_offset_bytes
+                            ),
+                            "hidden_output_ptr": format!(
+                                "0x{:x}",
+                                *self.scratch.d_hidden.device_ptr() + row_offset_bytes
+                            ),
+                            "norm_weight_ptr": format!("0x{:x}", self.layer_weights[layer_idx].input_norm),
+                            "control_row": *absolute_row == 394usize,
+                        });
+                        self.push_reference_stage_bf16_bits_snapshot(
+                            &format!(
+                                "layer1_fused_add_rmsnorm_expected_residual_row{}",
+                                absolute_row
+                            ),
+                            Some(layer_idx),
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            &expected_residual_bits,
+                            row_metadata.clone(),
+                        );
+                        self.push_reference_stage_bf16_bits_snapshot(
+                            &format!(
+                                "layer1_fused_add_rmsnorm_expected_output_row{}",
+                                absolute_row
+                            ),
+                            Some(layer_idx),
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            &expected_output_bits,
+                            row_metadata.clone(),
+                        );
+                        self.push_reference_stage_bf16_bits_snapshot(
+                            &format!(
+                                "layer1_fused_add_rmsnorm_actual_residual_row{}",
+                                absolute_row
+                            ),
+                            Some(layer_idx),
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            &residual_post_bits,
+                            row_metadata.clone(),
+                        );
+                        self.push_reference_stage_bf16_bits_snapshot(
+                            &format!(
+                                "layer1_fused_add_rmsnorm_actual_output_row{}",
+                                absolute_row
+                            ),
+                            Some(layer_idx),
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            &output_post_bits,
+                            row_metadata.clone(),
+                        );
+                        self.push_reference_stage_bf16_compare(
+                            &format!(
+                                "layer1_fused_add_rmsnorm_residual_compare_row{}",
+                                absolute_row
+                            ),
+                            Some(layer_idx),
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            &residual_post_bits,
+                            &expected_residual_bits,
+                            row_metadata.clone(),
+                        );
+                        self.push_reference_stage_bf16_compare(
+                            &format!(
+                                "layer1_fused_add_rmsnorm_output_compare_row{}",
+                                absolute_row
+                            ),
+                            Some(layer_idx),
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            &output_post_bits,
+                            &expected_output_bits,
+                            row_metadata,
+                        );
+                    }
+                    self.push_reference_stage_metadata(
+                        "layer1_input_norm_call_metadata_post",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        serde_json::json!({
+                            "sync_after_launch_success": input_norm_sync_success,
+                            "residual_ptr": format!("0x{:x}", *self.scratch.d_residual.device_ptr()),
+                            "hidden_input_output_ptr": format!("0x{:x}", *self.scratch.d_hidden.device_ptr()),
+                            "norm_weight_ptr": format!("0x{:x}", self.layer_weights[layer_idx].input_norm),
+                            "m": m,
+                            "hidden_size": h,
+                            "full_chunk_row_start": trace_norm_full_chunk_start,
+                            "full_chunk_row_count": trace_norm_full_chunk_rows,
+                            "trace_chunk_row_start": trace_norm_chunk_start,
+                            "trace_chunk_row_count": trace_norm_chunk_rows,
+                            "stream_ptr": format!("0x{:x}", self.stream as usize),
+                        }),
+                    );
+                }
                 if timing {
                     self.stream_sync()?;
                     t_norm_ms += tn0.elapsed().as_secs_f64() * 1000.0;
                 }
+                self.push_reference_stage_snapshot(
+                    "layer_input_residual_last",
+                    Some(layer_idx),
+                    chunk_idx,
+                    chunk_last_pos,
+                    chunk_last_tok,
+                    *self.scratch.d_residual.device_ptr(),
+                    m.saturating_sub(1),
+                    h,
+                );
+                self.push_reference_stage_snapshot(
+                    "post_input_norm_last",
+                    Some(layer_idx),
+                    chunk_idx,
+                    chunk_last_pos,
+                    chunk_last_tok,
+                    *self.scratch.d_hidden.device_ptr(),
+                    m.saturating_sub(1),
+                    h,
+                );
                 if self.trace.as_ref().map_or(false, |t| {
                     t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")
                 }) {
@@ -4961,6 +8104,28 @@ impl PrefillEngine {
                         );
                     }
                 }
+                if self.trace_prefill_layer_summary_enabled(chunk_idx, layer_idx) {
+                    self.trace_emit_bf16_row_summary(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        layer_idx,
+                        "layer_input_residual_last",
+                        *self.scratch.d_residual.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
+                    self.trace_emit_bf16_row_summary(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        layer_idx,
+                        "post_input_norm_last",
+                        *self.scratch.d_hidden.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
+                }
 
                 // Mixer
                 let ta0 = Instant::now();
@@ -4979,7 +8144,7 @@ impl PrefillEngine {
                         )?;
                     }
                     3 => self
-                        .forward_linear_attention(layer_idx, m)
+                        .forward_linear_attention(layer_idx, m, chunk_start)
                         .map_err(|e| format!("linear_attn layer {}: {}", layer_idx, e))?,
                     _ => {
                         self.memcpy_d2d(
@@ -4999,6 +8164,16 @@ impl PrefillEngine {
                         _ => {}
                     }
                 }
+                self.push_reference_stage_snapshot(
+                    "mixer_out_last",
+                    Some(layer_idx),
+                    chunk_idx,
+                    chunk_last_pos,
+                    chunk_last_tok,
+                    *self.scratch.d_attn_out.device_ptr(),
+                    m.saturating_sub(1),
+                    h,
+                );
                 if self.trace.as_ref().map_or(false, |t| {
                     t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")
                 }) {
@@ -5018,6 +8193,18 @@ impl PrefillEngine {
                         chunk_last_tok,
                         Some(layer_idx),
                         "prefill_layer",
+                        "mixer_out_last",
+                        *self.scratch.d_attn_out.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
+                }
+                if self.trace_prefill_layer_summary_enabled(chunk_idx, layer_idx) {
+                    self.trace_emit_bf16_row_summary(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        layer_idx,
                         "mixer_out_last",
                         *self.scratch.d_attn_out.device_ptr(),
                         m.saturating_sub(1),
@@ -5085,6 +8272,26 @@ impl PrefillEngine {
                     self.stream_sync()?;
                     t_norm_ms += tn1.elapsed().as_secs_f64() * 1000.0;
                 }
+                self.push_reference_stage_snapshot(
+                    "post_attn_residual_last",
+                    Some(layer_idx),
+                    chunk_idx,
+                    chunk_last_pos,
+                    chunk_last_tok,
+                    *self.scratch.d_residual.device_ptr(),
+                    m.saturating_sub(1),
+                    h,
+                );
+                self.push_reference_stage_snapshot(
+                    "pre_mlp_hidden_last",
+                    Some(layer_idx),
+                    chunk_idx,
+                    chunk_last_pos,
+                    chunk_last_tok,
+                    *self.scratch.d_hidden.device_ptr(),
+                    m.saturating_sub(1),
+                    h,
+                );
                 if self.trace.as_ref().map_or(false, |t| {
                     t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")
                 }) {
@@ -5171,6 +8378,28 @@ impl PrefillEngine {
                         h,
                     );
                 }
+                if self.trace_prefill_layer_summary_enabled(chunk_idx, layer_idx) {
+                    self.trace_emit_bf16_row_summary(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        layer_idx,
+                        "post_attn_residual_last",
+                        *self.scratch.d_residual.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
+                    self.trace_emit_bf16_row_summary(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        layer_idx,
+                        "pre_mlp_hidden_last",
+                        *self.scratch.d_hidden.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
+                }
 
                 // DIAG: d_hidden before MLP (after post-attn-norm = MoE input)
                 if diag && chunk_idx == 0 && Self::diag_layer_enabled(layer_idx) {
@@ -5179,6 +8408,65 @@ impl PrefillEngine {
                         *self.scratch.d_hidden.device_ptr(),
                         &diag_positions,
                         h,
+                    );
+                }
+                if self.reference_debug_trace_enabled && layer_idx == 0 {
+                    let sync_before_mlp = self.stream_sync().is_ok();
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer0_pre_mlp_hidden_full_chunk",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_hidden.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                        "layer0_pre_mlp_hidden_full_chunk_column_segments",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_hidden.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                        &[395, 429],
+                        128,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer0_pre_mlp_residual_full_chunk",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_residual.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer0_pre_mlp_metadata",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        serde_json::json!({
+                            "sync_before_mlp_success": sync_before_mlp,
+                            "hidden_ptr": format!("0x{:x}", *self.scratch.d_hidden.device_ptr()),
+                            "residual_ptr": format!("0x{:x}", *self.scratch.d_residual.device_ptr()),
+                            "hidden_size": h,
+                            "m": m,
+                            "row_start": trace_norm_full_chunk_start,
+                            "row_count": trace_norm_full_chunk_rows,
+                            "hidden_layout": "row_major_bf16_m_by_hidden",
+                            "residual_layout": "row_major_bf16_m_by_hidden",
+                            "producer": "post_attention_norm",
+                            "consumer": "layer0_mlp_moe",
+                            "stream_ptr": format!("0x{:x}", self.stream as usize),
+                        }),
                     );
                 }
 
@@ -5209,6 +8497,109 @@ impl PrefillEngine {
                 if timing {
                     self.stream_sync()?;
                     t_moe_ms += tm0.elapsed().as_secs_f64() * 1000.0;
+                }
+                if reference_layer0_to_layer1_handoff_trace && layer_idx == 0 {
+                    let sync_after_layer0_mlp = self.stream_sync().is_ok();
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer0_post_mlp_hidden_full_chunk",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_hidden.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                        "layer0_post_mlp_hidden_full_chunk_column_segments",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_hidden.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                        &[395, 429],
+                        128,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer0_post_mlp_residual_full_chunk",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_residual.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                        "layer0_post_mlp_residual_full_chunk_column_segments",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        *self.scratch.d_residual.device_ptr(),
+                        trace_norm_full_chunk_rows,
+                        h,
+                        trace_norm_full_chunk_start,
+                        &[395, 429],
+                        128,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer0_to_layer1_handoff_metadata",
+                        Some(layer_idx),
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        serde_json::json!({
+                            "sync_after_layer0_mlp_success": sync_after_layer0_mlp,
+                            "hidden_ptr": format!("0x{:x}", *self.scratch.d_hidden.device_ptr()),
+                            "residual_ptr": format!("0x{:x}", *self.scratch.d_residual.device_ptr()),
+                            "hidden_size": h,
+                            "m": m,
+                            "row_start": trace_norm_full_chunk_start,
+                            "row_count": trace_norm_full_chunk_rows,
+                            "hidden_layout": "row_major_bf16_m_by_hidden",
+                            "residual_layout": "row_major_bf16_m_by_hidden",
+                            "producer_layer": 0,
+                            "consumer_layer": 1,
+                            "stream_ptr": format!("0x{:x}", self.stream as usize),
+                        }),
+                    );
+                }
+                self.push_reference_stage_snapshot(
+                    "post_mlp_hidden_last",
+                    Some(layer_idx),
+                    chunk_idx,
+                    chunk_last_pos,
+                    chunk_last_tok,
+                    *self.scratch.d_hidden.device_ptr(),
+                    m.saturating_sub(1),
+                    h,
+                );
+                if self.reference_debug_trace_enabled {
+                    let row_offset = (m.saturating_sub(1) * h * 2) as u64;
+                    if let (Ok(residual_bits), Ok(hidden_bits)) = (
+                        download_device_u16(*self.scratch.d_residual.device_ptr() + row_offset, h),
+                        download_device_u16(*self.scratch.d_hidden.device_ptr() + row_offset, h),
+                    ) {
+                        let post_mlp_residual = residual_bits
+                            .iter()
+                            .zip(hidden_bits.iter())
+                            .map(|(&residual, &hidden)| bf16_to_f32(residual) + bf16_to_f32(hidden))
+                            .collect::<Vec<_>>();
+                        self.push_reference_stage_f32_snapshot(
+                            "post_mlp_residual_estimate_last",
+                            Some(layer_idx),
+                            chunk_idx,
+                            chunk_last_pos,
+                            chunk_last_tok,
+                            &post_mlp_residual,
+                        );
+                    }
                 }
                 if self.trace.as_ref().map_or(false, |t| {
                     t.should_emit(chunk_idx, Some(layer_idx), "prefill_layer")
@@ -5297,6 +8688,18 @@ impl PrefillEngine {
                             &post_moe_last,
                         );
                     }
+                }
+                if self.trace_prefill_layer_summary_enabled(chunk_idx, layer_idx) {
+                    self.trace_emit_bf16_row_summary(
+                        chunk_idx,
+                        chunk_last_pos,
+                        chunk_last_tok,
+                        layer_idx,
+                        "post_mlp_hidden_last",
+                        *self.scratch.d_hidden.device_ptr(),
+                        m.saturating_sub(1),
+                        h,
+                    );
                 }
 
                 if diag && chunk_idx == 0 && Self::diag_layer_enabled(layer_idx) {
@@ -5988,14 +9391,6 @@ impl PrefillEngine {
         capture_kv_cache: bool,
     ) -> Result<Vec<u16>, String> {
         self.bind_cuda_context()?;
-        if self
-            .layer_weights
-            .get(layer_idx)
-            .and_then(|layer| layer.hqq_gqa.as_ref())
-            .is_some()
-        {
-            self.materialize_hqq_gqa_prefill_weights()?;
-        }
         if hidden_bf16.len() != m * self.config.hidden_size {
             return Err(format!(
                 "debug_run_gqa_prefill_layer expected {} BF16 values, got {}",
@@ -6194,7 +9589,7 @@ impl PrefillEngine {
                         (m * h * 2) as u64,
                     )?;
                 }
-                3 => self.forward_linear_attention(layer_idx, m)?,
+                3 => self.forward_linear_attention(layer_idx, m, 0)?,
                 _ => {
                     self.memcpy_d2d(
                         *self.scratch.d_attn_out.device_ptr(),
@@ -6758,6 +10153,57 @@ impl PrefillEngine {
         Ok(())
     }
 
+    fn hqq_nbits_from_desc(desc: &HqqTensorExecDescriptor) -> Result<u8, String> {
+        if desc.layout.contains("uint4") {
+            Ok(4)
+        } else if desc.layout.contains("uint8") {
+            Ok(8)
+        } else {
+            Err(format!("Cannot infer HQQ nbits from layout {}", desc.layout))
+        }
+    }
+
+    fn validate_hqq_quantized_prefill_tensor_desc(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+    ) -> Result<u8, String> {
+        if desc.axis != 1 {
+            return Err(format!(
+                "HQQ tensor {} uses unsupported axis {} (expected axis=1)",
+                tensor_name, desc.axis
+            ));
+        }
+        let nbits = Self::hqq_nbits_from_desc(desc)?;
+        let expected_layout = match nbits {
+            4 => "row_major_axis1_grouped_uint4_packed",
+            8 => "row_major_axis1_grouped_uint8",
+            _ => return Err(format!("Unsupported HQQ nbits={}", nbits)),
+        };
+        if desc.layout != expected_layout {
+            return Err(format!(
+                "HQQ{} tensor {} uses unsupported prefill layout {} (expected {})",
+                nbits, tensor_name, desc.layout, expected_layout
+            ));
+        }
+        if desc.packed_dtype != "uint8" {
+            return Err(format!(
+                "HQQ{} tensor {} uses unsupported packed dtype {}",
+                nbits, tensor_name, desc.packed_dtype
+            ));
+        }
+        if desc.scales_dtype != "float32" || desc.zeros_dtype != "float32" {
+            return Err(format!(
+                "HQQ{} tensor {} uses unsupported scale/zero dtypes {}/{}",
+                nbits, tensor_name, desc.scales_dtype, desc.zeros_dtype
+            ));
+        }
+        if desc.group_size == 0 {
+            return Err(format!("HQQ{} tensor {} has invalid group_size=0", nbits, tensor_name));
+        }
+        Ok(nbits)
+    }
+
     fn hqq4_dequant_to_bf16(
         &self,
         tensor_name: &str,
@@ -6795,6 +10241,254 @@ impl PrefillEngine {
                     &mut a6 as *mut _ as *mut std::ffi::c_void,
                 ],
             )?;
+        }
+        Ok(())
+    }
+
+    fn hqq_quantized_prefill_gemm_bf16(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+        m: usize,
+    ) -> Result<(), String> {
+        let nbits = self.validate_hqq_quantized_prefill_tensor_desc(tensor_name, desc)?;
+        if m == 0 || desc.rows == 0 || desc.cols == 0 {
+            return Ok(());
+        }
+        let groups = desc.cols.div_ceil(desc.group_size);
+        let padded_cols = groups * desc.group_size;
+        let packed_row_stride_bytes = if nbits == 4 { padded_cols.div_ceil(2) } else { padded_cols };
+        let scales_row_stride_bytes = groups * std::mem::size_of::<f32>();
+        let zeros_row_stride_bytes = scales_row_stride_bytes;
+        let kernel = match nbits {
+            4 => self.kernels.hqq4_prefill_gemm_bf16,
+            8 => self.kernels.hqq8_prefill_gemm_bf16,
+            _ => return Err(format!("Unsupported HQQ prefill nbits={}", nbits)),
+        };
+        let grid_x = (desc.rows as u32).div_ceil(8);
+        let grid_y = (m as u32).div_ceil(8);
+        let mut a0 = output_ptr;
+        let mut a1 = input_ptr;
+        let mut a2 = desc.packed_ptr;
+        let mut a3 = desc.scales_ptr;
+        let mut a4 = desc.zeros_ptr;
+        let mut a5 = m as i32;
+        let mut a6 = desc.rows as i32;
+        let mut a7 = desc.cols as i32;
+        let mut a8 = desc.group_size as i32;
+        let mut a9 = packed_row_stride_bytes as i32;
+        let mut a10 = scales_row_stride_bytes as i32;
+        let mut a11 = zeros_row_stride_bytes as i32;
+        unsafe {
+            launch(
+                kernel,
+                (grid_x, grid_y, 1),
+                (256, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut a0 as *mut _ as *mut std::ffi::c_void,
+                    &mut a1 as *mut _ as *mut std::ffi::c_void,
+                    &mut a2 as *mut _ as *mut std::ffi::c_void,
+                    &mut a3 as *mut _ as *mut std::ffi::c_void,
+                    &mut a4 as *mut _ as *mut std::ffi::c_void,
+                    &mut a5 as *mut _ as *mut std::ffi::c_void,
+                    &mut a6 as *mut _ as *mut std::ffi::c_void,
+                    &mut a7 as *mut _ as *mut std::ffi::c_void,
+                    &mut a8 as *mut _ as *mut std::ffi::c_void,
+                    &mut a9 as *mut _ as *mut std::ffi::c_void,
+                    &mut a10 as *mut _ as *mut std::ffi::c_void,
+                    &mut a11 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        self.apply_hqq_prefill_quantized_int8_exceptions(
+            layer_idx,
+            tensor_name,
+            desc,
+            input_ptr,
+            output_ptr,
+            m,
+            nbits,
+            packed_row_stride_bytes,
+            scales_row_stride_bytes,
+            zeros_row_stride_bytes,
+        )?;
+        Ok(())
+    }
+
+    fn apply_hqq_prefill_sidecars(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+        out_ptr: u64,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), String> {
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let Some(lw) = self.layer_weights.get(layer_idx) else {
+            return Err(format!("HQQ sidecar layer {} not present in prefill weights", layer_idx));
+        };
+        for sidecar in lw
+            .hqq_prefill_sidecars
+            .iter()
+            .filter(|entry| entry.tensor_name == tensor_name)
+        {
+            if sidecar.row_group_count == 0 || sidecar.max_width == 0 {
+                continue;
+            }
+            let mode = match sidecar.mode.as_str() {
+                "int8_symmetric" => 1i32,
+                "exact_bf16" => 2i32,
+                "int8_exception" => 3i32,
+                other => {
+                    return Err(format!(
+                        "Unsupported HQQ prefill sidecar mode {} for layer {} tensor {}",
+                        other, layer_idx, tensor_name
+                    ));
+                }
+            };
+            let total = sidecar.row_group_count * sidecar.max_width;
+            let threads = 256u32;
+            let blocks = (total as u32).div_ceil(threads);
+            let mut a0 = out_ptr;
+            let mut qint8_ptr = if mode == 1 || mode == 3 { sidecar.correction_ptr } else { 0 };
+            let mut bf16_ptr = if mode == 2 { sidecar.correction_ptr } else { 0 };
+            let mut a3 = sidecar.scales_ptr;
+            let mut a4 = sidecar.output_rows_ptr;
+            let mut a5 = sidecar.start_cols_ptr;
+            let mut a6 = sidecar.widths_ptr;
+            let mut a7 = sidecar.row_group_count as i32;
+            let mut a8 = cols as i32;
+            let mut a9 = sidecar.max_width as i32;
+            let mut a10 = mode;
+            unsafe {
+                launch(
+                    self.kernels.hqq_apply_sidecar_bf16,
+                    (blocks, 1, 1),
+                    (threads, 1, 1),
+                    0,
+                    self.stream,
+                    &mut [
+                        &mut a0 as *mut _ as *mut std::ffi::c_void,
+                        &mut qint8_ptr as *mut _ as *mut std::ffi::c_void,
+                        &mut bf16_ptr as *mut _ as *mut std::ffi::c_void,
+                        &mut a3 as *mut _ as *mut std::ffi::c_void,
+                        &mut a4 as *mut _ as *mut std::ffi::c_void,
+                        &mut a5 as *mut _ as *mut std::ffi::c_void,
+                        &mut a6 as *mut _ as *mut std::ffi::c_void,
+                        &mut a7 as *mut _ as *mut std::ffi::c_void,
+                        &mut a8 as *mut _ as *mut std::ffi::c_void,
+                        &mut a9 as *mut _ as *mut std::ffi::c_void,
+                        &mut a10 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+            trace_emit_prefill_mark(
+                self.trace.as_ref(),
+                0,
+                0,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                &format!(
+                    "phase=hqq_sidecar_apply tensor={} mode={} variant={} row_groups={} max_width={}",
+                    tensor_name,
+                    sidecar.mode,
+                    sidecar.variant_name,
+                    sidecar.row_group_count,
+                    sidecar.max_width,
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_hqq_prefill_quantized_int8_exceptions(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+        m: usize,
+        nbits: u8,
+        packed_row_stride_bytes: usize,
+        scales_row_stride_bytes: usize,
+        zeros_row_stride_bytes: usize,
+    ) -> Result<(), String> {
+        if m == 0 {
+            return Ok(());
+        }
+        let threads = 256u32;
+        let smem = threads * std::mem::size_of::<f32>() as u32;
+        let Some(lw) = self.layer_weights.get(layer_idx) else {
+            return Err(format!("HQQ quantized prefill sidecar layer {} not present", layer_idx));
+        };
+        for sidecar in lw
+                .hqq_prefill_sidecars
+                .iter()
+                .filter(|entry| entry.tensor_name == tensor_name && entry.mode == "int8_exception")
+            {
+                if sidecar.row_group_count == 0 || sidecar.max_width == 0 {
+                    continue;
+                }
+                let mut a0 = output_ptr;
+                let mut a1 = input_ptr;
+                let mut a2 = sidecar.correction_ptr;
+                let mut a3 = sidecar.scales_ptr;
+                let mut a4 = sidecar.output_rows_ptr;
+                let mut a5 = sidecar.start_cols_ptr;
+                let mut a6 = sidecar.widths_ptr;
+                let mut a7 = desc.packed_ptr;
+                let mut a8 = desc.scales_ptr;
+                let mut a9 = desc.zeros_ptr;
+                let mut a10 = m as i32;
+                let mut a11 = desc.rows as i32;
+                let mut a12 = sidecar.row_group_count as i32;
+                let mut a13 = desc.cols as i32;
+                let mut a14 = desc.group_size as i32;
+                let mut a15 = sidecar.max_width as i32;
+                let mut a16 = packed_row_stride_bytes as i32;
+                let mut a17 = scales_row_stride_bytes as i32;
+                let mut a18 = zeros_row_stride_bytes as i32;
+                let mut a19 = nbits as i32;
+                unsafe {
+                    launch(
+                        self.kernels.hqq_prefill_int8_exception_delta_bf16,
+                        (sidecar.row_group_count as u32, m as u32, 1),
+                        (threads, 1, 1),
+                        smem,
+                        self.stream,
+                        &mut [
+                            &mut a0 as *mut _ as *mut std::ffi::c_void,
+                            &mut a1 as *mut _ as *mut std::ffi::c_void,
+                            &mut a2 as *mut _ as *mut std::ffi::c_void,
+                            &mut a3 as *mut _ as *mut std::ffi::c_void,
+                            &mut a4 as *mut _ as *mut std::ffi::c_void,
+                            &mut a5 as *mut _ as *mut std::ffi::c_void,
+                            &mut a6 as *mut _ as *mut std::ffi::c_void,
+                            &mut a7 as *mut _ as *mut std::ffi::c_void,
+                            &mut a8 as *mut _ as *mut std::ffi::c_void,
+                            &mut a9 as *mut _ as *mut std::ffi::c_void,
+                            &mut a10 as *mut _ as *mut std::ffi::c_void,
+                            &mut a11 as *mut _ as *mut std::ffi::c_void,
+                            &mut a12 as *mut _ as *mut std::ffi::c_void,
+                            &mut a13 as *mut _ as *mut std::ffi::c_void,
+                            &mut a14 as *mut _ as *mut std::ffi::c_void,
+                            &mut a15 as *mut _ as *mut std::ffi::c_void,
+                            &mut a16 as *mut _ as *mut std::ffi::c_void,
+                            &mut a17 as *mut _ as *mut std::ffi::c_void,
+                            &mut a18 as *mut _ as *mut std::ffi::c_void,
+                            &mut a19 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
         }
         Ok(())
     }
@@ -6851,6 +10545,7 @@ impl PrefillEngine {
                 "q_proj",
             )?;
             self.hqq4_dequant_to_bf16("q_proj", &desc.q_proj, q_weight.ptr)?;
+            self.apply_hqq_prefill_sidecars(layer_idx, "q_proj", q_weight.ptr, q_weight.n, q_weight.k)?;
 
             let k_weight = ensure_weight_ptr(
                 self,
@@ -6863,6 +10558,7 @@ impl PrefillEngine {
                 "k_proj",
             )?;
             self.hqq4_dequant_to_bf16("k_proj", &desc.k_proj, k_weight.ptr)?;
+            self.apply_hqq_prefill_sidecars(layer_idx, "k_proj", k_weight.ptr, k_weight.n, k_weight.k)?;
 
             let v_weight = ensure_weight_ptr(
                 self,
@@ -6875,6 +10571,7 @@ impl PrefillEngine {
                 "v_proj",
             )?;
             self.hqq4_dequant_to_bf16("v_proj", &desc.v_proj, v_weight.ptr)?;
+            self.apply_hqq_prefill_sidecars(layer_idx, "v_proj", v_weight.ptr, v_weight.n, v_weight.k)?;
 
             let o_weight = ensure_weight_ptr(
                 self,
@@ -6887,6 +10584,7 @@ impl PrefillEngine {
                 "o_proj",
             )?;
             self.hqq4_dequant_to_bf16("o_proj", &desc.o_proj, o_weight.ptr)?;
+            self.apply_hqq_prefill_sidecars(layer_idx, "o_proj", o_weight.ptr, o_weight.n, o_weight.k)?;
 
             {
                 let lw = &mut self.layer_weights[layer_idx];
@@ -6963,6 +10661,13 @@ impl PrefillEngine {
                 &desc.in_proj_qkvz,
                 in_proj_qkvz.ptr,
             )?;
+            self.apply_hqq_prefill_sidecars(
+                layer_idx,
+                "in_proj_qkvz",
+                in_proj_qkvz.ptr,
+                in_proj_qkvz.n,
+                in_proj_qkvz.k,
+            )?;
 
             let in_proj_ba = ensure_weight_ptr(
                 self,
@@ -6975,6 +10680,13 @@ impl PrefillEngine {
                 "in_proj_ba",
             )?;
             self.hqq4_dequant_to_bf16("in_proj_ba", &desc.in_proj_ba, in_proj_ba.ptr)?;
+            self.apply_hqq_prefill_sidecars(
+                layer_idx,
+                "in_proj_ba",
+                in_proj_ba.ptr,
+                in_proj_ba.n,
+                in_proj_ba.k,
+            )?;
 
             let out_proj = ensure_weight_ptr(
                 self,
@@ -6987,6 +10699,7 @@ impl PrefillEngine {
                 "out_proj",
             )?;
             self.hqq4_dequant_to_bf16("out_proj", &desc.out_proj, out_proj.ptr)?;
+            self.apply_hqq_prefill_sidecars(layer_idx, "out_proj", out_proj.ptr, out_proj.n, out_proj.k)?;
 
             let lw = &mut self.layer_weights[layer_idx];
             lw.la_in_proj_qkvz_bf16 = Some(in_proj_qkvz);
@@ -7008,21 +10721,26 @@ impl PrefillEngine {
         Ok(())
     }
 
-    /// Dispatch GEMM: Marlin (INT4/INT8) or cuBLAS BF16 fallback.
+    /// Dispatch GEMM: HQQ quantized, Marlin (INT4/INT8), or cuBLAS BF16 fallback.
     fn la_gemm(
         &self,
+        layer_idx: usize,
+        tensor_name: &str,
         a: u64,
+        hqq: Option<&HqqTensorExecDescriptor>,
         marlin: &Option<MarlinWeight>,
         bf16: &Option<Bf16Weight>,
         c: u64,
         m: usize,
     ) -> Result<(), String> {
-        if let Some(w) = marlin {
+        if let Some(desc) = hqq {
+            self.hqq_quantized_prefill_gemm_bf16(layer_idx, tensor_name, desc, a, c, m)
+        } else if let Some(w) = marlin {
             self.marlin_gemm(a, w, c, m)
         } else if let Some(w) = bf16 {
             self.cublas_bf16_gemm(a, w, c, m)
         } else {
-            Err("LA GEMM: no Marlin or BF16 weight available".to_string())
+            Err(format!("GEMM {tensor_name}: no HQQ, Marlin, or BF16 weight available"))
         }
     }
 
@@ -7110,21 +10828,10 @@ impl PrefillEngine {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
         if let Some(hqq) = &lw.hqq_gqa {
-            if lw.q_proj_bf16.is_none()
-                || lw.k_proj_bf16.is_none()
-                || lw.v_proj_bf16.is_none()
-                || lw.o_proj_bf16.is_none()
-            {
-                return Err(format!(
-                    "HQQ prefill GQA weights were not refreshed from the registered slot-backed descriptors before layer {} (backend={} nbits={} format_v{} q_proj_rows={} q_proj_cols={})",
-                    layer_idx,
-                    hqq.backend,
-                    hqq.nbits,
-                    hqq.format_version,
-                    hqq.q_proj.rows,
-                    hqq.q_proj.cols,
-                ));
-            }
+            self.validate_hqq_quantized_prefill_tensor_desc("q_proj", &hqq.q_proj)?;
+            self.validate_hqq_quantized_prefill_tensor_desc("k_proj", &hqq.k_proj)?;
+            self.validate_hqq_quantized_prefill_tensor_desc("v_proj", &hqq.v_proj)?;
+            self.validate_hqq_quantized_prefill_tensor_desc("o_proj", &hqq.o_proj)?;
         }
         if let Some(hqq) = &lw.hqq_mla {
             return Err(format!(
@@ -7151,6 +10858,55 @@ impl PrefillEngine {
         let k = *self.scratch.d_k.device_ptr();
         let v = *self.scratch.d_v.device_ptr();
         let attn_out = *self.scratch.d_attn_out.device_ptr();
+        let trace_last_pos = m.saturating_sub(1);
+        let trace_last_abs_pos = start_pos + trace_last_pos;
+        let q_dim = cfg.num_q_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let reference_layer1_trace = self.reference_debug_trace_enabled && layer_idx == 1;
+
+        if reference_layer1_trace {
+            self.push_reference_stage_metadata(
+                "layer1_gqa_entry_metadata",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                serde_json::json!({
+                    "input_dtype": "bf16",
+                    "input_device": "cuda",
+                    "input_shape": [m, cfg.hidden_size],
+                    "q_shape": [m, cfg.num_q_heads, cfg.head_dim],
+                    "k_shape": [m, cfg.num_kv_heads, cfg.head_dim],
+                    "v_shape": [m, cfg.num_kv_heads, cfg.head_dim],
+                    "start_pos": start_pos,
+                    "last_position": trace_last_abs_pos,
+                    "capture_kv_cache": capture_kv_cache,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                    "d_hidden_ptr": format!("0x{:x}", hidden),
+                    "d_q_ptr": format!("0x{:x}", q),
+                    "d_k_ptr": format!("0x{:x}", k),
+                    "d_v_ptr": format!("0x{:x}", v),
+                    "d_attn_out_ptr": format!("0x{:x}", attn_out),
+                    "d_workspace_ptr": format!("0x{:x}", *self.scratch.d_workspace.device_ptr()),
+                    "d_fa2_lse_ptr": self.scratch.d_fa2_lse.as_ref()
+                        .map(|s| format!("0x{:x}", *s.device_ptr()))
+                        .unwrap_or_else(|| "0x0".to_string()),
+                }),
+            );
+        }
+
+        for (abs_pos, row_idx) in Self::trace_input_row_positions_for_chunk(start_pos, m) {
+            self.trace_emit_bf16_row_full_words(
+                trace_step,
+                abs_pos,
+                0,
+                layer_idx,
+                "gqa_input_norm_last",
+                hidden,
+                row_idx,
+                cfg.hidden_size,
+            );
+        }
 
         // Q/K/V projections (Marlin or cuBLAS BF16)
         let gt0 = Instant::now();
@@ -7159,7 +10915,16 @@ impl PrefillEngine {
             // Gated attention: q_proj outputs [M, num_q_heads, head_dim * 2]
             // GEMM into scratch1, then split into Q + gate via single kernel
             let q_raw = *self.scratch.d_scratch1.device_ptr();
-            self.la_gemm(hidden, &lw.q_proj, &lw.q_proj_bf16, q_raw, m)?;
+            self.la_gemm(
+                layer_idx,
+                "q_proj",
+                hidden,
+                lw.hqq_gqa.as_ref().map(|hqq| &hqq.q_proj),
+                &lw.q_proj,
+                &lw.q_proj_bf16,
+                q_raw,
+                m,
+            )?;
 
             let gate_buf = *self.scratch.d_scratch2.device_ptr();
             let threads =
@@ -7187,11 +10952,175 @@ impl PrefillEngine {
             }
             gate_ptr = gate_buf;
         } else {
-            self.la_gemm(hidden, &lw.q_proj, &lw.q_proj_bf16, q, m)?;
+            self.la_gemm(
+                layer_idx,
+                "q_proj",
+                hidden,
+                lw.hqq_gqa.as_ref().map(|hqq| &hqq.q_proj),
+                &lw.q_proj,
+                &lw.q_proj_bf16,
+                q,
+                m,
+            )?;
             gate_ptr = 0;
         }
-        self.la_gemm(hidden, &lw.k_proj, &lw.k_proj_bf16, k, m)?;
-        self.la_gemm(hidden, &lw.v_proj, &lw.v_proj_bf16, v, m)?;
+        self.la_gemm(
+            layer_idx,
+            "k_proj",
+            hidden,
+            lw.hqq_gqa.as_ref().map(|hqq| &hqq.k_proj),
+            &lw.k_proj,
+            &lw.k_proj_bf16,
+            k,
+            m,
+        )?;
+        self.la_gemm(
+            layer_idx,
+            "v_proj",
+            hidden,
+            lw.hqq_gqa.as_ref().map(|hqq| &hqq.v_proj),
+            &lw.v_proj,
+            &lw.v_proj_bf16,
+            v,
+            m,
+        )?;
+        if reference_layer1_trace {
+            self.push_reference_stage_snapshot(
+                "layer1_q_projection_raw_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                q,
+                trace_last_pos,
+                q_dim,
+            );
+            self.push_reference_stage_snapshot(
+                "layer1_k_projection_raw_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                k,
+                trace_last_pos,
+                kv_dim,
+            );
+            self.push_reference_stage_snapshot(
+                "layer1_v_projection_raw_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                v,
+                trace_last_pos,
+                kv_dim,
+            );
+            if lw.gqa_gated && gate_ptr != 0 {
+                self.push_reference_stage_snapshot(
+                    "layer1_q_gate_projection_raw_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_abs_pos,
+                    0,
+                    gate_ptr,
+                    trace_last_pos,
+                    q_dim,
+                );
+            }
+        }
+        if self.trace_prefill_layer_enabled(trace_step, layer_idx) {
+            self.trace_emit_gqa_weight_surfaces(trace_step, trace_last_abs_pos, layer_idx, lw);
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "q_after_projection_last",
+                q,
+                trace_last_pos,
+                q_dim,
+            );
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "k_after_projection_last",
+                k,
+                trace_last_pos,
+                kv_dim,
+            );
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "v_after_projection_last",
+                v,
+                trace_last_pos,
+                kv_dim,
+            );
+            if lw.gqa_gated && gate_ptr != 0 {
+                self.trace_emit_bf16_row(
+                    trace_step,
+                    trace_last_abs_pos,
+                    0,
+                    Some(layer_idx),
+                    "prefill_layer",
+                    "q_gate_after_projection_last",
+                    gate_ptr,
+                    trace_last_pos,
+                    q_dim,
+                );
+            }
+        }
+        if self.trace_prefill_layer_summary_enabled(trace_step, layer_idx) {
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "q_after_projection_last",
+                q,
+                trace_last_pos,
+                q_dim,
+            );
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "k_after_projection_last",
+                k,
+                trace_last_pos,
+                kv_dim,
+            );
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "v_after_projection_last",
+                v,
+                trace_last_pos,
+                kv_dim,
+            );
+            if lw.gqa_gated && gate_ptr != 0 {
+                self.trace_emit_bf16_row_summary(
+                    trace_step,
+                    trace_last_abs_pos,
+                    0,
+                    layer_idx,
+                    "q_gate_after_projection_last",
+                    gate_ptr,
+                    trace_last_pos,
+                    q_dim,
+                );
+            }
+        }
 
         if gt {
             self.stream_sync()?;
@@ -7208,6 +11137,89 @@ impl PrefillEngine {
         }
         if lw.k_norm_ptr != 0 {
             self.launch_rmsnorm_fp32w(k, k, lw.k_norm_ptr, m * cfg.num_kv_heads, cfg.head_dim)?;
+        }
+        if reference_layer1_trace {
+            self.push_reference_stage_snapshot(
+                "layer1_q_before_rope_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                q,
+                trace_last_pos,
+                q_dim,
+            );
+            self.push_reference_stage_snapshot(
+                "layer1_k_before_rope_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                k,
+                trace_last_pos,
+                kv_dim,
+            );
+            self.push_reference_stage_metadata(
+                "layer1_qk_norm_metadata",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                serde_json::json!({
+                    "q_norm_ptr": format!("0x{:x}", lw.q_norm_ptr),
+                    "k_norm_ptr": format!("0x{:x}", lw.k_norm_ptr),
+                    "q_norm_shape": if lw.q_norm_ptr != 0 { serde_json::json!([cfg.head_dim]) } else { serde_json::json!(null) },
+                    "k_norm_shape": if lw.k_norm_ptr != 0 { serde_json::json!([cfg.head_dim]) } else { serde_json::json!(null) },
+                    "dtype": "bf16_input_fp32_weight",
+                    "sync_after_capture": true,
+                }),
+            );
+        }
+        if self.trace_prefill_layer_enabled(trace_step, layer_idx) {
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "q_after_qk_norm_last",
+                q,
+                trace_last_pos,
+                q_dim,
+            );
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "k_after_qk_norm_last",
+                k,
+                trace_last_pos,
+                kv_dim,
+            );
+        }
+        if self.trace_prefill_layer_summary_enabled(trace_step, layer_idx) {
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "q_after_qk_norm_last",
+                q,
+                trace_last_pos,
+                q_dim,
+            );
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "k_after_qk_norm_last",
+                k,
+                trace_last_pos,
+                kv_dim,
+            );
         }
 
         if gt {
@@ -7266,6 +11278,124 @@ impl PrefillEngine {
                     ],
                 )?;
             }
+        }
+        if reference_layer1_trace {
+            self.push_reference_stage_snapshot(
+                "layer1_q_after_rope_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                q,
+                trace_last_pos,
+                q_dim,
+            );
+            self.push_reference_stage_snapshot(
+                "layer1_k_after_rope_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                k,
+                trace_last_pos,
+                kv_dim,
+            );
+            self.push_reference_stage_snapshot(
+                "layer1_v_after_rope_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                v,
+                trace_last_pos,
+                kv_dim,
+            );
+            self.push_reference_stage_metadata(
+                "layer1_rope_metadata",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                serde_json::json!({
+                    "positions_ptr": format!("0x{:x}", *self.scratch.d_positions.device_ptr()),
+                    "start_pos": start_pos,
+                    "last_position": trace_last_abs_pos,
+                    "seq_len": m,
+                    "rope_cos_ptr": format!("0x{:x}", self.rope_cos_ptr),
+                    "rope_sin_ptr": format!("0x{:x}", self.rope_sin_ptr),
+                    "head_dim": cfg.head_dim,
+                    "rope_half_dim": if cfg.rope_half_dim > 0 { cfg.rope_half_dim } else { cfg.head_dim / 2 },
+                    "rope_interleave": false,
+                    "sync_after_capture": true,
+                }),
+            );
+        }
+        if self.trace_prefill_layer_enabled(trace_step, layer_idx) {
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "q_after_rotary_last",
+                q,
+                trace_last_pos,
+                q_dim,
+            );
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "k_after_rotary_last",
+                k,
+                trace_last_pos,
+                kv_dim,
+            );
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "v_after_rotary_last",
+                v,
+                trace_last_pos,
+                kv_dim,
+            );
+        }
+        if self.trace_prefill_layer_summary_enabled(trace_step, layer_idx) {
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "q_after_rotary_last",
+                q,
+                trace_last_pos,
+                q_dim,
+            );
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "k_after_rotary_last",
+                k,
+                trace_last_pos,
+                kv_dim,
+            );
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "v_after_rotary_last",
+                v,
+                trace_last_pos,
+                kv_dim,
+            );
         }
 
         if gt {
@@ -7773,6 +11903,106 @@ impl PrefillEngine {
                 cfg,
             )?;
         }
+        if reference_layer1_trace {
+            self.push_reference_stage_snapshot(
+                "layer1_attention_context_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                attn_out,
+                trace_last_pos,
+                q_dim,
+            );
+            self.push_reference_stage_metadata(
+                "layer1_attention_call_metadata",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                serde_json::json!({
+                    "attention_path": attn_path,
+                    "kv_append_path_at_attention_return": kv_append_path,
+                    "kv_cache_already_stored": kv_cache_already_stored,
+                    "capture_kv_cache": capture_kv_cache,
+                    "kv_format": self.kv_format,
+                    "kv_max_seq": self.kv_max_seq,
+                    "kv_num_blocks": self.kv_num_blocks,
+                    "layer_k_ptr": format!("0x{:x}", layer_k_ptr),
+                    "layer_v_ptr": format!("0x{:x}", layer_v_ptr),
+                    "kv_k_radius_ptr": self.kv_k_radius_ptrs.get(layer_idx)
+                        .map(|p| format!("0x{:x}", *p))
+                        .unwrap_or_else(|| "0x0".to_string()),
+                    "kv_v_radius_ptr": self.kv_v_radius_ptrs.get(layer_idx)
+                        .map(|p| format!("0x{:x}", *p))
+                        .unwrap_or_else(|| "0x0".to_string()),
+                    "kv_k_angles_ptr": self.kv_k_angles_ptrs.get(layer_idx)
+                        .map(|p| format!("0x{:x}", *p))
+                        .unwrap_or_else(|| "0x0".to_string()),
+                    "kv_v_angles_ptr": self.kv_v_angles_ptrs.get(layer_idx)
+                        .map(|p| format!("0x{:x}", *p))
+                        .unwrap_or_else(|| "0x0".to_string()),
+                    "q_ptr": format!("0x{:x}", q),
+                    "k_ptr": format!("0x{:x}", k),
+                    "v_ptr": format!("0x{:x}", v),
+                    "attn_out_ptr": format!("0x{:x}", attn_out),
+                    "workspace_ptr": format!("0x{:x}", *self.scratch.d_workspace.device_ptr()),
+                    "fa2_lse_ptr": self.scratch.d_fa2_lse.as_ref()
+                        .map(|s| format!("0x{:x}", *s.device_ptr()))
+                        .unwrap_or_else(|| "0x0".to_string()),
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                    "dtype": {
+                        "q": "bf16",
+                        "k": "bf16_or_cache_format",
+                        "v": "bf16_or_cache_format",
+                        "output": "bf16"
+                    },
+                    "shape": {
+                        "q": [m, cfg.num_q_heads, cfg.head_dim],
+                        "k": [m, cfg.num_kv_heads, cfg.head_dim],
+                        "v": [m, cfg.num_kv_heads, cfg.head_dim],
+                        "output": [m, cfg.num_q_heads, cfg.head_dim]
+                    },
+                    "sync_after_capture": true,
+                }),
+            );
+        }
+        if self.trace_prefill_layer_enabled(trace_step, layer_idx) {
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "attention_context_last",
+                attn_out,
+                trace_last_pos,
+                q_dim,
+            );
+            self.trace_emit_gqa_attention_cpu_diag(
+                trace_step,
+                trace_last_abs_pos,
+                layer_idx,
+                q,
+                k,
+                v,
+                attn_out,
+                m,
+                start_pos,
+            );
+        }
+        if self.trace_prefill_layer_summary_enabled(trace_step, layer_idx) {
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "attention_context_last",
+                attn_out,
+                trace_last_pos,
+                q_dim,
+            );
+        }
 
         // KV cache append: BF16 K,V -> cache format into separate per-layer caches
         // Skip if cross-chunk path already stored K/V before attention.
@@ -7884,17 +12114,132 @@ impl PrefillEngine {
                 )?;
             }
         }
+        if reference_layer1_trace && lw.gqa_gated && gate_ptr != 0 {
+            self.push_reference_stage_snapshot(
+                "layer1_attention_context_gated_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                attn_out,
+                trace_last_pos,
+                q_dim,
+            );
+        }
         if gt {
             self.stream_sync()?;
             self.t_gqa_gate
                 .set(self.t_gqa_gate.get() + gt_gate.elapsed().as_secs_f64() * 1000.0);
         }
+        if self.trace_prefill_layer_enabled(trace_step, layer_idx) && lw.gqa_gated && gate_ptr != 0 {
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "attention_context_gated_last",
+                attn_out,
+                trace_last_pos,
+                q_dim,
+            );
+        }
+        if self.trace_prefill_layer_summary_enabled(trace_step, layer_idx)
+            && lw.gqa_gated
+            && gate_ptr != 0
+        {
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "attention_context_gated_last",
+                attn_out,
+                trace_last_pos,
+                q_dim,
+            );
+        }
 
         // O projection (use scratch1 as temp to avoid input/output aliasing)
         let gt_oproj = Instant::now();
         let o_temp = *self.scratch.d_scratch1.device_ptr();
-        self.la_gemm(attn_out, &lw.o_proj, &lw.o_proj_bf16, o_temp, m)?;
+        for (abs_pos, row_idx) in Self::trace_input_row_positions_for_chunk(start_pos, m) {
+            self.trace_emit_bf16_row_full_words(
+                trace_step,
+                abs_pos,
+                0,
+                layer_idx,
+                "gqa_o_proj_input_last",
+                attn_out,
+                row_idx,
+                q_dim,
+            );
+        }
+        self.la_gemm(
+            layer_idx,
+            "o_proj",
+            attn_out,
+            lw.hqq_gqa.as_ref().map(|hqq| &hqq.o_proj),
+            &lw.o_proj,
+            &lw.o_proj_bf16,
+            o_temp,
+            m,
+        )?;
         self.memcpy_d2d(attn_out, o_temp, (m * cfg.hidden_size * 2) as u64)?;
+        if reference_layer1_trace {
+            self.push_reference_stage_snapshot(
+                "layer1_o_projection_output_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                attn_out,
+                trace_last_pos,
+                cfg.hidden_size,
+            );
+            self.push_reference_stage_metadata(
+                "layer1_o_projection_metadata",
+                Some(layer_idx),
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                serde_json::json!({
+                    "input_ptr": format!("0x{:x}", o_temp),
+                    "output_ptr": format!("0x{:x}", attn_out),
+                    "input_dtype": "bf16",
+                    "output_dtype": "bf16",
+                    "input_shape": [m, cfg.num_q_heads * cfg.head_dim],
+                    "output_shape": [m, cfg.hidden_size],
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                    "sync_after_capture": true,
+                }),
+            );
+        }
+        if self.trace_prefill_layer_enabled(trace_step, layer_idx) {
+            self.trace_emit_bf16_row(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                Some(layer_idx),
+                "prefill_layer",
+                "o_proj_out_last",
+                attn_out,
+                trace_last_pos,
+                cfg.hidden_size,
+            );
+        }
+        if self.trace_prefill_layer_summary_enabled(trace_step, layer_idx) {
+            self.trace_emit_bf16_row_summary(
+                trace_step,
+                trace_last_abs_pos,
+                0,
+                layer_idx,
+                "o_proj_out_last",
+                attn_out,
+                trace_last_pos,
+                cfg.hidden_size,
+            );
+        }
         if gt {
             self.stream_sync()?;
             self.t_gqa_oproj
@@ -8100,24 +12445,18 @@ impl PrefillEngine {
 
     // ── Linear Attention (Gated DeltaNet) ──
 
-    fn forward_linear_attention(&self, layer_idx: usize, m: usize) -> Result<(), String> {
+    fn forward_linear_attention(
+        &self,
+        layer_idx: usize,
+        m: usize,
+        chunk_start: usize,
+    ) -> Result<(), String> {
         let cfg = &self.config;
         let lw = &self.layer_weights[layer_idx];
         if let Some(hqq) = &lw.hqq_linear_attention {
-            if lw.la_in_proj_qkvz_bf16.is_none()
-                || lw.la_in_proj_ba_bf16.is_none()
-                || lw.la_out_proj_bf16.is_none()
-            {
-                return Err(format!(
-                    "HQQ prefill linear-attention weights were not refreshed from the registered slot-backed descriptors before layer {} (backend={} nbits={} format_v{} in_proj_qkvz_rows={} in_proj_qkvz_cols={})",
-                    layer_idx,
-                    hqq.backend,
-                    hqq.nbits,
-                    hqq.format_version,
-                    hqq.in_proj_qkvz.rows,
-                    hqq.in_proj_qkvz.cols,
-                ));
-            }
+            self.validate_hqq_quantized_prefill_tensor_desc("in_proj_qkvz", &hqq.in_proj_qkvz)?;
+            self.validate_hqq_quantized_prefill_tensor_desc("in_proj_ba", &hqq.in_proj_ba)?;
+            self.validate_hqq_quantized_prefill_tensor_desc("out_proj", &hqq.out_proj)?;
         }
         let nk = cfg.la_num_k_heads;
         let nv = cfg.la_num_v_heads;
@@ -8130,14 +12469,23 @@ impl PrefillEngine {
         let scale = cfg.la_scale;
 
         // LA projections: prefer Marlin INT4/INT8, fall back to cuBLAS BF16
-        if lw.la_in_proj_qkvz.is_none() && lw.la_in_proj_qkvz_bf16.is_none() {
-            return Err("missing la_in_proj_qkvz (no Marlin or BF16)".to_string());
+        if lw.hqq_linear_attention.is_none()
+            && lw.la_in_proj_qkvz.is_none()
+            && lw.la_in_proj_qkvz_bf16.is_none()
+        {
+            return Err("missing la_in_proj_qkvz (no HQQ, Marlin, or BF16)".to_string());
         }
-        if lw.la_in_proj_ba.is_none() && lw.la_in_proj_ba_bf16.is_none() {
-            return Err("missing la_in_proj_ba (no Marlin or BF16)".to_string());
+        if lw.hqq_linear_attention.is_none()
+            && lw.la_in_proj_ba.is_none()
+            && lw.la_in_proj_ba_bf16.is_none()
+        {
+            return Err("missing la_in_proj_ba (no HQQ, Marlin, or BF16)".to_string());
         }
-        if lw.la_out_proj.is_none() && lw.la_out_proj_bf16.is_none() {
-            return Err("missing la_out_proj (no Marlin or BF16)".to_string());
+        if lw.hqq_linear_attention.is_none()
+            && lw.la_out_proj.is_none()
+            && lw.la_out_proj_bf16.is_none()
+        {
+            return Err("missing la_out_proj (no HQQ, Marlin, or BF16)".to_string());
         }
         if layer_idx == 0 && std::env::var("KRASIS_PREFILL_DIAG").is_ok() {
             eprintln!("[DIAG L00] LA config: nk={} nv={} dk={} dv={} hr={} chunk_size={} scale={:.4} kernel_dim={} conv_dim={}",
@@ -8230,16 +12578,318 @@ impl PrefillEngine {
 
         let lt = self.gqa_timing_enabled.get(); // reuse same env flag for LA timing
         let lt0 = Instant::now();
+        let trace_step = if self.config.prefill_chunk_size > 0 {
+            chunk_start / self.config.prefill_chunk_size
+        } else {
+            0
+        };
         let la_diag =
             std::env::var("KRASIS_PREFILL_DIAG").is_ok() && Self::diag_layer_enabled(layer_idx);
+        let trace_la_projection_summary =
+            self.trace_prefill_la_projection_summary_enabled(trace_step, layer_idx);
+        let trace_last_row = m.saturating_sub(1);
+        let trace_last_pos = chunk_start.saturating_add(trace_last_row);
+        let trace_fla_bt: usize = 64;
+        let trace_fla_chunk_start = (trace_last_row / trace_fla_bt) * trace_fla_bt;
+        let trace_fla_chunk_rows = trace_fla_bt.min(m.saturating_sub(trace_fla_chunk_start));
+        let trace_qkvz_weight_provenance =
+            trace_la_projection_summary && Self::trace_target_position_matches(trace_last_pos);
+        let qkvz_backend = if lw.hqq_linear_attention.is_some() {
+            "hqq4"
+        } else {
+            "bf16"
+        };
+        let reference_layer1_la_trace = self.reference_debug_trace_enabled && layer_idx == 1;
+        if reference_layer1_la_trace {
+            self.push_reference_stage_metadata(
+                "layer1_la_entry_metadata",
+                Some(layer_idx),
+                trace_step,
+                trace_last_pos,
+                0,
+                serde_json::json!({
+                    "layer_type": "linear_attention",
+                    "qkvz_backend": qkvz_backend,
+                    "m": m,
+                    "chunk_start": chunk_start,
+                        "trace_last_row": trace_last_row,
+                        "trace_last_pos": trace_last_pos,
+                        "trace_fla_chunk_start": trace_fla_chunk_start,
+                        "trace_fla_chunk_rows": trace_fla_chunk_rows,
+                        "nk": nk,
+                        "nv": nv,
+                    "dk": dk,
+                    "dv": dv,
+                    "hr": hr,
+                    "key_dim": key_dim,
+                    "value_dim": value_dim,
+                    "qkvz_dim": qkvz_dim,
+                    "ba_dim": ba_dim,
+                    "chunk_size": chunk_size,
+                    "scale": scale,
+                    "rope_applicable": false,
+                    "kv_cache_applicable": false,
+                    "hidden_ptr": format!("0x{:x}", hidden),
+                    "attn_out_ptr": format!("0x{:x}", attn_out),
+                    "proj_buf_ptr": format!("0x{:x}", proj_buf),
+                    "la_q_ptr": format!("0x{:x}", la_q),
+                    "la_k_ptr": format!("0x{:x}", la_k),
+                    "la_v_ptr": format!("0x{:x}", la_v),
+                    "la_z_ptr": format!("0x{:x}", la_z),
+                    "la_b_ptr": format!("0x{:x}", la_b),
+                    "la_a_ptr": format!("0x{:x}", la_a),
+                }),
+            );
+        }
+        if let Some(weight) = lw.la_in_proj_qkvz_bf16.as_ref() {
+            for (abs_pos, row_idx) in Self::trace_input_row_positions_for_chunk(chunk_start, m) {
+                self.trace_emit_bf16_row_full_words(
+                    trace_step,
+                    abs_pos,
+                    0,
+                    layer_idx,
+                    "la_input_row_for_qkvz_last",
+                    hidden,
+                    row_idx,
+                    weight.k,
+                );
+            }
+        }
+        if trace_qkvz_weight_provenance {
+            if let Some(weight) = lw.la_in_proj_qkvz_bf16.as_ref() {
+                self.trace_emit_bf16_row_summary(
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    "la_input_row_for_qkvz_last",
+                    hidden,
+                    trace_last_row,
+                    weight.k,
+                );
+                self.trace_emit_la_qkvz_weight_provenance(
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    qkvz_backend,
+                    weight,
+                    lw.hqq_linear_attention.as_ref().map(|hqq| &hqq.in_proj_qkvz),
+                    nk,
+                    dk,
+                    hr,
+                    dv,
+                );
+            }
+        }
+        if reference_layer1_la_trace {
+            if let Some(weight) = lw.la_in_proj_qkvz_bf16.as_ref() {
+                self.push_reference_stage_metadata(
+                    "layer1_la_qkvz_materialized_weight_metadata",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    serde_json::json!({
+                        "runtime_projection_backend": if lw.la_in_proj_qkvz.is_some() { "marlin" } else { "cublas_bf16" },
+                        "materialized_weight_available": true,
+                        "materialized_weight_ptr": format!("0x{:x}", weight.ptr),
+                        "materialized_weight_rows": weight.n,
+                        "materialized_weight_cols": weight.k,
+                        "materialized_weight_dtype": "bf16",
+                        "materialized_weight_layout": "row_major_output_rows",
+                        "hqq_source_available": lw.hqq_linear_attention.is_some(),
+                        "hqq_source": lw.hqq_linear_attention.as_ref().map(|hqq| serde_json::json!({
+                            "backend": hqq.backend,
+                            "format_version": hqq.format_version,
+                            "nbits": hqq.nbits,
+                            "rows": hqq.in_proj_qkvz.rows,
+                            "cols": hqq.in_proj_qkvz.cols,
+                            "group_size": hqq.in_proj_qkvz.group_size,
+                            "axis": hqq.in_proj_qkvz.axis,
+                            "layout": hqq.in_proj_qkvz.layout,
+                            "packed_dtype": hqq.in_proj_qkvz.packed_dtype,
+                            "scales_dtype": hqq.in_proj_qkvz.scales_dtype,
+                            "zeros_dtype": hqq.in_proj_qkvz.zeros_dtype,
+                            "packed_ptr": format!("0x{:x}", hqq.in_proj_qkvz.packed_ptr),
+                            "scales_ptr": format!("0x{:x}", hqq.in_proj_qkvz.scales_ptr),
+                            "zeros_ptr": format!("0x{:x}", hqq.in_proj_qkvz.zeros_ptr),
+                        })),
+                    }),
+                );
+                self.push_reference_stage_bf16_chunk_snapshot(
+                    "layer1_la_qkvz_materialized_weight_sample_rows",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    weight.ptr,
+                    8usize.min(weight.n),
+                    weight.k,
+                    0,
+                );
+            } else {
+                self.push_reference_stage_metadata(
+                    "layer1_la_qkvz_materialized_weight_metadata",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    serde_json::json!({
+                        "runtime_projection_backend": if lw.la_in_proj_qkvz.is_some() { "marlin" } else { "none" },
+                        "materialized_weight_available": false,
+                        "hqq_source_available": lw.hqq_linear_attention.is_some(),
+                    }),
+                );
+            }
+            self.push_reference_stage_bf16_chunk_snapshot(
+                "layer1_la_qkvz_projection_input_norm_chunk",
+                Some(layer_idx),
+                trace_step,
+                trace_last_pos,
+                0,
+                hidden + ((trace_fla_chunk_start * cfg.hidden_size * 2) as u64),
+                trace_fla_chunk_rows,
+                cfg.hidden_size,
+                trace_fla_chunk_start,
+            );
+            self.push_reference_stage_bf16_chunk_snapshot(
+                "layer1_la_in_proj_qkvz_output_pre_call_chunk",
+                Some(layer_idx),
+                trace_step,
+                trace_last_pos,
+                0,
+                proj_buf + ((trace_fla_chunk_start * qkvz_dim * 2) as u64),
+                trace_fla_chunk_rows,
+                qkvz_dim,
+                trace_fla_chunk_start,
+            );
+            self.push_reference_stage_metadata(
+                "layer1_la_qkvz_projection_call_metadata_pre",
+                Some(layer_idx),
+                trace_step,
+                trace_last_pos,
+                0,
+                serde_json::json!({
+                    "runtime_projection_backend": if lw.la_in_proj_qkvz.is_some() { "marlin" } else { "cublas_bf16" },
+                    "input_ptr": format!("0x{:x}", hidden),
+                    "output_ptr": format!("0x{:x}", proj_buf),
+                    "m": m,
+                    "k": cfg.hidden_size,
+                    "n": qkvz_dim,
+                    "input_dtype": "bf16",
+                    "output_dtype": "bf16",
+                    "compute_dtype": if lw.la_in_proj_qkvz.is_some() { "marlin_fp32_reduce" } else { "cublas_compute_32f" },
+                    "input_layout": "row_major_m_by_hidden",
+                    "output_layout": "row_major_m_by_qkvz",
+                    "input_stride_elems": cfg.hidden_size,
+                    "output_stride_elems": qkvz_dim,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                    "cublas_handle_ptr": format!("0x{:x}", self.cublas_handle as usize),
+                    "trace_chunk_start": trace_fla_chunk_start,
+                    "trace_chunk_rows": trace_fla_chunk_rows,
+                    "watched_output_rows": [395usize, 425usize],
+                    "column_segment_width": 256usize,
+                }),
+            );
+        }
         // 1. in_proj_qkvz GEMM: [M, hidden] -> [M, qkvz_dim] BF16
         self.la_gemm(
+            layer_idx,
+            "in_proj_qkvz",
             hidden,
+            lw.hqq_linear_attention.as_ref().map(|hqq| &hqq.in_proj_qkvz),
             &lw.la_in_proj_qkvz,
             &lw.la_in_proj_qkvz_bf16,
             proj_buf,
             m,
         )?;
+        let qkvz_projection_sync_success = if reference_layer1_la_trace {
+            self.stream_sync().is_ok()
+        } else {
+            true
+        };
+        if trace_la_projection_summary {
+            self.trace_emit_bf16_row_summary(
+                0,
+                trace_last_pos,
+                0,
+                layer_idx,
+                "la_in_proj_qkvz_last",
+                proj_buf,
+                trace_last_pos,
+                qkvz_dim,
+            );
+        }
+        if reference_layer1_la_trace {
+            self.push_reference_stage_snapshot(
+                "layer1_la_in_proj_qkvz_last",
+                Some(layer_idx),
+                trace_step,
+                trace_last_pos,
+                0,
+                proj_buf,
+                trace_last_row,
+                qkvz_dim,
+            );
+            self.push_reference_stage_bf16_chunk_snapshot(
+                "layer1_la_in_proj_qkvz_chunk",
+                Some(layer_idx),
+                trace_step,
+                trace_last_pos,
+                0,
+                proj_buf + ((trace_fla_chunk_start * qkvz_dim * 2) as u64),
+                trace_fla_chunk_rows,
+                qkvz_dim,
+                trace_fla_chunk_start,
+            );
+            self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                "layer1_la_in_proj_qkvz_chunk_column_segments",
+                Some(layer_idx),
+                trace_step,
+                trace_last_pos,
+                0,
+                proj_buf + ((trace_fla_chunk_start * qkvz_dim * 2) as u64),
+                trace_fla_chunk_rows,
+                qkvz_dim,
+                trace_fla_chunk_start,
+                &[395usize, 425usize],
+                256,
+            );
+            self.push_reference_stage_metadata(
+                "layer1_la_qkvz_projection_call_metadata_post",
+                Some(layer_idx),
+                trace_step,
+                trace_last_pos,
+                0,
+                serde_json::json!({
+                    "sync_after_launch_success": qkvz_projection_sync_success,
+                    "runtime_projection_backend": if lw.la_in_proj_qkvz.is_some() { "marlin" } else { "cublas_bf16" },
+                    "input_ptr": format!("0x{:x}", hidden),
+                    "output_ptr": format!("0x{:x}", proj_buf),
+                    "m": m,
+                    "k": cfg.hidden_size,
+                    "n": qkvz_dim,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
+        }
+        if trace_qkvz_weight_provenance {
+            if let Some(weight) = lw.la_in_proj_qkvz_bf16.as_ref() {
+                self.trace_emit_la_qkvz_projection_check(
+                    0,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    qkvz_backend,
+                    hidden,
+                    trace_last_pos,
+                    weight,
+                    proj_buf,
+                    trace_last_pos,
+                );
+            }
+        }
         if la_diag {
             let gemm_norm = self.diag_l2_norm(proj_buf, 0, qkvz_dim, qkvz_dim);
             eprintln!(
@@ -8276,6 +12926,52 @@ impl PrefillEngine {
             let mut p6 = dk as i32;
             let mut p7 = hr as i32;
             let mut p8 = dv as i32;
+            if reference_layer1_la_trace {
+                self.push_reference_stage_bf16_chunk_snapshot(
+                    "layer1_la_k_split_output_pre_call_chunk",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    k_bf16 + ((trace_fla_chunk_start * key_dim * 2) as u64),
+                    trace_fla_chunk_rows,
+                    key_dim,
+                    trace_fla_chunk_start,
+                );
+                self.push_reference_stage_metadata(
+                    "layer1_la_qkvz_split_call_metadata_pre",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    serde_json::json!({
+                        "kernel": "la_uninterleave_qkvz",
+                        "q_output_ptr": format!("0x{:x}", q_bf16),
+                        "k_output_ptr": format!("0x{:x}", k_bf16),
+                        "v_output_ptr": format!("0x{:x}", v_bf16),
+                        "z_output_ptr": format!("0x{:x}", la_z),
+                        "input_proj_ptr": format!("0x{:x}", proj_buf),
+                        "stream_ptr": format!("0x{:x}", self.stream as usize),
+                        "dtype": "bf16",
+                        "shape": {
+                            "m": m,
+                            "nk": nk,
+                            "dk": dk,
+                            "hr": hr,
+                            "dv": dv,
+                            "key_dim": key_dim,
+                            "value_dim": value_dim,
+                            "qkvz_dim": qkvz_dim,
+                            "trace_fla_chunk_start": trace_fla_chunk_start,
+                            "trace_fla_chunk_rows": trace_fla_chunk_rows
+                        },
+                        "stride_elems": {
+                            "k_row": key_dim,
+                            "qkvz_row": qkvz_dim
+                        }
+                    }),
+                );
+            }
             unsafe {
                 launch(
                     self.kernels.la_uninterleave_qkvz,
@@ -8296,6 +12992,32 @@ impl PrefillEngine {
                     ],
                 )?;
             }
+            if reference_layer1_la_trace {
+                self.push_reference_stage_bf16_chunk_snapshot(
+                    "layer1_la_k_split_output_post_call_chunk",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    k_bf16 + ((trace_fla_chunk_start * key_dim * 2) as u64),
+                    trace_fla_chunk_rows,
+                    key_dim,
+                    trace_fla_chunk_start,
+                );
+                self.push_reference_stage_metadata(
+                    "layer1_la_qkvz_split_call_metadata_post",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    serde_json::json!({
+                        "kernel": "la_uninterleave_qkvz",
+                        "sync_before_snapshot": true,
+                        "k_output_ptr": format!("0x{:x}", k_bf16),
+                        "stream_ptr": format!("0x{:x}", self.stream as usize)
+                    }),
+                );
+            }
 
             // DIAG: norms after uninterleave
             if la_diag {
@@ -8309,15 +13031,143 @@ impl PrefillEngine {
                     layer_idx, q_norm, k_norm, v_norm, z_norm
                 );
             }
+            if trace_la_projection_summary {
+                self.trace_emit_bf16_row_summary(
+                    0,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    "la_q_split_last",
+                    q_bf16,
+                    trace_last_pos,
+                    key_dim,
+                );
+                self.trace_emit_bf16_row_summary(
+                    0,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    "la_k_split_last",
+                    k_bf16,
+                    trace_last_pos,
+                    key_dim,
+                );
+                self.trace_emit_bf16_row_summary(
+                    0,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    "la_v_split_last",
+                    v_bf16,
+                    trace_last_pos,
+                    value_dim,
+                );
+                self.trace_emit_bf16_row_summary(
+                    0,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    "la_z_split_last",
+                    la_z,
+                    trace_last_pos,
+                    value_dim,
+                );
+            }
+            if reference_layer1_la_trace {
+                self.push_reference_stage_snapshot(
+                    "layer1_la_q_split_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    q_bf16,
+                    trace_last_row,
+                    key_dim,
+                );
+                self.push_reference_stage_snapshot(
+                    "layer1_la_k_split_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    k_bf16,
+                    trace_last_row,
+                    key_dim,
+                );
+                self.push_reference_stage_snapshot(
+                    "layer1_la_v_split_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    v_bf16,
+                    trace_last_row,
+                    value_dim,
+                );
+                self.push_reference_stage_snapshot(
+                    "layer1_la_z_split_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    la_z,
+                    trace_last_row,
+                    value_dim,
+                );
+                self.push_reference_stage_metadata(
+                    "layer1_la_qkvz_split_metadata",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    serde_json::json!({
+                        "q_bf16_ptr": format!("0x{:x}", q_bf16),
+                        "k_bf16_ptr": format!("0x{:x}", k_bf16),
+                        "v_bf16_ptr": format!("0x{:x}", v_bf16),
+                        "z_bf16_ptr": format!("0x{:x}", la_z),
+                        "q_width": key_dim,
+                        "k_width": key_dim,
+                        "v_width": value_dim,
+                        "z_width": value_dim,
+                    }),
+                );
+            }
 
             // 3. in_proj_ba GEMM: [M, hidden] -> [M, ba_dim] BF16
             self.la_gemm(
+                layer_idx,
+                "in_proj_ba",
                 hidden,
+                lw.hqq_linear_attention.as_ref().map(|hqq| &hqq.in_proj_ba),
                 &lw.la_in_proj_ba,
                 &lw.la_in_proj_ba_bf16,
                 proj_buf,
                 m,
             )?;
+            if trace_la_projection_summary {
+                self.trace_emit_bf16_row_summary(
+                    0,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    "la_in_proj_ba_last",
+                    proj_buf,
+                    trace_last_pos,
+                    ba_dim,
+                );
+            }
+            if reference_layer1_la_trace {
+                self.push_reference_stage_snapshot(
+                    "layer1_la_in_proj_ba_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    proj_buf,
+                    trace_last_row,
+                    ba_dim,
+                );
+            }
 
             // 4. Uninterleave BA -> b [M, nv] BF16, a [M, nv] BF16
             {
@@ -8344,6 +13194,50 @@ impl PrefillEngine {
                         ],
                     )?;
                 }
+            }
+            if trace_la_projection_summary {
+                self.trace_emit_bf16_row_summary(
+                    0,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    "la_b_split_last",
+                    la_b,
+                    trace_last_pos,
+                    nv,
+                );
+                self.trace_emit_bf16_row_summary(
+                    0,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    "la_a_split_last",
+                    la_a,
+                    trace_last_pos,
+                    nv,
+                );
+            }
+            if reference_layer1_la_trace {
+                self.push_reference_stage_snapshot(
+                    "layer1_la_b_split_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    la_b,
+                    trace_last_row,
+                    nv,
+                );
+                self.push_reference_stage_snapshot(
+                    "layer1_la_a_split_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    la_a,
+                    trace_last_row,
+                    nv,
+                );
             }
             if lt {
                 self.stream_sync()?;
@@ -8386,6 +13280,59 @@ impl PrefillEngine {
                     let mut c9 = key_dim as i32;
                     let mut c10 = value_dim as i32;
                     let mut c11 = kernel_dim as i32;
+                    if reference_layer1_la_trace {
+                        self.push_reference_stage_bf16_chunk_snapshot(
+                            "layer1_la_conv_k_input_chunk",
+                            Some(layer_idx),
+                            trace_step,
+                            trace_last_pos,
+                            0,
+                            k_bf16 + ((trace_fla_chunk_start * key_dim * 2) as u64),
+                            trace_fla_chunk_rows,
+                            key_dim,
+                            trace_fla_chunk_start,
+                        );
+                        self.push_reference_stage_bf16_chunk_snapshot(
+                            "layer1_la_conv_k_output_pre_call_chunk",
+                            Some(layer_idx),
+                            trace_step,
+                            trace_last_pos,
+                            0,
+                            conv_k_bf16 + ((trace_fla_chunk_start * key_dim * 2) as u64),
+                            trace_fla_chunk_rows,
+                            key_dim,
+                            trace_fla_chunk_start,
+                        );
+                        self.push_reference_stage_metadata(
+                            "layer1_la_conv_k_call_metadata_pre",
+                            Some(layer_idx),
+                            trace_step,
+                            trace_last_pos,
+                            0,
+                            serde_json::json!({
+                                "kernel": "la_fused_conv1d_silu_bf16",
+                                "conv_state_ptr": format!("0x{:x}", conv_state),
+                                "conv_weight_ptr": format!("0x{:x}", conv_weight),
+                                "conv_k_input_ptr": format!("0x{:x}", k_bf16),
+                                "conv_k_output_ptr": format!("0x{:x}", conv_k_bf16),
+                                "stream_ptr": format!("0x{:x}", self.stream as usize),
+                                "dtype": "bf16",
+                                "shape": {
+                                    "m": m,
+                                    "key_dim": key_dim,
+                                    "value_dim": value_dim,
+                                    "kernel_dim": kernel_dim,
+                                    "conv_dim": conv_dim,
+                                    "trace_fla_chunk_start": trace_fla_chunk_start,
+                                    "trace_fla_chunk_rows": trace_fla_chunk_rows
+                                },
+                                "stride_elems": {
+                                    "k_input_row": key_dim,
+                                    "k_output_row": key_dim
+                                }
+                            }),
+                        );
+                    }
                     unsafe {
                         launch(
                             self.kernels.la_fused_conv1d_silu_bf16,
@@ -8409,6 +13356,115 @@ impl PrefillEngine {
                             ],
                         )?;
                     }
+                    if reference_layer1_la_trace {
+                        self.push_reference_stage_bf16_chunk_snapshot(
+                            "layer1_la_conv_k_output_post_call_chunk",
+                            Some(layer_idx),
+                            trace_step,
+                            trace_last_pos,
+                            0,
+                            conv_k_bf16 + ((trace_fla_chunk_start * key_dim * 2) as u64),
+                            trace_fla_chunk_rows,
+                            key_dim,
+                            trace_fla_chunk_start,
+                        );
+                        self.push_reference_stage_metadata(
+                            "layer1_la_conv_k_call_metadata_post",
+                            Some(layer_idx),
+                            trace_step,
+                            trace_last_pos,
+                            0,
+                            serde_json::json!({
+                                "kernel": "la_fused_conv1d_silu_bf16",
+                                "sync_before_snapshot": true,
+                                "conv_k_output_ptr": format!("0x{:x}", conv_k_bf16),
+                                "stream_ptr": format!("0x{:x}", self.stream as usize)
+                            }),
+                        );
+                    }
+                }
+                if trace_la_projection_summary {
+                    self.trace_emit_bf16_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_conv_q_last",
+                        conv_q_bf16,
+                        trace_last_pos,
+                        key_dim,
+                    );
+                    self.trace_emit_bf16_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_conv_k_last",
+                        conv_k_bf16,
+                        trace_last_pos,
+                        key_dim,
+                    );
+                    self.trace_emit_bf16_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_conv_v_last",
+                        conv_v_bf16,
+                        trace_last_pos,
+                        value_dim,
+                    );
+                }
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_conv_q_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        conv_q_bf16,
+                        trace_last_row,
+                        key_dim,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_conv_k_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        conv_k_bf16,
+                        trace_last_row,
+                        key_dim,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_conv_v_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        conv_v_bf16,
+                        trace_last_row,
+                        value_dim,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_conv_metadata",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "conv_state_ptr": format!("0x{:x}", conv_state),
+                            "conv_weight_ptr": format!("0x{:x}", conv_weight),
+                            "conv_q_ptr": format!("0x{:x}", conv_q_bf16),
+                            "conv_k_ptr": format!("0x{:x}", conv_k_bf16),
+                            "conv_v_ptr": format!("0x{:x}", conv_v_bf16),
+                            "kernel_dim": kernel_dim,
+                            "conv_dim": conv_dim,
+                            "input_q_ptr": format!("0x{:x}", q_bf16),
+                            "input_k_ptr": format!("0x{:x}", k_bf16),
+                            "input_v_ptr": format!("0x{:x}", v_bf16),
+                        }),
+                    );
                 }
 
                 // Update conv state (tiny kernel, negligible cost)
@@ -8481,6 +13537,64 @@ impl PrefillEngine {
                         )?;
                     }
                 }
+                if trace_la_projection_summary {
+                    self.trace_emit_bf16_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_beta_bf16_last",
+                        beta_bf16_buf,
+                        trace_last_pos,
+                        nv,
+                    );
+                    self.trace_emit_bf16_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_gate_bf16_last",
+                        gate_bf16_buf,
+                        trace_last_pos,
+                        nv,
+                    );
+                }
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_beta_bf16_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        beta_bf16_buf,
+                        trace_last_row,
+                        nv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_gate_bf16_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        gate_bf16_buf,
+                        trace_last_row,
+                        nv,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_gate_beta_metadata",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "beta_bf16_ptr": format!("0x{:x}", beta_bf16_buf),
+                            "gate_bf16_ptr": format!("0x{:x}", gate_bf16_buf),
+                            "a_log_ptr": format!("0x{:x}", lw.la_a_log_ptr),
+                            "dt_bias_ptr": format!("0x{:x}", lw.la_dt_bias_ptr),
+                            "width": nv,
+                        }),
+                    );
+                }
                 if self
                     .trace
                     .as_ref()
@@ -8547,6 +13661,59 @@ impl PrefillEngine {
                     r0 = fla_k_bf16;
                     r1 = conv_k_bf16;
                     r5 = 1.0f32;
+                    if reference_layer1_la_trace {
+                        self.push_reference_stage_bf16_chunk_snapshot(
+                            "layer1_la_fla_k_norm_input_chunk",
+                            Some(layer_idx),
+                            trace_step,
+                            trace_last_pos,
+                            0,
+                            conv_k_bf16 + ((trace_fla_chunk_start * key_dim * 2) as u64),
+                            trace_fla_chunk_rows,
+                            key_dim,
+                            trace_fla_chunk_start,
+                        );
+                        self.push_reference_stage_bf16_chunk_snapshot(
+                            "layer1_la_fla_k_norm_output_pre_call_chunk",
+                            Some(layer_idx),
+                            trace_step,
+                            trace_last_pos,
+                            0,
+                            fla_k_bf16 + ((trace_fla_chunk_start * nv * dk * 2) as u64),
+                            trace_fla_chunk_rows,
+                            nv * dk,
+                            trace_fla_chunk_start,
+                        );
+                        self.push_reference_stage_metadata(
+                            "layer1_la_fla_k_norm_call_metadata_pre",
+                            Some(layer_idx),
+                            trace_step,
+                            trace_last_pos,
+                            0,
+                            serde_json::json!({
+                                "kernel": "la_fused_repeat_l2norm_bf16",
+                                "input_ptr": format!("0x{:x}", conv_k_bf16),
+                                "output_ptr": format!("0x{:x}", fla_k_bf16),
+                                "stream_ptr": format!("0x{:x}", self.stream as usize),
+                                "dtype": "bf16",
+                                "scale": 1.0f32,
+                                "shared_memory_bytes": smem,
+                                "shape": {
+                                    "m": m,
+                                    "nk": nk,
+                                    "nv": nv,
+                                    "dk": dk,
+                                    "hr": hr,
+                                    "trace_fla_chunk_start": trace_fla_chunk_start,
+                                    "trace_fla_chunk_rows": trace_fla_chunk_rows
+                                },
+                                "stride_elems": {
+                                    "input_row": key_dim,
+                                    "output_row": nv * dk
+                                }
+                            }),
+                        );
+                    }
                     unsafe {
                         launch(
                             self.kernels.la_fused_repeat_l2norm_bf16,
@@ -8564,6 +13731,115 @@ impl PrefillEngine {
                             ],
                         )?;
                     }
+                    if reference_layer1_la_trace {
+                        self.push_reference_stage_bf16_chunk_snapshot(
+                            "layer1_la_fla_k_norm_output_post_call_chunk",
+                            Some(layer_idx),
+                            trace_step,
+                            trace_last_pos,
+                            0,
+                            fla_k_bf16 + ((trace_fla_chunk_start * nv * dk * 2) as u64),
+                            trace_fla_chunk_rows,
+                            nv * dk,
+                            trace_fla_chunk_start,
+                        );
+                        self.push_reference_stage_metadata(
+                            "layer1_la_fla_k_norm_call_metadata_post",
+                            Some(layer_idx),
+                            trace_step,
+                            trace_last_pos,
+                            0,
+                            serde_json::json!({
+                                "kernel": "la_fused_repeat_l2norm_bf16",
+                                "sync_before_snapshot": true,
+                                "output_ptr": format!("0x{:x}", fla_k_bf16),
+                                "stream_ptr": format!("0x{:x}", self.stream as usize)
+                            }),
+                        );
+                    }
+                }
+                if trace_la_projection_summary {
+                    self.trace_emit_bf16_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_q_norm_last",
+                        fla_q_bf16,
+                        trace_last_pos,
+                        nv * dk,
+                    );
+                    self.trace_emit_bf16_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_k_norm_last",
+                        fla_k_bf16,
+                        trace_last_pos,
+                        nv * dk,
+                    );
+                    self.trace_emit_bf16_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_v_fla_last",
+                        conv_v_bf16,
+                        trace_last_pos,
+                        nv * dv,
+                    );
+                }
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_q_norm_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        fla_q_bf16,
+                        trace_last_row,
+                        nv * dk,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_k_norm_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        fla_k_bf16,
+                        trace_last_row,
+                        nv * dk,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_v_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        conv_v_bf16,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_fla_input_metadata",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "fla_q_bf16_ptr": format!("0x{:x}", fla_q_bf16),
+                            "fla_k_bf16_ptr": format!("0x{:x}", fla_k_bf16),
+                            "fla_v_bf16_ptr": format!("0x{:x}", conv_v_bf16),
+                            "fla_beta_bf16_ptr": format!("0x{:x}", beta_bf16_buf),
+                            "fla_gate_bf16_ptr": format!("0x{:x}", gate_bf16_buf),
+                            "q_width": nv * dk,
+                            "k_width": nv * dk,
+                            "v_width": nv * dv,
+                            "q_scale": scale,
+                            "k_scale": 1.0f32,
+                        }),
+                    );
                 }
                 if lt {
                     self.stream_sync()?;
@@ -8689,6 +13965,30 @@ impl PrefillEngine {
 
                 let fla = self.fla.as_ref().unwrap();
                 let t_arg = fla_total as i32;
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_metadata(
+                        "layer1_la_fla_workspace_metadata",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "fla_bt": fla_bt,
+                            "fla_pad": fla_pad,
+                            "fla_total": fla_total,
+                            "fla_nt": fla_nt,
+                            "a_fla_ptr": format!("0x{:x}", a_fla),
+                            "ai_fla_ptr": format!("0x{:x}", ai_fla),
+                            "w_fla_ptr": format!("0x{:x}", w_fla),
+                            "u_fla_ptr": format!("0x{:x}", u_fla),
+                            "h_fla_ptr": format!("0x{:x}", h_fla),
+                            "h0_fla_ptr": format!("0x{:x}", h0_fla),
+                            "ht_fla_ptr": format!("0x{:x}", ht_fla),
+                            "v_new_fla_ptr": format!("0x{:x}", v_new_fla),
+                            "o_fla_ptr": format!("0x{:x}", o_fla),
+                        }),
+                    );
+                }
 
                 // DEBUG: sync before FLA to catch conv/gate/repeat kernel errors
 
@@ -8808,6 +14108,63 @@ impl PrefillEngine {
                     }
                 }
                 self.launch_transpose_f32(g_cum_fla, fp32_scratch, nv, fla_total)?;
+                if trace_la_projection_summary {
+                    self.trace_emit_f32_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_gate_fp32_last",
+                        gate_fp32_token_major,
+                        trace_last_pos,
+                        nv,
+                    );
+                    self.trace_emit_f32_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_g_cumsum_last",
+                        g_cum_fla,
+                        trace_last_pos,
+                        nv,
+                    );
+                }
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_gate_fp32_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(
+                            gate_fp32_token_major + ((trace_last_row * nv * 4) as u64),
+                            nv,
+                        ),
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_g_cumsum_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(g_cum_fla + ((trace_last_row * nv * 4) as u64), nv),
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_cumsum_metadata",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "gate_fp32_token_major_ptr": format!("0x{:x}", gate_fp32_token_major),
+                            "g_cum_fla_ptr": format!("0x{:x}", g_cum_fla),
+                            "fp32_scratch_ptr": format!("0x{:x}", fp32_scratch),
+                            "layout": "token-major-after-transpose-back",
+                            "width": nv,
+                        }),
+                    );
+                }
                 if trace_la_mixer {
                     let last_pos = m.saturating_sub(1);
                     let beta_trace_scratch = a_fla; // trace-only scratch; kkt overwrites A afterwards
@@ -9023,6 +14380,173 @@ impl PrefillEngine {
 
                 // Step 2: kkt — k, g_cumsum, beta → A
                 // Grid: (NT, B*H) = (fla_nt, nv)
+                let trace_chunk_start = (trace_last_row / fla_bt) * fla_bt;
+                let trace_chunk_rows = fla_bt.min(fla_total.saturating_sub(trace_chunk_start));
+                let trace_chunk_k_offset = trace_chunk_start * nv * dk;
+                let trace_chunk_beta_offset = trace_chunk_start * nv;
+                let trace_chunk_a_offset = trace_chunk_start * nv * fla_bt;
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_kkt_k_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        fla_k_bf16,
+                        trace_last_row,
+                        nv * dk,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_kkt_beta_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        fla_beta_bf16,
+                        trace_last_row,
+                        nv,
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_kkt_g_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(g_cum_fla + ((trace_last_row * nv * 4) as u64), nv),
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        "layer1_la_kkt_k_input_chunk",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        fla_k_bf16 + ((trace_chunk_k_offset * 2) as u64),
+                        trace_chunk_rows,
+                        nv * dk,
+                        trace_chunk_start,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_kkt_beta_input_chunk",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        fla_beta_bf16 + ((trace_chunk_beta_offset * 2) as u64),
+                        0,
+                        trace_chunk_rows * nv,
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_kkt_g_input_chunk",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(
+                            g_cum_fla + ((trace_chunk_beta_offset * 4) as u64),
+                            trace_chunk_rows * nv,
+                        ),
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_kkt_a_pre_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(
+                            a_fla + ((trace_last_row * nv * fla_bt * 4) as u64),
+                            nv * fla_bt,
+                        ),
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_kkt_a_pre_call_chunk",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(
+                            a_fla + ((trace_chunk_a_offset * 4) as u64),
+                            trace_chunk_rows * nv * fla_bt,
+                        ),
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_kkt_call_metadata_pre",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "kernel": "krasis_fla_chunk_scaled_dot_kkt_fwd_kernel",
+                            "vendored_source": "src/cuda/fla/ops/common/chunk_scaled_dot_kkt.py",
+                            "compiled_symbol": "krasis_fla_chunk_scaled_dot_kkt_fwd_kernel",
+                            "triton_kernel": "chunk_scaled_dot_kkt_fwd_kernel",
+                            "k_ptr": format!("0x{:x}", fla_k_bf16),
+                            "beta_ptr": format!("0x{:x}", fla_beta_bf16),
+                            "g_ptr": format!("0x{:x}", g_cum_fla),
+                            "a_output_ptr": format!("0x{:x}", a_fla),
+                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+                            "cu_seqlens_ptr": null,
+                            "chunk_indices_ptr": null,
+                            "workspace_ptr": null,
+                            "workspace_size_bytes": 0,
+                            "workspace_readable": false,
+                            "workspace_reason": "KKT wrapper exposes k/g/beta inputs and A output only; Triton temporaries are internal to the launched cubin",
+                            "temp_state_ptr": null,
+                            "temp_state_readable": false,
+                            "per_call_memset_or_reset": false,
+                            "a_output_allocation": "d_fla_a is allocated with alloc_zeros during prefill buffer preparation; no per-call memset is issued before KKT",
+                            "dtypes": {
+                                "k": "bf16",
+                                "beta": "bf16",
+                                "g": "fp32",
+                                "a_output": "fp32"
+                            },
+                            "shape": {
+                                "m": m,
+                                "fla_total": fla_total,
+                                "fla_nt": fla_nt,
+                                "fla_bt": fla_bt,
+                                "nv": nv,
+                                "dk": dk,
+                                "trace_last_pos": trace_last_pos,
+                                "trace_last_row": trace_last_row,
+                                "trace_chunk_start": trace_chunk_start,
+                                "trace_chunk_rows": trace_chunk_rows
+                            },
+                            "stride_elems": {
+                                "k_row": nv * dk,
+                                "beta_row": nv,
+                                "g_row": nv,
+                                "a_row": nv * fla_bt
+                            },
+                            "buffer_elems": {
+                                "k": fla_total * nv * dk,
+                                "beta": fla_total * nv,
+                                "g": fla_total * nv,
+                                "a_output": fla_total * nv * fla_bt,
+                                "trace_chunk_k": trace_chunk_rows * nv * dk,
+                                "trace_chunk_beta": trace_chunk_rows * nv,
+                                "trace_chunk_g": trace_chunk_rows * nv,
+                                "trace_chunk_a": trace_chunk_rows * nv * fla_bt
+                            },
+                            "params": {
+                                "t_arg": t_arg,
+                                "grid_x": fla_nt,
+                                "grid_y": nv,
+                                "grid_z": 1,
+                                "constexpr_k": dk,
+                                "constexpr_bt": fla_bt,
+                                "constexpr_bk": 64,
+                                "use_g": true,
+                                "is_varlen": false,
+                                "num_warps": 4,
+                                "num_stages": 3
+                            },
+                            "sync_before_snapshot": true,
+                            "sync_before_call": true,
+                            "sync_method": "cuStreamSynchronize(self.stream) via snapshot download",
+                        }),
+                    );
+                }
                 let rc = unsafe {
                     (fla.kkt)(
                         fla_k_bf16,
@@ -9038,9 +14562,79 @@ impl PrefillEngine {
                         stream_ptr,
                     )
                 };
+                let kkt_sync_after_launch = if reference_layer1_la_trace {
+                    Some(unsafe { cuda_sys::lib().cuStreamSynchronize(self.stream) })
+                } else {
+                    None
+                };
                 if rc != 0 {
                     return Err(format!("FLA kkt failed: {}", rc));
                 }
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_kkt_a_post_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(
+                            a_fla + ((trace_last_row * nv * fla_bt * 4) as u64),
+                            nv * fla_bt,
+                        ),
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_kkt_a_post_call_chunk",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(
+                            a_fla + ((trace_chunk_a_offset * 4) as u64),
+                            trace_chunk_rows * nv * fla_bt,
+                        ),
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_kkt_call_metadata_post",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+	                            "kernel": "krasis_fla_compute_A_kernel",
+	                            "compiled_symbol": "krasis_fla_chunk_scaled_dot_kkt_fwd_kernel",
+	                            "ffi_return_code": rc,
+	                            "sync_after_launch_result": format!("{:?}", kkt_sync_after_launch),
+	                            "sync_after_launch_success": matches!(kkt_sync_after_launch, Some(cuda_sys::CUresult::CUDA_SUCCESS)),
+	                            "a_output_ptr": format!("0x{:x}", a_fla),
+	                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+	                            "workspace_ptr": null,
+	                            "workspace_size_bytes": 0,
+	                            "workspace_readable": false,
+	                            "workspace_reason": "No KKT workspace/state pointer is exposed by the native wrapper",
+	                            "temp_state_ptr": null,
+	                            "temp_state_readable": false,
+	                            "per_call_memset_or_reset": false,
+	                            "shape": {
+	                                "m": m,
+	                                "fla_total": fla_total,
+	                                "fla_nt": fla_nt,
+	                                "fla_bt": fla_bt,
+	                                "nv": nv,
+	                                "dk": dk,
+	                                "trace_last_pos": trace_last_pos,
+	                                "trace_last_row": trace_last_row,
+	                                "trace_chunk_start": trace_chunk_start,
+	                                "trace_chunk_rows": trace_chunk_rows
+	                            },
+	                            "stride_elems": {
+	                                "a_row": nv * fla_bt
+	                            },
+	                            "sync_before_snapshot": true,
+	                            "sync_after_call": true,
+	                            "sync_method": "cuStreamSynchronize(self.stream) via post-call A download",
+	                        }),
+	                    );
+	                }
                 if trace_la_mixer {
                     let last_pos = m.saturating_sub(1);
                     self.trace_emit_f32_row(
@@ -9166,6 +14760,62 @@ impl PrefillEngine {
 
                 // Step 3: solve_tril — A → Ai
                 // Grid: (NT, B*H) = (fla_nt, nv)
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_solve_a_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(
+                            a_fla + ((trace_last_row * nv * fla_bt * 4) as u64),
+                            nv * fla_bt,
+                        ),
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_solve_ai_pre_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        ai_fla,
+                        trace_last_row,
+                        nv * fla_bt,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_solve_call_metadata_pre",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "kernel": "krasis_fla_merge_16x16_to_64x64_inverse_kernel",
+                            "a_ptr": format!("0x{:x}", a_fla),
+                            "ai_output_ptr": format!("0x{:x}", ai_fla),
+                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+                            "dtypes": {
+                                "a": "fp32",
+                                "ai_output": "bf16"
+                            },
+                            "shape": {
+                                "m": m,
+                                "fla_total": fla_total,
+                                "fla_nt": fla_nt,
+                                "fla_bt": fla_bt,
+                                "nv": nv,
+                                "trace_last_pos": trace_last_pos,
+                                "trace_last_row": trace_last_row
+                            },
+                            "params": {
+                                "t_arg": t_arg,
+                                "grid_x": fla_nt,
+                                "grid_y": nv,
+                                "grid_z": 1
+                            },
+                            "sync_before_snapshot": true,
+                        }),
+                    );
+                }
                 let rc = unsafe {
                     (fla.solve_tril)(
                         a_fla,
@@ -9181,6 +14831,31 @@ impl PrefillEngine {
                 };
                 if rc != 0 {
                     return Err(format!("FLA solve_tril failed: {}", rc));
+                }
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_solve_ai_post_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        ai_fla,
+                        trace_last_row,
+                        nv * fla_bt,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_solve_call_metadata_post",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "kernel": "krasis_fla_merge_16x16_to_64x64_inverse_kernel",
+                            "ai_output_ptr": format!("0x{:x}", ai_fla),
+                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+                            "sync_before_snapshot": true,
+                        }),
+                    );
                 }
                 if trace_la_mixer {
                     let last_pos = m.saturating_sub(1);
@@ -9257,6 +14932,132 @@ impl PrefillEngine {
                 // Step 4: recompute_w_u — k, v, beta, Ai, g → w, u
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 // Note: after step 3, A (la_conv_out) is dead, so u can reuse that space
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_wy_k_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        fla_k_bf16,
+                        trace_last_row,
+                        nv * dk,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_wy_v_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        fla_v_bf16,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_wy_beta_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        fla_beta_bf16,
+                        trace_last_row,
+                        nv,
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_wy_g_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(g_cum_fla + ((trace_last_row * nv * 4) as u64), nv),
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_wy_w_pre_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        w_fla,
+                        trace_last_row,
+                        nv * dk,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_wy_u_pre_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        u_fla,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_wy_ai_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        ai_fla,
+                        trace_last_row,
+                        nv * fla_bt,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_wy_call_metadata_pre",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "kernel": "krasis_fla_chunk_wy_repr",
+                            "k_ptr": format!("0x{:x}", fla_k_bf16),
+                            "v_ptr": format!("0x{:x}", fla_v_bf16),
+                            "beta_ptr": format!("0x{:x}", fla_beta_bf16),
+                            "w_output_ptr": format!("0x{:x}", w_fla),
+                            "u_output_ptr": format!("0x{:x}", u_fla),
+                            "ai_ptr": format!("0x{:x}", ai_fla),
+                            "g_ptr": format!("0x{:x}", g_cum_fla),
+                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+                            "dtypes": {
+                                "k": "bf16",
+                                "v": "bf16",
+                                "beta": "bf16",
+                                "w_output": "bf16",
+                                "u_output": "bf16",
+                                "ai": "bf16",
+                                "g": "fp32"
+                            },
+                            "shape": {
+                                "m": m,
+                                "fla_total": fla_total,
+                                "fla_nt": fla_nt,
+                                "fla_bt": fla_bt,
+                                "nv": nv,
+                                "dk": dk,
+                                "dv": dv,
+                                "trace_last_pos": trace_last_pos,
+                                "trace_last_row": trace_last_row,
+                            },
+                            "strides": {
+                                "k_token_stride_elements": nv * dk,
+                                "v_token_stride_elements": nv * dv,
+                                "beta_token_stride_elements": nv,
+                                "w_token_stride_elements": nv * dk,
+                                "u_token_stride_elements": nv * dv,
+                                "ai_token_stride_elements": nv * fla_bt,
+                                "g_token_stride_elements": nv,
+                            },
+                            "params": {
+                                "t_arg": t_arg,
+                                "grid_x": fla_nt,
+                                "grid_y": nv,
+                                "grid_z": 1,
+                            },
+                            "sync_before_snapshot": true,
+                            "kv_cache_applicable": false,
+                            "rope_applicable": false,
+                        }),
+                    );
+                }
                 let rc = unsafe {
                     (fla.wy_repr)(
                         fla_k_bf16,
@@ -9277,6 +15078,42 @@ impl PrefillEngine {
                 };
                 if rc != 0 {
                     return Err(format!("FLA wy_repr failed: {}", rc));
+                }
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_wy_w_post_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        w_fla,
+                        trace_last_row,
+                        nv * dk,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_wy_u_post_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        u_fla,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_wy_call_metadata_post",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "kernel": "krasis_fla_chunk_wy_repr",
+                            "w_output_ptr": format!("0x{:x}", w_fla),
+                            "u_output_ptr": format!("0x{:x}", u_fla),
+                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+                            "sync_before_snapshot": true,
+                        }),
+                    );
                 }
                 if trace_la_mixer {
                     let last_pos = m.saturating_sub(1);
@@ -9537,6 +15374,145 @@ impl PrefillEngine {
                 // C wrapper params: k, v(=u), w, v_new, g, h, h0, ht, T
                 // h0 is BF16 (zeroed), ht is FP32 — separate buffers to avoid dtype/overlap issues
                 let sr_grid_x = ((dv + 31) / 32) as u32;
+                if reference_layer1_la_trace {
+                    let current_chunk = trace_last_pos / fla_bt;
+                    let state_row = current_chunk * nv;
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_state_k_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        fla_k_bf16,
+                        trace_last_row,
+                        nv * dk,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_state_u_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        u_fla,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_state_w_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        w_fla,
+                        trace_last_row,
+                        nv * dk,
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_state_g_input_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(g_cum_fla + ((trace_last_row * nv * 4) as u64), nv),
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_state_v_new_pre_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        v_new_fla,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_state_h_pre_call_chunk_head0",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        h_fla,
+                        state_row,
+                        dk * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_state_h0_pre_call_head0",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        h0_fla,
+                        0,
+                        dk * dv,
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_state_ht_pre_call_head0",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(ht_fla, dk * dv),
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_state_recurrence_metadata_pre",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "kernel": "krasis_fla_chunk_state_recurrence",
+                            "k_ptr": format!("0x{:x}", fla_k_bf16),
+                            "u_input_ptr": format!("0x{:x}", u_fla),
+                            "w_input_ptr": format!("0x{:x}", w_fla),
+                            "v_new_output_ptr": format!("0x{:x}", v_new_fla),
+                            "g_ptr": format!("0x{:x}", g_cum_fla),
+                            "h_output_ptr": format!("0x{:x}", h_fla),
+                            "h0_ptr": format!("0x{:x}", h0_fla),
+                            "ht_output_ptr": format!("0x{:x}", ht_fla),
+                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+                            "dtypes": {
+                                "k": "bf16",
+                                "u_input": "bf16",
+                                "w_input": "bf16",
+                                "v_new_output": "bf16",
+                                "g": "fp32",
+                                "h_output": "bf16",
+                                "h0": "bf16",
+                                "ht_output": "fp32"
+                            },
+                            "shape": {
+                                "m": m,
+                                "fla_total": fla_total,
+                                "fla_nt": fla_nt,
+                                "fla_bt": fla_bt,
+                                "nv": nv,
+                                "dk": dk,
+                                "dv": dv,
+                                "trace_last_pos": trace_last_pos,
+                                "trace_last_row": trace_last_row,
+                                "current_chunk": current_chunk,
+                            },
+                            "strides": {
+                                "k_token_stride_elements": nv * dk,
+                                "u_token_stride_elements": nv * dv,
+                                "w_token_stride_elements": nv * dk,
+                                "v_new_token_stride_elements": nv * dv,
+                                "g_token_stride_elements": nv,
+                                "h_chunk_stride_elements": nv * dk * dv,
+                                "h_head_stride_elements": dk * dv,
+                            },
+                            "params": {
+                                "t_arg": t_arg,
+                                "grid_x": sr_grid_x,
+                                "grid_y": nv,
+                                "grid_z": 1,
+                            },
+                            "sync_before_snapshot": true,
+                            "kv_cache_applicable": false,
+                            "rope_applicable": false,
+                        }),
+                    );
+                }
                 let rc = unsafe {
                     (fla.state_recurrence)(
                         fla_k_bf16, // k (BF16)
@@ -9554,6 +15530,53 @@ impl PrefillEngine {
                 };
                 if rc != 0 {
                     return Err(format!("FLA state_recurrence failed: {}", rc));
+                }
+                if reference_layer1_la_trace {
+                    let current_chunk = trace_last_pos / fla_bt;
+                    let state_row = current_chunk * nv;
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_state_v_new_post_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        v_new_fla,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_state_h_post_call_chunk_head0",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        h_fla,
+                        state_row,
+                        dk * dv,
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_state_ht_post_call_head0",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(ht_fla, dk * dv),
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_state_recurrence_metadata_post",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "kernel": "krasis_fla_chunk_state_recurrence",
+                            "v_new_output_ptr": format!("0x{:x}", v_new_fla),
+                            "h_output_ptr": format!("0x{:x}", h_fla),
+                            "ht_output_ptr": format!("0x{:x}", ht_fla),
+                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+                            "sync_before_snapshot": true,
+                        }),
+                    );
                 }
                 if trace_la_mixer {
                     let last_pos = m.saturating_sub(1);
@@ -9600,6 +15623,123 @@ impl PrefillEngine {
                 // chunk_fwd_kernel_o multiplies ALL output by its `scale` arg (line 122:
                 //   b_o = b_o * scale + dot(A, v) * scale).
                 // Passing scale=1.0 avoids double-scaling.
+                if reference_layer1_la_trace {
+                    let current_chunk = trace_last_pos / fla_bt;
+                    let state_row = current_chunk * nv;
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_output_pre_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        o_fla,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_v_new_pre_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        v_new_fla,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_h_state_pre_call_chunk_head0",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        h_fla,
+                        state_row,
+                        dk * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_h0_pre_call_head0",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        h0_fla,
+                        0,
+                        dk * dv,
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_fla_ht_pre_call_head0",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(ht_fla, dk * dv),
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_fla_g_cumsum_pre_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(g_cum_fla + ((trace_last_row * nv * 4) as u64), nv),
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_fla_output_call_metadata_pre",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "kernel": "krasis_fla_chunk_fwd_kernel_o",
+                            "q_ptr": format!("0x{:x}", fla_q_bf16),
+                            "k_ptr": format!("0x{:x}", fla_k_bf16),
+                            "v_new_ptr": format!("0x{:x}", v_new_fla),
+                            "h_ptr": format!("0x{:x}", h_fla),
+                            "g_ptr": format!("0x{:x}", g_cum_fla),
+                            "output_ptr": format!("0x{:x}", o_fla),
+                            "h0_ptr": format!("0x{:x}", h0_fla),
+                            "ht_ptr": format!("0x{:x}", ht_fla),
+                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+                            "q_dtype": "bf16",
+                            "k_dtype": "bf16",
+                            "v_new_dtype": "bf16",
+                            "h_dtype": "bf16",
+                            "g_dtype": "fp32",
+                            "output_dtype": "bf16",
+                            "shape": {
+                                "m": m,
+                                "fla_total": fla_total,
+                                "fla_nt": fla_nt,
+                                "fla_bt": fla_bt,
+                                "nv": nv,
+                                "dk": dk,
+                                "dv": dv,
+                                "trace_last_pos": trace_last_pos,
+                                "trace_last_row": trace_last_row,
+                                "current_chunk": current_chunk,
+                            },
+                            "strides": {
+                                "q_token_stride_elements": nv * dk,
+                                "k_token_stride_elements": nv * dk,
+                                "v_new_token_stride_elements": nv * dv,
+                                "output_token_stride_elements": nv * dv,
+                                "h_chunk_stride_elements": nv * dk * dv,
+                                "h_head_stride_elements": dk * dv,
+                                "g_token_stride_elements": nv,
+                            },
+                            "params": {
+                                "scale": 1.0f32,
+                                "grid_x": o_grid_x,
+                                "grid_y": fla_nt,
+                                "grid_z": nv,
+                                "o_bv": o_bv,
+                                "t_arg": t_arg,
+                            },
+                            "sync_before_snapshot": true,
+                            "kv_cache_applicable": false,
+                            "rope_applicable": false,
+                        }),
+                    );
+                }
                 let rc = unsafe {
                     (fla.output)(
                         fla_q_bf16, // q (already includes scale from fused repeat+l2norm)
@@ -9621,6 +15761,117 @@ impl PrefillEngine {
                 };
                 if rc != 0 {
                     return Err(format!("FLA output failed: {}", rc));
+                }
+                if reference_layer1_la_trace {
+                    let current_chunk = trace_last_pos / fla_bt;
+                    let state_row = current_chunk * nv;
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_output_post_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        o_fla,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_v_new_post_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        v_new_fla,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_h_state_post_call_chunk_head0",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        h_fla,
+                        state_row,
+                        dk * dv,
+                    );
+                    self.push_reference_stage_f32_snapshot(
+                        "layer1_la_fla_g_cumsum_post_call_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        &self.diag_download_f32(g_cum_fla + ((trace_last_row * nv * 4) as u64), nv),
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_fla_output_call_metadata_post",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "kernel": "krasis_fla_chunk_fwd_kernel_o",
+                            "rc": rc,
+                            "output_ptr": format!("0x{:x}", o_fla),
+                            "v_new_ptr": format!("0x{:x}", v_new_fla),
+                            "h_ptr": format!("0x{:x}", h_fla),
+                            "g_ptr": format!("0x{:x}", g_cum_fla),
+                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+                            "sync_after_snapshot": true,
+                            "shape": {
+                                "m": m,
+                                "fla_total": fla_total,
+                                "fla_nt": fla_nt,
+                                "fla_bt": fla_bt,
+                                "nv": nv,
+                                "dk": dk,
+                                "dv": dv,
+                                "trace_last_pos": trace_last_pos,
+                                "trace_last_row": trace_last_row,
+                                "current_chunk": current_chunk,
+                            },
+                        }),
+                    );
+                }
+                if trace_la_projection_summary {
+                    self.trace_emit_bf16_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_fla_output_last",
+                        o_fla,
+                        trace_last_pos,
+                        nv * dv,
+                    );
+                }
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_fla_output_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        o_fla,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_fla_output_metadata",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "o_fla_ptr": format!("0x{:x}", o_fla),
+                            "h_fla_ptr": format!("0x{:x}", h_fla),
+                            "ht_fla_ptr": format!("0x{:x}", ht_fla),
+                            "g_cum_fla_ptr": format!("0x{:x}", g_cum_fla),
+                            "v_new_fla_ptr": format!("0x{:x}", v_new_fla),
+                            "stream_ptr": format!("0x{:x}", stream_ptr as usize),
+                            "width": nv * dv,
+                        }),
+                    );
                 }
                 if trace_la_mixer {
                     let last_pos = m.saturating_sub(1);
@@ -9925,6 +16176,46 @@ impl PrefillEngine {
                             )?;
                         }
                     }
+                }
+                if trace_la_projection_summary {
+                    self.trace_emit_bf16_row_summary(
+                        0,
+                        trace_last_pos,
+                        0,
+                        layer_idx,
+                        "la_grmsnorm_out_last",
+                        rmsnorm_out,
+                        trace_last_pos,
+                        nv * dv,
+                    );
+                }
+                if reference_layer1_la_trace {
+                    self.push_reference_stage_snapshot(
+                        "layer1_la_grmsnorm_out_last",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        rmsnorm_out,
+                        trace_last_row,
+                        nv * dv,
+                    );
+                    self.push_reference_stage_metadata(
+                        "layer1_la_grmsnorm_metadata",
+                        Some(layer_idx),
+                        trace_step,
+                        trace_last_pos,
+                        0,
+                        serde_json::json!({
+                            "rmsnorm_out_ptr": format!("0x{:x}", rmsnorm_out),
+                            "fla_output_ptr": format!("0x{:x}", o_fla),
+                            "gate_ptr": format!("0x{:x}", la_z),
+                            "norm_weight_ptr": format!("0x{:x}", lw.la_norm_weight_ptr),
+                            "input_dtype": "bf16",
+                            "output_dtype": "bf16",
+                            "width": nv * dv,
+                        }),
+                    );
                 }
                 if trace_la_mixer {
                     let last_pos = m.saturating_sub(1);
@@ -11073,6 +17364,42 @@ impl PrefillEngine {
             // 21. Output projection: [M, nv*dv] BF16 -> [M, hidden] BF16
             // Input is rmsnorm_out (la_v or la_v_beta, sized [M, nv*dv]).
             // Use scratch1 as temp to avoid Marlin GEMM input/output aliasing.
+            for (abs_pos, row_idx) in Self::trace_input_row_positions_for_chunk(chunk_start, m) {
+                self.trace_emit_bf16_row_full_words(
+                    trace_step,
+                    abs_pos,
+                    0,
+                    layer_idx,
+                    "la_out_proj_input_last",
+                    rmsnorm_out,
+                    row_idx,
+                    value_dim,
+                );
+            }
+            if trace_la_projection_summary {
+                self.trace_emit_bf16_row_summary(
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    "la_out_proj_input_last",
+                    rmsnorm_out,
+                    trace_last_row,
+                    value_dim,
+                );
+            }
+            if reference_layer1_la_trace {
+                self.push_reference_stage_snapshot(
+                    "layer1_la_out_proj_input_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    rmsnorm_out,
+                    trace_last_row,
+                    value_dim,
+                );
+            }
             if la_diag {
                 self.stream_sync()?;
                 let pre_oproj_norm = self.diag_l2_norm(rmsnorm_out, 0, value_dim, value_dim);
@@ -11090,12 +17417,54 @@ impl PrefillEngine {
             }
             let o_temp = *self.scratch.d_scratch1.device_ptr();
             self.la_gemm(
+                layer_idx,
+                "out_proj",
                 rmsnorm_out,
+                lw.hqq_linear_attention.as_ref().map(|hqq| &hqq.out_proj),
                 &lw.la_out_proj,
                 &lw.la_out_proj_bf16,
                 o_temp,
                 m,
             )?;
+            if trace_la_projection_summary {
+                self.trace_emit_bf16_row_summary(
+                    0,
+                    trace_last_pos,
+                    0,
+                    layer_idx,
+                    "la_out_proj_output_last",
+                    o_temp,
+                    trace_last_pos,
+                    cfg.hidden_size,
+                );
+            }
+            if reference_layer1_la_trace {
+                self.push_reference_stage_snapshot(
+                    "layer1_la_out_proj_output_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    o_temp,
+                    trace_last_row,
+                    cfg.hidden_size,
+                );
+                self.push_reference_stage_metadata(
+                    "layer1_la_out_proj_metadata",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    serde_json::json!({
+                        "input_ptr": format!("0x{:x}", rmsnorm_out),
+                        "output_temp_ptr": format!("0x{:x}", o_temp),
+                        "attn_out_ptr": format!("0x{:x}", attn_out),
+                        "input_width": value_dim,
+                        "output_width": cfg.hidden_size,
+                        "backend": if lw.la_out_proj_bf16.is_some() { "bf16_or_hqq_materialized" } else { "marlin" },
+                    }),
+                );
+            }
             if self.trace.as_ref().map_or(false, |t| {
                 t.should_emit(0, Some(layer_idx), "prefill_layer")
             }) {
@@ -11208,6 +17577,18 @@ impl PrefillEngine {
                 }
             }
             self.memcpy_d2d(attn_out, o_temp, (m * cfg.hidden_size * 2) as u64)?;
+            if reference_layer1_la_trace {
+                self.push_reference_stage_snapshot(
+                    "layer1_la_mixer_out_last",
+                    Some(layer_idx),
+                    trace_step,
+                    trace_last_pos,
+                    0,
+                    attn_out,
+                    trace_last_row,
+                    cfg.hidden_size,
+                );
+            }
             if la_diag {
                 let post_oproj_norm =
                     self.diag_l2_norm(attn_out, 0, cfg.hidden_size, cfg.hidden_size);
@@ -11331,6 +17712,13 @@ impl PrefillEngine {
         let gate_out = *self.scratch.d_gate_out.device_ptr();
         let topk_ids_ptr = *self.scratch.d_topk_ids.device_ptr();
         let topk_weights_ptr = *self.scratch.d_topk_weights.device_ptr();
+        let reference_layer0_moe_trace = self.reference_debug_trace_enabled && layer_idx == 0;
+        let trace_moe_full_chunk_start = 0usize;
+        let trace_moe_full_chunk_rows = m;
+        let trace_moe_watched_rows = [0usize, 1usize, 2usize, 395usize, 429usize];
+        let trace_moe_rows_for_slots = [0usize, 1usize, 2usize, 395usize, 429usize];
+        let trace_moe_last_pos = m.saturating_sub(1);
+        let trace_moe_token_id = 0usize;
 
         // 1. Gate GEMM (same as sequential)
         let gate_ptr = self.layer_weights[layer_idx].moe_gate_ptr;
@@ -11366,8 +17754,63 @@ impl PrefillEngine {
         }
 
         // 2. Top-K routing
+        let topk_threads =
+            std::cmp::max(32, ((std::cmp::min(1024, n_experts) + 31) / 32) * 32) as u32;
+        let topk_smem =
+            (n_experts * 4 + topk * 8 + if scoring_func == 0 { 32 * 4 } else { 0 }) as u32;
+        if reference_layer0_moe_trace {
+            let sync_before_topk = self.stream_sync().is_ok();
+            self.push_reference_stage_f32_chunk_snapshot(
+                "layer0_moe_topk_weights_pre_call_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                topk_weights_ptr,
+                trace_moe_full_chunk_rows,
+                topk,
+                trace_moe_full_chunk_start,
+            );
+            self.push_reference_stage_i32_chunk_snapshot(
+                "layer0_moe_topk_ids_pre_call_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                topk_ids_ptr,
+                trace_moe_full_chunk_rows,
+                topk,
+                trace_moe_full_chunk_start,
+            );
+            self.push_reference_stage_metadata(
+                "layer0_moe_router_topk_metadata_pre_call",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_before_topk_success": sync_before_topk,
+                    "kernel": if scoring_func == 1 { "sigmoid_topk_kernel" } else { "softmax_topk_kernel" },
+                    "grid": [m, 1, 1],
+                    "block": [topk_threads, 1, 1],
+                    "shared_memory_bytes": topk_smem,
+                    "gate_out_ptr": format!("0x{:x}", gate_out),
+                    "topk_weights_ptr": format!("0x{:x}", topk_weights_ptr),
+                    "topk_ids_ptr": format!("0x{:x}", topk_ids_ptr),
+                    "m": m,
+                    "n_experts": n_experts,
+                    "topk": topk,
+                    "scoring_func": scoring_func,
+                    "gate_out_dtype": "f32",
+                    "topk_weights_dtype": "f32",
+                    "topk_ids_dtype": "i32",
+                    "gate_out_layout": "row_major_m_by_n_experts",
+                    "topk_layout": "row_major_m_by_topk",
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
+        }
         {
-            let t = std::cmp::max(32, ((std::cmp::min(1024, n_experts) + 31) / 32) * 32) as u32;
             let mut p0 = topk_weights_ptr;
             let mut p1 = topk_ids_ptr;
             let mut p2 = gate_out;
@@ -11378,14 +17821,12 @@ impl PrefillEngine {
             } else {
                 self.kernels.softmax_topk
             };
-            let smem =
-                (n_experts * 4 + topk * 8 + if scoring_func == 0 { 32 * 4 } else { 0 }) as u32;
             unsafe {
                 launch(
                     kernel,
                     (m as u32, 1, 1),
-                    (t, 1, 1),
-                    smem,
+                    (topk_threads, 1, 1),
+                    topk_smem,
                     self.stream,
                     &mut [
                         &mut p0 as *mut _ as *mut std::ffi::c_void,
@@ -11395,6 +17836,180 @@ impl PrefillEngine {
                         &mut p4 as *mut _ as *mut std::ffi::c_void,
                     ],
                 )?;
+            }
+        }
+        let mut topk_sum_probe: Option<(CudaSlice<f32>, usize, usize, bool)> = None;
+        let mut topk_selected_probe: Option<(CudaSlice<f32>, usize, usize, bool)> = None;
+        if reference_layer0_moe_trace && scoring_func == 0 {
+            let probe_runs = 4usize;
+            let probe_fields = 5usize + 3usize * topk;
+            match self.device.alloc_zeros::<f32>(probe_runs * m * probe_fields) {
+                Ok(probe_buf) => {
+                    let probe_ptr = *probe_buf.device_ptr();
+                    let mut launch_error: Option<String> = None;
+                    for run_idx in 0..probe_runs {
+                        let mut p0 = probe_ptr + ((run_idx * m * probe_fields * 4) as u64);
+                        let mut p1 = gate_out;
+                        let mut p2 = n_experts as i32;
+                        let mut p3 = topk as i32;
+                        let mut p4 = probe_fields as i32;
+                        let launch_result = unsafe {
+                            launch(
+                                self.kernels.softmax_topk_sum_probe,
+                                (m as u32, 1, 1),
+                                (topk_threads, 1, 1),
+                                topk_smem,
+                                self.stream,
+                                &mut [
+                                    &mut p0 as *mut _ as *mut std::ffi::c_void,
+                                    &mut p1 as *mut _ as *mut std::ffi::c_void,
+                                    &mut p2 as *mut _ as *mut std::ffi::c_void,
+                                    &mut p3 as *mut _ as *mut std::ffi::c_void,
+                                    &mut p4 as *mut _ as *mut std::ffi::c_void,
+                                ],
+                            )
+                        };
+                        if let Err(err) = launch_result {
+                            launch_error = Some(format!("run{}: {}", run_idx, err));
+                            break;
+                        }
+                    }
+                    let sync_after_probe = launch_error.is_none() && self.stream_sync().is_ok();
+                    self.push_reference_stage_metadata(
+                        "layer0_moe_router_topk_cuda_sum_probe_metadata",
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        serde_json::json!({
+                            "kernel": "softmax_topk_sum_probe_kernel",
+                            "purpose": "diagnostic_only_recompute_of_softmax_topk_denominator_and_selected_weights",
+                            "normal_topk_kernel_behavior_changed": false,
+                            "probe_ptr": format!("0x{:x}", probe_ptr),
+                            "gate_out_ptr": format!("0x{:x}", gate_out),
+                            "probe_runs": probe_runs,
+                            "probe_fields_per_row": probe_fields,
+                            "field_layout": ["max", "sum", "inv_sum", "topk_probability_sum", "inv_topk_probability_sum", "ids", "softmax_probabilities", "renormalized_weights"],
+                            "grid": [m, 1, 1],
+                            "block": [topk_threads, 1, 1],
+                            "shared_memory_bytes": topk_smem,
+                            "m": m,
+                            "n_experts": n_experts,
+                            "topk": topk,
+                            "stream_ptr": format!("0x{:x}", self.stream as usize),
+                            "sync_after_probe_success": sync_after_probe,
+                            "launch_error": launch_error,
+                        }),
+                    );
+                    topk_sum_probe = Some((probe_buf, probe_runs, probe_fields, sync_after_probe));
+                }
+                Err(err) => {
+                    self.push_reference_stage_metadata(
+                        "layer0_moe_router_topk_cuda_sum_probe_metadata",
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        serde_json::json!({
+                            "kernel": "softmax_topk_sum_probe_kernel",
+                            "purpose": "diagnostic_only_recompute_of_softmax_topk_denominator_and_selected_weights",
+                            "normal_topk_kernel_behavior_changed": false,
+                            "allocation_error": format!("{:?}", err),
+                            "probe_runs": 4usize,
+                            "probe_fields_per_row": probe_fields,
+                            "m": m,
+                            "n_experts": n_experts,
+                            "topk": topk,
+                        }),
+                    );
+                }
+            }
+            let selected_probe_fields = 3usize + 3usize * topk;
+            match self
+                .device
+                .alloc_zeros::<f32>(probe_runs * m * selected_probe_fields)
+            {
+                Ok(probe_buf) => {
+                    let probe_ptr = *probe_buf.device_ptr();
+                    let mut launch_error: Option<String> = None;
+                    for run_idx in 0..probe_runs {
+                        let mut p0 =
+                            probe_ptr + ((run_idx * m * selected_probe_fields * 4) as u64);
+                        let mut p1 = gate_out;
+                        let mut p2 = n_experts as i32;
+                        let mut p3 = topk as i32;
+                        let mut p4 = selected_probe_fields as i32;
+                        let launch_result = unsafe {
+                            launch(
+                                self.kernels.softmax_topk_selected_probe,
+                                (m as u32, 1, 1),
+                                (topk_threads, 1, 1),
+                                topk_smem,
+                                self.stream,
+                                &mut [
+                                    &mut p0 as *mut _ as *mut std::ffi::c_void,
+                                    &mut p1 as *mut _ as *mut std::ffi::c_void,
+                                    &mut p2 as *mut _ as *mut std::ffi::c_void,
+                                    &mut p3 as *mut _ as *mut std::ffi::c_void,
+                                    &mut p4 as *mut _ as *mut std::ffi::c_void,
+                                ],
+                            )
+                        };
+                        if let Err(err) = launch_result {
+                            launch_error = Some(format!("run{}: {}", run_idx, err));
+                            break;
+                        }
+                    }
+                    let sync_after_probe = launch_error.is_none() && self.stream_sync().is_ok();
+                    self.push_reference_stage_metadata(
+                        "layer0_moe_router_topk_cuda_selected_probe_metadata",
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        serde_json::json!({
+                            "kernel": "softmax_topk_selected_probe_kernel",
+                            "purpose": "diagnostic_only_selected_logit_normalization_without_full_softmax_denominator",
+                            "normal_topk_kernel_behavior_changed": false,
+                            "probe_ptr": format!("0x{:x}", probe_ptr),
+                            "gate_out_ptr": format!("0x{:x}", gate_out),
+                            "probe_runs": probe_runs,
+                            "probe_fields_per_row": selected_probe_fields,
+                            "field_layout": ["max", "selected_exp_sum", "inv_selected_exp_sum", "ids", "selected_exp_values", "selected_only_weights"],
+                            "grid": [m, 1, 1],
+                            "block": [topk_threads, 1, 1],
+                            "shared_memory_bytes": topk_smem,
+                            "m": m,
+                            "n_experts": n_experts,
+                            "topk": topk,
+                            "stream_ptr": format!("0x{:x}", self.stream as usize),
+                            "sync_after_probe_success": sync_after_probe,
+                            "launch_error": launch_error,
+                        }),
+                    );
+                    topk_selected_probe =
+                        Some((probe_buf, probe_runs, selected_probe_fields, sync_after_probe));
+                }
+                Err(err) => {
+                    self.push_reference_stage_metadata(
+                        "layer0_moe_router_topk_cuda_selected_probe_metadata",
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        serde_json::json!({
+                            "kernel": "softmax_topk_selected_probe_kernel",
+                            "purpose": "diagnostic_only_selected_logit_normalization_without_full_softmax_denominator",
+                            "normal_topk_kernel_behavior_changed": false,
+                            "allocation_error": format!("{:?}", err),
+                            "probe_runs": 4usize,
+                            "probe_fields_per_row": selected_probe_fields,
+                            "m": m,
+                            "n_experts": n_experts,
+                            "topk": topk,
+                        }),
+                    );
+                }
             }
         }
         self.trace_emit_router_compare_last(
@@ -11412,6 +18027,514 @@ impl PrefillEngine {
             topk_weights_ptr,
             m,
         );
+        if reference_layer0_moe_trace {
+            let sync_after_router = self.stream_sync().is_ok();
+            self.push_reference_stage_f32_chunk_snapshot(
+                "layer0_moe_router_logits_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                gate_out,
+                trace_moe_full_chunk_rows,
+                n_experts,
+                trace_moe_full_chunk_start,
+            );
+            self.push_reference_stage_f32_chunk_snapshot_with_column_segments(
+                "layer0_moe_router_logits_full_chunk_column_segments",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                gate_out,
+                trace_moe_full_chunk_rows,
+                n_experts,
+                trace_moe_full_chunk_start,
+                &trace_moe_watched_rows,
+                64,
+            );
+            self.push_reference_stage_f32_chunk_snapshot(
+                "layer0_moe_topk_weights_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                topk_weights_ptr,
+                trace_moe_full_chunk_rows,
+                topk,
+                trace_moe_full_chunk_start,
+            );
+            self.push_reference_stage_i32_chunk_snapshot(
+                "layer0_moe_topk_ids_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                topk_ids_ptr,
+                trace_moe_full_chunk_rows,
+                topk,
+                trace_moe_full_chunk_start,
+            );
+            self.push_reference_stage_metadata(
+                "layer0_moe_router_topk_metadata",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_after_router_success": sync_after_router,
+                    "hidden_ptr": format!("0x{:x}", hidden),
+                    "gate_weight_ptr": format!("0x{:x}", gate_ptr),
+                    "gate_out_ptr": format!("0x{:x}", gate_out),
+                    "topk_ids_ptr": format!("0x{:x}", topk_ids_ptr),
+                    "topk_weights_ptr": format!("0x{:x}", topk_weights_ptr),
+                    "m": m,
+                    "hidden_size": h,
+                    "n_experts": n_experts,
+                    "topk": topk,
+                    "scoring_func": scoring_func,
+                    "scale_factor": scale_factor,
+                    "gate_out_dtype": "f32",
+                    "topk_ids_dtype": "i32",
+                    "topk_weights_dtype": "f32",
+                    "gate_out_layout": "row_major_m_by_n_experts",
+                    "topk_layout": "row_major_m_by_topk",
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
+            let gate_bias = if self.layer_weights[layer_idx].moe_gate_bias_ptr != 0 {
+                download_device_f32(self.layer_weights[layer_idx].moe_gate_bias_ptr, n_experts).ok()
+            } else {
+                None
+            };
+            let e_score_corr = if self.layer_weights[layer_idx].moe_e_score_corr_ptr != 0 {
+                download_device_f32(
+                    self.layer_weights[layer_idx].moe_e_score_corr_ptr,
+                    n_experts,
+                )
+                .ok()
+            } else {
+                None
+            };
+            for &row in &trace_moe_watched_rows {
+                if row >= m {
+                    continue;
+                }
+                let stage_prefix = format!("layer0_moe_router_topk_row{}", row);
+                let row_result: Result<(), String> = (|| {
+                    let hidden_row = download_device_u16(hidden + ((row * h * 2) as u64), h)?;
+                    let logits = download_device_f32(
+                        gate_out + ((row * n_experts * 4) as u64),
+                        n_experts,
+                    )?;
+                    let actual_weights = download_device_f32(
+                        topk_weights_ptr + ((row * topk * 4) as u64),
+                        topk,
+                    )?;
+                    let actual_ids = download_device_i32(
+                        topk_ids_ptr + ((row * topk * 4) as u64),
+                        topk,
+                    )?;
+                    let (expected_weights, expected_ids, cpu_metadata) =
+                        compute_router_topk_cpu_debug(
+                            &logits,
+                            topk,
+                            scoring_func,
+                            gate_bias.as_deref(),
+                            e_score_corr.as_deref(),
+                        )?;
+                    let kernel_math_debug = compute_router_topk_kernel_math_debug(
+                        &logits,
+                        topk,
+                        scoring_func,
+                        gate_bias.as_deref(),
+                        e_score_corr.as_deref(),
+                        topk_threads as usize,
+                    )?;
+                    let ids_match = actual_ids == expected_ids;
+                    let weight_diff = actual_weights
+                        .iter()
+                        .zip(expected_weights.iter())
+                        .map(|(&a, &e)| a - e)
+                        .collect::<Vec<_>>();
+                    let weight_compare = summarize_trace_diff(&actual_weights, &expected_weights);
+                    self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                        "stage": format!("{}_input_hidden", stage_prefix),
+                        "layer": Some(layer_idx),
+                        "chunk": 0,
+                        "absolute_position": trace_moe_last_pos,
+                        "row_index_in_chunk": row,
+                        "token_id": trace_moe_token_id,
+                        "row_width": h,
+                        "absolute_row": row,
+                        "trace": reference_hidden_trace_json_with_source(
+                            &hidden_row,
+                            h,
+                            None,
+                            hidden + ((row * h * 2) as u64),
+                            true,
+                            "router_input_hidden_row",
+                        ),
+                    }));
+                    self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                        "stage": format!("{}_logits", stage_prefix),
+                        "layer": Some(layer_idx),
+                        "chunk": 0,
+                        "absolute_position": trace_moe_last_pos,
+                        "row_index_in_chunk": row,
+                        "token_id": trace_moe_token_id,
+                        "row_width": n_experts,
+                        "absolute_row": row,
+                        "trace": reference_f32_trace_json(&logits, "router_logits_row"),
+                        "metadata": {
+                            "row": row,
+                            "dtype": "f32",
+                            "shape": [n_experts],
+                            "layout": "row_major_experts",
+                            "gate_out_ptr": format!("0x{:x}", gate_out),
+                            "row_ptr": format!("0x{:x}", gate_out + ((row * n_experts * 4) as u64)),
+                        },
+                    }));
+                    self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                        "stage": format!("{}_expected_weights", stage_prefix),
+                        "layer": Some(layer_idx),
+                        "chunk": 0,
+                        "absolute_position": trace_moe_last_pos,
+                        "row_index_in_chunk": row,
+                        "token_id": trace_moe_token_id,
+                        "row_width": topk,
+                        "absolute_row": row,
+                            "trace": reference_f32_trace_json(&expected_weights, "router_topk_host_expected_weights"),
+                            "metadata": cpu_metadata,
+                        }));
+                    self.push_reference_stage_metadata(
+	                        &format!("{}_kernel_math_variants", stage_prefix),
+	                        Some(layer_idx),
+	                        0,
+	                        trace_moe_last_pos,
+	                        trace_moe_token_id,
+	                        kernel_math_debug.metadata.clone(),
+	                    );
+                    let actual_vs_envelope =
+                        envelope_compare_json(&actual_weights, &kernel_math_debug.envelope_min, &kernel_math_debug.envelope_max);
+                    self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                        "stage": format!("{}_same_logit_order_envelope_midpoint_weights", stage_prefix),
+                        "layer": Some(layer_idx),
+                        "chunk": 0,
+                        "absolute_position": trace_moe_last_pos,
+                        "row_index_in_chunk": row,
+                        "token_id": trace_moe_token_id,
+                        "row_width": topk,
+                        "absolute_row": row,
+                        "trace": reference_f32_trace_json(
+                            &kernel_math_debug.envelope_midpoint,
+                            "router_topk_same_logit_order_envelope_midpoint_weights",
+                        ),
+                        "metadata": {
+                            "row": row,
+                            "source": "deterministic_same_logit_reduction_order_variants",
+                            "actual_gpu_weights_within_same_logit_order_envelope": actual_vs_envelope,
+                            "envelope_min": kernel_math_debug.envelope_min,
+                            "envelope_max": kernel_math_debug.envelope_max,
+                        },
+                    }));
+	                    self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+	                        "stage": format!("{}_actual_weights", stage_prefix),
+	                        "layer": Some(layer_idx),
+	                        "chunk": 0,
+                        "absolute_position": trace_moe_last_pos,
+                        "row_index_in_chunk": row,
+                        "token_id": trace_moe_token_id,
+                        "row_width": topk,
+                        "absolute_row": row,
+                        "trace": reference_f32_trace_json(&actual_weights, "router_topk_gpu_actual_weights"),
+                    }));
+                    self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                        "stage": format!("{}_actual_minus_expected_weights", stage_prefix),
+                        "layer": Some(layer_idx),
+                        "chunk": 0,
+                        "absolute_position": trace_moe_last_pos,
+                        "row_index_in_chunk": row,
+                        "token_id": trace_moe_token_id,
+                        "row_width": topk,
+                        "absolute_row": row,
+                        "trace": reference_f32_trace_json(&weight_diff, "router_topk_gpu_actual_minus_host_expected_weights"),
+                        "compare": {
+                            "actual": "gpu_topk_weights",
+                            "expected": "host_recompute_from_router_logits",
+                            "max_abs": weight_compare.max_abs,
+                            "max_abs_idx": weight_compare.max_abs_idx,
+                            "actual_at_max": weight_compare.actual_at_max,
+                            "expected_at_max": weight_compare.expected_at_max,
+                            "l2": weight_compare.l2,
+                            "mean_abs": weight_compare.mean_abs,
+                        },
+                    }));
+	                    if let Some((probe_buf, probe_runs, probe_fields, probe_sync_ok)) =
+	                        topk_sum_probe.as_ref()
+	                    {
+                        let probe_ptr = *probe_buf.device_ptr();
+                        let mut denominators = Vec::with_capacity(*probe_runs);
+                        let mut max_values = Vec::with_capacity(*probe_runs);
+                        let mut topk_prob_sums = Vec::with_capacity(*probe_runs);
+                        let mut flat_weights = Vec::with_capacity(*probe_runs * topk);
+                        let mut flat_minus_actual = Vec::with_capacity(*probe_runs * topk);
+                        let mut run_json = Vec::with_capacity(*probe_runs);
+                        let mut first_weights: Option<Vec<f32>> = None;
+                        let mut within_request_max_l2 = 0.0f64;
+                        let mut within_request_max_abs = 0.0f32;
+                        for probe_run in 0..*probe_runs {
+                            let row_offset =
+                                ((probe_run * m + row) * *probe_fields * 4) as u64;
+                            let values =
+                                download_device_f32(probe_ptr + row_offset, *probe_fields)?;
+                            let ids_start = 5usize;
+                            let probs_start = ids_start + topk;
+                            let weights_start = probs_start + topk;
+                            let ids = values[ids_start..ids_start + topk]
+                                .iter()
+                                .map(|value| value.round() as i32)
+                                .collect::<Vec<_>>();
+                            let softmax_probs =
+                                values[probs_start..probs_start + topk].to_vec();
+                            let probe_weights =
+                                values[weights_start..weights_start + topk].to_vec();
+                            denominators.push(values[1]);
+                            max_values.push(values[0]);
+                            topk_prob_sums.push(values[3]);
+                            flat_minus_actual.extend(
+                                probe_weights
+                                    .iter()
+                                    .zip(actual_weights.iter())
+                                    .map(|(&probe, &actual)| probe - actual),
+                            );
+                            flat_weights.extend(probe_weights.iter().copied());
+                            if let Some(first) = first_weights.as_ref() {
+                                let diff = summarize_trace_diff(&probe_weights, first);
+                                within_request_max_l2 = within_request_max_l2.max(diff.l2 as f64);
+                                within_request_max_abs = within_request_max_abs.max(diff.max_abs);
+                            } else {
+                                first_weights = Some(probe_weights.clone());
+                            }
+                            run_json.push(serde_json::json!({
+                                "run": probe_run,
+                                "max": values[0],
+                                "denominator_sum": values[1],
+                                "inv_sum": values[2],
+                                "topk_probability_sum": values[3],
+                                "inv_topk_probability_sum": values[4],
+                                "ids": ids,
+                                "softmax_probabilities": softmax_probs,
+                                "renormalized_weights": probe_weights,
+                            }));
+                        }
+                        self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                            "stage": format!("{}_cuda_sum_probe_denominators", stage_prefix),
+                            "layer": Some(layer_idx),
+                            "chunk": 0,
+                            "absolute_position": trace_moe_last_pos,
+                            "row_index_in_chunk": row,
+                            "token_id": trace_moe_token_id,
+                            "row_width": *probe_runs,
+                            "absolute_row": row,
+                            "trace": reference_f32_trace_json(&denominators, "router_topk_cuda_sum_probe_denominators"),
+                            "metadata": {
+                                "row": row,
+                                "probe_runs": *probe_runs,
+                                "probe_sync_after_launch_success": *probe_sync_ok,
+                                "max_values": max_values,
+                                "topk_probability_sums": topk_prob_sums,
+                            },
+                        }));
+                        self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                            "stage": format!("{}_cuda_sum_probe_weights_flat", stage_prefix),
+                            "layer": Some(layer_idx),
+                            "chunk": 0,
+                            "absolute_position": trace_moe_last_pos,
+                            "row_index_in_chunk": row,
+                            "token_id": trace_moe_token_id,
+                            "row_width": *probe_runs * topk,
+                            "absolute_row": row,
+                            "trace": reference_f32_trace_json(&flat_weights, "router_topk_cuda_sum_probe_weights_flat"),
+                            "metadata": {
+                                "row": row,
+                                "probe_runs": *probe_runs,
+                                "topk": topk,
+                                "probe_fields_per_row": *probe_fields,
+                                "within_request_max_l2": within_request_max_l2,
+                                "within_request_max_abs": within_request_max_abs,
+                                "runs": run_json,
+                            },
+                        }));
+                        self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                            "stage": format!("{}_cuda_sum_probe_minus_actual_weights_flat", stage_prefix),
+                            "layer": Some(layer_idx),
+                            "chunk": 0,
+                            "absolute_position": trace_moe_last_pos,
+                            "row_index_in_chunk": row,
+                            "token_id": trace_moe_token_id,
+                            "row_width": *probe_runs * topk,
+                            "absolute_row": row,
+                            "trace": reference_f32_trace_json(&flat_minus_actual, "router_topk_cuda_sum_probe_minus_actual_weights_flat"),
+                            "compare": {
+                                "actual": "diagnostic_cuda_sum_probe_weights",
+                                "expected": "normal_gpu_topk_weights",
+                                "probe_runs": *probe_runs,
+                                "topk": topk,
+	                            },
+	                        }));
+	                    }
+	                    if let Some((probe_buf, probe_runs, probe_fields, probe_sync_ok)) =
+	                        topk_selected_probe.as_ref()
+	                    {
+	                        let probe_ptr = *probe_buf.device_ptr();
+	                        let mut selected_sums = Vec::with_capacity(*probe_runs);
+	                        let mut max_values = Vec::with_capacity(*probe_runs);
+	                        let mut flat_weights = Vec::with_capacity(*probe_runs * topk);
+	                        let mut flat_minus_actual = Vec::with_capacity(*probe_runs * topk);
+	                        let mut run_json = Vec::with_capacity(*probe_runs);
+	                        let mut first_weights: Option<Vec<f32>> = None;
+	                        let mut within_request_max_l2 = 0.0f64;
+	                        let mut within_request_max_abs = 0.0f32;
+	                        for probe_run in 0..*probe_runs {
+	                            let row_offset =
+	                                ((probe_run * m + row) * *probe_fields * 4) as u64;
+	                            let values =
+	                                download_device_f32(probe_ptr + row_offset, *probe_fields)?;
+	                            let ids_start = 3usize;
+	                            let selected_exp_start = ids_start + topk;
+	                            let weights_start = selected_exp_start + topk;
+	                            let ids = values[ids_start..ids_start + topk]
+	                                .iter()
+	                                .map(|value| value.round() as i32)
+	                                .collect::<Vec<_>>();
+	                            let selected_exp =
+	                                values[selected_exp_start..selected_exp_start + topk].to_vec();
+	                            let probe_weights =
+	                                values[weights_start..weights_start + topk].to_vec();
+	                            max_values.push(values[0]);
+	                            selected_sums.push(values[1]);
+	                            flat_minus_actual.extend(
+	                                probe_weights
+	                                    .iter()
+	                                    .zip(actual_weights.iter())
+	                                    .map(|(&probe, &actual)| probe - actual),
+	                            );
+	                            flat_weights.extend(probe_weights.iter().copied());
+	                            if let Some(first) = first_weights.as_ref() {
+	                                let diff = summarize_trace_diff(&probe_weights, first);
+	                                within_request_max_l2 = within_request_max_l2.max(diff.l2 as f64);
+	                                within_request_max_abs = within_request_max_abs.max(diff.max_abs);
+	                            } else {
+	                                first_weights = Some(probe_weights.clone());
+	                            }
+	                            run_json.push(serde_json::json!({
+	                                "run": probe_run,
+	                                "max": values[0],
+	                                "selected_exp_sum": values[1],
+	                                "inv_selected_exp_sum": values[2],
+	                                "ids": ids,
+	                                "selected_exp_values": selected_exp,
+	                                "selected_only_weights": probe_weights,
+	                            }));
+	                        }
+	                        self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+	                            "stage": format!("{}_cuda_selected_probe_sums", stage_prefix),
+	                            "layer": Some(layer_idx),
+	                            "chunk": 0,
+	                            "absolute_position": trace_moe_last_pos,
+	                            "row_index_in_chunk": row,
+	                            "token_id": trace_moe_token_id,
+	                            "row_width": *probe_runs,
+	                            "absolute_row": row,
+	                            "trace": reference_f32_trace_json(&selected_sums, "router_topk_cuda_selected_probe_sums"),
+	                            "metadata": {
+	                                "row": row,
+	                                "probe_runs": *probe_runs,
+	                                "probe_sync_after_launch_success": *probe_sync_ok,
+	                                "max_values": max_values,
+	                            },
+	                        }));
+	                        self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+	                            "stage": format!("{}_cuda_selected_probe_weights_flat", stage_prefix),
+	                            "layer": Some(layer_idx),
+	                            "chunk": 0,
+	                            "absolute_position": trace_moe_last_pos,
+	                            "row_index_in_chunk": row,
+	                            "token_id": trace_moe_token_id,
+	                            "row_width": *probe_runs * topk,
+	                            "absolute_row": row,
+	                            "trace": reference_f32_trace_json(&flat_weights, "router_topk_cuda_selected_probe_weights_flat"),
+	                            "metadata": {
+	                                "row": row,
+	                                "probe_runs": *probe_runs,
+	                                "topk": topk,
+	                                "probe_fields_per_row": *probe_fields,
+	                                "within_request_max_l2": within_request_max_l2,
+	                                "within_request_max_abs": within_request_max_abs,
+	                                "runs": run_json,
+	                            },
+	                        }));
+	                        self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+	                            "stage": format!("{}_cuda_selected_probe_minus_actual_weights_flat", stage_prefix),
+	                            "layer": Some(layer_idx),
+	                            "chunk": 0,
+	                            "absolute_position": trace_moe_last_pos,
+	                            "row_index_in_chunk": row,
+	                            "token_id": trace_moe_token_id,
+	                            "row_width": *probe_runs * topk,
+	                            "absolute_row": row,
+	                            "trace": reference_f32_trace_json(&flat_minus_actual, "router_topk_cuda_selected_probe_minus_actual_weights_flat"),
+	                            "compare": {
+	                                "actual": "diagnostic_cuda_selected_probe_weights",
+	                                "expected": "normal_gpu_topk_weights",
+	                                "probe_runs": *probe_runs,
+	                                "topk": topk,
+	                            },
+	                        }));
+	                    }
+	                    self.push_reference_stage_metadata(
+	                        &format!("{}_ids_and_setup", stage_prefix),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        serde_json::json!({
+                            "row": row,
+                            "actual_ids": actual_ids,
+                            "expected_ids": expected_ids,
+                            "ids_match": ids_match,
+                            "topk": topk,
+                            "n_experts": n_experts,
+                            "scoring_func": scoring_func,
+                            "kernel": if scoring_func == 1 { "sigmoid_topk_kernel" } else { "softmax_topk_kernel" },
+                            "threads": topk_threads,
+                            "shared_memory_bytes": topk_smem,
+                            "topk_weights_ptr": format!("0x{:x}", topk_weights_ptr),
+                            "topk_ids_ptr": format!("0x{:x}", topk_ids_ptr),
+                            "stream_ptr": format!("0x{:x}", self.stream as usize),
+                        }),
+                    );
+                    Ok(())
+                })();
+                if let Err(err) = row_result {
+                    self.push_reference_stage_metadata(
+                        &format!("{}_failed", stage_prefix),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        serde_json::json!({
+                            "row": row,
+                            "error": err,
+                            "gate_out_ptr": format!("0x{:x}", gate_out),
+                            "topk_weights_ptr": format!("0x{:x}", topk_weights_ptr),
+                            "topk_ids_ptr": format!("0x{:x}", topk_ids_ptr),
+                        }),
+                    );
+                }
+            }
+        }
 
         // 3. moe_align_block_size: padded prefix sum + build sorted token/expert maps
         let block_size = 64i32; // MarlinDefault max thread_m_blocks=4 -> max block_size=64
@@ -12077,6 +19200,58 @@ impl PrefillEngine {
                 )?;
             }
         }
+        if reference_layer0_moe_trace {
+            let sync_after_replicate = self.stream_sync().is_ok();
+            for &row in &trace_moe_rows_for_slots {
+                if row < m {
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        &format!("layer0_moe_expert_input_slots_row{}", row),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        fused_input_ptr + ((row * topk * h * 2) as u64),
+                        topk,
+                        h,
+                        row * topk,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                        &format!("layer0_moe_expert_input_slots_row{}_column_segments", row),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        fused_input_ptr + ((row * topk * h * 2) as u64),
+                        topk,
+                        h,
+                        row * topk,
+                        &(row * topk..row * topk + topk).collect::<Vec<usize>>(),
+                        128,
+                    );
+                }
+            }
+            self.push_reference_stage_metadata(
+                "layer0_moe_replicate_hidden_metadata",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_after_replicate_success": sync_after_replicate,
+                    "source_hidden_ptr": format!("0x{:x}", hidden),
+                    "fused_input_ptr": format!("0x{:x}", fused_input_ptr),
+                    "m": m,
+                    "topk": topk,
+                    "m_topk": m_topk,
+                    "hidden_size": h,
+                    "dtype": "bf16",
+                    "source_layout": "row_major_m_by_hidden",
+                    "output_layout": "row_major_m_topk_by_hidden",
+                    "watched_rows": trace_moe_rows_for_slots,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
+        }
 
         let moe_trace_enabled = self.trace.as_ref().map_or(false, |t| {
             t.should_emit(0, Some(layer_idx), "prefill_layer")
@@ -12167,6 +19342,50 @@ impl PrefillEngine {
             cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
             // Zero C_tmp (FP32 scratch) — Marlin uses this for fp32_reduce accumulation
             cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, w1_ctmp_floats, self.stream);
+        }
+        if reference_layer0_moe_trace {
+            let sync_before_w1 = self.stream_sync().is_ok();
+            for &row in &trace_moe_rows_for_slots {
+                if row < m {
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        &format!("layer0_moe_w1_output_pre_call_slots_row{}", row),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        fused_inter_ptr + ((row * topk * w1_n * 2) as u64),
+                        topk,
+                        w1_n,
+                        row * topk,
+                    );
+                }
+            }
+            self.push_reference_stage_metadata(
+                "layer0_moe_w1_call_metadata_pre",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_before_w1_success": sync_before_w1,
+                    "fused_input_ptr": format!("0x{:x}", fused_input_ptr),
+                    "fused_inter_ptr": format!("0x{:x}", fused_inter_ptr),
+                    "fused_c_tmp_ptr": format!("0x{:x}", fused_c_tmp_ptr),
+                    "workspace_ptr": format!("0x{:x}", ws_ptr),
+                    "workspace_len_u32": ws_len,
+                    "w1_ctmp_floats": w1_ctmp_floats,
+                    "m": m,
+                    "topk": topk,
+                    "m_topk": m_topk,
+                    "hidden_size": h,
+                    "w1_n": w1_n,
+                    "intermediate_size": inter,
+                    "expert_bits": bits,
+                    "group_size": self.config.group_size,
+                    "use_ptr_table": use_ptr_table,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
         }
 
         // Pointer-table mode supplies absolute per-expert addresses for weights/scales.
@@ -12386,6 +19605,38 @@ impl PrefillEngine {
                 } else {
                     std::ptr::null()
                 }, // S_expert_ptrs
+            );
+        }
+        if reference_layer0_moe_trace {
+            let sync_after_w1 = self.stream_sync().is_ok();
+            for &row in &trace_moe_rows_for_slots {
+                if row < m {
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        &format!("layer0_moe_w1_output_post_call_slots_row{}", row),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        fused_inter_ptr + ((row * topk * w1_n * 2) as u64),
+                        topk,
+                        w1_n,
+                        row * topk,
+                    );
+                }
+            }
+            self.push_reference_stage_metadata(
+                "layer0_moe_w1_call_metadata_post",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_after_w1_success": sync_after_w1,
+                    "fused_inter_ptr": format!("0x{:x}", fused_inter_ptr),
+                    "fused_c_tmp_ptr": format!("0x{:x}", fused_c_tmp_ptr),
+                    "workspace_ptr": format!("0x{:x}", ws_ptr),
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
             );
         }
         if moe_trace_enabled {
@@ -12904,6 +20155,47 @@ impl PrefillEngine {
                 )?;
             }
         }
+        if reference_layer0_moe_trace {
+            let sync_after_activation = self.stream_sync().is_ok();
+            let activation_ptr = if gated {
+                fused_inter2_ptr
+            } else {
+                fused_inter_ptr
+            };
+            for &row in &trace_moe_rows_for_slots {
+                if row < m {
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        &format!("layer0_moe_activation_output_slots_row{}", row),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        activation_ptr + ((row * topk * inter * 2) as u64),
+                        topk,
+                        inter,
+                        row * topk,
+                    );
+                }
+            }
+            self.push_reference_stage_metadata(
+                "layer0_moe_activation_metadata",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_after_activation_success": sync_after_activation,
+                    "activation": if activation == 1 { "relu2" } else { "silu_mul" },
+                    "gated": gated,
+                    "fused_inter_ptr": format!("0x{:x}", fused_inter_ptr),
+                    "fused_inter2_ptr": format!("0x{:x}", fused_inter2_ptr),
+                    "activation_output_ptr": format!("0x{:x}", activation_ptr),
+                    "m_topk": m_topk,
+                    "intermediate_size": inter,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
+        }
 
         if let Some(t) = mt2 {
             self.stream_sync()?;
@@ -12927,6 +20219,49 @@ impl PrefillEngine {
         unsafe {
             cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
             cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, w2_ctmp_floats, self.stream);
+        }
+        if reference_layer0_moe_trace {
+            let sync_before_w2 = self.stream_sync().is_ok();
+            for &row in &trace_moe_rows_for_slots {
+                if row < m {
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        &format!("layer0_moe_w2_output_pre_call_slots_row{}", row),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        fused_output_ptr + ((row * topk * h * 2) as u64),
+                        topk,
+                        h,
+                        row * topk,
+                    );
+                }
+            }
+            self.push_reference_stage_metadata(
+                "layer0_moe_w2_call_metadata_pre",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_before_w2_success": sync_before_w2,
+                    "w2_input_ptr": format!("0x{:x}", w2_input),
+                    "fused_output_ptr": format!("0x{:x}", fused_output_ptr),
+                    "fused_c_tmp_ptr": format!("0x{:x}", fused_c_tmp_ptr),
+                    "workspace_ptr": format!("0x{:x}", ws_ptr),
+                    "workspace_len_u32": ws_len,
+                    "w2_ctmp_floats": w2_ctmp_floats,
+                    "m": m,
+                    "topk": topk,
+                    "m_topk": m_topk,
+                    "hidden_size": h,
+                    "intermediate_size": inter,
+                    "expert_bits": bits,
+                    "group_size": self.config.group_size,
+                    "use_ptr_table": use_ptr_table,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
         }
         unsafe {
             fused_fn(
@@ -12978,6 +20313,51 @@ impl PrefillEngine {
                 } else {
                     std::ptr::null()
                 }, // S_expert_ptrs
+            );
+        }
+        if reference_layer0_moe_trace {
+            let sync_after_w2 = self.stream_sync().is_ok();
+            for &row in &trace_moe_rows_for_slots {
+                if row < m {
+                    self.push_reference_stage_bf16_chunk_snapshot(
+                        &format!("layer0_moe_w2_output_post_call_slots_row{}", row),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        fused_output_ptr + ((row * topk * h * 2) as u64),
+                        topk,
+                        h,
+                        row * topk,
+                    );
+                    self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                        &format!("layer0_moe_w2_output_post_call_slots_row{}_column_segments", row),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        fused_output_ptr + ((row * topk * h * 2) as u64),
+                        topk,
+                        h,
+                        row * topk,
+                        &(row * topk..row * topk + topk).collect::<Vec<usize>>(),
+                        128,
+                    );
+                }
+            }
+            self.push_reference_stage_metadata(
+                "layer0_moe_w2_call_metadata_post",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_after_w2_success": sync_after_w2,
+                    "fused_output_ptr": format!("0x{:x}", fused_output_ptr),
+                    "fused_c_tmp_ptr": format!("0x{:x}", fused_c_tmp_ptr),
+                    "workspace_ptr": format!("0x{:x}", ws_ptr),
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
             );
         }
         if let Some(t) = mt3 {
@@ -13253,6 +20633,46 @@ impl PrefillEngine {
             self.stream
         };
         let scatter_stream_ptr = scatter_stream as *mut std::ffi::c_void;
+        if reference_layer0_moe_trace {
+            let sync_before_scatter = self.stream_sync().is_ok();
+            self.push_reference_stage_f32_chunk_snapshot(
+                "layer0_moe_accum_pre_routed_scatter_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                moe_accum,
+                trace_moe_full_chunk_rows,
+                h,
+                trace_moe_full_chunk_start,
+            );
+            self.push_reference_stage_metadata(
+                "layer0_moe_routed_scatter_metadata_pre",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_before_scatter_success": sync_before_scatter,
+                    "moe_accum_ptr": format!("0x{:x}", moe_accum),
+                    "fused_output_ptr": format!("0x{:x}", fused_output_ptr),
+                    "topk_weights_ptr": format!("0x{:x}", topk_weights_ptr),
+                    "sorted_ids_ptr": format!("0x{:x}", sorted_ids_val),
+                    "scatter_stream_ptr": format!("0x{:x}", scatter_stream as usize),
+                    "main_stream_ptr": format!("0x{:x}", self.stream as usize),
+                    "copy_stream_ptr": format!("0x{:x}", self.copy_stream as usize),
+                    "use_copy_stream_scatter": use_copy_stream_scatter,
+                    "use_driver_scatter": use_driver_scatter,
+                    "use_fresh_moe_accum": use_fresh_moe_accum,
+                    "m": m,
+                    "topk": topk,
+                    "m_topk": m_topk,
+                    "hidden_size": h,
+                    "total_sorted": total_sorted,
+                    "scale_factor": scale_factor,
+                }),
+            );
+        }
         if use_driver_scatter {
             unsafe {
                 cuda_sys::lib().cuMemsetD32Async(moe_accum, 0, m * h, scatter_stream);
@@ -13305,6 +20725,368 @@ impl PrefillEngine {
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.scatter_event, self.copy_stream);
                 cuda_sys::lib().cuStreamWaitEvent(self.stream, self.scatter_event, 0);
+            }
+        }
+        if reference_layer0_moe_trace {
+            let sync_after_scatter = self.stream_sync().is_ok();
+            self.push_reference_stage_f32_chunk_snapshot(
+                "layer0_moe_accum_post_routed_scatter_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                moe_accum,
+                trace_moe_full_chunk_rows,
+                h,
+                trace_moe_full_chunk_start,
+            );
+            self.push_reference_stage_f32_chunk_snapshot_with_column_segments(
+                "layer0_moe_accum_post_routed_scatter_full_chunk_column_segments",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                moe_accum,
+                trace_moe_full_chunk_rows,
+                h,
+                trace_moe_full_chunk_start,
+                &trace_moe_watched_rows,
+                128,
+            );
+            self.push_reference_stage_metadata(
+                "layer0_moe_routed_scatter_metadata_post",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_after_scatter_success": sync_after_scatter,
+                    "moe_accum_ptr": format!("0x{:x}", moe_accum),
+                    "scatter_stream_ptr": format!("0x{:x}", scatter_stream as usize),
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
+            for &row in &trace_moe_rows_for_slots {
+                if row >= m {
+                    continue;
+                }
+                let stage_prefix = format!("layer0_moe_routed_scatter_row{}_host_recompute", row);
+                let row_result: Result<(), String> = (|| {
+                    let weights = download_device_f32(
+                        topk_weights_ptr + ((row * topk * 4) as u64),
+                        topk,
+                    )?;
+                    let expert_ids = download_device_i32(
+                        topk_ids_ptr + ((row * topk * 4) as u64),
+                        topk,
+                    )?;
+                    let actual = download_device_f32(
+                        moe_accum + ((row * h * 4) as u64),
+                        h,
+                    )?;
+                    let mut expected = vec![0.0f32; h];
+                    let mut slot_values = Vec::with_capacity(topk);
+                    let mut slot_metadata = Vec::with_capacity(topk);
+                    for slot in 0..topk {
+                        let compact_row = row * topk + slot;
+                        let slot_bits = download_device_u16(
+                            fused_output_ptr + ((compact_row * h * 2) as u64),
+                            h,
+                        )?;
+                        let slot_weight = weights.get(slot).copied().unwrap_or(0.0);
+                        let scaled_weight = slot_weight * scale_factor;
+                        let mut slot_l2 = 0.0f64;
+                        let mut slot_f32 = Vec::with_capacity(h);
+                        for i in 0..h {
+                            let value = bf16_to_f32(slot_bits[i]);
+                            slot_f32.push(value);
+                            expected[i] += value * scaled_weight;
+                            slot_l2 += (value as f64) * (value as f64);
+                        }
+                        slot_values.push(slot_f32);
+                        slot_metadata.push(serde_json::json!({
+                            "slot": slot,
+                            "compact_row": compact_row,
+                            "destination_token": row,
+                            "expert_id": expert_ids.get(slot).copied(),
+                            "topk_weight": slot_weight,
+                            "scale_factor": scale_factor,
+                            "scaled_weight": scaled_weight,
+                            "source_row_hash_fnv1a64_bf16_bits": format!("0x{:016x}", fnv1a_u16_hash(&slot_bits)),
+                            "source_row_l2": slot_l2.sqrt(),
+                        }));
+                    }
+                    let diff: Vec<f32> = actual
+                        .iter()
+                        .zip(expected.iter())
+                        .map(|(&a, &e)| a - e)
+                        .collect();
+                    let compare = summarize_trace_diff(&actual, &expected);
+                    self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                        "stage": format!("{}_expected", stage_prefix),
+                        "layer": Some(layer_idx),
+                        "chunk": 0,
+                        "absolute_position": trace_moe_last_pos,
+                        "row_index_in_chunk": row,
+                        "token_id": trace_moe_token_id,
+                        "row_width": h,
+                        "absolute_row": row,
+                        "trace": reference_f32_trace_json(&expected, "routed_scatter_host_expected"),
+                        "metadata": {
+                            "row": row,
+                            "topk": topk,
+                            "hidden_size": h,
+                            "kernel": "moe_scatter_fused_kernel",
+                            "kernel_indexing": "compact_row = token * topk + slot",
+                            "accumulation": "FP32 atomicAdd over slot contributions",
+                            "slot_inputs": slot_metadata,
+                        },
+                    }));
+                    self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                        "stage": format!("{}_actual", stage_prefix),
+                        "layer": Some(layer_idx),
+                        "chunk": 0,
+                        "absolute_position": trace_moe_last_pos,
+                        "row_index_in_chunk": row,
+                        "token_id": trace_moe_token_id,
+                        "row_width": h,
+                        "absolute_row": row,
+                        "trace": reference_f32_trace_json(&actual, "routed_scatter_gpu_actual"),
+                    }));
+                    self.reference_prefill_stage_snapshots.borrow_mut().push(serde_json::json!({
+                        "stage": format!("{}_actual_minus_expected", stage_prefix),
+                        "layer": Some(layer_idx),
+                        "chunk": 0,
+                        "absolute_position": trace_moe_last_pos,
+                        "row_index_in_chunk": row,
+                        "token_id": trace_moe_token_id,
+                        "row_width": h,
+                        "absolute_row": row,
+                        "trace": reference_f32_trace_json(&diff, "routed_scatter_gpu_actual_minus_host_expected"),
+                        "compare": {
+                            "actual": "gpu_post_scatter_accum",
+                            "expected": "host_recompute_from_fused_w2_rows_and_topk_weights",
+                            "max_abs": compare.max_abs,
+                            "max_abs_idx": compare.max_abs_idx,
+                            "actual_at_max": compare.actual_at_max,
+                            "expected_at_max": compare.expected_at_max,
+                            "l2": compare.l2,
+                            "mean_abs": compare.mean_abs,
+                        },
+                    }));
+                    if let Some((probe_buf, probe_runs, probe_fields, probe_sync_ok)) =
+                        topk_sum_probe.as_ref()
+                    {
+                        let probe_ptr = *probe_buf.device_ptr();
+                        let mut probe_runs_json = Vec::with_capacity(*probe_runs);
+                        for probe_run in 0..*probe_runs {
+                            let row_offset =
+                                ((probe_run * m + row) * *probe_fields * 4) as u64;
+                            let values =
+                                download_device_f32(probe_ptr + row_offset, *probe_fields)?;
+                            let weights_start = 5usize + 2usize * topk;
+                            let probe_weights =
+                                values[weights_start..weights_start + topk].to_vec();
+                            let mut probe_expected = vec![0.0f32; h];
+                            for slot in 0..topk {
+                                let scaled_weight =
+                                    probe_weights.get(slot).copied().unwrap_or(0.0) * scale_factor;
+                                if let Some(slot_row) = slot_values.get(slot) {
+                                    for i in 0..h {
+                                        probe_expected[i] += slot_row[i] * scaled_weight;
+                                    }
+                                }
+                            }
+                            let probe_vs_actual = summarize_trace_diff(&actual, &probe_expected);
+                            let probe_vs_normal_expected =
+                                summarize_trace_diff(&probe_expected, &expected);
+                            probe_runs_json.push(serde_json::json!({
+                                "run": probe_run,
+                                "denominator_sum": values[1],
+                                "topk_probability_sum": values[3],
+                                "weights": probe_weights,
+                                "expected_l2": diag_l2_norm(&probe_expected),
+                                "actual_minus_probe_expected_l2": probe_vs_actual.l2,
+                                "probe_expected_minus_normal_expected_l2": probe_vs_normal_expected.l2,
+                                "actual_minus_probe_expected_max_abs": probe_vs_actual.max_abs,
+                                "probe_expected_minus_normal_expected_max_abs": probe_vs_normal_expected.max_abs,
+                            }));
+                        }
+                        self.push_reference_stage_metadata(
+                            &format!("{}_cuda_sum_probe_routed_expected_summaries", stage_prefix),
+                            Some(layer_idx),
+                            0,
+                            trace_moe_last_pos,
+                            trace_moe_token_id,
+                            serde_json::json!({
+                                "row": row,
+                                "probe_runs": *probe_runs,
+                                "probe_sync_after_launch_success": *probe_sync_ok,
+                                "topk": topk,
+                                "hidden_size": h,
+                                "scale_factor": scale_factor,
+                                "normal_expected_l2": diag_l2_norm(&expected),
+                                "gpu_actual_l2": diag_l2_norm(&actual),
+                                "runs": probe_runs_json,
+	                            }),
+	                        );
+	                    }
+	                    if let Some((probe_buf, probe_runs, probe_fields, probe_sync_ok)) =
+	                        topk_selected_probe.as_ref()
+	                    {
+	                        let probe_ptr = *probe_buf.device_ptr();
+	                        let mut probe_runs_json = Vec::with_capacity(*probe_runs);
+	                        for probe_run in 0..*probe_runs {
+	                            let row_offset =
+	                                ((probe_run * m + row) * *probe_fields * 4) as u64;
+	                            let values =
+	                                download_device_f32(probe_ptr + row_offset, *probe_fields)?;
+	                            let weights_start = 3usize + 2usize * topk;
+	                            let probe_weights =
+	                                values[weights_start..weights_start + topk].to_vec();
+	                            let mut probe_expected = vec![0.0f32; h];
+	                            for slot in 0..topk {
+	                                let scaled_weight =
+	                                    probe_weights.get(slot).copied().unwrap_or(0.0) * scale_factor;
+	                                if let Some(slot_row) = slot_values.get(slot) {
+	                                    for i in 0..h {
+	                                        probe_expected[i] += slot_row[i] * scaled_weight;
+	                                    }
+	                                }
+	                            }
+	                            let probe_vs_actual = summarize_trace_diff(&actual, &probe_expected);
+	                            let probe_vs_normal_expected =
+	                                summarize_trace_diff(&probe_expected, &expected);
+	                            probe_runs_json.push(serde_json::json!({
+	                                "run": probe_run,
+	                                "selected_exp_sum": values[1],
+	                                "weights": probe_weights,
+	                                "expected_l2": diag_l2_norm(&probe_expected),
+	                                "actual_minus_probe_expected_l2": probe_vs_actual.l2,
+	                                "probe_expected_minus_normal_expected_l2": probe_vs_normal_expected.l2,
+	                                "actual_minus_probe_expected_max_abs": probe_vs_actual.max_abs,
+	                                "probe_expected_minus_normal_expected_max_abs": probe_vs_normal_expected.max_abs,
+	                            }));
+	                        }
+	                        self.push_reference_stage_metadata(
+	                            &format!("{}_cuda_selected_probe_routed_expected_summaries", stage_prefix),
+	                            Some(layer_idx),
+	                            0,
+	                            trace_moe_last_pos,
+	                            trace_moe_token_id,
+	                            serde_json::json!({
+	                                "row": row,
+	                                "probe_runs": *probe_runs,
+	                                "probe_sync_after_launch_success": *probe_sync_ok,
+	                                "topk": topk,
+	                                "hidden_size": h,
+	                                "scale_factor": scale_factor,
+	                                "normal_expected_l2": diag_l2_norm(&expected),
+	                                "gpu_actual_l2": diag_l2_norm(&actual),
+	                                "runs": probe_runs_json,
+	                            }),
+	                        );
+	                    }
+	                    if scoring_func == 0 {
+	                        let host_variant: Result<(), String> = (|| {
+	                            let logits = download_device_f32(
+	                                gate_out + ((row * n_experts * 4) as u64),
+	                                n_experts,
+	                            )?;
+	                            let gate_bias =
+	                                if self.layer_weights[layer_idx].moe_gate_bias_ptr != 0 {
+	                                    Some(download_device_f32(
+	                                        self.layer_weights[layer_idx].moe_gate_bias_ptr,
+	                                        n_experts,
+	                                    )?)
+	                                } else {
+	                                    None
+	                                };
+	                            let e_score_corr =
+	                                if self.layer_weights[layer_idx].moe_e_score_corr_ptr != 0 {
+	                                    Some(download_device_f32(
+	                                        self.layer_weights[layer_idx].moe_e_score_corr_ptr,
+	                                        n_experts,
+	                                    )?)
+	                                } else {
+	                                    None
+	                                };
+	                            let (host_weights, host_ids) = compute_router_topk_cpu_reference(
+	                                &logits,
+	                                topk,
+	                                scoring_func,
+	                                gate_bias.as_deref(),
+	                                e_score_corr.as_deref(),
+	                            )?;
+	                            let mut host_expected = vec![0.0f32; h];
+	                            for slot in 0..topk {
+	                                let scaled_weight =
+	                                    host_weights.get(slot).copied().unwrap_or(0.0) * scale_factor;
+	                                if let Some(slot_row) = slot_values.get(slot) {
+	                                    for i in 0..h {
+	                                        host_expected[i] += slot_row[i] * scaled_weight;
+	                                    }
+	                                }
+	                            }
+	                            let host_vs_actual = summarize_trace_diff(&actual, &host_expected);
+	                            let host_vs_normal_expected =
+	                                summarize_trace_diff(&host_expected, &expected);
+	                            self.push_reference_stage_metadata(
+	                                &format!("{}_host_exact_routed_expected_summary", stage_prefix),
+	                                Some(layer_idx),
+	                                0,
+	                                trace_moe_last_pos,
+	                                trace_moe_token_id,
+	                                serde_json::json!({
+	                                    "row": row,
+	                                    "topk": topk,
+	                                    "hidden_size": h,
+	                                    "scale_factor": scale_factor,
+	                                    "host_ids": host_ids,
+	                                    "host_weights": host_weights,
+	                                    "host_expected_l2": diag_l2_norm(&host_expected),
+	                                    "normal_expected_l2": diag_l2_norm(&expected),
+	                                    "gpu_actual_l2": diag_l2_norm(&actual),
+	                                    "actual_minus_host_expected_l2": host_vs_actual.l2,
+	                                    "host_expected_minus_normal_expected_l2": host_vs_normal_expected.l2,
+	                                    "actual_minus_host_expected_max_abs": host_vs_actual.max_abs,
+	                                    "host_expected_minus_normal_expected_max_abs": host_vs_normal_expected.max_abs,
+	                                }),
+	                            );
+	                            Ok(())
+	                        })();
+	                        if let Err(err) = host_variant {
+	                            self.push_reference_stage_metadata(
+	                                &format!("{}_host_exact_routed_expected_failed", stage_prefix),
+	                                Some(layer_idx),
+	                                0,
+	                                trace_moe_last_pos,
+	                                trace_moe_token_id,
+	                                serde_json::json!({
+	                                    "row": row,
+	                                    "error": err,
+	                                }),
+	                            );
+	                        }
+	                    }
+	                    Ok(())
+	                })();
+                if let Err(err) = row_result {
+                    self.push_reference_stage_metadata(
+                        &format!("{}_failed", stage_prefix),
+                        Some(layer_idx),
+                        0,
+                        trace_moe_last_pos,
+                        trace_moe_token_id,
+                        serde_json::json!({
+                            "row": row,
+                            "error": err,
+                            "topk_weights_ptr": format!("0x{:x}", topk_weights_ptr),
+                            "fused_output_ptr": format!("0x{:x}", fused_output_ptr),
+                            "moe_accum_ptr": format!("0x{:x}", moe_accum),
+                        }),
+                    );
+                }
             }
         }
 
@@ -13957,6 +21739,19 @@ impl PrefillEngine {
                 .set(self.t_moe_scatter.get() + t.elapsed().as_secs_f64() * 1000.0);
         }
         let mt5 = if mt { Some(Instant::now()) } else { None };
+        if reference_layer0_moe_trace {
+            self.push_reference_stage_f32_chunk_snapshot(
+                "layer0_moe_accum_pre_shared_add_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                moe_accum,
+                trace_moe_full_chunk_rows,
+                h,
+                trace_moe_full_chunk_start,
+            );
+        }
 
         // 12. Wait for shared expert on shared_stream, then add to accumulator with sigmoid gate
         if has_shared {
@@ -14130,6 +21925,83 @@ impl PrefillEngine {
                     cuda_sys::lib().cuStreamWaitEvent(self.stream, self.shared_event, 0);
                 }
             }
+            if reference_layer0_moe_trace {
+                let sync_after_shared_add = self.stream_sync().is_ok();
+                self.push_reference_stage_bf16_chunk_snapshot(
+                    "layer0_moe_shared_output_full_chunk",
+                    Some(layer_idx),
+                    0,
+                    trace_moe_last_pos,
+                    trace_moe_token_id,
+                    s1_buf,
+                    trace_moe_full_chunk_rows,
+                    h,
+                    trace_moe_full_chunk_start,
+                );
+                self.push_reference_stage_f32_chunk_snapshot(
+                    "layer0_moe_accum_post_shared_add_full_chunk",
+                    Some(layer_idx),
+                    0,
+                    trace_moe_last_pos,
+                    trace_moe_token_id,
+                    moe_accum,
+                    trace_moe_full_chunk_rows,
+                    h,
+                    trace_moe_full_chunk_start,
+                );
+                self.push_reference_stage_f32_chunk_snapshot_with_column_segments(
+                    "layer0_moe_accum_post_shared_add_full_chunk_column_segments",
+                    Some(layer_idx),
+                    0,
+                    trace_moe_last_pos,
+                    trace_moe_token_id,
+                    moe_accum,
+                    trace_moe_full_chunk_rows,
+                    h,
+                    trace_moe_full_chunk_start,
+                    &trace_moe_watched_rows,
+                    128,
+                );
+                self.push_reference_stage_metadata(
+                    "layer0_moe_shared_add_metadata_post",
+                    Some(layer_idx),
+                    0,
+                    trace_moe_last_pos,
+                    trace_moe_token_id,
+                    serde_json::json!({
+                        "sync_after_shared_add_success": sync_after_shared_add,
+                        "has_shared": has_shared,
+                        "force_sync_shared_expert": force_sync_shared_expert,
+                        "defer_shared_expert_launch": defer_shared_expert_launch,
+                        "shared_add_on_shared_stream": shared_add_on_shared_stream,
+                        "shared_expert_use_main_scratch": shared_expert_use_main_scratch,
+                        "moe_accum_ptr": format!("0x{:x}", moe_accum),
+                        "shared_output_ptr": format!("0x{:x}", s1_buf),
+                        "shared_gate_ptr": format!("0x{:x}", sg_ptr),
+                        "add_stream_ptr": format!("0x{:x}", add_stream as usize),
+                        "main_stream_ptr": format!("0x{:x}", self.stream as usize),
+                        "shared_stream_ptr": format!("0x{:x}", self.shared_stream as usize),
+                        "m": m,
+                        "hidden_size": h,
+                    }),
+                );
+            }
+        }
+        if reference_layer0_moe_trace && !has_shared {
+            self.push_reference_stage_metadata(
+                "layer0_moe_shared_add_metadata_post",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "has_shared": false,
+                    "moe_accum_ptr": format!("0x{:x}", moe_accum),
+                    "m": m,
+                    "hidden_size": h,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
         }
 
         if moe_trace_enabled {
@@ -14872,6 +22744,50 @@ impl PrefillEngine {
         }
 
         // 13. Convert FP32 accum -> BF16 hidden
+        if reference_layer0_moe_trace {
+            let sync_before_convert = self.stream_sync().is_ok();
+            self.push_reference_stage_bf16_chunk_snapshot(
+                "layer0_moe_hidden_output_pre_convert_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                hidden,
+                trace_moe_full_chunk_rows,
+                h,
+                trace_moe_full_chunk_start,
+            );
+            self.push_reference_stage_f32_chunk_snapshot(
+                "layer0_moe_accum_pre_bf16_convert_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                moe_accum,
+                trace_moe_full_chunk_rows,
+                h,
+                trace_moe_full_chunk_start,
+            );
+            self.push_reference_stage_metadata(
+                "layer0_moe_bf16_convert_metadata_pre",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_before_convert_success": sync_before_convert,
+                    "kernel": "moe_accum_to_bf16",
+                    "hidden_output_ptr": format!("0x{:x}", hidden),
+                    "moe_accum_ptr": format!("0x{:x}", moe_accum),
+                    "m": m,
+                    "hidden_size": h,
+                    "input_dtype": "f32",
+                    "output_dtype": "bf16",
+                    "layout": "row_major_m_by_hidden",
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
+        }
         {
             let ct = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
             let mut c0 = hidden;
@@ -14893,6 +22809,49 @@ impl PrefillEngine {
                     ],
                 )?;
             }
+        }
+        if reference_layer0_moe_trace {
+            let sync_after_convert = self.stream_sync().is_ok();
+            self.push_reference_stage_bf16_chunk_snapshot(
+                "layer0_moe_hidden_output_post_convert_full_chunk",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                hidden,
+                trace_moe_full_chunk_rows,
+                h,
+                trace_moe_full_chunk_start,
+            );
+            self.push_reference_stage_bf16_chunk_snapshot_with_column_segments(
+                "layer0_moe_hidden_output_post_convert_full_chunk_column_segments",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                hidden,
+                trace_moe_full_chunk_rows,
+                h,
+                trace_moe_full_chunk_start,
+                &trace_moe_watched_rows,
+                128,
+            );
+            self.push_reference_stage_metadata(
+                "layer0_moe_bf16_convert_metadata_post",
+                Some(layer_idx),
+                0,
+                trace_moe_last_pos,
+                trace_moe_token_id,
+                serde_json::json!({
+                    "sync_after_convert_success": sync_after_convert,
+                    "kernel": "moe_accum_to_bf16",
+                    "hidden_output_ptr": format!("0x{:x}", hidden),
+                    "moe_accum_ptr": format!("0x{:x}", moe_accum),
+                    "m": m,
+                    "hidden_size": h,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                }),
+            );
         }
 
         if let Some(t) = mt5 {
@@ -18276,6 +26235,36 @@ impl PrefillEngine {
         let v = cfg.vocab_size;
 
         let last_tok = *self.scratch.d_hidden.device_ptr() + ((m - 1) * h * 2) as u64;
+        let debug_reference_trace = self.reference_debug_trace_enabled;
+        let hidden_before_lm = if debug_reference_trace {
+            // Request-gated diagnostic sync: capture the final hidden vector at
+            // the exact LM-head input point. This is deliberately not used by
+            // normal inference or benchmarks.
+            self.stream_sync()?;
+            Some(download_device_u16(last_tok, h)?)
+        } else {
+            None
+        };
+        let lm_head_kind = if self.lm_head.is_some() {
+            "marlin"
+        } else if self.lm_head_bf16_ptr != 0 {
+            "bf16_cublas_gemm_ex"
+        } else {
+            "none"
+        };
+        let lm_head_weight_shape = if self.lm_head.is_some() {
+            serde_json::json!({
+                "rows": v,
+                "cols": h,
+                "source": "marlin_weight_descriptor",
+            })
+        } else {
+            serde_json::json!({
+                "rows": self.lm_head_bf16_rows,
+                "cols": self.lm_head_bf16_cols,
+                "source": "bf16_weight_pointer",
+            })
+        };
 
         if let Some(ref lm) = self.lm_head {
             self.marlin_gemm(last_tok, lm, *self.scratch.d_logits.device_ptr(), 1)?;
@@ -18320,6 +26309,9 @@ impl PrefillEngine {
 
         // Download logits
         self.h_logits.resize(v, 0.0);
+        let h_logits_host_ptr = self.h_logits.as_ptr() as usize;
+        let h_logits_host_len = self.h_logits.len();
+        let h_logits_host_capacity = self.h_logits.capacity();
         unsafe {
             let err = cuda_sys::lib().cuMemcpyDtoHAsync_v2(
                 self.h_logits.as_mut_ptr() as *mut _,
@@ -18332,6 +26324,11 @@ impl PrefillEngine {
             }
         }
         self.stream_sync()?;
+        let logits_before_suppression = if debug_reference_trace {
+            Some(self.h_logits.clone())
+        } else {
+            None
+        };
 
         // Suppress tokens
         for &t in suppress_tokens {
@@ -18341,7 +26338,7 @@ impl PrefillEngine {
         }
 
         // Sample
-        if temperature < 1e-6 {
+        let first_token = if temperature < 1e-6 {
             // Greedy
             let (best, _) = self
                 .h_logits
@@ -18349,7 +26346,7 @@ impl PrefillEngine {
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or((0, &0.0));
-            Ok(best as u32)
+            best as u32
         } else {
             // Temperature-scaled softmax sampling
             let max_l = self
@@ -18382,11 +26379,135 @@ impl PrefillEngine {
             for (i, &p) in self.h_logits.iter().enumerate() {
                 cum += p as f64;
                 if cum >= r {
+                    if debug_reference_trace {
+                        self.last_reference_debug_trace = Some(serde_json::json!({
+                            "available": true,
+                            "prefill_stage_snapshots": self.reference_prefill_stage_snapshots.borrow().clone(),
+                            "prefill_buffer_identity": {
+                                "d_hidden_ptr": format!("0x{:x}", *self.scratch.d_hidden.device_ptr()),
+                                "d_residual_ptr": format!("0x{:x}", *self.scratch.d_residual.device_ptr()),
+                                "d_attn_out_ptr": format!("0x{:x}", *self.scratch.d_attn_out.device_ptr()),
+                                "d_logits_ptr": format!("0x{:x}", *self.scratch.d_logits.device_ptr()),
+                                "scratch_max_tokens": self.scratch.max_tokens,
+                                "hidden_size": h,
+                                "num_hidden_layers": self.config.num_hidden_layers,
+                                "stream_ptr": format!("0x{:x}", self.stream as usize),
+                                "copy_stream_ptr": format!("0x{:x}", self.copy_stream as usize),
+                            },
+                            "final_hidden_before_lm_head": hidden_before_lm
+                                .as_ref()
+                                .map(|bits| reference_hidden_trace_json(
+                                    bits,
+                                    h,
+                                    Some(i),
+                                    last_tok,
+                                    true,
+                                ))
+                                .unwrap_or_else(|| serde_json::json!({"available": false})),
+                            "lm_head": {
+                                "kind": lm_head_kind,
+                                "input_dtype": "bf16",
+                                "input_device": "cuda",
+                                "input_shape": [1usize, h],
+                                "weight_shape": lm_head_weight_shape.clone(),
+                                "output_dtype": "f32",
+                                "output_device": "cuda",
+                                "output_shape": [1usize, v],
+                                "temperature": temperature,
+                            },
+                            "output_buffer": {
+                                "d_logits_device_ptr": format!("0x{:x}", *self.scratch.d_logits.device_ptr()),
+                                "h_logits_host_ptr": format!("0x{:x}", h_logits_host_ptr),
+                                "h_logits_len": h_logits_host_len,
+                                "h_logits_capacity": h_logits_host_capacity,
+                                "stream_ptr": format!("0x{:x}", self.stream as usize),
+                                "cublas_handle": format!("0x{:x}", self.cublas_handle as usize),
+                                "reused_engine_h_logits_buffer": true,
+                            },
+                            "sync_points": {
+                                "stream_sync_before_hidden_download": true,
+                                "stream_sync_after_logits_download": true,
+                                "logits_download_api": "cuMemcpyDtoHAsync_v2",
+                            },
+                            "logits_after_lm_head_before_suppression": logits_before_suppression
+                                .as_ref()
+                                .map(|logits| reference_lm_head_logit_trace_json(logits, v, i, 10))
+                                .unwrap_or_else(|| serde_json::json!({"available": false})),
+                            "selected_token_id_after_suppression": i,
+                            "suppressed_token_count": suppress_tokens.len(),
+                        }));
+                    }
                     return Ok(i as u32);
                 }
             }
-            Ok((v - 1) as u32)
+            (v - 1) as u32
+        };
+
+        if debug_reference_trace {
+            self.last_reference_debug_trace = Some(serde_json::json!({
+                "available": true,
+                "prefill_stage_snapshots": self.reference_prefill_stage_snapshots.borrow().clone(),
+                "prefill_buffer_identity": {
+                    "d_hidden_ptr": format!("0x{:x}", *self.scratch.d_hidden.device_ptr()),
+                    "d_residual_ptr": format!("0x{:x}", *self.scratch.d_residual.device_ptr()),
+                    "d_attn_out_ptr": format!("0x{:x}", *self.scratch.d_attn_out.device_ptr()),
+                    "d_logits_ptr": format!("0x{:x}", *self.scratch.d_logits.device_ptr()),
+                    "scratch_max_tokens": self.scratch.max_tokens,
+                    "hidden_size": h,
+                    "num_hidden_layers": self.config.num_hidden_layers,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                    "copy_stream_ptr": format!("0x{:x}", self.copy_stream as usize),
+                },
+                "final_hidden_before_lm_head": hidden_before_lm
+                    .as_ref()
+                    .map(|bits| reference_hidden_trace_json(
+                        bits,
+                        h,
+                        Some(first_token as usize),
+                        last_tok,
+                        true,
+                    ))
+                    .unwrap_or_else(|| serde_json::json!({"available": false})),
+                "lm_head": {
+                    "kind": lm_head_kind,
+                    "input_dtype": "bf16",
+                    "input_device": "cuda",
+                    "input_shape": [1usize, h],
+                    "weight_shape": lm_head_weight_shape.clone(),
+                    "output_dtype": "f32",
+                    "output_device": "cuda",
+                    "output_shape": [1usize, v],
+                    "temperature": temperature,
+                },
+                "output_buffer": {
+                    "d_logits_device_ptr": format!("0x{:x}", *self.scratch.d_logits.device_ptr()),
+                    "h_logits_host_ptr": format!("0x{:x}", h_logits_host_ptr),
+                    "h_logits_len": h_logits_host_len,
+                    "h_logits_capacity": h_logits_host_capacity,
+                    "stream_ptr": format!("0x{:x}", self.stream as usize),
+                    "cublas_handle": format!("0x{:x}", self.cublas_handle as usize),
+                    "reused_engine_h_logits_buffer": true,
+                },
+                "sync_points": {
+                    "stream_sync_before_hidden_download": true,
+                    "stream_sync_after_logits_download": true,
+                    "logits_download_api": "cuMemcpyDtoHAsync_v2",
+                },
+                "logits_after_lm_head_before_suppression": logits_before_suppression
+                    .as_ref()
+                    .map(|logits| reference_lm_head_logit_trace_json(
+                        logits,
+                        v,
+                        first_token as usize,
+                        10,
+                    ))
+                    .unwrap_or_else(|| serde_json::json!({"available": false})),
+                "selected_token_id_after_suppression": first_token,
+                "suppressed_token_count": suppress_tokens.len(),
+            }));
         }
+
+        Ok(first_token)
     }
 }
 
@@ -18408,6 +26529,10 @@ impl PrefillKernels {
                     "fused_add_rmsnorm_batched_kernel",
                     "embedding_batched_kernel",
                     "hqq4_dequant_bf16_kernel",
+                    "hqq4_prefill_gemm_bf16_kernel",
+                    "hqq8_prefill_gemm_bf16_kernel",
+                    "hqq_prefill_int8_exception_delta_bf16_kernel",
+                    "hqq_apply_sidecar_bf16_kernel",
                     "rope_batched_kernel",
                     "silu_mul_batched_kernel",
                     "relu2_batched_kernel",
@@ -18416,6 +26541,8 @@ impl PrefillKernels {
                     "fp32_to_bf16_kernel",
                     "sigmoid_topk_kernel",
                     "softmax_topk_kernel",
+                    "softmax_topk_sum_probe_kernel",
+                    "softmax_topk_selected_probe_kernel",
                     "moe_sum_reduce_kernel",
                     "gqa_prefill_kernel",
                     "kv_cache_append_kernel",
@@ -18533,12 +26660,18 @@ impl PrefillKernels {
             fused_add_rmsnorm: get("fused_add_rmsnorm_batched_kernel")?,
             embedding: get("embedding_batched_kernel")?,
             hqq4_dequant_bf16: get("hqq4_dequant_bf16_kernel")?,
+            hqq4_prefill_gemm_bf16: get("hqq4_prefill_gemm_bf16_kernel")?,
+            hqq8_prefill_gemm_bf16: get("hqq8_prefill_gemm_bf16_kernel")?,
+            hqq_prefill_int8_exception_delta_bf16: get("hqq_prefill_int8_exception_delta_bf16_kernel")?,
+            hqq_apply_sidecar_bf16: get("hqq_apply_sidecar_bf16_kernel")?,
             rope: get("rope_batched_kernel")?,
             silu_mul: get("silu_mul_batched_kernel")?,
             relu2: get("relu2_batched_kernel")?,
             sigmoid_mul: get("sigmoid_mul_kernel")?,
             sigmoid_topk: get("sigmoid_topk_kernel")?,
             softmax_topk: get("softmax_topk_kernel")?,
+            softmax_topk_sum_probe: get("softmax_topk_sum_probe_kernel")?,
+            softmax_topk_selected_probe: get("softmax_topk_selected_probe_kernel")?,
             moe_sum_reduce: get("moe_sum_reduce_kernel")?,
             gqa_prefill: get("gqa_prefill_kernel")?,
             kv_cache_append: get("kv_cache_append_kernel")?,
@@ -19823,6 +27956,8 @@ mod kernel_tests {
                     "sigmoid_mul_kernel",
                     "sigmoid_topk_kernel",
                     "softmax_topk_kernel",
+                    "softmax_topk_sum_probe_kernel",
+                    "softmax_topk_selected_probe_kernel",
                     "transpose_3d_021_kernel",
                     "transpose_3d_021_bf16_kernel",
                     "la_transpose_f32_kernel",

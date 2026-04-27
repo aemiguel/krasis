@@ -256,6 +256,222 @@ extern "C" void krasis_hqq4_dequant_bf16(
         group_size);
 }
 
+__device__ __forceinline__ int hqq_group_idx(int col, int group_size) {
+    return group_size == 128 ? (col >> 7) : (col / group_size);
+}
+
+template<int NBITS>
+__device__ __forceinline__ float hqq_load_weight(
+    const unsigned char* __restrict__ row,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    int col,
+    int group_size)
+{
+    int q;
+    if constexpr (NBITS == 4) {
+        unsigned char packed = row[col >> 1];
+        q = (col & 1) ? (int)(packed >> 4) : (int)(packed & 0x0F);
+    } else {
+        q = (int)row[col];
+    }
+    int group = hqq_group_idx(col, group_size);
+    return ((float)q - zeros[group]) * scales[group];
+}
+
+template<int NBITS>
+__device__ void hqq_quantized_prefill_gemm_bf16_device(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ input,
+    const unsigned char* __restrict__ packed,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    int M,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes)
+{
+    __shared__ float partial[256];
+    int tid = threadIdx.x;
+    int lane = tid & 3;
+    int out_lane = tid >> 2;
+    int local_m = out_lane >> 3;
+    int local_row = out_lane & 7;
+    int token = blockIdx.y * 8 + local_m;
+    int row = blockIdx.x * 8 + local_row;
+    if (token >= M || row >= rows) return;
+
+    const __nv_bfloat16* x_row = input + (long long)token * cols;
+    const unsigned char* w_row = packed + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)zeros + (long long)row * zeros_row_stride_bytes);
+
+    float acc = 0.0f;
+    for (int col = lane; col < cols; col += 4) {
+        float w = hqq_load_weight<NBITS>(w_row, s_row, z_row, col, group_size);
+        float x = bf16_to_float(x_row[col]);
+        acc += w * x;
+    }
+
+    partial[tid] = acc;
+    __syncthreads();
+    if (lane == 0) {
+        float sum = partial[tid] + partial[tid + 1] + partial[tid + 2] + partial[tid + 3];
+        out[(long long)token * rows + row] = float_to_bf16(sum);
+    }
+}
+
+extern "C" __global__ void hqq4_prefill_gemm_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ input,
+    const unsigned char* __restrict__ packed,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    int M,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes)
+{
+    hqq_quantized_prefill_gemm_bf16_device<4>(
+        out, input, packed, scales, zeros, M, rows, cols, group_size,
+        packed_row_stride_bytes, scales_row_stride_bytes, zeros_row_stride_bytes);
+}
+
+extern "C" __global__ void hqq8_prefill_gemm_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ input,
+    const unsigned char* __restrict__ packed,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    int M,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes)
+{
+    hqq_quantized_prefill_gemm_bf16_device<8>(
+        out, input, packed, scales, zeros, M, rows, cols, group_size,
+        packed_row_stride_bytes, scales_row_stride_bytes, zeros_row_stride_bytes);
+}
+
+extern "C" __global__ void hqq_prefill_int8_exception_delta_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ input,
+    const signed char* __restrict__ exception_qint8,
+    const float* __restrict__ exception_scales,
+    const int* __restrict__ output_rows,
+    const int* __restrict__ start_cols,
+    const int* __restrict__ widths,
+    const unsigned char* __restrict__ hqq_packed_w,
+    const float* __restrict__ hqq_scales,
+    const float* __restrict__ hqq_zeros,
+    int M,
+    int rows,
+    int row_group_count,
+    int cols,
+    int group_size,
+    int max_width,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes,
+    int nbits)
+{
+    extern __shared__ float smem[];
+    int entry = blockIdx.x;
+    int token = blockIdx.y;
+    int tid = threadIdx.x;
+    if (entry >= row_group_count || token >= M) return;
+
+    int row = output_rows[entry];
+    int start_col = start_cols[entry];
+    int width = widths[entry];
+    const unsigned char* w_row = hqq_packed_w + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)hqq_scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)hqq_zeros + (long long)row * zeros_row_stride_bytes);
+    const __nv_bfloat16* x_row = input + (long long)token * cols;
+    float exc_scale = exception_scales[entry];
+
+    float acc = 0.0f;
+    for (int local = tid; local < width; local += blockDim.x) {
+        int col = start_col + local;
+        if (col >= cols) continue;
+        int q;
+        if (nbits == 4) {
+            unsigned char packed_byte = w_row[col >> 1];
+            q = (col & 1) ? (int)(packed_byte >> 4) : (int)(packed_byte & 0x0F);
+        } else {
+            q = (int)w_row[col];
+        }
+        int group = hqq_group_idx(col, group_size);
+        float hqq_w = ((float)q - z_row[group]) * s_row[group];
+        float int8_w = (float)exception_qint8[entry * max_width + local] * exc_scale;
+        float x = bf16_to_float(x_row[col]);
+        acc += (int8_w - hqq_w) * x;
+    }
+
+    smem[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        __nv_bfloat16 base = out[(long long)token * rows + row];
+        out[(long long)token * rows + row] = float_to_bf16(bf16_to_float(base) + smem[0]);
+    }
+}
+
+extern "C" __global__ void hqq_apply_sidecar_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const signed char* __restrict__ correction_qint8,
+    const __nv_bfloat16* __restrict__ correction_bf16,
+    const float* __restrict__ scales,
+    const int* __restrict__ output_rows,
+    const int* __restrict__ start_cols,
+    const int* __restrict__ widths,
+    int row_group_count,
+    int cols,
+    int max_width,
+    int mode)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = row_group_count * max_width;
+    if (idx >= total) return;
+
+    int entry = idx / max_width;
+    int local = idx - entry * max_width;
+    int width = widths[entry];
+    if (local >= width) return;
+
+    int row = output_rows[entry];
+    int col = start_cols[entry] + local;
+    float value = 0.0f;
+    if (mode == 1) {
+        value = (float)correction_qint8[idx] * scales[entry];
+    } else if (mode == 2) {
+        value = bf16_to_float(correction_bf16[idx]);
+    } else if (mode == 3) {
+        value = (float)correction_qint8[idx] * scales[entry];
+    } else {
+        return;
+    }
+    int out_idx = row * cols + col;
+    if (mode == 3) {
+        out[out_idx] = float_to_bf16(value);
+    } else {
+        float base = bf16_to_float(out[out_idx]);
+        out[out_idx] = float_to_bf16(base + value);
+    }
+}
+
 /* ── RoPE (Rotary Position Embedding) ─────────────────────────────────── */
 
 /* Apply RoPE to Q and K tensors in-place.
@@ -555,7 +771,9 @@ extern "C" __global__ void softmax_topk_kernel(
     float* top_vals = scores + E;
     int* top_idxs = (int*)(top_vals + topk);
 
-    /* Compute softmax: find max, subtract, exp, sum */
+    /* Compute exp(logit - max), then normalize only selected top-k values.
+     * The full softmax denominator cancels during top-k renormalization, and
+     * avoiding it removes atomicAdd reduction-order sensitivity. */
     float max_val = -1e30f;
     for (int i = threadIdx.x; i < E; i += blockDim.x) {
         scores[i] = g[i];
@@ -580,20 +798,8 @@ extern "C" __global__ void softmax_topk_kernel(
     __syncthreads();
     max_val = s_warp_max[0];
 
-    float sum = 0.0f;
     for (int i = threadIdx.x; i < E; i += blockDim.x) {
         scores[i] = __expf(scores[i] - max_val);
-        sum += scores[i];
-    }
-    __shared__ float s_sum;
-    if (threadIdx.x == 0) s_sum = 0.0f;
-    __syncthreads();
-    atomicAdd(&s_sum, sum);
-    __syncthreads();
-    float inv_sum = 1.0f / s_sum;
-
-    for (int i = threadIdx.x; i < E; i += blockDim.x) {
-        scores[i] *= inv_sum;
     }
     __syncthreads();
 
@@ -641,6 +847,191 @@ extern "C" void krasis_softmax_topk(
         (float*)topk_weights, (int*)topk_ids,
         (const float*)gate_logits,
         num_experts, topk);
+}
+
+/* Diagnostic-only softmax top-k sum probe. This reproduces the denominator and
+ * selected-weight path for observation, but writes only to a separate debug
+ * buffer and is never used by normal routing. Output row layout:
+ * [max, sum, inv_sum, topk_prob_sum, inv_topk_sum,
+ *  topk ids as f32, topk softmax probabilities, topk renormalized weights].
+ */
+extern "C" __global__ void softmax_topk_sum_probe_kernel(
+    float* __restrict__ probe_out,
+    const float* __restrict__ gate,
+    int E,
+    int topk,
+    int fields)
+{
+    int token = blockIdx.x;
+    const float* g = gate + (int64_t)token * E;
+    float* out = probe_out + (int64_t)token * fields;
+
+    extern __shared__ char smem_raw[];
+    float* scores = (float*)smem_raw;
+    float* top_vals = scores + E;
+    int* top_idxs = (int*)(top_vals + topk);
+
+    float max_val = -1e30f;
+    for (int i = threadIdx.x; i < E; i += blockDim.x) {
+        scores[i] = g[i];
+        max_val = fmaxf(max_val, scores[i]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_val = fmaxf(max_val, __shfl_xor_sync(0xffffffff, max_val, offset));
+    }
+    __shared__ float s_warp_max[32];
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) s_warp_max[warp_id] = max_val;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        int num_warps = (blockDim.x + 31) / 32;
+        for (int w = 0; w < num_warps; w++) m = fmaxf(m, s_warp_max[w]);
+        s_warp_max[0] = m;
+    }
+    __syncthreads();
+    max_val = s_warp_max[0];
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < E; i += blockDim.x) {
+        scores[i] = __expf(scores[i] - max_val);
+        sum += scores[i];
+    }
+    __shared__ float s_sum;
+    if (threadIdx.x == 0) s_sum = 0.0f;
+    __syncthreads();
+    atomicAdd(&s_sum, sum);
+    __syncthreads();
+    float inv_sum = 1.0f / s_sum;
+
+    for (int i = threadIdx.x; i < E; i += blockDim.x) {
+        scores[i] *= inv_sum;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        for (int k = 0; k < topk; k++) {
+            top_vals[k] = -1e30f;
+            top_idxs[k] = -1;
+        }
+        for (int i = 0; i < E; i++) {
+            float s = scores[i];
+            if (s > top_vals[topk - 1]) {
+                int pos = topk - 1;
+                while (pos > 0 && s > top_vals[pos - 1]) {
+                    top_vals[pos] = top_vals[pos - 1];
+                    top_idxs[pos] = top_idxs[pos - 1];
+                    pos--;
+                }
+                top_vals[pos] = s;
+                top_idxs[pos] = i;
+            }
+        }
+        float wsum = 0.0f;
+        for (int k = 0; k < topk; k++) wsum += top_vals[k];
+        float inv_wsum = (wsum > 0.0f) ? 1.0f / wsum : 0.0f;
+
+        if (fields >= 5 + 3 * topk) {
+            out[0] = max_val;
+            out[1] = s_sum;
+            out[2] = inv_sum;
+            out[3] = wsum;
+            out[4] = inv_wsum;
+            for (int k = 0; k < topk; k++) {
+                out[5 + k] = (float)top_idxs[k];
+                out[5 + topk + k] = top_vals[k];
+                out[5 + 2 * topk + k] = top_vals[k] * inv_wsum;
+            }
+        }
+    }
+}
+
+/* Diagnostic-only selected-logit normalization probe. Unlike
+ * softmax_topk_sum_probe_kernel, this never uses the full softmax denominator:
+ * it selects top-k by exp(logit - max) and normalizes only the selected exp
+ * values. It writes only to a separate debug buffer.
+ *
+ * Output row layout:
+ * [max, selected_exp_sum, inv_selected_exp_sum,
+ *  topk ids as f32, selected exp values, selected-only weights].
+ */
+extern "C" __global__ void softmax_topk_selected_probe_kernel(
+    float* __restrict__ probe_out,
+    const float* __restrict__ gate,
+    int E,
+    int topk,
+    int fields)
+{
+    int token = blockIdx.x;
+    const float* g = gate + (int64_t)token * E;
+    float* out = probe_out + (int64_t)token * fields;
+
+    extern __shared__ char smem_raw[];
+    float* scores = (float*)smem_raw;
+    float* top_vals = scores + E;
+    int* top_idxs = (int*)(top_vals + topk);
+
+    float max_val = -1e30f;
+    for (int i = threadIdx.x; i < E; i += blockDim.x) {
+        scores[i] = g[i];
+        max_val = fmaxf(max_val, scores[i]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_val = fmaxf(max_val, __shfl_xor_sync(0xffffffff, max_val, offset));
+    }
+    __shared__ float s_warp_max[32];
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) s_warp_max[warp_id] = max_val;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        int num_warps = (blockDim.x + 31) / 32;
+        for (int w = 0; w < num_warps; w++) m = fmaxf(m, s_warp_max[w]);
+        s_warp_max[0] = m;
+    }
+    __syncthreads();
+    max_val = s_warp_max[0];
+
+    for (int i = threadIdx.x; i < E; i += blockDim.x) {
+        scores[i] = __expf(scores[i] - max_val);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        for (int k = 0; k < topk; k++) {
+            top_vals[k] = -1e30f;
+            top_idxs[k] = -1;
+        }
+        for (int i = 0; i < E; i++) {
+            float s = scores[i];
+            if (s > top_vals[topk - 1]) {
+                int pos = topk - 1;
+                while (pos > 0 && s > top_vals[pos - 1]) {
+                    top_vals[pos] = top_vals[pos - 1];
+                    top_idxs[pos] = top_idxs[pos - 1];
+                    pos--;
+                }
+                top_vals[pos] = s;
+                top_idxs[pos] = i;
+            }
+        }
+        float wsum = 0.0f;
+        for (int k = 0; k < topk; k++) wsum += top_vals[k];
+        float inv_wsum = (wsum > 0.0f) ? 1.0f / wsum : 0.0f;
+
+        if (fields >= 3 + 3 * topk) {
+            out[0] = max_val;
+            out[1] = wsum;
+            out[2] = inv_wsum;
+            for (int k = 0; k < topk; k++) {
+                out[3 + k] = (float)top_idxs[k];
+                out[3 + topk + k] = top_vals[k];
+                out[3 + 2 * topk + k] = top_vals[k] * inv_wsum;
+            }
+        }
+    }
 }
 
 /* ── MoE Sum Reduce ────────────────────────────────────────────────────── */

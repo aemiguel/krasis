@@ -1,0 +1,1491 @@
+{
+  "cache": {
+    "sidecar_dir": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bk_qcn_top16_int8_exception/int8_exception",
+    "sidecar_manifest_path": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bk_qcn_top16_int8_exception/int8_exception/sidecar_manifest.json",
+    "target_cache_profile": "selfcal_v1"
+  },
+  "complete": true,
+  "created_at": "2026-04-26T20:39:52Z",
+  "format": "krasis_hqq_int8_exception_manifest_write",
+  "format_version": 1,
+  "loadable_hqq_manifest": false,
+  "model_path": "/home/main/.krasis/models/Qwen3-Coder-Next",
+  "runtime_ready": true,
+  "sidecar_manifest": {
+    "artifacts": [
+      {
+        "decode_fma_per_token": 25165824,
+        "entries": [
+          {
+            "benefit_score": 0.02695940830744803,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 128,
+            "group": 0,
+            "hqq_dequant_group_sha256": "4dad55b5a1d96ec60b83c5eae53809333ac1cc0e49d6ba9abfe05425b9f8fe2f",
+            "int8_dequant_group_sha256": "38973a04f2e7430f54d663b3663b563b18fde04f45a9574ade27c6f5449a0915",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 7532.63427734375,
+                  "max_abs": 0.24314311146736145,
+                  "mean_abs": 0.02189311943948269,
+                  "rms": 0.02899826690554619,
+                  "samples": 28,
+                  "signed_sum": 42.6715202331543
+                },
+                "int8_exception": {
+                  "abs_sum": 533.947998046875,
+                  "max_abs": 0.02152564749121666,
+                  "mean_abs": 0.0015518857399001718,
+                  "rms": 0.002038858598098159,
+                  "samples": 28,
+                  "signed_sum": -9.4740629196167
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07088463058041393,
+                  "abs_sum_reduction_fraction": 0.9291153694195861,
+                  "max_abs_ratio": 0.08853077252038939,
+                  "max_abs_reduction_fraction": 0.9114692274796106,
+                  "rms_ratio": 0.07030967073788151,
+                  "rms_reduction_fraction": 0.9296903292621185
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 6273.7451171875,
+                  "max_abs": 0.24314311146736145,
+                  "mean_abs": 0.02320721372961998,
+                  "rms": 0.030611759051680565,
+                  "samples": 22,
+                  "signed_sum": 36.1196403503418
+                },
+                "int8_exception": {
+                  "abs_sum": 444.8976135253906,
+                  "max_abs": 0.020270638167858124,
+                  "mean_abs": 0.0016457209130749106,
+                  "rms": 0.0021466428879648447,
+                  "samples": 22,
+                  "signed_sum": -6.034689426422119
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.0709141996072733,
+                  "abs_sum_reduction_fraction": 0.9290858003927267,
+                  "max_abs_ratio": 0.08336916495608461,
+                  "max_abs_reduction_fraction": 0.9166308350439154,
+                  "rms_ratio": 0.07012478062239927,
+                  "rms_reduction_fraction": 0.9298752193776008
+                }
+              }
+            },
+            "risk_score": 0.029962939539842914,
+            "row_count": 12288,
+            "source_group_sha256": "f7496a42fbadebdbadba3f089798d56dd06e634fa328a5d948446239b0f4b3a0",
+            "start_col": 0,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.015887197572737932,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 256,
+            "group": 1,
+            "hqq_dequant_group_sha256": "765b7fc5217f38c2923a76d7751e420bfdab26603b980ccd22a96c3dd6d3bc09",
+            "int8_dequant_group_sha256": "dd2f4011722c9d18022a960fad278bd4ae41998e3bffe6eb9ab2c3368b1049d9",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 4087.58544921875,
+                  "max_abs": 0.14701879024505615,
+                  "mean_abs": 0.011880305595695972,
+                  "rms": 0.017114456743001938,
+                  "samples": 28,
+                  "signed_sum": -25.259540557861328
+                },
+                "int8_exception": {
+                  "abs_sum": 291.5005798339844,
+                  "max_abs": 0.01064238976687193,
+                  "mean_abs": 0.0008472277550026774,
+                  "rms": 0.0012272591702640057,
+                  "samples": 28,
+                  "signed_sum": -1.1442450284957886
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07131363575278853,
+                  "abs_sum_reduction_fraction": 0.9286863642472115,
+                  "max_abs_ratio": 0.07238795632267696,
+                  "max_abs_reduction_fraction": 0.9276120436773231,
+                  "rms_ratio": 0.07170891771167841,
+                  "rms_reduction_fraction": 0.9282910822883216
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 3316.523681640625,
+                  "max_abs": 0.22034497559070587,
+                  "mean_abs": 0.012268153950572014,
+                  "rms": 0.017595089972019196,
+                  "samples": 22,
+                  "signed_sum": 1.3046472072601318
+                },
+                "int8_exception": {
+                  "abs_sum": 235.7538604736328,
+                  "max_abs": 0.011490318924188614,
+                  "mean_abs": 0.0008720771875232458,
+                  "rms": 0.0012539065210148692,
+                  "samples": 22,
+                  "signed_sum": 2.260115623474121
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07108463050594277,
+                  "abs_sum_reduction_fraction": 0.9289153694940573,
+                  "max_abs_ratio": 0.0521469522660324,
+                  "max_abs_reduction_fraction": 0.9478530477339676,
+                  "rms_ratio": 0.07126457000270582,
+                  "rms_reduction_fraction": 0.9287354299972942
+                }
+              }
+            },
+            "risk_score": 0.017687441763079587,
+            "row_count": 12288,
+            "source_group_sha256": "2faa7fd7b40327a7285d116159a8af5691673f742f109918b997a3117a36d85a",
+            "start_col": 128,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.017300196457654238,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 384,
+            "group": 2,
+            "hqq_dequant_group_sha256": "7b663e0e565e980c045cafec0099f725191239032a78678def12c89be7ee9301",
+            "int8_dequant_group_sha256": "dbe9f45e7dc58be604422ee13b6221b31710d4cde9043b3e1d207bd376e1be4b",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 4799.1162109375,
+                  "max_abs": 0.16470454633235931,
+                  "mean_abs": 0.013948324136435986,
+                  "rms": 0.01862424612045288,
+                  "samples": 28,
+                  "signed_sum": 32.31117630004883
+                },
+                "int8_exception": {
+                  "abs_sum": 338.62200927734375,
+                  "max_abs": 0.014638833701610565,
+                  "mean_abs": 0.000984183163382113,
+                  "rms": 0.0013240496627986431,
+                  "samples": 28,
+                  "signed_sum": 0.4496851861476898
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07055924349270852,
+                  "abs_sum_reduction_fraction": 0.9294407565072915,
+                  "max_abs_ratio": 0.0888793541379889,
+                  "max_abs_reduction_fraction": 0.9111206458620111,
+                  "rms_ratio": 0.07109279238661857,
+                  "rms_reduction_fraction": 0.9289072076133814
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 3759.699462890625,
+                  "max_abs": 0.16182999312877655,
+                  "mean_abs": 0.013907506130635738,
+                  "rms": 0.018828267231583595,
+                  "samples": 22,
+                  "signed_sum": 17.31795883178711
+                },
+                "int8_exception": {
+                  "abs_sum": 265.7124938964844,
+                  "max_abs": 0.019544430077075958,
+                  "mean_abs": 0.0009828972397372127,
+                  "rms": 0.0013437733286991715,
+                  "samples": 22,
+                  "signed_sum": 0.2516840696334839
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07067386542970984,
+                  "abs_sum_reduction_fraction": 0.9293261345702901,
+                  "max_abs_ratio": 0.12077137061683886,
+                  "max_abs_reduction_fraction": 0.8792286293831612,
+                  "rms_ratio": 0.07136999449662848,
+                  "rms_reduction_fraction": 0.9286300055033715
+                }
+              }
+            },
+            "risk_score": 0.019249684742987196,
+            "row_count": 12288,
+            "source_group_sha256": "5e9c65f769a5c4bd4c271925b511a49ee0ba105b883495b9ede132d49f33742a",
+            "start_col": 256,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.018344179028645158,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 512,
+            "group": 3,
+            "hqq_dequant_group_sha256": "05a9b682107fe9693e270cd605e82cff76d40df42b8b6fb94700eceb2dfe888d",
+            "int8_dequant_group_sha256": "9ac6fd47f656ac507214591e363b878c71949d5723e577d36c264a84d2449b2a",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 5097.259765625,
+                  "max_abs": 0.17590469121932983,
+                  "mean_abs": 0.014814859256148338,
+                  "rms": 0.019746076315641403,
+                  "samples": 28,
+                  "signed_sum": 16.34640121459961
+                },
+                "int8_exception": {
+                  "abs_sum": 359.02557373046875,
+                  "max_abs": 0.012907948344945908,
+                  "mean_abs": 0.00104348489549011,
+                  "rms": 0.0014018972869962454,
+                  "samples": 28,
+                  "signed_sum": 0.9340657591819763
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07043501611428016,
+                  "abs_sum_reduction_fraction": 0.9295649838857198,
+                  "max_abs_ratio": 0.0733803530506836,
+                  "max_abs_reduction_fraction": 0.9266196469493164,
+                  "rms_ratio": 0.0709962457648239,
+                  "rms_reduction_fraction": 0.9290037542351761
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 4189.64794921875,
+                  "max_abs": 0.17590469121932983,
+                  "mean_abs": 0.015497928485274315,
+                  "rms": 0.020876444876194,
+                  "samples": 22,
+                  "signed_sum": 44.33161163330078
+                },
+                "int8_exception": {
+                  "abs_sum": 294.86639404296875,
+                  "max_abs": 0.015404421836137772,
+                  "mean_abs": 0.001090740435756743,
+                  "rms": 0.0014738586032763124,
+                  "samples": 22,
+                  "signed_sum": 0.9415992498397827
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.0703797544846108,
+                  "abs_sum_reduction_fraction": 0.9296202455153892,
+                  "max_abs_ratio": 0.08757254698187952,
+                  "max_abs_reduction_fraction": 0.9124274530181204,
+                  "rms_ratio": 0.07059911838518995,
+                  "rms_reduction_fraction": 0.92940088161481
+                }
+              }
+            },
+            "risk_score": 0.020406538749408367,
+            "row_count": 12288,
+            "source_group_sha256": "4994b35f7fd5655a8404e68c8155fca14e84b4bdd5d1783360ef2e014de22c1b",
+            "start_col": 384,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.019819513079710305,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 640,
+            "group": 4,
+            "hqq_dequant_group_sha256": "f2092db1865dbc1dda8cef2eb3327e353c613699e22e8101cfb28438458dc95d",
+            "int8_dequant_group_sha256": "8e1f2bda94bf736f459eedbf76c179e23d015f0b5087f6963d68a646976c566e",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 5469.42333984375,
+                  "max_abs": 0.2547021806240082,
+                  "mean_abs": 0.015896528959274292,
+                  "rms": 0.021318797022104263,
+                  "samples": 28,
+                  "signed_sum": 72.21151733398438
+                },
+                "int8_exception": {
+                  "abs_sum": 386.0921325683594,
+                  "max_abs": 0.013452393934130669,
+                  "mean_abs": 0.0011221520835533738,
+                  "rms": 0.0014992839423939586,
+                  "samples": 28,
+                  "signed_sum": 1.5539849996566772
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07059101272262995,
+                  "abs_sum_reduction_fraction": 0.9294089872773701,
+                  "max_abs_ratio": 0.05281617103227364,
+                  "max_abs_reduction_fraction": 0.9471838289677263,
+                  "rms_ratio": 0.0703268547863857,
+                  "rms_reduction_fraction": 0.9296731452136143
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 4528.73291015625,
+                  "max_abs": 0.2547021806240082,
+                  "mean_abs": 0.01675223745405674,
+                  "rms": 0.02216523513197899,
+                  "samples": 22,
+                  "signed_sum": 63.57525634765625
+                },
+                "int8_exception": {
+                  "abs_sum": 319.0783386230469,
+                  "max_abs": 0.017723916098475456,
+                  "mean_abs": 0.0011803028173744678,
+                  "rms": 0.0015515476698055863,
+                  "samples": 22,
+                  "signed_sum": 1.6161712408065796
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.0704564267650834,
+                  "abs_sum_reduction_fraction": 0.9295435732349167,
+                  "max_abs_ratio": 0.0695868251110089,
+                  "max_abs_reduction_fraction": 0.9304131748889911,
+                  "rms_ratio": 0.0699991523016638,
+                  "rms_reduction_fraction": 0.9300008476983362
+                }
+              }
+            },
+            "risk_score": 0.02203154766661129,
+            "row_count": 12288,
+            "source_group_sha256": "ebf9ab9e26cff37a6a5f85ab3419c8645b15443d8ae00a0b34352840df24ac0a",
+            "start_col": 512,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.021344576380215585,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 768,
+            "group": 5,
+            "hqq_dequant_group_sha256": "a8840b2411b0f6a7347f20a2bb6118fca53b2d818766ce81002ece789b840ab7",
+            "int8_dequant_group_sha256": "831ce98941c106e640aa73fd2ece20b37c723842929f4d94024529c6bedeab92",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 6052.12646484375,
+                  "max_abs": 0.26328760385513306,
+                  "mean_abs": 0.017590118572115898,
+                  "rms": 0.022975532338023186,
+                  "samples": 28,
+                  "signed_sum": -23.154226303100586
+                },
+                "int8_exception": {
+                  "abs_sum": 428.8177795410156,
+                  "max_abs": 0.019805846735835075,
+                  "mean_abs": 0.0012463314924389124,
+                  "rms": 0.0016309559578076005,
+                  "samples": 28,
+                  "signed_sum": -2.2527647018432617
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07085406791017652,
+                  "abs_sum_reduction_fraction": 0.9291459320898234,
+                  "max_abs_ratio": 0.07522513952739192,
+                  "max_abs_reduction_fraction": 0.924774860472608,
+                  "rms_ratio": 0.07098664500184233,
+                  "rms_reduction_fraction": 0.9290133549981576
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 4688.2802734375,
+                  "max_abs": 0.15413321554660797,
+                  "mean_abs": 0.017342418432235718,
+                  "rms": 0.022602597251534462,
+                  "samples": 22,
+                  "signed_sum": 9.122347831726074
+                },
+                "int8_exception": {
+                  "abs_sum": 331.1392517089844,
+                  "max_abs": 0.013455109670758247,
+                  "mean_abs": 0.001224917359650135,
+                  "rms": 0.0016022882191464305,
+                  "samples": 22,
+                  "signed_sum": -1.0305838584899902
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07063128319890084,
+                  "abs_sum_reduction_fraction": 0.9293687168010991,
+                  "max_abs_ratio": 0.0872953284147218,
+                  "max_abs_reduction_fraction": 0.9127046715852782,
+                  "rms_ratio": 0.0708895619965822,
+                  "rms_reduction_fraction": 0.9291104380034179
+                }
+              }
+            },
+            "risk_score": 0.023742973862089466,
+            "row_count": 12288,
+            "source_group_sha256": "2af582cbb402abb38e957654982ae91fa72ee694e2d9809204613dc7d0320ba6",
+            "start_col": 640,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.019261637469753623,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 896,
+            "group": 6,
+            "hqq_dequant_group_sha256": "04d9ba01a6d387cdf526caeb486e6f498b392b36f7f56ab373d88084d117dfe6",
+            "int8_dequant_group_sha256": "0e4f03e3b37430097def5ce5e1d6f57bfacf9163a87c1b2c0f00b25f093cea54",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 5364.0791015625,
+                  "max_abs": 0.14531871676445007,
+                  "mean_abs": 0.015590352937579155,
+                  "rms": 0.020731264725327492,
+                  "samples": 28,
+                  "signed_sum": -28.974655151367188
+                },
+                "int8_exception": {
+                  "abs_sum": 378.21881103515625,
+                  "max_abs": 0.03165386989712715,
+                  "mean_abs": 0.0010992687894031405,
+                  "rms": 0.0014696272555738688,
+                  "samples": 28,
+                  "signed_sum": -2.3852787017822266
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07050955138319737,
+                  "abs_sum_reduction_fraction": 0.9294904486168026,
+                  "max_abs_ratio": 0.21782376421913718,
+                  "max_abs_reduction_fraction": 0.7821762357808628,
+                  "rms_ratio": 0.07088941630167009,
+                  "rms_reduction_fraction": 0.9291105836983299
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 4098.74853515625,
+                  "max_abs": 0.16822141408920288,
+                  "mean_abs": 0.015161681920289993,
+                  "rms": 0.020204193890094757,
+                  "samples": 22,
+                  "signed_sum": -35.514305114746094
+                },
+                "int8_exception": {
+                  "abs_sum": 287.8009948730469,
+                  "max_abs": 0.017935972660779953,
+                  "mean_abs": 0.0010646047303453088,
+                  "rms": 0.001420347485691309,
+                  "samples": 22,
+                  "signed_sum": -2.685894012451172
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07021679725030398,
+                  "abs_sum_reduction_fraction": 0.9297832027496961,
+                  "max_abs_ratio": 0.10662122154834006,
+                  "max_abs_reduction_fraction": 0.8933787784516599,
+                  "rms_ratio": 0.07029963647238824,
+                  "rms_reduction_fraction": 0.9297003635276118
+                }
+              }
+            },
+            "risk_score": 0.021429082176109383,
+            "row_count": 12288,
+            "source_group_sha256": "23ad79ea825ca033bd265ecac67fbbd24584a08e5c08f7974eb8b5d95c700c61",
+            "start_col": 768,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.016311938990838826,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 1024,
+            "group": 7,
+            "hqq_dequant_group_sha256": "71d5f1fb8e52850753b57789c8aba19a0b75d711d18b52f2a1e9516b49c0430b",
+            "int8_dequant_group_sha256": "793a3f1a264ac1b9efe871f6a631e762c582286e1bc6aaaf5c984eb4bc4ba1ec",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 4548.24169921875,
+                  "max_abs": 0.11621322482824326,
+                  "mean_abs": 0.013219173066318035,
+                  "rms": 0.017559422180056572,
+                  "samples": 28,
+                  "signed_sum": -49.34339904785156
+                },
+                "int8_exception": {
+                  "abs_sum": 321.5050048828125,
+                  "max_abs": 0.009460508823394775,
+                  "mean_abs": 0.0009344337158836424,
+                  "rms": 0.0012474831892177463,
+                  "samples": 28,
+                  "signed_sum": -0.5451365113258362
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07068775719154004,
+                  "abs_sum_reduction_fraction": 0.9293122428084599,
+                  "max_abs_ratio": 0.08140647363823597,
+                  "max_abs_reduction_fraction": 0.9185935263617641,
+                  "rms_ratio": 0.07104352161625213,
+                  "rms_reduction_fraction": 0.9289564783837478
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 3623.69140625,
+                  "max_abs": 0.13564147055149078,
+                  "mean_abs": 0.01340439822524786,
+                  "rms": 0.01796731911599636,
+                  "samples": 22,
+                  "signed_sum": -14.218267440795898
+                },
+                "int8_exception": {
+                  "abs_sum": 256.2403869628906,
+                  "max_abs": 0.010505704209208488,
+                  "mean_abs": 0.0009478589054197073,
+                  "rms": 0.0012757034273818135,
+                  "samples": 22,
+                  "signed_sum": 1.0672600269317627
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07071252991381587,
+                  "abs_sum_reduction_fraction": 0.9292874700861842,
+                  "max_abs_ratio": 0.07745200760869386,
+                  "max_abs_reduction_fraction": 0.9225479923913061,
+                  "rms_ratio": 0.07100132296565327,
+                  "rms_reduction_fraction": 0.9289986770343467
+                }
+              }
+            },
+            "risk_score": 0.018147807467528577,
+            "row_count": 12288,
+            "source_group_sha256": "c2ed0926964ff0d553eae0176b8864cffa2fafc811145ed32226e26b6ae2ab2d",
+            "start_col": 896,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.018803558661602437,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 1152,
+            "group": 8,
+            "hqq_dequant_group_sha256": "9168369dd790d1fced55873a65b371c3984bf243fdaa93b93bb7c29d97f529d9",
+            "int8_dequant_group_sha256": "b517a84c0df1f73eb6f08281e2507f11539fa7ecca85c6891f08e9dfd3771a12",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 5210.8515625,
+                  "max_abs": 0.15320095419883728,
+                  "mean_abs": 0.015145006589591503,
+                  "rms": 0.02022169902920723,
+                  "samples": 28,
+                  "signed_sum": 3.3393208980560303
+                },
+                "int8_exception": {
+                  "abs_sum": 363.8166198730469,
+                  "max_abs": 0.010799018666148186,
+                  "mean_abs": 0.001057409681379795,
+                  "rms": 0.0014181403676047921,
+                  "samples": 28,
+                  "signed_sum": -2.5816569328308105
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.0698190335129215,
+                  "abs_sum_reduction_fraction": 0.9301809664870785,
+                  "max_abs_ratio": 0.07048923893863153,
+                  "max_abs_reduction_fraction": 0.9295107610613684,
+                  "rms_ratio": 0.07012963478274005,
+                  "rms_reduction_fraction": 0.92987036521726
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 4006.322265625,
+                  "max_abs": 0.14198625087738037,
+                  "mean_abs": 0.014819787815213203,
+                  "rms": 0.01973531022667885,
+                  "samples": 22,
+                  "signed_sum": -31.472991943359375
+                },
+                "int8_exception": {
+                  "abs_sum": 280.4942321777344,
+                  "max_abs": 0.010223735123872757,
+                  "mean_abs": 0.0010375763522461057,
+                  "rms": 0.0013909297995269299,
+                  "samples": 22,
+                  "signed_sum": -0.17915749549865723
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07001289800983504,
+                  "abs_sum_reduction_fraction": 0.929987101990165,
+                  "max_abs_ratio": 0.07200510655571853,
+                  "max_abs_reduction_fraction": 0.9279948934442814,
+                  "rms_ratio": 0.0704792467689018,
+                  "rms_reduction_fraction": 0.9295207532310982
+                }
+              }
+            },
+            "risk_score": 0.02089539184829672,
+            "row_count": 12288,
+            "source_group_sha256": "aaea678c9c614b71e14843ae39405f7b8b5bbdff6d79fc73cd86e0fe019860cb",
+            "start_col": 1024,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.020756567595526576,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 1280,
+            "group": 9,
+            "hqq_dequant_group_sha256": "e52fab47ca5ece3ee27b040856c8f425e06aadaa0121bf15a589d110e23cad49",
+            "int8_dequant_group_sha256": "f5bc67b1d9378daeefbdbcc3464287ab85d8e33b377544275344b92dc6961d55",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 5254.798828125,
+                  "max_abs": 0.4936634600162506,
+                  "mean_abs": 0.015272736549377441,
+                  "rms": 0.02234601229429245,
+                  "samples": 28,
+                  "signed_sum": -0.4907034635543823
+                },
+                "int8_exception": {
+                  "abs_sum": 374.45770263671875,
+                  "max_abs": 0.02361716888844967,
+                  "mean_abs": 0.0010883373906835914,
+                  "rms": 0.001589444698765874,
+                  "samples": 28,
+                  "signed_sum": -0.09900158643722534
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07126014047055947,
+                  "abs_sum_reduction_fraction": 0.9287398595294405,
+                  "max_abs_ratio": 0.04784062585404281,
+                  "max_abs_reduction_fraction": 0.9521593741459572,
+                  "rms_ratio": 0.07112878476182728,
+                  "rms_reduction_fraction": 0.9288712152381727
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 4079.519775390625,
+                  "max_abs": 0.4936634600162506,
+                  "mean_abs": 0.01509055308997631,
+                  "rms": 0.022343184798955917,
+                  "samples": 22,
+                  "signed_sum": -17.4442138671875
+                },
+                "int8_exception": {
+                  "abs_sum": 290.28033447265625,
+                  "max_abs": 0.02361716888844967,
+                  "mean_abs": 0.0010737760458141565,
+                  "rms": 0.0015776155050843954,
+                  "samples": 22,
+                  "signed_sum": -0.11651366204023361
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07115551595649787,
+                  "abs_sum_reduction_fraction": 0.9288444840435022,
+                  "max_abs_ratio": 0.04784062585404281,
+                  "max_abs_reduction_fraction": 0.9521593741459572,
+                  "rms_ratio": 0.07060835414824643,
+                  "rms_reduction_fraction": 0.9293916458517536
+                }
+              }
+            },
+            "risk_score": 0.023085074333279713,
+            "row_count": 12288,
+            "source_group_sha256": "1dddcdc93a35d8398ca9daaba6b26a5f0955a2b4b631371444d3607050dc0c3e",
+            "start_col": 1152,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.021736820694059134,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 1408,
+            "group": 10,
+            "hqq_dequant_group_sha256": "7e1e0932cb8dc90ae6acdb01c83b63234cb66ecddb8a2bfb545c7791aee345ee",
+            "int8_dequant_group_sha256": "c8b819d4f7963b6fc891047059211d4766be149f7643faf38a28d4673331df01",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 6188.2158203125,
+                  "max_abs": 0.1529247760772705,
+                  "mean_abs": 0.01798565313220024,
+                  "rms": 0.023394079878926277,
+                  "samples": 28,
+                  "signed_sum": 66.79144287109375
+                },
+                "int8_exception": {
+                  "abs_sum": 437.5996398925781,
+                  "max_abs": 0.01778220385313034,
+                  "mean_abs": 0.0012718553189188242,
+                  "rms": 0.0016572591848671436,
+                  "samples": 28,
+                  "signed_sum": 0.046611569821834564
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07071499323862944,
+                  "abs_sum_reduction_fraction": 0.9292850067613706,
+                  "max_abs_ratio": 0.11628072513341638,
+                  "max_abs_reduction_fraction": 0.8837192748665836,
+                  "rms_ratio": 0.07084096461344593,
+                  "rms_reduction_fraction": 0.9291590353865541
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 5113.4140625,
+                  "max_abs": 0.18090039491653442,
+                  "mean_abs": 0.018915031105279922,
+                  "rms": 0.024435440078377724,
+                  "samples": 22,
+                  "signed_sum": 36.62693405151367
+                },
+                "int8_exception": {
+                  "abs_sum": 358.329833984375,
+                  "max_abs": 0.013952067121863365,
+                  "mean_abs": 0.001325497985817492,
+                  "rms": 0.0017108540050685406,
+                  "samples": 22,
+                  "signed_sum": -1.0901098251342773
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07007643613534865,
+                  "abs_sum_reduction_fraction": 0.9299235638646514,
+                  "max_abs_ratio": 0.07712568636624981,
+                  "max_abs_reduction_fraction": 0.9228743136337502,
+                  "rms_ratio": 0.07001527288155658,
+                  "rms_reduction_fraction": 0.9299847271184434
+                }
+              }
+            },
+            "risk_score": 0.02417002395434502,
+            "row_count": 12288,
+            "source_group_sha256": "01f84e27fd6bcacdd08a7e14966beef8af004a904cbc89a03e43632f545952ea",
+            "start_col": 1280,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.029713314725086093,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 1536,
+            "group": 11,
+            "hqq_dequant_group_sha256": "076872e00e5ee2e556dd54eabd2dfe2064773cee3612b171e2d177486254e940",
+            "int8_dequant_group_sha256": "da6452c532a9c3daf5756257fdb42f6be7698f9fb4f4305b947c71556237ebe7",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 7859.19873046875,
+                  "max_abs": 0.3548722565174103,
+                  "mean_abs": 0.02284225821495056,
+                  "rms": 0.03175211697816849,
+                  "samples": 28,
+                  "signed_sum": 91.63706970214844
+                },
+                "int8_exception": {
+                  "abs_sum": 530.806396484375,
+                  "max_abs": 0.015809476375579834,
+                  "mean_abs": 0.001542754820547998,
+                  "rms": 0.0020388022530823946,
+                  "samples": 28,
+                  "signed_sum": 1.2062792778015137
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.06753950557663477,
+                  "abs_sum_reduction_fraction": 0.9324604944233652,
+                  "max_abs_ratio": 0.04454976709289251,
+                  "max_abs_reduction_fraction": 0.9554502329071075,
+                  "rms_ratio": 0.06420996289740918,
+                  "rms_reduction_fraction": 0.9357900371025908
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 6593.1318359375,
+                  "max_abs": 0.35487231612205505,
+                  "mean_abs": 0.02438865602016449,
+                  "rms": 0.03389395400881767,
+                  "samples": 22,
+                  "signed_sum": 84.22712707519531
+                },
+                "int8_exception": {
+                  "abs_sum": 442.0943908691406,
+                  "max_abs": 0.0159139521420002,
+                  "mean_abs": 0.001635351567529142,
+                  "rms": 0.002150398911908269,
+                  "samples": 22,
+                  "signed_sum": 2.8700273036956787
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.06705377684993276,
+                  "abs_sum_reduction_fraction": 0.9329462231500673,
+                  "max_abs_ratio": 0.04484416343293102,
+                  "max_abs_reduction_fraction": 0.9551558365670689,
+                  "rms_ratio": 0.06344491148329381,
+                  "rms_reduction_fraction": 0.9365550885167062
+                }
+              }
+            },
+            "risk_score": 0.03281448148484635,
+            "row_count": 12288,
+            "source_group_sha256": "3912da4b4d7a91dfbbf27677d9e6d3d0b5c526a539e3dceb6022ba1fab2355da",
+            "start_col": 1408,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.05360580678097904,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 1664,
+            "group": 12,
+            "hqq_dequant_group_sha256": "5ab05140939a8d71aa55ceae0334bd3260fe45978ba33e0693815602b7cc3714",
+            "int8_dequant_group_sha256": "f3a656d1cf40b3952b46f08feed22e61ca0df88f86c8a69476967f65da15f83c",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 13552.001953125,
+                  "max_abs": 0.8374099731445312,
+                  "mean_abs": 0.0393880270421505,
+                  "rms": 0.057084374129772186,
+                  "samples": 28,
+                  "signed_sum": 987.0982055664062
+                },
+                "int8_exception": {
+                  "abs_sum": 881.3682250976562,
+                  "max_abs": 0.03711660951375961,
+                  "mean_abs": 0.0025616404600441456,
+                  "rms": 0.003478567348793149,
+                  "samples": 28,
+                  "signed_sum": 7.1606855392456055
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.0650360166819795,
+                  "abs_sum_reduction_fraction": 0.9349639833180206,
+                  "max_abs_ratio": 0.044323104219053215,
+                  "max_abs_reduction_fraction": 0.9556768957809468,
+                  "rms_ratio": 0.06093729504479077,
+                  "rms_reduction_fraction": 0.9390627049552093
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 9904.75390625,
+                  "max_abs": 0.6248627305030823,
+                  "mean_abs": 0.03663867712020874,
+                  "rms": 0.05236029624938965,
+                  "samples": 22,
+                  "signed_sum": 741.7349853515625
+                },
+                "int8_exception": {
+                  "abs_sum": 644.4849853515625,
+                  "max_abs": 0.03380236774682999,
+                  "mean_abs": 0.0023840146604925394,
+                  "rms": 0.003204526612535119,
+                  "samples": 22,
+                  "signed_sum": 4.093662261962891
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.06506824818180348,
+                  "abs_sum_reduction_fraction": 0.9349317518181965,
+                  "max_abs_ratio": 0.054095669491466415,
+                  "max_abs_reduction_fraction": 0.9459043305085336,
+                  "rms_ratio": 0.06120146068830681,
+                  "rms_reduction_fraction": 0.9387985393116932
+                }
+              }
+            },
+            "risk_score": 0.058968753422175835,
+            "row_count": 12288,
+            "source_group_sha256": "7957247c916581919b3cc6b1b72ac251754d92a235abf1139a8ae5d3f3082cbc",
+            "start_col": 1536,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.02659660833887756,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 1792,
+            "group": 13,
+            "hqq_dequant_group_sha256": "ec8cb0cc6c3e572bf832e34945e6ce605064f49e17e7a78ce1e4cf4ba84f2eeb",
+            "int8_dequant_group_sha256": "e1e3534fa3a596d830f3e9736935f6be9738b90d6e88a5953ba5b75f7db363fe",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 7261.13134765625,
+                  "max_abs": 0.3952375054359436,
+                  "mean_abs": 0.021104013547301292,
+                  "rms": 0.02859533578157425,
+                  "samples": 28,
+                  "signed_sum": 21.7402400970459
+                },
+                "int8_exception": {
+                  "abs_sum": 510.9264221191406,
+                  "max_abs": 0.033664606511592865,
+                  "mean_abs": 0.0014849749859422445,
+                  "rms": 0.0019987274426966906,
+                  "samples": 28,
+                  "signed_sum": 3.310330629348755
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07036457511322358,
+                  "abs_sum_reduction_fraction": 0.9296354248867764,
+                  "max_abs_ratio": 0.08517563755610968,
+                  "max_abs_reduction_fraction": 0.9148243624438903,
+                  "rms_ratio": 0.06989697403674465,
+                  "rms_reduction_fraction": 0.9301030259632553
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 5273.51611328125,
+                  "max_abs": 0.3952375054359436,
+                  "mean_abs": 0.019507264718413353,
+                  "rms": 0.02646896429359913,
+                  "samples": 22,
+                  "signed_sum": 33.70342254638672
+                },
+                "int8_exception": {
+                  "abs_sum": 371.39544677734375,
+                  "max_abs": 0.024988122284412384,
+                  "mean_abs": 0.001373829087242484,
+                  "rms": 0.0018582388292998075,
+                  "samples": 22,
+                  "signed_sum": -1.2313085794448853
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.0704265311415265,
+                  "abs_sum_reduction_fraction": 0.9295734688584735,
+                  "max_abs_ratio": 0.06322305434260521,
+                  "max_abs_reduction_fraction": 0.9367769456573948,
+                  "rms_ratio": 0.07020444051712205,
+                  "rms_reduction_fraction": 0.929795559482878
+                }
+              }
+            },
+            "risk_score": 0.0295429826630971,
+            "row_count": 12288,
+            "source_group_sha256": "e443cc47a3b0c3c0cc7d0c15fbe5b01f380c53f599a054e57cd0bfe0ffd48134",
+            "start_col": 1664,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.016692401259206235,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 1920,
+            "group": 14,
+            "hqq_dequant_group_sha256": "29eb7c4c1ae977d36041d83e18aac66838ad5050c6e32154d21274e4c2e228f2",
+            "int8_dequant_group_sha256": "5fc6e5c9f5c0db573a8a1a6be4ab91a4800f9b6b0cbdff4d14e6ddc2bbd49114",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 4458.24560546875,
+                  "max_abs": 0.1644972711801529,
+                  "mean_abs": 0.01295760553330183,
+                  "rms": 0.017978372052311897,
+                  "samples": 28,
+                  "signed_sum": -11.26944351196289
+                },
+                "int8_exception": {
+                  "abs_sum": 317.36395263671875,
+                  "max_abs": 0.0210411474108696,
+                  "mean_abs": 0.000922398001421243,
+                  "rms": 0.0012859707931056619,
+                  "samples": 28,
+                  "signed_sum": -1.758353590965271
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.0711858387181319,
+                  "abs_sum_reduction_fraction": 0.9288141612818681,
+                  "max_abs_ratio": 0.12791183257882688,
+                  "max_abs_reduction_fraction": 0.8720881674211731,
+                  "rms_ratio": 0.07152876741919993,
+                  "rms_reduction_fraction": 0.9284712325808001
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 3553.222412109375,
+                  "max_abs": 0.1644972711801529,
+                  "mean_abs": 0.013143726624548435,
+                  "rms": 0.01802373118698597,
+                  "samples": 22,
+                  "signed_sum": 5.605121612548828
+                },
+                "int8_exception": {
+                  "abs_sum": 251.39622497558594,
+                  "max_abs": 0.014818803407251835,
+                  "mean_abs": 0.0009299398516304791,
+                  "rms": 0.0012766961008310318,
+                  "samples": 22,
+                  "signed_sum": 0.31563371419906616
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07075161524334309,
+                  "abs_sum_reduction_fraction": 0.9292483847566569,
+                  "max_abs_ratio": 0.09008540567838776,
+                  "max_abs_reduction_fraction": 0.9099145943216123,
+                  "rms_ratio": 0.07083417343423708,
+                  "rms_reduction_fraction": 0.929165826565763
+                }
+              }
+            },
+            "risk_score": 0.01857887818933881,
+            "row_count": 12288,
+            "source_group_sha256": "dc1b38268bc353fc83204e06c1a8bf2b79774546d504d0fa9e8d7aa347e608a8",
+            "start_col": 1792,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          },
+          {
+            "benefit_score": 0.023035216727294028,
+            "cost": {
+              "int8_scale_bytes": 49152,
+              "int8_total_bytes": 1622040,
+              "int8_weight_bytes": 1572864,
+              "metadata_bytes_estimate": 24,
+              "prefill_extra_fma_estimate": 1572864
+            },
+            "end_col": 2048,
+            "group": 15,
+            "hqq_dequant_group_sha256": "3c92b02f95a24c15ebca62bb2c6cb59c94c6c8deccedc584d41c3e8f710e451c",
+            "int8_dequant_group_sha256": "099d7e49d20afe75513acfb65eccbabcde434f56cd80f789ee42fc0dfe9fd90c",
+            "layer": 0,
+            "output_row_end": 12288,
+            "output_row_start": 0,
+            "projection": {
+              "heldout": {
+                "hqq": {
+                  "abs_sum": 6476.62451171875,
+                  "max_abs": 0.25274741649627686,
+                  "mean_abs": 0.01882389560341835,
+                  "rms": 0.02474459819495678,
+                  "samples": 28,
+                  "signed_sum": 8.05479907989502
+                },
+                "int8_exception": {
+                  "abs_sum": 454.6609802246094,
+                  "max_abs": 0.01809106022119522,
+                  "mean_abs": 0.0013214430073276162,
+                  "rms": 0.0017093814676627517,
+                  "samples": 28,
+                  "signed_sum": 1.2402124404907227
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.07020029946184925,
+                  "abs_sum_reduction_fraction": 0.9297997005381508,
+                  "max_abs_ratio": 0.07157762667560923,
+                  "max_abs_reduction_fraction": 0.9284223733243908,
+                  "rms_ratio": 0.06908099514063407,
+                  "rms_reduction_fraction": 0.930919004859366
+                }
+              },
+              "train": {
+                "hqq": {
+                  "abs_sum": 5739.2216796875,
+                  "max_abs": 0.35072755813598633,
+                  "mean_abs": 0.021229956299066544,
+                  "rms": 0.027836458757519722,
+                  "samples": 22,
+                  "signed_sum": 12.813740730285645
+                },
+                "int8_exception": {
+                  "abs_sum": 400.30841064453125,
+                  "max_abs": 0.021592799574136734,
+                  "mean_abs": 0.0014807810075581074,
+                  "rms": 0.001904799253679812,
+                  "samples": 22,
+                  "signed_sum": -0.4472235143184662
+                },
+                "reduction_vs_hqq": {
+                  "abs_sum_ratio": 0.06974959898505402,
+                  "abs_sum_reduction_fraction": 0.9302504010149459,
+                  "max_abs_ratio": 0.06156573406690967,
+                  "max_abs_reduction_fraction": 0.9384342659330903,
+                  "rms_ratio": 0.06842821747810328,
+                  "rms_reduction_fraction": 0.9315717825218968
+                }
+              }
+            },
+            "risk_score": 0.025564445201322745,
+            "row_count": 12288,
+            "source_group_sha256": "a8d84d4e563c7aed0a6906675f1df449e131aa1d2bc1a4c3edcb6f7f55260e55",
+            "start_col": 1920,
+            "tensor": "in_proj_qkvz",
+            "width": 128
+          }
+        ],
+        "exception_group_count": 16,
+        "file": "layer_000_in_proj_qkvz_phase2bk_qcn_top16_int8_exception_int8_exception.safetensors",
+        "hqq_artifact_file": "layer_000_in_proj_qkvz_hqq4.safetensors",
+        "hqq_artifact_sha256": "9e5f1b559f4fb0bc5d0c570e169b8ac31e5951ed248f140d7584a763d13f7b2b",
+        "layer": 0,
+        "metadata_bytes": 3932160,
+        "row_group_count": 196608,
+        "sha256": "e5f72fa76b7eb439e5151e77c88e61ee4b4bc0f09a78bd9f747734497e76e838",
+        "source_contract": {
+          "artifact_sha256": "9e5f1b559f4fb0bc5d0c570e169b8ac31e5951ed248f140d7584a763d13f7b2b",
+          "artifact_sha256_unavailable_reason": null,
+          "fallback_allowed": false,
+          "fused_vs_split": "direct_fused",
+          "layer": 0,
+          "missing_contract_fields": [],
+          "model_id": "Qwen3-Coder-Next",
+          "ready": true,
+          "recipe": "direct_fused_qkvz",
+          "reconstructed_source_sha256": "5138053ffe294b6ee8b6164b865e8308eac36314c4e4685e84940f7ba4beac16",
+          "reconstructed_source_sha256_unavailable_reason": null,
+          "reconstructed_source_shape": [
+            12288,
+            2048
+          ],
+          "resolver_kind": "qcn_model_layers_direct_fused",
+          "resolver_ready": true,
+          "resolver_unavailable_reason": null,
+          "row_column_layout": "direct source rows must already match cached qkvz row order; columns are axis-1 HQQ groups",
+          "source_dtypes": [
+            "BF16"
+          ],
+          "source_shape": [
+            12288,
+            2048
+          ],
+          "source_tensors": [
+            {
+              "dtype": "BF16",
+              "exists": true,
+              "name": "model.layers.0.linear_attn.in_proj_qkvz.weight",
+              "shape": [
+                12288,
+                2048
+              ],
+              "shard": "model-00001-of-00040.safetensors",
+              "source_file": "model-00001-of-00040.safetensors",
+              "source_path": "/home/main/.krasis/models/Qwen3-Coder-Next/model-00001-of-00040.safetensors",
+              "source_sha256": "5138053ffe294b6ee8b6164b865e8308eac36314c4e4685e84940f7ba4beac16",
+              "source_sha256_unavailable_reason": null
+            }
+          ],
+          "target_file": "layer_000_in_proj_qkvz_hqq4.safetensors",
+          "target_path": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5/layer_000_in_proj_qkvz_hqq4.safetensors",
+          "target_tensor": "in_proj_qkvz"
+        },
+        "source_contract_validation": {
+          "artifact_hash_valid": true,
+          "contract_embedded": true,
+          "generation_ready": true,
+          "resolver_valid": true,
+          "runtime_ready": false,
+          "runtime_ready_reason": "offline contract only; runtime sidecar enablement remains explicit and out of scope",
+          "shape_valid": true,
+          "source_hash_valid": true
+        },
+        "tensor": "in_proj_qkvz",
+        "weight_bytes": 25165824
+      }
+    ],
+    "cache": {
+      "sidecar_dir": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bk_qcn_top16_int8_exception/int8_exception",
+      "sidecar_manifest_path": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bk_qcn_top16_int8_exception/int8_exception/sidecar_manifest.json",
+      "target_cache_profile": "selfcal_v1"
+    },
+    "complete": true,
+    "created_at": "2026-04-26T20:39:52Z",
+    "decode_application_implemented": false,
+    "exception_semantics": "replace selected HQQ-dequantized BF16 blocks with per-output-row symmetric INT8 dequantized source values before existing prefill matmul",
+    "format": "krasis_hqq_selfcal_sidecar_manifest",
+    "format_version": 1,
+    "loadable_hqq_manifest": false,
+    "main_int4_path": "unchanged regular HQQ INT4",
+    "model_path": "/home/main/.krasis/models/Qwen3-Coder-Next",
+    "not_loadable_reason": "This is an explicit runtime sidecar manifest, not a calibrated HQQ cache manifest.",
+    "runtime_application_implemented": true,
+    "runtime_ready": true,
+    "selection": {
+      "group_filter": null,
+      "selected_groups": [
+        {
+          "group": 12,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 11,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 0,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 13,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 15,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 10,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 5,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 9,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 4,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 6,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 8,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 3,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 2,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 14,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 7,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        },
+        {
+          "group": 1,
+          "layer": 0,
+          "tensor": "in_proj_qkvz"
+        }
+      ],
+      "top_groups": 16
+    },
+    "sidecar_mode": "int8_exception",
+    "source": {
+      "baseline_manifest_path": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5/manifest.json",
+      "baseline_manifest_sha256": "079c76e33c75e9e947e2e14e1760944930e37e52322b487bdeb8a1b40a8ba3b4",
+      "cache_profile": "baseline",
+      "int8_exception_candidates_path": "logs/manual/phase2bg_qcn_int8_exception_candidates_20260426.json",
+      "int8_exception_candidates_sha256": "6e2f8c6ced906e41aa3ed5e82e242ff4b2b498224a3d82f4b07f0c3fb0452d43"
+    },
+    "status": "experimental_int8_exception_manifest",
+    "summary": {
+      "artifact_count": 1,
+      "decode_fma_per_token": 25165824,
+      "exception_group_count": 16,
+      "row_group_count": 196608,
+      "sidecar_metadata_bytes": 3932160,
+      "sidecar_total_bytes": 29097984,
+      "sidecar_weight_bytes": 25165824,
+      "source_contract": {
+        "artifact_hash_valid": 1,
+        "contract_embedded": 1,
+        "fallback_allowed": false,
+        "generation_ready": 1,
+        "resolver_valid": 1,
+        "runtime_enablement_changed": false,
+        "runtime_ready": 0,
+        "shape_valid": 1,
+        "source_hash_valid": 1,
+        "target_count": 1
+      }
+    },
+    "switchability": {
+      "fallback_to_baseline": false,
+      "runtime_enabled_by_default": false,
+      "selection": "loaded only when explicitly referenced by hqq_sidecar_manifest"
+    },
+    "variant_name": "phase2bk_qcn_top16_int8_exception"
+  },
+  "source": {
+    "baseline_manifest_path": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5/manifest.json",
+    "baseline_manifest_sha256": "079c76e33c75e9e947e2e14e1760944930e37e52322b487bdeb8a1b40a8ba3b4",
+    "cache_profile": "baseline",
+    "int8_exception_candidates_path": "logs/manual/phase2bg_qcn_int8_exception_candidates_20260426.json",
+    "int8_exception_candidates_sha256": "6e2f8c6ced906e41aa3ed5e82e242ff4b2b498224a3d82f4b07f0c3fb0452d43"
+  },
+  "status": "int8_exception_manifest_written",
+  "summary": {
+    "artifact_count": 1,
+    "decode_fma_per_token": 25165824,
+    "exception_group_count": 16,
+    "row_group_count": 196608,
+    "sidecar_metadata_bytes": 3932160,
+    "sidecar_total_bytes": 29097984,
+    "sidecar_weight_bytes": 25165824,
+    "source_contract": {
+      "artifact_hash_valid": 1,
+      "contract_embedded": 1,
+      "fallback_allowed": false,
+      "generation_ready": 1,
+      "resolver_valid": 1,
+      "runtime_enablement_changed": false,
+      "runtime_ready": 0,
+      "shape_valid": 1,
+      "source_hash_valid": 1,
+      "target_count": 1
+    }
+  },
+  "variant_name": "phase2bk_qcn_top16_int8_exception"
+}

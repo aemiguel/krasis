@@ -1,0 +1,35 @@
+{
+  "phase": "2BK",
+  "decision": "top4_is_the_only_quality_positive_setting_across_qcn_and_q35_top8_regresses_top16_is_mixed_and_slower",
+  "runtime_changes": false,
+  "witness": {
+    "qcn": {
+      "profile": "llama_witness_stage3_qcn_expanded",
+      "base": {"first_token": "8/8", "selected_sum": 0.12104865, "top_overlap": "72/80"},
+      "top4": {"first_token": "8/8", "selected_sum": 0.0936387312, "selected_delta_vs_base": -0.0274099188, "top_overlap": "73/80"},
+      "top8": {"first_token": "8/8", "selected_sum": 0.1265897312, "selected_delta_vs_base": 0.0055410812, "top_overlap": "74/80"},
+      "top16": {"first_token": "8/8", "selected_sum": 0.1127257312, "selected_delta_vs_base": -0.0083229188, "top_overlap": "74/80"}
+    },
+    "q35": {
+      "profile": "llama_witness_qwen35_expanded_thinking_off",
+      "base": {"first_token": "10/10", "selected_sum": 0.8856095677, "top_overlap": "86/100"},
+      "top4": {"first_token": "10/10", "selected_sum": 0.7995640518, "selected_delta_vs_base": -0.0860455159, "top_overlap": "84/100"},
+      "top8": {"first_token": "10/10", "selected_sum": 0.9006975677, "selected_delta_vs_base": 0.015088, "top_overlap": "85/100"},
+      "top16": {"first_token": "10/10", "selected_sum": 0.8659915677, "selected_delta_vs_base": -0.019618, "top_overlap": "85/100"}
+    }
+  },
+  "benchmarks": {
+    "qcn": {
+      "base": {"prefill_tok_s": 7242.6, "decode_tok_s": 70.79, "hcs": "12960/24576 (52.7%)", "min_free_vram_mb": 686},
+      "top4": {"prefill_tok_s": 6936.2, "decode_tok_s": 71.14, "hcs": "12960/24576 (52.7%)", "min_free_vram_mb": 692},
+      "top8": {"prefill_tok_s": 7854.1, "decode_tok_s": 70.92, "hcs": "12960/24576 (52.7%)", "min_free_vram_mb": 690},
+      "top16": {"prefill_tok_s": 7833.9, "decode_tok_s": 68.59, "hcs": "12879/24576 (52.4%)", "min_free_vram_mb": 758}
+    },
+    "q35": {
+      "base": {"prefill_tok_s": 7146.8, "decode_tok_s": 114.01, "hcs": "10240/10240 (100.0%)", "min_free_vram_mb": 5452},
+      "top4": {"prefill_tok_s": 7186.4, "decode_tok_s": 116.59, "hcs": "10240/10240 (100.0%)", "min_free_vram_mb": 5428},
+      "top8": {"prefill_tok_s": 7138.4, "decode_tok_s": 114.16, "hcs": "10240/10240 (100.0%)", "min_free_vram_mb": 5426},
+      "top16": {"prefill_tok_s": 7428.9, "decode_tok_s": 104.14, "hcs": "10240/10240 (100.0%)", "min_free_vram_mb": 5396}
+    }
+  }
+}

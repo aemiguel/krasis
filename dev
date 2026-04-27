@@ -19,13 +19,21 @@
 #                                     to a state file. Re-running with the same target resumes
 #                                     from the first non-passed model. Without a target, runs
 #                                     all models with no resume capability.
-#   ./dev reference-test <config>   Compare engine output against BF16 reference data
-#   ./dev reference-test --compare <model>  Run 4 quant configs, produce comparative report
+#   ./dev reference-test <config>   Compare against stored non-HF references; HF artifacts require override
+#   ./dev reference-test --compare <model>  Comparison matrix; HF artifacts require override
 #   ./dev reference-inventory       Inventory stored reference artifacts and classify contract state
-#   ./dev capture-box <subcommand>  Run HF capture commands through the strict paid-box wrapper
-#   ./dev capture-preflight         Verify or bootstrap a host for HF reference capture
-#   ./dev reference-prep <model>    Prepare HF capture deps and download a public model
-#   ./dev generate-reference <model>  Generate a BF16 HF reference capture
+#   ./dev witness-inputs <model>    Build stored input_token_ids from fixed prompt-source JSON
+#   ./dev witness-model-check <model>  Check expected BF16 GGUF witness model readiness
+#   ./dev witness-gguf-preflight <model>  Preflight BF16 GGUF witness conversion readiness
+#   ./dev witness-gguf-convert <model>  Convert local safetensors to BF16 GGUF after preflight
+#   ./dev witness-capture <model>   Capture llama-witness JSON from stored input_token_ids
+#   ./dev witness-compare <config>  Compare Krasis against llama-witness JSON
+#   ./dev hqq-attn-diff <model>     Offline HQQ attention artifact diff against BF16 source
+#   ./dev hqq-self-calibrate <config>  Capture self-calibration evidence / candidates only
+#   ./dev capture-box <subcommand>  ARCHIVED HF capture wrapper; requires explicit override
+#   ./dev capture-preflight         ARCHIVED HF capture host preflight; requires explicit override
+#   ./dev reference-prep <model>    ARCHIVED HF dependency/model prep; requires explicit override
+#   ./dev generate-reference <model>  ARCHIVED HF reference capture; requires explicit override
 #   ./dev trace-diff <expected> <actual>  Diff two KRASIS_TRACE logs offline
 #   ./dev awq-calibrate <config>    Run AWQ calibration, produce attention template
 #   ./dev test-kernels [name]       Run CUDA kernel unit tests (or filter by name)
@@ -120,6 +128,8 @@ REFERENCE_CAPTURE_MODELS_DIR="${REFERENCE_CAPTURE_ROOT}/models"
 REFERENCE_CAPTURE_VENV="${REFERENCE_CAPTURE_ROOT}/reference-capture-venv"
 REFERENCE_CAPTURE_READY_JSON="${REFERENCE_CAPTURE_ROOT}/capture-host-ready.json"
 REFERENCE_CAPTURE_READY_STAMP="${REFERENCE_CAPTURE_ROOT}/capture-host-ready.stamp"
+WITNESS_REPO="${KRASIS_LLAMA_WITNESS_REPO:-$SCRIPT_DIR/../krasis-llama-witness}"
+WITNESS_PROFILE_ID="${KRASIS_WITNESS_PROFILE_ID:-llama_witness_first_token}"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -132,6 +142,14 @@ info()  { echo -e "${CYAN}${BOLD}=>${NC} $*"; }
 ok()    { echo -e "${GREEN}${BOLD}OK${NC} $*"; }
 warn()  { echo -e "${YELLOW}${BOLD}!!${NC} $*"; }
 err()   { echo -e "${RED}${BOLD}ERROR${NC} $*" >&2; exit 1; }
+
+require_archived_hf_reference_override() {
+    local command="$1"
+    if [[ "${KRASIS_ALLOW_ARCHIVED_HF_REFERENCE:-}" != "1" ]]; then
+        err "$command is archived. HF/Transformers reference tooling and artifacts are no longer a trusted witness path for Qwen3.5/large-model HQQ work. Use llama-witness for new reference authority. To rerun archived HF tooling for forensic evidence only, set KRASIS_ALLOW_ARCHIVED_HF_REFERENCE=1 and document the reason in krasis-internal."
+    fi
+    warn "$command is archived; running only because KRASIS_ALLOW_ARCHIVED_HF_REFERENCE=1 is set."
+}
 
 build_base_ld_library_path() {
     local current="${LD_LIBRARY_PATH:-}"
@@ -418,10 +436,11 @@ PY
 # Called before every run/test to prevent OOMs from stale processes.
 
 cleanup_gpu() {
-    # Optional arg: config file path. If provided, only check GPUs listed in CFG_SELECTED_GPUS.
+    # Optional args: config file path and explicit selected-GPU override.
+    # If provided, only check GPUs listed in the effective selection.
     local conf="${1:-}"
-    local selected_gpus=""
-    if [[ -n "$conf" && -f "$conf" ]]; then
+    local selected_gpus="${2:-}"
+    if [[ -z "$selected_gpus" && -n "$conf" && -f "$conf" ]]; then
         selected_gpus=$(grep '^CFG_SELECTED_GPUS=' "$conf" 2>/dev/null | head -1 | cut -d'"' -f2 || true)
     fi
 
@@ -516,6 +535,28 @@ cleanup_gpu() {
     warn "GPUs still not clear after ${gpu_timeout}s:"
     nvidia-smi 2>/dev/null || true
     err "Cannot proceed — GPU memory not released. Check for non-krasis processes using the GPU."
+}
+
+extract_selected_gpus_arg() {
+    local arg
+    while [[ $# -gt 0 ]]; do
+        arg="$1"
+        case "$arg" in
+            --selected-gpus=*)
+                printf '%s\n' "${arg#--selected-gpus=}"
+                return 0
+                ;;
+            --selected-gpus)
+                if [[ $# -lt 2 ]]; then
+                    err "--selected-gpus requires a comma-separated GPU list"
+                fi
+                printf '%s\n' "$2"
+                return 0
+                ;;
+        esac
+        shift
+    done
+    return 0
 }
 
 # ── Commands ─────────────────────────────────────────────────────────
@@ -634,15 +675,20 @@ PY
 }
 
 do_run() {
-    [[ $# -lt 1 ]] && err "Usage: ./dev run <config> [--benchmark] [extra args...]"
+    [[ $# -lt 1 ]] && err "Usage: ./dev run <config> [--benchmark] [--selected-gpus GPU[,GPU...]] [extra args...]"
     local conf
     conf=$(resolve_config "$1")
     shift
+    local selected_gpus_override
+    selected_gpus_override=$(extract_selected_gpus_arg "$@")
     local run_dir
     run_dir=$(create_run_dir "dev-run")
-    cleanup_gpu "$conf"
+    cleanup_gpu "$conf" "$selected_gpus_override"
     auto_rebuild
     info "Launching from: $conf"
+    if [[ -n "$selected_gpus_override" ]]; then
+        info "Selected GPU override: $selected_gpus_override"
+    fi
     info "Run dir: $run_dir"
     verify_repo_imports
     export KRASIS_RUN_DIR="$run_dir"
@@ -1115,6 +1161,13 @@ do_validate() {
 }
 
 do_reference_test() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev reference-test <config> [--verbose] [--no-server] [--port PORT]"
+        echo "       ./dev reference-test --compare <model> [--verbose]"
+        echo "  Runs reference test comparing engine output against stored reference data."
+        echo "  Use --no-server to connect to an already-running test-endpoint server."
+        return 0
+    fi
     [[ $# -lt 1 ]] && err "Usage: ./dev reference-test <config> [--verbose] [--no-server] [--port PORT]
        ./dev reference-test --compare <model> [--verbose]
   Runs reference test comparing engine output against BF16 reference data.
@@ -1137,14 +1190,26 @@ do_reference_test() {
         info "Run dir: $run_dir"
         verify_repo_imports
         KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="reference-test" run_repo_python "$SCRIPT_DIR/tests/reference_test.py" --compare "$model" "$@"
-    else
-        local conf
-        conf=$(resolve_config "$1")
-        shift
-        cleanup_gpu "$conf"
-        auto_rebuild
-        local run_dir
-        run_dir=$(create_run_dir "reference-test")
+	    else
+	        local conf
+	        conf=$(resolve_config "$1")
+	        shift
+	        local no_server=false
+	        local arg
+	        for arg in "$@"; do
+	            if [[ "$arg" == "--no-server" ]]; then
+	                no_server=true
+	                break
+	            fi
+	        done
+	        if [[ "$no_server" == true ]]; then
+	            info "Reference test using existing server; skipping GPU cleanup/rebuild"
+	        else
+	            cleanup_gpu "$conf"
+	            auto_rebuild
+	        fi
+	        local run_dir
+	        run_dir=$(create_run_dir "reference-test")
         info "Running reference test: $conf"
         info "Run dir: $run_dir"
         verify_repo_imports
@@ -1163,7 +1228,999 @@ do_reference_inventory() {
     KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="reference-inventory" run_repo_python "$SCRIPT_DIR/tests/reference_inventory.py" "$@"
 }
 
+witness_model_paths() {
+    local model="${1,,}"
+    case "$model" in
+        qcn|qwen3-coder-next)
+            echo "$HOME/.krasis/models/Qwen3-Coder-Next"
+            echo "$SCRIPT_DIR/../krasis-internal/reference-outputs/output/Qwen3-Coder-Next/greedy_reference.json"
+            echo "$HOME/.krasis/witness-gguf/Qwen3-Coder-Next-bf16.gguf"
+            ;;
+        qwen35|q35b|qwen3.5-35b-a3b)
+            echo "$HOME/.krasis/models/Qwen3.5-35B-A3B"
+            echo "$SCRIPT_DIR/../krasis-internal/reference-outputs/output/Qwen3.5-35B-A3B/greedy_reference.json"
+            echo "$HOME/.krasis/witness-gguf/Qwen3.5-35B-A3B-bf16.gguf"
+            ;;
+        *)
+            err "Unknown witness model: $model
+  Available: qcn, qwen35"
+            ;;
+    esac
+}
+
+do_witness_model_check() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev witness-model-check <model> [--hash]"
+        echo "  Checks local readiness for BF16 llama-witness capture."
+        echo "  Models: qcn, qwen35"
+        echo "  --hash computes the GGUF SHA-256 when the expected BF16 file exists."
+        return 0
+    fi
+    [[ $# -lt 1 ]] && err "Usage: ./dev witness-model-check <model> [--hash]"
+    local model="$1"
+    shift
+    local do_hash=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hash)
+                do_hash=1
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: ./dev witness-model-check <model> [--hash]"
+                echo "  Checks local readiness for BF16 llama-witness capture."
+                echo "  Models: qcn, qwen35"
+                return 0
+                ;;
+            *)
+                err "Unknown witness-model-check argument: $1"
+                ;;
+        esac
+    done
+
+    mapfile -t paths < <(witness_model_paths "$model")
+    local model_dir="${paths[0]}"
+    local default_reference_json="${paths[1]}"
+    local model_gguf="${paths[2]}"
+    local status=0
+
+    info "Checking llama-witness model readiness for $model"
+    echo "model_dir=$model_dir"
+    if [[ -d "$model_dir" ]]; then
+        ok "model_dir exists"
+        for required in config.json tokenizer.json tokenizer_config.json generation_config.json; do
+            if [[ -f "$model_dir/$required" ]]; then
+                stat -c "  $required: %s bytes" "$model_dir/$required"
+            else
+                echo "  MISSING: $required"
+                status=1
+            fi
+        done
+    else
+        echo "MISSING: model_dir"
+        status=1
+    fi
+
+    echo "default_input_token_source=$default_reference_json"
+    if [[ -f "$default_reference_json" ]]; then
+        ok "default input-token source exists"
+    else
+        echo "MISSING: default input-token source"
+        status=1
+    fi
+
+    echo "expected_bf16_gguf=$model_gguf"
+    if [[ -f "$model_gguf" ]]; then
+        stat -c "bf16_gguf_size_bytes=%s" "$model_gguf"
+        ok "expected BF16 GGUF exists"
+        if [[ "$do_hash" == "1" ]]; then
+            sha256sum "$model_gguf"
+        fi
+    else
+        echo "MISSING: expected BF16 GGUF"
+        status=1
+    fi
+
+    if [[ "${model,,}" == qwen35 || "${model,,}" == q35b || "${model,,}" == qwen3.5-35b-a3b ]]; then
+        local q4_path="$HOME/.krasis/models/Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-Q4_K_M.gguf"
+        if [[ -f "$q4_path" ]]; then
+            stat -c "non_authority_q4_gguf=$q4_path (%s bytes)" "$q4_path"
+            echo "NOTE: Q4 GGUF is present but is not acceptable as a BF16 witness authority."
+        fi
+    fi
+
+    if [[ "$status" == "0" ]]; then
+        ok "Witness model readiness check passed"
+    else
+        echo "Witness model readiness check failed"
+    fi
+    return "$status"
+}
+
+do_hqq_attn_diff() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev hqq-attn-diff <model> [--layer N] [--tensor in_proj_qkvz|in_proj_ba|out_proj|fused_qkv|q_proj|k_proj|v_proj|o_proj|cache-audit|source-map-audit|capture-plan|case-row-audit|named-row-divergence] [--output PATH]"
+        echo "       [--top-rows N] [--top-groups N] [--sample-cols N]"
+        echo "       [--input-row-trace PATH ...] [--input-row-pos N|all] [--case-summary PATH]"
+        echo "       [--max-input-rows N]"
+        echo "       [--focus-row N] [--focus-group N]"
+        echo "       [--candidate-grid-steps N] [--candidate-local-grid-steps N]"
+        echo "       [--bf16-trace PATH] [--hqq-trace PATH] [--bf16-summary PATH] [--hqq-summary PATH]"
+        echo "  Offline reporting-only HQQ attention artifact diff, attribution, quantizer-choice, activation-aware what-if, decision-summary, and named-row divergence diagnostics."
+        echo "  Currently supports qwen35 selected LA/GQA attention diagnostics, qcn/qwen35 cache/source-map audits, capture-plan reporting, and named-row divergence maps."
+        return 0
+    fi
+    [[ $# -lt 1 ]] && err "Usage: ./dev hqq-attn-diff <model> [--layer N] [--tensor in_proj_qkvz|in_proj_ba|out_proj|fused_qkv|q_proj|k_proj|v_proj|o_proj|cache-audit|source-map-audit|capture-plan|case-row-audit|named-row-divergence] [--output PATH]"
+    local model="$1"
+    shift
+    local layer=0
+    local tensor="in_proj_qkvz"
+    local output=""
+    local top_rows=12
+    local top_groups=12
+    local sample_cols=8
+    local input_row_traces=()
+    local input_row_pos=36
+    local case_summary=""
+    local max_input_rows=""
+    local focus_row=""
+    local focus_group=""
+    local candidate_grid_steps=129
+    local candidate_local_grid_steps=65
+    local bf16_trace=""
+    local hqq_trace=""
+    local bf16_summary=""
+    local hqq_summary=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --layer)
+                layer="${2:-}"
+                [[ -n "$layer" ]] || err "--layer requires a value"
+                shift 2
+                ;;
+            --tensor)
+                tensor="${2:-}"
+                [[ -n "$tensor" ]] || err "--tensor requires a value"
+                shift 2
+                ;;
+            --output)
+                output="${2:-}"
+                [[ -n "$output" ]] || err "--output requires a value"
+                shift 2
+                ;;
+            --top-rows)
+                top_rows="${2:-}"
+                [[ -n "$top_rows" ]] || err "--top-rows requires a value"
+                shift 2
+                ;;
+            --top-groups)
+                top_groups="${2:-}"
+                [[ -n "$top_groups" ]] || err "--top-groups requires a value"
+                shift 2
+                ;;
+            --sample-cols)
+                sample_cols="${2:-}"
+                [[ -n "$sample_cols" ]] || err "--sample-cols requires a value"
+                shift 2
+                ;;
+            --input-row-trace)
+                [[ -n "${2:-}" ]] || err "--input-row-trace requires a value"
+                input_row_traces+=(--input-row-trace "$2")
+                shift 2
+                ;;
+            --input-row-pos)
+                input_row_pos="${2:-}"
+                [[ -n "$input_row_pos" ]] || err "--input-row-pos requires a value"
+                shift 2
+                ;;
+            --case-summary)
+                case_summary="${2:-}"
+                [[ -n "$case_summary" ]] || err "--case-summary requires a path"
+                shift 2
+                ;;
+            --max-input-rows)
+                max_input_rows="${2:-}"
+                [[ -n "$max_input_rows" ]] || err "--max-input-rows requires a value"
+                shift 2
+                ;;
+            --focus-row)
+                focus_row="${2:-}"
+                [[ -n "$focus_row" ]] || err "--focus-row requires a value"
+                shift 2
+                ;;
+            --focus-group)
+                focus_group="${2:-}"
+                [[ -n "$focus_group" ]] || err "--focus-group requires a value"
+                shift 2
+                ;;
+            --candidate-grid-steps)
+                candidate_grid_steps="${2:-}"
+                [[ -n "$candidate_grid_steps" ]] || err "--candidate-grid-steps requires a value"
+                shift 2
+                ;;
+            --candidate-local-grid-steps)
+                candidate_local_grid_steps="${2:-}"
+                [[ -n "$candidate_local_grid_steps" ]] || err "--candidate-local-grid-steps requires a value"
+                shift 2
+                ;;
+            --bf16-trace)
+                bf16_trace="${2:-}"
+                [[ -n "$bf16_trace" ]] || err "--bf16-trace requires a value"
+                shift 2
+                ;;
+            --hqq-trace)
+                hqq_trace="${2:-}"
+                [[ -n "$hqq_trace" ]] || err "--hqq-trace requires a value"
+                shift 2
+                ;;
+            --bf16-summary)
+                bf16_summary="${2:-}"
+                [[ -n "$bf16_summary" ]] || err "--bf16-summary requires a value"
+                shift 2
+                ;;
+            --hqq-summary)
+                hqq_summary="${2:-}"
+                [[ -n "$hqq_summary" ]] || err "--hqq-summary requires a value"
+                shift 2
+                ;;
+            --help|-h)
+                echo "Usage: ./dev hqq-attn-diff <model> [--layer N] [--tensor in_proj_qkvz|in_proj_ba|out_proj|fused_qkv|q_proj|k_proj|v_proj|o_proj|cache-audit|source-map-audit|capture-plan|case-row-audit|named-row-divergence] [--output PATH]"
+                echo "       [--top-rows N] [--top-groups N] [--sample-cols N]"
+                echo "       [--input-row-trace PATH ...] [--input-row-pos N|all] [--case-summary PATH]"
+                echo "       [--max-input-rows N]"
+                echo "       [--focus-row N] [--focus-group N]"
+                echo "       [--candidate-grid-steps N] [--candidate-local-grid-steps N]"
+                echo "       [--bf16-trace PATH] [--hqq-trace PATH] [--bf16-summary PATH] [--hqq-summary PATH]"
+                echo "  Offline reporting-only HQQ attention artifact diff, attribution, quantizer-choice, activation-aware what-if, decision-summary, and named-row divergence diagnostics."
+                return 0
+                ;;
+            *)
+                err "Unknown hqq-attn-diff argument: $1"
+                ;;
+        esac
+    done
+    case "$tensor" in
+        in_proj_qkvz|in_proj_ba|out_proj|fused_qkv|q_proj|k_proj|v_proj|o_proj|cache-audit|source-map-audit|capture-plan|case-row-audit|named-row-divergence) ;;
+        *) err "Only selected Qwen3.5 LA/GQA HQQ tensors, cache-audit, source-map-audit, capture-plan, or named-row-divergence are supported today" ;;
+    esac
+    local model_key="${model,,}"
+    case "$model_key" in
+        qcn|qwen3-coder-next)
+            case "$tensor" in
+                cache-audit|source-map-audit|capture-plan|case-row-audit) ;;
+                *) err "qcn hqq-attn-diff currently supports audit-only tensors: cache-audit, source-map-audit, capture-plan" ;;
+            esac
+            ;;
+        qwen35|q35b|qwen3.5-35b-a3b) ;;
+        *) err "hqq-attn-diff currently supports qcn and qwen35" ;;
+    esac
+    mapfile -t paths < <(witness_model_paths "$model")
+    local model_dir="${paths[0]}"
+    local cache_dir
+    case "$model_key" in
+        qcn|qwen3-coder-next) cache_dir="$HOME/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5" ;;
+        *) cache_dir="$HOME/.krasis/cache/Qwen3.5-35B-A3B/attention_hqq_v5" ;;
+    esac
+    [[ -d "$model_dir" ]] || err "model dir not found: $model_dir"
+    [[ -d "$cache_dir" ]] || err "HQQ cache dir not found: $cache_dir"
+    local run_dir
+    run_dir=$(create_run_dir "hqq-attn-diff")
+    if [[ -z "$output" ]]; then
+        output="$run_dir/hqq_attention_diff.json"
+    fi
+    local tsv="${output%.json}.tsv"
+    local input_row_args=()
+    if [[ ${#input_row_traces[@]} -gt 0 ]]; then
+        input_row_args=("${input_row_traces[@]}" --input-row-pos "$input_row_pos")
+        if [[ -n "$case_summary" ]]; then
+            input_row_args+=(--case-summary "$case_summary")
+        fi
+        if [[ -n "$max_input_rows" ]]; then
+            input_row_args+=(--max-input-rows "$max_input_rows")
+        fi
+    fi
+    local focus_args=()
+    if [[ -n "$focus_row" || -n "$focus_group" ]]; then
+        [[ -n "$focus_row" && -n "$focus_group" ]] || err "--focus-row and --focus-group must be supplied together"
+        focus_args=(--focus-row "$focus_row" --focus-group "$focus_group")
+    fi
+    local named_row_args=()
+    if [[ "$tensor" == "named-row-divergence" ]]; then
+        [[ -n "$bf16_trace" && -n "$hqq_trace" ]] || err "named-row-divergence requires --bf16-trace and --hqq-trace"
+        named_row_args=(--bf16-trace "$bf16_trace" --hqq-trace "$hqq_trace")
+        if [[ -n "$bf16_summary" ]]; then
+            named_row_args+=(--bf16-summary "$bf16_summary")
+        fi
+        if [[ -n "$hqq_summary" ]]; then
+            named_row_args+=(--hqq-summary "$hqq_summary")
+        fi
+    fi
+    info "Running offline HQQ attention diff"
+    info "Run dir: $run_dir"
+    verify_repo_imports
+    KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="hqq-attn-diff" run_repo_python \
+        "$SCRIPT_DIR/tests/hqq_attention_diff.py" \
+        --model-dir "$model_dir" \
+        --cache-dir "$cache_dir" \
+        --layer "$layer" \
+        --tensor "$tensor" \
+        --output "$output" \
+        --tsv-output "$tsv" \
+        --top-rows "$top_rows" \
+        --top-groups "$top_groups" \
+        --sample-cols "$sample_cols" \
+        --candidate-grid-steps "$candidate_grid_steps" \
+        --candidate-local-grid-steps "$candidate_local_grid_steps" \
+        "${input_row_args[@]}" \
+        "${focus_args[@]}" \
+        "${named_row_args[@]}"
+    ok "Wrote $output"
+    ok "Wrote $tsv"
+}
+
+do_hqq_self_calibrate() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev hqq-self-calibrate <config> [--profile selfcal_v1] [--duration-seconds N]"
+        echo "       [--dataset canonical|c4] [--dataset-path PATH] [--trace-log PATH]"
+        echo "       [--output PATH] [--dry-run]"
+        echo "       [--positions LIST] [--layers LIST] [--tensors LIST]"
+        echo "       [--build-candidates EVIDENCE_JSON] [--top-candidates N]"
+        echo "       [--build-int8-exception-candidates TRAIN_EVIDENCE_JSON] [--heldout-evidence HELDOUT_EVIDENCE_JSON]"
+        echo "       [--evaluate-refits CANDIDATES_JSON] [--trace-log PATH]"
+        echo "       [--max-output-rows N] [--activation-policy all|shared_bf16_hqq_activation|lane_local_only]"
+        echo "       [--simulate-sidecars REFIT_EVAL_JSON] [--sidecar-modes exact_bf16,int8_symmetric]"
+        echo "       [--write-sidecar-artifact SIDECAR_SIM_JSON] [--sidecar-artifact-mode int8_symmetric|exact_bf16]"
+        echo "       [--write-int8-exception-manifest CANDIDATES_JSON] [--int8-exception-groups LIST]"
+        echo "       [--write-sidecar-contract-manifest SOURCE_MAP_AUDIT_JSON] [--source-contract-audit SOURCE_MAP_AUDIT_JSON]"
+        echo "       [--sidecar-correction-scale SCALE]"
+        echo "       [--sidecar-include-entries LIST] [--sidecar-exclude-entries LIST] [--sidecar-entry-scales LIST]"
+        echo "       [--write-experimental-cache REFIT_EVAL_JSON] [--variant-name NAME]"
+        echo "       [--patch-tensors LIST] [--patch-methods LIST] [--patch-top-groups N]"
+        echo "       [--summarize-ablation SPEC_JSON] [--search-sidecar-conflicts SPEC_JSON]"
+        echo "  Captures evidence, builds candidates, evaluates refits, or writes an explicit"
+        echo "  experimental selfcal_v1 cache/ablation report from a refit-evaluation artifact."
+        echo "  Evidence, candidate, refit-evaluation, sidecar-simulation, and sidecar-artifact modes remain non-loadable as HQQ manifests."
+        return 0
+    fi
+    [[ $# -lt 1 ]] && err "Usage: ./dev hqq-self-calibrate <config> [options]"
+    local config
+    config=$(resolve_config "$1")
+    shift
+    [[ -f "$config" ]] || err "Config not found: $config"
+    local run_dir
+    run_dir=$(create_run_dir "hqq-self-calibrate")
+    info "Running HQQ self-calibration evidence/candidate tool"
+    info "Config: $config"
+    info "Run dir: $run_dir"
+    verify_repo_imports
+    KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="hqq-self-calibrate" run_repo_python \
+        -m krasis.hqq_self_calibrate \
+        --config "$config" \
+        "$@"
+}
+
+do_hqq_self_calibrate_test() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev hqq-self-calibrate-test"
+        echo "  Runs no-GPU checks for HQQ cache profile selection and Phase 2A evidence files."
+        return 0
+    fi
+    [[ $# -eq 0 ]] || err "hqq-self-calibrate-test takes no arguments"
+    verify_repo_imports
+    KRASIS_DEV_SCRIPT=1 run_repo_python "$SCRIPT_DIR/tests/test_hqq_cache_profile.py"
+    KRASIS_DEV_SCRIPT=1 run_repo_python "$SCRIPT_DIR/tests/test_hqq_self_calibrate.py"
+}
+
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    printf '%s' "$s"
+}
+
+sum_file_sizes() {
+    local total=0
+    local f
+    for f in "$@"; do
+        [[ -f "$f" ]] || continue
+        total=$((total + $(stat -c '%s' "$f")))
+    done
+    echo "$total"
+}
+
+do_witness_gguf_preflight() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev witness-gguf-preflight <model> [--output PATH] [--outtype bf16]"
+        echo "  Preflights BF16 GGUF witness conversion without starting conversion."
+        echo "  Records source files, expected output, resource estimates, converter command, and support gates."
+        echo "  Models: qwen35"
+        return 0
+    fi
+    [[ $# -lt 1 ]] && err "Usage: ./dev witness-gguf-preflight <model> [--output PATH] [--outtype bf16]"
+    local model="$1"
+    shift
+    local output_override=""
+    local outtype="bf16"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --output)
+                [[ $# -ge 2 ]] || err "--output requires a path"
+                output_override="$2"
+                shift 2
+                ;;
+            --outtype)
+                [[ $# -ge 2 ]] || err "--outtype requires a value"
+                outtype="$2"
+                shift 2
+                ;;
+            --help|-h)
+                echo "Usage: ./dev witness-gguf-preflight <model> [--output PATH] [--outtype bf16]"
+                echo "  Preflights BF16 GGUF witness conversion without starting conversion."
+                echo "  Models: qwen35"
+                return 0
+                ;;
+            *)
+                err "Unknown witness-gguf-preflight argument: $1"
+                ;;
+        esac
+    done
+    [[ "$outtype" == "bf16" ]] || err "Only --outtype bf16 is accepted for witness authority preflight"
+    [[ -d "$WITNESS_REPO" ]] || err "llama-witness repo not found: $WITNESS_REPO"
+
+    mapfile -t paths < <(witness_model_paths "$model")
+    local model_dir="${paths[0]}"
+    local default_reference_json="${paths[1]}"
+    local expected_gguf="${paths[2]}"
+    [[ -n "$output_override" ]] && expected_gguf="$output_override"
+
+    local run_dir report
+    run_dir=$(create_run_dir "witness-gguf-preflight")
+    report="$run_dir/witness_gguf_preflight.json"
+    info "Running BF16 GGUF witness conversion preflight"
+    info "Run dir: $run_dir"
+    info "Report: $report"
+
+    local status=0
+    local converter="$WITNESS_REPO/convert_hf_to_gguf.py"
+    local config="$model_dir/config.json"
+    local tokenizer="$model_dir/tokenizer.json"
+    local tokenizer_config="$model_dir/tokenizer_config.json"
+    local generation_config="$model_dir/generation_config.json"
+    local index_json="$model_dir/model.safetensors.index.json"
+    local arch model_type text_model_type transformers_version
+    arch=""
+    model_type=""
+    text_model_type=""
+    transformers_version=""
+
+    if [[ -f "$config" ]]; then
+        arch=$(jq -r '.architectures[0] // ""' "$config")
+        model_type=$(jq -r '.model_type // ""' "$config")
+        text_model_type=$(jq -r '.text_config.model_type // ""' "$config")
+        transformers_version=$(jq -r '.transformers_version // ""' "$config")
+    else
+        status=1
+    fi
+
+    local expected_arch="Qwen3_5MoeForConditionalGeneration"
+    local expected_model_type="qwen3_5_moe"
+    local expected_text_model_type="qwen3_5_moe_text"
+    local config_supported=false
+    if [[ "$arch" == "$expected_arch" && "$model_type" == "$expected_model_type" && "$text_model_type" == "$expected_text_model_type" ]]; then
+        config_supported=true
+    else
+        status=1
+    fi
+
+    local converter_supported=false gguf_supported=false runtime_supported=false
+    if rg -q 'Qwen3_5MoeForConditionalGeneration' "$converter" \
+        && rg -q 'class Qwen3_5MoeTextModel' "$converter" \
+        && rg -q 'MODEL_ARCH.QWEN35MOE' "$converter"; then
+        converter_supported=true
+    else
+        status=1
+    fi
+    if rg -q 'QWEN35MOE' "$WITNESS_REPO/gguf-py/gguf/constants.py"; then
+        gguf_supported=true
+    else
+        status=1
+    fi
+    if rg -q 'LLM_ARCH_QWEN35MOE' "$WITNESS_REPO/src/llama-arch.h" \
+        && rg -q 'llm_build_qwen35moe' "$WITNESS_REPO/src/llama-model.cpp" \
+        && [[ -f "$WITNESS_REPO/src/models/qwen35moe.cpp" ]]; then
+        runtime_supported=true
+    else
+        status=1
+    fi
+
+    local required_missing=()
+    local required_file
+    for required_file in "$config" "$tokenizer" "$tokenizer_config" "$generation_config" "$index_json"; do
+        if [[ ! -f "$required_file" ]]; then
+            required_missing+=("$required_file")
+            status=1
+        fi
+    done
+
+    local safetensors=()
+    while IFS= read -r shard; do
+        safetensors+=("$shard")
+    done < <(find "$model_dir" -maxdepth 1 -type f -name '*.safetensors' | sort)
+    local shard_count="${#safetensors[@]}"
+    [[ "$shard_count" -gt 0 ]] || status=1
+    local source_bytes
+    source_bytes=$(sum_file_sizes "${safetensors[@]}" "$config" "$tokenizer" "$tokenizer_config" "$generation_config" "$index_json")
+
+    local output_dir output_available_bytes
+    output_dir="$(dirname "$expected_gguf")"
+    mkdir -p "$output_dir"
+    output_available_bytes=$(df -B1 --output=avail "$output_dir" | tail -n 1 | tr -d ' ')
+    local ram_available_bytes
+    ram_available_bytes=$(awk '/MemAvailable:/ {print $2 * 1024}' /proc/meminfo)
+
+    # The preflight records a conservative workspace estimate; the conversion is still not started here.
+    local disk_required_bytes ram_required_bytes
+    disk_required_bytes=$((source_bytes * 2))
+    ram_required_bytes=$((source_bytes * 3 / 2))
+    local disk_sane=false ram_sane=false
+    if [[ "$output_available_bytes" -ge "$disk_required_bytes" ]]; then
+        disk_sane=true
+    else
+        status=1
+    fi
+    if [[ "$ram_available_bytes" -ge "$ram_required_bytes" ]]; then
+        ram_sane=true
+    else
+        status=1
+    fi
+
+    local converter_cmd
+    printf -v converter_cmd '%q ' "$PYTHON" "$converter" "$model_dir" --outtype "$outtype" --outfile "$expected_gguf"
+    converter_cmd="${converter_cmd% }"
+
+    {
+        printf '{\n'
+        printf '  "format": "krasis_witness_gguf_preflight",\n'
+        printf '  "format_version": 1,\n'
+        printf '  "model": "%s",\n' "$(json_escape "$model")"
+        printf '  "outtype": "%s",\n' "$(json_escape "$outtype")"
+        printf '  "source_model_path": "%s",\n' "$(json_escape "$model_dir")"
+        printf '  "expected_output_path": "%s",\n' "$(json_escape "$expected_gguf")"
+        printf '  "default_input_token_source": "%s",\n' "$(json_escape "$default_reference_json")"
+        printf '  "converter": {\n'
+        printf '    "repo": "%s",\n' "$(json_escape "$WITNESS_REPO")"
+        printf '    "script": "%s",\n' "$(json_escape "$converter")"
+        printf '    "outtype": "%s",\n' "$(json_escape "$outtype")"
+        printf '    "command": "%s"\n' "$(json_escape "$converter_cmd")"
+        printf '  },\n'
+        printf '  "config": {\n'
+        printf '    "architecture": "%s",\n' "$(json_escape "$arch")"
+        printf '    "expected_architecture": "%s",\n' "$(json_escape "$expected_arch")"
+        printf '    "model_type": "%s",\n' "$(json_escape "$model_type")"
+        printf '    "expected_model_type": "%s",\n' "$(json_escape "$expected_model_type")"
+        printf '    "text_model_type": "%s",\n' "$(json_escape "$text_model_type")"
+        printf '    "expected_text_model_type": "%s",\n' "$(json_escape "$expected_text_model_type")"
+        printf '    "transformers_version": "%s"\n' "$(json_escape "$transformers_version")"
+        printf '  },\n'
+        printf '  "required_files": [\n'
+        local first=1
+        for required_file in "$config" "$tokenizer" "$tokenizer_config" "$generation_config" "$index_json"; do
+            [[ "$first" == "1" ]] || printf ',\n'
+            first=0
+            if [[ -f "$required_file" ]]; then
+                printf '    {"path": "%s", "exists": true, "size_bytes": %s, "sha256": "%s"}' \
+                    "$(json_escape "$required_file")" \
+                    "$(stat -c '%s' "$required_file")" \
+                    "$(sha256sum "$required_file" | awk '{print $1}')"
+            else
+                printf '    {"path": "%s", "exists": false}' "$(json_escape "$required_file")"
+            fi
+        done
+        printf '\n  ],\n'
+        printf '  "safetensors": {\n'
+        printf '    "shard_count": %s,\n' "$shard_count"
+        printf '    "total_source_bytes": %s\n' "$source_bytes"
+        printf '  },\n'
+        printf '  "resources": {\n'
+        printf '    "disk_available_bytes": %s,\n' "$output_available_bytes"
+        printf '    "disk_required_bytes": %s,\n' "$disk_required_bytes"
+        printf '    "disk_estimate_rule": "2x source bytes for BF16 output plus conversion workspace",\n'
+        printf '    "disk_sane": %s,\n' "$disk_sane"
+        printf '    "ram_available_bytes": %s,\n' "$ram_available_bytes"
+        printf '    "ram_required_bytes": %s,\n' "$ram_required_bytes"
+        printf '    "ram_estimate_rule": "1.5x source bytes for conversion metadata and tensor streaming headroom",\n'
+        printf '    "ram_sane": %s\n' "$ram_sane"
+        printf '  },\n'
+        printf '  "support": {\n'
+        printf '    "config_supported": %s,\n' "$config_supported"
+        printf '    "converter_supported": %s,\n' "$converter_supported"
+        printf '    "gguf_constants_supported": %s,\n' "$gguf_supported"
+        printf '    "runtime_supported": %s\n' "$runtime_supported"
+        printf '  },\n'
+        printf '  "conversion_started": false,\n'
+        if [[ "$status" == "0" ]]; then
+            printf '  "preflight_status": "pass"\n'
+        else
+            printf '  "preflight_status": "fail"\n'
+        fi
+        printf '}\n'
+    } > "$report"
+
+    jq '.' "$report"
+    if [[ "$status" == "0" ]]; then
+        ok "GGUF preflight passed. Conversion was not started."
+    else
+        echo "GGUF preflight failed. Conversion was not started."
+    fi
+    return "$status"
+}
+
+do_witness_gguf_convert() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev witness-gguf-convert <model> [--output PATH] [--outtype bf16] [--force]"
+        echo "  Converts a local safetensors model to BF16 GGUF only after the built preflight gate passes."
+        echo "  Writes logs and conversion manifest under logs/witness-gguf-convert_*."
+        echo "  Refuses to overwrite an existing expected output unless --force is supplied."
+        echo "  Models: qwen35"
+        return 0
+    fi
+    [[ $# -lt 1 ]] && err "Usage: ./dev witness-gguf-convert <model> [--output PATH] [--outtype bf16] [--force]"
+    local model="$1"
+    shift
+    local output_override=""
+    local outtype="bf16"
+    local force=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --output)
+                [[ $# -ge 2 ]] || err "--output requires a path"
+                output_override="$2"
+                shift 2
+                ;;
+            --outtype)
+                [[ $# -ge 2 ]] || err "--outtype requires a value"
+                outtype="$2"
+                shift 2
+                ;;
+            --force)
+                force=1
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: ./dev witness-gguf-convert <model> [--output PATH] [--outtype bf16] [--force]"
+                echo "  Converts a local safetensors model to BF16 GGUF only after the built preflight gate passes."
+                echo "  Models: qwen35"
+                return 0
+                ;;
+            *)
+                err "Unknown witness-gguf-convert argument: $1"
+                ;;
+        esac
+    done
+    [[ "$outtype" == "bf16" ]] || err "Only --outtype bf16 is accepted for witness authority conversion"
+    [[ -d "$WITNESS_REPO" ]] || err "llama-witness repo not found: $WITNESS_REPO"
+
+    mapfile -t paths < <(witness_model_paths "$model")
+    local model_dir="${paths[0]}"
+    local expected_gguf="${paths[2]}"
+    [[ -n "$output_override" ]] && expected_gguf="$output_override"
+    local converter="$WITNESS_REPO/convert_hf_to_gguf.py"
+    [[ -f "$converter" ]] || err "converter not found: $converter"
+
+    local run_dir preflight_log convert_log manifest
+    run_dir=$(create_run_dir "witness-gguf-convert")
+    preflight_log="$run_dir/preflight.log"
+    convert_log="$run_dir/converter.log"
+    manifest="$run_dir/witness_gguf_conversion.json"
+    info "Running BF16 GGUF witness conversion"
+    info "Run dir: $run_dir"
+    info "Preflight log: $preflight_log"
+    info "Converter log: $convert_log"
+    info "Manifest: $manifest"
+
+    if [[ -e "$expected_gguf" && "$force" != "1" ]]; then
+        {
+            printf '{\n'
+            printf '  "format": "krasis_witness_gguf_conversion",\n'
+            printf '  "format_version": 1,\n'
+            printf '  "model": "%s",\n' "$(json_escape "$model")"
+            printf '  "source_model_path": "%s",\n' "$(json_escape "$model_dir")"
+            printf '  "output_path": "%s",\n' "$(json_escape "$expected_gguf")"
+            printf '  "outtype": "%s",\n' "$(json_escape "$outtype")"
+            printf '  "conversion_started": false,\n'
+            printf '  "exit_status": 1,\n'
+            printf '  "failure_reason": "expected output already exists; rerun with --force to overwrite intentionally"\n'
+            printf '}\n'
+        } > "$manifest"
+        err "Expected BF16 GGUF already exists: $expected_gguf
+Use --force only if overwriting that witness artifact is intentional."
+    fi
+
+    local preflight_status=0
+    set +e
+    do_witness_gguf_preflight "$model" --output "$expected_gguf" --outtype "$outtype" 2>&1 | tee "$preflight_log"
+    preflight_status=${PIPESTATUS[0]}
+    set -e
+    local preflight_report
+    preflight_report=$(ls -td "$SCRIPT_DIR"/logs/witness-gguf-preflight_*/witness_gguf_preflight.json 2>/dev/null | head -1 || true)
+    [[ -n "$preflight_report" && -f "$preflight_report" ]] || err "Preflight did not produce a report; see $preflight_log"
+    if [[ "$preflight_status" != "0" ]]; then
+        err "Preflight failed; conversion was not started. See $preflight_report and $preflight_log"
+    fi
+    jq -e '
+      .preflight_status == "pass"
+      and .conversion_started == false
+      and .support.config_supported == true
+      and .support.converter_supported == true
+      and .support.gguf_constants_supported == true
+      and .support.runtime_supported == true
+      and .resources.disk_sane == true
+      and .resources.ram_sane == true
+    ' "$preflight_report" >/dev/null || err "Preflight report did not pass all support/resource gates: $preflight_report"
+
+    if [[ -e "$expected_gguf" && "$force" != "1" ]]; then
+        err "Expected BF16 GGUF appeared after preflight and --force was not supplied: $expected_gguf"
+    fi
+    if [[ -e "$expected_gguf" && "$force" == "1" ]]; then
+        warn "Removing existing output because --force was supplied: $expected_gguf"
+        rm -f "$expected_gguf"
+    fi
+    mkdir -p "$(dirname "$expected_gguf")"
+
+    local converter_cmd start_ts end_ts exit_status
+    printf -v converter_cmd '%q ' "$PYTHON" "$converter" "$model_dir" --outtype "$outtype" --outfile "$expected_gguf"
+    converter_cmd="${converter_cmd% }"
+    start_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    info "Starting converter:"
+    echo "  $converter_cmd"
+    set +e
+    (
+        cd "$WITNESS_REPO"
+        "$PYTHON" "$converter" "$model_dir" --outtype "$outtype" --outfile "$expected_gguf"
+    ) 2>&1 | tee "$convert_log"
+    exit_status=${PIPESTATUS[0]}
+    set -e
+    end_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+    {
+        printf '{\n'
+        printf '  "format": "krasis_witness_gguf_conversion",\n'
+        printf '  "format_version": 1,\n'
+        printf '  "model": "%s",\n' "$(json_escape "$model")"
+        printf '  "source_model_path": "%s",\n' "$(json_escape "$model_dir")"
+        printf '  "output_path": "%s",\n' "$(json_escape "$expected_gguf")"
+        printf '  "outtype": "%s",\n' "$(json_escape "$outtype")"
+        printf '  "preflight_report": "%s",\n' "$(json_escape "$preflight_report")"
+        printf '  "preflight_log": "%s",\n' "$(json_escape "$preflight_log")"
+        printf '  "converter_log": "%s",\n' "$(json_escape "$convert_log")"
+        printf '  "converter_command": "%s",\n' "$(json_escape "$converter_cmd")"
+        printf '  "start_timestamp_utc": "%s",\n' "$start_ts"
+        printf '  "end_timestamp_utc": "%s",\n' "$end_ts"
+        printf '  "conversion_started": true,\n'
+        printf '  "exit_status": %s,\n' "$exit_status"
+        if [[ -f "$expected_gguf" ]]; then
+            printf '  "output_exists": true,\n'
+            printf '  "output_size_bytes": %s\n' "$(stat -c '%s' "$expected_gguf")"
+        else
+            printf '  "output_exists": false,\n'
+            printf '  "output_size_bytes": null\n'
+        fi
+        printf '}\n'
+    } > "$manifest"
+
+    jq '.' "$manifest"
+    if [[ "$exit_status" == "0" && -f "$expected_gguf" ]]; then
+        ok "GGUF conversion complete: $expected_gguf"
+    else
+        echo "GGUF conversion failed. See $convert_log and $manifest"
+    fi
+    return "$exit_status"
+}
+
+do_witness_capture() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev witness-capture <model> [--output PATH] [--reference PATH] [--profile ID] [--max-cases N] [validator args...]"
+        echo "  Captures llama-witness JSON from stored input_token_ids only."
+        echo "  Models: qcn, qwen35"
+        return 0
+    fi
+    [[ $# -lt 1 ]] && err "Usage: ./dev witness-capture <model> [--output PATH] [--reference PATH] [--profile ID] [--max-cases N] [validator args...]
+  Captures llama-witness JSON from stored input_token_ids only.
+  Default profile: $WITNESS_PROFILE_ID"
+    local model="$1"
+    shift
+    local output=""
+    local reference_override=""
+    local profile="$WITNESS_PROFILE_ID"
+    local validator_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                echo "Usage: ./dev witness-capture <model> [--output PATH] [--reference PATH] [--profile ID] [--max-cases N] [validator args...]"
+                echo "  Captures llama-witness JSON from stored input_token_ids only."
+                echo "  Models: qcn, qwen35"
+                return 0
+                ;;
+            --reference)
+                [[ $# -ge 2 ]] || err "--reference requires a path"
+                reference_override="$2"
+                shift 2
+                ;;
+            --output)
+                [[ $# -ge 2 ]] || err "--output requires a path"
+                output="$2"
+                shift 2
+                ;;
+            --profile)
+                [[ $# -ge 2 ]] || err "--profile requires an id"
+                profile="$2"
+                shift 2
+                ;;
+            --max-cases)
+                [[ $# -ge 2 ]] || err "--max-cases requires a count"
+                validator_args+=(--max-cases "$2")
+                shift 2
+                ;;
+            *)
+                validator_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    [[ -d "$WITNESS_REPO" ]] || err "llama-witness repo not found: $WITNESS_REPO"
+    local script="$WITNESS_REPO/scripts/witness/validate_frozen_reference.sh"
+    [[ -x "$script" ]] || err "witness script not executable: $script"
+
+    mapfile -t paths < <(witness_model_paths "$model")
+    local model_dir="${paths[0]}"
+    local reference_json="${paths[1]}"
+    local model_gguf="${paths[2]}"
+    [[ -n "$reference_override" ]] && reference_json="$reference_override"
+    [[ -d "$model_dir" ]] || err "witness model dir not found: $model_dir"
+    [[ -f "$reference_json" ]] || err "input-token source reference not found: $reference_json"
+
+    local run_dir
+    run_dir=$(create_run_dir "witness-capture")
+    if [[ -z "$output" ]]; then
+        output="$run_dir/${model}_${profile}.json"
+    fi
+    mkdir -p "$(dirname "$output")"
+
+    info "Running llama-witness capture"
+    info "Run dir: $run_dir"
+    info "Output: $output"
+    (
+        cd "$WITNESS_REPO"
+        WITNESS_PROFILE_ID="$profile" \
+        WITNESS_MAX_NEW_TOKENS="${KRASIS_WITNESS_MAX_NEW_TOKENS:-1}" \
+        WITNESS_GENERATED_AT="${KRASIS_WITNESS_GENERATED_AT:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}" \
+            "$script" "$model_dir" "$reference_json" "$model_gguf" \
+            --json-output "$output" \
+            --capture-only \
+            "${validator_args[@]}"
+    ) 2>&1 | tee "$run_dir/witness_capture.log"
+    ok "Witness capture complete: $output"
+}
+
+do_witness_inputs() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev witness-inputs <model> --prompt-source PATH --output PATH [--profile ID] [validator args...]"
+	        echo "  Tokenizes fixed prompt-source JSON into a stored llama-witness input_token_ids artifact."
+	        echo "  qwen35 requires proven chat-template enable_thinking=false application."
+        echo "  Models: qcn, qwen35"
+        return 0
+    fi
+    [[ $# -lt 1 ]] && err "Usage: ./dev witness-inputs <model> --prompt-source PATH --output PATH [--profile ID] [validator args...]"
+    local model="$1"
+    shift
+    local prompt_source=""
+    local output=""
+    local profile="$WITNESS_PROFILE_ID"
+    local validator_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                echo "Usage: ./dev witness-inputs <model> --prompt-source PATH --output PATH [--profile ID] [validator args...]"
+	                echo "  Tokenizes fixed prompt-source JSON into a stored llama-witness input_token_ids artifact."
+	                echo "  qwen35 requires proven chat-template enable_thinking=false application."
+                echo "  Models: qcn, qwen35"
+                return 0
+                ;;
+            --prompt-source)
+                [[ $# -ge 2 ]] || err "--prompt-source requires a path"
+                prompt_source="$2"
+                shift 2
+                ;;
+            --output)
+                [[ $# -ge 2 ]] || err "--output requires a path"
+                output="$2"
+                shift 2
+                ;;
+            --profile)
+                [[ $# -ge 2 ]] || err "--profile requires an id"
+                profile="$2"
+                shift 2
+                ;;
+            *)
+                validator_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$prompt_source" ]] || err "--prompt-source is required"
+    [[ -n "$output" ]] || err "--output is required"
+    [[ -d "$WITNESS_REPO" ]] || err "llama-witness repo not found: $WITNESS_REPO"
+    local validator_bin="$WITNESS_REPO/build/bin/llama-witness-validate"
+
+    mapfile -t paths < <(witness_model_paths "$model")
+	    local model_dir="${paths[0]}"
+	    local model_gguf="${paths[2]}"
+	    [[ -d "$model_dir" ]] || err "witness model dir not found: $model_dir"
+	    [[ -f "$prompt_source" ]] || err "prompt source not found: $prompt_source"
+	    [[ -f "$model_gguf" ]] || err "witness GGUF not found: $model_gguf"
+	    if [[ "$model" == "qwen35" ]]; then
+	        validator_args+=(--require-thinking-off-proof)
+	    fi
+	    local run_dir
+    run_dir=$(create_run_dir "witness-inputs")
+    mkdir -p "$(dirname "$output")"
+
+    info "Building llama-witness input-token source"
+    info "Run dir: $run_dir"
+    info "Output: $output"
+    (
+        cd "$WITNESS_REPO"
+        cmake -S . -B build
+        cmake --build build --target llama-witness-validate -j "${WITNESS_BUILD_JOBS:-$(nproc)}"
+        "$validator_bin" \
+            --model "$model_gguf" \
+            --prompt-source "$prompt_source" \
+            --write-input-source "$output" \
+            --artifact-model-name "$(basename "$model_dir")" \
+            --artifact-model-path "$model_dir" \
+            --profile-id "$profile" \
+            "${validator_args[@]}"
+    ) 2>&1 | tee "$run_dir/witness_inputs.log"
+    ok "Witness input-token source complete: $output"
+}
+
+do_witness_compare() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev witness-compare <config> [--profile ID] [reference-test args...]"
+        echo "  Compares Krasis against a llama-witness-authored artifact."
+        return 0
+    fi
+    [[ $# -lt 1 ]] && err "Usage: ./dev witness-compare <config> [--profile ID] [reference-test args...]
+  Runs reference-test against a llama-witness-authored artifact."
+    local config="$1"
+    shift
+    local profile="$WITNESS_PROFILE_ID"
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                echo "Usage: ./dev witness-compare <config> [--profile ID] [reference-test args...]"
+                echo "  Compares Krasis against a llama-witness-authored artifact."
+                return 0
+                ;;
+            --profile)
+                [[ $# -ge 2 ]] || err "--profile requires an id"
+                profile="$2"
+                shift 2
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    do_reference_test "$config" --profile "$profile" "${args[@]}"
+}
+
 do_capture_preflight() {
+    require_archived_hf_reference_override "./dev capture-preflight"
     info "Running capture host preflight"
     KRASIS_DEV_SCRIPT=1 \
     KRASIS_DEV_PYTHON="$PYTHON" \
@@ -1189,6 +2246,7 @@ do_reference_prep() {
     ./dev reference-prep --deps-only
     ./dev reference-prep --print-deps-json
     ./dev reference-prep gemma --urls-only"
+    require_archived_hf_reference_override "./dev reference-prep"
     info "Preparing reference host: ${1:-listing models}"
     KRASIS_DEV_SCRIPT=1 KRASIS_DEV_PYTHON="$PYTHON" KRASIS_DEV_PIP="$PIP" \
     KRASIS_REFERENCE_CAPTURE_ROOT="$REFERENCE_CAPTURE_ROOT" \
@@ -1199,15 +2257,22 @@ do_reference_prep() {
 }
 
 do_generate_reference() {
-    [[ $# -lt 1 ]] && err "Usage: ./dev generate-reference <model> [--max-tokens N] [--profile PROFILE]
-  Generates a BF16 HuggingFace greedy reference with full contract metadata.
+    [[ $# -lt 1 ]] && err "Usage: ./dev generate-reference <model> [--max-tokens N] [--profile PROFILE] [--conversation-index N [--turn-index N|--turn-start-index N --turn-end-index N] | --first-stored-turns N] [--attn-implementation eager|sdpa|flash_attention_2] [--use-cache auto|on|off] [--generate-use-cache auto|on|off] [--diagnostic-use-cache auto|on|off] [--diagnostic-scope all|final|postponed] [--between-turn-cleanup none|gc|reset] [--diagnose-pre-post-forward] [--reload-model-between-turns] [--diagnostic-only] [--output PATH]
+  ARCHIVED: HF/Transformers reference capture is no longer trusted by default.
+  Generates a BF16 HuggingFace greedy reference with full contract metadata only when explicitly unarchived for forensic evidence.
+  Subset captures write a diagnostic non-canonical filename unless --output is supplied.
   Profiles:
     auto                    thinking_off if supported, otherwise default
     greedy_chat_default     default template invocation
     greedy_chat_thinking_off  pass enable_thinking=False
     greedy_chat_thinking_on   pass enable_thinking=True
   Example:
-    ./dev generate-reference Qwen3-Coder-Next --profile greedy_chat_thinking_off"
+    ./dev generate-reference Qwen3-Coder-Next --profile greedy_chat_thinking_off
+    ./dev generate-reference qwen35 --profile greedy_chat_thinking_off --conversation-index 0 --turn-index 0 --diag-steps 1 --diag-topk 10 --attn-implementation eager
+    ./dev generate-reference qwen35 --profile greedy_chat_thinking_off --conversation-index 0 --turn-start-index 0 --turn-end-index 1 --diag-steps 1 --diag-topk 10 --attn-implementation sdpa --diagnostic-scope final --diagnostic-only
+    ./dev generate-reference qwen35 --profile greedy_chat_thinking_off --first-stored-turns 4 --diag-steps 1 --diag-topk 10 --attn-implementation sdpa --diagnostic-scope postponed --diagnostic-only
+    ./dev generate-reference qwen35 --profile greedy_chat_thinking_off --conversation-index 0 --turn-start-index 0 --turn-end-index 1 --diag-steps 1 --diag-topk 10 --attn-implementation sdpa --generate-use-cache auto --diagnostic-use-cache off --diagnose-pre-post-forward --diagnostic-only"
+    require_archived_hf_reference_override "./dev generate-reference"
     cleanup_gpu
     local run_dir logfile dev_cmd
     run_dir=$(create_run_dir "generate-reference")
@@ -1223,6 +2288,40 @@ do_generate_reference() {
         KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE="$REFERENCE_CAPTURE_ROOT_SOURCE" \
         KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$REFERENCE_CAPTURE_MODELS_DIR" \
         run_reference_capture_python "$SCRIPT_DIR/tests/generate_reference.py" "$@" 2>&1 | tee "$logfile"
+    local status=${PIPESTATUS[0]}
+    set -e
+    return "$status"
+}
+
+do_reference_backfill_topk() {
+    [[ $# -lt 1 ]] && err "Usage: ./dev reference-backfill-topk <model> --reference <existing-greedy-reference.json> [--output <new-json>] [--diag-steps N] [--diag-topk N] [--diagnose-turn CONV:TURN] [--diagnose-prefix-search] [--diagnose-prefix-lengths CSV] [--attn-implementation eager|sdpa|flash_attention_2]
+  ARCHIVED: HF/Transformers reference backfill is no longer trusted by default.
+  Backfills teacher-forced top-k/logprob diagnostics from exact stored raw input_token_ids only when explicitly unarchived for forensic evidence.
+  Writes a new artifact by default; in-place backfill is not allowed.
+  With --diagnose-turn, writes no output artifact and reports strict logits/log-softmax diagnostics for selected turns.
+  With --diagnose-prefix-search, also probes raw-token prefixes for diagnosed turns.
+  With --diagnose-prefix-lengths, probes exact prefix lengths and records token pieces, validity, round-trip, and logits stats.
+  With --attn-implementation, requests an HF attention implementation for this diagnostic/backfill model load.
+  Example:
+    ./dev reference-backfill-topk qwen35 --reference ../krasis-internal/reference-outputs/output/Qwen3.5-35B-A3B/greedy_reference.json --output ../krasis-internal/reference-outputs/output/Qwen3.5-35B-A3B/greedy_reference_backfilled_topk.json --diag-steps 1 --diag-topk 10
+    ./dev reference-backfill-topk qwen35 --reference ../krasis-internal/reference-outputs/output/Qwen3.5-35B-A3B/greedy_reference.json --diagnose-turn 0:0 --diagnose-turn 0:2 --diagnose-prefix-search
+    ./dev reference-backfill-topk qwen35 --reference ../krasis-internal/reference-outputs/output/Qwen3.5-35B-A3B/greedy_reference.json --diagnose-turn 0:0 --diagnose-turn 0:2 --diagnose-prefix-lengths 1,2,3,13,32,78 --attn-implementation eager"
+    require_archived_hf_reference_override "./dev reference-backfill-topk"
+    cleanup_gpu
+    local run_dir logfile dev_cmd
+    run_dir=$(create_run_dir "reference-backfill-topk")
+    logfile="$run_dir/reference_backfill_topk_stdout.log"
+    printf -v dev_cmd '%q ' ./dev reference-backfill-topk "$@"
+    dev_cmd="${dev_cmd% }"
+    info "Backfilling reference top-k/logprobs: $1"
+    info "Run dir: $run_dir"
+    verify_repo_python_imports
+    set +e
+    KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="reference-backfill-topk" KRASIS_DEV_CMD="$dev_cmd" \
+        KRASIS_REFERENCE_CAPTURE_ROOT="$REFERENCE_CAPTURE_ROOT" \
+        KRASIS_REFERENCE_CAPTURE_ROOT_SOURCE="$REFERENCE_CAPTURE_ROOT_SOURCE" \
+        KRASIS_REFERENCE_CAPTURE_MODELS_DIR="$REFERENCE_CAPTURE_MODELS_DIR" \
+        run_reference_capture_python "$SCRIPT_DIR/tests/reference_backfill_topk.py" "$@" 2>&1 | tee "$logfile"
     local status=${PIPESTATUS[0]}
     set -e
     return "$status"
@@ -1317,7 +2416,7 @@ do_capture_box() {
             ;;
         generate|generate-reference)
             print_capture_box_env "$KRASIS_CAPTURE_BOX_REPO_HOME"
-            [[ $# -ge 1 ]] || err "Usage: ./dev capture-box generate <model> [--profile PROFILE] [--max-tokens N]"
+            [[ $# -ge 1 ]] || err "Usage: ./dev capture-box generate <model> [--profile PROFILE] [--max-tokens N] [--conversation-index N [--turn-index N|--turn-start-index N --turn-end-index N]] [--attn-implementation eager|sdpa|flash_attention_2]"
             info "Verifying paid-box capture host for model: $1"
             do_capture_preflight --bootstrap --model "$1"
             do_generate_reference "$@"
@@ -1325,7 +2424,10 @@ do_capture_box() {
         help|-h|--help)
             echo "Usage: ./dev capture-box <subcommand> [args...]"
             echo ""
-            echo "Strict paid-box wrapper for HF capture work."
+            echo "ARCHIVED strict paid-box wrapper for HF capture work."
+            echo "HF/Transformers capture commands now require KRASIS_ALLOW_ARCHIVED_HF_REFERENCE=1."
+            echo ""
+            echo "Historical behavior:"
             echo "It enforces one remote identity before any expensive work:"
             echo "  - HOME := inferred repo owner home"
             echo "  - PATH prepends <repo-home>/.cargo/bin"
@@ -1476,11 +2578,21 @@ case "$cmd" in
     release-test)   do_release_test "$@" ;;
     release-test-all) do_release_test_all "$@" ;;
     reference-test) do_reference_test "$@" ;;
+    witness-inputs) do_witness_inputs "$@" ;;
+    witness-model-check) do_witness_model_check "$@" ;;
+    witness-gguf-preflight) do_witness_gguf_preflight "$@" ;;
+    witness-gguf-convert) do_witness_gguf_convert "$@" ;;
+    witness-capture) do_witness_capture "$@" ;;
+    witness-compare) do_witness_compare "$@" ;;
+    hqq-attn-diff) do_hqq_attn_diff "$@" ;;
+    hqq-self-calibrate) do_hqq_self_calibrate "$@" ;;
+    hqq-self-calibrate-test) do_hqq_self_calibrate_test "$@" ;;
     reference-inventory) do_reference_inventory "$@" ;;
     capture-box)    do_capture_box "$@" ;;
     capture-preflight) do_capture_preflight "$@" ;;
     reference-prep) do_reference_prep "$@" ;;
     generate-reference) do_generate_reference "$@" ;;
+    reference-backfill-topk) do_reference_backfill_topk "$@" ;;
     trace-diff)     do_trace_diff "$@" ;;
     perplexity)     do_perplexity "$@" ;;
     awq-calibrate)  do_awq_calibrate "$@" ;;
@@ -1497,7 +2609,7 @@ case "$cmd" in
         echo ""
         echo "Core commands:"
         echo "  build                          Rebuild Rust extension into this repo only"
-        echo "  run <config> [flags]           Launch server (add --benchmark for benchmark mode)"
+        echo "  run <config> [flags]           Launch server (add --benchmark or --selected-gpus GPU[,GPU...] as needed)"
         echo "  benchmark <config>             Run standard benchmark and exit"
         echo "  speed-test                     Run the fixed standard speed benchmark"
         echo "  decode-harness <config>        Run synthetic GPU decode harness and exit"
@@ -1508,14 +2620,23 @@ case "$cmd" in
         echo "  test <config>                  Short model test (benchmark + network tests)"
         echo "  test <config> --thorough       Thorough test (+ stress + large prompts)"
         echo "  network <port> [--large]       Run network tests against a running server"
-        echo "  validate <config>              Validate model output against BF16 reference"
-        echo "  reference-test <config>        Compare engine output against BF16 reference data"
-        echo "  reference-test --compare <model>  Run comparative reference matrix"
+        echo "  validate <config>              Validate against stored non-HF references; HF artifacts require override"
+        echo "  reference-test <config>        Compare against stored non-HF references; HF artifacts require override"
+        echo "  reference-test --compare <model>  Comparison matrix; HF artifacts require override"
         echo "  reference-inventory            Inventory stored reference artifacts"
-        echo "  capture-box <subcommand>      Strict paid-box wrapper for HF reference capture"
-        echo "  capture-preflight             Verify or bootstrap a host for HF reference capture"
-        echo "  reference-prep <model>         Prepare HF capture deps and download a public model"
-        echo "  generate-reference <model>     Generate BF16 HF reference capture"
+        echo "  witness-inputs <model>         Build stored input_token_ids from fixed prompt-source JSON"
+        echo "  witness-model-check <model>    Check expected BF16 GGUF witness model readiness"
+        echo "  witness-gguf-preflight <model> Preflight BF16 GGUF witness conversion readiness"
+        echo "  witness-gguf-convert <model>   Convert local safetensors to BF16 GGUF after preflight"
+        echo "  witness-capture <model>        Capture llama-witness JSON from stored input_token_ids"
+        echo "  witness-compare <config>       Compare Krasis against llama-witness JSON"
+        echo "  hqq-attn-diff <model>          Offline HQQ attention artifact diff against BF16 source"
+        echo "  hqq-self-calibrate <config>    Capture HQQ self-calibration evidence/candidates"
+        echo "  capture-box <subcommand>      ARCHIVED HF capture wrapper; requires explicit override"
+        echo "  capture-preflight             ARCHIVED HF capture host preflight; requires explicit override"
+        echo "  reference-prep <model>         ARCHIVED HF dependency/model prep; requires explicit override"
+        echo "  generate-reference <model>     ARCHIVED HF reference capture; requires explicit override"
+        echo "  reference-backfill-topk <model>  ARCHIVED HF top-k backfill; requires explicit override"
         echo "  trace-diff <expected> <actual> Diff two KRASIS_TRACE logs offline"
         echo "  release-test <model>           Run full release test (4 configs, report)"
         echo "  release-test-all [target]      Run release test on all supported models sequentially"
@@ -1536,8 +2657,23 @@ case "$cmd" in
         echo "              NOT for speed benchmarks — only for profiling."
         echo ""
         echo "Reference workflow:"
-        echo "  1. Inventory current artifacts:"
+        echo "  HF/Transformers reference capture is archived and blocked by default."
+        echo "  Use llama-witness for new large-model reference authority."
+        echo "  Archived HF commands require KRASIS_ALLOW_ARCHIVED_HF_REFERENCE=1 and a documented reason."
+        echo ""
+        echo "  1. Check the BF16 witness model is present:"
+        echo "       ./dev witness-model-check qcn"
+        echo "  2. Preflight BF16 GGUF conversion if the witness model is missing:"
+        echo "       ./dev witness-gguf-preflight qwen35"
+        echo "  3. Convert BF16 GGUF only after preflight passes:"
+        echo "       ./dev witness-gguf-convert qwen35"
+        echo "  4. Capture a llama-witness first-token artifact from stored input_token_ids:"
+        echo "       ./dev witness-capture qcn --max-cases 4 --output ../krasis-internal/reference-outputs/output/Qwen3-Coder-Next/llama_witness_first_token.json"
+        echo "  5. Compare Krasis against that non-HF witness artifact:"
+        echo "       ./dev witness-compare tests/qcn-polar4-a16.conf"
+        echo "  6. Inventory current historical artifacts:"
         echo "       ./dev reference-inventory"
+        echo "  Archived HF workflow for forensic reruns only:"
         echo "  2. On paid boxes, enforce the remote environment first:"
         echo "       ./dev capture-box env"
         echo "  3. Prove the host is ready before queueing downloads/captures:"
@@ -1546,16 +2682,35 @@ case "$cmd" in
         echo "       ./dev capture-box prep <model>"
         echo "  5. Generate an explicit reference profile:"
         echo "       ./dev capture-box generate <model> --profile <profile>"
+        echo "     For minimal diagnostic recaptures:"
+        echo "       ./dev generate-reference qwen35 --profile greedy_chat_thinking_off --conversation-index 0 --turn-index 0 --diag-steps 1 --diag-topk 10 --attn-implementation eager"
+        echo "  5b. Backfill exact raw-token diagnostics into an existing artifact:"
+        echo "       ./dev reference-backfill-topk <model> --reference <greedy_reference.json> --output <new-json>"
         echo "    Or stage multiple downloads at once:"
         echo "       ./dev capture-box stage qcn gemma"
-        echo "  6. Validate the capture against a runtime config:"
+        echo "  6. Validate a non-HF capture against a runtime config; HF artifacts require override:"
         echo "       ./dev validate <config> --max-prompts 0 --no-server --port 1"
-        echo "  7. Run the real comparison:"
+        echo "  7. Run the real non-HF comparison; HF artifacts require override:"
         echo "       ./dev reference-test <config>"
         echo "  8. Diff stored traces offline when needed:"
         echo "       ./dev trace-diff <expected-trace> <actual-trace>"
         echo "  Reference-prep aliases:"
         echo "    qcn, qwen35, q122b, gemma, minimax, q235, q397"
+        echo "  Subset and attention controls:"
+        echo "    --conversation-index N       Restrict capture to one zero-based prompt conversation"
+        echo "    --turn-index N               Record one zero-based turn; prior turns are generated as context"
+        echo "    --turn-start-index N         Record a zero-based turn range inside --conversation-index"
+        echo "    --turn-end-index N           End of the recorded turn range"
+        echo "    --attn-implementation NAME   Request HF eager, sdpa, or flash_attention_2 for capture"
+        echo "    --use-cache auto|on|off      Legacy default for generate and diagnostics unless split flags are supplied"
+        echo "    --generate-use-cache MODE    Cache mode for model.generate only: auto, on, off"
+        echo "    --diagnostic-use-cache MODE  Cache mode for diagnostic forward only: auto, on, off"
+        echo "    --diagnostic-scope MODE      all, final, or postponed diagnostics for selected turns"
+        echo "    --diagnose-pre-post-forward  Capture diagnostic forward before and after generate"
+        echo "    --between-turn-cleanup MODE  none, gc, or reset before turns after the first"
+        echo "    --reload-model-between-turns Reload HF model before turns after the first"
+        echo "    --diagnostic-only            Write diagnostic/failure manifest only, not a reference artifact"
+        echo "    --output PATH                Explicit output path; subset captures otherwise use diagnostic filenames"
         echo "  Notes:"
         echo "    - Uses public Hugging Face repo IDs only; does not use an HF token."
         echo "    - capture root:"
@@ -1621,6 +2776,7 @@ case "$cmd" in
         echo "  ./dev capture-box prep qcn --detach"
         echo "  ./dev capture-box stage qcn gemma"
         echo "  ./dev capture-box generate Qwen3-Coder-Next --profile greedy_chat_thinking_off"
+        echo "  ./dev reference-backfill-topk qwen35 --reference ../krasis-internal/reference-outputs/output/Qwen3.5-35B-A3B/greedy_reference.json"
         echo "  ./dev awq-calibrate qcn    Build AWQ attention template"
         echo "  ./dev perplexity qcn"
         echo "  ./dev trace-diff /tmp/expected.log /tmp/actual.log --events mark,tensor"

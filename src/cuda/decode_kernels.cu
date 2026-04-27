@@ -5003,6 +5003,219 @@ extern "C" __global__ void hqq4_decode_gemv_bf16(
     }
 }
 
+extern "C" __global__ void hqq8_decode_gemv_f32(
+    const unsigned char* __restrict__ packed_w,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    const unsigned short* __restrict__ input,
+    float* __restrict__ output,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes
+) {
+    extern __shared__ unsigned short s_input[];
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < cols; i += 256) {
+        s_input[i] = input[i];
+    }
+    __syncthreads();
+
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int row = blockIdx.x * 8 + warp_id;
+    if (row >= rows) return;
+
+    const unsigned char* w_row = packed_w + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)zeros + (long long)row * zeros_row_stride_bytes);
+
+    float acc = 0.0f;
+    for (int col = lane; col < cols; col += 32) {
+        int group = (group_size == 128) ? (col >> 7) : (col / group_size);
+        float w = ((float)w_row[col] - z_row[group]) * s_row[group];
+        float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[col]));
+        acc += w * x;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (lane == 0) {
+        output[row] = acc;
+    }
+}
+
+extern "C" __global__ void hqq8_decode_gemv_bf16(
+    const unsigned char* __restrict__ packed_w,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    const unsigned short* __restrict__ input,
+    unsigned short* __restrict__ output,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes
+) {
+    extern __shared__ unsigned short s_input[];
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < cols; i += 256) {
+        s_input[i] = input[i];
+    }
+    __syncthreads();
+
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int row = blockIdx.x * 8 + warp_id;
+    if (row >= rows) return;
+
+    const unsigned char* w_row = packed_w + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)zeros + (long long)row * zeros_row_stride_bytes);
+
+    float acc = 0.0f;
+    for (int col = lane; col < cols; col += 32) {
+        int group = (group_size == 128) ? (col >> 7) : (col / group_size);
+        float w = ((float)w_row[col] - z_row[group]) * s_row[group];
+        float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[col]));
+        acc += w * x;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (lane == 0) {
+        __nv_bfloat16 result = __float2bfloat16(acc);
+        output[row] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
+extern "C" __global__ void hqq_decode_int8_exception_delta_f32(
+    const signed char* __restrict__ exception_qint8,
+    const float* __restrict__ exception_scales,
+    const int* __restrict__ output_rows,
+    const int* __restrict__ start_cols,
+    const int* __restrict__ widths,
+    const unsigned char* __restrict__ hqq_packed_w,
+    const float* __restrict__ hqq_scales,
+    const float* __restrict__ hqq_zeros,
+    const unsigned short* __restrict__ input,
+    float* __restrict__ output,
+    int row_group_count,
+    int cols,
+    int group_size,
+    int max_width,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes
+) {
+    extern __shared__ float smem[];
+    int entry = blockIdx.x;
+    int tid = threadIdx.x;
+    if (entry >= row_group_count) return;
+
+    int row = output_rows[entry];
+    int start_col = start_cols[entry];
+    int width = widths[entry];
+    const unsigned char* w_row = hqq_packed_w + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)hqq_scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)hqq_zeros + (long long)row * zeros_row_stride_bytes);
+    float exc_scale = exception_scales[entry];
+
+    float acc = 0.0f;
+    for (int local = tid; local < width; local += blockDim.x) {
+        int col = start_col + local;
+        if (col >= cols) continue;
+        unsigned char packed = w_row[col >> 1];
+        int q = (col & 1) ? (int)(packed >> 4) : (int)(packed & 0x0F);
+        int group = col / group_size;
+        float hqq_w = (float(q) - z_row[group]) * s_row[group];
+        float int8_w = (float)exception_qint8[entry * max_width + local] * exc_scale;
+        float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&input[col]));
+        acc += (int8_w - hqq_w) * x;
+    }
+
+    smem[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        output[row] += smem[0];
+    }
+}
+
+extern "C" __global__ void hqq_decode_int8_exception_delta_bf16(
+    const signed char* __restrict__ exception_qint8,
+    const float* __restrict__ exception_scales,
+    const int* __restrict__ output_rows,
+    const int* __restrict__ start_cols,
+    const int* __restrict__ widths,
+    const unsigned char* __restrict__ hqq_packed_w,
+    const float* __restrict__ hqq_scales,
+    const float* __restrict__ hqq_zeros,
+    const unsigned short* __restrict__ input,
+    unsigned short* __restrict__ output,
+    int row_group_count,
+    int cols,
+    int group_size,
+    int max_width,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes
+) {
+    extern __shared__ float smem[];
+    int entry = blockIdx.x;
+    int tid = threadIdx.x;
+    if (entry >= row_group_count) return;
+
+    int row = output_rows[entry];
+    int start_col = start_cols[entry];
+    int width = widths[entry];
+    const unsigned char* w_row = hqq_packed_w + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)hqq_scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)hqq_zeros + (long long)row * zeros_row_stride_bytes);
+    float exc_scale = exception_scales[entry];
+
+    float acc = 0.0f;
+    for (int local = tid; local < width; local += blockDim.x) {
+        int col = start_col + local;
+        if (col >= cols) continue;
+        unsigned char packed = w_row[col >> 1];
+        int q = (col & 1) ? (int)(packed >> 4) : (int)(packed & 0x0F);
+        int group = col / group_size;
+        float hqq_w = (float(q) - z_row[group]) * s_row[group];
+        float int8_w = (float)exception_qint8[entry * max_width + local] * exc_scale;
+        float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&input[col]));
+        acc += (int8_w - hqq_w) * x;
+    }
+
+    smem[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        __nv_bfloat16 base = *reinterpret_cast<__nv_bfloat16*>(&output[row]);
+        __nv_bfloat16 result = __float2bfloat16(__bfloat162float(base) + smem[0]);
+        output[row] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
 // ── BF16 → FP8 E4M3 conversion ──────────────────────────────────────────
 // ── Marlin INT8 GEMV (W8A16 attention decode) ────────────────────────
 //

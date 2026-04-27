@@ -114,6 +114,8 @@ struct ServerState {
     /// Model's EOS token IDs (from generation_config.json).
     /// These are always included in stop_ids for decode, matching the main branch behavior.
     eos_stop_ids: Vec<usize>,
+    /// Monotonic order for /v1/internal/reference_test requests.
+    reference_test_request_order: u64,
 }
 
 /// Parsed HTTP request.
@@ -199,6 +201,127 @@ fn send_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result
         body
     )?;
     stream.flush()
+}
+
+fn fnv1a_token_hash(token_ids: &[u32]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &token in token_ids {
+        for byte in token.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn reference_logit_trace_json(
+    logits: &[f32],
+    vocab_size: usize,
+    selected_token: usize,
+    top_n: usize,
+) -> serde_json::Value {
+    let vocab_size = vocab_size.min(logits.len());
+    if vocab_size == 0 {
+        return serde_json::json!({
+            "available": false,
+            "reason": "empty_logits",
+        });
+    }
+
+    let mut finite_count = 0usize;
+    let mut nan_count = 0usize;
+    let mut pos_inf_count = 0usize;
+    let mut neg_inf_count = 0usize;
+    let mut max_logit = f32::NEG_INFINITY;
+    let mut max_token = 0usize;
+    let mut min_logit = f32::INFINITY;
+    let mut min_token = 0usize;
+
+    for (idx, &value) in logits[..vocab_size].iter().enumerate() {
+        if value.is_nan() {
+            nan_count += 1;
+            continue;
+        }
+        if value == f32::INFINITY {
+            pos_inf_count += 1;
+        } else if value == f32::NEG_INFINITY {
+            neg_inf_count += 1;
+        } else {
+            finite_count += 1;
+        }
+        if value > max_logit {
+            max_logit = value;
+            max_token = idx;
+        }
+        if value < min_logit {
+            min_logit = value;
+            min_token = idx;
+        }
+    }
+
+    let sum_exp: f64 = logits[..vocab_size]
+        .iter()
+        .filter(|v| !v.is_nan())
+        .map(|&x| ((x - max_logit) as f64).exp())
+        .sum();
+    let log_sum_exp = max_logit as f64 + sum_exp.ln();
+    let selected_raw_logit = logits.get(selected_token).copied().unwrap_or(f32::NAN);
+    let selected_logprob = selected_raw_logit as f64 - log_sum_exp;
+
+    let mut top_logits: Vec<(usize, f32)> = Vec::with_capacity(top_n.saturating_add(1));
+    for (idx, &value) in logits[..vocab_size].iter().enumerate() {
+        if value.is_nan() {
+            continue;
+        }
+        if top_logits.len() < top_n {
+            top_logits.push((idx, value));
+            if top_logits.len() == top_n {
+                top_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        } else if top_n > 0 && value > top_logits[top_n - 1].1 {
+            top_logits[top_n - 1] = (idx, value);
+            top_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    top_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let top_entries: Vec<serde_json::Value> = top_logits
+        .iter()
+        .enumerate()
+        .map(|(rank, &(token_id, raw_logit))| {
+            serde_json::json!({
+                "rank": rank + 1,
+                "token_id": token_id,
+                "raw_logit": raw_logit as f64,
+                "logprob": raw_logit as f64 - log_sum_exp,
+                "softmax_prob": (raw_logit as f64 - log_sum_exp).exp(),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "available": true,
+        "source": "prefill_engine.h_logits_after_lm_head_download_and_suppression",
+        "dtype": "f32",
+        "device_before_download": "cuda",
+        "host_buffer": "engine.h_logits",
+        "vocab_size": vocab_size,
+        "selected_token_id": selected_token,
+        "selected_raw_logit": selected_raw_logit as f64,
+        "selected_logprob_from_raw": selected_logprob,
+        "selected_softmax_prob_from_raw": selected_logprob.exp(),
+        "max_logit": max_logit as f64,
+        "max_token_id": max_token,
+        "min_logit": min_logit as f64,
+        "min_token_id": min_token,
+        "sum_exp_shifted": sum_exp,
+        "logsumexp": log_sum_exp,
+        "finite_count": finite_count,
+        "nan_count": nan_count,
+        "pos_inf_count": pos_inf_count,
+        "neg_inf_count": neg_inf_count,
+        "top_logits_before_logprob": top_entries,
+    })
 }
 
 /// Begin an SSE stream (send headers, return stream for data).
@@ -703,7 +826,7 @@ fn handle_chat_completion(
         let kv_max_seq = engine.kv_max_seq;
         let kv_overflow = token_ids.len() > kv_max_seq;
 
-        let has_hqq_runtime_slots = {
+        let _has_hqq_runtime_slots = {
             let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
             match prepare_store_for_rust_prefill(store) {
                 Ok(has_hqq) => has_hqq,
@@ -715,15 +838,6 @@ fn handle_chat_completion(
         };
 
         engine.set_prefill_hcs_guard_store_addr(state.gpu_store_addr);
-        if has_hqq_runtime_slots {
-            if let Err(e) = engine.materialize_hqq_prefill_weights() {
-                engine.clear_prefill_hcs_guard_store_addr();
-                let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-                let _ = store.prepare_runtime_for_decode_rust();
-                let _ = send_json(stream, 500, &format!(r#"{{"error":"HQQ prefill refresh failed: {}"}}"#, e));
-                return;
-            }
-        }
 
         // Dynamically allocate scratch sized for this prompt
         if let Err(e) = engine.prepare_for_prefill(token_ids.len()) {
@@ -1011,7 +1125,7 @@ fn handle_prefill_logits(
         engine.update_hcs_snapshot(cache_fast, ne);
     }
 
-    let has_hqq_runtime_slots = {
+    let _has_hqq_runtime_slots = {
         let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
         match prepare_store_for_rust_prefill(store) {
             Ok(has_hqq) => has_hqq,
@@ -1021,15 +1135,6 @@ fn handle_prefill_logits(
             }
         }
     };
-
-    if has_hqq_runtime_slots {
-        if let Err(e) = engine.materialize_hqq_prefill_weights() {
-            let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-            let _ = store.prepare_runtime_for_decode_rust();
-            let _ = send_json(stream, 500, &format!(r#"{{"error":"HQQ prefill refresh failed: {}"}}"#, e));
-            return;
-        }
-    }
 
     // Dynamically allocate scratch for this prompt
     // run_prefill_logits needs scratch sized for all tokens (no chunking)
@@ -1101,6 +1206,8 @@ fn handle_reference_test(
     state: &mut ServerState,
 ) {
     let t_start = Instant::now();
+    state.reference_test_request_order = state.reference_test_request_order.saturating_add(1);
+    let reference_request_order = state.reference_test_request_order;
 
     // Parse request
     let req: serde_json::Value = match serde_json::from_str(body) {
@@ -1124,6 +1231,15 @@ fn handle_reference_test(
 
     let max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
     let top_logprobs = req.get("top_logprobs").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let debug_reference_trace = req
+        .get("debug_reference_trace")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let client_request_id = req
+        .get("debug_request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let input_token_hash = fnv1a_token_hash(&input_token_ids);
 
     // Stop token IDs (from reference data's eos_token_ids)
     let stop_ids: Vec<usize> = match req.get("stop_token_ids") {
@@ -1138,7 +1254,7 @@ fn handle_reference_test(
 
     // ── Evict soft HCS before prefill ──
     let store_for_evict = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-    let (_evicted, _freed_mb) = store_for_evict.hcs_evict_for_prefill(input_token_ids.len());
+    let (evicted, freed_mb) = store_for_evict.hcs_evict_for_prefill(input_token_ids.len());
 
     // ── Prefill with raw token IDs (no tokenization, no chat template) ──
     let mut engine_guard = state.rust_prefill.lock().unwrap();
@@ -1157,6 +1273,12 @@ fn handle_reference_test(
         engine.update_hcs_snapshot(cache_fast, ne);
     }
 
+    let (hcs_snapshot_entries, hcs_num_experts_per_layer) = {
+        let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
+        let (cache_fast, ne) = store.export_hcs_snapshot();
+        (cache_fast.len(), ne)
+    };
+
     let has_hqq_runtime_slots = {
         let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
         match prepare_store_for_rust_prefill(store) {
@@ -1168,14 +1290,7 @@ fn handle_reference_test(
         }
     };
 
-    if has_hqq_runtime_slots {
-        if let Err(e) = engine.materialize_hqq_prefill_weights() {
-            let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-            let _ = store.prepare_runtime_for_decode_rust();
-            let _ = send_json(stream, 500, &format!(r#"{{"error":"HQQ prefill refresh failed: {}"}}"#, e));
-            return;
-        }
-    }
+    let hqq_prefill_materialized = false;
 
     // Dynamically allocate scratch for this prompt
     if let Err(e) = engine.prepare_for_prefill(input_token_ids.len()) {
@@ -1184,24 +1299,43 @@ fn handle_reference_test(
         let _ = send_json(stream, 500, &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e));
         return;
     }
+    let scratch_tokens_after_prepare = engine.scratch.max_tokens;
+    let prefill_chunk_size_after_prepare = engine.config.prefill_chunk_size;
 
     // Run prefill with temperature=0 (greedy)
     let suppress_tokens = {
         let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
         store.suppress_tokens_clone()
     };
+    engine.set_reference_debug_trace_enabled(debug_reference_trace);
     let prefill_result = engine.run_prefill(
         &input_token_ids,
         0.0, // temperature=0 for greedy
         &suppress_tokens,
     );
+    let debug_prefill_stage_trace = if debug_reference_trace {
+        engine.take_reference_debug_trace()
+    } else {
+        None
+    };
+    engine.set_reference_debug_trace_enabled(false);
 
-    let (first_token, prompt_len, first_token_top_k) = match prefill_result {
-        Ok(r) => (
-            r.first_token as usize,
-            r.prompt_len,
-            crate::decode::extract_top_logprobs(&engine.h_logits, engine.h_logits.len(), top_logprobs),
-        ),
+    let (first_token, prompt_len, first_token_top_k, debug_prefill_logits) = match prefill_result {
+        Ok(r) => {
+            let first_token = r.first_token as usize;
+            let first_token_top_k = crate::decode::extract_top_logprobs(&engine.h_logits, engine.h_logits.len(), top_logprobs);
+            let debug_prefill_logits = if debug_reference_trace {
+                Some(reference_logit_trace_json(
+                    &engine.h_logits,
+                    engine.h_logits.len(),
+                    first_token,
+                    top_logprobs,
+                ))
+            } else {
+                None
+            };
+            (first_token, r.prompt_len, first_token_top_k, debug_prefill_logits)
+        },
         Err(e) => {
             let _ = engine.release_scratch();
             let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
@@ -1231,12 +1365,13 @@ fn handle_reference_test(
 
     // ── Reload soft HCS after prefill ──
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-    {
-        let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async(prompt_len);
+    let (queued, alloc_mb) = {
+        let (queued, alloc_mb) = store.hcs_reload_after_prefill_async(prompt_len);
         if queued > 0 {
             log::info!("reference_test: HCS soft reload queued {} experts", queued);
         }
-    }
+        (queued, alloc_mb)
+    };
     // Always sync: decode must not start with incomplete HCS
     let (activated, dma_ms) = store.hcs_sync_soft_reload();
     if activated > 0 {
@@ -1296,6 +1431,7 @@ fn handle_reference_test(
     Python::with_gil(|py| {
         let _ = state.py_model.call_method0(py, "server_cleanup");
     });
+    let server_cleanup_called = true;
 
     let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1325,15 +1461,82 @@ fn handle_reference_test(
         first_topk_json.push(format!(r#"{{"token_id":{},"log_prob":{:.6}}}"#, lp_tid, lp_val));
     }
 
+    let debug_json_suffix = if debug_reference_trace {
+        let final_top_logprobs: Vec<serde_json::Value> = first_token_top_k
+            .iter()
+            .enumerate()
+            .map(|(rank, &(token_id, log_prob))| {
+                serde_json::json!({
+                    "rank": rank + 1,
+                    "token_id": token_id,
+                    "log_prob": log_prob as f64,
+                })
+            })
+            .collect();
+        let selected_logprob_from_endpoint = first_token_top_k
+            .iter()
+            .find(|&&(token_id, _)| token_id == first_token as u32)
+            .map(|&(_, log_prob)| log_prob as f64);
+        let trace = serde_json::json!({
+            "schema": "krasis_reference_test_debug_v1",
+            "request_order": reference_request_order,
+            "client_request_id": client_request_id,
+            "input_token_count": input_token_ids.len(),
+            "input_token_hash_fnv1a64": format!("0x{:016x}", input_token_hash),
+            "max_tokens": max_tokens,
+            "top_logprobs": top_logprobs,
+            "stop_token_ids": stop_ids,
+            "selected_token_id": first_token,
+            "prompt_len": prompt_len,
+            "state_reset_proof": {
+                "fresh_prefill_run": true,
+                "run_prefill_zeroes_la_state": true,
+                "hcs_evict_for_prefill_called": true,
+                "hcs_evicted_experts": evicted,
+                "hcs_freed_mb": freed_mb,
+                "hcs_snapshot_entries": hcs_snapshot_entries,
+                "hcs_num_experts_per_layer": hcs_num_experts_per_layer,
+                "prepare_runtime_for_prefill_called": true,
+                "has_hqq_runtime_slots": has_hqq_runtime_slots,
+                "hqq_prefill_materialized": hqq_prefill_materialized,
+                "prepare_for_prefill_prompt_tokens": input_token_ids.len(),
+                "scratch_tokens_after_prepare": scratch_tokens_after_prepare,
+                "prefill_chunk_size_after_prepare": prefill_chunk_size_after_prepare,
+                "release_scratch_called": true,
+                "restore_runtime_for_decode_called": true,
+                "decode_kv_position_set_to_prompt_len": prompt_len,
+                "hcs_reload_after_prefill_queued": queued,
+                "hcs_reload_after_prefill_alloc_mb": alloc_mb,
+                "hcs_sync_soft_reload_activated": activated,
+                "hcs_sync_soft_reload_dma_ms": dma_ms,
+                "server_cleanup_called": server_cleanup_called
+            },
+            "prefill_stage_trace": debug_prefill_stage_trace.unwrap_or_else(|| serde_json::json!({"available": false})),
+            "prefill_logits": debug_prefill_logits.unwrap_or_else(|| serde_json::json!({"available": false})),
+            "final_top_logprobs": final_top_logprobs,
+            "selected_logprob_from_endpoint": selected_logprob_from_endpoint,
+            "timing": {
+                "prefill_ms": prefill_ms,
+                "decode_ms": decode_ms,
+                "total_ms": total_ms,
+                "prompt_tokens": prompt_len
+            }
+        });
+        format!(r#","debug_reference_trace":{}"#, trace)
+    } else {
+        String::new()
+    };
+
     let response = format!(
-        r#"{{"token_ids":[{}],"text":{},"num_tokens":{},"per_token_data":[{}],"first_token_top_k":[{}],"finish_reason":"{}","timing":{{"prefill_ms":{:.1},"decode_ms":{:.1},"total_ms":{:.1},"prompt_tokens":{}}}}}"#,
+        r#"{{"token_ids":[{}],"text":{},"num_tokens":{},"per_token_data":[{}],"first_token_top_k":[{}],"finish_reason":"{}","timing":{{"prefill_ms":{:.1},"decode_ms":{:.1},"total_ms":{:.1},"prompt_tokens":{}}}{}}}"#,
         output_tokens.iter().map(|(t, _)| t.to_string()).collect::<Vec<_>>().join(","),
         text_escaped,
         output_tokens.len(),
         per_token_json.join(","),
         first_topk_json.join(","),
         finish_reason,
-        prefill_ms, decode_ms, total_ms, prompt_len
+        prefill_ms, decode_ms, total_ms, prompt_len,
+        debug_json_suffix
     );
 
     log::info!("reference_test: {} output tokens in {:.0}ms (prefill={:.0}ms decode={:.0}ms), finish={}",
@@ -2106,6 +2309,7 @@ impl RustServer {
                 rust_prefill,
                 test_endpoints,
                 eos_stop_ids,
+                reference_test_request_order: 0,
             };
 
             while running.load(Ordering::Acquire) {
@@ -2221,18 +2425,11 @@ impl RustServer {
 
         let kv_overflow = token_ids.len() > engine.kv_max_seq;
 
-        let has_hqq_runtime_slots = prepare_store_for_rust_prefill(store)
+        let _has_hqq_runtime_slots = prepare_store_for_rust_prefill(store)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("Failed to prepare runtime for prefill: {}", e)))?;
 
         engine.set_prefill_hcs_guard_store_addr(self.gpu_store_addr);
-        if has_hqq_runtime_slots {
-            engine.materialize_hqq_prefill_weights().map_err(|e| {
-                let _ = store.prepare_runtime_for_decode_rust();
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("Rust HQQ prefill refresh failed: {}", e))
-            })?;
-        }
 
         // Dynamically allocate scratch for this prompt
         if let Err(e) = engine.prepare_for_prefill(token_ids.len()) {

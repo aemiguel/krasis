@@ -1,0 +1,110 @@
+{
+  "decision": "int8_exception_prefill_runtime_loads_and_executes_q35_g14_improves_selected_logprob_qcn_g12_regresses_slightly",
+  "scope": {
+    "runtime_default_changed": false,
+    "decode_changed": false,
+    "sigmoid_changed": false,
+    "qkvz_expansion_changed": false,
+    "fallback_added": false,
+    "prefill_only": true,
+    "mode": "int8_exception"
+  },
+  "manifests": {
+    "qcn": {
+      "model": "Qwen3-Coder-Next",
+      "layer": 0,
+      "tensor": "in_proj_qkvz",
+      "group": 12,
+      "row_group_count": 12288,
+      "sidecar_total_bytes": 1818624,
+      "sidecar_weight_bytes": 1572864,
+      "sidecar_metadata_bytes": 245760,
+      "runtime_ready": true
+    },
+    "q35": {
+      "model": "Qwen3.5-35B-A3B",
+      "layer": 0,
+      "tensor": "in_proj_qkvz",
+      "group": 14,
+      "row_group_count": 12288,
+      "sidecar_total_bytes": 1818624,
+      "sidecar_weight_bytes": 1572864,
+      "sidecar_metadata_bytes": 245760,
+      "runtime_ready": true
+    }
+  },
+  "intrinsic_projection": {
+    "qcn": {
+      "heldout_hqq_rms": 0.0570843741,
+      "heldout_int8_rms": 0.0034785673,
+      "heldout_rms_reduction_fraction": 0.9390627050
+    },
+    "q35": {
+      "heldout_hqq_rms": 0.0362454876,
+      "heldout_int8_rms": 0.0022250710,
+      "heldout_rms_reduction_fraction": 0.9386110905
+    }
+  },
+  "witness": {
+    "qcn_hqq_only": {
+      "summary": "logs/reference-test_20260426_192008/reference_test_summary.json",
+      "first_token": "8/8",
+      "selected_sum": 0.1236746500,
+      "top_overlap": "73/80",
+      "duration_seconds": 129.8
+    },
+    "qcn_int8_exception": {
+      "summary": "logs/reference-test_20260426_192240/reference_test_summary.json",
+      "first_token": "8/8",
+      "selected_sum": 0.1249526500,
+      "delta_vs_hqq_only": 0.0012780000,
+      "top_overlap": "73/80",
+      "duration_seconds": 126.5
+    },
+    "q35_hqq_only": {
+      "summary": "logs/reference-test_20260426_192514/reference_test_summary.json",
+      "first_token": "10/10",
+      "selected_sum": 0.8936375677,
+      "top_overlap": "85/100",
+      "duration_seconds": 137.4
+    },
+    "q35_int8_exception": {
+      "summary": "logs/reference-test_20260426_192825/reference_test_summary.json",
+      "first_token": "10/10",
+      "selected_sum": 0.8429255677,
+      "delta_vs_hqq_only": -0.0507120000,
+      "top_overlap": "84/100",
+      "duration_seconds": 136.5
+    }
+  },
+  "benchmarks": {
+    "qcn_hqq_only": {
+      "log": "logs/dev-benchmark_20260426_193218/benchmark_report.log",
+      "prefill_internal_tok_s": 7912.5,
+      "decode_internal_tok_s": 73.97,
+      "network_round_trip_tok_s": 150.85,
+      "min_free_vram_mb": 686
+    },
+    "qcn_int8_exception": {
+      "log": "logs/dev-benchmark_20260426_193537/benchmark_report.log",
+      "prefill_internal_tok_s": 7832.5,
+      "decode_internal_tok_s": 71.95,
+      "network_round_trip_tok_s": 146.84,
+      "min_free_vram_mb": 682
+    },
+    "q35_hqq_only": {
+      "log": "logs/dev-benchmark_20260426_193851/benchmark_report.log",
+      "prefill_internal_tok_s": 9360.5,
+      "decode_internal_tok_s": 116.24,
+      "network_round_trip_tok_s": 266.64,
+      "min_free_vram_mb": 5452
+    },
+    "q35_int8_exception": {
+      "log": "logs/dev-benchmark_20260426_194201/benchmark_report.log",
+      "prefill_internal_tok_s": 9332.0,
+      "decode_internal_tok_s": 116.06,
+      "network_round_trip_tok_s": 235.24,
+      "min_free_vram_mb": 5452
+    }
+  }
+}

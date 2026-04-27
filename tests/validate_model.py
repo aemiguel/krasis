@@ -116,6 +116,37 @@ def die(msg: str):
     sys.exit(1)
 
 
+def reference_runtime_name(reference: Dict[str, Any]) -> str:
+    """Return the declared producer runtime for a stored reference artifact."""
+    contract = reference.get("contract")
+    if isinstance(contract, dict):
+        runtime = contract.get("runtime")
+        if isinstance(runtime, dict) and runtime.get("name"):
+            return str(runtime["name"]).lower()
+    runtime = reference.get("runtime")
+    return str(runtime).lower() if runtime else "unknown"
+
+
+def require_non_archived_reference(reference: Dict[str, Any], reference_path: str) -> None:
+    """Block archived HF artifacts while allowing future non-HF witness artifacts."""
+    runtime_name = reference_runtime_name(reference)
+    if runtime_name != "transformers":
+        return
+    if os.environ.get("KRASIS_ALLOW_ARCHIVED_HF_REFERENCE") == "1":
+        warn(
+            "Using archived HF/Transformers reference artifact because "
+            "KRASIS_ALLOW_ARCHIVED_HF_REFERENCE=1 is set"
+        )
+        return
+    die(
+        "Reference artifact is HF/Transformers-backed and archived.\n"
+        f"  artifact: {reference_path}\n"
+        "  Use a llama-witness/non-HF reference artifact for normal validation.\n"
+        "  For forensic reruns only, set KRASIS_ALLOW_ARCHIVED_HF_REFERENCE=1 "
+        "and document the reason in krasis-internal."
+    )
+
+
 def find_krasis_command() -> str:
     """Find the installed krasis command."""
     conda_path = os.path.expanduser("~/miniconda3/envs/ktransformers/bin/krasis")
@@ -236,7 +267,11 @@ def apply_reference_chat_template(
     return template_out[0].tolist()
 
 
-def launch_server(config_path: str, test_endpoints: bool = False) -> Tuple[subprocess.Popen, str]:
+def launch_server(
+    config_path: str,
+    test_endpoints: bool = False,
+    selected_gpus: Optional[str] = None,
+) -> Tuple[subprocess.Popen, str]:
     """Launch Krasis server, return (process, log_path)."""
     log_dir = REPO_DIR / "logs" / "validate"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -246,6 +281,8 @@ def launch_server(config_path: str, test_endpoints: bool = False) -> Tuple[subpr
     # we run the correct krasis installation, not a stale one.
     python = sys.executable
     cmd = [python, "-m", "krasis.server", "--config", config_path]
+    if selected_gpus:
+        cmd.extend(["--selected-gpus", selected_gpus])
     if test_endpoints:
         cmd.append("--test-endpoints")
 
@@ -570,7 +607,8 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
                     enable_logprobs: bool = True, enable_prefill: bool = True,
                     max_prompts: Optional[int] = None,
                     return_summary: bool = False,
-                    profile_id: Optional[str] = None):
+                    profile_id: Optional[str] = None,
+                    selected_gpus: Optional[str] = None):
     """Run multi-layer validation against reference outputs.
 
     Layer 1: Decode token matching (always on)
@@ -584,6 +622,8 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
 
     info(f"Model: {model_name}")
     info(f"Config: {config_path}")
+    if selected_gpus:
+        info(f"Selected GPU override: {selected_gpus}")
     info(f"Attention: {'quantized' if is_quant else 'BF16'} (min match: {min_match} tokens)")
     layers_active = ["L1:tokens"]
     if enable_logprobs:
@@ -599,6 +639,7 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
 
     # Load reference
     reference, reference_path = load_reference(model_name, profile_id)
+    require_non_archived_reference(reference, reference_path)
     ref_conversations = reference["conversations"]
     total_reference_prompts = sum(len(c["turns"]) for c in ref_conversations)
     if max_prompts is not None:
@@ -646,6 +687,7 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
         tokenizer,
         max_new_tokens=reference.get("max_new_tokens", 200),
         effective_profile_id=reference_contract.get("profile_id"),
+        selected_gpus_override=selected_gpus,
     )
     contract_validation = validate_contracts(reference_contract, runtime_contract)
     reference_artifact = build_reference_artifact_metadata(reference, reference_contract, reference_path)
@@ -681,7 +723,11 @@ def validate_model(config_path: str, no_server: bool = False, port: Optional[int
     proc = None
     if not no_server:
         info(f"Starting Krasis server on port {config_port}...")
-        proc, log_path = launch_server(config_path, test_endpoints=(enable_prefill or compare_first_step))
+        proc, log_path = launch_server(
+            config_path,
+            test_endpoints=(enable_prefill or compare_first_step),
+            selected_gpus=selected_gpus,
+        )
         info(f"Server log: {log_path}")
 
         if not wait_for_health(config_port):
@@ -985,6 +1031,8 @@ def main():
                         help="Only run Layer 1 (token matching)")
     parser.add_argument("--max-prompts", type=int, default=None,
                         help="Stop after this many reference prompts")
+    parser.add_argument("--selected-gpus", default=None,
+                        help="Explicit physical GPU indices to pass through to krasis.server")
     args = parser.parse_args()
 
     enable_logprobs = not args.no_logprobs and not args.l1_only
@@ -994,7 +1042,8 @@ def main():
                             enable_logprobs=enable_logprobs,
                             enable_prefill=enable_prefill,
                             max_prompts=args.max_prompts,
-                            profile_id=args.profile))
+                            profile_id=args.profile,
+                            selected_gpus=args.selected_gpus))
 
 
 if __name__ == "__main__":

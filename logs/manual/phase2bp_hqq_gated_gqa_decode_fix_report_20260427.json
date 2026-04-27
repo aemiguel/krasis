@@ -1,0 +1,84 @@
+{
+  "phase": "2BP",
+  "date_utc": "2026-04-27",
+  "scope": "QCN HQQ gated GQA decode correctness diagnosis and fix",
+  "bug": {
+    "component": "src/gpu_decode.rs gated GQA decode",
+    "affected_modes": [
+      "HQQ4 gated GQA fused-QKV decode",
+      "HQQ8 gated GQA fused-QKV decode"
+    ],
+    "symptom": "HQQ fused-QKV wrote raw Q+gate to d_gqa_q, while split_gated_q read from d_gqa_out; HQQ fused-QKV skipped the alias-safe copy used by BF16/non-HQQ fused-QKV.",
+    "fix": "Copy d_gqa_q to d_gqa_out before split_gated_q whenever raw Q+gate is not already in d_gqa_out."
+  },
+  "commands": [
+    "./dev build",
+    "KRASIS_LA_DECODE_UNFUSED=1 ./dev witness-compare logs/manual/phase2bm_qcn_accuracy_hqq8_20260426.conf --profile phase2bn_qcn_64tok",
+    "KRASIS_NO_GRAPH=1 ./dev witness-compare logs/manual/phase2bm_qcn_accuracy_hqq8_20260426.conf --profile phase2bn_qcn_64tok",
+    "./dev witness-compare logs/manual/phase2bm_qcn_accuracy_hqq8_20260426.conf --profile phase2bn_qcn_64tok",
+    "./dev witness-compare logs/manual/phase2bm_qcn_accuracy_hqq4_20260426.conf --profile phase2bn_qcn_64tok"
+  ],
+  "runs": {
+    "hqq8_before": {
+      "summary": "logs/reference-test_20260427_023105/reference_test_summary.json",
+      "first_token": "14/14",
+      "selected_sum": 0.129170737779,
+      "top_overlap": "136/140",
+      "avg_exact_prefix": 7.428571428571429,
+      "worst_exact_prefix": 1,
+      "full_matches": "3/14",
+      "match_runs": [12, 7, 5, 8, 11, 11, 18, 1, 5, 4, 2, 8, 5, 7]
+    },
+    "hqq8_fixed": {
+      "summary": "logs/reference-test_20260427_084817/reference_test_summary.json",
+      "first_token": "14/14",
+      "selected_sum": 0.065985003411,
+      "top_overlap": "134/140",
+      "avg_exact_prefix": 16.428571428571427,
+      "worst_exact_prefix": 2,
+      "full_matches": "4/14",
+      "match_runs": [12, 4, 2, 9, 11, 11, 33, 17, 48, 6, 10, 11, 31, 25]
+    },
+    "bf16_control": {
+      "summary": "logs/reference-test_20260427_075501/reference_test_summary.json",
+      "first_token": "14/14",
+      "selected_sum": 0.13235183463,
+      "top_overlap": "135/140",
+      "avg_exact_prefix": 17.142857142857142,
+      "worst_exact_prefix": 4,
+      "full_matches": "5/14",
+      "match_runs": [12, 4, 17, 9, 11, 11, 22, 17, 9, 6, 40, 11, 7, 64]
+    },
+    "awq_control": {
+      "summary": "logs/reference-test_20260427_021702/reference_test_summary.json",
+      "first_token": "14/14",
+      "selected_sum": 0.372141474328,
+      "top_overlap": "123/140",
+      "avg_exact_prefix": 14.571428571428571,
+      "worst_exact_prefix": 4,
+      "full_matches": "4/14",
+      "match_runs": [12, 14, 32, 9, 11, 11, 33, 17, 5, 4, 10, 8, 31, 7]
+    },
+    "hqq4_before": {
+      "summary": "logs/reference-test_20260427_022304/reference_test_summary.json",
+      "first_token": "13/14",
+      "selected_sum": 0.340154573046,
+      "top_overlap": "129/140",
+      "avg_exact_prefix": 7.428571428571429,
+      "worst_exact_prefix": 0,
+      "full_matches": "3/14",
+      "match_runs": [12, 4, 5, 5, 11, 11, 18, 1, 15, 6, 2, 0, 7, 7]
+    },
+    "hqq4_fixed": {
+      "summary": "logs/reference-test_20260427_085538/reference_test_summary.json",
+      "first_token": "13/14",
+      "selected_sum": 0.383182601676,
+      "top_overlap": "128/140",
+      "avg_exact_prefix": 11.785714285714286,
+      "worst_exact_prefix": 0,
+      "full_matches": "4/14",
+      "match_runs": [12, 4, 17, 9, 11, 11, 1, 1, 29, 6, 26, 0, 31, 7]
+    }
+  },
+  "conclusion": "The severe HQQ8 divergence was caused by a stale-buffer bug in HQQ gated GQA fused-QKV decode. After the fix, HQQ8 moves from 7.43 to 16.43 average exact-prefix tokens and is close to the BF16 control in the controlled QCN 64-token matrix."
+}

@@ -23,10 +23,12 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
+from safetensors import safe_open
 
 from krasis.attention_backend import (
     attention_quant_nbits,
     HQQ_ATTENTION_CACHE_VERSION,
+    HQQ_CACHE_PROFILE_BASELINE,
     hqq_attention_cache_dir,
     hqq_attention_cache_total_bytes,
     hqq_backend_name,
@@ -39,6 +41,8 @@ from krasis.attention_backend import (
     load_hqq_attention_artifact,
     load_hqq_attention_manifest,
     load_hqq_attention_pending_manifest,
+    require_complete_hqq_sidecar_manifest,
+    require_complete_hqq_attention_manifest,
     save_hqq_attention_manifest,
     save_hqq_attention_pending_manifest,
     validate_hqq_nbits,
@@ -1198,16 +1202,33 @@ class KrasisModel:
         if nbits is None:
             raise RuntimeError(
                 f"HQQ attention backend must declare nbits, got {self.quant_cfg.attention}"
-            )
+        )
         validate_hqq_nbits(nbits)
-        cache_dir = hqq_attention_cache_dir(self.cfg.model_path)
+        cache_profile = self.quant_cfg.hqq_cache_profile
+        cache_dir = hqq_attention_cache_dir(self.cfg.model_path, cache_profile, nbits)
         manifest = init_hqq_attention_manifest(
             self.cfg.model_path,
             num_hidden_layers=self.cfg.num_hidden_layers,
             nbits=nbits,
         )
-        existing = load_hqq_attention_manifest(self.cfg.model_path)
-        pending = load_hqq_attention_pending_manifest(self.cfg.model_path)
+        if cache_profile != HQQ_CACHE_PROFILE_BASELINE:
+            self._hqq_rebuild = False
+            self._hqq_finalize_pending_manifest = False
+            self._hqq_manifest = require_complete_hqq_attention_manifest(
+                self.cfg.model_path,
+                cache_profile=cache_profile,
+                expected_nbits=nbits,
+                expected_num_hidden_layers=self.cfg.num_hidden_layers,
+            )
+            logger.info(
+                "Using HQQ attention cache profile '%s' from %s",
+                cache_profile,
+                hqq_attention_manifest_path(self.cfg.model_path, cache_profile, nbits),
+            )
+            return
+
+        existing = load_hqq_attention_manifest(self.cfg.model_path, cache_profile, nbits)
+        pending = load_hqq_attention_pending_manifest(self.cfg.model_path, cache_profile, nbits)
         self._hqq_rebuild = True
         self._hqq_finalize_pending_manifest = False
 
@@ -1253,17 +1274,17 @@ class KrasisModel:
                 self._hqq_finalize_pending_manifest = True
                 logger.info(
                     "Recovering complete pending HQQ attention manifest from %s",
-                    hqq_attention_pending_manifest_path(self.cfg.model_path),
+                    hqq_attention_pending_manifest_path(self.cfg.model_path, cache_profile, nbits),
                 )
         if self._hqq_rebuild:
             if os.path.isdir(cache_dir):
                 shutil.rmtree(cache_dir)
             os.makedirs(cache_dir, exist_ok=True)
-            incomplete_manifest_path = hqq_attention_manifest_path(self.cfg.model_path)
+            incomplete_manifest_path = hqq_attention_manifest_path(self.cfg.model_path, cache_profile, nbits)
             if os.path.isfile(incomplete_manifest_path):
                 os.remove(incomplete_manifest_path)
-            delete_hqq_attention_pending_manifest(self.cfg.model_path)
-            save_hqq_attention_pending_manifest(self.cfg.model_path, manifest)
+            delete_hqq_attention_pending_manifest(self.cfg.model_path, cache_profile, nbits)
+            save_hqq_attention_pending_manifest(self.cfg.model_path, manifest, cache_profile, nbits)
         self._hqq_manifest = manifest
 
     def _maybe_write_hqq_attention_artifacts(self, layer_idx: int, layer_type: str, weights: dict) -> None:
@@ -1391,7 +1412,12 @@ class KrasisModel:
                         ),
                         flush=True,
                     )
-        save_hqq_attention_pending_manifest(self.cfg.model_path, self._hqq_manifest)
+        save_hqq_attention_pending_manifest(
+            self.cfg.model_path,
+            self._hqq_manifest,
+            self.quant_cfg.hqq_cache_profile,
+            nbits,
+        )
         if timing_enabled:
             print(
                 json.dumps(
@@ -1418,16 +1444,17 @@ class KrasisModel:
         validate_hqq_nbits(nbits)
         rebuilding = getattr(self, "_hqq_rebuild", False)
         finalize_pending = getattr(self, "_hqq_finalize_pending_manifest", False)
+        cache_profile = self.quant_cfg.hqq_cache_profile
         manifest = (
-            load_hqq_attention_pending_manifest(self.cfg.model_path)
+            load_hqq_attention_pending_manifest(self.cfg.model_path, cache_profile, nbits)
             if rebuilding or finalize_pending
-            else load_hqq_attention_manifest(self.cfg.model_path)
+            else load_hqq_attention_manifest(self.cfg.model_path, cache_profile, nbits)
         )
         if manifest is None:
             expected_path = (
-                hqq_attention_pending_manifest_path(self.cfg.model_path)
+                hqq_attention_pending_manifest_path(self.cfg.model_path, cache_profile, nbits)
                 if rebuilding or finalize_pending
-                else hqq_attention_manifest_path(self.cfg.model_path)
+                else hqq_attention_manifest_path(self.cfg.model_path, cache_profile, nbits)
             )
             raise RuntimeError(
                 "attention_quant=hqq4 requested but no HQQ attention manifest exists. "
@@ -1502,6 +1529,7 @@ class KrasisModel:
                 entry,
                 expected_nbits=nbits,
                 device="cpu",
+                cache_profile=cache_profile,
             )
             if artifact["tensor_bytes"] != entry["tensor_bytes"]:
                 raise RuntimeError(
@@ -1512,8 +1540,8 @@ class KrasisModel:
         manifest["complete"] = True
         manifest["totals"]["tensor_bytes"] = total_bytes
         manifest["totals"]["num_tensors"] = len(expected)
-        save_hqq_attention_manifest(self.cfg.model_path, manifest)
-        delete_hqq_attention_pending_manifest(self.cfg.model_path)
+        save_hqq_attention_manifest(self.cfg.model_path, manifest, cache_profile, nbits)
+        delete_hqq_attention_pending_manifest(self.cfg.model_path, cache_profile, nbits)
         self._hqq_manifest = manifest
         self._hqq_attention_cache_bytes = total_bytes
 
@@ -1541,6 +1569,7 @@ class KrasisModel:
                 entry,
                 expected_nbits=nbits,
                 device="cpu",
+                cache_profile=self.quant_cfg.hqq_cache_profile,
             )
             if artifact["tensor_bytes"] != entry["tensor_bytes"]:
                 raise RuntimeError(
@@ -1594,8 +1623,151 @@ class KrasisModel:
         self._hqq_attention_runtime = runtime_layers
         self._hqq_attention_runtime_nbits = nbits
         self._hqq_attention_loaded_tensors = loaded_tensors
+        self._hqq_prefill_sidecar_runtime = self._load_hqq_prefill_sidecar_runtime(runtime_layers)
         for layer_idx, layer in enumerate(self.layers):
             setattr(layer, "_hqq_attention_runtime", runtime_layers.get(layer_idx, {}))
+
+    def _load_hqq_prefill_sidecar_runtime(self, runtime_layers: dict) -> dict:
+        sidecar_path = getattr(self.quant_cfg, "hqq_sidecar_manifest", None)
+        if not sidecar_path:
+            return {}
+        if self.quant_cfg.attention != "hqq4":
+            raise RuntimeError(
+                "HQQ sidecar/self-correction is only supported for attention_quant=hqq4. "
+                f"Found attention_quant={self.quant_cfg.attention!r}; HQQ8 must run without sidecars."
+            )
+        manifest = require_complete_hqq_sidecar_manifest(
+            sidecar_path,
+            model_path=self.cfg.model_path,
+            source_cache_profile=self.quant_cfg.hqq_cache_profile,
+        )
+        manifest_path = manifest["_manifest_path"]
+        base_dir = os.path.dirname(manifest_path)
+        mode = str(manifest["sidecar_mode"])
+        variant_name = str(manifest.get("variant_name", ""))
+        sidecars_by_layer = {}
+        total_rows = 0
+        total_bytes = 0
+
+        def _required_tensor(handle, name: str, path: str) -> torch.Tensor:
+            if name not in handle.keys():
+                raise RuntimeError(f"HQQ sidecar artifact {path} is missing tensor {name}")
+            return handle.get_tensor(name).contiguous()
+
+        for artifact in manifest.get("artifacts", []):
+            layer_idx = int(artifact["layer"])
+            tensor_name = str(artifact["tensor"])
+            runtime = runtime_layers.get(layer_idx, {}).get(tensor_name)
+            if runtime is None:
+                raise RuntimeError(
+                    f"HQQ sidecar artifact targets missing HQQ runtime tensor: layer={layer_idx} tensor={tensor_name}"
+                )
+            path = os.path.join(base_dir, artifact["file"])
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                output_rows_raw = _required_tensor(handle, "output_rows", path)
+                start_cols_raw = _required_tensor(handle, "start_cols", path)
+                widths_raw = _required_tensor(handle, "widths", path)
+                groups_raw = _required_tensor(handle, "groups", path)
+                scales_raw = _required_tensor(handle, "scales", path)
+                for tensor_label, tensor_value, expected_dtype in (
+                    ("output_rows", output_rows_raw, torch.int32),
+                    ("start_cols", start_cols_raw, torch.int32),
+                    ("widths", widths_raw, torch.int32),
+                    ("groups", groups_raw, torch.int32),
+                    ("scales", scales_raw, torch.float32),
+                ):
+                    if tensor_value.dtype != expected_dtype:
+                        raise RuntimeError(
+                            f"HQQ sidecar artifact {path} tensor {tensor_label} has dtype "
+                            f"{tensor_value.dtype}, expected {expected_dtype}"
+                        )
+                output_rows = output_rows_raw.contiguous()
+                start_cols = start_cols_raw.contiguous()
+                widths = widths_raw.contiguous()
+                groups = groups_raw.contiguous()
+                scales = scales_raw.contiguous()
+                if mode == "int8_symmetric":
+                    correction = _required_tensor(handle, "correction_qint8", path)
+                    if correction.dtype != torch.int8:
+                        raise RuntimeError(f"HQQ sidecar correction_qint8 dtype mismatch for {path}")
+                    correction = correction.contiguous()
+                elif mode == "int8_exception":
+                    correction = _required_tensor(handle, "exception_qint8", path)
+                    if correction.dtype != torch.int8:
+                        raise RuntimeError(f"HQQ sidecar exception_qint8 dtype mismatch for {path}")
+                    correction = correction.contiguous()
+                elif mode == "exact_bf16":
+                    correction = _required_tensor(handle, "correction_bf16", path)
+                    if correction.dtype != torch.bfloat16:
+                        raise RuntimeError(f"HQQ sidecar correction_bf16 dtype mismatch for {path}")
+                    correction = correction.contiguous()
+                else:
+                    raise RuntimeError(f"Unsupported HQQ sidecar mode {mode!r}")
+            row_group_count = int(output_rows.numel())
+            if row_group_count <= 0:
+                raise RuntimeError(f"HQQ sidecar artifact has no row/groups: {path}")
+            if correction.ndim != 2:
+                raise RuntimeError(f"HQQ sidecar payload tensor must be 2D: {path}")
+            if correction.shape[0] != row_group_count:
+                raise RuntimeError(
+                    f"HQQ sidecar payload row count mismatch for {path}: "
+                    f"{correction.shape[0]} vs {row_group_count}"
+                )
+            for tensor_name_check, tensor in (
+                ("start_cols", start_cols),
+                ("widths", widths),
+                ("groups", groups),
+                ("scales", scales),
+            ):
+                if int(tensor.numel()) != row_group_count:
+                    raise RuntimeError(
+                        f"HQQ sidecar {tensor_name_check} length mismatch for {path}: "
+                        f"{tensor.numel()} vs {row_group_count}"
+                    )
+            rows = int(runtime["orig_shape"][0])
+            cols = int(runtime["orig_shape"][1])
+            if int(output_rows.min().item()) < 0 or int(output_rows.max().item()) >= rows:
+                raise RuntimeError(f"HQQ sidecar output row out of bounds for {path}: rows={rows}")
+            if int(start_cols.min().item()) < 0:
+                raise RuntimeError(f"HQQ sidecar start_col out of bounds for {path}")
+            if int(widths.min().item()) <= 0:
+                raise RuntimeError(f"HQQ sidecar width must be positive for {path}")
+            if int((start_cols + widths).max().item()) > cols:
+                raise RuntimeError(f"HQQ sidecar column range out of bounds for {path}: cols={cols}")
+            if int(widths.max().item()) > int(correction.shape[1]):
+                raise RuntimeError(f"HQQ sidecar payload width is smaller than metadata widths for {path}")
+            sidecars_by_layer.setdefault(layer_idx, []).append(
+                {
+                    "tensor_name": tensor_name,
+                    "mode": mode,
+                    "variant_name": variant_name,
+                    "path": path,
+                    "correction": correction,
+                    "scales": scales,
+                    "output_rows": output_rows,
+                    "groups": groups,
+                    "start_cols": start_cols,
+                    "widths": widths,
+                    "row_group_count": row_group_count,
+                    "max_width": int(correction.shape[1]),
+                }
+            )
+            total_rows += row_group_count
+            total_bytes += correction.numel() * correction.element_size()
+            total_bytes += scales.numel() * scales.element_size()
+            total_bytes += sum(t.numel() * t.element_size() for t in (output_rows, groups, start_cols, widths))
+
+        logger.info(
+            "Loaded HQQ prefill sidecar manifest %s: variant=%s mode=%s artifacts=%d row_groups=%d bytes=%d source_profile=%s",
+            manifest_path,
+            variant_name,
+            mode,
+            sum(len(v) for v in sidecars_by_layer.values()),
+            total_rows,
+            total_bytes,
+            self.quant_cfg.hqq_cache_profile,
+        )
+        return sidecars_by_layer
 
     @staticmethod
     def _hqq_layer_kind(layer: TransformerLayer) -> str:
@@ -1610,11 +1782,13 @@ class KrasisModel:
     def _move_hqq_tensor_to_device(
         tensor: torch.Tensor, device: torch.device, keepalive: list
     ) -> torch.Tensor:
-        if tensor.device == device:
-            return tensor
-        moved = tensor.to(device, non_blocking=True)
-        keepalive.append(moved)
-        return moved
+        if tensor.device != device:
+            tensor = tensor.to(device, non_blocking=True)
+        # HQQ metadata frequently passes same-device temporaries such as
+        # `.float().contiguous()` into Rust by raw pointer. Keep every returned
+        # tensor alive, even when no device copy was needed.
+        keepalive.append(tensor)
+        return tensor
 
     def _hqq_layer_meta(
         self,
@@ -1817,6 +1991,45 @@ class KrasisModel:
                 )
                 staged_runtime_tensors += 1
                 tensor_names.append(tensor_name)
+            for sidecar in getattr(self, "_hqq_prefill_sidecar_runtime", {}).get(layer_idx, []):
+                correction = self._move_hqq_tensor_to_device(
+                    sidecar["correction"], target_device, keepalive
+                )
+                scales = self._move_hqq_tensor_to_device(
+                    sidecar["scales"], target_device, keepalive
+                )
+                output_rows = self._move_hqq_tensor_to_device(
+                    sidecar["output_rows"], target_device, keepalive
+                )
+                groups = self._move_hqq_tensor_to_device(
+                    sidecar["groups"], target_device, keepalive
+                )
+                start_cols = self._move_hqq_tensor_to_device(
+                    sidecar["start_cols"], target_device, keepalive
+                )
+                widths = self._move_hqq_tensor_to_device(
+                    sidecar["widths"], target_device, keepalive
+                )
+                store.stage_hqq_prefill_sidecar_tensor(
+                    layer_idx=layer_idx,
+                    tensor_name=str(sidecar["tensor_name"]),
+                    mode=str(sidecar["mode"]),
+                    variant_name=str(sidecar["variant_name"]),
+                    correction_ptr=int(correction.data_ptr()),
+                    correction_bytes=int(correction.numel() * correction.element_size()),
+                    scales_ptr=int(scales.data_ptr()),
+                    scales_bytes=int(scales.numel() * scales.element_size()),
+                    output_rows_ptr=int(output_rows.data_ptr()),
+                    output_rows_bytes=int(output_rows.numel() * output_rows.element_size()),
+                    groups_ptr=int(groups.data_ptr()),
+                    groups_bytes=int(groups.numel() * groups.element_size()),
+                    start_cols_ptr=int(start_cols.data_ptr()),
+                    start_cols_bytes=int(start_cols.numel() * start_cols.element_size()),
+                    widths_ptr=int(widths.data_ptr()),
+                    widths_bytes=int(widths.numel() * widths.element_size()),
+                    row_group_count=int(sidecar["row_group_count"]),
+                    max_width=int(sidecar["max_width"]),
+                )
             pending_layers.append(
                 dict(
                     layer_idx=layer_idx,
@@ -4887,7 +5100,11 @@ class KrasisModel:
             registered_layers = self._register_hqq_attention_layers_on_store(
                 store, device, self._rust_decode_weights
             )
-            cache_bytes = hqq_attention_cache_total_bytes(self.cfg.model_path) or 0
+            cache_bytes = hqq_attention_cache_total_bytes(
+                self.cfg.model_path,
+                self.quant_cfg.hqq_cache_profile,
+                attention_quant_nbits(self.quant_cfg.attention) or 4,
+            ) or 0
             logger.info(
                 "HQQ attention registration completed on cuda:%d: %d layers, %d MB validated cache, %d tensors loaded. Runtime execution descriptors are active on the decode store.",
                 gpu_idx,

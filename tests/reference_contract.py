@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -189,7 +190,17 @@ def _validate_turn_decode_diagnostics(
                 return f"step {idx} top_k[{top_idx}] token_id invalid"
             if not isinstance(log_prob, (int, float)):
                 return f"step {idx} top_k[{top_idx}] log_prob invalid"
+            if not math.isfinite(float(log_prob)):
+                return f"step {idx} top_k[{top_idx}] log_prob non-finite"
             top_k_ids.append(token_id)
+        if expected_top_k > 0 and len(top_k) != expected_top_k:
+            return f"step {idx} top_k length {len(top_k)} does not match expected {expected_top_k}"
+        log_prob = entry.get("log_prob")
+        logit = entry.get("logit")
+        if not isinstance(log_prob, (int, float)) or not math.isfinite(float(log_prob)):
+            return f"step {idx} selected log_prob missing or non-finite"
+        if not isinstance(logit, (int, float)) or not math.isfinite(float(logit)):
+            return f"step {idx} selected logit missing or non-finite"
         if token_ids[idx] not in top_k_ids and entry["rank"] <= len(top_k_ids):
             return f"step {idx} rank={entry['rank']} but selected token missing from top_k"
     return None
@@ -820,7 +831,7 @@ def build_reference_sanity_report(
             "declared": diagnostics_declared,
             "captured_steps_per_turn": diag_steps if diagnostics_declared else None,
             "top_k": diag_top_k if diagnostics_declared else None,
-            "invalid_turns": diag_errors[:3],
+            "invalid_turns": diag_errors,
         },
     }
 
@@ -889,6 +900,25 @@ def parse_config_file(conf_path: str) -> Dict[str, str]:
     return cfg
 
 
+def normalize_selected_gpus(raw: Optional[str]) -> Optional[str]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    values: List[str] = []
+    seen = set()
+    for part in text.split(","):
+        gpu = part.strip()
+        if not gpu:
+            continue
+        if not gpu.isdigit():
+            raise ValueError(f"selected GPU entry is not an integer: {gpu!r}")
+        if gpu in seen:
+            raise ValueError(f"selected GPU entry is duplicated: {gpu}")
+        seen.add(gpu)
+        values.append(gpu)
+    return ",".join(values) if values else None
+
+
 def _config_bool(cfg: Dict[str, str], key: str, default: bool) -> bool:
     raw = cfg.get(key)
     if raw is None:
@@ -902,6 +932,7 @@ def build_runtime_contract(
     *,
     max_new_tokens: int,
     effective_profile_id: Optional[str] = None,
+    selected_gpus_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     cfg = parse_config_file(conf_path)
     model_path = os.path.expanduser(cfg.get("CFG_MODEL_PATH", ""))
@@ -910,6 +941,10 @@ def build_runtime_contract(
     template_supports_enable_thinking = "enable_thinking" in (getattr(tokenizer, "chat_template", "") or "")
     profile_id = effective_profile_id or REFERENCE_PROFILE_RUNTIME
     capture_settings = capture_settings_for_profile(profile_id)
+    config_selected_gpus = normalize_selected_gpus(cfg.get("CFG_SELECTED_GPUS"))
+    override_selected_gpus = normalize_selected_gpus(selected_gpus_override)
+    effective_selected_gpus = override_selected_gpus or config_selected_gpus
+    selected_gpus_source = "cli" if override_selected_gpus else "config" if config_selected_gpus else "auto"
     return build_contract(
         model_name=model_name,
         model_path=model_path,
@@ -928,6 +963,9 @@ def build_runtime_contract(
             "gpu_expert_bits": cfg.get("CFG_GPU_EXPERT_BITS"),
             "cpu_expert_bits": cfg.get("CFG_CPU_EXPERT_BITS"),
             "kv_dtype": cfg.get("CFG_KV_DTYPE"),
+            "config_selected_gpus": config_selected_gpus,
+            "selected_gpus": effective_selected_gpus,
+            "selected_gpus_source": selected_gpus_source,
         },
     )
 
@@ -1148,7 +1186,10 @@ def emit_contract_trace(
         f"model={run_model.get('path_basename', run_model.get('name', 'unknown'))} "
         f"thinking={run_req.get('enable_thinking')} "
         f"template_hash={run_tok.get('chat_template_hash', 'missing')} "
-        f"server_default_thinking={runtime_contract.get('extra', {}).get('server_default_enable_thinking')}",
+        f"server_default_thinking={runtime_contract.get('extra', {}).get('server_default_enable_thinking')} "
+        f"selected_gpus={runtime_contract.get('extra', {}).get('selected_gpus') or 'auto'} "
+        f"selected_gpus_source={runtime_contract.get('extra', {}).get('selected_gpus_source') or 'auto'} "
+        f"config_selected_gpus={runtime_contract.get('extra', {}).get('config_selected_gpus') or 'none'}",
         file=sys.stderr,
     )
     print(

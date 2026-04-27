@@ -1,0 +1,59 @@
+{
+  "phase": "2BL",
+  "date_utc": "2026-04-26",
+  "decision": "hqq4_hqq8_quantized_prefill_decode_implemented_smoke_passed",
+  "implementation": {
+    "hqq8_config_supported": true,
+    "hqq8_separate_cache": true,
+    "hqq4_quantized_prefill": true,
+    "hqq8_quantized_prefill": true,
+    "hqq4_quantized_decode": true,
+    "hqq8_quantized_decode": true,
+    "persistent_bf16_prefill_materialization_required_for_requests": false,
+    "default_enablement_changed": false,
+    "testconfigs_changed": false
+  },
+  "validation": {
+    "build": "./dev build",
+    "compile": "./dev python -m py_compile python/krasis/attention_backend.py python/krasis/config.py python/krasis/model.py tests/test_hqq_self_calibrate.py",
+    "focused_tests": "./dev hqq-self-calibrate-test",
+    "witness": [
+      {
+        "model": "Qwen3-Coder-Next",
+        "config": "tests/qcn-hqq4.conf",
+        "profile": "llama_witness_stage3_qcn_expanded",
+        "run_dir": "logs/reference-test_20260426_230309",
+        "overall": "PASS",
+        "prompts": 8,
+        "selected_sum": 0.11674662039168524,
+        "top_overlap": 74,
+        "hqq_runtime_mb": 947.53,
+        "hcs_soft_experts": 14904,
+        "hcs_total_experts": 24576
+      },
+      {
+        "model": "Qwen3-Coder-Next",
+        "config": "logs/manual/phase2bl_qcn_hqq8_quantized_20260426.conf",
+        "profile": "llama_witness_stage3_qcn_expanded",
+        "run_dir": "logs/reference-test_20260426_232333",
+        "overall": "PASS",
+        "prompts": 8,
+        "selected_sum": 0.1087577254697546,
+        "top_overlap": 72,
+        "hqq_runtime_mb": 1789.78,
+        "hcs_soft_experts": 14337,
+        "hcs_total_experts": 24576
+      }
+    ]
+  },
+  "benchmarks": {
+    "standard_benchmark_run": false,
+    "reason": "Phase 2BL performed implementation and smoke validation only; throughput must be measured through a separate ./dev benchmark run before speed conclusions."
+  },
+  "open_items": [
+    "Tune direct quantized prefill kernels.",
+    "Run standard benchmark comparison for QCN HQQ4/HQQ8 and archive logs.",
+    "Validate Q35 HQQ4/HQQ8 after QCN benchmark review.",
+    "Fix any remaining user-facing labels that still print INT4/HQQ8 for HQQ8 configs."
+  ]
+}

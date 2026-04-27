@@ -1,0 +1,85 @@
+{
+  "phase": "2BJ",
+  "decision": "int8_exception_decode_path_implemented_end_to_end_top4_quality_small_improvement_decode_cost_visible",
+  "implementation": {
+    "runtime_scope": "prefill_and_decode",
+    "default_enabled": false,
+    "manifest_mode": "int8_exception",
+    "decode_semantics": "after_base_hqq_gemv_add_delta_int8_exception_minus_hqq_for_selected_blocks",
+    "fallbacks_added": false,
+    "runtime_language": "rust_cuda",
+    "python_hot_path": false
+  },
+  "artifacts": {
+    "qcn_config": "logs/manual/phase2bj_qcn_hqq4_int8_exception_qkvz_top4_20260426.conf",
+    "q35_config": "logs/manual/phase2bj_q35_hqq4_int8_exception_qkvz_top4_20260426.conf",
+    "qcn_manifest": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bi_qcn_top4_int8_exception/int8_exception/sidecar_manifest.json",
+    "q35_manifest": "/home/main/.krasis/cache/Qwen3.5-35B-A3B/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bi_q35_top4_int8_exception/int8_exception/sidecar_manifest.json",
+    "row_entries_per_manifest": 49152,
+    "bytes_per_manifest": 7274496
+  },
+  "witness": {
+    "qcn_hqq_only_baseline": {
+      "summary": "logs/reference-test_20260426_192008/reference_test_summary.json",
+      "first_token": "8/8",
+      "selected_logprob_delta_sum": 0.12367465,
+      "top_overlap": "73/80"
+    },
+    "qcn_int8_top4": {
+      "summary": "logs/reference-test_20260426_205459/reference_test_summary.json",
+      "first_token": "8/8",
+      "selected_logprob_delta_sum": 0.1168007312,
+      "delta_vs_baseline": -0.0068739188,
+      "top_overlap": "73/80",
+      "largest_case_deltas": [
+        {"case": 6, "selected_logprob_delta": 0.0469750293},
+        {"case": 4, "selected_logprob_delta": 0.0292705967},
+        {"case": 8, "selected_logprob_delta": 0.0285629623}
+      ]
+    },
+    "q35_hqq_only_baseline": {
+      "summary": "logs/reference-test_20260426_192514/reference_test_summary.json",
+      "first_token": "10/10",
+      "selected_logprob_delta_sum": 0.8936375677,
+      "top_overlap": "85/100"
+    },
+    "q35_int8_top4": {
+      "summary": "logs/reference-test_20260426_210006/reference_test_summary.json",
+      "first_token": "10/10",
+      "selected_logprob_delta_sum": 0.8868880518,
+      "delta_vs_baseline": -0.0067495159,
+      "top_overlap": "84/100",
+      "largest_case_deltas": [
+        {"case": 2, "selected_logprob_delta": 0.4912393825},
+        {"case": 5, "selected_logprob_delta": 0.2061549459},
+        {"case": 10, "selected_logprob_delta": 0.0690234286}
+      ]
+    }
+  },
+  "benchmarks": {
+    "qcn_hqq_only_baseline": {
+      "log": "benchmarks/20260426_193218_qcn_hqq4_int8_exception_phase2bh_baseline.log",
+      "prefill_internal_tps": 7912.5,
+      "decode_internal_tps": 73.97,
+      "min_free_vram_mb": 686
+    },
+    "qcn_int8_top4": {
+      "log": "benchmarks/20260426_210438_qcn_hqq4_int8_exception_phase2bj_top4_prefill_decode.log",
+      "prefill_internal_tps": 6984.6,
+      "decode_internal_tps": 71.30,
+      "min_free_vram_mb": 692
+    },
+    "q35_hqq_only_baseline": {
+      "log": "benchmarks/20260426_193851_q35_hqq4_int8_exception_phase2bh_baseline.log",
+      "prefill_internal_tps": 9360.5,
+      "decode_internal_tps": 116.24,
+      "min_free_vram_mb": 5452
+    },
+    "q35_int8_top4": {
+      "log": "benchmarks/20260426_210751_q35_hqq4_int8_exception_phase2bj_top4_prefill_decode.log",
+      "prefill_internal_tps": 9523.2,
+      "decode_internal_tps": 111.88,
+      "min_free_vram_mb": 5428
+    }
+  }
+}

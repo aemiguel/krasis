@@ -36,8 +36,8 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from krasis.attention_backend import (
-    HQQ_ATTENTION_CACHE_DIRNAME,
     hqq_attention_cache_layer_bytes,
+    hqq_attention_cache_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -304,6 +304,7 @@ def compute_launcher_budget(
     kv_dtype: str = "polar4",
     gpu_expert_bits: int = 4,
     attention_quant: str = "bf16",
+    hqq_cache_profile: str = "baseline",
     shared_expert_quant: str = "int8",
     dense_mlp_quant: str = "int8",
     lm_head_quant: str = "int8",
@@ -376,12 +377,12 @@ def compute_launcher_budget(
 
     hqq_layer_bytes = None
     if attention_quant == "hqq4":
-        hqq_layer_bytes = hqq_attention_cache_layer_bytes(model_path)
+        hqq_layer_bytes = hqq_attention_cache_layer_bytes(model_path, hqq_cache_profile)
         if hqq_layer_bytes is None:
             raise RuntimeError(
                 "attention_quant=hqq4 requires a complete validated HQQ artifact set. "
                 "No HQQ VRAM estimate is allowed before "
-                f"~/.krasis/cache/<model>/{HQQ_ATTENTION_CACHE_DIRNAME} is complete."
+                f"{hqq_attention_cache_dir(model_path, hqq_cache_profile)} is complete."
             )
 
     # Expert buffer bytes per expert (GPU Marlin format)

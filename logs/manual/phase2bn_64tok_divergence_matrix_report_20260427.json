@@ -1,0 +1,92 @@
+{
+  "phase": "Phase 2BN",
+  "date_utc": "2026-04-27",
+  "model": "Qwen3-Coder-Next",
+  "profile": "phase2bn_qcn_64tok",
+  "reference_artifact": "/home/main/Documents/Claude/krasis-internal/reference-outputs/output/Qwen3-Coder-Next/phase2bn_qcn_64tok.json",
+  "reference": {
+    "format": "krasis_llama_witness_sequence",
+    "format_version": 7,
+    "witness_schema_version": 2,
+    "max_new_tokens": 64,
+    "turn_count": 14,
+    "ref_token_counts": [12, 34, 64, 9, 11, 11, 64, 64, 64, 64, 64, 64, 64, 64]
+  },
+  "control_settings": {
+    "kv_dtype": "polar4",
+    "gpu_expert_bits": 8,
+    "cpu_expert_bits": 8,
+    "shared_experts": "int8",
+    "dense_layers": "int8",
+    "lm_head": "int8",
+    "generation": "greedy_thinking_disabled"
+  },
+  "variants": {
+    "AWQ": {
+      "summary_json": "/home/main/Documents/Claude/krasis-hqq/logs/reference-test_20260427_021702/reference_test_summary.json",
+      "overall": "PASS",
+      "first_token_matches": 14,
+      "prompt_count": 14,
+      "selected_logprob_delta_sum": 0.3721414743278472,
+      "first_token_top10_overlap": [123, 140],
+      "exact_top10_order": [0, 14],
+      "avg_exact_prefix_tokens": 14.571428571428571,
+      "weighted_exact_prefix_fraction": 0.3124042879019908,
+      "worst_exact_prefix_tokens": 4,
+      "full_sequence_matches": [4, 14],
+      "avg_decode_topk_containment": 0.5503545168067226,
+      "match_runs": [12, 14, 32, 9, 11, 11, 33, 17, 5, 4, 10, 8, 31, 7]
+    },
+    "HQQ4": {
+      "summary_json": "/home/main/Documents/Claude/krasis-hqq/logs/reference-test_20260427_022304/reference_test_summary.json",
+      "overall": "PASS",
+      "first_token_matches": 13,
+      "prompt_count": 14,
+      "selected_logprob_delta_sum": 0.3401545730457754,
+      "first_token_top10_overlap": [129, 140],
+      "exact_top10_order": [1, 14],
+      "avg_exact_prefix_tokens": 7.428571428571429,
+      "weighted_exact_prefix_fraction": 0.15926493108728942,
+      "worst_exact_prefix_tokens": 0,
+      "full_sequence_matches": [3, 14],
+      "avg_decode_topk_containment": 0.4254201680672269,
+      "match_runs": [12, 4, 5, 5, 11, 11, 18, 1, 15, 6, 2, 0, 7, 7]
+    },
+    "HQQ4SC": {
+      "summary_json": "/home/main/Documents/Claude/krasis-hqq/logs/reference-test_20260427_022705/reference_test_summary.json",
+      "overall": "PASS",
+      "first_token_matches": 13,
+      "prompt_count": 14,
+      "selected_logprob_delta_sum": 0.4059018806589869,
+      "first_token_top10_overlap": [128, 140],
+      "exact_top10_order": [1, 14],
+      "avg_exact_prefix_tokens": 7.571428571428571,
+      "weighted_exact_prefix_fraction": 0.16232771822358347,
+      "worst_exact_prefix_tokens": 0,
+      "full_sequence_matches": [3, 14],
+      "avg_decode_topk_containment": 0.4399290966386555,
+      "match_runs": [12, 4, 5, 5, 11, 11, 18, 2, 18, 4, 2, 0, 7, 7]
+    },
+    "HQQ8": {
+      "summary_json": "/home/main/Documents/Claude/krasis-hqq/logs/reference-test_20260427_023105/reference_test_summary.json",
+      "overall": "PASS",
+      "first_token_matches": 14,
+      "prompt_count": 14,
+      "selected_logprob_delta_sum": 0.1291707377787167,
+      "first_token_top10_overlap": [136, 140],
+      "exact_top10_order": [3, 14],
+      "avg_exact_prefix_tokens": 7.428571428571429,
+      "weighted_exact_prefix_fraction": 0.15926493108728942,
+      "worst_exact_prefix_tokens": 1,
+      "full_sequence_matches": [3, 14],
+      "avg_decode_topk_containment": 0.4498511904761905,
+      "match_runs": [12, 7, 5, 8, 11, 11, 18, 1, 5, 4, 2, 8, 5, 7]
+    }
+  },
+  "interpretation": {
+    "first_token_winner": "HQQ8",
+    "divergence_winner": "AWQ",
+    "hqq4sc_vs_hqq4": "HQQ4SC slightly improves average exact prefix and decode top-k containment but does not fix the first-token miss and worsens selected-logprob delta in this 14-turn sequence matrix.",
+    "speed_benchmark_run": false
+  }
+}

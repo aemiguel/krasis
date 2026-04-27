@@ -5,6 +5,7 @@ without forcing different backends into one runtime tensor contract.
 """
 
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -15,7 +16,12 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 import torch
 
-from krasis.config import cache_dir_for_model
+from krasis.config import (
+    HQQ_CACHE_PROFILE_BASELINE,
+    HQQ_CACHE_PROFILE_CHOICES,
+    HQQ_CACHE_PROFILE_SELFCAL_V1,
+    cache_dir_for_model,
+)
 from krasis.krasis import (
     hqq4_init_group_ptr,
     hqq4_quantize_tensor_ptr,
@@ -24,16 +30,28 @@ from krasis.krasis import (
 )
 
 
-ATTENTION_QUANT_CHOICES = ("bf16", "awq", "hqq4")
+ATTENTION_QUANT_CHOICES = ("bf16", "awq", "hqq4", "hqq8")
 
 HQQ_ATTENTION_CACHE_VERSION = 5
 HQQ_ATTENTION_CACHE_DIRNAME = f"attention_hqq_v{HQQ_ATTENTION_CACHE_VERSION}"
+HQQ8_ATTENTION_CACHE_DIRNAME = f"attention_hqq8_v{HQQ_ATTENTION_CACHE_VERSION}"
+HQQ_ATTENTION_CALIBRATED_CACHE_DIRNAMES = {
+    HQQ_CACHE_PROFILE_SELFCAL_V1: f"{HQQ_ATTENTION_CACHE_DIRNAME}_calib_selfcal_v1",
+}
 HQQ_ATTENTION_MANIFEST = "manifest.json"
 HQQ_ATTENTION_PENDING_MANIFEST = "manifest.build.json"
 HQQ_DEFAULT_GROUP_SIZE = 128
 HQQ_DEFAULT_AXIS = 1
 HQQ_LAYOUT = "row_major_axis1_grouped_uint4_packed"
-HQQ_ENABLED_NBITS = (4,)
+HQQ8_LAYOUT = "row_major_axis1_grouped_uint8"
+HQQ_LAYOUT_BY_NBITS = {
+    4: HQQ_LAYOUT,
+    8: HQQ8_LAYOUT,
+}
+HQQ_ENABLED_NBITS = (4, 8)
+HQQ_SIDECAR_MANIFEST_FORMAT = "krasis_hqq_selfcal_sidecar_manifest"
+HQQ_SIDECAR_MANIFEST_FORMAT_VERSION = 1
+HQQ_SIDECAR_MODES = ("int8_symmetric", "exact_bf16", "int8_exception")
 
 
 @dataclass(frozen=True)
@@ -73,6 +91,15 @@ def get_attention_backend_spec(attention_quant: str) -> AttentionBackendSpec:
             runtime_ready=True,
             nbits=4,
         )
+    if attention_quant == "hqq8":
+        return AttentionBackendSpec(
+            quant="hqq8",
+            label="HQQ8",
+            quantized=True,
+            requires_template=False,
+            runtime_ready=True,
+            nbits=8,
+        )
     raise ValueError(
         f"Unsupported attention quant '{attention_quant}'. "
         f"Use one of: {', '.join(ATTENTION_QUANT_CHOICES)}."
@@ -105,23 +132,62 @@ def validate_hqq_nbits(nbits: int) -> None:
         raise ValueError(f"Unsupported HQQ nbits={nbits}. Enabled HQQ backends: {enabled}")
 
 
+def hqq_layout_for_nbits(nbits: int) -> str:
+    validate_hqq_nbits(nbits)
+    return HQQ_LAYOUT_BY_NBITS[nbits]
+
+
 def _emit_real_model_timing(payload: dict) -> None:
     if os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1":
         print(json.dumps({"hqq_real_model_timing": payload}, sort_keys=True), flush=True)
 
 
-def hqq_attention_cache_dir(model_path: str) -> str:
+def normalize_hqq_attention_cache_profile(cache_profile: Optional[str]) -> str:
+    profile = str(cache_profile or HQQ_CACHE_PROFILE_BASELINE).strip().lower()
+    if profile not in HQQ_CACHE_PROFILE_CHOICES:
+        raise ValueError(
+            f"Unsupported HQQ cache profile '{profile}'. "
+            f"Use one of: {', '.join(HQQ_CACHE_PROFILE_CHOICES)}."
+        )
+    return profile
+
+
+def hqq_attention_cache_dir(
+    model_path: str,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    nbits: int = 4,
+) -> str:
     """Return the native HQQ attention artifact directory under the model cache."""
-    return os.path.join(cache_dir_for_model(model_path), HQQ_ATTENTION_CACHE_DIRNAME)
+    validate_hqq_nbits(nbits)
+    profile = normalize_hqq_attention_cache_profile(cache_profile)
+    baseline_dirname = HQQ_ATTENTION_CACHE_DIRNAME if nbits == 4 else HQQ8_ATTENTION_CACHE_DIRNAME
+    dirname = (
+        baseline_dirname
+        if profile == HQQ_CACHE_PROFILE_BASELINE
+        else (
+            HQQ_ATTENTION_CALIBRATED_CACHE_DIRNAMES[profile]
+            if nbits == 4
+            else f"{baseline_dirname}_calib_selfcal_v1"
+        )
+    )
+    return os.path.join(cache_dir_for_model(model_path), dirname)
 
 
-def hqq_attention_manifest_path(model_path: str) -> str:
-    return os.path.join(hqq_attention_cache_dir(model_path), HQQ_ATTENTION_MANIFEST)
+def hqq_attention_manifest_path(
+    model_path: str,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    nbits: int = 4,
+) -> str:
+    return os.path.join(hqq_attention_cache_dir(model_path, cache_profile, nbits), HQQ_ATTENTION_MANIFEST)
 
 
-def hqq_attention_pending_manifest_path(model_path: str) -> str:
+def hqq_attention_pending_manifest_path(
+    model_path: str,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    nbits: int = 4,
+) -> str:
     return os.path.join(
-        hqq_attention_cache_dir(model_path),
+        hqq_attention_cache_dir(model_path, cache_profile, nbits),
         HQQ_ATTENTION_PENDING_MANIFEST,
     )
 
@@ -131,9 +197,15 @@ def hqq_attention_cache_key(layer_idx: int, tensor_name: str, nbits: int = 4) ->
     return f"layer_{layer_idx:03d}_{tensor_name}_hqq{nbits}"
 
 
-def hqq_attention_tensor_path(model_path: str, layer_idx: int, tensor_name: str, nbits: int = 4) -> str:
+def hqq_attention_tensor_path(
+    model_path: str,
+    layer_idx: int,
+    tensor_name: str,
+    nbits: int = 4,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+) -> str:
     return os.path.join(
-        hqq_attention_cache_dir(model_path),
+        hqq_attention_cache_dir(model_path, cache_profile, nbits),
         f"{hqq_attention_cache_key(layer_idx, tensor_name, nbits)}.safetensors",
     )
 
@@ -176,12 +248,230 @@ def _artifact_tensor_bytes(path: str) -> int:
     return total
 
 
-def load_hqq_attention_manifest(model_path: str) -> Optional[dict]:
-    path = hqq_attention_manifest_path(model_path)
+def load_hqq_attention_manifest(
+    model_path: str,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    nbits: int = 4,
+) -> Optional[dict]:
+    path = hqq_attention_manifest_path(model_path, cache_profile, nbits)
     if not os.path.isfile(path):
         return None
     with open(path) as f:
         return json.load(f)
+
+
+def load_hqq_sidecar_manifest(path: Optional[str]) -> Optional[dict]:
+    if not path:
+        return None
+    expanded = os.path.expanduser(str(path))
+    if not os.path.isfile(expanded):
+        return None
+    with open(expanded) as f:
+        manifest = json.load(f)
+    manifest["_manifest_path"] = os.path.abspath(expanded)
+    return manifest
+
+
+def _file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    cpu = tensor.detach().contiguous().cpu()
+    if cpu.dtype == torch.bfloat16:
+        data = cpu.view(torch.uint16).numpy().tobytes()
+    else:
+        data = cpu.numpy().tobytes()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _contract_shape(contract: dict) -> Optional[tuple[int, int]]:
+    for key in ("reconstructed_source_shape", "source_shape", "target_shape"):
+        shape = contract.get(key)
+        if isinstance(shape, list) and len(shape) == 2:
+            return (int(shape[0]), int(shape[1]))
+    return None
+
+
+def _validate_hqq_sidecar_artifact_entries(artifact: dict, *, mode: str, artifact_path: str) -> None:
+    entries = artifact.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise RuntimeError(f"HQQ sidecar artifact has no explicit entries: {artifact_path}")
+    contract = artifact.get("source_contract") if isinstance(artifact.get("source_contract"), dict) else {}
+    shape = _contract_shape(contract)
+    expected_layer = int(artifact.get("layer", -1))
+    expected_tensor = str(artifact.get("tensor") or "")
+    total_rows = 0
+    seen: set[tuple[int, str, int, int, int]] = set()
+    for idx, entry in enumerate(entries):
+        try:
+            layer = int(entry.get("layer", expected_layer))
+            tensor = str(entry.get("tensor", expected_tensor))
+            group = int(entry["group"])
+            start_col = int(entry["start_col"])
+            end_col = int(entry["end_col"])
+            width = int(entry.get("width", end_col - start_col))
+            if "output_row" in entry:
+                output_row_start = int(entry["output_row"])
+                output_row_end = output_row_start + 1
+                row_count = 1
+            else:
+                output_row_start = int(entry.get("output_row_start", 0))
+                output_row_end = int(entry["output_row_end"])
+                row_count = int(entry["row_count"])
+        except Exception as exc:
+            raise RuntimeError(f"HQQ sidecar artifact entry {idx} has invalid required fields: {artifact_path}") from exc
+        if layer != expected_layer or tensor != expected_tensor:
+            raise RuntimeError(
+                f"HQQ sidecar artifact entry {idx} target mismatch: "
+                f"{layer}:{tensor} != {expected_layer}:{expected_tensor}"
+            )
+        if group < 0 or start_col < 0 or end_col <= start_col or width != end_col - start_col:
+            raise RuntimeError(f"HQQ sidecar artifact entry {idx} has invalid column bounds: {artifact_path}")
+        if output_row_start < 0 or output_row_end <= output_row_start:
+            raise RuntimeError(f"HQQ sidecar artifact entry {idx} has invalid output row bounds: {artifact_path}")
+        if row_count != output_row_end - output_row_start:
+            raise RuntimeError(f"HQQ sidecar artifact entry {idx} row_count does not match row bounds: {artifact_path}")
+        if shape is not None:
+            rows, cols = shape
+            if output_row_end > rows or end_col > cols:
+                raise RuntimeError(
+                    f"HQQ sidecar artifact entry {idx} exceeds source shape {rows}x{cols}: {artifact_path}"
+                )
+        key = (layer, tensor, group, output_row_start, output_row_end)
+        if mode == "int8_exception" and key in seen:
+            raise RuntimeError(f"Duplicate INT8 exception entry for {key}: {artifact_path}")
+        seen.add(key)
+        total_rows += row_count
+    if int(artifact.get("row_group_count", 0)) != total_rows:
+        raise RuntimeError(
+            f"HQQ sidecar artifact row_group_count mismatch: "
+            f"{artifact.get('row_group_count')} != summed rows {total_rows}"
+        )
+    if mode == "int8_exception":
+        if int(artifact.get("exception_group_count", 0)) != len(entries):
+            raise RuntimeError(
+                f"INT8 exception artifact exception_group_count mismatch: "
+                f"{artifact.get('exception_group_count')} != {len(entries)}"
+            )
+        if artifact.get("hqq_artifact_sha256") and contract.get("artifact_sha256"):
+            if artifact.get("hqq_artifact_sha256") != contract.get("artifact_sha256"):
+                raise RuntimeError(f"INT8 exception artifact HQQ sha256 does not match source contract: {artifact_path}")
+
+
+def require_complete_hqq_sidecar_manifest(
+    path: str,
+    *,
+    model_path: str,
+    source_cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+) -> dict:
+    """Validate an explicit HQQ sidecar manifest without treating it as a cache manifest."""
+    expanded = os.path.abspath(os.path.expanduser(str(path)))
+    if not os.path.isfile(expanded):
+        raise RuntimeError(f"HQQ sidecar manifest not found: {expanded}")
+    manifest = load_hqq_sidecar_manifest(expanded)
+    if manifest is None:
+        raise RuntimeError(f"HQQ sidecar manifest not found: {expanded}")
+    if manifest.get("format") != HQQ_SIDECAR_MANIFEST_FORMAT:
+        raise RuntimeError(
+            f"Not an HQQ sidecar manifest: {expanded} format={manifest.get('format')!r}"
+        )
+    if int(manifest.get("format_version", -1)) != HQQ_SIDECAR_MANIFEST_FORMAT_VERSION:
+        raise RuntimeError(
+            "Unsupported HQQ sidecar manifest format_version="
+            f"{manifest.get('format_version')} expected={HQQ_SIDECAR_MANIFEST_FORMAT_VERSION}"
+        )
+    if not manifest.get("complete"):
+        raise RuntimeError(f"HQQ sidecar manifest is incomplete: {expanded}")
+    mode = str(manifest.get("sidecar_mode", ""))
+    if mode not in HQQ_SIDECAR_MODES:
+        raise RuntimeError(
+            f"Unsupported HQQ sidecar mode {mode!r}. Use one of: {', '.join(HQQ_SIDECAR_MODES)}."
+        )
+    expected_model = os.path.abspath(os.path.expanduser(model_path))
+    manifest_model = os.path.abspath(os.path.expanduser(str(manifest.get("model_path", ""))))
+    if manifest_model != expected_model:
+        raise RuntimeError(
+            f"HQQ sidecar model_path mismatch: manifest={manifest_model} expected={expected_model}"
+        )
+    expected_profile = normalize_hqq_attention_cache_profile(source_cache_profile)
+    actual_profile = normalize_hqq_attention_cache_profile(
+        manifest.get("source", {}).get("cache_profile")
+    )
+    if actual_profile != expected_profile:
+        raise RuntimeError(
+            f"HQQ sidecar source cache profile mismatch: manifest={actual_profile} expected={expected_profile}. "
+            "No fallback to another HQQ profile is allowed."
+        )
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise RuntimeError(f"HQQ sidecar manifest has no artifacts: {expanded}")
+    base_dir = os.path.dirname(expanded)
+    source_cache_dir = hqq_attention_cache_dir(model_path, expected_profile)
+    for artifact in artifacts:
+        rel_file = artifact.get("file")
+        if not rel_file:
+            raise RuntimeError(f"HQQ sidecar artifact entry is missing file: {expanded}")
+        artifact_path = os.path.join(base_dir, rel_file)
+        if not os.path.isfile(artifact_path):
+            raise RuntimeError(f"Missing HQQ sidecar artifact file: {artifact_path}")
+        artifact_sha = artifact.get("sha256")
+        if artifact_sha and _file_sha256(artifact_path) != artifact_sha:
+            raise RuntimeError(f"HQQ sidecar artifact sha256 mismatch: {artifact_path}")
+        if int(artifact.get("row_group_count", 0)) <= 0:
+            raise RuntimeError(f"HQQ sidecar artifact has no row/groups: {artifact_path}")
+        contract = artifact.get("source_contract")
+        if isinstance(contract, dict):
+            if bool(contract.get("fallback_allowed")):
+                raise RuntimeError(f"HQQ sidecar source_contract fallback_allowed=true: {artifact_path}")
+            if not bool(contract.get("ready")):
+                raise RuntimeError(f"HQQ sidecar source_contract is not ready: {artifact_path}")
+            if str(contract.get("target_tensor") or "") != str(artifact.get("tensor") or ""):
+                raise RuntimeError(
+                    "HQQ sidecar source_contract target tensor mismatch: "
+                    f"{contract.get('target_tensor')} != {artifact.get('tensor')}"
+                )
+            if int(contract.get("layer", -1)) != int(artifact.get("layer", -2)):
+                raise RuntimeError(
+                    "HQQ sidecar source_contract layer mismatch: "
+                    f"{contract.get('layer')} != {artifact.get('layer')}"
+                )
+            target_file = str(contract.get("target_file") or "")
+            target_sha = str(contract.get("artifact_sha256") or "")
+            if target_file and target_sha:
+                target_path = os.path.join(source_cache_dir, target_file)
+                if not os.path.isfile(target_path):
+                    raise RuntimeError(f"HQQ sidecar source HQQ artifact is missing: {target_path}")
+                if _file_sha256(target_path) != target_sha:
+                    raise RuntimeError(f"HQQ sidecar source HQQ artifact sha256 mismatch: {target_path}")
+            source_tensors = contract.get("source_tensors")
+            if isinstance(source_tensors, list):
+                for source in source_tensors:
+                    source_path = str(source.get("source_path") or "")
+                    source_name = str(source.get("name") or "")
+                    source_sha = str(source.get("source_sha256") or "")
+                    if not source_path or not source_name or not source_sha:
+                        raise RuntimeError(
+                            "HQQ sidecar source_contract source tensor lacks source_path/name/source_sha256"
+                        )
+                    if not os.path.isfile(source_path):
+                        raise RuntimeError(f"HQQ sidecar source tensor file is missing: {source_path}")
+                    with safe_open(source_path, framework="pt", device="cpu") as handle:
+                        if source_name not in handle.keys():
+                            raise RuntimeError(
+                                f"HQQ sidecar source tensor {source_name!r} missing from {source_path}"
+                            )
+                        tensor_sha = _tensor_sha256(handle.get_tensor(source_name))
+                    if tensor_sha != source_sha:
+                        raise RuntimeError(
+                            f"HQQ sidecar source tensor sha256 mismatch: {source_path}:{source_name}"
+                        )
+        _validate_hqq_sidecar_artifact_entries(artifact, mode=mode, artifact_path=artifact_path)
+    return manifest
 
 
 def _save_hqq_attention_manifest_to_path(path: str, manifest: dict) -> None:
@@ -194,40 +484,59 @@ def _save_hqq_attention_manifest_to_path(path: str, manifest: dict) -> None:
     os.replace(tmp, path)
 
 
-def save_hqq_attention_manifest(model_path: str, manifest: dict) -> None:
-    _save_hqq_attention_manifest_to_path(hqq_attention_manifest_path(model_path), manifest)
+def save_hqq_attention_manifest(
+    model_path: str,
+    manifest: dict,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    nbits: int = 4,
+) -> None:
+    _save_hqq_attention_manifest_to_path(hqq_attention_manifest_path(model_path, cache_profile, nbits), manifest)
 
 
-def load_hqq_attention_pending_manifest(model_path: str) -> Optional[dict]:
-    path = hqq_attention_pending_manifest_path(model_path)
+def load_hqq_attention_pending_manifest(
+    model_path: str,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    nbits: int = 4,
+) -> Optional[dict]:
+    path = hqq_attention_pending_manifest_path(model_path, cache_profile, nbits)
     if not os.path.isfile(path):
         return None
     with open(path) as f:
         return json.load(f)
 
 
-def save_hqq_attention_pending_manifest(model_path: str, manifest: dict) -> None:
+def save_hqq_attention_pending_manifest(
+    model_path: str,
+    manifest: dict,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    nbits: int = 4,
+) -> None:
     _save_hqq_attention_manifest_to_path(
-        hqq_attention_pending_manifest_path(model_path),
+        hqq_attention_pending_manifest_path(model_path, cache_profile, nbits),
         manifest,
     )
 
 
-def delete_hqq_attention_pending_manifest(model_path: str) -> None:
-    path = hqq_attention_pending_manifest_path(model_path)
+def delete_hqq_attention_pending_manifest(
+    model_path: str,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    nbits: int = 4,
+) -> None:
+    path = hqq_attention_pending_manifest_path(model_path, cache_profile, nbits)
     if os.path.isfile(path):
         os.remove(path)
 
 
 def init_hqq_attention_manifest(model_path: str, num_hidden_layers: int, nbits: int = 4) -> dict:
     validate_hqq_nbits(nbits)
+    layout = hqq_layout_for_nbits(nbits)
     return {
         "format_version": HQQ_ATTENTION_CACHE_VERSION,
         "backend": hqq_backend_name(nbits),
         "nbits": nbits,
         "group_size": HQQ_DEFAULT_GROUP_SIZE,
         "axis": HQQ_DEFAULT_AXIS,
-        "layout": HQQ_LAYOUT,
+        "layout": layout,
         "num_hidden_layers": num_hidden_layers,
         "complete": False,
         "tensors": [],
@@ -236,6 +545,67 @@ def init_hqq_attention_manifest(model_path: str, num_hidden_layers: int, nbits: 
             "num_tensors": 0,
         },
     }
+
+
+def require_complete_hqq_attention_manifest(
+    model_path: str,
+    cache_profile: Optional[str],
+    expected_nbits: int,
+    expected_num_hidden_layers: int,
+) -> dict:
+    """Load a selected complete HQQ manifest, failing visibly without fallback."""
+    validate_hqq_nbits(expected_nbits)
+    profile = normalize_hqq_attention_cache_profile(cache_profile)
+    path = hqq_attention_manifest_path(model_path, profile, expected_nbits)
+    manifest = load_hqq_attention_manifest(model_path, profile, expected_nbits)
+    if manifest is None:
+        if profile == HQQ_CACHE_PROFILE_BASELINE:
+            raise RuntimeError(
+                "attention_quant=hqq4 requested but no HQQ attention manifest exists. "
+                f"Expected {path}"
+            )
+        raise RuntimeError(
+            f"HQQ cache profile '{profile}' was explicitly selected, but no calibrated "
+            f"HQQ attention manifest exists at {path}. No fallback to baseline is allowed."
+        )
+
+    expected_backend = hqq_backend_name(expected_nbits)
+    errors = []
+    if manifest.get("format_version") != HQQ_ATTENTION_CACHE_VERSION:
+        errors.append(f"format_version={manifest.get('format_version')}")
+    if manifest.get("backend") != expected_backend:
+        errors.append(f"backend={manifest.get('backend')}")
+    if manifest.get("nbits") != expected_nbits:
+        errors.append(f"nbits={manifest.get('nbits')}")
+    if manifest.get("num_hidden_layers") != expected_num_hidden_layers:
+        errors.append(f"num_hidden_layers={manifest.get('num_hidden_layers')}")
+    if manifest.get("group_size") != HQQ_DEFAULT_GROUP_SIZE:
+        errors.append(f"group_size={manifest.get('group_size')}")
+    if manifest.get("axis") != HQQ_DEFAULT_AXIS:
+        errors.append(f"axis={manifest.get('axis')}")
+    expected_layout = hqq_layout_for_nbits(expected_nbits)
+    if manifest.get("layout") != expected_layout:
+        errors.append(f"layout={manifest.get('layout')}")
+    if not manifest.get("complete"):
+        errors.append("complete=false")
+
+    if profile != HQQ_CACHE_PROFILE_BASELINE:
+        if manifest.get("cache_profile") != profile:
+            errors.append(f"cache_profile={manifest.get('cache_profile')}")
+        calibration = manifest.get("calibration")
+        if not isinstance(calibration, dict):
+            errors.append("calibration=<missing>")
+        elif calibration.get("profile") != profile:
+            errors.append(f"calibration.profile={calibration.get('profile')}")
+
+    if errors:
+        no_fallback = " No fallback to baseline is allowed." if profile != HQQ_CACHE_PROFILE_BASELINE else ""
+        raise RuntimeError(
+            f"HQQ attention cache manifest for profile '{profile}' is incomplete or "
+            f"incompatible at {path}: {', '.join(errors)}.{no_fallback}"
+        )
+
+    return manifest
 
 
 def _pack_uint4(q: torch.Tensor) -> torch.Tensor:
@@ -257,6 +627,24 @@ def _unpack_uint4(packed: torch.Tensor, cols: int) -> torch.Tensor:
     return q[:, :cols].contiguous()
 
 
+def _pack_hqq_quant(quant: torch.Tensor, nbits: int) -> torch.Tensor:
+    if nbits == 4:
+        return _pack_uint4(quant)
+    if nbits == 8:
+        if quant.dtype != torch.uint8:
+            quant = quant.to(torch.uint8)
+        return quant.contiguous()
+    raise ValueError(f"Unsupported HQQ nbits={nbits}")
+
+
+def _unpack_hqq_quant(packed: torch.Tensor, cols: int, nbits: int) -> torch.Tensor:
+    if nbits == 4:
+        return _unpack_uint4(packed, cols)
+    if nbits == 8:
+        return packed[:, :cols].contiguous()
+    raise ValueError(f"Unsupported HQQ nbits={nbits}")
+
+
 def _hqq_num_groups(cols: int, group_size: int) -> int:
     return (cols + group_size - 1) // group_size
 
@@ -267,6 +655,12 @@ def _hqq_padded_cols(cols: int, group_size: int) -> int:
 
 def _hqq_packed_cols(cols: int, group_size: int) -> int:
     return (_hqq_padded_cols(cols, group_size) + 1) // 2
+
+
+def _hqq_packed_cols_for_nbits(cols: int, group_size: int, nbits: int) -> int:
+    validate_hqq_nbits(nbits)
+    padded_cols = _hqq_padded_cols(cols, group_size)
+    return (padded_cols + 1) // 2 if nbits == 4 else padded_cols
 
 
 def _hqq_tensor_shape_list(tensor: torch.Tensor) -> List[int]:
@@ -325,14 +719,25 @@ def validate_hqq_attention_tensors(
         raise RuntimeError(f"HQQ axis mismatch: found {axis}, expected {expected_axis}")
     if expected_nbits is not None and nbits != expected_nbits:
         raise RuntimeError(f"HQQ nbits mismatch: found {nbits}, expected {expected_nbits}")
-    if expected_layout != HQQ_LAYOUT:
+    if expected_nbits is not None:
+        layout_for_bits = hqq_layout_for_nbits(expected_nbits)
+        if expected_layout != layout_for_bits:
+            raise RuntimeError(
+                f"HQQ validation expected layout {expected_layout}, but nbits={expected_nbits} requires {layout_for_bits}"
+            )
+    if expected_layout not in HQQ_LAYOUT_BY_NBITS.values():
         raise RuntimeError(
-            f"HQQ validation only supports runtime layout {HQQ_LAYOUT}, got expected {expected_layout}"
+            f"HQQ validation only supports runtime layouts {sorted(HQQ_LAYOUT_BY_NBITS.values())}, got expected {expected_layout}"
         )
 
     groups = _hqq_num_groups(cols, group_size)
     padded_cols = _hqq_padded_cols(cols, group_size)
-    packed_cols = _hqq_packed_cols(cols, group_size)
+    if nbits == 4:
+        packed_cols = _hqq_packed_cols(cols, group_size)
+    elif nbits == 8:
+        packed_cols = padded_cols
+    else:
+        raise RuntimeError(f"Unsupported HQQ nbits={nbits}")
     if tuple(scales.shape) != (rows, groups):
         raise RuntimeError(
             f"HQQ scales shape mismatch: found {tuple(scales.shape)}, expected {(rows, groups)}"
@@ -999,6 +1404,115 @@ def quantize_hqq4_tensor(
     return result
 
 
+def quantize_hqq8_tensor(
+    weight: torch.Tensor,
+    group_size: int = HQQ_DEFAULT_GROUP_SIZE,
+    *,
+    collect_stats: bool = False,
+    worst_groups_limit: int = 8,
+    timing_context: Optional[dict] = None,
+) -> Dict[str, torch.Tensor]:
+    if weight.ndim != 2:
+        raise ValueError(f"HQQ attention expects 2D weights, got shape {tuple(weight.shape)}")
+    if group_size <= 0:
+        raise ValueError(f"Invalid HQQ group_size {group_size}")
+
+    timing_enabled = os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1"
+    timing_prefix = dict(timing_context or {})
+    started = time.perf_counter() if timing_enabled else 0.0
+
+    w = weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    rows, cols = w.shape
+    groups = _hqq_num_groups(cols, group_size)
+    padded_cols = _hqq_padded_cols(cols, group_size)
+    quant = torch.zeros((rows, padded_cols), dtype=torch.uint8)
+    scales = torch.empty((rows, groups), dtype=torch.float32)
+    zeros = torch.empty((rows, groups), dtype=torch.float32)
+    qmax = 255.0
+    stats = {
+        "numel": 0,
+        "sum_abs": 0.0,
+        "sum_sq": 0.0,
+        "max_abs": 0.0,
+        "worst_groups": [],
+    } if collect_stats else None
+
+    for g in range(groups):
+        start = g * group_size
+        end = min(start + group_size, cols)
+        chunk = w[:, start:end]
+        q, scale, zero = _quantize_hqq4_group_current(chunk, qmax)
+        quant[:, start:end] = q[:, : end - start]
+        scales[:, g] = scale
+        zeros[:, g] = zero
+        if collect_stats:
+            deq = (q[:, : end - start].to(torch.float32) - zero.unsqueeze(1)) * scale.unsqueeze(1)
+            diff = deq - chunk
+            abs_diff = diff.abs()
+            stats["numel"] += diff.numel()
+            stats["sum_abs"] += float(abs_diff.sum().item())
+            stats["sum_sq"] += float((diff * diff).sum().item())
+            stats["max_abs"] = max(stats["max_abs"], float(abs_diff.max().item()))
+            group_mean_abs = abs_diff.mean(dim=1)
+            group_rmse = torch.sqrt(torch.mean(diff * diff, dim=1))
+            if worst_groups_limit > 0:
+                for row_idx in range(rows):
+                    entry = {
+                        "row": int(row_idx),
+                        "group": int(g),
+                        "start_col": int(start),
+                        "end_col": int(end),
+                        "mean_abs": float(group_mean_abs[row_idx].item()),
+                        "rmse": float(group_rmse[row_idx].item()),
+                        "max_abs": float(abs_diff[row_idx].max().item()),
+                        "scale": float(scale[row_idx].item()),
+                        "zero": float(zero[row_idx].item()),
+                    }
+                    if len(stats["worst_groups"]) < worst_groups_limit:
+                        stats["worst_groups"].append(entry)
+                    else:
+                        min_idx = min(
+                            range(len(stats["worst_groups"])),
+                            key=lambda idx: stats["worst_groups"][idx]["mean_abs"],
+                        )
+                        if entry["mean_abs"] > stats["worst_groups"][min_idx]["mean_abs"]:
+                            stats["worst_groups"][min_idx] = entry
+
+    if timing_enabled:
+        _emit_real_model_timing(
+            {
+                **timing_prefix,
+                "phase": "artifact_pack_stage",
+                "stage": "quantize_hqq8_affine_pack",
+                "elapsed_s": time.perf_counter() - started,
+                "rows": int(rows),
+                "cols": int(cols),
+                "groups": int(groups),
+            }
+        )
+
+    result = {
+        "packed": quant.contiguous(),
+        "scales": scales,
+        "zeros": zeros,
+        "orig_shape": torch.tensor([rows, cols], dtype=torch.int32),
+        "group_size": torch.tensor([group_size], dtype=torch.int32),
+        "axis": torch.tensor([HQQ_DEFAULT_AXIS], dtype=torch.int32),
+        "nbits": torch.tensor([8], dtype=torch.int32),
+    }
+    if collect_stats:
+        stats["worst_groups"].sort(key=lambda item: item["mean_abs"], reverse=True)
+        denom = max(1, stats["numel"])
+        result["stats"] = {
+            "numel": int(stats["numel"]),
+            "mean_abs": stats["sum_abs"] / denom,
+            "rmse": math.sqrt(stats["sum_sq"] / denom),
+            "max_abs": stats["max_abs"],
+            "worst_groups": stats["worst_groups"],
+        }
+    return result
+
+
 def write_hqq_attention_artifact(
     model_path: str,
     layer_idx: int,
@@ -1016,18 +1530,28 @@ def write_hqq_attention_artifact(
         "layer_type": layer_type,
         "tensor_name": tensor_name,
     }
-    tensors = quantize_hqq4_tensor(
-        weight,
-        group_size=HQQ_DEFAULT_GROUP_SIZE,
-        collect_stats=True,
-        timing_context=timing_context,
-    )
+    if nbits == 4:
+        tensors = quantize_hqq4_tensor(
+            weight,
+            group_size=HQQ_DEFAULT_GROUP_SIZE,
+            collect_stats=True,
+            timing_context=timing_context,
+        )
+    elif nbits == 8:
+        tensors = quantize_hqq8_tensor(
+            weight,
+            group_size=HQQ_DEFAULT_GROUP_SIZE,
+            collect_stats=True,
+            timing_context=timing_context,
+        )
+    else:
+        raise ValueError(f"Unsupported HQQ nbits={nbits}")
     metadata_started = time.perf_counter() if os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1" else 0.0
     payload_tensors = {k: v for k, v in tensors.items() if isinstance(v, torch.Tensor)}
     structure = validate_hqq_attention_tensors(
         payload_tensors,
         expected_nbits=nbits,
-        expected_layout=HQQ_LAYOUT,
+        expected_layout=hqq_layout_for_nbits(nbits),
     )
     metadata = {
         "backend": hqq_backend_name(nbits),
@@ -1035,7 +1559,7 @@ def write_hqq_attention_artifact(
         "layer_idx": str(layer_idx),
         "layer_type": layer_type,
         "tensor_name": tensor_name,
-        "layout": HQQ_LAYOUT,
+        "layout": hqq_layout_for_nbits(nbits),
         "dtype": str(weight.dtype).replace("torch.", ""),
     }
     if metadata_started:
@@ -1071,7 +1595,7 @@ def write_hqq_attention_artifact(
         "nbits": nbits,
         "group_size": int(tensors["group_size"][0].item()),
         "axis": int(tensors["axis"][0].item()),
-        "layout": HQQ_LAYOUT,
+        "layout": hqq_layout_for_nbits(nbits),
         "original_shape": orig_shape,
         "original_dtype": metadata["dtype"],
         "tensor_bytes": tensor_bytes,
@@ -1085,6 +1609,7 @@ def load_hqq_attention_artifact(
     entry: dict,
     expected_nbits: int,
     device: str = "cpu",
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
 ) -> dict:
     validate_hqq_nbits(expected_nbits)
     if entry.get("nbits") != expected_nbits:
@@ -1094,7 +1619,7 @@ def load_hqq_attention_artifact(
             f"expected {expected_nbits}"
         )
 
-    path = os.path.join(hqq_attention_cache_dir(model_path), entry["file"])
+    path = os.path.join(hqq_attention_cache_dir(model_path, cache_profile, expected_nbits), entry["file"])
     if not os.path.isfile(path):
         raise RuntimeError(f"Missing HQQ artifact file: {path}")
 
@@ -1130,21 +1655,29 @@ def load_hqq_attention_artifact(
     }
 
 
-def hqq_attention_cache_layer_bytes(model_path: str) -> Optional[Dict[int, int]]:
-    manifest = load_hqq_attention_manifest(model_path)
+def hqq_attention_cache_layer_bytes(
+    model_path: str,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    nbits: int = 4,
+) -> Optional[Dict[int, int]]:
+    manifest = load_hqq_attention_manifest(model_path, cache_profile, nbits)
     if not manifest:
         return None
     per_layer: Dict[int, int] = {}
     for entry in manifest.get("tensors", []):
-        path = os.path.join(hqq_attention_cache_dir(model_path), entry["file"])
+        path = os.path.join(hqq_attention_cache_dir(model_path, cache_profile, nbits), entry["file"])
         if not os.path.isfile(path):
             return None
         per_layer[entry["layer_idx"]] = per_layer.get(entry["layer_idx"], 0) + _artifact_tensor_bytes(path)
     return per_layer
 
 
-def hqq_attention_cache_total_bytes(model_path: str) -> Optional[int]:
-    per_layer = hqq_attention_cache_layer_bytes(model_path)
+def hqq_attention_cache_total_bytes(
+    model_path: str,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    nbits: int = 4,
+) -> Optional[int]:
+    per_layer = hqq_attention_cache_layer_bytes(model_path, cache_profile, nbits)
     if per_layer is None:
         return None
     return sum(per_layer.values())

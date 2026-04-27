@@ -1,0 +1,28 @@
+{
+  "phase": "2BM",
+  "title": "QCN attention accuracy matrix",
+  "model": "Qwen3-Coder-Next",
+  "reference_profile": "llama_witness_stage3_qcn_expanded",
+  "fixed_settings": {
+    "kv_dtype": "polar4",
+    "gpu_expert_bits": 8,
+    "cpu_expert_bits": 8,
+    "shared_expert_quant": "int8",
+    "dense_mlp_quant": "int8",
+    "lm_head_quant": "int8",
+    "enable_thinking": false
+  },
+  "variants": [
+    {"name": "AWQ", "run_dir": "logs/reference-test_20260426_235149", "first_token": "8/8", "selected_logprob_sum": 0.08900268424121751, "selected_logprob_avg": 0.011125335530152189, "top_overlap": "75/80", "exact_top_id_order": "0/8", "mean_common_logprob_delta_avg": 0.5872933485033084, "worst_common_logprob_delta": 1.9752711088502988, "avg_match_run": 1.0, "worst_match_run": 1},
+    {"name": "HQQ4", "run_dir": "logs/reference-test_20260426_235716", "first_token": "8/8", "selected_logprob_sum": 0.0971685264588872, "selected_logprob_avg": 0.0121460658073609, "top_overlap": "74/80", "exact_top_id_order": "2/8", "mean_common_logprob_delta_avg": 0.42476366251805096, "worst_common_logprob_delta": 2.4561710841931514, "avg_match_run": 1.0, "worst_match_run": 1},
+    {"name": "HQQ4SC", "run_dir": "logs/reference-test_20260427_000053", "first_token": "8/8", "selected_logprob_sum": 0.06185357871946058, "selected_logprob_avg": 0.007731697339932572, "top_overlap": "71/80", "exact_top_id_order": "1/8", "mean_common_logprob_delta_avg": 0.3828026820292809, "worst_common_logprob_delta": 2.0359000664756692, "avg_match_run": 1.0, "worst_match_run": 1},
+    {"name": "HQQ8", "run_dir": "logs/reference-test_20260427_000435", "first_token": "8/8", "selected_logprob_sum": 0.034590591524048344, "selected_logprob_avg": 0.004323823940506043, "top_overlap": "76/80", "exact_top_id_order": "1/8", "mean_common_logprob_delta_avg": 0.1975105778065199, "worst_common_logprob_delta": 0.8105520841931515, "avg_match_run": 1.0, "worst_match_run": 1}
+  ],
+  "ranking_by_selected_logprob_sum": ["HQQ8", "HQQ4SC", "AWQ", "HQQ4"],
+  "divergence_metric_limit": {
+    "reason": "current canonical QCN llama-witness artifacts are first-token artifacts",
+    "multi_token_divergence_available": false,
+    "attempted_profile": "phase2bm_qcn_accuracy_32tok",
+    "attempt_result": "witness-capture still emitted first-token schema with greedy_first_token/topk only; generated artifact deleted to avoid misuse"
+  }
+}

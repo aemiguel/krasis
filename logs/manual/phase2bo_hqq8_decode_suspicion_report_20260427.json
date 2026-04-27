@@ -1,0 +1,72 @@
+{
+  "phase": "2BO",
+  "date": "2026-04-27",
+  "question": "HQQ8 64-token exact-prefix result looks too poor for INT8-expert control; determine whether this implicates HQQ implementation.",
+  "reference_profile": "phase2bn_qcn_64tok",
+  "controls": {
+    "fixed_non_attention_settings": {
+      "model": "Qwen3-Coder-Next",
+      "kv_dtype": "polar4",
+      "gpu_expert_bits": 8,
+      "cpu_expert_bits": 8,
+      "shared_expert_quant": "int8",
+      "dense_mlp_quant": "int8",
+      "lm_head_quant": "int8",
+      "thinking": false
+    },
+    "bf16_config": "logs/manual/phase2bo_qcn_accuracy_bf16_control_20260427.conf",
+    "bf16_run": "logs/reference-test_20260427_075501"
+  },
+  "matrix": {
+    "AWQ": {
+      "run": "logs/reference-test_20260427_021702",
+      "first_token": "14/14",
+      "selected_sum": 0.372141474328,
+      "top10_overlap": "123/140",
+      "avg_exact_prefix": 14.57,
+      "worst_prefix": 4,
+      "full_matches": "4/14",
+      "weighted_decode_topk": 0.407,
+      "hcs": "8528/24576"
+    },
+    "BF16": {
+      "run": "logs/reference-test_20260427_075501",
+      "first_token": "14/14",
+      "selected_sum": 0.132351834630,
+      "top10_overlap": "135/140",
+      "avg_exact_prefix": 17.14,
+      "worst_prefix": 4,
+      "full_matches": "5/14",
+      "weighted_decode_topk": 0.499,
+      "hcs": "7831/24576"
+    },
+    "HQQ8": {
+      "run": "logs/reference-test_20260427_023105",
+      "first_token": "14/14",
+      "selected_sum": 0.129170737779,
+      "top10_overlap": "136/140",
+      "avg_exact_prefix": 7.43,
+      "worst_prefix": 1,
+      "full_matches": "3/14",
+      "weighted_decode_topk": 0.279,
+      "hcs": "7216/24576"
+    }
+  },
+  "hqq8_artifact_quality": {
+    "mean_tensor_mean_abs": 0.00011905326810737852,
+    "max_tensor_mean_abs": 0.0001628408754186239,
+    "mean_tensor_rmse": 0.00014415871376700898,
+    "max_tensor_rmse": 0.00020299330680661852
+  },
+  "teacher_forced_prefill_probe": {
+    "method": "HQQ8 /v1/internal/prefill_logits over prompt plus reference generated prefix; checks next-token top-1 without token-time decode state.",
+    "server_config": "logs/manual/phase2bm_qcn_accuracy_hqq8_20260426.conf",
+    "results": [
+      {"prompt_index": 7, "runtime_exact_prefix": 1, "teacher_forced_prefill_top1": "16/16"},
+      {"prompt_index": 10, "runtime_exact_prefix": 2, "teacher_forced_prefill_top1": "16/16"},
+      {"prompt_index": 1, "runtime_exact_prefix": 7, "teacher_forced_prefill_top1": "16/16"}
+    ]
+  },
+  "conclusion": "HQQ8 poor exact-prefix stability should be treated as an active HQQ decode/recurrent-state correctness bug until proven otherwise. Artifact generation and quantized prefill are unlikely to be the primary failure.",
+  "next_step": "Add/use a forced-decode diagnostic path that feeds reference tokens through token-time decode and compares HQQ8 against BF16 by step/layer/component."
+}

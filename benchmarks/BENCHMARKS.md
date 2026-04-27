@@ -1,5 +1,99 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-26 (Phase 2BK INT8 exception top-k validation)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: QCN and Qwen3.5 HQQ4 baselines versus explicit top-4/top-8/top-16 INT8
+exception manifests for layer-0 `in_proj_qkvz`. Timing instrumentation off.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| QCN HQQ4 baseline | 7,242.6 | 70.79 | 12960/24576 (52.7%) | 686 MB | [log](20260426_220134_qcn_hqq4_phase2bk_base.log) |
+| QCN HQQ4 + INT8 exceptions top-4 | 6,936.2 | 71.14 | 12960/24576 (52.7%) | 692 MB | [log](20260426_220448_qcn_hqq4_phase2bk_int8_top4.log) |
+| QCN HQQ4 + INT8 exceptions top-8 | 7,854.1 | 70.92 | 12960/24576 (52.7%) | 690 MB | [log](20260426_220800_qcn_hqq4_phase2bk_int8_top8.log) |
+| QCN HQQ4 + INT8 exceptions top-16 | 7,833.9 | 68.59 | 12879/24576 (52.4%) | 758 MB | [log](20260426_221107_qcn_hqq4_phase2bk_int8_top16.log) |
+| Q35 HQQ4 baseline | 7,146.8 | 114.01 | 10240/10240 (100.0%) | 5452 MB | [log](20260426_221419_q35_hqq4_phase2bk_base.log) |
+| Q35 HQQ4 + INT8 exceptions top-4 | 7,186.4 | 116.59 | 10240/10240 (100.0%) | 5428 MB | [log](20260426_221755_q35_hqq4_phase2bk_int8_top4.log) |
+| Q35 HQQ4 + INT8 exceptions top-8 | 7,138.4 | 114.16 | 10240/10240 (100.0%) | 5426 MB | [log](20260426_222218_q35_hqq4_phase2bk_int8_top8.log) |
+| Q35 HQQ4 + INT8 exceptions top-16 | 7,428.9 | 104.14 | 10240/10240 (100.0%) | 5396 MB | [log](20260426_222643_q35_hqq4_phase2bk_int8_top16.log) |
+
+Notes:
+- Runs executed via `./dev benchmark ...`, not timing-instrumented profiling.
+- Decode values are the benchmark's internal engine numbers. Network round-trip
+  numbers are present in the full logs but are not used as decode speed.
+- Top-4 was the only variant that improved witness selected-logprob on both QCN
+  and Q35 in the matching Phase 2BK witness set.
+- Top-8 regressed witness selected-logprob on both models. Top-16 improved
+  selected-logprob less than top-4 and had a meaningful decode-speed cost,
+  especially on Q35.
+- The associated quality reduction is
+  `logs/manual/phase2bk_int8_exception_topk_validation_reduction_20260426.md`.
+
+---
+
+## Standard Benchmarks — 2026-04-26 (QCN AWQ/Polar4 speed regression check)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: standard `./dev speed-test` QCN AWQ/Polar4 path after Phase 2BJ decode INT8 exception work. Timing instrumentation off.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| QCN AWQ/Polar4 speed-test check | 7,295.6 | 91.77 | 16848/24576 (68.6%) | 688 MB | [log](20260426_211755_qcn_polar4_awq_speed_regression_check.log) |
+
+Notes:
+- Run executed via `./dev speed-test`.
+- This checks the historical `90+ tok/s` QCN path directly after Phase 2BJ.
+- Result: standard QCN AWQ/Polar4 decode remains in the expected `90+ tok/s` class; the `71.30 tok/s` number belongs to the separate QCN HQQ4 + INT8 exception top-4 config.
+- Decode values are the benchmark's internal engine numbers. Network round-trip numbers are present in the full log but are not used as decode speed.
+
+---
+
+## Standard Benchmarks — 2026-04-26 (Phase 2BJ INT8 exception prefill+decode top-4)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: QCN and Qwen3.5 HQQ4 with explicit top-4 INT8 exception manifests after decode-side exception execution was implemented. Timing instrumentation off. Baselines are the same-day Phase 2BH HQQ4 baseline runs below.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| QCN HQQ4 baseline | 7,912.5 | 73.97 | 12960/24576 (52.7%) | 686 MB | [log](20260426_193218_qcn_hqq4_int8_exception_phase2bh_baseline.log) |
+| QCN HQQ4 + INT8 exceptions top-4 | 6,984.6 | 71.30 | 12960/24576 (52.7%) | 692 MB | [log](20260426_210438_qcn_hqq4_int8_exception_phase2bj_top4_prefill_decode.log) |
+| Q35 HQQ4 baseline | 9,360.5 | 116.24 | 10240/10240 (100.0%) | 5452 MB | [log](20260426_193851_q35_hqq4_int8_exception_phase2bh_baseline.log) |
+| Q35 HQQ4 + INT8 exceptions top-4 | 9,523.2 | 111.88 | 10240/10240 (100.0%) | 5428 MB | [log](20260426_210751_q35_hqq4_int8_exception_phase2bj_top4_prefill_decode.log) |
+
+Notes:
+- Runs executed via `./dev benchmark ...`, not timing-instrumented profiling.
+- QCN top-4 prefill+decode path had lower internal prefill throughput than the HQQ-only baseline (`-11.7%`) and lower decode throughput (`-3.6%`).
+- Q35 top-4 prefill+decode path had slightly higher internal prefill throughput (`+1.7%`) but lower decode throughput (`-3.8%`).
+- Decode values are the benchmark's internal engine numbers. Network round-trip numbers are present in the full logs but are not used as decode speed.
+- The associated implementation and quality reduction is `logs/manual/phase2bj_int8_exception_decode_runtime_reduction_20260426.md`.
+
+---
+
+## Standard Benchmarks — 2026-04-26 (Phase 2BH INT8 exception prefill prototype)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: QCN and Qwen3.5 HQQ4 baselines versus explicit single-block INT8 exception prefill manifests. Timing instrumentation off. These runs were used only to measure the opt-in Phase 2BH prefill path; no default/runtime promotion was made.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| QCN HQQ4 baseline | 7,912.5 | 73.97 | 12960/24576 (52.7%) | 686 MB | [log](20260426_193218_qcn_hqq4_int8_exception_phase2bh_baseline.log) |
+| QCN HQQ4 + INT8 exception group 12 | 7,832.5 | 71.95 | 12960/24576 (52.7%) | 682 MB | [log](20260426_193537_qcn_hqq4_int8_exception_phase2bh_g12.log) |
+| Q35 HQQ4 baseline | 9,360.5 | 116.24 | 10240/10240 (100.0%) | 5452 MB | [log](20260426_193851_q35_hqq4_int8_exception_phase2bh_baseline.log) |
+| Q35 HQQ4 + INT8 exception group 14 | 9,332.0 | 116.06 | 10240/10240 (100.0%) | 5452 MB | [log](20260426_194201_q35_hqq4_int8_exception_phase2bh_g14.log) |
+
+Notes:
+- Runs executed via `./dev benchmark ...`, not timing-instrumented profiling.
+- QCN INT8 exception prefill overhead was about `-1.0%` internal prefill throughput and `-4 MB` measured min-free VRAM difference.
+- Q35 INT8 exception prefill overhead was about `-0.3%` internal prefill throughput with unchanged measured min-free VRAM.
+- Decode values are the benchmark's internal engine numbers. Network round-trip numbers are present in the full logs but are not used as decode speed.
+- The associated quality reduction is `logs/manual/phase2bh_int8_exception_runtime_reduction_20260426.md`.
+
+---
+
 ## Standard Benchmarks — 2026-04-16 (QCN Polar4 AWQ after QK FP32 decision rerun)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
