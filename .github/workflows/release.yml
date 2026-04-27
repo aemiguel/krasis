@@ -19,7 +19,7 @@ jobs:
         with:
           target: x86_64
           args: --release --out dist -i python3.10 python3.11 python3.12 python3.13
-          manylinux: auto
+          manylinux: "2_28"
           before-script-linux: |
             # numactl for libnuma
             yum install -y numactl-devel 2>/dev/null || dnf install -y numactl-devel 2>/dev/null || apt-get install -y libnuma-dev 2>/dev/null || true
