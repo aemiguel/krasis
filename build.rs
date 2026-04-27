@@ -173,7 +173,6 @@ fn compile_cuda_kernels() {
         .args([
             "-ptx",
             "-allow-unsupported-compiler",
-            "-ccbin", "/usr/bin/g++",
             "-arch=sm_80",
             "-O3",
             "--use_fast_math",
@@ -225,7 +224,6 @@ fn compile_prefill_kernels() {
         .args([
             "-ptx",
             "-allow-unsupported-compiler",
-            "-ccbin", "/usr/bin/g++",
             "-arch=sm_80",
             "-O3",
             "--use_fast_math",
@@ -296,7 +294,6 @@ fn compile_marlin_kernels() {
     let common_args = [
         "--expt-relaxed-constexpr",
         "-allow-unsupported-compiler",
-        "-ccbin", "/usr/bin/g++",
         "-Xcompiler", "-fPIC",
         "-arch=sm_80",
         "-O3",
@@ -429,7 +426,6 @@ fn compile_flash_attn_kernels() {
         "--expt-relaxed-constexpr".to_string(),
         "--expt-extended-lambda".to_string(),
         "-allow-unsupported-compiler".to_string(),
-        "-ccbin".to_string(), "/usr/bin/g++".to_string(),
         "-Xcompiler".to_string(), "-fPIC".to_string(),
         "-arch=sm_80".to_string(),
         "-O3".to_string(),
