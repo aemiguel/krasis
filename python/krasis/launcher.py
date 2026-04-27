@@ -1713,6 +1713,7 @@ class Launcher:
 def parse_args() -> argparse.Namespace:
     from krasis import __version__
     parser = argparse.ArgumentParser(
+        prog="krasis",
         description="Krasis — High-performance MoE inference engine",
         epilog=(
             "subcommands (use before any flags):\n"

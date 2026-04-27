@@ -670,7 +670,7 @@ def main():
         if config_defaults.get("attention_quant") in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported attention_quant={config_defaults['attention_quant']} in {config_path}. "
-                "Naive int4/int8 attention has been removed; use 'awq', 'hqq4', or 'bf16'."
+                "Naive int4/int8 attention has been removed; use 'awq', 'hqq4', 'hqq8', or 'bf16'."
             )
         # Expand ~ in model_path
         if "model_path" in config_defaults and isinstance(config_defaults["model_path"], str):
