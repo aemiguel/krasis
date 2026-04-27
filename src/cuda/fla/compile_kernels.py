@@ -496,6 +496,15 @@ def main():
     filtered_archs = [arch for arch in archs if arch <= max_supported_arch]
     skipped_archs = [arch for arch in archs if arch > max_supported_arch]
     if skipped_archs:
+        if os.environ.get("KRASIS_FLA_REQUIRE_ALL_ARCHS") == "1":
+            print(
+                f"ERROR: Triton {triton.__version__} cannot cross-compile "
+                f"{', '.join(f'sm_{arch}' for arch in skipped_archs)}; "
+                "KRASIS_FLA_REQUIRE_ALL_ARCHS=1 forbids publishing a partial "
+                "FLA sidecar set.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print(
             f"WARNING: Triton {triton.__version__} cannot cross-compile "
             f"{', '.join(f'sm_{arch}' for arch in skipped_archs)}; "
