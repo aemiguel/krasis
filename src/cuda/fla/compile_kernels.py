@@ -613,6 +613,7 @@ def main():
         so_path = arch_dir / so_name
         compile_cmd = [
             nvcc, "-shared",
+            "-allow-unsupported-compiler",
             "-o", str(so_path),
             "-Xcompiler", "-fPIC",
             "-Wno-deprecated-gpu-targets",

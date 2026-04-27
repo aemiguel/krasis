@@ -150,6 +150,7 @@ fn compile_cuda_kernels() {
     let status = std::process::Command::new(&nvcc)
         .args([
             "-ptx",
+            "-allow-unsupported-compiler",
             "-arch=sm_80",
             "-O3",
             "--use_fast_math",
@@ -200,6 +201,7 @@ fn compile_prefill_kernels() {
     let status = std::process::Command::new(&nvcc)
         .args([
             "-ptx",
+            "-allow-unsupported-compiler",
             "-arch=sm_80",
             "-O3",
             "--use_fast_math",
@@ -269,6 +271,7 @@ fn compile_marlin_kernels() {
 
     let common_args = [
         "--expt-relaxed-constexpr",
+        "-allow-unsupported-compiler",
         "-Xcompiler", "-fPIC",
         "-arch=sm_80",
         "-O3",
@@ -400,6 +403,7 @@ fn compile_flash_attn_kernels() {
     let common_args = vec![
         "--expt-relaxed-constexpr".to_string(),
         "--expt-extended-lambda".to_string(),
+        "-allow-unsupported-compiler".to_string(),
         "-Xcompiler".to_string(), "-fPIC".to_string(),
         "-arch=sm_80".to_string(),
         "-O3".to_string(),
