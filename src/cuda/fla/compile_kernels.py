@@ -614,6 +614,7 @@ def main():
         compile_cmd = [
             nvcc, "-shared",
             "-allow-unsupported-compiler",
+            "-ccbin", "/usr/bin/g++",
             "-o", str(so_path),
             "-Xcompiler", "-fPIC",
             "-Wno-deprecated-gpu-targets",
