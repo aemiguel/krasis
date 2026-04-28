@@ -1,0 +1,191 @@
+{
+  "summary": {
+    "bf16": {
+      "path": "logs/reference-test_20260428_180715/reference_test_summary.json",
+      "avg_exact": 36.5,
+      "total_exact": 511,
+      "total_ref": 653,
+      "full_matches": 10,
+      "containment": 554,
+      "first_matches": 14
+    },
+    "polar4_base": {
+      "path": "logs/reference-test_20260428_181329/reference_test_summary.json",
+      "avg_exact": 30.5,
+      "total_exact": 427,
+      "total_ref": 653,
+      "full_matches": 8,
+      "containment": 459,
+      "first_matches": 14
+    },
+    "polar4_nc_kv": {
+      "path": "logs/reference-test_20260428_183555/reference_test_summary.json",
+      "avg_exact": 30.5,
+      "total_exact": 427,
+      "total_ref": 653,
+      "full_matches": 7,
+      "containment": 496,
+      "first_matches": 14
+    },
+    "polar4_nc_k": {
+      "path": "logs/reference-test_20260428_184708/reference_test_summary.json",
+      "avg_exact": 29.3571,
+      "total_exact": 411,
+      "total_ref": 653,
+      "full_matches": 7,
+      "containment": 494,
+      "first_matches": 14
+    },
+    "polar4_nc_v": {
+      "path": "logs/reference-test_20260428_185358/reference_test_summary.json",
+      "avg_exact": 24.3571,
+      "total_exact": 341,
+      "total_ref": 653,
+      "full_matches": 6,
+      "containment": 405,
+      "first_matches": 14
+    }
+  },
+  "per_prompt": [
+    {
+      "idx": 1,
+      "prompt": "Hi",
+      "bf16": 12,
+      "polar4_base": 12,
+      "polar4_nc_kv": 12,
+      "polar4_nc_k": 12,
+      "polar4_nc_v": 12,
+      "ref": 12
+    },
+    {
+      "idx": 2,
+      "prompt": "What's your name?",
+      "bf16": 34,
+      "polar4_base": 34,
+      "polar4_nc_kv": 34,
+      "polar4_nc_k": 34,
+      "polar4_nc_v": 34,
+      "ref": 34
+    },
+    {
+      "idx": 3,
+      "prompt": "Who trained you?",
+      "bf16": 17,
+      "polar4_base": 2,
+      "polar4_nc_kv": 17,
+      "polar4_nc_k": 2,
+      "polar4_nc_v": 24,
+      "ref": 64
+    },
+    {
+      "idx": 4,
+      "prompt": "What is 2+2?",
+      "bf16": 9,
+      "polar4_base": 9,
+      "polar4_nc_kv": 9,
+      "polar4_nc_k": 9,
+      "polar4_nc_v": 9,
+      "ref": 9
+    },
+    {
+      "idx": 5,
+      "prompt": "Now multiply that by 10",
+      "bf16": 11,
+      "polar4_base": 11,
+      "polar4_nc_kv": 11,
+      "polar4_nc_k": 11,
+      "polar4_nc_v": 11,
+      "ref": 11
+    },
+    {
+      "idx": 6,
+      "prompt": "And divide the result by 5",
+      "bf16": 11,
+      "polar4_base": 11,
+      "polar4_nc_kv": 11,
+      "polar4_nc_k": 11,
+      "polar4_nc_v": 11,
+      "ref": 11
+    },
+    {
+      "idx": 7,
+      "prompt": "What is the largest animal in the world?",
+      "bf16": 64,
+      "polar4_base": 64,
+      "polar4_nc_kv": 56,
+      "polar4_nc_k": 55,
+      "polar4_nc_v": 22,
+      "ref": 64
+    },
+    {
+      "idx": 8,
+      "prompt": "What is the largest body of water in the world?",
+      "bf16": 40,
+      "polar4_base": 55,
+      "polar4_nc_kv": 17,
+      "polar4_nc_k": 17,
+      "polar4_nc_v": 17,
+      "ref": 64
+    },
+    {
+      "idx": 9,
+      "prompt": "Describe the binary chop algorithm in depth",
+      "bf16": 64,
+      "polar4_base": 47,
+      "polar4_nc_kv": 50,
+      "polar4_nc_k": 50,
+      "polar4_nc_v": 44,
+      "ref": 64
+    },
+    {
+      "idx": 10,
+      "prompt": "If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long do",
+      "bf16": 24,
+      "polar4_base": 13,
+      "polar4_nc_kv": 24,
+      "polar4_nc_k": 24,
+      "polar4_nc_v": 24,
+      "ref": 64
+    },
+    {
+      "idx": 11,
+      "prompt": "Tell me facts about the blue whale",
+      "bf16": 64,
+      "polar4_base": 64,
+      "polar4_nc_kv": 64,
+      "polar4_nc_k": 64,
+      "polar4_nc_v": 64,
+      "ref": 64
+    },
+    {
+      "idx": 12,
+      "prompt": "Tell me more about whales in general",
+      "bf16": 64,
+      "polar4_base": 8,
+      "polar4_nc_kv": 64,
+      "polar4_nc_k": 64,
+      "polar4_nc_v": 11,
+      "ref": 64
+    },
+    {
+      "idx": 13,
+      "prompt": "Where do whales live geographically?",
+      "bf16": 33,
+      "polar4_base": 33,
+      "polar4_nc_kv": 33,
+      "polar4_nc_k": 33,
+      "polar4_nc_v": 33,
+      "ref": 64
+    },
+    {
+      "idx": 14,
+      "prompt": "Write me a quicksort implementation in Rust",
+      "bf16": 64,
+      "polar4_base": 64,
+      "polar4_nc_kv": 25,
+      "polar4_nc_k": 25,
+      "polar4_nc_v": 25,
+      "ref": 64
+    }
+  ]
+}

@@ -714,6 +714,8 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
             return f"{DIM}{native_label} \u2192 fp8 \u2014 ~lossless{NC}"
         elif current == "polar4":
             return f"{DIM}{native_label} \u2192 polar4 \u2014 compact 4-bit{NC}"
+        elif current == "k8v4":
+            return f"{DIM}{native_label} \u2192 k8v4 \u2014 FP8 K + 4-bit V{NC}"
         elif current == "bf16":
             return f"{DIM}{native_label} \u2192 bf16 \u2014 lossless{NC}"
         return f"{DIM}{native_label} \u2192 {current}{NC}"
@@ -1210,7 +1212,12 @@ class Launcher:
             # KV allocation (capped to available VRAM)
             free_before_kv = rank.get("free_mb", 0)
             kv_alloc = int(min(self.cfg.kv_cache_mb, max(0, free_before_kv)))
-            kv_label = "polar4" if self.cfg.kv_dtype == "polar4" else ("fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16")
+            kv_label = (
+                "polar4" if self.cfg.kv_dtype == "polar4"
+                else "k8v4" if self.cfg.kv_dtype == "k8v4"
+                else "fp8" if self.cfg.kv_dtype == "fp8_e4m3"
+                else "bf16"
+            )
             kv_alloc_tokens = rank.get("kv_alloc_tokens", rank["kv_tokens"])
 
             total_used = experts_mb + attention_mb + overhead_mb + kv_alloc
@@ -1643,7 +1650,12 @@ class Launcher:
                 rank.get("lm_head_mb", 0) + rank.get("prefill_scratch_mb", 0) +
                 rank.get("prefill_workspace_mb", 0) + rank.get("cuda_overhead_mb", 0)
             )
-            kv_label = "polar4" if self.cfg.kv_dtype == "polar4" else ("fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16")
+            kv_label = (
+                "polar4" if self.cfg.kv_dtype == "polar4"
+                else "k8v4" if self.cfg.kv_dtype == "k8v4"
+                else "fp8" if self.cfg.kv_dtype == "fp8_e4m3"
+                else "bf16"
+            )
             print(f"\n  Experts:     {experts_mb:>8,} MB  (INT{self.cfg.gpu_expert_bits} g{self.cfg.expert_group_size})")
             attn_label = "HQQ4SC" if self.cfg.attention_quant == "hqq4" and self.cfg.hqq_sidecar_manifest else attention_quant_label(self.cfg.attention_quant)
             print(f"  Attention:   {attention_mb:>8,} MB  ({attn_label})")
@@ -1779,7 +1791,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vram-safety-margin", type=int, default=None,
                         help="VRAM safety margin in MB (default: 600)")
     parser.add_argument("--kv-dtype", default=None,
-                        help="KV cache dtype: fp8_e4m3, polar4, or bf16")
+                        help="KV cache dtype: fp8_e4m3, polar4, k8v4, or bf16")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
                         help="Model quantization: 4 or 8")
     parser.add_argument("--expert-group-size", type=int, default=None, choices=[32, 64, 128],

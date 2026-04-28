@@ -1,5 +1,33 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-28 (Phase 2CS QCN k8v4 HQQ8 expert-bit comparison)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: QCN HQQ8 attention with `k8v4` KV cache, graph replay enabled, timing
+instrumentation off. Both runs used
+`KRASIS_HQQ8_PREFILL_MODE=native-fused-marlin-twoscale-intercept`; only the
+GPU/CPU expert bits differ.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| QCN HQQ8/k8v4, INT8 experts | 4,238.1 | 35.00 | 7175/24576 (29.2%) | 752 MB | [log](20260428_194459_qcn_k8v4_hqq8_int8_benchmark.log) |
+| QCN HQQ8/k8v4, INT4 experts | 5,245.5 | 76.74 | 14256/24576 (58.0%) | 708 MB | [log](20260428_195237_qcn_k8v4_hqq8_int4_benchmark.log) |
+
+Notes:
+- Runs executed via `./dev benchmark ...`, not timing-instrumented profiling.
+- Decode values are the benchmark's internal engine numbers. Network round-trip
+  numbers are present in the full logs but are not used as decode speed.
+- INT4 experts are substantially faster on this surface because HCS soft
+  coverage roughly doubles (`29.2% -> 58.0%`) and expert cache bandwidth is
+  lower.
+- The INT4 run emitted a prefill-time VRAM monitor warning at `564 MB` free,
+  below the configured `600 MB` safety margin. The benchmark summary's min free
+  VRAM row is the decode min-free value.
+- Reduction: `logs/manual/phase2cs_qcn_k8v4_hqq8_benchmark_reduction_20260428.md`.
+
+---
+
 ## Standard Benchmarks — 2026-04-27 (Phase 2BR QCN Polar4 HQQ speed-test variants)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.

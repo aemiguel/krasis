@@ -243,7 +243,7 @@ class QuantConfig:
     expert_group_size: int = 128   # routed expert quantization group size; 32 matches Q8_0-style block scale granularity
     gpu_expert_int4_calib: str = "amax"  # "amax" or "search_rmse" for routed-expert GPU INT4 cache build
     cpu_expert_bits: int = 4       # 4 or 8 for CPU expert quantization
-    kv_cache_format: str = "fp8"   # "bf16", "fp8", or "polar4"
+    kv_cache_format: str = "fp8"   # "bf16", "fp8", "polar4", or "k8v4"
     hqq_cache_profile: str = HQQ_CACHE_PROFILE_BASELINE  # "baseline" or an explicit calibrated HQQ profile
     hqq_sidecar_manifest: Optional[str] = None  # explicit HQQ4-only sidecar manifest for switchable correction
 
@@ -254,11 +254,12 @@ class QuantConfig:
             "bf16": "bf16",
             "bfloat16": "bf16",
             "polar4": "polar4",
+            "k8v4": "k8v4",
         }
         if self.kv_cache_format not in kv_aliases:
             raise ValueError(
                 f"Unsupported kv_cache_format '{self.kv_cache_format}'. "
-                "Use 'bf16', 'fp8_e4m3', or 'polar4'."
+                "Use 'bf16', 'fp8_e4m3', 'polar4', or 'k8v4'."
             )
         self.kv_cache_format = kv_aliases[self.kv_cache_format]
 

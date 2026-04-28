@@ -3992,7 +3992,8 @@ extern "C" __global__ void kv_cache_append_polar4_kernel(
     int M,
     int kv_stride,
     int max_seq,
-    int start_pos
+    int start_pos,
+    int norm_correction
 ) {
     int ti = blockIdx.x; // token index in prefill batch
     if (ti >= M) return;
@@ -4029,25 +4030,100 @@ extern "C" __global__ void kv_cache_append_polar4_kernel(
         k_r = sqrtf(k_r + 1e-12f);
         v_r = sqrtf(v_r + 1e-12f);
 
-        __nv_bfloat16 k_rb = __float2bfloat16(k_r);
-        __nv_bfloat16 v_rb = __float2bfloat16(v_r);
-        k_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_rb);
-        v_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
-
         float inv_k_r = 1.0f / k_r;
         float inv_v_r = 1.0f / v_r;
         unsigned char* k_ang = k_angles_cache + (dst_pos * num_blocks + block_idx) * 8;
         unsigned char* v_ang = v_angles_cache + (dst_pos * num_blocks + block_idx) * 8;
 
+        float k_qnorm2 = 0.0f;
+        float v_qnorm2 = 0.0f;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             int k0 = quantize_polar4_p(k_local[i*2] * inv_k_r);
             int k1 = quantize_polar4_p(k_local[i*2+1] * inv_k_r);
             k_ang[i] = (unsigned char)((k1 << 4) | k0);
+            float k0v = polar4_codebook_p[k0];
+            float k1v = polar4_codebook_p[k1];
+            k_qnorm2 += k0v * k0v + k1v * k1v;
             int v0 = quantize_polar4_p(v_local[i*2] * inv_v_r);
             int v1 = quantize_polar4_p(v_local[i*2+1] * inv_v_r);
             v_ang[i] = (unsigned char)((v1 << 4) | v0);
+            float v0v = polar4_codebook_p[v0];
+            float v1v = polar4_codebook_p[v1];
+            v_qnorm2 += v0v * v0v + v1v * v1v;
         }
+
+        if (norm_correction & 1) {
+            k_r = k_r / sqrtf(k_qnorm2 + 1e-12f);
+        }
+        if (norm_correction & 2) {
+            v_r = v_r / sqrtf(v_qnorm2 + 1e-12f);
+        }
+
+        __nv_bfloat16 k_rb = __float2bfloat16(k_r);
+        __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+        k_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_rb);
+        v_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+    }
+}
+
+extern "C" __global__ void kv_cache_append_k8v4_kernel(
+    __nv_fp8_e4m3* __restrict__ k_cache,
+    unsigned short* __restrict__ v_radius_cache,
+    unsigned char* __restrict__ v_angles_cache,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    int M,
+    int kv_stride,
+    int max_seq,
+    int start_pos,
+    int norm_correction
+) {
+    int ti = blockIdx.x;
+    if (ti >= M) return;
+
+    int num_blocks = kv_stride / 16;
+    int dst_pos = start_pos + ti;
+    if (dst_pos >= max_seq) return;
+
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int src_offset = ti * kv_stride + block_idx * 16;
+        int dst_offset = dst_pos * kv_stride + block_idx * 16;
+        float v_local[16];
+
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            k_cache[dst_offset + i] = bf16_to_fp8e4m3(k[src_offset + i]);
+            v_local[i] = __bfloat162float(v[src_offset + i]) * polar4_signs_p[i];
+        }
+
+        fht16_p(v_local);
+        #pragma unroll
+        for (int i = 0; i < 16; i++) v_local[i] *= 0.25f;
+
+        float v_r = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) v_r += v_local[i] * v_local[i];
+        v_r = sqrtf(v_r + 1e-12f);
+
+        float inv_v_r = 1.0f / v_r;
+        unsigned char* v_ang = v_angles_cache + (dst_pos * num_blocks + block_idx) * 8;
+        float v_qnorm2 = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int v0 = quantize_polar4_p(v_local[i*2] * inv_v_r);
+            int v1 = quantize_polar4_p(v_local[i*2+1] * inv_v_r);
+            v_ang[i] = (unsigned char)((v1 << 4) | v0);
+            float v0v = polar4_codebook_p[v0];
+            float v1v = polar4_codebook_p[v1];
+            v_qnorm2 += v0v * v0v + v1v * v1v;
+        }
+        if (norm_correction & 2) {
+            v_r = v_r / sqrtf(v_qnorm2 + 1e-12f);
+        }
+
+        __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+        v_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
     }
 }
 

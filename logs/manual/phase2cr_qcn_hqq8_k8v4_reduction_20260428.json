@@ -1,0 +1,738 @@
+{
+  "HQQ8 + BF16 KV": {
+    "path": "logs/reference-test_20260428_180715/reference_test_summary.json",
+    "avg_exact": 36.5,
+    "total_exact": 511,
+    "total_ref": 653,
+    "full_matches": 10,
+    "containment": 554,
+    "containment_total": 653,
+    "first_matches": 14,
+    "rows": [
+      {
+        "idx": 1,
+        "prompt": "Hi",
+        "exact": 12,
+        "ref": 12,
+        "containment": 12,
+        "containment_total": 12,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 2,
+        "prompt": "What's your name?",
+        "exact": 34,
+        "ref": 34,
+        "containment": 34,
+        "containment_total": 34,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 3,
+        "prompt": "Who trained you?",
+        "exact": 17,
+        "ref": 64,
+        "containment": 21,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 4,
+        "prompt": "What is 2+2?",
+        "exact": 9,
+        "ref": 9,
+        "containment": 9,
+        "containment_total": 9,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 5,
+        "prompt": "Now multiply that by 10",
+        "exact": 11,
+        "ref": 11,
+        "containment": 11,
+        "containment_total": 11,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 6,
+        "prompt": "And divide the result by 5",
+        "exact": 11,
+        "ref": 11,
+        "containment": 11,
+        "containment_total": 11,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 7,
+        "prompt": "What is the largest animal in the world?",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 8,
+        "prompt": "What is the largest body of water in the world?",
+        "exact": 40,
+        "ref": 64,
+        "containment": 63,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 9,
+        "prompt": "Describe the binary chop algorithm in depth",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 10,
+        "prompt": "If it takes 4 hours for 4 towels to dry on a clothesline in ",
+        "exact": 24,
+        "ref": 64,
+        "containment": 37,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 11,
+        "prompt": "Tell me facts about the blue whale",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 12,
+        "prompt": "Tell me more about whales in general",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 13,
+        "prompt": "Where do whales live geographically?",
+        "exact": 33,
+        "ref": 64,
+        "containment": 36,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 14,
+        "prompt": "Write me a quicksort implementation in Rust",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      }
+    ]
+  },
+  "HQQ8 + Polar4": {
+    "path": "logs/reference-test_20260428_181329/reference_test_summary.json",
+    "avg_exact": 30.5,
+    "total_exact": 427,
+    "total_ref": 653,
+    "full_matches": 8,
+    "containment": 459,
+    "containment_total": 653,
+    "first_matches": 14,
+    "rows": [
+      {
+        "idx": 1,
+        "prompt": "Hi",
+        "exact": 12,
+        "ref": 12,
+        "containment": 12,
+        "containment_total": 12,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 2,
+        "prompt": "What's your name?",
+        "exact": 34,
+        "ref": 34,
+        "containment": 34,
+        "containment_total": 34,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 3,
+        "prompt": "Who trained you?",
+        "exact": 2,
+        "ref": 64,
+        "containment": 11,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 4,
+        "prompt": "What is 2+2?",
+        "exact": 9,
+        "ref": 9,
+        "containment": 9,
+        "containment_total": 9,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 5,
+        "prompt": "Now multiply that by 10",
+        "exact": 11,
+        "ref": 11,
+        "containment": 11,
+        "containment_total": 11,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 6,
+        "prompt": "And divide the result by 5",
+        "exact": 11,
+        "ref": 11,
+        "containment": 11,
+        "containment_total": 11,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 7,
+        "prompt": "What is the largest animal in the world?",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 8,
+        "prompt": "What is the largest body of water in the world?",
+        "exact": 55,
+        "ref": 64,
+        "containment": 56,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 9,
+        "prompt": "Describe the binary chop algorithm in depth",
+        "exact": 47,
+        "ref": 64,
+        "containment": 49,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 10,
+        "prompt": "If it takes 4 hours for 4 towels to dry on a clothesline in ",
+        "exact": 13,
+        "ref": 64,
+        "containment": 26,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 11,
+        "prompt": "Tell me facts about the blue whale",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 12,
+        "prompt": "Tell me more about whales in general",
+        "exact": 8,
+        "ref": 64,
+        "containment": 12,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 13,
+        "prompt": "Where do whales live geographically?",
+        "exact": 33,
+        "ref": 64,
+        "containment": 36,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 14,
+        "prompt": "Write me a quicksort implementation in Rust",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      }
+    ]
+  },
+  "Polar4 norm-correct K+V": {
+    "path": "logs/reference-test_20260428_183555/reference_test_summary.json",
+    "avg_exact": 30.5,
+    "total_exact": 427,
+    "total_ref": 653,
+    "full_matches": 7,
+    "containment": 496,
+    "containment_total": 653,
+    "first_matches": 14,
+    "rows": [
+      {
+        "idx": 1,
+        "prompt": "Hi",
+        "exact": 12,
+        "ref": 12,
+        "containment": 12,
+        "containment_total": 12,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 2,
+        "prompt": "What's your name?",
+        "exact": 34,
+        "ref": 34,
+        "containment": 34,
+        "containment_total": 34,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 3,
+        "prompt": "Who trained you?",
+        "exact": 17,
+        "ref": 64,
+        "containment": 21,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 4,
+        "prompt": "What is 2+2?",
+        "exact": 9,
+        "ref": 9,
+        "containment": 9,
+        "containment_total": 9,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 5,
+        "prompt": "Now multiply that by 10",
+        "exact": 11,
+        "ref": 11,
+        "containment": 11,
+        "containment_total": 11,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 6,
+        "prompt": "And divide the result by 5",
+        "exact": 11,
+        "ref": 11,
+        "containment": 11,
+        "containment_total": 11,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 7,
+        "prompt": "What is the largest animal in the world?",
+        "exact": 56,
+        "ref": 64,
+        "containment": 57,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 8,
+        "prompt": "What is the largest body of water in the world?",
+        "exact": 17,
+        "ref": 64,
+        "containment": 23,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 9,
+        "prompt": "Describe the binary chop algorithm in depth",
+        "exact": 50,
+        "ref": 64,
+        "containment": 59,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 10,
+        "prompt": "If it takes 4 hours for 4 towels to dry on a clothesline in ",
+        "exact": 24,
+        "ref": 64,
+        "containment": 37,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 11,
+        "prompt": "Tell me facts about the blue whale",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 12,
+        "prompt": "Tell me more about whales in general",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 13,
+        "prompt": "Where do whales live geographically?",
+        "exact": 33,
+        "ref": 64,
+        "containment": 36,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 14,
+        "prompt": "Write me a quicksort implementation in Rust",
+        "exact": 25,
+        "ref": 64,
+        "containment": 58,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      }
+    ]
+  },
+  "HQQ8 + k8v4": {
+    "path": "logs/reference-test_20260428_193047/reference_test_summary.json",
+    "avg_exact": 32.14,
+    "total_exact": 450,
+    "total_ref": 653,
+    "full_matches": 8,
+    "containment": 504,
+    "containment_total": 653,
+    "first_matches": 14,
+    "rows": [
+      {
+        "idx": 1,
+        "prompt": "Hi",
+        "exact": 12,
+        "ref": 12,
+        "containment": 12,
+        "containment_total": 12,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 2,
+        "prompt": "What's your name?",
+        "exact": 34,
+        "ref": 34,
+        "containment": 34,
+        "containment_total": 34,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 3,
+        "prompt": "Who trained you?",
+        "exact": 15,
+        "ref": 64,
+        "containment": 22,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 4,
+        "prompt": "What is 2+2?",
+        "exact": 9,
+        "ref": 9,
+        "containment": 9,
+        "containment_total": 9,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 5,
+        "prompt": "Now multiply that by 10",
+        "exact": 11,
+        "ref": 11,
+        "containment": 11,
+        "containment_total": 11,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 6,
+        "prompt": "And divide the result by 5",
+        "exact": 11,
+        "ref": 11,
+        "containment": 11,
+        "containment_total": 11,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 7,
+        "prompt": "What is the largest animal in the world?",
+        "exact": 55,
+        "ref": 64,
+        "containment": 57,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 8,
+        "prompt": "What is the largest body of water in the world?",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 9,
+        "prompt": "Describe the binary chop algorithm in depth",
+        "exact": 29,
+        "ref": 64,
+        "containment": 33,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 10,
+        "prompt": "If it takes 4 hours for 4 towels to dry on a clothesline in ",
+        "exact": 24,
+        "ref": 64,
+        "containment": 37,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 11,
+        "prompt": "Tell me facts about the blue whale",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 12,
+        "prompt": "Tell me more about whales in general",
+        "exact": 64,
+        "ref": 64,
+        "containment": 64,
+        "containment_total": 64,
+        "full": true,
+        "first_match": true
+      },
+      {
+        "idx": 13,
+        "prompt": "Where do whales live geographically?",
+        "exact": 33,
+        "ref": 64,
+        "containment": 35,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      },
+      {
+        "idx": 14,
+        "prompt": "Write me a quicksort implementation in Rust",
+        "exact": 25,
+        "ref": 64,
+        "containment": 51,
+        "containment_total": 64,
+        "full": false,
+        "first_match": true
+      }
+    ]
+  },
+  "deltas": [
+    {
+      "idx": 1,
+      "prompt": "Hi",
+      "bf16": 12,
+      "polar4": 12,
+      "k8v4": 12,
+      "delta_vs_polar4": 0,
+      "gap_to_bf16": 0
+    },
+    {
+      "idx": 2,
+      "prompt": "What's your name?",
+      "bf16": 34,
+      "polar4": 34,
+      "k8v4": 34,
+      "delta_vs_polar4": 0,
+      "gap_to_bf16": 0
+    },
+    {
+      "idx": 3,
+      "prompt": "Who trained you?",
+      "bf16": 17,
+      "polar4": 2,
+      "k8v4": 15,
+      "delta_vs_polar4": 13,
+      "gap_to_bf16": 2
+    },
+    {
+      "idx": 4,
+      "prompt": "What is 2+2?",
+      "bf16": 9,
+      "polar4": 9,
+      "k8v4": 9,
+      "delta_vs_polar4": 0,
+      "gap_to_bf16": 0
+    },
+    {
+      "idx": 5,
+      "prompt": "Now multiply that by 10",
+      "bf16": 11,
+      "polar4": 11,
+      "k8v4": 11,
+      "delta_vs_polar4": 0,
+      "gap_to_bf16": 0
+    },
+    {
+      "idx": 6,
+      "prompt": "And divide the result by 5",
+      "bf16": 11,
+      "polar4": 11,
+      "k8v4": 11,
+      "delta_vs_polar4": 0,
+      "gap_to_bf16": 0
+    },
+    {
+      "idx": 7,
+      "prompt": "What is the largest animal in the world?",
+      "bf16": 64,
+      "polar4": 64,
+      "k8v4": 55,
+      "delta_vs_polar4": -9,
+      "gap_to_bf16": 9
+    },
+    {
+      "idx": 8,
+      "prompt": "What is the largest body of water in the world?",
+      "bf16": 40,
+      "polar4": 55,
+      "k8v4": 64,
+      "delta_vs_polar4": 9,
+      "gap_to_bf16": -24
+    },
+    {
+      "idx": 9,
+      "prompt": "Describe the binary chop algorithm in depth",
+      "bf16": 64,
+      "polar4": 47,
+      "k8v4": 29,
+      "delta_vs_polar4": -18,
+      "gap_to_bf16": 35
+    },
+    {
+      "idx": 10,
+      "prompt": "If it takes 4 hours for 4 towels to dry on a clothesline in ",
+      "bf16": 24,
+      "polar4": 13,
+      "k8v4": 24,
+      "delta_vs_polar4": 11,
+      "gap_to_bf16": 0
+    },
+    {
+      "idx": 11,
+      "prompt": "Tell me facts about the blue whale",
+      "bf16": 64,
+      "polar4": 64,
+      "k8v4": 64,
+      "delta_vs_polar4": 0,
+      "gap_to_bf16": 0
+    },
+    {
+      "idx": 12,
+      "prompt": "Tell me more about whales in general",
+      "bf16": 64,
+      "polar4": 8,
+      "k8v4": 64,
+      "delta_vs_polar4": 56,
+      "gap_to_bf16": 0
+    },
+    {
+      "idx": 13,
+      "prompt": "Where do whales live geographically?",
+      "bf16": 33,
+      "polar4": 33,
+      "k8v4": 33,
+      "delta_vs_polar4": 0,
+      "gap_to_bf16": 0
+    },
+    {
+      "idx": 14,
+      "prompt": "Write me a quicksort implementation in Rust",
+      "bf16": 64,
+      "polar4": 64,
+      "k8v4": 25,
+      "delta_vs_polar4": -39,
+      "gap_to_bf16": 39
+    }
+  ]
+}

@@ -22,6 +22,25 @@ use cudarc::cublas::result as cublas_result;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig};
 use cudarc::driver::sys as cuda_sys;
 
+fn parse_polar4_norm_correction_mode() -> i32 {
+    match std::env::var("KRASIS_POLAR4_NORM_CORRECTION") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "no" | "off" | "none" => 0,
+            "1" | "true" | "yes" | "on" | "kv" | "both" => 3,
+            "k" | "key" | "keys" => 1,
+            "v" | "value" | "values" => 2,
+            other => {
+                log::warn!(
+                    "Unrecognized KRASIS_POLAR4_NORM_CORRECTION='{}'; disabling Polar4 norm correction",
+                    other
+                );
+                0
+            }
+        },
+        Err(_) => 0,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TraceRange {
     start: usize,
@@ -616,8 +635,10 @@ const KERNEL_NAMES: &[&str] = &[
     "apply_rope",
     "kv_cache_write",
     "kv_cache_write_bf16",
+    "kv_cache_write_k8v4",
     "gqa_attention",
     "gqa_attention_bf16",
+    "gqa_attention_k8v4",
     "gqa_attention_tiled",
     "gqa_attention_tiled_bf16",
     "gqa_attention_reduce",
@@ -661,12 +682,14 @@ const KERNEL_NAMES: &[&str] = &[
     "apply_rope_g",
     "kv_cache_write_g",
     "kv_cache_write_bf16_g",
+    "kv_cache_write_k8v4_g",
     "gqa_attention_g",
     "gated_rmsnorm_silu_bf16",
     "gqa_attention_g_bf16",
     "apply_gated_attn_bf16",
     "gqa_attention_tiled_g",
     "gqa_attention_tiled_bf16_g",
+    "gqa_attention_k8v4_tiled_g",
     "gqa_attention_reduce_g",
     "la_fused_post_proj",
     "la_fused_post_proj_f32",
@@ -3448,8 +3471,10 @@ struct CachedKernels {
     apply_rope: cudarc::driver::CudaFunction,
     kv_cache_write: cudarc::driver::CudaFunction,
     kv_cache_write_bf16: cudarc::driver::CudaFunction,
+    kv_cache_write_k8v4: cudarc::driver::CudaFunction,
     gqa_attention: cudarc::driver::CudaFunction,
     gqa_attention_bf16: cudarc::driver::CudaFunction,
+    gqa_attention_k8v4: cudarc::driver::CudaFunction,
     gqa_attention_tiled: cudarc::driver::CudaFunction,
     gqa_attention_tiled_bf16: cudarc::driver::CudaFunction,
     gqa_attention_reduce: cudarc::driver::CudaFunction,
@@ -3470,6 +3495,7 @@ struct CachedKernels {
     apply_rope_g: cudarc::driver::CudaFunction,
     kv_cache_write_g: cudarc::driver::CudaFunction,
     kv_cache_write_bf16_g: cudarc::driver::CudaFunction,
+    kv_cache_write_k8v4_g: cudarc::driver::CudaFunction,
     gqa_attention_g: cudarc::driver::CudaFunction,
     // BF16-output variants (eliminate fp32_to_bf16 conversion kernel)
     gated_rmsnorm_silu_bf16: cudarc::driver::CudaFunction,
@@ -3478,6 +3504,7 @@ struct CachedKernels {
     // Tiled GQA for CUDA graph capture (reads d_seq_len from GPU pointer)
     gqa_attention_tiled_g: cudarc::driver::CudaFunction,
     gqa_attention_tiled_bf16_g: cudarc::driver::CudaFunction,
+    gqa_attention_k8v4_tiled_g: cudarc::driver::CudaFunction,
     gqa_attention_reduce_g: cudarc::driver::CudaFunction,
     // Fused LA post-projection: repeat_interleave + l2norm + delta_net + rmsnorm → BF16
     la_fused_post_proj: cudarc::driver::CudaFunction,
@@ -3723,8 +3750,11 @@ struct GpuDecodeGraph {
     kv_v_ptrs: Vec<u64>,
     kv_max_seq: usize,
     kv_current_pos: usize,
-    /// KV cache format: 0=bf16, 1=fp8, 2=polar4
+    /// KV cache format: 0=bf16, 1=fp8, 2=polar4, 3=k8v4
     kv_format: u32,
+    /// Opt-in Polar4 radius norm correction mode.
+    /// 0=off, 1=K only, 2=V only, 3=K+V. Cache layout is unchanged.
+    polar4_norm_correction_mode: i32,
     /// Polar4 KV cache pointers (only used when kv_format==2)
     kv_k_radius_ptrs: Vec<u64>,
     kv_v_radius_ptrs: Vec<u64>,
@@ -3914,6 +3944,9 @@ struct GpuDecodeGraph {
     /// Snapshot of Polar4 KV cache pointers at capture time (k_radius, v_radius, k_angles, v_angles).
     /// Vec of (layer_idx, k_radius_ptr, v_radius_ptr, k_angles_ptr, v_angles_ptr).
     captured_polar4_ptrs: Vec<(usize, u64, u64, u64, u64)>,
+    /// Snapshot of k8v4 KV cache pointers at capture time (k_fp8, v_radius, v_angles).
+    /// Vec of (layer_idx, k_ptr, v_radius_ptr, v_angles_ptr).
+    captured_k8v4_ptrs: Vec<(usize, u64, u64, u64)>,
     /// MoE layer indices (which layers have MoE data).
     per_layer_moe_indices: Vec<usize>,
     /// Persistent cuBLAS workspace for CUDA graph capture (prevents internal cudaMalloc).
@@ -6247,6 +6280,7 @@ impl GpuDecodeStore {
             kv_max_seq: 0,
             kv_current_pos: 0,
             kv_format: 1, // default FP8
+            polar4_norm_correction_mode: parse_polar4_norm_correction_mode(),
             kv_k_radius_ptrs: Vec::new(),
             kv_v_radius_ptrs: Vec::new(),
             kv_k_angles_ptrs: Vec::new(),
@@ -6357,6 +6391,7 @@ impl GpuDecodeStore {
             captured_kv_ptrs: Vec::new(),
             captured_mla_ptrs: Vec::new(),
             captured_polar4_ptrs: Vec::new(),
+            captured_k8v4_ptrs: Vec::new(),
             per_layer_moe_indices: Vec::new(),
             d_cublas_workspace: None,
         }));
@@ -6402,8 +6437,10 @@ impl GpuDecodeStore {
                 apply_rope: get("apply_rope")?,
                 kv_cache_write: get("kv_cache_write")?,
                 kv_cache_write_bf16: get("kv_cache_write_bf16")?,
+                kv_cache_write_k8v4: get("kv_cache_write_k8v4")?,
                 gqa_attention: get("gqa_attention")?,
                 gqa_attention_bf16: get("gqa_attention_bf16")?,
+                gqa_attention_k8v4: get("gqa_attention_k8v4")?,
                 gqa_attention_tiled: get("gqa_attention_tiled")?,
                 gqa_attention_tiled_bf16: get("gqa_attention_tiled_bf16")?,
                 gqa_attention_reduce: get("gqa_attention_reduce")?,
@@ -6423,6 +6460,7 @@ impl GpuDecodeStore {
                 apply_rope_g: get("apply_rope_g")?,
                 kv_cache_write_g: get("kv_cache_write_g")?,
                 kv_cache_write_bf16_g: get("kv_cache_write_bf16_g")?,
+                kv_cache_write_k8v4_g: get("kv_cache_write_k8v4_g")?,
                 gqa_attention_g: get("gqa_attention_g")?,
                 // BF16-output variants
                 gated_rmsnorm_silu_bf16: get("gated_rmsnorm_silu_bf16")?,
@@ -6430,6 +6468,7 @@ impl GpuDecodeStore {
                 apply_gated_attn_bf16: get("apply_gated_attn_bf16")?,
                 gqa_attention_tiled_g: get("gqa_attention_tiled_g")?,
                 gqa_attention_tiled_bf16_g: get("gqa_attention_tiled_bf16_g")?,
+                gqa_attention_k8v4_tiled_g: get("gqa_attention_k8v4_tiled_g")?,
                 gqa_attention_reduce_g: get("gqa_attention_reduce_g")?,
                 la_fused_post_proj: get("la_fused_post_proj")?,
                 la_fused_post_proj_f32: get("la_fused_post_proj_f32")?,
@@ -10700,10 +10739,78 @@ impl GpuDecodeStore {
             graph.kv_v_angles_ptrs[layer_idx] = va_ptr as u64;
             registered += 1;
         }
-        log::info!("GpuDecodeStore: Polar4 KV cache pointers set ({} GQA layers, max_seq={}, blocks={})",
-            registered, max_seq, num_blocks);
+        log::info!(
+            "GpuDecodeStore: Polar4 KV cache pointers set ({} GQA layers, max_seq={}, blocks={}, norm_correction_mode={})",
+            registered, max_seq, num_blocks, graph.polar4_norm_correction_mode
+        );
 
         // Allocate FlashDecoding tiled attention buffers (same as FP8 path).
+        let mut max_nh: usize = 0;
+        let mut max_hd: usize = 0;
+        for layer in &graph.layers {
+            if let GpuAttnConfig::GQA { num_heads, head_dim, .. } = &layer.attn {
+                max_nh = max_nh.max(*num_heads);
+                max_hd = max_hd.max(*head_dim);
+            }
+        }
+        if max_nh > 0 && max_hd > 0 {
+            let tile_size: usize = 256;
+            let max_tiles = (max_seq + tile_size - 1) / tile_size;
+            let partial_o_size = max_nh * max_tiles * max_hd;
+            let partial_lse_size = max_nh * max_tiles * 2;
+            let d_tiled_o = self.device.alloc_zeros::<f32>(partial_o_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            let d_tiled_lse = self.device.alloc_zeros::<f32>(partial_lse_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            graph.d_gqa_tiled_o = Some(d_tiled_o);
+            graph.d_gqa_tiled_lse = Some(d_tiled_lse);
+            graph.gqa_tile_size = tile_size;
+            graph.gqa_max_tiles = max_tiles;
+            graph.gqa_num_q_heads = max_nh;
+            graph.gqa_head_dim = max_hd;
+        }
+        Ok(())
+    }
+
+    /// Register k8v4 KV cache pointers from Python's PagedKVCache.
+    /// k8v4_ptrs: list of (layer_idx, k_fp8_ptr, v_radius_ptr, v_angles_ptr)
+    #[pyo3(signature = (k8v4_ptrs, max_seq, num_blocks))]
+    fn set_kv_cache_ptrs_k8v4(
+        &mut self,
+        k8v4_ptrs: Vec<(usize, usize, usize, usize)>,
+        max_seq: usize,
+        num_blocks: usize,
+    ) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let num_layers = graph.layers.len();
+        graph.kv_k_ptrs = vec![0u64; num_layers];
+        graph.kv_v_ptrs = vec![0u64; num_layers];
+        graph.kv_k_radius_ptrs = vec![0u64; num_layers];
+        graph.kv_v_radius_ptrs = vec![0u64; num_layers];
+        graph.kv_k_angles_ptrs = vec![0u64; num_layers];
+        graph.kv_v_angles_ptrs = vec![0u64; num_layers];
+        graph.kv_max_seq = max_seq;
+        graph.kv_format = 3;
+        graph.kv_num_blocks = num_blocks;
+
+        let mut registered = 0usize;
+        for (layer_idx, k_ptr, vr_ptr, va_ptr) in k8v4_ptrs {
+            if layer_idx >= num_layers {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Layer {} out of range ({})", layer_idx, num_layers)));
+            }
+            graph.kv_k_ptrs[layer_idx] = k_ptr as u64;
+            graph.kv_v_radius_ptrs[layer_idx] = vr_ptr as u64;
+            graph.kv_v_angles_ptrs[layer_idx] = va_ptr as u64;
+            registered += 1;
+        }
+        log::info!(
+            "GpuDecodeStore: k8v4 KV cache pointers set ({} GQA layers, max_seq={}, V blocks={}, norm_correction_mode={})",
+            registered, max_seq, num_blocks, graph.polar4_norm_correction_mode
+        );
+
+        // Allocate FlashDecoding tiled attention buffers (same as FP8/Polar4 path).
         let mut max_nh: usize = 0;
         let mut max_hd: usize = 0;
         for layer in &graph.layers {
@@ -11457,7 +11564,7 @@ impl GpuDecodeStore {
                 // Polar4 uses different packing: radius and angles
                 k.kv_cache_write_polar4.clone().launch(
                     LaunchConfig { grid_dim: (blocks_write, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                    (cache_k_ptr, cache_v_ptr, cache_k_angles_ptr, cache_v_angles_ptr, k_ptr, v_ptr, pos, kv_stride),
+                    (cache_k_ptr, cache_v_ptr, cache_k_angles_ptr, cache_v_angles_ptr, k_ptr, v_ptr, pos, kv_stride, 0i32),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("kv_cache_write_polar4 failed: {:?}", e)))?;
             } else if format == 0 {
                 k.kv_cache_write_bf16.clone().launch(
@@ -12853,6 +12960,7 @@ impl GpuDecodeStore {
             kv_v_ptrs: graph.kv_v_ptrs.clone(),
             kv_max_seq: graph.kv_max_seq,
             kv_format: graph.kv_format,
+            polar4_norm_correction_mode: graph.polar4_norm_correction_mode,
             kv_k_radius_ptrs: graph.kv_k_radius_ptrs.clone(),
             kv_v_radius_ptrs: graph.kv_v_radius_ptrs.clone(),
             kv_k_angles_ptrs: graph.kv_k_angles_ptrs.clone(),
@@ -13915,6 +14023,21 @@ impl GpuDecodeStore {
             }
         }
 
+        // Check k8v4 KV cache pointers
+        for &(li, cap_k, cap_vr, cap_va) in &graph.captured_k8v4_ptrs {
+            if li >= graph.kv_k_ptrs.len() || li >= graph.kv_v_radius_ptrs.len() {
+                trace_emit_global_mark(trace_cfg.as_ref(), "graph", &format!("phase=pointer_verify kind=k8v4 result=out_of_range layer={}", li));
+                return false;
+            }
+            if graph.kv_k_ptrs[li] != cap_k
+                || graph.kv_v_radius_ptrs[li] != cap_vr
+                || graph.kv_v_angles_ptrs[li] != cap_va
+            {
+                trace_emit_global_mark(trace_cfg.as_ref(), "graph", &format!("phase=pointer_verify kind=k8v4 result=changed layer={}", li));
+                return false;
+            }
+        }
+
         true
     }
 
@@ -14177,6 +14300,7 @@ impl GpuDecodeStore {
         graph.captured_kv_ptrs.clear();
         graph.captured_mla_ptrs.clear();
         graph.captured_polar4_ptrs.clear();
+        graph.captured_k8v4_ptrs.clear();
         for (li, layer) in graph.layers.iter().enumerate() {
             match &layer.attn {
                 GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
@@ -14191,6 +14315,19 @@ impl GpuDecodeStore {
                                 graph.kv_k_radius_ptrs[li],
                                 graph.kv_v_radius_ptrs[li],
                                 graph.kv_k_angles_ptrs[li],
+                                graph.kv_v_angles_ptrs[li],
+                            ));
+                        }
+                    } else if graph.kv_format == 3 {
+                        // k8v4: track FP8 K pointer plus Polar4 V radius/angles pointers
+                        if li < graph.kv_k_ptrs.len()
+                            && li < graph.kv_v_radius_ptrs.len()
+                            && graph.kv_k_ptrs[li] != 0
+                        {
+                            graph.captured_k8v4_ptrs.push((
+                                li,
+                                graph.kv_k_ptrs[li],
+                                graph.kv_v_radius_ptrs[li],
                                 graph.kv_v_angles_ptrs[li],
                             ));
                         }
@@ -14212,11 +14349,12 @@ impl GpuDecodeStore {
             trace_cfg.as_ref(),
             "graph",
             &format!(
-                "phase=pointer_snapshot la={} kv={} mla={} polar4={}",
+                "phase=pointer_snapshot la={} kv={} mla={} polar4={} k8v4={}",
                 graph.captured_la_ptrs.len(),
                 graph.captured_kv_ptrs.len(),
                 graph.captured_mla_ptrs.len(),
                 graph.captured_polar4_ptrs.len(),
+                graph.captured_k8v4_ptrs.len(),
             ),
         );
 
@@ -14944,13 +15082,43 @@ impl GpuDecodeStore {
                                     (
                                         graph.kv_k_radius_ptrs[layer_idx],
                                         graph.kv_v_radius_ptrs[layer_idx],
-                                        graph.kv_k_angles_ptrs[layer_idx],
+                                graph.kv_k_angles_ptrs[layer_idx],
+                                graph.kv_v_angles_ptrs[layer_idx],
+                                *graph.d_gqa_k.device_ptr(),
+                                *graph.d_gqa_v.device_ptr(),
+                                d_pos_ptr, kv_stride as i32,
+                                graph.polar4_norm_correction_mode,
+                                    ),
+                                ).map_err(|e| format!("kv_cache_write_polar4_g[{}]: {:?}", layer_idx, e))?;
+                            }
+                        } else if graph.kv_format == 3 {
+                            // k8v4: K is FP8, V is Polar4 radius + angle.
+                            let num_blocks = graph.kv_num_blocks;
+                            let threads = 256u32;
+                            let blocks = ((num_blocks as u32) + threads - 1) / threads;
+                            if graph.kv_k_ptrs[layer_idx] == 0 || graph.kv_v_radius_ptrs[layer_idx] == 0 {
+                                return Err(format!(
+                                    "kv_cache_write_k8v4_g[{}]: null k8v4 pointer (k={:#x}, vr={:#x}, va={:#x})",
+                                    layer_idx,
+                                    graph.kv_k_ptrs[layer_idx],
+                                    graph.kv_v_radius_ptrs[layer_idx],
+                                    graph.kv_v_angles_ptrs[layer_idx]
+                                ));
+                            }
+                            unsafe {
+                                k.kv_cache_write_k8v4_g.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        graph.kv_k_ptrs[layer_idx],
+                                        graph.kv_v_radius_ptrs[layer_idx],
                                         graph.kv_v_angles_ptrs[layer_idx],
                                         *graph.d_gqa_k.device_ptr(),
                                         *graph.d_gqa_v.device_ptr(),
-                                        d_pos_ptr, kv_stride as i32,
+                                        d_pos_ptr,
+                                        kv_stride as i32,
+                                        graph.polar4_norm_correction_mode,
                                     ),
-                                ).map_err(|e| format!("kv_cache_write_polar4_g[{}]: {:?}", layer_idx, e))?;
+                                ).map_err(|e| format!("kv_cache_write_k8v4_g[{}]: {:?}", layer_idx, e))?;
                             }
                         } else if graph.kv_format == 0 {
                             let threads = 256u32;
@@ -15037,6 +15205,59 @@ impl GpuDecodeStore {
                                         max_tiles as i32,
                                     ),
                                 ).map_err(|e| format!("gqa_attention_polar4_reduce_g[{}]: {:?}", layer_idx, e))?;
+                            }
+                        } else if graph.kv_format == 3 {
+                            // k8v4 attention: FP8 K scores, Polar4 V accumulation.
+                            let threads = 256u32;
+                            let tile_size = graph.gqa_tile_size;
+                            let max_tiles = graph.gqa_max_tiles;
+
+                            let tiled_o = graph.d_gqa_tiled_o.as_ref()
+                                .ok_or_else(|| format!("gqa_attention_k8v4_tiled_g[{}]: tiled buffers not allocated", layer_idx))?;
+                            let tiled_lse = graph.d_gqa_tiled_lse.as_ref().unwrap();
+                            if tile_size == 0 || max_tiles == 0 {
+                                return Err(format!("gqa_attention_k8v4_tiled_g[{}]: tile_size={} max_tiles={} invalid", layer_idx, tile_size, max_tiles));
+                            }
+                            let tile_smem = ((tile_size + hd) as u32) * 4 + 128;
+                            unsafe {
+                                k.gqa_attention_k8v4_tiled_g.clone().launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, max_tiles as u32, 1),
+                                        block_dim: (threads, 1, 1),
+                                        shared_mem_bytes: tile_smem,
+                                    },
+                                    (
+                                        *tiled_o.device_ptr(),
+                                        *tiled_lse.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        graph.kv_k_ptrs[layer_idx],
+                                        graph.kv_v_radius_ptrs[layer_idx],
+                                        graph.kv_v_angles_ptrs[layer_idx],
+                                        *sm_scale,
+                                        nkv as i32,
+                                        hd as i32,
+                                        d_seq_len_ptr,
+                                        tile_size as i32,
+                                    ),
+                                ).map_err(|e| format!("gqa_attention_k8v4_tiled_g[{}]: {:?}", layer_idx, e))?;
+
+                                let reduce_smem = ((max_tiles + hd) as u32) * 4;
+                                k.gqa_attention_polar4_reduce_g.clone().launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, 1, 1),
+                                        block_dim: (threads, 1, 1),
+                                        shared_mem_bytes: reduce_smem,
+                                    },
+                                    (
+                                        *graph.d_gqa_out.device_ptr(),
+                                        *tiled_o.device_ptr(),
+                                        *tiled_lse.device_ptr(),
+                                        nh as i32, hd as i32,
+                                        d_seq_len_ptr,
+                                        tile_size as i32,
+                                        max_tiles as i32,
+                                    ),
+                                ).map_err(|e| format!("gqa_attention_polar4_reduce_g[k8v4][{}]: {:?}", layer_idx, e))?;
                             }
                         } else if graph.kv_format == 0 {
                             // BF16 attention (tiled + reduce for SM utilization + single K read)
@@ -17242,7 +17463,38 @@ impl GpuDecodeStore {
                                 *graph.d_gqa_v.device_ptr(),
                                 position as i32,
                                 kv_stride as i32,
+                                graph.polar4_norm_correction_mode,
                             )).map_err(|e| format!("kv_cache_write_polar4[{}]: {:?}", layer_idx, e))?;
+                        }
+                    } else if graph.kv_format == 3 {
+                        let num_blocks = graph.kv_num_blocks;
+                        let threads = 256u32;
+                        let blocks = ((num_blocks as u32) + threads - 1) / threads;
+                        let cfg = LaunchConfig {
+                            grid_dim: (blocks, 1, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        if graph.kv_k_ptrs[layer_idx] == 0 || graph.kv_v_radius_ptrs[layer_idx] == 0 {
+                            return Err(format!(
+                                "kv_cache_write_k8v4[{}]: null k8v4 pointer (k={:#x}, vr={:#x}, va={:#x})",
+                                layer_idx,
+                                graph.kv_k_ptrs[layer_idx],
+                                graph.kv_v_radius_ptrs[layer_idx],
+                                graph.kv_v_angles_ptrs[layer_idx]
+                            ));
+                        }
+                        unsafe {
+                            k.kv_cache_write_k8v4.clone().launch(cfg, (
+                                graph.kv_k_ptrs[layer_idx],
+                                graph.kv_v_radius_ptrs[layer_idx],
+                                graph.kv_v_angles_ptrs[layer_idx],
+                                *graph.d_gqa_k.device_ptr(),
+                                *graph.d_gqa_v.device_ptr(),
+                                position as i32,
+                                kv_stride as i32,
+                                graph.polar4_norm_correction_mode,
+                            )).map_err(|e| format!("kv_cache_write_k8v4[{}]: {:?}", layer_idx, e))?;
                         }
                     } else if graph.kv_format == 0 {
                         let threads = 256u32;
@@ -17332,6 +17584,32 @@ impl GpuDecodeStore {
                                 seq_len as i32,
                                 graph.kv_max_seq as i32,
                             )).map_err(|e| format!("gqa_attention_polar4[{}]: {:?}", layer_idx, e))?;
+                        }
+                    } else if graph.kv_format == 3 {
+                        // k8v4 attention: single-block-per-head kernel.
+                        let threads = 256u32;
+                        let seq_len = (position + 1) as u32;
+                        let num_warps = threads / 32;
+                        let shared_mem_bytes = ((hd as u32) * (num_warps + 1) + 2 * num_warps) * 4 + 128;
+                        let cfg = LaunchConfig {
+                            grid_dim: (nh as u32, 1, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes,
+                        };
+                        unsafe {
+                            k.gqa_attention_k8v4.clone().launch(cfg, (
+                                *graph.d_gqa_out.device_ptr(),
+                                *graph.d_gqa_q.device_ptr(),
+                                graph.kv_k_ptrs[layer_idx],
+                                graph.kv_v_radius_ptrs[layer_idx],
+                                graph.kv_v_angles_ptrs[layer_idx],
+                                *sm_scale,
+                                nh as i32,
+                                nkv as i32,
+                                hd as i32,
+                                seq_len as i32,
+                                graph.kv_max_seq as i32,
+                            )).map_err(|e| format!("gqa_attention_k8v4[{}]: {:?}", layer_idx, e))?;
                         }
                     } else if graph.kv_format == 0 {
                     // BF16 KV attention path.
@@ -18592,6 +18870,78 @@ impl GpuDecodeStore {
                             *nbytes);
                         if err != cuda_sys::CUresult::CUDA_SUCCESS {
                             return Err(format!("KV copy H2D {} layer {}: {:?}", name, layer_idx, err));
+                        }
+                    }
+                    total_bytes += nbytes;
+                }
+                copied += 1;
+            }
+        } else if graph.kv_format == 3 {
+            // k8v4: K is FP8 [max_seq, kv_stride], V is Polar4 radius/angles.
+            let num_blocks = graph.kv_num_blocks;
+            if num_blocks == 0 {
+                return Err("k8v4 copy but kv_num_blocks=0".to_string());
+            }
+            let v_radius_bytes_per_pos = num_blocks * 2;
+            let v_angles_bytes_per_pos = num_blocks * 8;
+
+            for layer_idx in layer_start..layer_end {
+                let k_src = graph.kv_k_ptrs[layer_idx];
+                let vr_src = graph.kv_v_radius_ptrs[layer_idx];
+                let va_src = graph.kv_v_angles_ptrs[layer_idx];
+                if k_src == 0 { continue; }
+
+                let k_dst = aux_graph.kv_k_ptrs[layer_idx];
+                let vr_dst = aux_graph.kv_v_radius_ptrs[layer_idx];
+                let va_dst = aux_graph.kv_v_angles_ptrs[layer_idx];
+                if k_dst == 0 || vr_dst == 0 || va_dst == 0 {
+                    return Err(format!("Aux store missing k8v4 KV cache for GQA layer {}", layer_idx));
+                }
+
+                let kv_stride = if let GpuAttnConfig::GQA { num_kv_heads, head_dim, .. } = &graph.layers[layer_idx].attn {
+                    num_kv_heads * head_dim
+                } else {
+                    continue;
+                };
+
+                let k_bytes = prompt_len * kv_stride;
+                let vr_bytes = prompt_len * v_radius_bytes_per_pos;
+                let va_bytes = prompt_len * v_angles_bytes_per_pos;
+                let max_bytes = k_bytes.max(vr_bytes).max(va_bytes);
+                if max_bytes == 0 { continue; }
+                let mut host_buf = vec![0u8; max_bytes];
+
+                let copies: [(u64, u64, usize, &str); 3] = [
+                    (k_src, k_dst, k_bytes, "k_fp8"),
+                    (vr_src, vr_dst, vr_bytes, "v_radius"),
+                    (va_src, va_dst, va_bytes, "v_angles"),
+                ];
+
+                for (src, dst, nbytes, name) in &copies {
+                    self.device.bind_to_thread()
+                        .map_err(|e| format!("bind primary for k8v4 {} copy: {:?}", name, e))?;
+                    if copies[0].0 == *src {
+                        self.device.synchronize()
+                            .map_err(|e| format!("sync primary before k8v4 KV copy: {:?}", e))?;
+                    }
+                    unsafe {
+                        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                            host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                            *src,
+                            *nbytes);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(format!("k8v4 KV copy D2H {} layer {}: {:?}", name, layer_idx, err));
+                        }
+                    }
+                    aux_store.device.bind_to_thread()
+                        .map_err(|e| format!("bind aux for k8v4 {} copy: {:?}", name, e))?;
+                    unsafe {
+                        let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                            *dst,
+                            host_buf.as_ptr() as *const std::ffi::c_void,
+                            *nbytes);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(format!("k8v4 KV copy H2D {} layer {}: {:?}", name, layer_idx, err));
                         }
                     }
                     total_bytes += nbytes;

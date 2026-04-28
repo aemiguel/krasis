@@ -183,6 +183,7 @@ def _kv_dtype_bytes(kv_cache_dtype: str) -> float:
     dtypes = {
         "fp8_e4m3": 1, "fp8_e5m2": 1, "fp8": 1,
         "polar4": 0.625,
+        "k8v4": 0.8125,
         "bf16": 2, "bfloat16": 2, "fp16": 2, "float16": 2,
         "auto": 2,
     }

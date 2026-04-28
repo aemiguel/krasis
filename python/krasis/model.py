@@ -5816,7 +5816,26 @@ class KrasisModel:
         # same GPU buffers that Rust prefill writes. No separate
         # allocation, no D2D export copy between prefill and decode.
         cache = self.kv_caches[0]
-        if cache is not None and cache.kv_format == 2 and cache.k_radius_cache is not None:
+        if cache is not None and cache.kv_format == 3 and cache.k_cache is not None and cache.v_radius_cache is not None:
+            # k8v4 KV cache: K is FP8, V is Polar4 radius + angle.
+            k8v4_ptrs = []
+            gqa_cache_idx = 0
+            for layer_idx, layer in enumerate(self.layers):
+                if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
+                    and not hasattr(layer.attention, 'kv_a_proj')):
+                    k_layer = cache.k_cache[gqa_cache_idx]
+                    vr = cache.v_radius_cache[gqa_cache_idx]
+                    va = cache.v_angles_cache[gqa_cache_idx]
+                    gqa_cache_idx += 1
+                    k8v4_ptrs.append((layer_idx,
+                                      k_layer.data_ptr(),
+                                      vr.data_ptr(), va.data_ptr()))
+            max_seq = cache.max_pages * cache.page_size
+            num_blocks = (cache.num_kv_heads * cache.gqa_head_dim) // 16
+            store.set_kv_cache_ptrs_k8v4(k8v4_ptrs, max_seq, num_blocks)
+            logger.info("Shared k8v4 KV cache: %d GQA layers, max_seq=%d (%d pages × %d), %d V blocks",
+                        len(k8v4_ptrs), max_seq, cache.max_pages, cache.page_size, num_blocks)
+        elif cache is not None and cache.kv_format == 2 and cache.k_radius_cache is not None:
             # Polar4 KV cache: 4 pointer sets (radius + angles for K and V)
             polar4_ptrs = []
             gqa_cache_idx = 0
@@ -6590,7 +6609,40 @@ class KrasisModel:
 
         # Allocate KV cache on aux GPU for GQA layers in this segment [split_layer..layer_end)
         cache = self.kv_caches[0]
-        if cache is not None and cache.kv_format == 2 and cache.k_radius_cache is not None:
+        if cache is not None and cache.kv_format == 3 and cache.k_cache is not None and cache.v_radius_cache is not None:
+            # k8v4 KV cache: K is FP8, V is Polar4 radius + angle.
+            k8v4_ptrs = []
+            gqa_cache_idx = 0
+            for layer_idx, layer in enumerate(self.layers):
+                if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
+                    and not hasattr(layer.attention, 'kv_a_proj')):
+                    if split_layer <= layer_idx < layer_end:
+                        k_src = cache.k_cache[gqa_cache_idx]
+                        vr_src = cache.v_radius_cache[gqa_cache_idx]
+                        va_src = cache.v_angles_cache[gqa_cache_idx]
+                        k_aux = torch.empty_like(k_src, device=aux_device)
+                        vr_aux = torch.empty_like(vr_src, device=aux_device)
+                        va_aux = torch.empty_like(va_src, device=aux_device)
+                        if not hasattr(self, '_aux_kv_caches'):
+                            self._aux_kv_caches = []
+                        self._aux_kv_caches.extend([k_aux, vr_aux, va_aux])
+                        k8v4_ptrs.append((layer_idx,
+                                          k_aux.data_ptr(),
+                                          vr_aux.data_ptr(), va_aux.data_ptr()))
+                    else:
+                        k_layer = cache.k_cache[gqa_cache_idx]
+                        vr = cache.v_radius_cache[gqa_cache_idx]
+                        va = cache.v_angles_cache[gqa_cache_idx]
+                        k8v4_ptrs.append((layer_idx,
+                                          k_layer.data_ptr(),
+                                          vr.data_ptr(), va.data_ptr()))
+                    gqa_cache_idx += 1
+            max_seq = cache.max_pages * cache.page_size
+            num_blocks = (cache.num_kv_heads * cache.gqa_head_dim) // 16
+            store.set_kv_cache_ptrs_k8v4(k8v4_ptrs, max_seq, num_blocks)
+            logger.info("Aux k8v4 KV cache on cuda:%d: %d GQA layers for [%d..%d), max_seq=%d, V blocks=%d",
+                        gpu_idx, len(k8v4_ptrs), split_layer, layer_end, max_seq, num_blocks)
+        elif cache is not None and cache.kv_format == 2 and cache.k_radius_cache is not None:
             # Polar4 KV cache: 4 tensors per layer (radius BF16 + angles uint8 for K and V)
             polar4_ptrs = []
             gqa_cache_idx = 0
