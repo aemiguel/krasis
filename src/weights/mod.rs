@@ -2047,32 +2047,30 @@ impl WeightStore {
             });
         }
 
-        // Try loading existing Marlin cache
+        // Try loading the requested Marlin cache. Do not fall back to a different
+        // group size: the runtime kernels are configured with this exact layout.
         let mut gpu_loaded = false;
-        for try_gs in &[cache_gs, group_size, 32, 64, 128] {
-            if gpu_loaded { break; }
-            let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits, expert_int4_calib_mode);
-            if try_path.exists() {
-                match Self::load_marlin_cache(
-                    &try_path, &config, *try_gs, total_moe_layers, config_hash,
-                    expert_int4_calib_mode,
-                    moe_start, num_moe_layers, gpu_num_bits,
-                ) {
-                    Ok(store) => {
-                        log::info!(
-                            "Loaded GPU Marlin INT{} cache in {:.1}s (gs={}): {} layers, {} experts (+ {} shared)",
-                            gpu_num_bits, start.elapsed().as_secs_f64(), try_gs,
-                            num_moe_layers, config.n_routed_experts, store.shared_experts_gpu.len(),
-                        );
-                        experts_gpu = store.experts_gpu;
-                        shared_experts_gpu = store.shared_experts_gpu;
-                        layer_backings_gpu = store.layer_backings_gpu;
-                        effective_gs = *try_gs;
-                        gpu_loaded = true;
-                    }
-                    Err(e) => {
-                        log::warn!("Marlin INT{} cache load failed (gs={}): {e}", gpu_num_bits, try_gs);
-                    }
+        let gpu_cache_path = cache_path_marlin(model_dir, cache_gs, gpu_num_bits, expert_int4_calib_mode);
+        if gpu_cache_path.exists() {
+            match Self::load_marlin_cache(
+                &gpu_cache_path, &config, cache_gs, total_moe_layers, config_hash,
+                expert_int4_calib_mode,
+                moe_start, num_moe_layers, gpu_num_bits,
+            ) {
+                Ok(store) => {
+                    log::info!(
+                        "Loaded GPU Marlin INT{} cache in {:.1}s (gs={}): {} layers, {} experts (+ {} shared)",
+                        gpu_num_bits, start.elapsed().as_secs_f64(), cache_gs,
+                        num_moe_layers, config.n_routed_experts, store.shared_experts_gpu.len(),
+                    );
+                    experts_gpu = store.experts_gpu;
+                    shared_experts_gpu = store.shared_experts_gpu;
+                    layer_backings_gpu = store.layer_backings_gpu;
+                    effective_gs = cache_gs;
+                    gpu_loaded = true;
+                }
+                Err(e) => {
+                    log::warn!("Marlin INT{} cache load failed (gs={}): {e}", gpu_num_bits, cache_gs);
                 }
             }
         }
@@ -2095,30 +2093,27 @@ impl WeightStore {
             )?;
             effective_gs = built_gs;
 
-            // Load the just-built cache
-            for try_gs in &[built_gs, cache_gs, group_size, 32, 64, 128] {
-                if gpu_loaded { break; }
-                let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits, expert_int4_calib_mode);
-                if try_path.exists() {
-                    match Self::load_marlin_cache(
-                        &try_path, &config, *try_gs, total_moe_layers, config_hash,
-                        expert_int4_calib_mode,
-                        moe_start, num_moe_layers, gpu_num_bits,
-                    ) {
-                        Ok(store) => {
-                            log::info!(
-                                "Loaded GPU Marlin cache in {:.1}s (built gs={})",
-                                start.elapsed().as_secs_f64(), try_gs,
-                            );
-                            experts_gpu = store.experts_gpu;
-                            shared_experts_gpu = store.shared_experts_gpu;
-                            layer_backings_gpu = store.layer_backings_gpu;
-                            effective_gs = *try_gs;
-                            gpu_loaded = true;
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to load just-built Marlin cache (gs={}): {e}", try_gs);
-                        }
+            // Load the just-built cache with its exact group size.
+            let built_path = cache_path_marlin(model_dir, built_gs, gpu_num_bits, expert_int4_calib_mode);
+            if built_path.exists() {
+                match Self::load_marlin_cache(
+                    &built_path, &config, built_gs, total_moe_layers, config_hash,
+                    expert_int4_calib_mode,
+                    moe_start, num_moe_layers, gpu_num_bits,
+                ) {
+                    Ok(store) => {
+                        log::info!(
+                            "Loaded GPU Marlin cache in {:.1}s (built gs={})",
+                            start.elapsed().as_secs_f64(), built_gs,
+                        );
+                        experts_gpu = store.experts_gpu;
+                        shared_experts_gpu = store.shared_experts_gpu;
+                        layer_backings_gpu = store.layer_backings_gpu;
+                        effective_gs = built_gs;
+                        gpu_loaded = true;
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to load just-built Marlin cache (gs={}): {e}", built_gs);
                     }
                 }
             }
@@ -3394,17 +3389,13 @@ impl WeightStore {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(5));
 
-                    for try_gs in &[group_size, 32, 64, 128] {
-                        let try_path =
-                            cache_path_marlin(model_dir, *try_gs, gpu_bits, expert_int4_calib_mode);
-                        if try_path.exists() {
-                            let waited = wait_start.elapsed();
-                            log::info!(
-                                "Marlin cache ready after {:.0}s wait (gs={})",
-                                waited.as_secs_f64(), try_gs,
-                            );
-                            return Ok(*try_gs);
-                        }
+                    if cache_path.exists() {
+                        let waited = wait_start.elapsed();
+                        log::info!(
+                            "Marlin cache ready after {:.0}s wait (gs={})",
+                            waited.as_secs_f64(), group_size,
+                        );
+                        return Ok(group_size);
                     }
 
                     // Check for stale lock (process died while we were waiting)
@@ -4487,29 +4478,27 @@ impl WeightStore {
         let mut effective_gs = cache_gs;
         let mut gpu_loaded = false;
 
-        // Try loading existing Marlin cache
-        for try_gs in &[cache_gs, group_size, 32, 64, 128] {
-            if gpu_loaded { break; }
-            let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits, expert_int4_calib_mode);
-            if try_path.exists() {
-                match Self::load_marlin_cache(
-                    &try_path, &config, *try_gs, total_moe_layers, config_hash,
-                    expert_int4_calib_mode,
-                    moe_start, num_moe_layers, gpu_num_bits,
-                ) {
-                    Ok(store) => {
-                        log::info!(
-                            "Loaded GPU Marlin INT{} cache in {:.1}s (gs={})",
-                            gpu_num_bits, start.elapsed().as_secs_f64(), try_gs,
-                        );
-                        experts_gpu = store.experts_gpu;
-                        shared_experts_gpu = store.shared_experts_gpu;
-                        effective_gs = *try_gs;
-                        gpu_loaded = true;
-                    }
-                    Err(e) => {
-                        log::warn!("Marlin INT{} cache load failed (gs={}): {e}", gpu_num_bits, try_gs);
-                    }
+        // Try loading the requested Marlin cache. Do not fall back to a different
+        // group size: the runtime kernels are configured with this exact layout.
+        let gpu_cache_path = cache_path_marlin(model_dir, cache_gs, gpu_num_bits, expert_int4_calib_mode);
+        if gpu_cache_path.exists() {
+            match Self::load_marlin_cache(
+                &gpu_cache_path, &config, cache_gs, total_moe_layers, config_hash,
+                expert_int4_calib_mode,
+                moe_start, num_moe_layers, gpu_num_bits,
+            ) {
+                Ok(store) => {
+                    log::info!(
+                        "Loaded GPU Marlin INT{} cache in {:.1}s (gs={})",
+                        gpu_num_bits, start.elapsed().as_secs_f64(), cache_gs,
+                    );
+                    experts_gpu = store.experts_gpu;
+                    shared_experts_gpu = store.shared_experts_gpu;
+                    effective_gs = cache_gs;
+                    gpu_loaded = true;
+                }
+                Err(e) => {
+                    log::warn!("Marlin INT{} cache load failed (gs={}): {e}", gpu_num_bits, cache_gs);
                 }
             }
         }
@@ -4532,20 +4521,17 @@ impl WeightStore {
             )?;
             effective_gs = built_gs;
 
-            for try_gs in &[built_gs, cache_gs, group_size, 32, 64, 128] {
-                if gpu_loaded { break; }
-                let try_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits, expert_int4_calib_mode);
-                if try_path.exists() {
-                    if let Ok(store) = Self::load_marlin_cache(
-                        &try_path, &config, *try_gs, total_moe_layers, config_hash,
-                        expert_int4_calib_mode,
-                        moe_start, num_moe_layers, gpu_num_bits,
-                    ) {
-                        experts_gpu = store.experts_gpu;
-                        shared_experts_gpu = store.shared_experts_gpu;
-                        effective_gs = *try_gs;
-                        gpu_loaded = true;
-                    }
+            let built_path = cache_path_marlin(model_dir, built_gs, gpu_num_bits, expert_int4_calib_mode);
+            if built_path.exists() {
+                if let Ok(store) = Self::load_marlin_cache(
+                    &built_path, &config, built_gs, total_moe_layers, config_hash,
+                    expert_int4_calib_mode,
+                    moe_start, num_moe_layers, gpu_num_bits,
+                ) {
+                    experts_gpu = store.experts_gpu;
+                    shared_experts_gpu = store.shared_experts_gpu;
+                    effective_gs = built_gs;
+                    gpu_loaded = true;
                 }
             }
         }

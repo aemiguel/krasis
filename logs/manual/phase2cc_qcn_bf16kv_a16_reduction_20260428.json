@@ -1,0 +1,46 @@
+{
+  "phase": "2CC",
+  "description": "QCN BF16 KV cache plus BF16 attention weights",
+  "config": "tests/qcn-bf16kv-a16-accuracy.conf",
+  "profile": "phase2bn_qcn_64tok",
+  "run_dir": "logs/reference-test_20260428_080508",
+  "comparisons": {
+    "hqq8_twoscale_intercept_polar4": {
+      "run_dir": "logs/reference-test_20260428_062206",
+      "first_token": "14/14",
+      "prefill_argmax": "14/14",
+      "avg_exact_prefix": 18.14,
+      "total_exact_prefix": "254/653",
+      "full_matches": "5/14",
+      "containment": "326/653",
+      "selected_logprob_delta_sum": 0.082125920769
+    },
+    "hqq8_twoscale_intercept_bf16kv": {
+      "run_dir": "logs/reference-test_20260428_075446",
+      "first_token": "14/14",
+      "prefill_argmax": "14/14",
+      "avg_exact_prefix": 18.21,
+      "total_exact_prefix": "255/653",
+      "full_matches": "5/14",
+      "containment": "317/653",
+      "selected_logprob_delta_sum": 0.190790702423
+    },
+    "bf16_attention_bf16kv": {
+      "run_dir": "logs/reference-test_20260428_080508",
+      "first_token": "14/14",
+      "prefill_argmax": "14/14",
+      "avg_exact_prefix": 18.79,
+      "total_exact_prefix": "263/653",
+      "full_matches": "5/14",
+      "containment": "338/653",
+      "selected_logprob_delta_sum": 0.067247679384
+    },
+    "llama_q8_default": {
+      "avg_exact_prefix": 37.50,
+      "total_exact_prefix": "525/653",
+      "full_matches": "11/14",
+      "first_token": "14/14"
+    }
+  },
+  "conclusion": "BF16 KV plus BF16 attention improves Krasis modestly but does not explain the gap to llama Q8 default."
+}

@@ -244,21 +244,21 @@ def _linear_attention_bytes_per_layer(cfg: Dict[str, Any], quantization: str) ->
     return _component_weight_bytes(quantizable_params, quantization) + bf16_params * 2
 
 
-def _expert_bytes_per_expert(cfg: Dict[str, Any], bits: int = 4) -> int:
+def _expert_bytes_per_expert(cfg: Dict[str, Any], bits: int = 4, group_size: int = 128) -> int:
     """Expert buffer size for Marlin INT4/INT8 on GPU."""
     hidden = cfg["hidden_size"]
     intermediate = cfg.get("moe_intermediate_size", 0)
     total_params = 3 * hidden * intermediate
     if bits == 4:
         packed = total_params // 2
-        scales = (total_params // 128) * 2
+        scales = (total_params // group_size) * 2
     else:  # INT8
         packed = total_params
-        scales = (total_params // 128) * 2
+        scales = (total_params // group_size) * 2
     return packed + scales
 
 
-def _component_weight_bytes(params: int, quant: str) -> int:
+def _component_weight_bytes(params: int, quant: str, group_size: int = 128) -> int:
     """Weight bytes for per-component quant ("int4", "int8", "awq", or "bf16")."""
     if quant.startswith("hqq"):
         raise ValueError(
@@ -266,22 +266,22 @@ def _component_weight_bytes(params: int, quant: str) -> int:
         )
     if quant in ("int4", "awq"):
         # Marlin INT4 / AWQ estimate.
-        return params // 2 + (params // 128) * 2
+        return params // 2 + (params // group_size) * 2
     if quant == "int8":
-        # Marlin INT8: packed = params, scales = params/128 * 2
-        return params + (params // 128) * 2
+        # Marlin INT8: packed = params, scales = params/group_size * 2
+        return params + (params // group_size) * 2
     return params * 2  # BF16
 
 
-def _cpu_expert_bytes_per_expert(cfg: Dict[str, Any], bits: int = 4) -> int:
+def _cpu_expert_bytes_per_expert(cfg: Dict[str, Any], bits: int = 4, group_size: int = 128) -> int:
     """CPU expert size (INT4 or INT8 with group scales)."""
     hidden = cfg["hidden_size"]
     intermediate = cfg.get("moe_intermediate_size", 0)
     total_params = 3 * hidden * intermediate
     if bits == 4:
-        return total_params // 2 + (total_params // 128) * 2
+        return total_params // 2 + (total_params // group_size) * 2
     else:  # INT8
-        return total_params + (total_params // 128) * 2
+        return total_params + (total_params // group_size) * 2
 
 
 def _detect_total_ram_gb() -> int:
@@ -303,6 +303,7 @@ def compute_launcher_budget(
     layer_group_size: int = 1,
     kv_dtype: str = "polar4",
     gpu_expert_bits: int = 4,
+    expert_group_size: int = 128,
     attention_quant: str = "bf16",
     hqq_cache_profile: str = "baseline",
     shared_expert_quant: str = "int8",
@@ -386,7 +387,9 @@ def compute_launcher_budget(
             )
 
     # Expert buffer bytes per expert (GPU Marlin format)
-    expert_buf_bytes = _expert_bytes_per_expert(cfg, gpu_expert_bits) if n_experts > 0 else 0
+    expert_buf_bytes = _expert_bytes_per_expert(
+        cfg, gpu_expert_bits, expert_group_size,
+    ) if n_experts > 0 else 0
 
     # Shared expert params per MoE layer
     hidden = cfg["hidden_size"]
@@ -419,7 +422,9 @@ def compute_launcher_budget(
     base_embed_bytes = cfg["vocab_size"] * hidden * 2      # always BF16
     base_lmhead_bytes = 0
     if not cfg.get("tie_word_embeddings", True):
-        base_lmhead_bytes = _component_weight_bytes(cfg["vocab_size"] * hidden, lm_head_quant)
+        base_lmhead_bytes = _component_weight_bytes(
+            cfg["vocab_size"] * hidden, lm_head_quant, expert_group_size,
+        )
 
     # Gate weights and norms are PERMANENT on GPU for ALL layers (not streamed).
     # Additionally, f32 copies of gate weights are kept for routing precision.
@@ -503,8 +508,12 @@ def compute_launcher_budget(
         gate_bytes = gate_bytes_all_layers + gate_f32_bytes_all_layers
 
         # Shared experts: ALL layers permanently on GPU (not capped by group_size)
-        shared_bytes = _component_weight_bytes(shared_params_per_moe, shared_expert_quant) * mn if shared_params_per_moe else 0
-        dense_mlp_bytes = _component_weight_bytes(dense_mlp_params_per_layer, dense_mlp_quant) * dn
+        shared_bytes = _component_weight_bytes(
+            shared_params_per_moe, shared_expert_quant, expert_group_size,
+        ) * mn if shared_params_per_moe else 0
+        dense_mlp_bytes = _component_weight_bytes(
+            dense_mlp_params_per_layer, dense_mlp_quant, expert_group_size,
+        ) * dn
 
         # Expert buffers (GPU side)
         # layer_group_size: 0 = persistent (all layers), >=1 = N layers at a time
@@ -619,6 +628,7 @@ def compute_vram_budget(
     num_gpu_experts: int = 0,
     requested_context: int = 65536,
     layer_group_size: int = 2,
+    expert_group_size: int = 128,
 ) -> Dict[str, Any]:
     """Compute VRAM budget and recommended SGLang parameters.
 
@@ -636,6 +646,7 @@ def compute_vram_budget(
         num_gpu_experts: Number of pinned experts on GPU (default 0).
         requested_context: Context length hint from user (tokens).
         layer_group_size: Layer group size for streaming (0=persistent, >=1=streaming).
+        expert_group_size: INT4/INT8 expert quantization group size.
     """
     cfg = _read_model_config(model_path)
 
@@ -660,7 +671,9 @@ def compute_vram_budget(
     headroom_bytes = headroom_mb * 1024 * 1024
     overhead_bytes = DEFAULT_CUDA_OVERHEAD_MB * 1024 * 1024
 
-    expert_bytes = _expert_bytes_per_expert(cfg) if num_gpu_experts > 0 else 0
+    expert_bytes = _expert_bytes_per_expert(
+        cfg, group_size=expert_group_size,
+    ) if num_gpu_experts > 0 else 0
     linear_attn_bpl = _linear_attention_bytes_per_layer(cfg, quantization) if hybrid else 0
 
     total_model_layers = cfg["num_hidden_layers"]
@@ -884,6 +897,8 @@ def main():
                         help="Requested context length hint in tokens (default: 65536)")
     parser.add_argument("--layer-group-size", type=int, default=2,
                         help="Layer group size for streaming (0=persistent, default: 2)")
+    parser.add_argument("--expert-group-size", type=int, default=128, choices=[32, 64, 128],
+                        help="INT4/INT8 expert quantization group size (default: 128)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress summary to stderr")
     args = parser.parse_args()
@@ -901,6 +916,7 @@ def main():
         num_gpu_experts=args.gpu_experts,
         requested_context=args.context_length,
         layer_group_size=args.layer_group_size,
+        expert_group_size=args.expert_group_size,
     )
 
     if not args.quiet:

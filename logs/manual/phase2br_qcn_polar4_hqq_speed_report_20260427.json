@@ -1,0 +1,61 @@
+{
+  "phase": "Phase 2BR",
+  "date": "2026-04-27",
+  "goal": "QCN speed-test-equivalent HQQ4SC and HQQ8 runs on the AWQ/Polar4 surface",
+  "timing_instrumentation": "disabled",
+  "hardware": {
+    "cpu": "AMD EPYC 7742 64-Core Processor",
+    "ram_gb": 1007,
+    "selected_gpu": "NVIDIA GeForce RTX 5090"
+  },
+  "baseline": {
+    "variant": "AWQ speed-test baseline",
+    "date": "2026-04-26",
+    "config": "./dev speed-test, QCN AWQ/Polar4, INT4 GPU/CPU experts",
+    "prefill_internal_tok_s": 7295.6,
+    "decode_internal_tok_s": 91.77,
+    "hcs": "16848/24576 (68.6%)",
+    "min_free_vram_mb": 688,
+    "log": "benchmarks/20260426_211755_qcn_polar4_awq_speed_regression_check.log"
+  },
+  "runs": [
+    {
+      "variant": "HQQ4SC speed-test variant",
+      "command": "./dev benchmark tests/qcn-polar4-hqq4sc.conf",
+      "config": "tests/qcn-polar4-hqq4sc.conf",
+      "attention_quant": "hqq4",
+      "sidecar_manifest": "/home/main/.krasis/cache/Qwen3-Coder-Next/attention_hqq_v5_calib_selfcal_v1/sidecars/phase2bi_qcn_top4_int8_exception/int8_exception/sidecar_manifest.json",
+      "kv_dtype": "polar4",
+      "gpu_expert_bits": 4,
+      "cpu_expert_bits": 4,
+      "prefill_internal_tok_s": 466.2,
+      "decode_internal_tok_s": 79.17,
+      "round_trip_best_tok_s": 168.33,
+      "hcs": "14823/24576 (60.3%)",
+      "min_free_vram_mb": 706,
+      "prefill_vram_monitor_lows_mb": [576, 532],
+      "run_dir": "logs/dev-benchmark_20260427_201735",
+      "benchmark_log": "benchmarks/20260427_201735_qcn_polar4_hqq4sc_speed_variant.log"
+    },
+    {
+      "variant": "HQQ8 speed-test variant",
+      "command": "./dev benchmark tests/qcn-polar4-hqq8.conf",
+      "config": "tests/qcn-polar4-hqq8.conf",
+      "attention_quant": "hqq8",
+      "sidecar_manifest": "",
+      "kv_dtype": "polar4",
+      "gpu_expert_bits": 4,
+      "cpu_expert_bits": 4,
+      "prefill_internal_tok_s": 486.8,
+      "decode_internal_tok_s": 75.16,
+      "round_trip_best_tok_s": 121.04,
+      "hcs": "14256/24576 (58.0%)",
+      "min_free_vram_mb": 734,
+      "prefill_vram_monitor_lows_mb": [516],
+      "run_dir": "logs/dev-benchmark_20260427_202957",
+      "benchmark_log": "benchmarks/20260427_202957_qcn_polar4_hqq8_speed_variant.log"
+    }
+  ],
+  "conclusion": "HQQ4SC/HQQ8 decode is usable but slower than AWQ on the QCN Polar4 speed-test surface. HQQ4SC/HQQ8 prefill is roughly 15x slower than the AWQ baseline and needs diagnosis before HQQ8 can replace AWQ for speed-sensitive Polar4 runs.",
+  "follow_up": "Run current-code HQQ8 with FP8 KV to separate a general HQQ prefill issue from an HQQ+Polar4 interaction; if FP8 remains fast, instrument HQQ+Polar4 prefill."
+}

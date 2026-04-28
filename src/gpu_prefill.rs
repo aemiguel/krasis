@@ -887,6 +887,8 @@ fn scalar_type_label(st: &ScalarType) -> &'static str {
         "U4B8"
     } else if st.mantissa == ScalarType::U8B128.mantissa && st.bias == ScalarType::U8B128.bias {
         "U8B128"
+    } else if st.mantissa == ScalarType::U8.mantissa && st.bias == ScalarType::U8.bias {
+        "U8"
     } else {
         "UNKNOWN"
     }
@@ -2251,6 +2253,10 @@ impl<T: Copy> GpuBuf<T> {
     pub fn device_ptr(&self) -> &u64 {
         &self.ptr
     }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
 }
 
 impl<T: Copy> Drop for GpuBuf<T> {
@@ -2344,6 +2350,9 @@ pub struct PrefillKernels {
     hqq4_dequant_bf16: RawCuFunc,
     hqq4_prefill_gemm_bf16: RawCuFunc,
     hqq8_prefill_gemm_bf16: RawCuFunc,
+    hqq_prefill_group_sums_bf16: RawCuFunc,
+    hqq8_marlin_zero_correct_bf16: RawCuFunc,
+    hqq8_marlin_intercept_correct_bf16: RawCuFunc,
     hqq_prefill_int8_exception_delta_bf16: RawCuFunc,
     hqq_apply_sidecar_bf16: RawCuFunc,
     rope: RawCuFunc,
@@ -2357,7 +2366,9 @@ pub struct PrefillKernels {
     moe_sum_reduce: RawCuFunc,
     gqa_prefill: RawCuFunc,
     kv_cache_append: RawCuFunc,
+    kv_cache_append_bf16: RawCuFunc,
     kv_dequant_concat: RawCuFunc,
+    kv_concat_bf16: RawCuFunc,
     kv_cache_append_polar4: RawCuFunc,
     kv_dequant_concat_polar4: RawCuFunc,
     causal_conv1d: RawCuFunc,
@@ -2671,6 +2682,16 @@ pub struct ScalarType {
 }
 
 impl ScalarType {
+    pub const U8: ScalarType = ScalarType {
+        exponent: 0,
+        mantissa: 8,
+        is_signed: 0,
+        _pad0: 0,
+        bias: 0,
+        finite_values_only: 0,
+        nan_repr: 1,
+        _pad1: [0; 2], // nan_repr=1 = NAN_IEEE_754
+    };
     pub const U4B8: ScalarType = ScalarType {
         exponent: 0,
         mantissa: 4,
@@ -5761,6 +5782,78 @@ impl PrefillEngine {
             );
         }
 
+        Ok(())
+    }
+
+    fn marlin_gemm_u8_float_zp(
+        &self,
+        a: u64,
+        packed: u64,
+        scales: u64,
+        scale2: u64,
+        zeros: u64,
+        c: u64,
+        m: usize,
+        n: usize,
+        k: usize,
+        num_groups: usize,
+        group_size: usize,
+    ) -> Result<(), String> {
+        let f = self.kernels.marlin_mm.ok_or("Marlin GEMM not loaded")?;
+        if zeros == 0 {
+            return Err("Marlin U8 float-zp GEMM requires non-null zero-point buffer".to_string());
+        }
+
+        let ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
+        unsafe {
+            cuda_sys::lib().cuMemsetD32Async(*self.scratch.d_workspace.device_ptr(), 0, ws_len, self.stream);
+        }
+
+        let ctmp_len = m
+            .checked_mul(n)
+            .ok_or("Marlin U8 float-zp C_tmp element count overflow")?;
+        unsafe {
+            cuda_sys::lib().cuMemsetD32Async(
+                *self.scratch.d_fp32_scratch.device_ptr(),
+                0,
+                ctmp_len,
+                self.stream,
+            );
+        }
+
+        unsafe {
+            f(
+                a as *const _,
+                packed as *const _,
+                c as *mut _,
+                *self.scratch.d_fp32_scratch.device_ptr() as *mut _,
+                scales as *const _,
+                if scale2 == 0 { std::ptr::null() } else { scale2 as *const _ },
+                zeros as *const _,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                m as i32,
+                n as i32,
+                k as i32,
+                k as i32,
+                *self.scratch.d_workspace.device_ptr() as *mut _,
+                &ScalarType::U8,
+                false,
+                true,
+                true,
+                num_groups as i32,
+                group_size as i32,
+                self.config.device_ordinal as i32,
+                self.stream as u64,
+                -1,
+                -1,
+                self.config.sms as i32,
+                false,
+                true,
+                true,
+            );
+        }
         Ok(())
     }
 
@@ -10156,7 +10249,7 @@ impl PrefillEngine {
     fn hqq_nbits_from_desc(desc: &HqqTensorExecDescriptor) -> Result<u8, String> {
         if desc.layout.contains("uint4") {
             Ok(4)
-        } else if desc.layout.contains("uint8") {
+        } else if desc.layout.contains("uint8") || desc.layout.contains("int8") {
             Ok(8)
         } else {
             Err(format!("Cannot infer HQQ nbits from layout {}", desc.layout))
@@ -10180,28 +10273,109 @@ impl PrefillEngine {
             8 => "row_major_axis1_grouped_uint8",
             _ => return Err(format!("Unsupported HQQ nbits={}", nbits)),
         };
-        if desc.layout != expected_layout {
+        let is_hqq8_residual_marlin_prefill =
+            nbits == 8 && desc.layout == "marlin_u8b128_zero_correction_axis1_grouped_uint8";
+        let is_hqq8_symmetric_marlin_prefill =
+            nbits == 8 && desc.layout == "marlin_u8b128_symmetric_axis1_grouped_int8";
+        let is_hqq8_native_zp_marlin_prefill =
+            nbits == 8 && desc.layout == "marlin_u8_float_zp_axis1_grouped_uint8";
+        let is_hqq8_native_zp_intercept_marlin_prefill =
+            nbits == 8 && desc.layout == "marlin_u8_float_zp_intercept_axis1_grouped_uint8";
+        let is_hqq8_native_zp_twoscale_marlin_prefill =
+            nbits == 8 && desc.layout == "marlin_u8_float_zp_twoscale_axis1_grouped_uint8";
+        let is_hqq8_native_zp_twoscale_intercept_marlin_prefill =
+            nbits == 8
+                && desc.layout
+                    == "marlin_u8_float_zp_twoscale_intercept_axis1_grouped_uint8";
+        let is_hqq8_marlin_prefill =
+            is_hqq8_residual_marlin_prefill
+                || is_hqq8_symmetric_marlin_prefill
+                || is_hqq8_native_zp_marlin_prefill
+                || is_hqq8_native_zp_intercept_marlin_prefill
+                || is_hqq8_native_zp_twoscale_marlin_prefill
+                || is_hqq8_native_zp_twoscale_intercept_marlin_prefill;
+        if desc.layout != expected_layout && !is_hqq8_marlin_prefill {
             return Err(format!(
                 "HQQ{} tensor {} uses unsupported prefill layout {} (expected {})",
                 nbits, tensor_name, desc.layout, expected_layout
             ));
         }
-        if desc.packed_dtype != "uint8" {
+        let expected_packed_dtype = if is_hqq8_marlin_prefill { "uint32" } else { "uint8" };
+        if desc.packed_dtype != expected_packed_dtype {
             return Err(format!(
-                "HQQ{} tensor {} uses unsupported packed dtype {}",
-                nbits, tensor_name, desc.packed_dtype
+                "HQQ{} tensor {} uses unsupported packed dtype {} (expected {})",
+                nbits, tensor_name, desc.packed_dtype, expected_packed_dtype
             ));
         }
-        if desc.scales_dtype != "float32" || desc.zeros_dtype != "float32" {
+        let expected_scales_dtype = if is_hqq8_residual_marlin_prefill
+            || is_hqq8_native_zp_twoscale_marlin_prefill
+            || is_hqq8_native_zp_twoscale_intercept_marlin_prefill
+        {
+            "bfloat16_base_delta"
+        } else if is_hqq8_symmetric_marlin_prefill
+            || is_hqq8_native_zp_marlin_prefill
+            || is_hqq8_native_zp_intercept_marlin_prefill
+        {
+            "bfloat16"
+        } else {
+            "float32"
+        };
+        let expected_zeros_dtype = if is_hqq8_residual_marlin_prefill {
+            "float32_zero_correction"
+        } else if is_hqq8_native_zp_marlin_prefill {
+            "bfloat16"
+        } else if is_hqq8_native_zp_twoscale_marlin_prefill {
+            "bfloat16"
+        } else if is_hqq8_native_zp_twoscale_intercept_marlin_prefill {
+            "bfloat16_plus_float32_twoscale_intercept_correction"
+        } else if is_hqq8_native_zp_intercept_marlin_prefill {
+            "bfloat16_plus_float32_intercept_correction"
+        } else if is_hqq8_symmetric_marlin_prefill {
+            "none"
+        } else {
+            "float32"
+        };
+        if desc.scales_dtype != expected_scales_dtype || desc.zeros_dtype != expected_zeros_dtype {
             return Err(format!(
-                "HQQ{} tensor {} uses unsupported scale/zero dtypes {}/{}",
-                nbits, tensor_name, desc.scales_dtype, desc.zeros_dtype
+                "HQQ{} tensor {} uses unsupported scale/zero dtypes {}/{} (expected {}/{})",
+                nbits,
+                tensor_name,
+                desc.scales_dtype,
+                desc.zeros_dtype,
+                expected_scales_dtype,
+                expected_zeros_dtype,
             ));
         }
         if desc.group_size == 0 {
             return Err(format!("HQQ{} tensor {} has invalid group_size=0", nbits, tensor_name));
         }
         Ok(nbits)
+    }
+
+    fn is_hqq8_marlin_prefill(desc: &HqqTensorExecDescriptor) -> bool {
+        desc.layout == "marlin_u8b128_zero_correction_axis1_grouped_uint8"
+    }
+
+    fn is_hqq8_symmetric_marlin_prefill(desc: &HqqTensorExecDescriptor) -> bool {
+        desc.layout == "marlin_u8b128_symmetric_axis1_grouped_int8"
+    }
+
+    fn is_hqq8_native_zp_marlin_prefill(desc: &HqqTensorExecDescriptor) -> bool {
+        desc.layout == "marlin_u8_float_zp_axis1_grouped_uint8"
+    }
+
+    fn is_hqq8_native_zp_intercept_marlin_prefill(desc: &HqqTensorExecDescriptor) -> bool {
+        desc.layout == "marlin_u8_float_zp_intercept_axis1_grouped_uint8"
+    }
+
+    fn is_hqq8_native_zp_twoscale_marlin_prefill(desc: &HqqTensorExecDescriptor) -> bool {
+        desc.layout == "marlin_u8_float_zp_twoscale_axis1_grouped_uint8"
+    }
+
+    fn is_hqq8_native_zp_twoscale_intercept_marlin_prefill(
+        desc: &HqqTensorExecDescriptor,
+    ) -> bool {
+        desc.layout == "marlin_u8_float_zp_twoscale_intercept_axis1_grouped_uint8"
     }
 
     fn hqq4_dequant_to_bf16(
@@ -10245,6 +10419,543 @@ impl PrefillEngine {
         Ok(())
     }
 
+    fn hqq_prefill_has_sidecar(&self, layer_idx: usize, tensor_name: &str) -> bool {
+        self.layer_weights
+            .get(layer_idx)
+            .map(|lw| {
+                lw.hqq_prefill_sidecars
+                    .iter()
+                    .any(|entry| entry.tensor_name == tensor_name)
+            })
+            .unwrap_or(false)
+    }
+
+    fn byte_ranges_overlap(a_start: u64, a_bytes: usize, b_start: u64, b_bytes: usize) -> bool {
+        if a_start == 0 || b_start == 0 || a_bytes == 0 || b_bytes == 0 {
+            return false;
+        }
+        let a_end = a_start.saturating_add(a_bytes as u64);
+        let b_end = b_start.saturating_add(b_bytes as u64);
+        a_start < b_end && b_start < a_end
+    }
+
+    fn choose_hqq8_delta_scratch_bf16(
+        &self,
+        input_ptr: u64,
+        input_elems: usize,
+        output_ptr: u64,
+        output_elems: usize,
+        temp_elems: usize,
+    ) -> Result<u64, String> {
+        let input_bytes = input_elems
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or("HQQ8 delta scratch input byte count overflow")?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or("HQQ8 delta scratch output byte count overflow")?;
+        let temp_bytes = temp_elems
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or("HQQ8 delta scratch byte count overflow")?;
+        let mut candidates: Vec<(u64, usize)> = Vec::with_capacity(12);
+        candidates.push((
+            *self.scratch.d_scratch1.device_ptr(),
+            self.scratch.d_scratch1.len() * std::mem::size_of::<u16>(),
+        ));
+        candidates.push((
+            *self.scratch.d_scratch2.device_ptr(),
+            self.scratch.d_scratch2.len() * std::mem::size_of::<u16>(),
+        ));
+        candidates.push((
+            *self.scratch.d_attn_out.device_ptr(),
+            self.scratch.d_attn_out.len() * std::mem::size_of::<u16>(),
+        ));
+        candidates.push((
+            *self.scratch.d_moe_gathered.device_ptr(),
+            self.scratch.d_moe_gathered.len() * std::mem::size_of::<u16>(),
+        ));
+        candidates.push((
+            *self.scratch.d_moe_expert_out.device_ptr(),
+            self.scratch.d_moe_expert_out.len() * std::mem::size_of::<u16>(),
+        ));
+        candidates.push((
+            *self.scratch.d_moe_gate_up.device_ptr(),
+            self.scratch.d_moe_gate_up.len() * std::mem::size_of::<u16>(),
+        ));
+        candidates.push((
+            *self.scratch.d_moe_inter.device_ptr(),
+            self.scratch.d_moe_inter.len() * std::mem::size_of::<u16>(),
+        ));
+        candidates.push((
+            *self.scratch.d_moe_accum.device_ptr(),
+            self.scratch.d_moe_accum.len() * std::mem::size_of::<f32>(),
+        ));
+        if let Some(buf) = &self.scratch.d_la_q {
+            candidates.push((*buf.device_ptr(), buf.len() * std::mem::size_of::<f32>()));
+        }
+        if let Some(buf) = &self.scratch.d_la_k {
+            candidates.push((*buf.device_ptr(), buf.len() * std::mem::size_of::<f32>()));
+        }
+        if let Some(buf) = &self.scratch.d_la_v {
+            candidates.push((*buf.device_ptr(), buf.len() * std::mem::size_of::<f32>()));
+        }
+        if let Some(buf) = &self.scratch.d_la_conv_out {
+            candidates.push((*buf.device_ptr(), buf.len() * std::mem::size_of::<f32>()));
+        }
+        if let Some(buf) = &self.scratch.d_la_v_beta {
+            candidates.push((*buf.device_ptr(), buf.len() * std::mem::size_of::<f32>()));
+        }
+        if let Some(buf) = &self.scratch.d_la_k_beta {
+            candidates.push((*buf.device_ptr(), buf.len() * std::mem::size_of::<f32>()));
+        }
+        for (ptr, capacity_bytes) in candidates {
+            if capacity_bytes < temp_bytes || ptr == 0 {
+                continue;
+            }
+            if Self::byte_ranges_overlap(ptr, temp_bytes, input_ptr, input_bytes)
+                || Self::byte_ranges_overlap(ptr, temp_bytes, output_ptr, output_bytes)
+            {
+                continue;
+            }
+            return Ok(ptr);
+        }
+        Err(format!(
+            "HQQ8 Marlin prefill could not find non-overlapping BF16 scratch for delta output: input=0x{input_ptr:x} input_elems={input_elems} output=0x{output_ptr:x} output_elems={output_elems} temp_elems={temp_elems}"
+        ))
+    }
+
+    fn hqq8_marlin_prefill_gemm_bf16(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+        m: usize,
+    ) -> Result<(), String> {
+        if self.hqq_prefill_has_sidecar(layer_idx, tensor_name) {
+            return Err(format!(
+                "HQQ8 Marlin prefill does not support sidecar corrections yet: layer={} tensor={}",
+                layer_idx, tensor_name,
+            ));
+        }
+        if desc.group_size == 0 || desc.cols % desc.group_size != 0 {
+            return Err(format!(
+                "HQQ8 Marlin prefill requires cols divisible by group_size for layer {} tensor {}: cols={} group_size={}",
+                layer_idx, tensor_name, desc.cols, desc.group_size,
+            ));
+        }
+        let groups = desc.cols / desc.group_size;
+        let scale_elems = groups
+            .checked_mul(desc.rows)
+            .ok_or("HQQ8 Marlin scale element count overflow")?;
+        let delta_scales_ptr = desc
+            .scales_ptr
+            .checked_add((scale_elems * std::mem::size_of::<u16>()) as u64)
+            .ok_or("HQQ8 Marlin delta scales pointer overflow")?;
+        let output_elems = m
+            .checked_mul(desc.rows)
+            .ok_or("HQQ8 Marlin output element count overflow")?;
+        let input_elems = m
+            .checked_mul(desc.cols)
+            .ok_or("HQQ8 Marlin input element count overflow")?;
+        let delta_out_ptr = self.choose_hqq8_delta_scratch_bf16(
+            input_ptr,
+            input_elems,
+            output_ptr,
+            output_elems,
+            output_elems,
+        )?;
+        let w = MarlinWeight {
+            packed: desc.packed_ptr,
+            scales: desc.scales_ptr,
+            n: desc.rows,
+            k: desc.cols,
+            num_groups: groups,
+            group_size: desc.group_size,
+            num_bits: 8,
+        };
+        self.marlin_gemm(input_ptr, &w, output_ptr, m)?;
+        let w_delta = MarlinWeight {
+            scales: delta_scales_ptr,
+            ..w
+        };
+        self.marlin_gemm(input_ptr, &w_delta, delta_out_ptr, m)?;
+
+        let group_sums_ptr = *self.scratch.d_fp32_scratch.device_ptr();
+        let threads = 256u32;
+        let mut s0 = group_sums_ptr;
+        let mut s1 = input_ptr;
+        let mut s2 = m as i32;
+        let mut s3 = desc.cols as i32;
+        let mut s4 = desc.group_size as i32;
+        let mut s5 = groups as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq_prefill_group_sums_bf16,
+                (m as u32, groups as u32, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut s0 as *mut _ as *mut std::ffi::c_void,
+                    &mut s1 as *mut _ as *mut std::ffi::c_void,
+                    &mut s2 as *mut _ as *mut std::ffi::c_void,
+                    &mut s3 as *mut _ as *mut std::ffi::c_void,
+                    &mut s4 as *mut _ as *mut std::ffi::c_void,
+                    &mut s5 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+
+        let total = output_elems;
+        let blocks = (total as u32).div_ceil(threads);
+        let mut c0 = output_ptr;
+        let mut c1 = delta_out_ptr;
+        let mut c2 = group_sums_ptr;
+        let mut c3 = desc.zeros_ptr;
+        let mut c4 = m as i32;
+        let mut c5 = desc.rows as i32;
+        let mut c6 = groups as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq8_marlin_zero_correct_bf16,
+                (blocks, 1, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut c0 as *mut _ as *mut std::ffi::c_void,
+                    &mut c1 as *mut _ as *mut std::ffi::c_void,
+                    &mut c2 as *mut _ as *mut std::ffi::c_void,
+                    &mut c3 as *mut _ as *mut std::ffi::c_void,
+                    &mut c4 as *mut _ as *mut std::ffi::c_void,
+                    &mut c5 as *mut _ as *mut std::ffi::c_void,
+                    &mut c6 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn hqq8_symmetric_marlin_prefill_gemm_bf16(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+        m: usize,
+    ) -> Result<(), String> {
+        if self.hqq_prefill_has_sidecar(layer_idx, tensor_name) {
+            return Err(format!(
+                "HQQ8 symmetric Marlin prefill does not support sidecar corrections: layer={} tensor={}",
+                layer_idx, tensor_name,
+            ));
+        }
+        if desc.group_size == 0 || desc.cols % desc.group_size != 0 {
+            return Err(format!(
+                "HQQ8 symmetric Marlin prefill requires cols divisible by group_size for layer {} tensor {}: cols={} group_size={}",
+                layer_idx, tensor_name, desc.cols, desc.group_size,
+            ));
+        }
+        let groups = desc.cols / desc.group_size;
+        let w = MarlinWeight {
+            packed: desc.packed_ptr,
+            scales: desc.scales_ptr,
+            n: desc.rows,
+            k: desc.cols,
+            num_groups: groups,
+            group_size: desc.group_size,
+            num_bits: 8,
+        };
+        self.marlin_gemm(input_ptr, &w, output_ptr, m)
+    }
+
+    fn hqq8_native_zp_marlin_prefill_gemm_bf16(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+        m: usize,
+    ) -> Result<(), String> {
+        if self.hqq_prefill_has_sidecar(layer_idx, tensor_name) {
+            return Err(format!(
+                "HQQ8 native fused Marlin prefill does not support sidecar corrections: layer={} tensor={}",
+                layer_idx, tensor_name,
+            ));
+        }
+        if desc.group_size == 0 || desc.cols % desc.group_size != 0 {
+            return Err(format!(
+                "HQQ8 native fused Marlin prefill requires cols divisible by group_size for layer {} tensor {}: cols={} group_size={}",
+                layer_idx, tensor_name, desc.cols, desc.group_size,
+            ));
+        }
+        let groups = desc.cols / desc.group_size;
+        self.marlin_gemm_u8_float_zp(
+            input_ptr,
+            desc.packed_ptr,
+            desc.scales_ptr,
+            0,
+            desc.zeros_ptr,
+            output_ptr,
+            m,
+            desc.rows,
+            desc.cols,
+            groups,
+            desc.group_size,
+        )
+    }
+
+    fn hqq8_native_zp_intercept_marlin_prefill_gemm_bf16(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+        m: usize,
+    ) -> Result<(), String> {
+        if self.hqq_prefill_has_sidecar(layer_idx, tensor_name) {
+            return Err(format!(
+                "HQQ8 native fused v2 Marlin prefill does not support sidecar corrections: layer={} tensor={}",
+                layer_idx, tensor_name,
+            ));
+        }
+        if desc.group_size == 0 || desc.cols % desc.group_size != 0 {
+            return Err(format!(
+                "HQQ8 native fused v2 Marlin prefill requires cols divisible by group_size for layer {} tensor {}: cols={} group_size={}",
+                layer_idx, tensor_name, desc.cols, desc.group_size,
+            ));
+        }
+        let groups = desc.cols / desc.group_size;
+        let scale_elems = groups
+            .checked_mul(desc.rows)
+            .ok_or("HQQ8 native fused v2 correction element count overflow")?;
+        let correction_ptr = desc
+            .zeros_ptr
+            .checked_add((scale_elems * std::mem::size_of::<u16>()) as u64)
+            .ok_or("HQQ8 native fused v2 correction pointer overflow")?;
+
+        self.marlin_gemm_u8_float_zp(
+            input_ptr,
+            desc.packed_ptr,
+            desc.scales_ptr,
+            0,
+            desc.zeros_ptr,
+            output_ptr,
+            m,
+            desc.rows,
+            desc.cols,
+            groups,
+            desc.group_size,
+        )?;
+
+        let group_sums_ptr = *self.scratch.d_fp32_scratch.device_ptr();
+        let threads = 256u32;
+        let mut s0 = group_sums_ptr;
+        let mut s1 = input_ptr;
+        let mut s2 = m as i32;
+        let mut s3 = desc.cols as i32;
+        let mut s4 = desc.group_size as i32;
+        let mut s5 = groups as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq_prefill_group_sums_bf16,
+                (m as u32, groups as u32, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut s0 as *mut _ as *mut std::ffi::c_void,
+                    &mut s1 as *mut _ as *mut std::ffi::c_void,
+                    &mut s2 as *mut _ as *mut std::ffi::c_void,
+                    &mut s3 as *mut _ as *mut std::ffi::c_void,
+                    &mut s4 as *mut _ as *mut std::ffi::c_void,
+                    &mut s5 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+
+        let total = m
+            .checked_mul(desc.rows)
+            .ok_or("HQQ8 native fused v2 output element count overflow")?;
+        let blocks = (total as u32).div_ceil(threads);
+        let mut c0 = output_ptr;
+        let mut c1 = group_sums_ptr;
+        let mut c2 = correction_ptr;
+        let mut c3 = m as i32;
+        let mut c4 = desc.rows as i32;
+        let mut c5 = groups as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq8_marlin_intercept_correct_bf16,
+                (blocks, 1, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut c0 as *mut _ as *mut std::ffi::c_void,
+                    &mut c1 as *mut _ as *mut std::ffi::c_void,
+                    &mut c2 as *mut _ as *mut std::ffi::c_void,
+                    &mut c3 as *mut _ as *mut std::ffi::c_void,
+                    &mut c4 as *mut _ as *mut std::ffi::c_void,
+                    &mut c5 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn hqq8_native_zp_twoscale_marlin_prefill_gemm_bf16(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+        m: usize,
+    ) -> Result<(), String> {
+        if self.hqq_prefill_has_sidecar(layer_idx, tensor_name) {
+            return Err(format!(
+                "HQQ8 native fused two-scale Marlin prefill does not support sidecar corrections: layer={} tensor={}",
+                layer_idx, tensor_name,
+            ));
+        }
+        if desc.group_size == 0 || desc.cols % desc.group_size != 0 {
+            return Err(format!(
+                "HQQ8 native fused two-scale Marlin prefill requires cols divisible by group_size for layer {} tensor {}: cols={} group_size={}",
+                layer_idx, tensor_name, desc.cols, desc.group_size,
+            ));
+        }
+        let groups = desc.cols / desc.group_size;
+        let scale_elems = groups
+            .checked_mul(desc.rows)
+            .ok_or("HQQ8 native fused two-scale scale element count overflow")?;
+        let delta_scales_ptr = desc
+            .scales_ptr
+            .checked_add((scale_elems * std::mem::size_of::<u16>()) as u64)
+            .ok_or("HQQ8 native fused two-scale delta scales pointer overflow")?;
+        self.marlin_gemm_u8_float_zp(
+            input_ptr,
+            desc.packed_ptr,
+            desc.scales_ptr,
+            delta_scales_ptr,
+            desc.zeros_ptr,
+            output_ptr,
+            m,
+            desc.rows,
+            desc.cols,
+            groups,
+            desc.group_size,
+        )
+    }
+
+    fn hqq8_native_zp_twoscale_intercept_marlin_prefill_gemm_bf16(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+        m: usize,
+    ) -> Result<(), String> {
+        if self.hqq_prefill_has_sidecar(layer_idx, tensor_name) {
+            return Err(format!(
+                "HQQ8 native fused two-scale-intercept Marlin prefill does not support sidecar corrections: layer={} tensor={}",
+                layer_idx, tensor_name,
+            ));
+        }
+        if desc.group_size == 0 || desc.cols % desc.group_size != 0 {
+            return Err(format!(
+                "HQQ8 native fused two-scale-intercept Marlin prefill requires cols divisible by group_size for layer {} tensor {}: cols={} group_size={}",
+                layer_idx, tensor_name, desc.cols, desc.group_size,
+            ));
+        }
+        let groups = desc.cols / desc.group_size;
+        let scale_elems = groups
+            .checked_mul(desc.rows)
+            .ok_or("HQQ8 native fused two-scale-intercept element count overflow")?;
+        let delta_scales_ptr = desc
+            .scales_ptr
+            .checked_add((scale_elems * std::mem::size_of::<u16>()) as u64)
+            .ok_or("HQQ8 native fused two-scale-intercept delta scales pointer overflow")?;
+        let correction_ptr = desc
+            .zeros_ptr
+            .checked_add((scale_elems * std::mem::size_of::<u16>()) as u64)
+            .ok_or("HQQ8 native fused two-scale-intercept correction pointer overflow")?;
+
+        self.marlin_gemm_u8_float_zp(
+            input_ptr,
+            desc.packed_ptr,
+            desc.scales_ptr,
+            delta_scales_ptr,
+            desc.zeros_ptr,
+            output_ptr,
+            m,
+            desc.rows,
+            desc.cols,
+            groups,
+            desc.group_size,
+        )?;
+
+        let group_sums_ptr = *self.scratch.d_fp32_scratch.device_ptr();
+        let threads = 256u32;
+        let mut s0 = group_sums_ptr;
+        let mut s1 = input_ptr;
+        let mut s2 = m as i32;
+        let mut s3 = desc.cols as i32;
+        let mut s4 = desc.group_size as i32;
+        let mut s5 = groups as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq_prefill_group_sums_bf16,
+                (m as u32, groups as u32, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut s0 as *mut _ as *mut std::ffi::c_void,
+                    &mut s1 as *mut _ as *mut std::ffi::c_void,
+                    &mut s2 as *mut _ as *mut std::ffi::c_void,
+                    &mut s3 as *mut _ as *mut std::ffi::c_void,
+                    &mut s4 as *mut _ as *mut std::ffi::c_void,
+                    &mut s5 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+
+        let total = m
+            .checked_mul(desc.rows)
+            .ok_or("HQQ8 native fused two-scale-intercept output element count overflow")?;
+        let blocks = (total as u32).div_ceil(threads);
+        let mut c0 = output_ptr;
+        let mut c1 = group_sums_ptr;
+        let mut c2 = correction_ptr;
+        let mut c3 = m as i32;
+        let mut c4 = desc.rows as i32;
+        let mut c5 = groups as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq8_marlin_intercept_correct_bf16,
+                (blocks, 1, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut c0 as *mut _ as *mut std::ffi::c_void,
+                    &mut c1 as *mut _ as *mut std::ffi::c_void,
+                    &mut c2 as *mut _ as *mut std::ffi::c_void,
+                    &mut c3 as *mut _ as *mut std::ffi::c_void,
+                    &mut c4 as *mut _ as *mut std::ffi::c_void,
+                    &mut c5 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn hqq_quantized_prefill_gemm_bf16(
         &self,
         layer_idx: usize,
@@ -10257,6 +10968,66 @@ impl PrefillEngine {
         let nbits = self.validate_hqq_quantized_prefill_tensor_desc(tensor_name, desc)?;
         if m == 0 || desc.rows == 0 || desc.cols == 0 {
             return Ok(());
+        }
+        if Self::is_hqq8_marlin_prefill(desc) {
+            return self.hqq8_marlin_prefill_gemm_bf16(
+                layer_idx,
+                tensor_name,
+                desc,
+                input_ptr,
+                output_ptr,
+                m,
+            );
+        }
+        if Self::is_hqq8_symmetric_marlin_prefill(desc) {
+            return self.hqq8_symmetric_marlin_prefill_gemm_bf16(
+                layer_idx,
+                tensor_name,
+                desc,
+                input_ptr,
+                output_ptr,
+                m,
+            );
+        }
+        if Self::is_hqq8_native_zp_marlin_prefill(desc) {
+            return self.hqq8_native_zp_marlin_prefill_gemm_bf16(
+                layer_idx,
+                tensor_name,
+                desc,
+                input_ptr,
+                output_ptr,
+                m,
+            );
+        }
+        if Self::is_hqq8_native_zp_intercept_marlin_prefill(desc) {
+            return self.hqq8_native_zp_intercept_marlin_prefill_gemm_bf16(
+                layer_idx,
+                tensor_name,
+                desc,
+                input_ptr,
+                output_ptr,
+                m,
+            );
+        }
+        if Self::is_hqq8_native_zp_twoscale_marlin_prefill(desc) {
+            return self.hqq8_native_zp_twoscale_marlin_prefill_gemm_bf16(
+                layer_idx,
+                tensor_name,
+                desc,
+                input_ptr,
+                output_ptr,
+                m,
+            );
+        }
+        if Self::is_hqq8_native_zp_twoscale_intercept_marlin_prefill(desc) {
+            return self.hqq8_native_zp_twoscale_intercept_marlin_prefill_gemm_bf16(
+                layer_idx,
+                tensor_name,
+                desc,
+                input_ptr,
+                output_ptr,
+                m,
+            );
         }
         let groups = desc.cols.div_ceil(desc.group_size);
         let padded_cols = groups * desc.group_size;
@@ -11624,7 +12395,9 @@ impl PrefillEngine {
                 // For head_dim > 128, staging forces kBlockN=32 which is slower than
                 // the dequant+BF16 path (separate dequant kernel + standard BF16 FA2).
                 let use_fp8_fa2 =
-                    self.kernels.flash_attn_fwd_fp8kv.is_some() && cfg.head_dim <= 128;
+                    self.kv_format != 0
+                        && self.kernels.flash_attn_fwd_fp8kv.is_some()
+                        && cfg.head_dim <= 128;
                 if let (true, Some(fa2_fp8)) = (use_fp8_fa2, self.kernels.flash_attn_fwd_fp8kv) {
                     attn_path = "fa2_fp8_cross_chunk";
                     // FP8 FA2 path: store current K/V to FP8 cache FIRST, then
@@ -11734,9 +12507,14 @@ impl PrefillEngine {
                     }
                     kv_cache_already_stored = true;
                     kv_append_path = "fp8_pre_attn";
-                } else {
-                    attn_path = "fa2_bf16_cross_chunk";
-                    // Fallback: dequant FP8 cache + concat current BF16 K/V, then FA2 BF16
+	                } else {
+	                    attn_path = if self.kv_format == 0 {
+	                        "fa2_bf16kv_cross_chunk"
+	                    } else {
+	                        "fa2_bf16_cross_chunk"
+	                    };
+	                    // Fallback: concat cache + current BF16 K/V, then FA2 BF16.
+	                    // FP8 cache dequantizes; BF16 cache copies directly.
                     let kv_buf_bytes = (total_kv * kv_stride * 2) as u64; // BF16
                     let scratch_bytes =
                         (self.scratch.d_fp32_scratch.len * std::mem::size_of::<f32>()) as u64;
@@ -11762,10 +12540,15 @@ impl PrefillEngine {
                         let mut a3 = start_pos as i32;
                         let mut a4 = m as i32;
                         let mut a5 = kv_stride as i32;
-                        launch(
-                            self.kernels.kv_dequant_concat,
-                            grid,
-                            (kv_threads, 1, 1),
+	                        let concat_kernel = if self.kv_format == 0 {
+	                            self.kernels.kv_concat_bf16
+	                        } else {
+	                            self.kernels.kv_dequant_concat
+	                        };
+	                        launch(
+	                            concat_kernel,
+	                            grid,
+	                            (kv_threads, 1, 1),
                             0,
                             self.stream,
                             &mut [
@@ -11780,9 +12563,9 @@ impl PrefillEngine {
                         let mut a0 = full_v_bf16;
                         let mut a1 = layer_v_ptr;
                         let mut a2 = v;
-                        launch(
-                            self.kernels.kv_dequant_concat,
-                            grid,
+	                        launch(
+	                            concat_kernel,
+	                            grid,
                             (kv_threads, 1, 1),
                             0,
                             self.stream,
@@ -12052,8 +12835,11 @@ impl PrefillEngine {
             && layer_v_ptr != 0
             && !kv_cache_already_stored
         {
-            kv_append_path = "fp8_append";
-            // FP8 E4M3: standard path
+            kv_append_path = if self.kv_format == 0 {
+                "bf16_append"
+            } else {
+                "fp8_append"
+            };
             let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
             let kt = std::cmp::max(
                 32,
@@ -12067,9 +12853,14 @@ impl PrefillEngine {
             let mut k5 = kv_stride;
             let mut k6 = self.kv_max_seq as i32;
             let mut k7 = start_pos as i32;
+            let append_kernel = if self.kv_format == 0 {
+                self.kernels.kv_cache_append_bf16
+            } else {
+                self.kernels.kv_cache_append
+            };
             unsafe {
                 launch(
-                    self.kernels.kv_cache_append,
+                    append_kernel,
                     (m as u32, 1, 1),
                     (kt, 1, 1),
                     0,
@@ -26531,6 +27322,9 @@ impl PrefillKernels {
                     "hqq4_dequant_bf16_kernel",
                     "hqq4_prefill_gemm_bf16_kernel",
                     "hqq8_prefill_gemm_bf16_kernel",
+                    "hqq_prefill_group_sums_bf16_kernel",
+                    "hqq8_marlin_zero_correct_bf16_kernel",
+                    "hqq8_marlin_intercept_correct_bf16_kernel",
                     "hqq_prefill_int8_exception_delta_bf16_kernel",
                     "hqq_apply_sidecar_bf16_kernel",
                     "rope_batched_kernel",
@@ -26546,6 +27340,7 @@ impl PrefillKernels {
                     "moe_sum_reduce_kernel",
                     "gqa_prefill_kernel",
                     "kv_cache_append_kernel",
+                    "kv_cache_append_bf16_kernel",
                     "causal_conv1d_fwd_kernel",
                     "mamba2_ssd_sequential_kernel",
                     "mamba2_extract_kernel",
@@ -26596,6 +27391,7 @@ impl PrefillKernels {
                     "moe_accum_to_bf16_kernel",
                     "kv_cache_append_fp8_kernel",
                     "kv_cache_dequant_concat_kernel",
+                    "kv_cache_concat_bf16_kernel",
                     "kv_cache_append_polar4_kernel",
                     "kv_cache_dequant_concat_polar4_kernel",
                     // Optimized LA kernels (BF16 pipeline)
@@ -26662,6 +27458,9 @@ impl PrefillKernels {
             hqq4_dequant_bf16: get("hqq4_dequant_bf16_kernel")?,
             hqq4_prefill_gemm_bf16: get("hqq4_prefill_gemm_bf16_kernel")?,
             hqq8_prefill_gemm_bf16: get("hqq8_prefill_gemm_bf16_kernel")?,
+            hqq_prefill_group_sums_bf16: get("hqq_prefill_group_sums_bf16_kernel")?,
+            hqq8_marlin_zero_correct_bf16: get("hqq8_marlin_zero_correct_bf16_kernel")?,
+            hqq8_marlin_intercept_correct_bf16: get("hqq8_marlin_intercept_correct_bf16_kernel")?,
             hqq_prefill_int8_exception_delta_bf16: get("hqq_prefill_int8_exception_delta_bf16_kernel")?,
             hqq_apply_sidecar_bf16: get("hqq_apply_sidecar_bf16_kernel")?,
             rope: get("rope_batched_kernel")?,
@@ -26675,7 +27474,9 @@ impl PrefillKernels {
             moe_sum_reduce: get("moe_sum_reduce_kernel")?,
             gqa_prefill: get("gqa_prefill_kernel")?,
             kv_cache_append: get("kv_cache_append_kernel")?,
+            kv_cache_append_bf16: get("kv_cache_append_bf16_kernel")?,
             kv_dequant_concat: get("kv_cache_dequant_concat_kernel")?,
+            kv_concat_bf16: get("kv_cache_concat_bf16_kernel")?,
             kv_cache_append_polar4: get("kv_cache_append_polar4_kernel")?,
             kv_dequant_concat_polar4: get("kv_cache_dequant_concat_polar4_kernel")?,
             causal_conv1d: get("causal_conv1d_fwd_kernel")?,

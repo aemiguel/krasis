@@ -74,7 +74,8 @@ static int get_scales_cache_size(
 static int get_kernel_cache_size(
     thread_config_t const& th_config, int thread_m_blocks,
     int prob_m, int prob_n, int prob_k, int num_bits, int group_size,
-    bool has_act_order, bool is_k_full, int has_zp, int is_zp_float) {
+    bool has_act_order, bool is_k_full, int has_zp, int is_zp_float,
+    bool has_scale2) {
     int pack_factor = 32 / num_bits;
     int tb_k = th_config.thread_k;
     int tb_n = th_config.thread_n;
@@ -92,26 +93,28 @@ static int get_kernel_cache_size(
         else if (num_bits == 4) sh_zp_size = sh_s_size / 4;
         else if (num_bits == 8) sh_zp_size = sh_s_size / 2;
     }
-    return std::max(sh_b_size, sh_red_size) + sh_a_size + sh_s_size + sh_zp_size + sh_g_idx_size;
+    int sh_s2_size = has_scale2 ? sh_s_size : 0;
+    return std::max(sh_b_size, sh_red_size) + sh_a_size + sh_s_size + sh_s2_size + sh_zp_size + sh_g_idx_size;
 }
 
 static bool is_valid_config(
     thread_config_t const& th_config, int thread_m_blocks,
     int prob_m, int prob_n, int prob_k, int num_bits, int group_size,
     bool has_act_order, bool is_k_full, int has_zp, int is_zp_float,
-    int max_shared_mem) {
+    bool has_scale2, int max_shared_mem) {
     if (th_config.thread_k == -1) return false;
     if (prob_k % th_config.thread_k != 0 || prob_n % th_config.thread_n != 0) return false;
     if (th_config.thread_n < min_thread_n || th_config.thread_k < min_thread_k) return false;
     if (th_config.num_threads < 128) return false;
     int cache_size = get_kernel_cache_size(
         th_config, thread_m_blocks, prob_m, prob_n, prob_k, num_bits,
-        group_size, has_act_order, is_k_full, has_zp, is_zp_float);
+        group_size, has_act_order, is_k_full, has_zp, is_zp_float,
+        has_scale2);
     return cache_size <= max_shared_mem;
 }
 
 // Template dispatch -- only instantiate what we need:
-// BF16 compute, U4B8 and U8B128, no act order, no zp, is_zp_float=false
+// BF16 compute, U4B8/U8B128 no-zp, and U8 with HQQ float zero points.
 #define _GET_IF(W_TYPE, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8, GROUP_BLOCKS, NUM_THREADS, IS_ZP_FLOAT) \
     else if (q_type == W_TYPE && thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS && \
              thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8 && group_blocks == GROUP_BLOCKS && \
@@ -153,6 +156,38 @@ static bool is_valid_config(
     COMMON_GET_IF_M234(W_TYPE, 8, 4, 128) \
     COMMON_GET_IF_M234(W_TYPE, 4, 8, 128)
 
+#define COMMON_GET_IF_FLOAT_ZP_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS) \
+    _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 4, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 8, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, true)
+
+#define COMMON_GET_IF_FLOAT_ZP_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS) \
+    _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, true) \
+    _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, true)
+
+#define COMMON_GET_IF_FLOAT_ZP(W_TYPE) \
+    COMMON_GET_IF_FLOAT_ZP_M1(W_TYPE, 8, 8, 256) \
+    COMMON_GET_IF_FLOAT_ZP_M1(W_TYPE, 8, 4, 128) \
+    COMMON_GET_IF_FLOAT_ZP_M1(W_TYPE, 4, 8, 128) \
+    COMMON_GET_IF_FLOAT_ZP_M234(W_TYPE, 16, 4, 256) \
+    COMMON_GET_IF_FLOAT_ZP_M234(W_TYPE, 8, 4, 128) \
+    COMMON_GET_IF_FLOAT_ZP_M234(W_TYPE, 4, 8, 128)
+
 template <typename scalar_t>
 MarlinFuncPtr get_marlin_kernel(
     const sglang::ScalarType q_type, int thread_m_blocks, int thread_n_blocks,
@@ -162,9 +197,10 @@ MarlinFuncPtr get_marlin_kernel(
     auto kernel = MarlinDefault;
     if (false) {}
 
-    // Only U4B8 and U8B128 for Krasis
+    // U8 is used for native fused HQQ8 prefill with BF16 zero points.
     COMMON_GET_IF(sglang::kU4B8)
     COMMON_GET_IF(sglang::kU8B128)
+    COMMON_GET_IF_FLOAT_ZP(sglang::kU8)
 
     return kernel;
 }
@@ -174,7 +210,7 @@ exec_config_t determine_exec_config(
     const sglang::ScalarType& q_type, int prob_m, int prob_n, int prob_k,
     int thread_m_blocks, bool m_block_size_8, int num_bits, int group_size,
     bool has_act_order, bool is_k_full, bool has_zp, bool is_zp_float,
-    int max_shared_mem, int sms) {
+    bool has_scale2, int max_shared_mem, int sms) {
 
     exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
     thread_config_t* thread_configs = thread_m_blocks > 1
@@ -187,7 +223,7 @@ exec_config_t determine_exec_config(
         thread_config_t th_config = thread_configs[i];
         if (!is_valid_config(th_config, thread_m_blocks, prob_m, prob_n, prob_k,
                             num_bits, group_size, has_act_order, is_k_full,
-                            has_zp, is_zp_float, max_shared_mem))
+                            has_zp, is_zp_float, has_scale2, max_shared_mem))
             continue;
 
         int group_blocks = 0;
@@ -243,6 +279,7 @@ void marlin_mm_impl(
     if (max_shared_mem <= 0) return;
 
     int max_par_local = 16;
+    bool has_scale2 = s2_ptr != nullptr && has_zp && is_zp_float;
     if (prob_n <= 4096) max_par_local = 16 * 8;
     int max_shared_mem_new = max_shared_mem;
     int rest_m = prob_m;
@@ -267,7 +304,7 @@ void marlin_mm_impl(
             exec_cfg = determine_exec_config<scalar_t>(
                 q_type, prob_m_split, prob_n, prob_k, thread_m_blocks,
                 m_block_size_8, num_bits, group_size, has_act_order, is_k_full,
-                has_zp, is_zp_float, max_shared_mem, sms);
+                has_zp, is_zp_float, has_scale2, max_shared_mem, sms);
             thread_tfg = exec_cfg.tb_cfg;
             if (thread_tfg.thread_k == -1 && max_thread_m_blocks > 1) {
                 max_thread_m_blocks--;

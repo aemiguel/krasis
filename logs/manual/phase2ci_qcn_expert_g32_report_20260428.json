@@ -1,0 +1,60 @@
+{
+  "phase": "2CI",
+  "date": "2026-04-28",
+  "purpose": "Test whether smaller grouped INT8 expert scale granularity improves QCN exact-prefix accuracy.",
+  "config": "tests/qcn-bf16kv-a16-g32-accuracy.conf",
+  "profile": "phase2bn_qcn_64tok",
+  "fixed_bug": {
+    "description": "Removed silent Marlin expert cache fallback across group sizes.",
+    "invalid_run": "logs/reference-test_20260428_095734/reference_test_summary.json",
+    "invalid_result": {
+      "first_token": "0/14",
+      "prefill_top10": "0/14",
+      "reason": "g128 cache was reused while runtime was configured for g32"
+    }
+  },
+  "valid_run": {
+    "summary": "logs/reference-test_20260428_100614/reference_test_summary.json",
+    "log": "logs/manual/phase2ci_qcn_bf16kv_a16_g32_accuracy_fixed_20260428.log",
+    "cache": "/home/main/.krasis/cache/Qwen3-Coder-Next/experts_marlin_int8_g32.bin",
+    "cache_bytes": 82301681728,
+    "first_token": "14/14",
+    "prefill": "14/14",
+    "avg_exact_prefix": 18.29,
+    "total_exact_prefix": "256/653",
+    "full_matches": "5/14",
+    "containment": "326/653",
+    "selected_logprob_delta_sum": 0.110593359159
+  },
+  "comparisons": [
+    {
+      "name": "HQQ8 two-scale-intercept + Polar4 KV + g128 experts",
+      "avg_exact_prefix": 18.14,
+      "total_exact_prefix": "254/653",
+      "full_matches": "5/14",
+      "containment": "326/653"
+    },
+    {
+      "name": "BF16 attention + BF16 KV + g128 experts",
+      "avg_exact_prefix": 18.79,
+      "total_exact_prefix": "263/653",
+      "full_matches": "5/14",
+      "containment": "338/653"
+    },
+    {
+      "name": "BF16 attention + BF16 KV + BF16 shared expert + g128 experts",
+      "avg_exact_prefix": 18.86,
+      "total_exact_prefix": "264/653",
+      "full_matches": "4/14",
+      "containment": "357/653"
+    },
+    {
+      "name": "BF16 attention + BF16 KV + g32 experts",
+      "avg_exact_prefix": 18.29,
+      "total_exact_prefix": "256/653",
+      "full_matches": "5/14",
+      "containment": "326/653"
+    }
+  ],
+  "decision": "Do not run speed. g32 is valid but does not improve the aggregate accuracy gate."
+}

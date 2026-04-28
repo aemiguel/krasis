@@ -240,6 +240,7 @@ class QuantConfig:
     shared_expert: str = "int8"    # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
     dense_mlp: str = "int8"        # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
     gpu_expert_bits: int = 4       # 4, 8 (Marlin), or 16 (UNVALIDATED BF16 debug-only path; do not use for validation)
+    expert_group_size: int = 128   # routed expert quantization group size; 32 matches Q8_0-style block scale granularity
     gpu_expert_int4_calib: str = "amax"  # "amax" or "search_rmse" for routed-expert GPU INT4 cache build
     cpu_expert_bits: int = 4       # 4 or 8 for CPU expert quantization
     kv_cache_format: str = "fp8"   # "bf16", "fp8", or "polar4"
@@ -295,6 +296,17 @@ class QuantConfig:
             raise ValueError(
                 f"Unsupported gpu_expert_int4_calib '{self.gpu_expert_int4_calib}'. "
                 f"Use one of: {', '.join(GPU_EXPERT_INT4_CALIB_CHOICES)}."
+            )
+        try:
+            self.expert_group_size = int(self.expert_group_size)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"expert_group_size must be an integer, got {self.expert_group_size!r}"
+            ) from exc
+        if self.expert_group_size not in (32, 64, 128):
+            raise ValueError(
+                f"Unsupported expert_group_size={self.expert_group_size}. "
+                "Use 32, 64, or 128."
             )
 
 

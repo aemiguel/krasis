@@ -1,0 +1,48 @@
+{
+  "phase": "2BW",
+  "date_utc": "2026-04-28",
+  "variant": "HQQ8 native fused v2 intercept correction",
+  "mode": "KRASIS_HQQ8_PREFILL_MODE=native-fused-marlin-v2",
+  "config": "logs/manual/phase2bm_qcn_accuracy_hqq8_20260426.conf",
+  "profile": "phase2bn_qcn_64tok",
+  "implementation": {
+    "description": "One Marlin U8 + BF16 float-zero-point GEMM followed by BF16 input group sums and a FP32 intercept-correction kernel.",
+    "correction": "sum(input_group) * (zero_bf16 * scale_bf16 - zero_f32 * scale_f32)",
+    "default_changed": false,
+    "speed_benchmark_run": false,
+    "speed_benchmark_reason": "Accuracy regressed versus native fused v1, so no speed benchmark was run."
+  },
+  "runs": {
+    "residual_marlin_hqq8": {
+      "summary": "logs/reference-test_20260427_214956/reference_test_summary.json",
+      "first_token": "14/14",
+      "prefill_argmax": "14/14",
+      "avg_exact_prefix": 15.79,
+      "worst_exact_prefix": 1,
+      "full_matches": "4/14",
+      "decode_containment": "285/653",
+      "selected_logprob_delta_sum": 0.354102521143
+    },
+    "native_fused_v1": {
+      "summary": "logs/reference-test_20260427_225530/reference_test_summary.json",
+      "first_token": "14/14",
+      "prefill_argmax": "14/14",
+      "avg_exact_prefix": 14.29,
+      "worst_exact_prefix": 1,
+      "full_matches": "5/14",
+      "decode_containment": "262/653",
+      "selected_logprob_delta_sum": 0.081758249973
+    },
+    "native_fused_v2": {
+      "summary": "logs/reference-test_20260428_000742/reference_test_summary.json",
+      "first_token": "14/14",
+      "prefill_argmax": "14/14",
+      "avg_exact_prefix": 11.21,
+      "worst_exact_prefix": 1,
+      "full_matches": "4/14",
+      "decode_containment": "265/650",
+      "selected_logprob_delta_sum": 0.11729101972
+    }
+  },
+  "decision": "Do not promote v2 and do not run speed; the intercept-only correction hurts exact-prefix quality despite preserving first-token/prefill checks."
+}

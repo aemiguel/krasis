@@ -401,6 +401,7 @@ class LauncherConfig:
         self.kv_cache_mb: int = 1000
         self.kv_dtype: str = "polar4"
         self.gpu_expert_bits: int = 4
+        self.expert_group_size: int = 128
         self.gpu_expert_int4_calib: str = "amax"
         self.cpu_expert_bits: int = 4
         self.attention_quant: str = "hqq8"
@@ -464,6 +465,13 @@ class LauncherConfig:
         if "CFG_GPU_EXPERT_BITS" in saved:
             try:
                 self.gpu_expert_bits = int(saved["CFG_GPU_EXPERT_BITS"])
+            except ValueError:
+                pass
+        if "CFG_EXPERT_GROUP_SIZE" in saved:
+            try:
+                val = int(saved["CFG_EXPERT_GROUP_SIZE"])
+                if val in (32, 64, 128):
+                    self.expert_group_size = val
             except ValueError:
                 pass
         if "CFG_GPU_EXPERT_INT4_CALIB" in saved:
@@ -551,6 +559,7 @@ class LauncherConfig:
             "CFG_KV_CACHE_MB": str(self.kv_cache_mb),
             "CFG_KV_DTYPE": self.kv_dtype,
             "CFG_GPU_EXPERT_BITS": str(self.gpu_expert_bits),
+            "CFG_EXPERT_GROUP_SIZE": str(self.expert_group_size),
             "CFG_GPU_EXPERT_INT4_CALIB": self.gpu_expert_int4_calib,
             "CFG_CPU_EXPERT_BITS": str(self.cpu_expert_bits),
             "CFG_ATTENTION_QUANT": self.attention_quant,
@@ -611,6 +620,8 @@ OPTIONS = [
                  opt_type="number", min_val=200, max_val=65500, step=100, affects_budget=True),
     ConfigOption("Model quantization", "gpu_expert_bits",
                  choices=[4, 8], affects_budget=True),
+    ConfigOption("Expert group size", "expert_group_size",
+                 choices=[32, 64, 128], affects_budget=True),
     ConfigOption("Expert INT4 calib", "gpu_expert_int4_calib",
                  choices=list(GPU_EXPERT_INT4_CALIB_CHOICES)),
     ConfigOption("Attention quant", "attention_quant",
@@ -693,6 +704,9 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
         elif bits == 4:
             return f"{DIM}{native_label} \u2192 int4 \u2014 {YELLOW}slight loss{NC}{DIM}{NC}"
         return f"{DIM}{native_label} \u2192 int{bits}{NC}"
+
+    elif config_key == "expert_group_size":
+        return f"{DIM}scale per {current_val} input columns{NC}"
 
     elif config_key == "kv_dtype":
         current = str(current_val)
@@ -1080,6 +1094,7 @@ class Launcher:
                 layer_group_size=lgs,
                 kv_dtype=self.cfg.kv_dtype,
                 gpu_expert_bits=self.cfg.gpu_expert_bits,
+                expert_group_size=self.cfg.expert_group_size,
                 attention_quant=self.cfg.attention_quant,
                 hqq_cache_profile=self.cfg.hqq_cache_profile,
                 shared_expert_quant=self.cfg.shared_expert_quant,
@@ -1593,7 +1608,7 @@ class Launcher:
         print(f"  Layer group:     {self.cfg.layer_group_size} layers (double-buffered)")
         print(f"  KV cache:        {self.cfg.kv_cache_mb:,} MB")
         print(f"  KV dtype:        {self.cfg.kv_dtype}")
-        print(f"  Quantization:    INT{self.cfg.gpu_expert_bits}")
+        print(f"  Quantization:    INT{self.cfg.gpu_expert_bits} g{self.cfg.expert_group_size}")
         if self.cfg.gpu_expert_bits == 4:
             print(f"  Expert INT4:     {self.cfg.gpu_expert_int4_calib}")
         attn_display = "hqq4sc" if self.cfg.attention_quant == "hqq4" and self.cfg.hqq_sidecar_manifest else self.cfg.attention_quant
@@ -1629,7 +1644,7 @@ class Launcher:
                 rank.get("prefill_workspace_mb", 0) + rank.get("cuda_overhead_mb", 0)
             )
             kv_label = "polar4" if self.cfg.kv_dtype == "polar4" else ("fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16")
-            print(f"\n  Experts:     {experts_mb:>8,} MB  (INT{self.cfg.gpu_expert_bits})")
+            print(f"\n  Experts:     {experts_mb:>8,} MB  (INT{self.cfg.gpu_expert_bits} g{self.cfg.expert_group_size})")
             attn_label = "HQQ4SC" if self.cfg.attention_quant == "hqq4" and self.cfg.hqq_sidecar_manifest else attention_quant_label(self.cfg.attention_quant)
             print(f"  Attention:   {attention_mb:>8,} MB  ({attn_label})")
             print(f"  Overhead:    {overhead_mb:>8,} MB")
@@ -1767,6 +1782,8 @@ def parse_args() -> argparse.Namespace:
                         help="KV cache dtype: fp8_e4m3, polar4, or bf16")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
                         help="Model quantization: 4 or 8")
+    parser.add_argument("--expert-group-size", type=int, default=None, choices=[32, 64, 128],
+                        help="Expert quantization group size for routed GPU/CPU expert caches")
     parser.add_argument("--gpu-expert-int4-calib", default=None,
                         choices=list(GPU_EXPERT_INT4_CALIB_CHOICES),
                         help="Offline calibration mode for GPU routed-expert INT4 cache build")
@@ -1836,6 +1853,8 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         cfg.kv_dtype = args.kv_dtype
     if args.gpu_expert_bits is not None:
         cfg.gpu_expert_bits = args.gpu_expert_bits
+    if args.expert_group_size is not None:
+        cfg.expert_group_size = args.expert_group_size
     if args.gpu_expert_int4_calib is not None:
         cfg.gpu_expert_int4_calib = args.gpu_expert_int4_calib
     if args.attention_quant is not None:

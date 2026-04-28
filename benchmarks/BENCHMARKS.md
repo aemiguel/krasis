@@ -1,5 +1,58 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-27 (Phase 2BR QCN Polar4 HQQ speed-test variants)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: speed-test-equivalent QCN runs with the AWQ attention choice replaced
+by HQQ4SC or HQQ8. The rest of the surface matches the QCN AWQ/Polar4 speed
+test: INT4 GPU/CPU experts, Polar4 KV, INT8 shared/dense/lm-head, layer group
+size 2, timing instrumentation off.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| QCN AWQ/Polar4 speed-test baseline, 2026-04-26 | 7,295.6 | 91.77 | 16848/24576 (68.6%) | 688 MB | [log](20260426_211755_qcn_polar4_awq_speed_regression_check.log) |
+| QCN HQQ4SC/Polar4 speed-test variant | 466.2 | 79.17 | 14823/24576 (60.3%) | 706 MB | [log](20260427_201735_qcn_polar4_hqq4sc_speed_variant.log) |
+| QCN HQQ8/Polar4 speed-test variant, scalar HQQ prefill | 486.8 | 75.16 | 14256/24576 (58.0%) | 734 MB | [log](20260427_202957_qcn_polar4_hqq8_speed_variant.log) |
+| QCN HQQ8/Polar4 speed-test variant, Marlin prefill prototype | 5,011.6 | 79.80 | 14256/24576 (58.0%) | 734 MB | [log](20260427_215803_qcn_polar4_hqq8_fastprefill_speed.log) |
+| QCN HQQ8/Polar4 speed-test variant, native fused Marlin experiment | 7,132.9 | 79.68 | 14256/24576 (58.0%) | 734 MB | [log](20260427_230455_qcn_polar4_hqq8_native_fused_speed.log) |
+| QCN HQQ8/Polar4 speed-test variant, two-scale + intercept Marlin experiment | 5,340.1 | 83.45 | 14256/24576 (58.0%) | 702 MB | [log](20260428_063003_qcn_polar4_hqq8_twoscale_intercept_speed.log) |
+
+Notes:
+- Runs executed via `./dev benchmark tests/qcn-polar4-hqq4sc.conf` and
+  `./dev benchmark tests/qcn-polar4-hqq8.conf` because `./dev speed-test` is
+  still the fixed AWQ config.
+- Decode values are the benchmark's internal engine numbers. Network round-trip
+  numbers are present in the full logs but are not used as decode speed.
+- HQQ4SC/HQQ8 decode is usable but below AWQ on this exact Polar4 speed-test
+  surface: HQQ4SC is about `86%` of AWQ decode, HQQ8 about `82%`.
+- The first HQQ8/Polar4 row used the old scalar HQQ prefill kernel and was not
+  acceptable: about `6-7%` of AWQ prefill.
+- The Marlin prefill prototype replaces the scalar HQQ8 prefill GEMM with a
+  two-pass Marlin U8B128 path plus grouped zero correction. It improves HQQ8
+  prefill from `486.8` to `5,011.6 tok/s` (`10.3x`) on this surface, reaching
+  about `68.7%` of the AWQ/Polar4 baseline prefill.
+- The native fused Marlin experiment uses Marlin U8 with BF16 float zero-points
+  as a single GEMM. It improves HQQ8 prefill from `486.8` to `7,132.9 tok/s`
+  (`14.7x`) and reaches `97.8%` of the AWQ/Polar4 baseline prefill. Accuracy
+  did not fully hold versus the residual Marlin HQQ8 prototype (`14.29` average
+  exact prefix versus `15.79`), so this is a speed/architecture result rather
+  than a production default.
+- The two-scale + intercept Marlin experiment uses one U8 float-zp Marlin GEMM
+  with a second BF16 scale plane plus a compact FP32 intercept correction. It
+  improves the QCN HQQ8 64-token witness gate over both residual Marlin and
+  native fused v1 (`18.14` average exact prefix, `326/653` decode containment),
+  while prefill lands between those two speed points at `5,340.1 tok/s`.
+- The Marlin prefill prototype passed the QCN 64-token witness gate before this
+  speed run (`14/14` first-token, `15.79` average exact prefix), but selected
+  first-token logprob delta remains worse than the previous fixed HQQ8 path; it
+  should stay treated as a prototype until that residual quality gap is closed.
+- VRAM monitor lows during timed prefill: HQQ4SC reached `532 MB` free; HQQ8
+  scalar and Marlin-prefill runs reached `516 MB` free.
+- Reduction: `logs/manual/phase2br_qcn_polar4_hqq_speed_reduction_20260427.md`.
+
+---
+
 ## Standard Benchmarks — 2026-04-26 (Phase 2BK INT8 exception top-k validation)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.

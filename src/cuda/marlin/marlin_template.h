@@ -294,7 +294,8 @@ __global__ void Marlin(
     const int4* __restrict__ scales_ptr,      // fp16 quantization scales of shape
                                               // (k/groupsize)xn
     const uint16_t* __restrict__ scale2_ptr,  // fp16 global scale (for nvfp4
-                                              // only)
+                                              // only), or optional second HQQ8
+                                              // scale plane for U8 float-zp
     const int4* __restrict__ zp_ptr,          // 4bit packed zero-points of shape
                                               // (k/groupsize)x(n/pack_factor)
     const int* __restrict__ g_idx,            // int32 group indices of shape k
@@ -652,10 +653,13 @@ __global__ void Marlin(
   int4* sh_zp = sh_g_idx + (stages * g_idx_stage);
   constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride) : (stages * s_sh_stage);
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
+  const bool has_scale2 = scale2_ptr != nullptr && has_zp && is_zp_float && group_blocks != -1;
+  const int4* scales2_ptr = reinterpret_cast<const int4*>(scale2_ptr);
+  int4* sh_s2 = sh_s + sh_s_size;
   // shared memory reused by reduction should be smaller than
   // shared memory used by weight.
   static_assert(thread_m_blocks * 16 * thread_n_blocks * 16 / 8 <= stages * b_sh_stage);
-  int4* sh_a = sh_s + sh_s_size;
+  int4* sh_a = sh_s2 + (has_scale2 ? sh_s_size : 0);
   // constexpr int shm_size_used =
   //     stages * (g_idx_stage + zp_sh_stage) + sh_s_size +
   //     (sh_red_size > sh_b_size ? sh_red_size : sh_b_size);
@@ -665,9 +669,11 @@ __global__ void Marlin(
   I4 frag_b_quant[2][b_thread_vecs];
   FragC frag_c[thread_m_blocks][4][2];
   FragS frag_s[2][4];                    // No act-order
+  FragS frag_s2[2][4];                   // Optional second HQQ8 scale plane
   FragS act_frag_s[2][4][4];             // For act-order
   int frag_qzp[2][num_ints_per_thread];  // Zero-points
   FragZP frag_zp;                        // Zero-points in fp16
+  FragZP frag_zp_raw;                    // Zero-points before scaling
   FragZP frag_zpf[2];                    // Zero-points in fp16 in HQQ
 
   // Zero accumulators.
@@ -756,6 +762,9 @@ __global__ void Marlin(
             if (pipe % (group_blocks / thread_k_blocks) == 0) {
               if (s_sh_wr_pred) {
                 cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+                if (has_scale2) {
+                  cp_async4(&sh_s2[s_sh_stage * pipe + s_sh_wr], &scales2_ptr[s_gl_rd]);
+                }
               }
               s_gl_rd += s_gl_rd_delta;
             }
@@ -763,6 +772,9 @@ __global__ void Marlin(
             for (int i = 0; i < s_tb_groups; i++) {
               if (s_sh_wr_pred) {
                 cp_async4(&sh_s_stage[i * s_sh_stride + s_sh_wr], &scales_ptr[s_gl_rd]);
+                if (has_scale2) {
+                  cp_async4(&sh_s2[s_sh_stage * pipe + i * s_sh_stride + s_sh_wr], &scales2_ptr[s_gl_rd]);
+                }
               }
               s_gl_rd += s_gl_rd_delta;
             }
@@ -805,6 +817,9 @@ __global__ void Marlin(
   auto fetch_col_scale_to_shared = [&]() {
     if (s_sh_wr_pred) {
       cp_async4(&sh_s[s_sh_wr], &scales_ptr[s_gl_rd]);
+      if (has_scale2) {
+        cp_async4(&sh_s2[s_sh_wr], &scales2_ptr[s_gl_rd]);
+      }
     }
   };
 
@@ -856,11 +871,15 @@ __global__ void Marlin(
 
     if constexpr (!has_act_order) {
       // No act-order case
-      if constexpr (group_blocks == -1) {
+        if constexpr (group_blocks == -1) {
         // load only when starting a new slice
         if (k == 0 && full_pipe == 0) {
           reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd];
           reinterpret_cast<int4*>(&frag_s)[1] = sh_s[s_sh_rd + 4];
+          if (has_scale2) {
+            reinterpret_cast<int4*>(&frag_s2)[0] = sh_s2[s_sh_rd];
+            reinterpret_cast<int4*>(&frag_s2)[1] = sh_s2[s_sh_rd + 4];
+          }
         }
       } else if constexpr (group_blocks != -1) {
         if constexpr (group_blocks >= thread_k_blocks) {
@@ -868,8 +887,16 @@ __global__ void Marlin(
             int4* sh_s_stage =
                 sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
+            if (has_scale2) {
+              int4* sh_s2_stage =
+                  sh_s2 + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+              reinterpret_cast<int4*>(&frag_s2[k % 2])[0] = sh_s2_stage[s_sh_rd];
+            }
           } else {
             reinterpret_cast<int4*>(&frag_s[1])[0] = reinterpret_cast<int4*>(&frag_s[0])[0];
+            if (has_scale2) {
+              reinterpret_cast<int4*>(&frag_s2[1])[0] = reinterpret_cast<int4*>(&frag_s2[0])[0];
+            }
           }
         } else {
           auto warp_id = threadIdx.x / 32;
@@ -887,6 +914,11 @@ __global__ void Marlin(
 
           if constexpr (w_type_id != sglang::kFE2M1f.id()) {
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
+            if (has_scale2) {
+              int4* sh_s2_stage = sh_s2 + s_sh_stage * pipe;
+              reinterpret_cast<int4*>(&frag_s2[k % 2])[0] =
+                  sh_s2_stage[s_sh_rd + cur_group_id * s_sh_stride];
+            }
           } else {
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
                 reinterpret_cast<int2*>(sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
@@ -1082,6 +1114,7 @@ __global__ void Marlin(
     if constexpr (!dequant_skip_flop && has_zp && is_zp_float) {
       if (is_new_zp) {
         reinterpret_cast<int4*>(&frag_zp)[0] = reinterpret_cast<int4*>(&frag_zpf[k2])[0];
+        reinterpret_cast<int4*>(&frag_zp_raw)[0] = reinterpret_cast<int4*>(&frag_zpf[k2])[0];
       }
     }
 
@@ -1153,6 +1186,27 @@ __global__ void Marlin(
         } else {
           mma<scalar_t>(frag_a[k2][i], frag_b0, frag_c[i][j][0]);
           mma<scalar_t>(frag_a[k2][i], frag_b1, frag_c[i][j][1]);
+        }
+      }
+      if constexpr (!dequant_skip_flop && has_zp && is_zp_float && group_blocks != -1) {
+        if (has_scale2) {
+          FragB frag_b0_s2;
+          FragB frag_b1_s2;
+          dequant_data(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0_s2));
+          dequant_data(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1_s2));
+          scalar_t2 s2_val = *reinterpret_cast<scalar_t2*>(&frag_s2[k2][j]);
+          scalar_t2 zp_s2 = __hmul2(frag_zp_raw[j], s2_val);
+          scale_and_sub<scalar_t>(frag_b0_s2, s2_val.x, zp_s2.x);
+          scale_and_sub<scalar_t>(frag_b1_s2, s2_val.y, zp_s2.y);
+#pragma unroll
+          for (int i = 0; i < thread_m_blocks; i++) {
+            if constexpr (m_block_size_8) {
+              mma_trans<scalar_t>(frag_a[k2][i], frag_b0_s2, frag_b1_s2, frag_c[i][j][0]);
+            } else {
+              mma<scalar_t>(frag_a[k2][i], frag_b0_s2, frag_c[i][j][0]);
+              mma<scalar_t>(frag_a[k2][i], frag_b1_s2, frag_c[i][j][1]);
+            }
+          }
         }
       }
     }

@@ -1,0 +1,63 @@
+{
+  "phase": "Phase 2BY",
+  "date_utc": "2026-04-28",
+  "model": "Qwen3-Coder-Next",
+  "mode": "native-fused-marlin-twoscale-intercept",
+  "env": {
+    "KRASIS_HQQ8_PREFILL_MODE": "native-fused-marlin-twoscale-intercept"
+  },
+  "implementation": {
+    "summary": "HQQ8 prefill mode using one Marlin U8 float-zero-point GEMM with base and residual BF16 scale planes, followed by a compact FP32 intercept correction from input group sums.",
+    "target_math": "q * (scale_hi_bf16 + scale_lo_bf16) - zero_f32 * scale_f32",
+    "files": [
+      "src/weights/marlin.rs",
+      "src/gpu_decode.rs",
+      "src/gpu_prefill.rs"
+    ]
+  },
+  "build": {
+    "command": "./dev build",
+    "result": "passed"
+  },
+  "accuracy": {
+    "command": "KRASIS_HQQ8_PREFILL_MODE=native-fused-marlin-twoscale-intercept ./dev witness-compare logs/manual/phase2bm_qcn_accuracy_hqq8_20260426.conf --profile phase2bn_qcn_64tok",
+    "run_dir": "logs/reference-test_20260428_062206",
+    "first_token": "14/14",
+    "prefill": "14/14",
+    "average_exact_prefix": 18.14,
+    "worst_exact_prefix": 1,
+    "full_matches": "5/14",
+    "decode_containment": "326/653",
+    "selected_logprob_delta_sum": 0.082125920769,
+    "comparison": {
+      "residual_marlin_hqq8": {
+        "average_exact_prefix": 15.79,
+        "decode_containment": "285/653",
+        "selected_logprob_delta_sum": 0.354102521143
+      },
+      "native_fused_v1": {
+        "average_exact_prefix": 14.29,
+        "decode_containment": "262/653",
+        "selected_logprob_delta_sum": 0.081758249973
+      },
+      "native_fused_twoscale": {
+        "average_exact_prefix": 13.57,
+        "decode_containment": "294/653",
+        "selected_logprob_delta_sum": 0.12101902834
+      }
+    }
+  },
+  "speed": {
+    "command": "KRASIS_HQQ8_PREFILL_MODE=native-fused-marlin-twoscale-intercept ./dev benchmark tests/qcn-polar4-hqq8.conf",
+    "run_dir": "logs/dev-benchmark_20260428_063003",
+    "timing_instrumentation": "off",
+    "prefill_best_tok_s": 5340.1,
+    "prefill_best_tokens": 35000,
+    "decode_best_tok_s": 83.45,
+    "hcs": "14256/24576",
+    "hcs_percent": 58.0,
+    "min_free_vram_mb": 702,
+    "benchmark_log": "benchmarks/20260428_063003_qcn_polar4_hqq8_twoscale_intercept_speed.log"
+  },
+  "decision": "Accuracy improved over residual Marlin and native fused v1. Speed is faster than residual Marlin but below native fused v1; this is the current quality-favored HQQ8 fast-prefill candidate."
+}

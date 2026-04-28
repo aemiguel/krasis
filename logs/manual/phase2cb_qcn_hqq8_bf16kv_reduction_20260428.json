@@ -1,0 +1,29 @@
+{
+  "phase": "2CB",
+  "description": "QCN HQQ8 two-scale-intercept with BF16 KV cache",
+  "config": "tests/qcn-bf16kv-hqq8-accuracy.conf",
+  "mode": "KRASIS_HQQ8_PREFILL_MODE=native-fused-marlin-twoscale-intercept",
+  "profile": "phase2bn_qcn_64tok",
+  "run_dir": "logs/reference-test_20260428_075446",
+  "fixed_after_invalid_phase2ca": true,
+  "baseline_polar4": {
+    "run_dir": "logs/reference-test_20260428_062206",
+    "first_token": "14/14",
+    "prefill_argmax": "14/14",
+    "avg_exact_prefix": 18.14,
+    "total_exact_prefix": "254/653",
+    "full_matches": "5/14",
+    "containment": "326/653",
+    "selected_logprob_delta_sum": 0.082125920769
+  },
+  "bf16_kv": {
+    "first_token": "14/14",
+    "prefill_argmax": "14/14",
+    "avg_exact_prefix": 18.21,
+    "total_exact_prefix": "255/653",
+    "full_matches": "5/14",
+    "containment": "317/653",
+    "selected_logprob_delta_sum": 0.190790702423
+  },
+  "conclusion": "BF16 KV alone does not materially improve exact-prefix accuracy versus Polar4 KV on this surface."
+}

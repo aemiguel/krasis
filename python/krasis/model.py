@@ -226,7 +226,12 @@ def _estimate_expert_ram_gb(cfg, cpu_expert_bits: int = 4, group_size: int = 128
     return (routed_total + shared_total) / 1e9
 
 
-def _check_system_ram(cfg, cpu_expert_bits: int = 4, force_load: bool = False):
+def _check_system_ram(
+    cfg,
+    cpu_expert_bits: int = 4,
+    group_size: int = 128,
+    force_load: bool = False,
+):
     """Check system RAM budget before loading expert weights.
 
     Reads /proc/meminfo, estimates RAM needed, and refuses to run if
@@ -235,6 +240,7 @@ def _check_system_ram(cfg, cpu_expert_bits: int = 4, force_load: bool = False):
     Args:
         cfg: ModelConfig with model dimensions
         cpu_expert_bits: 4 or 8
+        group_size: expert weight quantization group size
         force_load: If True, log error but don't raise
 
     Raises:
@@ -248,7 +254,7 @@ def _check_system_ram(cfg, cpu_expert_bits: int = 4, force_load: bool = False):
     mem_total_gb = meminfo.get("MemTotal", 0) / 1024 / 1024
     mem_avail_gb = meminfo.get("MemAvailable", 0) / 1024 / 1024
 
-    expert_ram_gb = _estimate_expert_ram_gb(cfg, cpu_expert_bits)
+    expert_ram_gb = _estimate_expert_ram_gb(cfg, cpu_expert_bits, group_size)
     # Compute non-expert RAM overhead from model dimensions:
     # - GPU weights (attention, embedding, lm_head, norms, gates, shared experts) are loaded
     #   to GPU but PyTorch/CUDA uses staging buffers in system RAM during loading.
@@ -706,10 +712,11 @@ class KrasisModel:
             _check_system_ram(
                 self.cfg,
                 cpu_expert_bits=self.quant_cfg.cpu_expert_bits,
+                group_size=self.quant_cfg.expert_group_size,
                 force_load=self.force_load,
             )
             self._estimated_expert_ram_gb = _estimate_expert_ram_gb(
-                self.cfg, self.quant_cfg.cpu_expert_bits,
+                self.cfg, self.quant_cfg.cpu_expert_bits, self.quant_cfg.expert_group_size,
             )
         else:
             self._estimated_expert_ram_gb = 0.0
@@ -791,7 +798,7 @@ class KrasisModel:
                     cache_dir,
                     marlin_cache_basename(
                         gpu_bits,
-                        128,
+                        self.quant_cfg.expert_group_size,
                         self.quant_cfg.gpu_expert_int4_calib,
                     ),
                 )
@@ -2817,6 +2824,7 @@ class KrasisModel:
             logger.info("Loading CPU experts from GGUF: %s (native=%s)", self.gguf_path, self.gguf_native)
             engine.load(
                 self.cfg.model_path,
+                group_size=self.quant_cfg.expert_group_size,
                 cpu_num_bits=cpu_bits,
                 gpu_num_bits=gpu_bits,
                 expert_int4_calib=self.quant_cfg.gpu_expert_int4_calib,
@@ -2826,6 +2834,7 @@ class KrasisModel:
         else:
             engine.load(
                 self.cfg.model_path,
+                group_size=self.quant_cfg.expert_group_size,
                 cpu_num_bits=cpu_bits,
                 gpu_num_bits=gpu_bits,
                 expert_int4_calib=self.quant_cfg.gpu_expert_int4_calib,
@@ -5050,7 +5059,7 @@ class KrasisModel:
             max_experts_per_tok=self.cfg.num_experts_per_tok,
             max_intermediate_size=max_inter,
             max_qkv_size=max_qkv,
-            group_size=128,
+            group_size=self.quant_cfg.expert_group_size,
             expert_bits=self.quant_cfg.gpu_expert_bits,
             moe_intermediate_size=self.cfg.moe_intermediate_size,
             shared_expert_intermediate_size=self.cfg.effective_shared_expert_intermediate,
@@ -5840,9 +5849,14 @@ class KrasisModel:
                     gqa_cache_idx += 1
                     kv_ptrs.append((layer_idx, k_layer.data_ptr(), v_layer.data_ptr()))
             max_seq = cache.max_pages * cache.page_size
-            store.set_kv_cache_ptrs(kv_ptrs, max_seq)
-            logger.info("Shared FP8 KV cache: %d GQA layers, max_seq=%d (%d pages × %d)",
-                        len(kv_ptrs), max_seq, cache.max_pages, cache.page_size)
+            if cache.kv_format == 0:
+                store.set_kv_cache_ptrs_bf16(kv_ptrs, max_seq)
+                cache_label = "BF16"
+            else:
+                store.set_kv_cache_ptrs(kv_ptrs, max_seq)
+                cache_label = "FP8"
+            logger.info("Shared %s KV cache: %d GQA layers, max_seq=%d (%d pages × %d)",
+                        cache_label, len(kv_ptrs), max_seq, cache.max_pages, cache.page_size)
         elif cache is not None and cache.ckv_cache is not None:
             # MLA-only model (no GQA layers): still need to set max_seq for Rust decode
             max_seq = cache.max_pages * cache.page_size
@@ -6037,7 +6051,7 @@ class KrasisModel:
             max_experts_per_tok=self.cfg.num_experts_per_tok,
             max_intermediate_size=max_inter,
             max_qkv_size=max_qkv,
-            group_size=128,
+            group_size=self.quant_cfg.expert_group_size,
             expert_bits=self.quant_cfg.gpu_expert_bits,
             moe_intermediate_size=self.cfg.moe_intermediate_size,
             shared_expert_intermediate_size=self.cfg.effective_shared_expert_intermediate,
@@ -6634,9 +6648,14 @@ class KrasisModel:
                         kv_ptrs.append((layer_idx, k_layer.data_ptr(), v_layer.data_ptr()))
                     gqa_cache_idx += 1
             max_seq = cache.max_pages * cache.page_size
-            store.set_kv_cache_ptrs(kv_ptrs, max_seq)
-            logger.info("Aux KV cache on cuda:%d: %d GQA layers for [%d..%d), max_seq=%d",
-                        gpu_idx, len(kv_ptrs), split_layer, layer_end, max_seq)
+            if cache.kv_format == 0:
+                store.set_kv_cache_ptrs_bf16(kv_ptrs, max_seq)
+                cache_label = "BF16"
+            else:
+                store.set_kv_cache_ptrs(kv_ptrs, max_seq)
+                cache_label = "FP8"
+            logger.info("Aux %s KV cache on cuda:%d: %d GQA layers for [%d..%d), max_seq=%d",
+                        cache_label, gpu_idx, len(kv_ptrs), split_layer, layer_end, max_seq)
 
         torch.cuda.synchronize(aux_device)
 

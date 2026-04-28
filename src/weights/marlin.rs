@@ -298,6 +298,44 @@ pub struct MarlinRepacked {
     pub group_size: usize,
 }
 
+/// HQQ8 weights repacked for Marlin U8B128 prefill plus grouped zero correction.
+///
+/// Marlin U8B128 computes `(q - 128) * scale_bf16`. HQQ8 computes
+/// `(q - zero) * scale_fp32`, so the prefill path runs a second Marlin pass
+/// with a BF16 residual scale plane and adds:
+/// `sum(input_group) * (128 - zero) * scale_fp32`.
+///
+/// This keeps the production path tiled/Marlin-class while preserving the HQQ
+/// affine math much more closely than a single BF16 scale plane.
+pub struct Hqq8MarlinPrefill {
+    pub marlin: MarlinRepacked,
+    pub delta_scales: Vec<u16>,
+    pub zero_correction: Vec<f32>, // [rows, cols/group_size]
+}
+
+/// HQQ8 weights converted to native symmetric Marlin INT8 prefill layout.
+///
+/// This intentionally does not preserve HQQ's asymmetric zero point at runtime.
+/// It dequantizes each HQQ8 group on the host, requantizes to signed symmetric
+/// INT8 with Marlin-native BF16 scales, and then uses the standard INT8 Marlin
+/// GEMM path with no zero-correction launches.
+pub struct Hqq8SymmetricMarlinPrefill {
+    pub marlin: MarlinRepacked,
+}
+
+/// HQQ8 weights repacked for Marlin's native U8 + float zero-point path.
+///
+/// Runtime executes one Marlin-class GEMM where the template applies
+/// `(q - zero_bf16) * scale_bf16` inside the tiled path before MMA. This avoids
+/// the residual second GEMM and the external grouped zero-correction pass.
+pub struct Hqq8NativeZpMarlinPrefill {
+    pub marlin: MarlinRepacked,
+    pub delta_scales: Vec<u16>,
+    pub zeros: Vec<u16>,
+    pub intercept_correction: Vec<f32>,
+    pub twoscale_intercept_correction: Vec<f32>,
+}
+
 /// Generate the Marlin weight permutation table for INT4.
 ///
 /// Returns a 1024-element array mapping destination → source index within a
@@ -806,6 +844,386 @@ pub fn marlin_repack_int8(q: &QuantizedInt8) -> MarlinRepacked {
     }
 }
 
+/// Repack canonical HQQ8 row-major weights into Marlin U8B128 prefill layout.
+///
+/// `packed` is HQQ's raw unsigned q values, shape `[rows, cols]`.
+/// `scales` and `zeros` are FP32, shape `[rows, cols/group_size]`.
+pub fn marlin_repack_hqq8_prefill(
+    packed: &[u8],
+    scales: &[f32],
+    zeros: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Hqq8MarlinPrefill {
+    let n = rows;
+    let k = cols;
+    let t0 = std::time::Instant::now();
+
+    assert_eq!(packed.len(), n * k);
+    assert!(group_size > 0, "group_size must be non-zero");
+    assert!(k % group_size == 0, "K ({k}) must be divisible by group_size ({group_size})");
+    assert_eq!(scales.len(), n * (k / group_size));
+    assert_eq!(zeros.len(), scales.len());
+    assert!(k % MARLIN_TILE == 0, "K ({k}) must be divisible by {MARLIN_TILE}");
+    assert!(n % 64 == 0, "N ({n}) must be divisible by 64 (Marlin tile constraint)");
+
+    let k_tiles = k / MARLIN_TILE;
+    let n_tiles = n / MARLIN_TILE;
+    let row_len = n * MARLIN_TILE;
+
+    let mut permuted = vec![0u8; k_tiles * row_len];
+    for kt in 0..k_tiles {
+        for nt in 0..n_tiles {
+            for tk in 0..MARLIN_TILE {
+                for tn in 0..MARLIN_TILE {
+                    let src_k = kt * MARLIN_TILE + tk;
+                    let src_n = nt * MARLIN_TILE + tn;
+                    let dst_col = nt * MARLIN_TILE * MARLIN_TILE + tk * MARLIN_TILE + tn;
+                    permuted[kt * row_len + dst_col] = packed[src_n * k + src_k];
+                }
+            }
+        }
+    }
+
+    let perm = generate_weight_perm_int8();
+    let num_chunks = row_len / 1024;
+    let mut perm_applied = vec![0u8; k_tiles * row_len];
+    for kt in 0..k_tiles {
+        for chunk in 0..num_chunks {
+            let base = kt * row_len + chunk * 1024;
+            for i in 0..1024 {
+                perm_applied[base + i] = permuted[base + perm[i]];
+            }
+        }
+    }
+
+    let out_cols = row_len / PACK_FACTOR_INT8;
+    let mut out_packed = vec![0u32; k_tiles * out_cols];
+    for row in 0..k_tiles {
+        for col in 0..out_cols {
+            let mut word: u32 = 0;
+            for i in 0..PACK_FACTOR_INT8 {
+                let src_col = col * PACK_FACTOR_INT8 + i;
+                let val = perm_applied[row * row_len + src_col] as u32;
+                word |= val << (i as u32 * 8);
+            }
+            out_packed[row * out_cols + col] = word;
+        }
+    }
+
+    let num_groups_k = k / group_size;
+    let mut scales_transposed = vec![0u16; num_groups_k * n];
+    let mut delta_scales_transposed = vec![0u16; num_groups_k * n];
+    for row in 0..n {
+        for g in 0..num_groups_k {
+            let idx = row * num_groups_k + g;
+            let base_scale = f32_to_bf16(scales[idx]);
+            let base_scale_f32 = bf16_to_f32(base_scale);
+            scales_transposed[g * n + row] = base_scale;
+            delta_scales_transposed[g * n + row] = f32_to_bf16(scales[idx] - base_scale_f32);
+        }
+    }
+
+    let (scale_perm, scale_perm_single) = generate_scale_perms();
+    let is_grouped = group_size < k;
+    let sperm: &[usize] = if is_grouped { &scale_perm } else { &scale_perm_single };
+    let perm_len = sperm.len();
+    let total_scale_vals = num_groups_k * n;
+    let num_scale_chunks = total_scale_vals / perm_len;
+
+    let mut scales_permuted = vec![0u16; total_scale_vals];
+    let mut delta_scales_permuted = vec![0u16; total_scale_vals];
+    for chunk in 0..num_scale_chunks {
+        let base = chunk * perm_len;
+        for i in 0..perm_len {
+            scales_permuted[base + i] = scales_transposed[base + sperm[i]];
+            delta_scales_permuted[base + i] = delta_scales_transposed[base + sperm[i]];
+        }
+    }
+
+    let mut zero_correction = vec![0.0f32; n * num_groups_k];
+    for row in 0..n {
+        for g in 0..num_groups_k {
+            let idx = row * num_groups_k + g;
+            zero_correction[idx] = (128.0 - zeros[idx]) * scales[idx];
+        }
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static HQQ8_MARLIN_REPACK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let count = HQQ8_MARLIN_REPACK_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 5 || count % 384 == 0 {
+        log::info!(
+            "marlin_repack_hqq8_prefill [{n}x{k}] total={:.1}ms groups={}",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            num_groups_k,
+        );
+    }
+
+    Hqq8MarlinPrefill {
+        marlin: MarlinRepacked {
+            packed: out_packed,
+            scales: scales_permuted,
+            k,
+            n,
+            group_size,
+        },
+        delta_scales: delta_scales_permuted,
+        zero_correction,
+    }
+}
+
+/// Convert canonical HQQ8 row-major weights into native symmetric Marlin INT8.
+///
+/// This is the maximum-speed experiment: runtime becomes a single standard
+/// Marlin INT8 GEMM. The host conversion uses two lightweight least-squares
+/// refinement passes per group so the BF16 Marlin scale fits the dequantized HQQ
+/// values better than a plain max-abs scale.
+pub fn marlin_repack_hqq8_symmetric_prefill(
+    packed: &[u8],
+    scales: &[f32],
+    zeros: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Hqq8SymmetricMarlinPrefill {
+    let t0 = std::time::Instant::now();
+    assert_eq!(packed.len(), rows * cols);
+    assert!(group_size > 0, "group_size must be non-zero");
+    assert!(cols % group_size == 0, "cols ({cols}) must be divisible by group_size ({group_size})");
+    assert_eq!(scales.len(), rows * (cols / group_size));
+    assert_eq!(zeros.len(), scales.len());
+    assert!(cols % MARLIN_TILE == 0, "K ({cols}) must be divisible by {MARLIN_TILE}");
+    assert!(rows % 64 == 0, "N ({rows}) must be divisible by 64 (Marlin tile constraint)");
+
+    let groups = cols / group_size;
+    let mut data = vec![0i8; rows * cols];
+    let mut sym_scales = vec![0u16; rows * groups];
+    let mut total_sq_error = 0.0f64;
+    let mut total_sq_ref = 0.0f64;
+    let mut max_abs_error = 0.0f32;
+
+    for row in 0..rows {
+        for g in 0..groups {
+            let group_start = row * cols + g * group_size;
+            let meta_idx = row * groups + g;
+            let hqq_scale = scales[meta_idx];
+            let hqq_zero = zeros[meta_idx];
+            let mut amax = 0.0f32;
+            for i in 0..group_size {
+                let w = (packed[group_start + i] as f32 - hqq_zero) * hqq_scale;
+                amax = amax.max(w.abs());
+            }
+
+            let mut scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+            for _ in 0..2 {
+                let effective = bf16_to_f32(f32_to_bf16(scale));
+                if effective == 0.0 {
+                    break;
+                }
+                let inv = 1.0 / effective;
+                let mut numer = 0.0f64;
+                let mut denom = 0.0f64;
+                for i in 0..group_size {
+                    let w = (packed[group_start + i] as f32 - hqq_zero) * hqq_scale;
+                    let q = (w * inv).round().clamp(-128.0, 127.0);
+                    numer += (w as f64) * (q as f64);
+                    denom += (q as f64) * (q as f64);
+                }
+                if denom > 0.0 {
+                    scale = (numer / denom) as f32;
+                    if !scale.is_finite() || scale <= 0.0 {
+                        scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+                        break;
+                    }
+                }
+            }
+
+            let scale_bf16 = f32_to_bf16(scale);
+            let effective = bf16_to_f32(scale_bf16);
+            let inv = if effective == 0.0 { 0.0 } else { 1.0 / effective };
+            sym_scales[meta_idx] = scale_bf16;
+            for i in 0..group_size {
+                let idx = group_start + i;
+                let w = (packed[idx] as f32 - hqq_zero) * hqq_scale;
+                let q = (w * inv).round().clamp(-128.0, 127.0) as i8;
+                let reconstructed = q as f32 * effective;
+                let err = reconstructed - w;
+                data[idx] = q;
+                total_sq_error += (err as f64) * (err as f64);
+                total_sq_ref += (w as f64) * (w as f64);
+                max_abs_error = max_abs_error.max(err.abs());
+            }
+        }
+    }
+
+    let marlin = marlin_repack_int8(&QuantizedInt8 {
+        data,
+        scales: sym_scales,
+        rows,
+        cols,
+        group_size,
+    });
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static HQQ8_SYM_MARLIN_REPACK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let count = HQQ8_SYM_MARLIN_REPACK_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 5 || count % 384 == 0 {
+        let rel_rmse = if total_sq_ref > 0.0 {
+            (total_sq_error / total_sq_ref).sqrt()
+        } else {
+            0.0
+        };
+        log::info!(
+            "marlin_repack_hqq8_symmetric_prefill [{rows}x{cols}] total={:.1}ms groups={} rel_rmse={:.6} max_abs_error={:.6}",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            groups,
+            rel_rmse,
+            max_abs_error,
+        );
+    }
+
+    Hqq8SymmetricMarlinPrefill { marlin }
+}
+
+/// Repack canonical HQQ8 row-major weights into native Marlin U8 with BF16
+/// zero points. `packed` is HQQ's raw unsigned q values, shape `[rows, cols]`;
+/// `scales` and `zeros` are FP32, shape `[rows, cols/group_size]`.
+pub fn marlin_repack_hqq8_native_zp_prefill(
+    packed: &[u8],
+    scales: &[f32],
+    zeros: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Hqq8NativeZpMarlinPrefill {
+    let t0 = std::time::Instant::now();
+    assert_eq!(packed.len(), rows * cols);
+    assert!(group_size > 0, "group_size must be non-zero");
+    assert!(cols % group_size == 0, "cols ({cols}) must be divisible by group_size ({group_size})");
+    assert_eq!(scales.len(), rows * (cols / group_size));
+    assert_eq!(zeros.len(), scales.len());
+    assert!(cols % MARLIN_TILE == 0, "K ({cols}) must be divisible by {MARLIN_TILE}");
+    assert!(rows % 64 == 0, "N ({rows}) must be divisible by 64 (Marlin tile constraint)");
+
+    let n = rows;
+    let k = cols;
+    let k_tiles = k / MARLIN_TILE;
+    let n_tiles = n / MARLIN_TILE;
+    let row_len = n * MARLIN_TILE;
+
+    let mut permuted = vec![0u8; k_tiles * row_len];
+    for kt in 0..k_tiles {
+        for nt in 0..n_tiles {
+            for tk in 0..MARLIN_TILE {
+                for tn in 0..MARLIN_TILE {
+                    let src_k = kt * MARLIN_TILE + tk;
+                    let src_n = nt * MARLIN_TILE + tn;
+                    let dst_col = nt * MARLIN_TILE * MARLIN_TILE + tk * MARLIN_TILE + tn;
+                    permuted[kt * row_len + dst_col] = packed[src_n * k + src_k];
+                }
+            }
+        }
+    }
+
+    let perm = generate_weight_perm_int8();
+    let num_chunks = row_len / 1024;
+    let mut perm_applied = vec![0u8; k_tiles * row_len];
+    for kt in 0..k_tiles {
+        for chunk in 0..num_chunks {
+            let base = kt * row_len + chunk * 1024;
+            for i in 0..1024 {
+                perm_applied[base + i] = permuted[base + perm[i]];
+            }
+        }
+    }
+
+    let out_cols = row_len / PACK_FACTOR_INT8;
+    let mut out_packed = vec![0u32; k_tiles * out_cols];
+    for row in 0..k_tiles {
+        for col in 0..out_cols {
+            let mut word: u32 = 0;
+            for i in 0..PACK_FACTOR_INT8 {
+                let src_col = col * PACK_FACTOR_INT8 + i;
+                word |= (perm_applied[row * row_len + src_col] as u32) << (i as u32 * 8);
+            }
+            out_packed[row * out_cols + col] = word;
+        }
+    }
+
+    let num_groups_k = k / group_size;
+    let mut scales_transposed = vec![0u16; num_groups_k * n];
+    let mut delta_scales_transposed = vec![0u16; num_groups_k * n];
+    let mut zeros_transposed = vec![0u16; num_groups_k * n];
+    let mut intercept_correction = vec![0.0f32; n * num_groups_k];
+    let mut twoscale_intercept_correction = vec![0.0f32; n * num_groups_k];
+    for row in 0..n {
+        for g in 0..num_groups_k {
+            let idx = row * num_groups_k + g;
+            let scale_bf16 = f32_to_bf16(scales[idx]);
+            let scale_bf16_f32 = bf16_to_f32(scale_bf16);
+            let delta_scale_bf16 = f32_to_bf16(scales[idx] - scale_bf16_f32);
+            let delta_scale_bf16_f32 = bf16_to_f32(delta_scale_bf16);
+            let zero_bf16 = f32_to_bf16(zeros[idx]);
+            scales_transposed[g * n + row] = scale_bf16;
+            delta_scales_transposed[g * n + row] = delta_scale_bf16;
+            zeros_transposed[g * n + row] = zero_bf16;
+            let rounded_intercept = bf16_to_f32(zero_bf16) * bf16_to_f32(scale_bf16);
+            let rounded_twoscale_intercept =
+                bf16_to_f32(zero_bf16) * (scale_bf16_f32 + delta_scale_bf16_f32);
+            let reference_intercept = zeros[idx] * scales[idx];
+            intercept_correction[idx] = rounded_intercept - reference_intercept;
+            twoscale_intercept_correction[idx] =
+                rounded_twoscale_intercept - reference_intercept;
+        }
+    }
+
+    let (scale_perm, scale_perm_single) = generate_scale_perms();
+    let is_grouped = group_size < k;
+    let sperm: &[usize] = if is_grouped { &scale_perm } else { &scale_perm_single };
+    let perm_len = sperm.len();
+    let total_scale_vals = num_groups_k * n;
+    let num_scale_chunks = total_scale_vals / perm_len;
+
+    let mut scales_permuted = vec![0u16; total_scale_vals];
+    let mut delta_scales_permuted = vec![0u16; total_scale_vals];
+    let mut zeros_permuted = vec![0u16; total_scale_vals];
+    for chunk in 0..num_scale_chunks {
+        let base = chunk * perm_len;
+        for i in 0..perm_len {
+            scales_permuted[base + i] = scales_transposed[base + sperm[i]];
+            delta_scales_permuted[base + i] = delta_scales_transposed[base + sperm[i]];
+            zeros_permuted[base + i] = zeros_transposed[base + sperm[i]];
+        }
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static HQQ8_NATIVE_ZP_MARLIN_REPACK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let count = HQQ8_NATIVE_ZP_MARLIN_REPACK_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 5 || count % 384 == 0 {
+        log::info!(
+            "marlin_repack_hqq8_native_zp_prefill [{rows}x{cols}] total={:.1}ms groups={}",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            num_groups_k,
+        );
+    }
+
+    Hqq8NativeZpMarlinPrefill {
+        marlin: MarlinRepacked {
+            packed: out_packed,
+            scales: scales_permuted,
+            k,
+            n,
+            group_size,
+        },
+        delta_scales: delta_scales_permuted,
+        zeros: zeros_permuted,
+        intercept_correction,
+        twoscale_intercept_correction,
+    }
+}
+
 /// Dequantize Marlin-repacked INT8 weights back to f32 for verification.
 ///
 /// Reverses the INT8 permutation and packing to recover the original [N, K] f32 values.
@@ -1158,6 +1576,133 @@ mod tests {
             max_diff == 0.0,
             "Marlin INT8 repack changed values! max_diff={max_diff}"
         );
+    }
+
+    #[test]
+    fn test_marlin_repack_hqq8_prefill_zero_correction() {
+        let rows = 64;
+        let cols = 128;
+        let group_size = 128;
+        let groups = cols / group_size;
+        let mut packed = vec![0u8; rows * cols];
+        let mut scales = vec![0.0f32; rows * groups];
+        let mut zeros = vec![0.0f32; rows * groups];
+
+        for row in 0..rows {
+            scales[row] = 0.01 + row as f32 * 0.0001;
+            zeros[row] = 120.0 + (row % 7) as f32;
+            for col in 0..cols {
+                packed[row * cols + col] = ((row * 3 + col * 5) % 251) as u8;
+            }
+        }
+
+        let hqq = marlin_repack_hqq8_prefill(&packed, &scales, &zeros, rows, cols, group_size);
+        assert_eq!(hqq.marlin.n, rows);
+        assert_eq!(hqq.marlin.k, cols);
+        assert_eq!(hqq.delta_scales.len(), rows * groups);
+        assert_eq!(hqq.zero_correction.len(), rows * groups);
+
+        let marlin_base = dequantize_marlin_int8(&hqq.marlin);
+        let marlin_delta = dequantize_marlin_int8(&MarlinRepacked {
+            packed: hqq.marlin.packed.clone(),
+            scales: hqq.delta_scales.clone(),
+            k: hqq.marlin.k,
+            n: hqq.marlin.n,
+            group_size: hqq.marlin.group_size,
+        });
+        for row in 0..rows {
+            let corr = hqq.zero_correction[row];
+            assert!((corr - (128.0 - zeros[row]) * scales[row]).abs() < 1e-6);
+            for col in 0..cols {
+                let q_centered = packed[row * cols + col] as f32 - 128.0;
+                let expected_base = q_centered * bf16_to_f32(f32_to_bf16(scales[row]));
+                let expected_combined = q_centered * scales[row];
+                let actual_base = marlin_base[row * cols + col];
+                let actual_combined = actual_base + marlin_delta[row * cols + col];
+                assert!(
+                    (actual_base - expected_base).abs() < 1e-6,
+                    "row={row} col={col} actual_base={actual_base} expected={expected_base}"
+                );
+                assert!(
+                    (actual_combined - expected_combined).abs() <= 0.002,
+                    "row={row} col={col} actual_combined={actual_combined} expected={expected_combined}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_marlin_repack_hqq8_symmetric_prefill() {
+        let rows = 64;
+        let cols = 128;
+        let group_size = 128;
+        let groups = cols / group_size;
+        let mut packed = vec![0u8; rows * cols];
+        let mut scales = vec![0.0f32; rows * groups];
+        let mut zeros = vec![0.0f32; rows * groups];
+
+        for row in 0..rows {
+            scales[row] = 0.01 + row as f32 * 0.0001;
+            zeros[row] = 120.0 + (row % 7) as f32;
+            for col in 0..cols {
+                packed[row * cols + col] = ((row * 3 + col * 5) % 251) as u8;
+            }
+        }
+
+        let hqq = marlin_repack_hqq8_symmetric_prefill(
+            &packed, &scales, &zeros, rows, cols, group_size,
+        );
+        assert_eq!(hqq.marlin.n, rows);
+        assert_eq!(hqq.marlin.k, cols);
+        assert_eq!(hqq.marlin.scales.len(), rows * groups);
+
+        let deq = dequantize_marlin_int8(&hqq.marlin);
+        let mut mse = 0.0f64;
+        let mut ref_mse = 0.0f64;
+        for row in 0..rows {
+            for col in 0..cols {
+                let expected = (packed[row * cols + col] as f32 - zeros[row]) * scales[row];
+                let err = deq[row * cols + col] - expected;
+                mse += (err as f64) * (err as f64);
+                ref_mse += (expected as f64) * (expected as f64);
+            }
+        }
+        let rel_rmse = (mse / ref_mse).sqrt();
+        assert!(rel_rmse < 0.01, "rel_rmse={rel_rmse}");
+    }
+
+    #[test]
+    fn test_marlin_repack_hqq8_native_zp_prefill_metadata() {
+        let rows = 64;
+        let cols = 128;
+        let group_size = 128;
+        let groups = cols / group_size;
+        let mut packed = vec![0u8; rows * cols];
+        let mut scales = vec![0.0f32; rows * groups];
+        let mut zeros = vec![0.0f32; rows * groups];
+
+        for row in 0..rows {
+            scales[row] = 0.01 + row as f32 * 0.0001;
+            zeros[row] = 120.25 + (row % 7) as f32;
+            for col in 0..cols {
+                packed[row * cols + col] = ((row * 3 + col * 5) % 251) as u8;
+            }
+        }
+
+        let hqq = marlin_repack_hqq8_native_zp_prefill(
+            &packed, &scales, &zeros, rows, cols, group_size,
+        );
+        assert_eq!(hqq.marlin.n, rows);
+        assert_eq!(hqq.marlin.k, cols);
+        assert_eq!(hqq.marlin.scales.len(), rows * groups);
+        assert_eq!(hqq.delta_scales.len(), rows * groups);
+        assert_eq!(hqq.zeros.len(), rows * groups);
+        assert_eq!(hqq.intercept_correction.len(), rows * groups);
+        assert_eq!(hqq.twoscale_intercept_correction.len(), rows * groups);
+        assert!(hqq.zeros.iter().any(|&z| z != 0));
+        assert!(hqq.delta_scales.iter().any(|&s| s != 0));
+        assert!(hqq.intercept_correction.iter().any(|&c| c != 0.0));
+        assert!(hqq.twoscale_intercept_correction.iter().any(|&c| c != 0.0));
     }
 
     #[test]

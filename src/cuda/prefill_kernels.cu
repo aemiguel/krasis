@@ -362,6 +362,87 @@ extern "C" __global__ void hqq8_prefill_gemm_bf16_kernel(
         packed_row_stride_bytes, scales_row_stride_bytes, zeros_row_stride_bytes);
 }
 
+extern "C" __global__ void hqq_prefill_group_sums_bf16_kernel(
+    float* __restrict__ group_sums,
+    const __nv_bfloat16* __restrict__ input,
+    int M,
+    int cols,
+    int group_size,
+    int groups)
+{
+    __shared__ float smem[256];
+    int token = blockIdx.x;
+    int group = blockIdx.y;
+    int tid = threadIdx.x;
+    if (token >= M || group >= groups) return;
+
+    int start = group * group_size;
+    int end = min(start + group_size, cols);
+    float acc = 0.0f;
+    const __nv_bfloat16* x_row = input + (long long)token * cols;
+    for (int col = start + tid; col < end; col += blockDim.x) {
+        acc += bf16_to_float(x_row[col]);
+    }
+    smem[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        group_sums[(long long)token * groups + group] = smem[0];
+    }
+}
+
+extern "C" __global__ void hqq8_marlin_zero_correct_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ delta_out,
+    const float* __restrict__ group_sums,
+    const float* __restrict__ zero_correction,
+    int M,
+    int rows,
+    int groups)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)M * rows;
+    if (idx >= total) return;
+
+    int row = (int)(idx % rows);
+    int token = (int)(idx / rows);
+    float acc = 0.0f;
+    const float* sums = group_sums + (long long)token * groups;
+    const float* corr = zero_correction + (long long)row * groups;
+    for (int g = 0; g < groups; ++g) {
+        acc += sums[g] * corr[g];
+    }
+    __nv_bfloat16 base = out[idx];
+    __nv_bfloat16 delta = delta_out[idx];
+    out[idx] = float_to_bf16(bf16_to_float(base) + bf16_to_float(delta) + acc);
+}
+
+extern "C" __global__ void hqq8_marlin_intercept_correct_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const float* __restrict__ group_sums,
+    const float* __restrict__ intercept_correction,
+    int M,
+    int rows,
+    int groups)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)M * rows;
+    if (idx >= total) return;
+
+    int row = (int)(idx % rows);
+    int token = (int)(idx / rows);
+    float acc = 0.0f;
+    const float* sums = group_sums + (long long)token * groups;
+    const float* corr = intercept_correction + (long long)row * groups;
+    for (int g = 0; g < groups; ++g) {
+        acc += sums[g] * corr[g];
+    }
+    out[idx] = float_to_bf16(bf16_to_float(out[idx]) + acc);
+}
+
 extern "C" __global__ void hqq_prefill_int8_exception_delta_bf16_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ input,
@@ -1393,6 +1474,29 @@ extern "C" __global__ void kv_cache_append_kernel(
     }
 }
 
+extern "C" __global__ void kv_cache_append_bf16_kernel(
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    int M,
+    int kv_stride,
+    int max_seq,
+    int start_pos)
+{
+    int ti = blockIdx.x;
+    int pos = start_pos + ti;
+    if (pos >= max_seq) return;
+
+    int64_t src_off = (int64_t)ti * kv_stride;
+    int64_t dst_off = (int64_t)pos * kv_stride;
+
+    for (int d = threadIdx.x; d < kv_stride; d += blockDim.x) {
+        k_cache[dst_off + d] = k[src_off + d];
+        v_cache[dst_off + d] = v[src_off + d];
+    }
+}
+
 /* ── FP8 KV Cache Dequant + Concat for Cross-Chunk FA2 ─────────────────
  * Dequantizes FP8 E4M3 KV cache [0..cache_len] to BF16, then copies
  * current chunk BF16 K/V [0..m] into [cache_len..cache_len+m].
@@ -1417,6 +1521,32 @@ extern "C" __global__ void kv_cache_dequant_concat_kernel(
         }
     } else {
         /* Copy BF16 from current chunk */
+        int ci = ti - cache_len;
+        if (ci < m) {
+            int64_t src_off = (int64_t)ci * kv_stride;
+            int64_t dst_off = (int64_t)ti * kv_stride;
+            for (int d = threadIdx.x; d < kv_stride; d += blockDim.x) {
+                out[dst_off + d] = kv_new[src_off + d];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void kv_cache_concat_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ kv_cache,
+    const __nv_bfloat16* __restrict__ kv_new,
+    int cache_len,
+    int m,
+    int kv_stride)
+{
+    int ti = blockIdx.x;
+    if (ti < cache_len) {
+        int64_t off = (int64_t)ti * kv_stride;
+        for (int d = threadIdx.x; d < kv_stride; d += blockDim.x) {
+            out[off + d] = kv_cache[off + d];
+        }
+    } else {
         int ci = ti - cache_len;
         if (ci < m) {
             int64_t src_off = (int64_t)ci * kv_stride;

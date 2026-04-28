@@ -1,0 +1,51 @@
+{
+  "phase": "2BV",
+  "date_utc": "2026-04-27",
+  "subject": "HQQ8 native fused fitted-zero accuracy test",
+  "mode": "KRASIS_HQQ8_PREFILL_MODE=native-fused-marlin",
+  "change_tested": {
+    "description": "Fit BF16 zero metadata as zero_f32 * scale_f32 / scale_bf16_effective so Marlin's float-zero-point path preserves the HQQ intercept more closely.",
+    "retained": false,
+    "reason_not_retained": "The witness gate regressed recurrent decode accuracy despite lower first-token selected-logprob delta."
+  },
+  "commands": {
+    "build_before_gate": "./dev build",
+    "witness_gate": "KRASIS_HQQ8_PREFILL_MODE=native-fused-marlin ./dev witness-compare logs/manual/phase2bm_qcn_accuracy_hqq8_20260426.conf --profile phase2bn_qcn_64tok",
+    "restore_build": "./dev build"
+  },
+  "runs": {
+    "fitted_zero_witness": "logs/reference-test_20260427_232502",
+    "previous_native_fused_witness": "logs/reference-test_20260427_225530",
+    "residual_marlin_witness": "logs/reference-test_20260427_214956"
+  },
+  "metrics": {
+    "residual_marlin_hqq8": {
+      "first_token": "14/14",
+      "prefill_argmax": "14/14",
+      "avg_exact_prefix": 15.79,
+      "worst_exact_prefix": 1,
+      "full_matches": "4/14",
+      "decode_containment": "285/653",
+      "selected_logprob_delta_sum": 0.354102521143
+    },
+    "native_fused_hqq8_before_fit": {
+      "first_token": "14/14",
+      "prefill_argmax": "14/14",
+      "avg_exact_prefix": 14.29,
+      "worst_exact_prefix": 1,
+      "full_matches": "5/14",
+      "decode_containment": "262/653",
+      "selected_logprob_delta_sum": 0.081758249973
+    },
+    "native_fused_hqq8_fitted_zero": {
+      "first_token": "14/14",
+      "prefill_argmax": "14/14",
+      "avg_exact_prefix": 9.57,
+      "worst_exact_prefix": 1,
+      "full_matches": "4/14",
+      "decode_containment": "186/653",
+      "selected_logprob_delta_sum": 0.049697407994
+    }
+  },
+  "decision": "No speed benchmark was run because accuracy did not improve. The fitted-zero code was reverted and the local extension was rebuilt."
+}

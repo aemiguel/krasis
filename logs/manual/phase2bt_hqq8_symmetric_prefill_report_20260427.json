@@ -1,0 +1,43 @@
+{
+  "phase": "2BT",
+  "date": "2026-04-27",
+  "model": "Qwen3-Coder-Next",
+  "experiment": "hqq8_symmetric_marlin_prefill",
+  "env": {
+    "KRASIS_HQQ8_PREFILL_MODE": "symmetric-marlin"
+  },
+  "command": "KRASIS_HQQ8_PREFILL_MODE=symmetric-marlin ./dev witness-compare logs/manual/phase2bm_qcn_accuracy_hqq8_20260426.conf --profile phase2bn_qcn_64tok",
+  "run_dir": "logs/reference-test_20260427_223238",
+  "baseline": {
+    "name": "residual Marlin HQQ8",
+    "run_dir": "logs/reference-test_20260427_214956",
+    "first_token": "14/14",
+    "prefill_argmax": "14/14",
+    "avg_exact_prefix": 15.79,
+    "worst_exact_prefix": 1,
+    "full_matches": "4/14",
+    "decode_topk_hits": 285,
+    "decode_topk_total": 653,
+    "decode_topk_rate": 0.436,
+    "selected_logprob_abs_sum": 0.354103,
+    "hcs_experts": "7216/24576"
+  },
+  "result": {
+    "overall": "PASS",
+    "first_token": "14/14",
+    "prefill_argmax": "14/14",
+    "avg_exact_prefix": 11.71,
+    "worst_exact_prefix": 1,
+    "full_matches": "4/14",
+    "decode_topk_hits": 230,
+    "decode_topk_total": 653,
+    "decode_topk_rate": 0.352,
+    "selected_logprob_abs_sum": 0.163842,
+    "hcs_experts": "7216/24576"
+  },
+  "exact_prefix_runs": {
+    "residual_marlin_hqq8": [12, 14, 15, 9, 11, 11, 1, 34, 29, 6, 46, 11, 15, 7],
+    "symmetric_marlin_hqq8": [12, 4, 24, 9, 11, 11, 1, 17, 29, 6, 10, 8, 15, 7]
+  },
+  "conclusion": "First-token and prefill argmax held, but recurrent exact-prefix and decode top-k quality regressed versus residual Marlin HQQ8. Do not treat simple HQQ8-to-symmetric-Marlin conversion as production quality without calibration/self-correction."
+}

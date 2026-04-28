@@ -1,0 +1,71 @@
+{
+  "phase": "2CK",
+  "date_utc": "2026-04-28",
+  "purpose": "Test whether preserving QCN linear-attention recurrent output as FP32 through the LA output projection improves free-running exact-prefix accuracy.",
+  "mode": {
+    "config": "tests/qcn-bf16kv-a16-fp32laout-accuracy.conf",
+    "env": {
+      "KRASIS_LA_FP32_OUT_PROJ": "1"
+    },
+    "kv_dtype": "bf16",
+    "attention_quant": "bf16",
+    "expert_quant": "int8",
+    "lm_head_quant": "int8"
+  },
+  "implementation": {
+    "kernels_added": [
+      "la_fused_post_proj_f32",
+      "gemv_bf16_weight_f32_input_bf16"
+    ],
+    "notes": [
+      "The first run failed before witness rows because cuBLAS rejected the BF16-weight/F32-input/BF16-output GEMV shape.",
+      "The rerun used a custom debug CUDA GEMV to keep the attribution contract intact.",
+      "The mode errors for HQQ/Marlin LA out_proj because those paths consume BF16 activations and would not test FP32-through-out-proj."
+    ]
+  },
+  "runs": {
+    "failed_cublas_probe": {
+      "run_dir": "logs/reference-test_20260428_132449",
+      "result": "failed during heatmap before witness rows",
+      "error": "CUBLAS_STATUS_NOT_SUPPORTED for mixed BF16-weight/F32-input/BF16-output GEMV"
+    },
+    "valid_fp32laout": {
+      "run_dir": "logs/reference-test_20260428_133056",
+      "summary": "logs/reference-test_20260428_133056/reference_test_summary.json",
+      "result": "REFERENCE TEST: PASS",
+      "first_token": "14/14",
+      "prefill_argmax": "14/14",
+      "avg_exact_prefix": 12.2143,
+      "total_exact_prefix": "171/653",
+      "full_matches": "4/14",
+      "decode_containment": "293/647",
+      "avg_abs_selected_logprob_delta": 0.006070906674
+    }
+  },
+  "comparison": [
+    {
+      "name": "BF16 attention + BF16 KV baseline",
+      "run_dir": "logs/reference-test_20260428_080508",
+      "avg_exact_prefix": 18.7857,
+      "total_exact_prefix": "263/653",
+      "full_matches": "5/14",
+      "decode_containment": "338/653"
+    },
+    {
+      "name": "FP32 LA out-proj debug mode",
+      "run_dir": "logs/reference-test_20260428_133056",
+      "avg_exact_prefix": 12.2143,
+      "total_exact_prefix": "171/653",
+      "full_matches": "4/14",
+      "decode_containment": "293/647"
+    },
+    {
+      "name": "llama Q8_0 default",
+      "run_dir": "krasis-internal/reference-outputs/output/Qwen3-Coder-Next/phase2bz_qcn_llama_q8_64tok.json",
+      "avg_exact_prefix": 37.5,
+      "total_exact_prefix": "525/653",
+      "full_matches": "11/14"
+    }
+  ],
+  "decision": "Do not run speed. Preserving FP32 through the LA output projection worsened exact-prefix accuracy and is not the missing llama Q8 behavior."
+}

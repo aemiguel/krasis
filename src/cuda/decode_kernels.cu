@@ -1643,6 +1643,22 @@ extern "C" __global__ void kv_cache_write(
     }
 }
 
+// Write K,V to BF16 KV cache at given position.
+extern "C" __global__ void kv_cache_write_bf16(
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int position,
+    int kv_stride
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < kv_stride) {
+        k_cache[position * kv_stride + i] = f32_to_bf16(k[i]);
+        v_cache[position * kv_stride + i] = f32_to_bf16(v[i]);
+    }
+}
+
 // Single-query GQA attention: scores over all cached K, softmax, weighted V sum.
 // One block per Q head. KV cache is FP8 E4M3 — dequantized to FP32 on the fly.
 //
@@ -1848,6 +1864,166 @@ extern "C" __global__ void gqa_attention(
     }
 }
 
+extern "C" __global__ void gqa_attention_bf16(
+    float* __restrict__ output,
+    const float* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int max_seq,
+    int use_smem
+) {
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    const float* q_head = q + qh * head_dim;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + (use_smem ? seq_len : 0);
+
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    if (use_smem) {
+        for (int pos = tid; pos < seq_len; pos += num_threads) {
+            float score = 0.0f;
+            const __nv_bfloat16* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                score += s_q[d] * bf16_to_f32(k_vec[d]);
+            }
+            smem_scores[pos] = score * sm_scale;
+        }
+        __syncthreads();
+
+        float local_max = -1e30f;
+        for (int pos = tid; pos < seq_len; pos += num_threads) {
+            local_max = fmaxf(local_max, smem_scores[pos]);
+        }
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+        }
+        if (lane_id == 0) smem_reduce[warp_id] = local_max;
+        __syncthreads();
+        if (tid == 0) {
+            float gmax = smem_reduce[0];
+            for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+            smem_reduce[0] = gmax;
+        }
+        __syncthreads();
+        float global_max = smem_reduce[0];
+
+        float local_sum = 0.0f;
+        for (int pos = tid; pos < seq_len; pos += num_threads) {
+            float w = __expf(smem_scores[pos] - global_max);
+            smem_scores[pos] = w;
+            local_sum += w;
+        }
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+        }
+        if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+        __syncthreads();
+        if (tid == 0) {
+            float gsum = 0.0f;
+            for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+            smem_reduce[0] = gsum;
+        }
+        __syncthreads();
+        float inv_sum = 1.0f / smem_reduce[0];
+
+        for (int pos = tid; pos < seq_len; pos += num_threads) {
+            smem_scores[pos] *= inv_sum;
+        }
+        __syncthreads();
+
+        float* out_head = output + qh * head_dim;
+        for (int d = tid; d < head_dim; d += num_threads) {
+            float acc = 0.0f;
+            for (int pos = 0; pos < seq_len; pos++) {
+                acc += smem_scores[pos] *
+                    bf16_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
+            }
+            out_head[d] = acc;
+        }
+    } else {
+        float local_max = -1e30f;
+        float local_sum = 0.0f;
+        for (int pos = tid; pos < seq_len; pos += num_threads) {
+            float score = 0.0f;
+            const __nv_bfloat16* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                score += s_q[d] * bf16_to_f32(k_vec[d]);
+            }
+            score *= sm_scale;
+            if (score > local_max) {
+                local_sum *= __expf(local_max - score);
+                local_max = score;
+            }
+            local_sum += __expf(score - local_max);
+        }
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            float other_max = __shfl_down_sync(0xffffffff, local_max, offset);
+            float other_sum = __shfl_down_sync(0xffffffff, local_sum, offset);
+            float new_max = fmaxf(local_max, other_max);
+            local_sum = local_sum * __expf(local_max - new_max) + other_sum * __expf(other_max - new_max);
+            local_max = new_max;
+        }
+        if (lane_id == 0) {
+            smem_reduce[warp_id] = local_max;
+            smem_reduce[warp_id + 16] = local_sum;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float gmax = smem_reduce[0];
+            float gsum = smem_reduce[16];
+            for (int w = 1; w < num_warps; w++) {
+                float wm = smem_reduce[w];
+                float ws = smem_reduce[w + 16];
+                float new_max = fmaxf(gmax, wm);
+                gsum = gsum * __expf(gmax - new_max) + ws * __expf(wm - new_max);
+                gmax = new_max;
+            }
+            smem_reduce[0] = gmax;
+            smem_reduce[16] = gsum;
+        }
+        __syncthreads();
+        float global_max = smem_reduce[0];
+        float inv_sum = 1.0f / smem_reduce[16];
+
+        float* out_head = output + qh * head_dim;
+        for (int d = tid; d < head_dim; d += num_threads) {
+            float acc = 0.0f;
+            for (int pos = 0; pos < seq_len; pos++) {
+                float score = 0.0f;
+                const __nv_bfloat16* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+                for (int dd = 0; dd < head_dim; dd++) {
+                    score += s_q[dd] * bf16_to_f32(k_vec[dd]);
+                }
+                float weight = __expf(score * sm_scale - global_max) * inv_sum;
+                acc += weight * bf16_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
+            }
+            out_head[d] = acc;
+        }
+    }
+}
+
 // ── FlashDecoding-style tiled GQA attention ───────────────────────────
 //
 // Splits the sequence dimension across grid.y blocks for massive SM
@@ -1984,6 +2160,112 @@ extern "C" __global__ void gqa_attention_tiled(
     }
 
     // ── Step 5: Store tile statistics ──
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * num_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
+    }
+}
+
+extern "C" __global__ void gqa_attention_tiled_bf16(
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_lse,
+    const float* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int tile_size
+) {
+    int qh = blockIdx.x;
+    int tile_idx = blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (qh >= num_q_heads || tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    const float* q_head = q + qh * head_dim;
+    int tile_start = tile_idx * tile_size;
+    int tile_end = tile_start + tile_size;
+    if (tile_end > seq_len) tile_end = seq_len;
+    int tile_len = tile_end - tile_start;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        float score = 0.0f;
+        const __nv_bfloat16* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        for (int d = 0; d < head_dim; d++) {
+            score += s_q[d] * bf16_to_f32(k_vec[d]);
+        }
+        smem_scores[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem_scores[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = __expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    float* out_partial = partial_o + (qh * num_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int i = 0; i < tile_len; i++) {
+            acc += smem_scores[i] *
+                bf16_to_f32(v_cache[(tile_start + i) * kv_stride + kv_head * head_dim + d]);
+        }
+        out_partial[d] = acc;
+    }
+
     if (tid == 0) {
         float* lse = partial_lse + (qh * num_tiles + tile_idx) * 2;
         lse[0] = tile_max;
@@ -2142,6 +2424,39 @@ extern "C" __global__ void fp32_to_bf16(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) {
         output[i] = f32_to_bf16(input[i]);
+    }
+}
+
+extern "C" __global__ void gemv_bf16_weight_f32_input_bf16(
+    const __nv_bfloat16* __restrict__ weight,
+    const float* __restrict__ input,
+    unsigned short* __restrict__ output,
+    int rows,
+    int cols
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int tid = threadIdx.x;
+    extern __shared__ float smem[];
+    float acc = 0.0f;
+    const __nv_bfloat16* w_row = weight + row * cols;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        acc += bf16_to_f32(w_row[col]) * input[col];
+    }
+    smem[tid] = acc;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        __nv_bfloat16 result = __float2bfloat16(smem[0]);
+        output[row] = *reinterpret_cast<unsigned short*>(&result);
     }
 }
 
@@ -4181,6 +4496,22 @@ extern "C" __global__ void kv_cache_write_g(
     }
 }
 
+extern "C" __global__ void kv_cache_write_bf16_g(
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const int* __restrict__ d_position,
+    int kv_stride
+) {
+    int position = *d_position;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < kv_stride) {
+        k_cache[position * kv_stride + i] = f32_to_bf16(k[i]);
+        v_cache[position * kv_stride + i] = f32_to_bf16(v[i]);
+    }
+}
+
 // GQA attention variant for CUDA graph capture.
 // Tiled 3-pass: (1) find max, (2) compute weights + V accumulation in tiles.
 // Weights are computed once per position and stored in shared memory,
@@ -4598,6 +4929,114 @@ extern "C" __global__ void gqa_attention_tiled_g(
     }
 
     // Step 5: Store tile statistics
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * max_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
+    }
+}
+
+extern "C" __global__ void gqa_attention_tiled_bf16_g(
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_lse,
+    const float* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int tile_size,
+    int max_tiles
+) {
+    int seq_len = *d_seq_len;
+    int qh = blockIdx.x;
+    int tile_idx = (int)blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (qh >= num_q_heads || tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    const float* q_head = q + qh * head_dim;
+    int tile_start = tile_idx * tile_size;
+    int tile_end = tile_start + tile_size;
+    if (tile_end > seq_len) tile_end = seq_len;
+    int tile_len = tile_end - tile_start;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        float score = 0.0f;
+        const __nv_bfloat16* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        for (int d = 0; d < head_dim; d++) {
+            score += s_q[d] * bf16_to_f32(k_vec[d]);
+        }
+        smem_scores[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem_scores[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = __expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int i = 0; i < tile_len; i++) {
+            acc += smem_scores[i] *
+                bf16_to_f32(v_cache[(tile_start + i) * kv_stride + kv_head * head_dim + d]);
+        }
+        out_partial[d] = acc;
+    }
+
     if (tid == 0) {
         float* lse = partial_lse + (qh * max_tiles + tile_idx) * 2;
         lse[0] = tile_max;
@@ -5628,6 +6067,144 @@ extern "C" __global__ void la_fused_post_proj(
         float silu_z = zv / (1.0f + __expf(-zv));
         __nv_bfloat16 result = __float2bfloat16(silu_z * normed);
         out_h[i] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
+extern "C" __global__ void la_fused_post_proj_f32(
+    float* __restrict__ state,             // [nv, dk, dv] in/out (recurrence state)
+    const float* __restrict__ q_in,        // [nk * dk]
+    const float* __restrict__ k_in,        // [nk * dk]
+    const float* __restrict__ v_in,        // [nv * dv]
+    const float* __restrict__ gate,        // [nv]
+    const float* __restrict__ beta,        // [nv]
+    const float* __restrict__ z,           // [nv * dv]
+    const float* __restrict__ norm_weight, // [dv]
+    float* __restrict__ f32_out,           // [nv * dv] FP32 output
+    float q_scale,
+    float eps,
+    long long dims_packed
+) {
+    int nv_dk = (int)(dims_packed >> 32);
+    int dv_ratio = (int)(dims_packed & 0xFFFFFFFF);
+    int nv = (nv_dk >> 16) & 0xFFFF;
+    int dk = nv_dk & 0xFFFF;
+    int dv = (dv_ratio >> 16) & 0xFFFF;
+    int ratio = dv_ratio & 0xFFFF;
+
+    int head = blockIdx.x;
+    if (head >= nv) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* s_k = smem + dk;
+    float* s_scratch = smem + 2 * dk;
+
+    int in_head = head / ratio;
+    for (int i = tid; i < dk; i += num_threads) {
+        s_q[i] = q_in[in_head * dk + i];
+        s_k[i] = k_in[in_head * dk + i];
+    }
+    __syncthreads();
+
+    float sum_sq_q = 0.0f;
+    float sum_sq_k = 0.0f;
+    for (int i = tid; i < dk; i += num_threads) {
+        sum_sq_q += s_q[i] * s_q[i];
+        sum_sq_k += s_k[i] * s_k[i];
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq_q += __shfl_down_sync(0xffffffff, sum_sq_q, offset);
+        sum_sq_k += __shfl_down_sync(0xffffffff, sum_sq_k, offset);
+    }
+
+    __shared__ float warp_sums_q[32];
+    __shared__ float warp_sums_k[32];
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    if (lane_id == 0) {
+        warp_sums_q[warp_id] = sum_sq_q;
+        warp_sums_k[warp_id] = sum_sq_k;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float total_q = 0.0f;
+        float total_k = 0.0f;
+        int num_warps = (num_threads + warpSize - 1) / warpSize;
+        for (int w = 0; w < num_warps; w++) {
+            total_q += warp_sums_q[w];
+            total_k += warp_sums_k[w];
+        }
+        warp_sums_q[0] = rsqrtf(total_q + 1e-12f) * q_scale;
+        warp_sums_k[0] = rsqrtf(total_k + 1e-12f);
+    }
+    __syncthreads();
+
+    float norm_q = warp_sums_q[0];
+    float norm_k = warp_sums_k[0];
+    for (int i = tid; i < dk; i += num_threads) {
+        s_q[i] *= norm_q;
+        s_k[i] *= norm_k;
+    }
+    __syncthreads();
+
+    float g = gate[head];
+    float b = beta[head];
+    int mat_size = dk * dv;
+    float* S = state + head * mat_size;
+    const float* v_h = v_in + head * dv;
+
+    for (int idx = tid; idx < mat_size; idx += num_threads) {
+        S[idx] *= g;
+    }
+    __syncthreads();
+
+    for (int j = tid; j < dv; j += num_threads) {
+        float kv_mem = 0.0f;
+        for (int i = 0; i < dk; i++) {
+            kv_mem += S[i * dv + j] * s_k[i];
+        }
+        float delta = (v_h[j] - kv_mem) * b;
+        for (int i = 0; i < dk; i++) {
+            S[i * dv + j] += s_k[i] * delta;
+        }
+        float acc = 0.0f;
+        for (int i = 0; i < dk; i++) {
+            acc += s_q[i] * S[i * dv + j];
+        }
+        s_scratch[j] = acc;
+    }
+    __syncthreads();
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dv; i += num_threads) {
+        sum_sq += s_scratch[i] * s_scratch[i];
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+    if (lane_id == 0) warp_sums_q[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        int num_warps = (num_threads + warpSize - 1) / warpSize;
+        for (int w = 0; w < num_warps; w++) total += warp_sums_q[w];
+        warp_sums_q[0] = rsqrtf(total / (float)dv + eps);
+    }
+    __syncthreads();
+    float rms_scale = warp_sums_q[0];
+
+    const float* z_h = z + head * dv;
+    float* out_h = f32_out + head * dv;
+    for (int i = tid; i < dv; i += num_threads) {
+        float normed = s_scratch[i] * rms_scale * norm_weight[i];
+        float zv = z_h[i];
+        float silu_z = zv / (1.0f + __expf(-zv));
+        out_h[i] = silu_z * normed;
     }
 }
 

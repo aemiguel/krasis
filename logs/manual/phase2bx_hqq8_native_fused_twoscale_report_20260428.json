@@ -1,0 +1,39 @@
+{
+  "phase": "phase2bx",
+  "date_utc": "2026-04-28",
+  "mode": "native-fused-marlin-twoscale",
+  "command": "KRASIS_HQQ8_PREFILL_MODE=native-fused-marlin-twoscale ./dev witness-compare logs/manual/phase2bm_qcn_accuracy_hqq8_20260426.conf --profile phase2bn_qcn_64tok",
+  "run_dir": "logs/reference-test_20260428_004043",
+  "result": "mixed_negative",
+  "summary": {
+    "first_token": "14/14",
+    "prefill_argmax": "14/14",
+    "avg_exact_prefix": 13.57,
+    "worst_exact_prefix": 1,
+    "full_matches": "0/14",
+    "decode_containment": "294/653",
+    "selected_logprob_delta_sum": 0.12101902834
+  },
+  "comparisons": {
+    "residual_marlin_hqq8": {
+      "avg_exact_prefix": 15.79,
+      "decode_containment": "285/653",
+      "selected_logprob_delta_sum": 0.354102521143
+    },
+    "native_fused_v1": {
+      "avg_exact_prefix": 14.29,
+      "decode_containment": "262/653",
+      "selected_logprob_delta_sum": 0.081758249973
+    },
+    "native_fused_v2": {
+      "avg_exact_prefix": 11.21,
+      "decode_containment": "265/650",
+      "selected_logprob_delta_sum": 0.11729101972
+    }
+  },
+  "decision": "No speed benchmark run because avg exact-prefix did not improve over native fused v1 or residual Marlin, despite better decode containment.",
+  "notes": [
+    "Two-scale mode uses one Marlin BF16 U8 float-zp kernel launch with a second BF16 residual scale plane contributing to the same FP32 accumulator before final BF16 output.",
+    "The experiment restores slope fidelity relative to v2, but still uses BF16 zero points and does not recover recurrent exact-prefix stability."
+  ]
+}

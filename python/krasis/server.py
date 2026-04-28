@@ -594,6 +594,7 @@ def main():
             "CFG_LAYER_GROUP_SIZE": "layer_group_size",
             "CFG_KV_DTYPE": "kv_dtype",
             "CFG_GPU_EXPERT_BITS": "gpu_expert_bits",
+            "CFG_EXPERT_GROUP_SIZE": "expert_group_size",
             "CFG_GPU_EXPERT_INT4_CALIB": "gpu_expert_int4_calib",
             "CFG_CPU_EXPERT_BITS": "cpu_expert_bits",
             "CFG_ATTENTION_QUANT": "attention_quant",
@@ -702,6 +703,8 @@ def main():
                         help="Path to expert_heatmap.json for HCS init")
     parser.add_argument("--gpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Marlin quantization bits for GPU prefill experts")
+    parser.add_argument("--expert-group-size", type=int, default=128, choices=[32, 64, 128],
+                        help="Expert quantization group size for routed GPU/CPU expert caches")
     parser.add_argument("--gpu-expert-int4-calib", default="amax", choices=list(GPU_EXPERT_INT4_CALIB_CHOICES),
                         help="Offline calibration mode for GPU routed-expert INT4 cache build")
     parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
@@ -899,6 +902,7 @@ def main():
         shared_expert=args.shared_expert_quant,
         dense_mlp=args.dense_mlp_quant,
         gpu_expert_bits=args.gpu_expert_bits,
+        expert_group_size=args.expert_group_size,
         gpu_expert_int4_calib=args.gpu_expert_int4_calib,
         cpu_expert_bits=args.cpu_expert_bits,
         kv_cache_format=args.kv_dtype,
@@ -933,7 +937,7 @@ def main():
             f"Selected physical GPUs: {args.selected_gpus} "
             f"({args.selected_gpus_source}; CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')})"
         )
-    expert_detail = f"Experts: GPU INT{args.gpu_expert_bits}"
+    expert_detail = f"Experts: GPU INT{args.gpu_expert_bits} g{args.expert_group_size}"
     if args.gpu_expert_bits == 4:
         expert_detail += f" ({args.gpu_expert_int4_calib})"
     _detail(f"{expert_detail}  |  Attention: {args.attention_quant}  |  KV: {args.kv_dtype}")
@@ -1694,6 +1698,7 @@ def main():
         config = {
             "model_path": args.model_path,
             "gpu_expert_bits": args.gpu_expert_bits,
+            "expert_group_size": args.expert_group_size,
             "gpu_expert_int4_calib": args.gpu_expert_int4_calib,
             "cpu_expert_bits": args.cpu_expert_bits,
             "attention_quant": args.attention_quant,

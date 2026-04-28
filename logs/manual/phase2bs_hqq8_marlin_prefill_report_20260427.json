@@ -1,0 +1,54 @@
+{
+  "phase": "Phase 2BS",
+  "date_utc": "2026-04-27",
+  "scope": "HQQ8 Marlin-class prefill prototype for QCN Polar4 speed-test surface",
+  "implementation": {
+    "prefill_format": "marlin_u8b128_zero_correction_axis1_grouped_uint8",
+    "packed_term": "(q - 128) * scale_bf16 via Marlin U8B128",
+    "residual_term": "(q - 128) * bf16(scale_fp32 - scale_bf16) via second Marlin pass",
+    "zero_correction": "sum(input_group) * (128 - zero) * scale_fp32",
+    "scratch_policy": "reuse existing large non-overlapping attention/MoE scratch buffers; no new VRAM allocation"
+  },
+  "correctness": {
+    "command": "./dev witness-compare logs/manual/phase2bm_qcn_accuracy_hqq8_20260426.conf --profile phase2bn_qcn_64tok",
+    "summary": "logs/reference-test_20260427_214956/reference_test_summary.json",
+    "first_token": "14/14",
+    "prefill": "14/14 argmax, 14/14 top10",
+    "avg_exact_prefix": 15.785714285714286,
+    "worst_exact_prefix": 1,
+    "full_matches": "4/14",
+    "decode_topk": 0.572,
+    "match_runs": [12, 14, 15, 9, 11, 11, 1, 34, 29, 6, 46, 11, 15, 7],
+    "comparison": {
+      "previous_fixed_hqq8_avg_exact_prefix": 16.428571428571427,
+      "previous_fixed_hqq8_worst": 2,
+      "awq_control_avg_exact_prefix": 14.571428571428571
+    }
+  },
+  "speed": {
+    "command": "./dev benchmark tests/qcn-polar4-hqq8.conf",
+    "log": "benchmarks/20260427_215803_qcn_polar4_hqq8_fastprefill_speed.log",
+    "report": "logs/dev-benchmark_20260427_215803/benchmark_report.log",
+    "hqq8_marlin_prefill": {
+      "prefill_tok_s": 5011.6,
+      "decode_tok_s": 79.8,
+      "hcs": "14256/24576 (58.0%)",
+      "min_free_vram_mb": 734
+    },
+    "hqq8_scalar_prefill": {
+      "prefill_tok_s": 486.8,
+      "decode_tok_s": 75.16,
+      "hcs": "14256/24576 (58.0%)",
+      "min_free_vram_mb": 734
+    },
+    "awq_polar4_baseline": {
+      "prefill_tok_s": 7295.6,
+      "decode_tok_s": 91.77,
+      "hcs": "16848/24576 (68.6%)",
+      "min_free_vram_mb": 688
+    },
+    "speedup_vs_hqq8_scalar_prefill": 10.294165982,
+    "prefill_fraction_of_awq": 0.686936779
+  },
+  "conclusion": "The Marlin-class HQQ8 prefill architecture is validated as the right performance direction, but the prototype still has a residual quality gap versus previous fixed HQQ8 and should not be treated as final default behavior yet."
+}

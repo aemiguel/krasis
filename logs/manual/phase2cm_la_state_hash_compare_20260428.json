@@ -1,0 +1,2368 @@
+{
+  "nograph_step4_start__vs__teacher_decode_start": {
+    "same": 0,
+    "mismatches": 72,
+    "missing": 0,
+    "keys_a": 72,
+    "keys_b": 72,
+    "first_mismatches": [
+      {
+        "layer": 0,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "1be8df1561d291aa",
+          "l2": 417.761082,
+          "mean": -0.000894,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "404fe7e7d54e9ea1",
+          "l2": 417.771311,
+          "mean": -0.000919,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 0,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "af8be7bb06a5a31f",
+          "l2": 20.896675,
+          "mean": 0.002346,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "a91d4d8d53529944",
+          "l2": 20.897376,
+          "mean": 0.002346,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 1,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "95891acfc4ebe34b",
+          "l2": 203.878137,
+          "mean": 0.003956,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "ac1310919a75cc81",
+          "l2": 203.832453,
+          "mean": 0.003957,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 1,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "489365c83d50e9ff",
+          "l2": 5.717392,
+          "mean": -7e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "6c459d77a1972edd",
+          "l2": 5.718634,
+          "mean": -8e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "fa47c78f381ce4a6",
+          "l2": 204.39569,
+          "mean": 0.00087,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "33199e82ccd10ccf",
+          "l2": 204.265206,
+          "mean": 0.000874,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "5a572875d10c17cd",
+          "l2": 5.248557,
+          "mean": 1.4e-05,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "8a0566b61db2d033",
+          "l2": 5.241219,
+          "mean": 1.4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "006b016a881923f7",
+          "l2": 184.894343,
+          "mean": 0.008985,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "840ea7f7a9ccb3a6",
+          "l2": 184.91931,
+          "mean": 0.008969,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "4f2c9d8bced282c4",
+          "l2": 3.748166,
+          "mean": -1e-05,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "e90dc5a2ed205047",
+          "l2": 3.748962,
+          "mean": -1e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "828996be17c6aabc",
+          "l2": 186.524538,
+          "mean": -0.000176,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "39f1b388826a7196",
+          "l2": 186.414638,
+          "mean": -0.000167,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "255597866e5b8c4c",
+          "l2": 5.051654,
+          "mean": 4e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "5ee81fb8cc7f6655",
+          "l2": 5.051092,
+          "mean": 4e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "09d28429b568e956",
+          "l2": 197.96943,
+          "mean": -0.005052,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "1d8968894d4972d8",
+          "l2": 197.9885,
+          "mean": -0.005088,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "76e265e8cc0a8579",
+          "l2": 3.371735,
+          "mean": 2e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "e42f47ca74215df1",
+          "l2": 3.368804,
+          "mean": 2e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "561f5affe6de7080",
+          "l2": 250.46558,
+          "mean": 0.018454,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "ac8334a344bb4c06",
+          "l2": 250.525668,
+          "mean": 0.018456,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "bb440288e1e4ef15",
+          "l2": 6.089589,
+          "mean": 9e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "b40169d827881660",
+          "l2": 6.088642,
+          "mean": 8e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "c8f14c7dc34ad13e",
+          "l2": 271.314991,
+          "mean": 0.016831,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "621b5a1a643992e0",
+          "l2": 271.405871,
+          "mean": 0.016761,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "12d6397196dec6b7",
+          "l2": 6.815266,
+          "mean": 3e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "861d93ec4ada54bb",
+          "l2": 6.814965,
+          "mean": 4e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "feff7fa7e534ad51",
+          "l2": 251.979001,
+          "mean": 0.016982,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "0bb3b3156bea0269",
+          "l2": 252.154051,
+          "mean": 0.01704,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "9c766255b0b08ad0",
+          "l2": 6.616887,
+          "mean": 4.4e-05,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "87b578f1353a662b",
+          "l2": 6.620592,
+          "mean": 4.4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "6f1878dff6341258",
+          "l2": 239.841909,
+          "mean": -0.001705,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "668c998b2a7d2802",
+          "l2": 239.763658,
+          "mean": -0.001675,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "44f5278bd5c8ee0c",
+          "l2": 6.535326,
+          "mean": 7.7e-05,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "cfa342efef57907a",
+          "l2": 6.531091,
+          "mean": 7.7e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "b71057f049258a65",
+          "l2": 258.920535,
+          "mean": 0.008953,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "06232af31467168c",
+          "l2": 258.943439,
+          "mean": 0.008923,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "9027f121f291183c",
+          "l2": 5.248301,
+          "mean": 0.0,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "ef6ab025c372f7a7",
+          "l2": 5.243873,
+          "mean": 0.0,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "c646b8d769c3f546",
+          "l2": 256.568121,
+          "mean": -0.006763,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "beb131255f4974da",
+          "l2": 256.796684,
+          "mean": -0.00686,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "b2d6a728fc6e6111",
+          "l2": 6.905433,
+          "mean": 1.8e-05,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "e5f8b5e50878c109",
+          "l2": 6.901676,
+          "mean": 1.8e-05,
+          "tok": 1959
+        }
+      }
+    ]
+  },
+  "graph_step4_start__vs__teacher_decode_start": {
+    "same": 0,
+    "mismatches": 72,
+    "missing": 0,
+    "keys_a": 72,
+    "keys_b": 72,
+    "first_mismatches": [
+      {
+        "layer": 0,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "1be8df1561d291aa",
+          "l2": 417.761082,
+          "mean": -0.000894,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "404fe7e7d54e9ea1",
+          "l2": 417.771311,
+          "mean": -0.000919,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 0,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "af8be7bb06a5a31f",
+          "l2": 20.896675,
+          "mean": 0.002346,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "a91d4d8d53529944",
+          "l2": 20.897376,
+          "mean": 0.002346,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 1,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "72073a60cb4e3f06",
+          "l2": 198.518974,
+          "mean": 0.004481,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "ac1310919a75cc81",
+          "l2": 203.832453,
+          "mean": 0.003957,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 1,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "61b5ef07158dfe0e",
+          "l2": 5.635612,
+          "mean": -8e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "6c459d77a1972edd",
+          "l2": 5.718634,
+          "mean": -8e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "8ad032003067844a",
+          "l2": 200.32653,
+          "mean": 0.001941,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "33199e82ccd10ccf",
+          "l2": 204.265206,
+          "mean": 0.000874,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "b6fe1124be0e57e5",
+          "l2": 5.06515,
+          "mean": 1.5e-05,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "8a0566b61db2d033",
+          "l2": 5.241219,
+          "mean": 1.4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "eee9f44e44362a04",
+          "l2": 184.25364,
+          "mean": 0.007885,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "840ea7f7a9ccb3a6",
+          "l2": 184.91931,
+          "mean": 0.008969,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "19fa2f0d3c9fa4c8",
+          "l2": 3.676115,
+          "mean": -7e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "e90dc5a2ed205047",
+          "l2": 3.748962,
+          "mean": -1e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "f58039106578bea2",
+          "l2": 186.113847,
+          "mean": 0.00024,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "39f1b388826a7196",
+          "l2": 186.414638,
+          "mean": -0.000167,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "6302fe0b37bf3c5b",
+          "l2": 5.023735,
+          "mean": 4e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "5ee81fb8cc7f6655",
+          "l2": 5.051092,
+          "mean": 4e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "c91ea748496419e3",
+          "l2": 197.384042,
+          "mean": -0.005069,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "1d8968894d4972d8",
+          "l2": 197.9885,
+          "mean": -0.005088,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "09b0e17d175c2fa3",
+          "l2": 3.356676,
+          "mean": 3e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "e42f47ca74215df1",
+          "l2": 3.368804,
+          "mean": 2e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "269ef00001fc353d",
+          "l2": 250.046148,
+          "mean": 0.020061,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "ac8334a344bb4c06",
+          "l2": 250.525668,
+          "mean": 0.018456,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "5f1265a4d76c3262",
+          "l2": 6.075758,
+          "mean": 8e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "b40169d827881660",
+          "l2": 6.088642,
+          "mean": 8e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "07ffffea6cde67e2",
+          "l2": 272.971862,
+          "mean": 0.016665,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "621b5a1a643992e0",
+          "l2": 271.405871,
+          "mean": 0.016761,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "5608950c429299b3",
+          "l2": 6.85221,
+          "mean": 3e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "861d93ec4ada54bb",
+          "l2": 6.814965,
+          "mean": 4e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "61c04739e02a3030",
+          "l2": 252.127354,
+          "mean": 0.016408,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "0bb3b3156bea0269",
+          "l2": 252.154051,
+          "mean": 0.01704,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "680d9caede0a0a9a",
+          "l2": 6.625461,
+          "mean": 4.3e-05,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "87b578f1353a662b",
+          "l2": 6.620592,
+          "mean": 4.4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "162707f39c44b5ec",
+          "l2": 238.27567,
+          "mean": -0.000398,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "668c998b2a7d2802",
+          "l2": 239.763658,
+          "mean": -0.001675,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "e6a10337c3663964",
+          "l2": 6.496127,
+          "mean": 7.6e-05,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "cfa342efef57907a",
+          "l2": 6.531091,
+          "mean": 7.7e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "bcc8d95673cc5a5f",
+          "l2": 257.357344,
+          "mean": 0.009591,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "06232af31467168c",
+          "l2": 258.943439,
+          "mean": 0.008923,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "101dcbf1b2508991",
+          "l2": 5.210909,
+          "mean": -1e-06,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "ef6ab025c372f7a7",
+          "l2": 5.243873,
+          "mean": 0.0,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "82e46acd4798852f",
+          "l2": 254.525405,
+          "mean": -0.009369,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "beb131255f4974da",
+          "l2": 256.796684,
+          "mean": -0.00686,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "d4ff86e855f04a64",
+          "l2": 6.809166,
+          "mean": 1.6e-05,
+          "tok": 1959
+        },
+        "teacher_decode_start": {
+          "hash": "e5f8b5e50878c109",
+          "l2": 6.901676,
+          "mean": 1.8e-05,
+          "tok": 1959
+        }
+      }
+    ]
+  },
+  "graph_step4_start__vs__nograph_step4_start": {
+    "same": 2,
+    "mismatches": 70,
+    "missing": 0,
+    "keys_a": 72,
+    "keys_b": 72,
+    "first_mismatches": [
+      {
+        "layer": 1,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "72073a60cb4e3f06",
+          "l2": 198.518974,
+          "mean": 0.004481,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "95891acfc4ebe34b",
+          "l2": 203.878137,
+          "mean": 0.003956,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 1,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "61b5ef07158dfe0e",
+          "l2": 5.635612,
+          "mean": -8e-06,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "489365c83d50e9ff",
+          "l2": 5.717392,
+          "mean": -7e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "8ad032003067844a",
+          "l2": 200.32653,
+          "mean": 0.001941,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "fa47c78f381ce4a6",
+          "l2": 204.39569,
+          "mean": 0.00087,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "b6fe1124be0e57e5",
+          "l2": 5.06515,
+          "mean": 1.5e-05,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "5a572875d10c17cd",
+          "l2": 5.248557,
+          "mean": 1.4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "eee9f44e44362a04",
+          "l2": 184.25364,
+          "mean": 0.007885,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "006b016a881923f7",
+          "l2": 184.894343,
+          "mean": 0.008985,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "19fa2f0d3c9fa4c8",
+          "l2": 3.676115,
+          "mean": -7e-06,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "4f2c9d8bced282c4",
+          "l2": 3.748166,
+          "mean": -1e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "f58039106578bea2",
+          "l2": 186.113847,
+          "mean": 0.00024,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "828996be17c6aabc",
+          "l2": 186.524538,
+          "mean": -0.000176,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "6302fe0b37bf3c5b",
+          "l2": 5.023735,
+          "mean": 4e-06,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "255597866e5b8c4c",
+          "l2": 5.051654,
+          "mean": 4e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "c91ea748496419e3",
+          "l2": 197.384042,
+          "mean": -0.005069,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "09d28429b568e956",
+          "l2": 197.96943,
+          "mean": -0.005052,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "09b0e17d175c2fa3",
+          "l2": 3.356676,
+          "mean": 3e-06,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "76e265e8cc0a8579",
+          "l2": 3.371735,
+          "mean": 2e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "269ef00001fc353d",
+          "l2": 250.046148,
+          "mean": 0.020061,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "561f5affe6de7080",
+          "l2": 250.46558,
+          "mean": 0.018454,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "5f1265a4d76c3262",
+          "l2": 6.075758,
+          "mean": 8e-06,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "bb440288e1e4ef15",
+          "l2": 6.089589,
+          "mean": 9e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "07ffffea6cde67e2",
+          "l2": 272.971862,
+          "mean": 0.016665,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "c8f14c7dc34ad13e",
+          "l2": 271.314991,
+          "mean": 0.016831,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "5608950c429299b3",
+          "l2": 6.85221,
+          "mean": 3e-06,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "12d6397196dec6b7",
+          "l2": 6.815266,
+          "mean": 3e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "61c04739e02a3030",
+          "l2": 252.127354,
+          "mean": 0.016408,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "feff7fa7e534ad51",
+          "l2": 251.979001,
+          "mean": 0.016982,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "680d9caede0a0a9a",
+          "l2": 6.625461,
+          "mean": 4.3e-05,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "9c766255b0b08ad0",
+          "l2": 6.616887,
+          "mean": 4.4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "162707f39c44b5ec",
+          "l2": 238.27567,
+          "mean": -0.000398,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "6f1878dff6341258",
+          "l2": 239.841909,
+          "mean": -0.001705,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "e6a10337c3663964",
+          "l2": 6.496127,
+          "mean": 7.6e-05,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "44f5278bd5c8ee0c",
+          "l2": 6.535326,
+          "mean": 7.7e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "bcc8d95673cc5a5f",
+          "l2": 257.357344,
+          "mean": 0.009591,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "b71057f049258a65",
+          "l2": 258.920535,
+          "mean": 0.008953,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "101dcbf1b2508991",
+          "l2": 5.210909,
+          "mean": -1e-06,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "9027f121f291183c",
+          "l2": 5.248301,
+          "mean": 0.0,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "82e46acd4798852f",
+          "l2": 254.525405,
+          "mean": -0.009369,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "c646b8d769c3f546",
+          "l2": 256.568121,
+          "mean": -0.006763,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "d4ff86e855f04a64",
+          "l2": 6.809166,
+          "mean": 1.6e-05,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "b2d6a728fc6e6111",
+          "l2": 6.905433,
+          "mean": 1.8e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 16,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "723af2dadc4b5e27",
+          "l2": 216.666191,
+          "mean": 0.013821,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "34e6a2f3cee1b413",
+          "l2": 218.308533,
+          "mean": 0.013509,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 16,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "cbbbbe02cb36c231",
+          "l2": 4.367824,
+          "mean": -3e-06,
+          "tok": 1959
+        },
+        "nograph_step4_start": {
+          "hash": "6d3aa88a43916c04",
+          "l2": 4.408325,
+          "mean": -6e-06,
+          "tok": 1959
+        }
+      }
+    ]
+  },
+  "graph_step4_end__vs__nograph_step4_end": {
+    "same": 2,
+    "mismatches": 70,
+    "missing": 0,
+    "keys_a": 72,
+    "keys_b": 72,
+    "first_mismatches": [
+      {
+        "layer": 1,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "ba3bc0d945760e27",
+          "l2": 201.319775,
+          "mean": 0.000746,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "6f592748b5ea2d41",
+          "l2": 206.607747,
+          "mean": 0.000221,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 1,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "9ab7cbf69adadac1",
+          "l2": 5.631114,
+          "mean": -4e-06,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "c60f78b1d6bc0802",
+          "l2": 5.73696,
+          "mean": -1e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "a59b2bb75ed67e4b",
+          "l2": 202.569092,
+          "mean": 0.000825,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "03282026481c70c8",
+          "l2": 205.379936,
+          "mean": -0.000687,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "52d30a41f53b17a5",
+          "l2": 4.795294,
+          "mean": 2.2e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "153efbeb7ad35d05",
+          "l2": 4.895233,
+          "mean": 2e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "045a4de6f907746b",
+          "l2": 189.545245,
+          "mean": 0.008194,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "2cb826039291f8fa",
+          "l2": 191.624133,
+          "mean": 0.009353,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "9526c6d441528999",
+          "l2": 3.5892,
+          "mean": -3e-06,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "b65bb65b7aee5145",
+          "l2": 3.559495,
+          "mean": -5e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "ddd147c9e9c725b9",
+          "l2": 190.065379,
+          "mean": -0.000641,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "5f23e053786ba894",
+          "l2": 193.351951,
+          "mean": -0.000903,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "491ea91c9a6e0eb2",
+          "l2": 4.989984,
+          "mean": 2.1e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "504db38d69e43653",
+          "l2": 4.884034,
+          "mean": 2.3e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "f4499504fb2a64c8",
+          "l2": 201.894078,
+          "mean": -0.006455,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "409f71c31dbe8c05",
+          "l2": 202.561658,
+          "mean": -0.005815,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "82fd0178d8310404",
+          "l2": 3.453012,
+          "mean": 9e-06,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "58eb24d06c384d4c",
+          "l2": 3.411923,
+          "mean": 1e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "1a16a1bf15b601da",
+          "l2": 253.525131,
+          "mean": 0.019922,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "b98273bfa2d0c8f5",
+          "l2": 253.798828,
+          "mean": 0.017981,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "5ed236e1c255ab55",
+          "l2": 6.013388,
+          "mean": 2.2e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "1b6aa4018980e5c3",
+          "l2": 5.991076,
+          "mean": 2.4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "bfd5fa26a634a289",
+          "l2": 277.821985,
+          "mean": 0.018794,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "dd7c217aac366f49",
+          "l2": 276.736223,
+          "mean": 0.018229,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "1fb1e5e7cc986d86",
+          "l2": 6.919099,
+          "mean": 9e-06,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "9774e826e50cdd2c",
+          "l2": 6.883367,
+          "mean": 8e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "7bd94c26c8445d90",
+          "l2": 256.196575,
+          "mean": 0.015969,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "d0aa9088beb946b1",
+          "l2": 256.151729,
+          "mean": 0.017126,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "ed78365c99be825a",
+          "l2": 6.80585,
+          "mean": 4e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "c030231245573680",
+          "l2": 6.82223,
+          "mean": 4.5e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "5083e5ebf166b46a",
+          "l2": 241.422996,
+          "mean": -0.005893,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "894fb17b15772562",
+          "l2": 244.179224,
+          "mean": -0.007355,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "d45364ca65308edd",
+          "l2": 6.790339,
+          "mean": 8e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "fcb777a233721754",
+          "l2": 6.851056,
+          "mean": 8.4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "4950c5b7f1a8b23f",
+          "l2": 259.336916,
+          "mean": 0.007981,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "565db188ee41cd15",
+          "l2": 262.169923,
+          "mean": 0.007513,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "8f7cd9b68beb7298",
+          "l2": 5.403333,
+          "mean": 7e-06,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "a38a7c211eb197a9",
+          "l2": 5.446539,
+          "mean": 1e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "b91391f2d653b74e",
+          "l2": 255.144866,
+          "mean": -0.010116,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "e236048f79ced73b",
+          "l2": 257.455585,
+          "mean": -0.007966,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "4c3cfc513d912bce",
+          "l2": 6.810944,
+          "mean": 2.5e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "af9fafcd18058d12",
+          "l2": 6.892742,
+          "mean": 2.9e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 16,
+        "tensor": "conv_state",
+        "graph_step4_end": {
+          "hash": "f34ee3646fa28d5b",
+          "l2": 217.51758,
+          "mean": 0.012951,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "64e5fb65c0708d0c",
+          "l2": 219.470232,
+          "mean": 0.013853,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 16,
+        "tensor": "recur_state",
+        "graph_step4_end": {
+          "hash": "3c38d2e50e41979a",
+          "l2": 4.392366,
+          "mean": -1.2e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "8ed9c4ebce4f5d3a",
+          "l2": 4.416385,
+          "mean": -1.5e-05,
+          "tok": 1959
+        }
+      }
+    ]
+  },
+  "teacher_decode_start__vs__teacher_step0_start": {
+    "same": 0,
+    "mismatches": 0,
+    "missing": 72,
+    "keys_a": 72,
+    "keys_b": 0,
+    "first_mismatches": []
+  },
+  "graph_step4_start__vs__graph_step4_end": {
+    "same": 0,
+    "mismatches": 72,
+    "missing": 0,
+    "keys_a": 72,
+    "keys_b": 72,
+    "first_mismatches": [
+      {
+        "layer": 0,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "1be8df1561d291aa",
+          "l2": 417.761082,
+          "mean": -0.000894,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "6fadb1bc49640270",
+          "l2": 420.276422,
+          "mean": -0.008637,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 0,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "af8be7bb06a5a31f",
+          "l2": 20.896675,
+          "mean": 0.002346,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "082b17b1557162aa",
+          "l2": 20.918214,
+          "mean": 0.00239,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 1,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "72073a60cb4e3f06",
+          "l2": 198.518974,
+          "mean": 0.004481,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "ba3bc0d945760e27",
+          "l2": 201.319775,
+          "mean": 0.000746,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 1,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "61b5ef07158dfe0e",
+          "l2": 5.635612,
+          "mean": -8e-06,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "9ab7cbf69adadac1",
+          "l2": 5.631114,
+          "mean": -4e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "8ad032003067844a",
+          "l2": 200.32653,
+          "mean": 0.001941,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "a59b2bb75ed67e4b",
+          "l2": 202.569092,
+          "mean": 0.000825,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "b6fe1124be0e57e5",
+          "l2": 5.06515,
+          "mean": 1.5e-05,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "52d30a41f53b17a5",
+          "l2": 4.795294,
+          "mean": 2.2e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "eee9f44e44362a04",
+          "l2": 184.25364,
+          "mean": 0.007885,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "045a4de6f907746b",
+          "l2": 189.545245,
+          "mean": 0.008194,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "19fa2f0d3c9fa4c8",
+          "l2": 3.676115,
+          "mean": -7e-06,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "9526c6d441528999",
+          "l2": 3.5892,
+          "mean": -3e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "f58039106578bea2",
+          "l2": 186.113847,
+          "mean": 0.00024,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "ddd147c9e9c725b9",
+          "l2": 190.065379,
+          "mean": -0.000641,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "6302fe0b37bf3c5b",
+          "l2": 5.023735,
+          "mean": 4e-06,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "491ea91c9a6e0eb2",
+          "l2": 4.989984,
+          "mean": 2.1e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "c91ea748496419e3",
+          "l2": 197.384042,
+          "mean": -0.005069,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "f4499504fb2a64c8",
+          "l2": 201.894078,
+          "mean": -0.006455,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "09b0e17d175c2fa3",
+          "l2": 3.356676,
+          "mean": 3e-06,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "82fd0178d8310404",
+          "l2": 3.453012,
+          "mean": 9e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "269ef00001fc353d",
+          "l2": 250.046148,
+          "mean": 0.020061,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "1a16a1bf15b601da",
+          "l2": 253.525131,
+          "mean": 0.019922,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "5f1265a4d76c3262",
+          "l2": 6.075758,
+          "mean": 8e-06,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "5ed236e1c255ab55",
+          "l2": 6.013388,
+          "mean": 2.2e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "07ffffea6cde67e2",
+          "l2": 272.971862,
+          "mean": 0.016665,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "bfd5fa26a634a289",
+          "l2": 277.821985,
+          "mean": 0.018794,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "5608950c429299b3",
+          "l2": 6.85221,
+          "mean": 3e-06,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "1fb1e5e7cc986d86",
+          "l2": 6.919099,
+          "mean": 9e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "61c04739e02a3030",
+          "l2": 252.127354,
+          "mean": 0.016408,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "7bd94c26c8445d90",
+          "l2": 256.196575,
+          "mean": 0.015969,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "680d9caede0a0a9a",
+          "l2": 6.625461,
+          "mean": 4.3e-05,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "ed78365c99be825a",
+          "l2": 6.80585,
+          "mean": 4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "162707f39c44b5ec",
+          "l2": 238.27567,
+          "mean": -0.000398,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "5083e5ebf166b46a",
+          "l2": 241.422996,
+          "mean": -0.005893,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "e6a10337c3663964",
+          "l2": 6.496127,
+          "mean": 7.6e-05,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "d45364ca65308edd",
+          "l2": 6.790339,
+          "mean": 8e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "bcc8d95673cc5a5f",
+          "l2": 257.357344,
+          "mean": 0.009591,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "4950c5b7f1a8b23f",
+          "l2": 259.336916,
+          "mean": 0.007981,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "101dcbf1b2508991",
+          "l2": 5.210909,
+          "mean": -1e-06,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "8f7cd9b68beb7298",
+          "l2": 5.403333,
+          "mean": 7e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "conv_state",
+        "graph_step4_start": {
+          "hash": "82e46acd4798852f",
+          "l2": 254.525405,
+          "mean": -0.009369,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "b91391f2d653b74e",
+          "l2": 255.144866,
+          "mean": -0.010116,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "recur_state",
+        "graph_step4_start": {
+          "hash": "d4ff86e855f04a64",
+          "l2": 6.809166,
+          "mean": 1.6e-05,
+          "tok": 1959
+        },
+        "graph_step4_end": {
+          "hash": "4c3cfc513d912bce",
+          "l2": 6.810944,
+          "mean": 2.5e-05,
+          "tok": 1959
+        }
+      }
+    ]
+  },
+  "nograph_step4_start__vs__nograph_step4_end": {
+    "same": 0,
+    "mismatches": 72,
+    "missing": 0,
+    "keys_a": 72,
+    "keys_b": 72,
+    "first_mismatches": [
+      {
+        "layer": 0,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "1be8df1561d291aa",
+          "l2": 417.761082,
+          "mean": -0.000894,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "6fadb1bc49640270",
+          "l2": 420.276422,
+          "mean": -0.008637,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 0,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "af8be7bb06a5a31f",
+          "l2": 20.896675,
+          "mean": 0.002346,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "082b17b1557162aa",
+          "l2": 20.918214,
+          "mean": 0.00239,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 1,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "95891acfc4ebe34b",
+          "l2": 203.878137,
+          "mean": 0.003956,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "6f592748b5ea2d41",
+          "l2": 206.607747,
+          "mean": 0.000221,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 1,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "489365c83d50e9ff",
+          "l2": 5.717392,
+          "mean": -7e-06,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "c60f78b1d6bc0802",
+          "l2": 5.73696,
+          "mean": -1e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "fa47c78f381ce4a6",
+          "l2": 204.39569,
+          "mean": 0.00087,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "03282026481c70c8",
+          "l2": 205.379936,
+          "mean": -0.000687,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 2,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "5a572875d10c17cd",
+          "l2": 5.248557,
+          "mean": 1.4e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "153efbeb7ad35d05",
+          "l2": 4.895233,
+          "mean": 2e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "006b016a881923f7",
+          "l2": 184.894343,
+          "mean": 0.008985,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "2cb826039291f8fa",
+          "l2": 191.624133,
+          "mean": 0.009353,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 4,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "4f2c9d8bced282c4",
+          "l2": 3.748166,
+          "mean": -1e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "b65bb65b7aee5145",
+          "l2": 3.559495,
+          "mean": -5e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "828996be17c6aabc",
+          "l2": 186.524538,
+          "mean": -0.000176,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "5f23e053786ba894",
+          "l2": 193.351951,
+          "mean": -0.000903,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 5,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "255597866e5b8c4c",
+          "l2": 5.051654,
+          "mean": 4e-06,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "504db38d69e43653",
+          "l2": 4.884034,
+          "mean": 2.3e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "09d28429b568e956",
+          "l2": 197.96943,
+          "mean": -0.005052,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "409f71c31dbe8c05",
+          "l2": 202.561658,
+          "mean": -0.005815,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 6,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "76e265e8cc0a8579",
+          "l2": 3.371735,
+          "mean": 2e-06,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "58eb24d06c384d4c",
+          "l2": 3.411923,
+          "mean": 1e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "561f5affe6de7080",
+          "l2": 250.46558,
+          "mean": 0.018454,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "b98273bfa2d0c8f5",
+          "l2": 253.798828,
+          "mean": 0.017981,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 8,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "bb440288e1e4ef15",
+          "l2": 6.089589,
+          "mean": 9e-06,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "1b6aa4018980e5c3",
+          "l2": 5.991076,
+          "mean": 2.4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "c8f14c7dc34ad13e",
+          "l2": 271.314991,
+          "mean": 0.016831,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "dd7c217aac366f49",
+          "l2": 276.736223,
+          "mean": 0.018229,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 9,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "12d6397196dec6b7",
+          "l2": 6.815266,
+          "mean": 3e-06,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "9774e826e50cdd2c",
+          "l2": 6.883367,
+          "mean": 8e-06,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "feff7fa7e534ad51",
+          "l2": 251.979001,
+          "mean": 0.016982,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "d0aa9088beb946b1",
+          "l2": 256.151729,
+          "mean": 0.017126,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 10,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "9c766255b0b08ad0",
+          "l2": 6.616887,
+          "mean": 4.4e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "c030231245573680",
+          "l2": 6.82223,
+          "mean": 4.5e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "6f1878dff6341258",
+          "l2": 239.841909,
+          "mean": -0.001705,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "894fb17b15772562",
+          "l2": 244.179224,
+          "mean": -0.007355,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 12,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "44f5278bd5c8ee0c",
+          "l2": 6.535326,
+          "mean": 7.7e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "fcb777a233721754",
+          "l2": 6.851056,
+          "mean": 8.4e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "b71057f049258a65",
+          "l2": 258.920535,
+          "mean": 0.008953,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "565db188ee41cd15",
+          "l2": 262.169923,
+          "mean": 0.007513,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 13,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "9027f121f291183c",
+          "l2": 5.248301,
+          "mean": 0.0,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "a38a7c211eb197a9",
+          "l2": 5.446539,
+          "mean": 1e-05,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "conv_state",
+        "nograph_step4_start": {
+          "hash": "c646b8d769c3f546",
+          "l2": 256.568121,
+          "mean": -0.006763,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "e236048f79ced73b",
+          "l2": 257.455585,
+          "mean": -0.007966,
+          "tok": 1959
+        }
+      },
+      {
+        "layer": 14,
+        "tensor": "recur_state",
+        "nograph_step4_start": {
+          "hash": "b2d6a728fc6e6111",
+          "l2": 6.905433,
+          "mean": 1.8e-05,
+          "tok": 1959
+        },
+        "nograph_step4_end": {
+          "hash": "af9fafcd18058d12",
+          "l2": 6.892742,
+          "mean": 2.9e-05,
+          "tok": 1959
+        }
+      }
+    ]
+  }
+}
