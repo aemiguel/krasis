@@ -52,7 +52,7 @@ class SuiteCombo:
     shared_expert_quant: str = "int8"
     dense_mlp_quant: str = "int8"
     lm_head_quant: str = "int8"
-    kv_dtype: str = "polar4"
+    kv_dtype: str = "k6v6"
     krasis_threads: int = 40
     gguf_path: str = ""
     layer_group_size: int = 2
@@ -192,7 +192,7 @@ class SuiteRunner:
                     shared_expert_quant=cfg.get("shared_expert_quant", "int8"),
                     dense_mlp_quant=cfg.get("dense_mlp_quant", "int8"),
                     lm_head_quant=cfg.get("lm_head_quant", "int8"),
-                    kv_dtype=cfg.get("kv_dtype", "fp8_e4m3"),
+                    kv_dtype=cfg.get("kv_dtype", "k6v6"),
                     krasis_threads=cfg.get("krasis_threads", 40),
                     gguf_path=gguf_path,
                     layer_group_size=cfg.get("layer_group_size", 2),

@@ -458,7 +458,7 @@ def main():
                         help="Limit number of prompts (0=all)")
     parser.add_argument("--no-shuffle", action="store_true")
     parser.add_argument("--layer-group-size", type=int, default=2)
-    parser.add_argument("--kv-dtype", default="polar4")
+    parser.add_argument("--kv-dtype", default="k6v6")
     parser.add_argument("--gpu-expert-bits", type=int, default=4)
     parser.add_argument("--cpu-expert-bits", type=int, default=4)
     parser.add_argument("--attention-quant", default="bf16", choices=list(ATTENTION_QUANT_CHOICES),

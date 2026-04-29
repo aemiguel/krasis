@@ -6834,6 +6834,472 @@ extern "C" __global__ void kv_cache_write_k8v4(
     v_radius_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
 }
 
+__device__ inline void pack_k6_16(unsigned char* dst, const unsigned char* codes) {
+    #pragma unroll
+    for (int i = 0; i < 12; i++) dst[i] = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        int bit = i * 6;
+        int byte = bit >> 3;
+        int shift = bit & 7;
+        unsigned int val = ((unsigned int)codes[i]) & 0x3fu;
+        dst[byte] |= (unsigned char)(val << shift);
+        if (shift > 2) {
+            dst[byte + 1] |= (unsigned char)(val >> (8 - shift));
+        }
+    }
+}
+
+__device__ inline int unpack_k6(const unsigned char* src, int idx) {
+    int bit = idx * 6;
+    int byte = bit >> 3;
+    int shift = bit & 7;
+    unsigned int val = ((unsigned int)src[byte]) >> shift;
+    if (shift > 2) {
+        val |= ((unsigned int)src[byte + 1]) << (8 - shift);
+    }
+    return (int)(val & 0x3fu);
+}
+
+__device__ inline float quantize_k6_one_pass_ls(const float* src, unsigned char* codes) {
+    float max_abs = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        max_abs = fmaxf(max_abs, fabsf(src[i]));
+    }
+
+    float k_scale = fmaxf(max_abs * (1.0f / 31.0f), 1e-8f);
+    float inv_k_scale = 1.0f / k_scale;
+    float ls_num = 0.0f;
+    float ls_den = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        float scaled = src[i] * inv_k_scale;
+        int q = (int)(scaled >= 0.0f ? floorf(scaled + 0.5f) : -floorf(-scaled + 0.5f));
+        q = max(-31, min(31, q));
+        codes[i] = (unsigned char)(q + 32);
+        float qf = (float)q;
+        ls_num += src[i] * qf;
+        ls_den += qf * qf;
+    }
+    if (ls_den > 1e-12f) {
+        k_scale = fmaxf(ls_num / ls_den, 1e-8f);
+    }
+    return k_scale;
+}
+
+__device__ inline void pack_k7_16(unsigned char* dst, const unsigned char* codes) {
+    #pragma unroll
+    for (int i = 0; i < 14; i++) dst[i] = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        int bit = i * 7;
+        int byte = bit >> 3;
+        int shift = bit & 7;
+        unsigned int val = ((unsigned int)codes[i]) & 0x7fu;
+        dst[byte] |= (unsigned char)(val << shift);
+        if (shift > 1) {
+            dst[byte + 1] |= (unsigned char)(val >> (8 - shift));
+        }
+    }
+}
+
+__device__ inline int unpack_k7(const unsigned char* src, int idx) {
+    int bit = idx * 7;
+    int byte = bit >> 3;
+    int shift = bit & 7;
+    unsigned int val = ((unsigned int)src[byte]) >> shift;
+    if (shift > 1) {
+        val |= ((unsigned int)src[byte + 1]) << (8 - shift);
+    }
+    return (int)(val & 0x7fu);
+}
+
+__device__ inline float quantize_k7_one_pass_ls(const float* src, unsigned char* codes) {
+    float max_abs = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        max_abs = fmaxf(max_abs, fabsf(src[i]));
+    }
+
+    float k_scale = fmaxf(max_abs * (1.0f / 63.0f), 1e-8f);
+    float inv_k_scale = 1.0f / k_scale;
+    float ls_num = 0.0f;
+    float ls_den = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        float scaled = src[i] * inv_k_scale;
+        int q = (int)(scaled >= 0.0f ? floorf(scaled + 0.5f) : -floorf(-scaled + 0.5f));
+        q = max(-63, min(63, q));
+        codes[i] = (unsigned char)(q + 64);
+        float qf = (float)q;
+        ls_num += src[i] * qf;
+        ls_den += qf * qf;
+    }
+    if (ls_den > 1e-12f) {
+        k_scale = fmaxf(ls_num / ls_den, 1e-8f);
+    }
+    return k_scale;
+}
+
+__device__ inline float quantize_k8_one_pass_ls(const float* src, unsigned char* codes) {
+    float max_abs = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        max_abs = fmaxf(max_abs, fabsf(src[i]));
+    }
+
+    float k_scale = fmaxf(max_abs * (1.0f / 127.0f), 1e-8f);
+    float inv_k_scale = 1.0f / k_scale;
+    float ls_num = 0.0f;
+    float ls_den = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        float scaled = src[i] * inv_k_scale;
+        int q = (int)(scaled >= 0.0f ? floorf(scaled + 0.5f) : -floorf(-scaled + 0.5f));
+        q = max(-127, min(127, q));
+        codes[i] = (unsigned char)(q + 128);
+        float qf = (float)q;
+        ls_num += src[i] * qf;
+        ls_den += qf * qf;
+    }
+    if (ls_den > 1e-12f) {
+        k_scale = fmaxf(ls_num / ls_den, 1e-8f);
+    }
+    return k_scale;
+}
+
+// Write K to blockwise signed INT6 and V to Polar4 at a given decode position.
+extern "C" __global__ void kv_cache_write_k6v4(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_radius_cache,
+    unsigned char* __restrict__ v_angles_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int position,
+    int kv_stride,
+    int norm_correction
+) {
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = kv_stride / 16;
+    if (block_idx >= num_blocks) return;
+
+    int offset = block_idx * 16;
+    float k_local[16];
+    float v_local[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_local[i] = k[offset + i];
+        v_local[i] = v[offset + i] * polar4_signs[i];
+    }
+
+    unsigned char codes[16];
+    float k_scale = quantize_k6_one_pass_ls(k_local, codes);
+    unsigned char* k_pack = k_idx_cache + (position * num_blocks + block_idx) * 12;
+    pack_k6_16(k_pack, codes);
+    __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+    k_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+    fht16(v_local);
+    #pragma unroll
+    for (int i = 0; i < 16; i++) v_local[i] *= 0.25f;
+
+    float v_r = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) v_r += v_local[i] * v_local[i];
+    v_r = sqrtf(v_r + 1e-12f);
+
+    float inv_v_r = 1.0f / v_r;
+    unsigned char* v_ang = v_angles_cache + (position * num_blocks + block_idx) * 8;
+    float v_qnorm2 = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int v0 = quantize_polar4(v_local[i*2] * inv_v_r);
+        int v1 = quantize_polar4(v_local[i*2+1] * inv_v_r);
+        v_ang[i] = (unsigned char)((v1 << 4) | v0);
+        float v0v = polar4_codebook[v0];
+        float v1v = polar4_codebook[v1];
+        v_qnorm2 += v0v * v0v + v1v * v1v;
+    }
+    if (norm_correction & 2) {
+        v_r = v_r / sqrtf(v_qnorm2 + 1e-12f);
+    }
+    __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+    v_radius_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+}
+
+// Write K to blockwise signed INT7 and V to Polar4 at a given decode position.
+extern "C" __global__ void kv_cache_write_k7v4(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_radius_cache,
+    unsigned char* __restrict__ v_angles_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int position,
+    int kv_stride,
+    int norm_correction
+) {
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = kv_stride / 16;
+    if (block_idx >= num_blocks) return;
+
+    int offset = block_idx * 16;
+    float k_local[16];
+    float v_local[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_local[i] = k[offset + i];
+        v_local[i] = v[offset + i] * polar4_signs[i];
+    }
+
+    unsigned char codes[16];
+    float k_scale = quantize_k7_one_pass_ls(k_local, codes);
+    unsigned char* k_pack = k_idx_cache + (position * num_blocks + block_idx) * 14;
+    pack_k7_16(k_pack, codes);
+    __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+    k_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+    fht16(v_local);
+    #pragma unroll
+    for (int i = 0; i < 16; i++) v_local[i] *= 0.25f;
+
+    float v_r = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) v_r += v_local[i] * v_local[i];
+    v_r = sqrtf(v_r + 1e-12f);
+
+    float inv_v_r = 1.0f / v_r;
+    unsigned char* v_ang = v_angles_cache + (position * num_blocks + block_idx) * 8;
+    float v_qnorm2 = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int v0 = quantize_polar4(v_local[i*2] * inv_v_r);
+        int v1 = quantize_polar4(v_local[i*2+1] * inv_v_r);
+        v_ang[i] = (unsigned char)((v1 << 4) | v0);
+        float v0v = polar4_codebook[v0];
+        float v1v = polar4_codebook[v1];
+        v_qnorm2 += v0v * v0v + v1v * v1v;
+    }
+    if (norm_correction & 2) {
+        v_r = v_r / sqrtf(v_qnorm2 + 1e-12f);
+    }
+    __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+    v_radius_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+}
+
+// Write K and V to blockwise signed INT6 with BF16 least-squares scales.
+extern "C" __global__ void kv_cache_write_k6v6(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_scale_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int position,
+    int kv_stride,
+    int norm_correction
+) {
+    (void)norm_correction;
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = kv_stride / 16;
+    if (block_idx >= num_blocks) return;
+
+    int offset = block_idx * 16;
+    float k_local[16];
+    float v_local[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_local[i] = k[offset + i];
+        v_local[i] = v[offset + i];
+    }
+
+    unsigned char codes[16];
+    float k_scale = quantize_k6_one_pass_ls(k_local, codes);
+    unsigned char* k_pack = k_idx_cache + (position * num_blocks + block_idx) * 12;
+    pack_k6_16(k_pack, codes);
+    __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+    k_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+    float v_scale = quantize_k6_one_pass_ls(v_local, codes);
+    unsigned char* v_pack = v_idx_cache + (position * num_blocks + block_idx) * 12;
+    pack_k6_16(v_pack, codes);
+    __nv_bfloat16 v_sb = __float2bfloat16(v_scale);
+    v_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_sb);
+}
+
+// Write K to blockwise signed INT8 and V to blockwise signed INT6 with BF16 least-squares scales.
+extern "C" __global__ void kv_cache_write_k8v6(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_scale_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int position,
+    int kv_stride,
+    int norm_correction
+) {
+    (void)norm_correction;
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = kv_stride / 16;
+    if (block_idx >= num_blocks) return;
+
+    int offset = block_idx * 16;
+    float k_local[16];
+    float v_local[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_local[i] = k[offset + i];
+        v_local[i] = v[offset + i];
+    }
+
+    unsigned char codes[16];
+    float k_scale = quantize_k8_one_pass_ls(k_local, codes);
+    unsigned char* k_pack = k_idx_cache + (position * num_blocks + block_idx) * 16;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) k_pack[i] = codes[i];
+    __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+    k_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+    float v_scale = quantize_k6_one_pass_ls(v_local, codes);
+    unsigned char* v_pack = v_idx_cache + (position * num_blocks + block_idx) * 12;
+    pack_k6_16(v_pack, codes);
+    __nv_bfloat16 v_sb = __float2bfloat16(v_scale);
+    v_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_sb);
+}
+
+__device__ inline float tq4_codebook_value(int idx, int head_dim) {
+    // vLLM turboquant_4bit_nc Lloyd-Max centroids for N(0, 1), scaled to
+    // N(0, 1/head_dim). These are algorithm constants, not model calibration.
+    static const float lloyd4_unit[16] = {
+        -2.7309222221f, -2.0684471130f, -1.6178817749f, -1.2562575340f,
+        -0.9424482584f, -0.6568799019f, -0.3881377876f, -0.1284276545f,
+         0.1284276545f,  0.3881377876f,  0.6568799019f,  0.9424482584f,
+         1.2562575340f,  1.6178817749f,  2.0684471130f,  2.7309222221f,
+    };
+    return lloyd4_unit[idx] * rsqrtf((float)head_dim);
+}
+
+__device__ inline int quantize_tq4(float val, int head_dim) {
+    int best_idx = 0;
+    float best_diff = fabsf(val - tq4_codebook_value(0, head_dim));
+    #pragma unroll
+    for (int i = 1; i < 16; i++) {
+        float diff = fabsf(val - tq4_codebook_value(i, head_dim));
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+__device__ inline void fht_shared_serial(float* x, int n) {
+    for (int step = 1; step < n; step <<= 1) {
+        int jump = step << 1;
+        for (int base = 0; base < n; base += jump) {
+            for (int j = 0; j < step; j++) {
+                float a = x[base + j];
+                float b = x[base + j + step];
+                x[base + j] = a + b;
+                x[base + j + step] = a - b;
+            }
+        }
+    }
+}
+
+__device__ inline void tq4_store_head(
+    unsigned short* __restrict__ k_norm_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_meta_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ signs,
+    int position,
+    int kv_head,
+    int num_kv_heads,
+    int head_dim,
+    float* scratch
+) {
+    int packed_hd = (head_dim + 1) >> 1;
+    int token_head = position * num_kv_heads + kv_head;
+    int src_off = kv_head * head_dim;
+
+    float k_norm2 = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = k[src_off + d];
+        scratch[d] = val * signs[d];
+        k_norm2 += val * val;
+    }
+    float k_norm = sqrtf(k_norm2 + 1e-12f);
+    fht_shared_serial(scratch, head_dim);
+    float fht_scale = rsqrtf((float)head_dim);
+    float inv_norm = 1.0f / k_norm;
+    float q_norm2 = 0.0f;
+    unsigned char* k_pack = k_idx_cache + token_head * packed_hd;
+    for (int d = 0; d < head_dim; d += 2) {
+        int q0 = quantize_tq4(scratch[d] * fht_scale * inv_norm, head_dim);
+        int q1 = 0;
+        q_norm2 += tq4_codebook_value(q0, head_dim) * tq4_codebook_value(q0, head_dim);
+        if (d + 1 < head_dim) {
+            q1 = quantize_tq4(scratch[d + 1] * fht_scale * inv_norm, head_dim);
+            q_norm2 += tq4_codebook_value(q1, head_dim) * tq4_codebook_value(q1, head_dim);
+        }
+        k_pack[d >> 1] = (unsigned char)((q1 << 4) | q0);
+    }
+    float corrected_norm = k_norm / sqrtf(q_norm2 + 1e-12f);
+    __half k_nb = __float2half(corrected_norm);
+    k_norm_cache[token_head] = *reinterpret_cast<unsigned short*>(&k_nb);
+
+    float v_min = 1e30f;
+    float v_max = -1e30f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = v[src_off + d];
+        v_min = fminf(v_min, val);
+        v_max = fmaxf(v_max, val);
+    }
+    float scale = (v_max - v_min) * (1.0f / 15.0f);
+    if (scale < 1e-8f) scale = 1e-8f;
+    float inv_scale = 1.0f / scale;
+    unsigned char* v_pack = v_idx_cache + token_head * packed_hd;
+    for (int d = 0; d < head_dim; d += 2) {
+        int q0 = (int)floorf((v[src_off + d] - v_min) * inv_scale + 0.5f);
+        q0 = max(0, min(15, q0));
+        int q1 = 0;
+        if (d + 1 < head_dim) {
+            q1 = (int)floorf((v[src_off + d + 1] - v_min) * inv_scale + 0.5f);
+            q1 = max(0, min(15, q1));
+        }
+        v_pack[d >> 1] = (unsigned char)((q1 << 4) | q0);
+    }
+    __half scale_b = __float2half(scale);
+    __half zero_b = __float2half(v_min);
+    v_meta_cache[token_head * 2] = *reinterpret_cast<unsigned short*>(&scale_b);
+    v_meta_cache[token_head * 2 + 1] = *reinterpret_cast<unsigned short*>(&zero_b);
+}
+
+extern "C" __global__ void kv_cache_write_tq4(
+    unsigned short* __restrict__ k_norm_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_meta_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ signs,
+    int position,
+    int num_kv_heads,
+    int head_dim
+) {
+    int kv_head = blockIdx.x;
+    if (kv_head >= num_kv_heads || threadIdx.x != 0) return;
+    extern __shared__ float scratch[];
+    tq4_store_head(k_norm_cache, k_idx_cache, v_meta_cache, v_idx_cache,
+                   k, v, signs, position, kv_head, num_kv_heads, head_dim, scratch);
+}
+
 // Simple GQA attention with Polar 4-bit KV cache
 extern "C" __global__ void gqa_attention_polar4(
     float* __restrict__ output,
@@ -7117,6 +7583,629 @@ extern "C" __global__ void gqa_attention_k8v4(
     }
 }
 
+// Single-query GQA attention with blockwise INT6 K and Polar4 V.
+extern "C" __global__ void gqa_attention_k6v4(
+    float* __restrict__ output,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const unsigned short* __restrict__ v_radius_cache,
+    const unsigned char* __restrict__ v_angles_cache,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int max_seq
+) {
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+    (void)max_seq;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int lane_id = tid & 31;
+    int warp_id = tid >> 5;
+    int num_warps = num_threads >> 5;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    int num_blocks = kv_stride / 16;
+    int block_offset_in_head = (kv_head * head_dim) / 16;
+
+    const float* q_head = q + qh * head_dim;
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_reduce = smem + head_dim;
+    float* s_partial_v = smem_reduce + 2 * num_warps;
+
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int pos = tid; pos < seq_len; pos += num_threads) {
+        float score = 0.0f;
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 12;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[b * 16 + j] * scale * (float)(unpack_k6(k_pack, j) - 32);
+            }
+        }
+        local_max = fmaxf(local_max, score * sm_scale);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = smem_reduce[0];
+        for (int i = 1; i < num_warps; i++) m = fmaxf(m, smem_reduce[i]);
+        smem_reduce[0] = m;
+    }
+    __syncthreads();
+    float global_max = smem_reduce[0];
+
+    float local_sum_exp = 0.0f;
+    for (int d = lane_id; d < head_dim; d += 32) {
+        s_partial_v[warp_id * head_dim + d] = 0.0f;
+    }
+    __syncwarp();
+
+    for (int pos = warp_id; pos < seq_len; pos += num_warps) {
+        float score_partial = 0.0f;
+        for (int d = lane_id; d < head_dim; d += 32) {
+            int block_idx = block_offset_in_head + (d >> 4);
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 12;
+            score_partial += s_q[d] * scale * (float)(unpack_k6(k_pack, d & 15) - 32);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
+        }
+        float w = __expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
+        local_sum_exp += w;
+
+        for (int d = lane_id; d < head_dim; d += 32) {
+            int block_idx = block_offset_in_head + (d >> 4);
+            float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &v_radius_cache[pos * num_blocks + block_idx]));
+            const unsigned char* angs = v_angles_cache + (pos * num_blocks + block_idx) * 8;
+            unsigned char p = angs[(d & 15) >> 1];
+            float v_val = ((d & 1) == 0)
+                ? r * polar4_codebook[p & 0xF]
+                : r * polar4_codebook[p >> 4];
+            s_partial_v[warp_id * head_dim + d] += w * v_val;
+        }
+    }
+
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum_exp;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+
+    float inv_sum = 1.0f / (smem_reduce[0] + 1e-12f);
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int w = 0; w < num_warps; w++) acc += s_partial_v[w * head_dim + d];
+        s_q[d] = acc * inv_sum;
+    }
+    __syncthreads();
+
+    for (int b = 0; b < head_dim / 16; b++) {
+        if (tid == b) {
+            float o_local[16];
+            for (int i = 0; i < 16; i++) o_local[i] = s_q[b*16+i];
+            fht16(o_local);
+            for (int i = 0; i < 16; i++) {
+                output[qh * head_dim + b*16 + i] = o_local[i] * 0.25f * polar4_signs[i];
+            }
+        }
+    }
+}
+
+// Single-query GQA attention with blockwise INT7 K and Polar4 V.
+extern "C" __global__ void gqa_attention_k7v4(
+    float* __restrict__ output,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const unsigned short* __restrict__ v_radius_cache,
+    const unsigned char* __restrict__ v_angles_cache,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int max_seq
+) {
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+    (void)max_seq;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int lane_id = tid & 31;
+    int warp_id = tid >> 5;
+    int num_warps = num_threads >> 5;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    int num_blocks = kv_stride / 16;
+    int block_offset_in_head = (kv_head * head_dim) / 16;
+
+    const float* q_head = q + qh * head_dim;
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_reduce = smem + head_dim;
+    float* s_partial_v = smem_reduce + 2 * num_warps;
+
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int pos = tid; pos < seq_len; pos += num_threads) {
+        float score = 0.0f;
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 14;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[b * 16 + j] * scale * (float)(unpack_k7(k_pack, j) - 64);
+            }
+        }
+        local_max = fmaxf(local_max, score * sm_scale);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = smem_reduce[0];
+        for (int i = 1; i < num_warps; i++) m = fmaxf(m, smem_reduce[i]);
+        smem_reduce[0] = m;
+    }
+    __syncthreads();
+    float global_max = smem_reduce[0];
+
+    float local_sum_exp = 0.0f;
+    for (int d = lane_id; d < head_dim; d += 32) {
+        s_partial_v[warp_id * head_dim + d] = 0.0f;
+    }
+    __syncwarp();
+
+    for (int pos = warp_id; pos < seq_len; pos += num_warps) {
+        float score_partial = 0.0f;
+        for (int d = lane_id; d < head_dim; d += 32) {
+            int block_idx = block_offset_in_head + (d >> 4);
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 14;
+            score_partial += s_q[d] * scale * (float)(unpack_k7(k_pack, d & 15) - 64);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
+        }
+        float w = __expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
+        local_sum_exp += w;
+
+        for (int d = lane_id; d < head_dim; d += 32) {
+            int block_idx = block_offset_in_head + (d >> 4);
+            float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &v_radius_cache[pos * num_blocks + block_idx]));
+            const unsigned char* angs = v_angles_cache + (pos * num_blocks + block_idx) * 8;
+            unsigned char p = angs[(d & 15) >> 1];
+            float v_val = ((d & 1) == 0)
+                ? r * polar4_codebook[p & 0xF]
+                : r * polar4_codebook[p >> 4];
+            s_partial_v[warp_id * head_dim + d] += w * v_val;
+        }
+    }
+
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum_exp;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+
+    float inv_sum = 1.0f / (smem_reduce[0] + 1e-12f);
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int w = 0; w < num_warps; w++) acc += s_partial_v[w * head_dim + d];
+        s_q[d] = acc * inv_sum;
+    }
+    __syncthreads();
+
+    for (int b = 0; b < head_dim / 16; b++) {
+        if (tid == b) {
+            float o_local[16];
+            for (int i = 0; i < 16; i++) o_local[i] = s_q[b*16+i];
+            fht16(o_local);
+            for (int i = 0; i < 16; i++) {
+                output[qh * head_dim + b*16 + i] = o_local[i] * 0.25f * polar4_signs[i];
+            }
+        }
+    }
+}
+
+// Single-query GQA attention with blockwise INT6 K and INT6 V.
+extern "C" __global__ void gqa_attention_k6v6(
+    float* __restrict__ output,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const unsigned short* __restrict__ v_scale_cache,
+    const unsigned char* __restrict__ v_idx_cache,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int max_seq
+) {
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+    (void)max_seq;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int lane_id = tid & 31;
+    int warp_id = tid >> 5;
+    int num_warps = num_threads >> 5;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    int num_blocks = kv_stride / 16;
+    int block_offset_in_head = (kv_head * head_dim) / 16;
+
+    const float* q_head = q + qh * head_dim;
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_reduce = smem + head_dim;
+    float* s_partial_v = smem_reduce + 2 * num_warps;
+
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int pos = tid; pos < seq_len; pos += num_threads) {
+        float score = 0.0f;
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 12;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[b * 16 + j] * scale * (float)(unpack_k6(k_pack, j) - 32);
+            }
+        }
+        local_max = fmaxf(local_max, score * sm_scale);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = smem_reduce[0];
+        for (int i = 1; i < num_warps; i++) m = fmaxf(m, smem_reduce[i]);
+        smem_reduce[0] = m;
+    }
+    __syncthreads();
+    float global_max = smem_reduce[0];
+
+    float local_sum_exp = 0.0f;
+    for (int d = lane_id; d < head_dim; d += 32) {
+        s_partial_v[warp_id * head_dim + d] = 0.0f;
+    }
+    __syncwarp();
+
+    for (int pos = warp_id; pos < seq_len; pos += num_warps) {
+        float score_partial = 0.0f;
+        for (int d = lane_id; d < head_dim; d += 32) {
+            int block_idx = block_offset_in_head + (d >> 4);
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 12;
+            score_partial += s_q[d] * scale * (float)(unpack_k6(k_pack, d & 15) - 32);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
+        }
+        float w = __expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
+        local_sum_exp += w;
+
+        for (int d = lane_id; d < head_dim; d += 32) {
+            int block_idx = block_offset_in_head + (d >> 4);
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &v_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* v_pack = v_idx_cache + (pos * num_blocks + block_idx) * 12;
+            float v_val = scale * (float)(unpack_k6(v_pack, d & 15) - 32);
+            s_partial_v[warp_id * head_dim + d] += w * v_val;
+        }
+    }
+
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum_exp;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+
+    float inv_sum = 1.0f / (smem_reduce[0] + 1e-12f);
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int w = 0; w < num_warps; w++) acc += s_partial_v[w * head_dim + d];
+        output[qh * head_dim + d] = acc * inv_sum;
+    }
+}
+
+// Single-query GQA attention with blockwise INT8 K and INT6 V.
+extern "C" __global__ void gqa_attention_k8v6(
+    float* __restrict__ output,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const unsigned short* __restrict__ v_scale_cache,
+    const unsigned char* __restrict__ v_idx_cache,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int max_seq
+) {
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+    (void)max_seq;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int lane_id = tid & 31;
+    int warp_id = tid >> 5;
+    int num_warps = num_threads >> 5;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    int num_blocks = kv_stride / 16;
+    int block_offset_in_head = (kv_head * head_dim) / 16;
+
+    const float* q_head = q + qh * head_dim;
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_reduce = smem + head_dim;
+    float* s_partial_v = smem_reduce + 2 * num_warps;
+
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int pos = tid; pos < seq_len; pos += num_threads) {
+        float score = 0.0f;
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 16;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[b * 16 + j] * scale * (float)((int)k_pack[j] - 128);
+            }
+        }
+        local_max = fmaxf(local_max, score * sm_scale);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = smem_reduce[0];
+        for (int i = 1; i < num_warps; i++) m = fmaxf(m, smem_reduce[i]);
+        smem_reduce[0] = m;
+    }
+    __syncthreads();
+    float global_max = smem_reduce[0];
+
+    float local_sum_exp = 0.0f;
+    for (int d = lane_id; d < head_dim; d += 32) {
+        s_partial_v[warp_id * head_dim + d] = 0.0f;
+    }
+    __syncwarp();
+
+    for (int pos = warp_id; pos < seq_len; pos += num_warps) {
+        float score_partial = 0.0f;
+        for (int d = lane_id; d < head_dim; d += 32) {
+            int block_idx = block_offset_in_head + (d >> 4);
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 16;
+            score_partial += s_q[d] * scale * (float)((int)k_pack[d & 15] - 128);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
+        }
+        float w = __expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
+        local_sum_exp += w;
+
+        for (int d = lane_id; d < head_dim; d += 32) {
+            int block_idx = block_offset_in_head + (d >> 4);
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &v_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* v_pack = v_idx_cache + (pos * num_blocks + block_idx) * 12;
+            float v_val = scale * (float)(unpack_k6(v_pack, d & 15) - 32);
+            s_partial_v[warp_id * head_dim + d] += w * v_val;
+        }
+    }
+
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum_exp;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+
+    float inv_sum = 1.0f / (smem_reduce[0] + 1e-12f);
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int w = 0; w < num_warps; w++) acc += s_partial_v[w * head_dim + d];
+        output[qh * head_dim + d] = acc * inv_sum;
+    }
+}
+
+extern "C" __global__ void gqa_attention_tq4(
+    float* __restrict__ output,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_norm_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const unsigned short* __restrict__ v_meta_cache,
+    const unsigned char* __restrict__ v_idx_cache,
+    const float* __restrict__ signs,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int max_seq
+) {
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+    (void)max_seq;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int lane_id = tid & 31;
+    int warp_id = tid >> 5;
+    int num_warps = num_threads >> 5;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int packed_hd = (head_dim + 1) >> 1;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_reduce = smem + head_dim;
+    float* s_partial_v = smem_reduce + 2 * num_warps;
+
+    const float* q_head = q + qh * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        s_q[d] = q_head[d];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (int d = 0; d < head_dim; d++) s_q[d] *= signs[d];
+        fht_shared_serial(s_q, head_dim);
+        float inv_sqrt_hd = rsqrtf((float)head_dim);
+        for (int d = 0; d < head_dim; d++) s_q[d] *= inv_sqrt_hd;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int pos = tid; pos < seq_len; pos += num_threads) {
+        int token_head = pos * num_kv_heads + kv_head;
+        float kn = __half2float(*reinterpret_cast<const __half*>(
+            &k_norm_cache[token_head]));
+        const unsigned char* k_pack = k_idx_cache + token_head * packed_hd;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            unsigned char p = k_pack[d >> 1];
+            int idx = ((d & 1) == 0) ? (p & 0xF) : (p >> 4);
+            score += s_q[d] * kn * tq4_codebook_value(idx, head_dim);
+        }
+        local_max = fmaxf(local_max, score * sm_scale);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) m = fmaxf(m, smem_reduce[w]);
+        smem_reduce[0] = m;
+    }
+    __syncthreads();
+    float global_max = smem_reduce[0];
+
+    float local_sum_exp = 0.0f;
+    for (int d = lane_id; d < head_dim; d += 32) {
+        s_partial_v[warp_id * head_dim + d] = 0.0f;
+    }
+    __syncwarp();
+
+    for (int pos = warp_id; pos < seq_len; pos += num_warps) {
+        int token_head = pos * num_kv_heads + kv_head;
+        float kn = __half2float(*reinterpret_cast<const __half*>(
+            &k_norm_cache[token_head]));
+        const unsigned char* k_pack = k_idx_cache + token_head * packed_hd;
+        float score_partial = 0.0f;
+        for (int d = lane_id; d < head_dim; d += 32) {
+            unsigned char p = k_pack[d >> 1];
+            int idx = ((d & 1) == 0) ? (p & 0xF) : (p >> 4);
+            score_partial += s_q[d] * kn * tq4_codebook_value(idx, head_dim);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
+        }
+        float w = __expf(__shfl_sync(0xffffffff, score_partial, 0) * sm_scale - global_max);
+        local_sum_exp += w;
+
+        float v_scale = __half2float(*reinterpret_cast<const __half*>(
+            &v_meta_cache[token_head * 2]));
+        float v_zero = __half2float(*reinterpret_cast<const __half*>(
+            &v_meta_cache[token_head * 2 + 1]));
+        const unsigned char* v_pack = v_idx_cache + token_head * packed_hd;
+        for (int d = lane_id; d < head_dim; d += 32) {
+            unsigned char p = v_pack[d >> 1];
+            int idx = ((d & 1) == 0) ? (p & 0xF) : (p >> 4);
+            s_partial_v[warp_id * head_dim + d] += w * (v_zero + v_scale * (float)idx);
+        }
+    }
+
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum_exp;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+
+    float inv_sum = 1.0f / (smem_reduce[0] + 1e-12f);
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int w = 0; w < num_warps; w++) acc += s_partial_v[w * head_dim + d];
+        output[qh * head_dim + d] = acc * inv_sum;
+    }
+}
+
 // ── Graph-compatible Polar4 kernels ──────────────────────────────────
 // These read position/seq_len from device pointers so values can change
 // between CUDA graph replays without recapturing.
@@ -7252,6 +8341,226 @@ extern "C" __global__ void kv_cache_write_k8v4_g(
     }
     __nv_bfloat16 v_rb = __float2bfloat16(v_r);
     v_radius_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+}
+
+extern "C" __global__ void kv_cache_write_k6v4_g(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_radius_cache,
+    unsigned char* __restrict__ v_angles_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const int* __restrict__ d_position,
+    int kv_stride,
+    int norm_correction
+) {
+    int position = *d_position;
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = kv_stride / 16;
+    if (block_idx >= num_blocks) return;
+
+    int offset = block_idx * 16;
+    float k_local[16];
+    float v_local[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_local[i] = k[offset + i];
+        v_local[i] = v[offset + i] * polar4_signs[i];
+    }
+
+    unsigned char codes[16];
+    float k_scale = quantize_k6_one_pass_ls(k_local, codes);
+    unsigned char* k_pack = k_idx_cache + (position * num_blocks + block_idx) * 12;
+    pack_k6_16(k_pack, codes);
+    __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+    k_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+    fht16(v_local);
+    #pragma unroll
+    for (int i = 0; i < 16; i++) v_local[i] *= 0.25f;
+
+    float v_r = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) v_r += v_local[i] * v_local[i];
+    v_r = sqrtf(v_r + 1e-12f);
+
+    float inv_v_r = 1.0f / v_r;
+    unsigned char* v_ang = v_angles_cache + (position * num_blocks + block_idx) * 8;
+    float v_qnorm2 = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int v0 = quantize_polar4(v_local[i*2] * inv_v_r);
+        int v1 = quantize_polar4(v_local[i*2+1] * inv_v_r);
+        v_ang[i] = (unsigned char)((v1 << 4) | v0);
+        float v0v = polar4_codebook[v0];
+        float v1v = polar4_codebook[v1];
+        v_qnorm2 += v0v * v0v + v1v * v1v;
+    }
+    if (norm_correction & 2) {
+        v_r = v_r / sqrtf(v_qnorm2 + 1e-12f);
+    }
+    __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+    v_radius_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+}
+
+extern "C" __global__ void kv_cache_write_k7v4_g(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_radius_cache,
+    unsigned char* __restrict__ v_angles_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const int* __restrict__ d_position,
+    int kv_stride,
+    int norm_correction
+) {
+    int position = *d_position;
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = kv_stride / 16;
+    if (block_idx >= num_blocks) return;
+
+    int offset = block_idx * 16;
+    float k_local[16];
+    float v_local[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_local[i] = k[offset + i];
+        v_local[i] = v[offset + i] * polar4_signs[i];
+    }
+
+    unsigned char codes[16];
+    float k_scale = quantize_k7_one_pass_ls(k_local, codes);
+    unsigned char* k_pack = k_idx_cache + (position * num_blocks + block_idx) * 14;
+    pack_k7_16(k_pack, codes);
+    __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+    k_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+    fht16(v_local);
+    #pragma unroll
+    for (int i = 0; i < 16; i++) v_local[i] *= 0.25f;
+
+    float v_r = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) v_r += v_local[i] * v_local[i];
+    v_r = sqrtf(v_r + 1e-12f);
+
+    float inv_v_r = 1.0f / v_r;
+    unsigned char* v_ang = v_angles_cache + (position * num_blocks + block_idx) * 8;
+    float v_qnorm2 = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int v0 = quantize_polar4(v_local[i*2] * inv_v_r);
+        int v1 = quantize_polar4(v_local[i*2+1] * inv_v_r);
+        v_ang[i] = (unsigned char)((v1 << 4) | v0);
+        float v0v = polar4_codebook[v0];
+        float v1v = polar4_codebook[v1];
+        v_qnorm2 += v0v * v0v + v1v * v1v;
+    }
+    if (norm_correction & 2) {
+        v_r = v_r / sqrtf(v_qnorm2 + 1e-12f);
+    }
+    __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+    v_radius_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+}
+
+extern "C" __global__ void kv_cache_write_k6v6_g(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_scale_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const int* __restrict__ d_position,
+    int kv_stride,
+    int norm_correction
+) {
+    (void)norm_correction;
+    int position = *d_position;
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = kv_stride / 16;
+    if (block_idx >= num_blocks) return;
+
+    int offset = block_idx * 16;
+    float k_local[16];
+    float v_local[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_local[i] = k[offset + i];
+        v_local[i] = v[offset + i];
+    }
+
+    unsigned char codes[16];
+    float k_scale = quantize_k6_one_pass_ls(k_local, codes);
+    unsigned char* k_pack = k_idx_cache + (position * num_blocks + block_idx) * 12;
+    pack_k6_16(k_pack, codes);
+    __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+    k_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+    float v_scale = quantize_k6_one_pass_ls(v_local, codes);
+    unsigned char* v_pack = v_idx_cache + (position * num_blocks + block_idx) * 12;
+    pack_k6_16(v_pack, codes);
+    __nv_bfloat16 v_sb = __float2bfloat16(v_scale);
+    v_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_sb);
+}
+
+extern "C" __global__ void kv_cache_write_k8v6_g(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_scale_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const int* __restrict__ d_position,
+    int kv_stride,
+    int norm_correction
+) {
+    (void)norm_correction;
+    int position = *d_position;
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = kv_stride / 16;
+    if (block_idx >= num_blocks) return;
+
+    int offset = block_idx * 16;
+    float k_local[16];
+    float v_local[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        k_local[i] = k[offset + i];
+        v_local[i] = v[offset + i];
+    }
+
+    unsigned char codes[16];
+    float k_scale = quantize_k8_one_pass_ls(k_local, codes);
+    unsigned char* k_pack = k_idx_cache + (position * num_blocks + block_idx) * 16;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) k_pack[i] = codes[i];
+    __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+    k_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+    float v_scale = quantize_k6_one_pass_ls(v_local, codes);
+    unsigned char* v_pack = v_idx_cache + (position * num_blocks + block_idx) * 12;
+    pack_k6_16(v_pack, codes);
+    __nv_bfloat16 v_sb = __float2bfloat16(v_scale);
+    v_scale_cache[position * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_sb);
+}
+
+extern "C" __global__ void kv_cache_write_tq4_g(
+    unsigned short* __restrict__ k_norm_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_meta_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ signs,
+    const int* __restrict__ d_position,
+    int num_kv_heads,
+    int head_dim
+) {
+    int kv_head = blockIdx.x;
+    if (kv_head >= num_kv_heads || threadIdx.x != 0) return;
+    extern __shared__ float scratch[];
+    tq4_store_head(k_norm_cache, k_idx_cache, v_meta_cache, v_idx_cache,
+                   k, v, signs, *d_position, kv_head, num_kv_heads, head_dim, scratch);
 }
 
 extern "C" __global__ void gqa_attention_polar4_g(
@@ -7671,6 +8980,140 @@ extern "C" __global__ void gqa_attention_k8v4_tiled_g(
     // Step 4: Unnormalised weighted V sum in the rotated Hadamard domain.
     float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
     for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        int b = d >> 4;
+        int block_idx = block_offset_in_head + b;
+        int sub_idx = d & 15;
+        int byte_idx = sub_idx >> 1;
+        bool is_high = (sub_idx & 1) != 0;
+        for (int i = 0; i < tile_len; i++) {
+            int pos = tile_start + i;
+            float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &v_radius_cache[pos * num_blocks + block_idx]));
+            unsigned char p = v_angles_cache[(pos * num_blocks + block_idx) * 8 + byte_idx];
+            float v_val = is_high
+                ? r * polar4_codebook[p >> 4]
+                : r * polar4_codebook[p & 0xF];
+            acc += smem_scores[i] * v_val;
+        }
+        out_partial[d] = acc;
+    }
+
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * max_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
+    }
+}
+
+// Tiled k6v4 GQA attention (graph-compatible): INT6 K scores, Polar4 V output.
+// Partial outputs are in the rotated Hadamard domain and are reduced by
+// gqa_attention_polar4_reduce_g.
+extern "C" __global__ void gqa_attention_k6v4_tiled_g(
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_lse,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const unsigned short* __restrict__ v_radius_cache,
+    const unsigned char* __restrict__ v_angles_cache,
+    float sm_scale,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int tile_size
+) {
+    int num_q_heads = gridDim.x;
+    int max_tiles = gridDim.y;
+
+    int seq_len = *d_seq_len;
+    int qh = blockIdx.x;
+    int tile_idx = (int)blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    int num_blocks = kv_stride / 16;
+    int block_offset_in_head = (kv_head * head_dim) / 16;
+
+    int tile_start = tile_idx * tile_size;
+    int tile_end = min(tile_start + tile_size, seq_len);
+    int tile_len = tile_end - tile_start;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
+
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    const float* q_head = q + qh * head_dim;
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        float score = 0.0f;
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 12;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[b * 16 + j] * scale * (float)(unpack_k6(k_pack, j) - 32);
+            }
+        }
+        smem_scores[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem_scores[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = __expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
         int b = d >> 4;
         int block_idx = block_offset_in_head + b;
         int sub_idx = d & 15;
@@ -7686,6 +9129,522 @@ extern "C" __global__ void gqa_attention_k8v4_tiled_g(
                 ? r * polar4_codebook[p >> 4]
                 : r * polar4_codebook[p & 0xF];
             acc += smem_scores[i] * v_val;
+        }
+        out_partial[d] = acc;
+    }
+
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * max_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
+    }
+}
+
+// Tiled k7v4 GQA attention (graph-compatible): INT7 K scores, Polar4 V output.
+// Partial outputs are in the rotated Hadamard domain and are reduced by
+// gqa_attention_polar4_reduce_g.
+extern "C" __global__ void gqa_attention_k7v4_tiled_g(
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_lse,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const unsigned short* __restrict__ v_radius_cache,
+    const unsigned char* __restrict__ v_angles_cache,
+    float sm_scale,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int tile_size
+) {
+    int num_q_heads = gridDim.x;
+    int max_tiles = gridDim.y;
+
+    int seq_len = *d_seq_len;
+    int qh = blockIdx.x;
+    int tile_idx = (int)blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    int num_blocks = kv_stride / 16;
+    int block_offset_in_head = (kv_head * head_dim) / 16;
+
+    int tile_start = tile_idx * tile_size;
+    int tile_end = min(tile_start + tile_size, seq_len);
+    int tile_len = tile_end - tile_start;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
+
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    const float* q_head = q + qh * head_dim;
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        float score = 0.0f;
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 14;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[b * 16 + j] * scale * (float)(unpack_k7(k_pack, j) - 64);
+            }
+        }
+        smem_scores[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem_scores[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = __expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        int b = d >> 4;
+        int block_idx = block_offset_in_head + b;
+        int sub_idx = d & 15;
+        int byte_idx = sub_idx >> 1;
+        bool is_high = (sub_idx & 1) != 0;
+        float acc = 0.0f;
+        for (int i = 0; i < tile_len; i++) {
+            int pos = tile_start + i;
+            float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &v_radius_cache[pos * num_blocks + block_idx]));
+            unsigned char p = v_angles_cache[(pos * num_blocks + block_idx) * 8 + byte_idx];
+            float v_val = is_high
+                ? r * polar4_codebook[p >> 4]
+                : r * polar4_codebook[p & 0xF];
+            acc += smem_scores[i] * v_val;
+        }
+        out_partial[d] = acc;
+    }
+
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * max_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
+    }
+}
+
+// Tiled k6v6 GQA attention (graph-compatible): INT6 K scores, INT6 V output.
+// Partial outputs are in the original V domain and use gqa_attention_reduce_g.
+extern "C" __global__ void gqa_attention_k6v6_tiled_g(
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_lse,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const unsigned short* __restrict__ v_scale_cache,
+    const unsigned char* __restrict__ v_idx_cache,
+    float sm_scale,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int tile_size
+) {
+    int num_q_heads = gridDim.x;
+    int max_tiles = gridDim.y;
+
+    int seq_len = *d_seq_len;
+    int qh = blockIdx.x;
+    int tile_idx = (int)blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    int num_blocks = kv_stride / 16;
+    int block_offset_in_head = (kv_head * head_dim) / 16;
+
+    int tile_start = tile_idx * tile_size;
+    int tile_end = min(tile_start + tile_size, seq_len);
+    int tile_len = tile_end - tile_start;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
+
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    const float* q_head = q + qh * head_dim;
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        float score = 0.0f;
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 12;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[b * 16 + j] * scale * (float)(unpack_k6(k_pack, j) - 32);
+            }
+        }
+        smem_scores[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem_scores[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = __expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        int block_idx = block_offset_in_head + (d >> 4);
+        float acc = 0.0f;
+        for (int i = 0; i < tile_len; i++) {
+            int pos = tile_start + i;
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &v_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* v_pack = v_idx_cache + (pos * num_blocks + block_idx) * 12;
+            acc += smem_scores[i] * scale * (float)(unpack_k6(v_pack, d & 15) - 32);
+        }
+        out_partial[d] = acc;
+    }
+
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * max_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
+    }
+}
+
+// Tiled k8v6 GQA attention (graph-compatible): INT8 K scores, INT6 V output.
+// Partial outputs are in the original V domain and use gqa_attention_reduce_g.
+extern "C" __global__ void gqa_attention_k8v6_tiled_g(
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_lse,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const unsigned short* __restrict__ v_scale_cache,
+    const unsigned char* __restrict__ v_idx_cache,
+    float sm_scale,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int tile_size
+) {
+    int num_q_heads = gridDim.x;
+    int max_tiles = gridDim.y;
+
+    int seq_len = *d_seq_len;
+    int qh = blockIdx.x;
+    int tile_idx = (int)blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+    int num_blocks = kv_stride / 16;
+    int block_offset_in_head = (kv_head * head_dim) / 16;
+
+    int tile_start = tile_idx * tile_size;
+    int tile_end = min(tile_start + tile_size, seq_len);
+    int tile_len = tile_end - tile_start;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
+
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    const float* q_head = q + qh * head_dim;
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        float score = 0.0f;
+        for (int b = 0; b < head_dim / 16; b++) {
+            int block_idx = block_offset_in_head + b;
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (pos * num_blocks + block_idx) * 16;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[b * 16 + j] * scale * (float)((int)k_pack[j] - 128);
+            }
+        }
+        smem_scores[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem_scores[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = __expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        int block_idx = block_offset_in_head + (d >> 4);
+        float acc = 0.0f;
+        for (int i = 0; i < tile_len; i++) {
+            int pos = tile_start + i;
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &v_scale_cache[pos * num_blocks + block_idx]));
+            const unsigned char* v_pack = v_idx_cache + (pos * num_blocks + block_idx) * 12;
+            acc += smem_scores[i] * scale * (float)(unpack_k6(v_pack, d & 15) - 32);
+        }
+        out_partial[d] = acc;
+    }
+
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * max_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
+    }
+}
+
+extern "C" __global__ void gqa_attention_tq4_tiled_g(
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_lse,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_norm_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const unsigned short* __restrict__ v_meta_cache,
+    const unsigned char* __restrict__ v_idx_cache,
+    const float* __restrict__ signs,
+    float sm_scale,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int tile_size
+) {
+    int num_q_heads = gridDim.x;
+    int max_tiles = gridDim.y;
+    int seq_len = *d_seq_len;
+    int qh = blockIdx.x;
+    int tile_idx = (int)blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int packed_hd = (head_dim + 1) >> 1;
+    int tile_start = tile_idx * tile_size;
+    int tile_end = min(tile_start + tile_size, seq_len);
+    int tile_len = tile_end - tile_start;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
+
+    const float* q_head = q + qh * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        s_q[d] = q_head[d];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (int d = 0; d < head_dim; d++) s_q[d] *= signs[d];
+        fht_shared_serial(s_q, head_dim);
+        float inv_sqrt_hd = rsqrtf((float)head_dim);
+        for (int d = 0; d < head_dim; d++) s_q[d] *= inv_sqrt_hd;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        int token_head = pos * num_kv_heads + kv_head;
+        float kn = __half2float(*reinterpret_cast<const __half*>(
+            &k_norm_cache[token_head]));
+        const unsigned char* k_pack = k_idx_cache + token_head * packed_hd;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            unsigned char p = k_pack[d >> 1];
+            int idx = ((d & 1) == 0) ? (p & 0xF) : (p >> 4);
+            score += s_q[d] * kn * tq4_codebook_value(idx, head_dim);
+        }
+        smem_scores[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem_scores[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = __expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int i = 0; i < tile_len; i++) {
+            int pos = tile_start + i;
+            int token_head = pos * num_kv_heads + kv_head;
+            float v_scale = __half2float(*reinterpret_cast<const __half*>(
+                &v_meta_cache[token_head * 2]));
+            float v_zero = __half2float(*reinterpret_cast<const __half*>(
+                &v_meta_cache[token_head * 2 + 1]));
+            const unsigned char* v_pack = v_idx_cache + token_head * packed_hd;
+            unsigned char p = v_pack[d >> 1];
+            int idx = ((d & 1) == 0) ? (p & 0xF) : (p >> 4);
+            acc += smem_scores[i] * (v_zero + v_scale * (float)idx);
         }
         out_partial[d] = acc;
     }

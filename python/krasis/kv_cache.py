@@ -61,6 +61,11 @@ class PagedKVCache:
             "bfloat16": "bf16",
             "polar4": "polar4",
             "k8v4": "k8v4",
+            "k8v6": "k8v6",
+            "k7v4": "k7v4",
+            "k6v6": "k6v6",
+            "k6v4": "k6v4",
+            "tq4": "tq4",
         }
         self.kv_format_str = kv_aliases.get(kv_format, kv_format)
         self.kv_format = 0  # bf16
@@ -70,6 +75,16 @@ class PagedKVCache:
             self.kv_format = 2
         elif self.kv_format_str == "k8v4":
             self.kv_format = 3
+        elif self.kv_format_str == "tq4":
+            self.kv_format = 4
+        elif self.kv_format_str == "k6v4":
+            self.kv_format = 5
+        elif self.kv_format_str == "k7v4":
+            self.kv_format = 6
+        elif self.kv_format_str == "k6v6":
+            self.kv_format = 7
+        elif self.kv_format_str == "k8v6":
+            self.kv_format = 8
 
         # Compute cache dimensions based on attention type
         if cfg.is_mla:
@@ -193,6 +208,70 @@ class PagedKVCache:
                     + self.v_angles_cache.nbytes
                 ) / (1024**2)
                 layout_str = "gqa-k8v4"
+            elif self.kv_format in (5, 6, 7, 8):
+                # k6v4/k7v4: integer K plus Polar4 V. k6v6/k8v6 use
+                # the same slots with integer V scale/indices instead.
+                num_blocks = (self.num_kv_heads * self.gqa_head_dim) // 16
+                k_packed_bytes = 16 if self.kv_format == 8 else 14 if self.kv_format == 6 else 12
+                v_packed_bytes = 12 if self.kv_format in (7, 8) else 8
+                self.k_radius_cache = torch.zeros(
+                    num_layers, max_pages, page_size, num_blocks,
+                    dtype=torch.bfloat16, device=device,
+                )
+                self.k_angles_cache = torch.zeros(
+                    num_layers, max_pages, page_size, num_blocks * k_packed_bytes,
+                    dtype=torch.uint8, device=device,
+                )
+                self.v_radius_cache = torch.zeros(
+                    num_layers, max_pages, page_size, num_blocks,
+                    dtype=torch.bfloat16, device=device,
+                )
+                self.v_angles_cache = torch.zeros(
+                    num_layers, max_pages, page_size, num_blocks * v_packed_bytes,
+                    dtype=torch.uint8, device=device,
+                )
+                alloc_mb = (
+                    self.k_radius_cache.nbytes
+                    + self.k_angles_cache.nbytes
+                    + self.v_radius_cache.nbytes
+                    + self.v_angles_cache.nbytes
+                ) / (1024**2)
+                if self.kv_format == 8:
+                    layout_str = "gqa-k8v6"
+                elif self.kv_format == 7:
+                    layout_str = "gqa-k6v6"
+                elif self.kv_format == 6:
+                    layout_str = "gqa-k7v4"
+                else:
+                    layout_str = "gqa-k6v4"
+            elif self.kv_format == 4:
+                # tq4: K uses 4-bit Lloyd-Max indices + FP16 norm per KV
+                # head; V uses 4-bit uniform indices + FP16 scale/zero per KV
+                # head. Index tensors pack two 4-bit values per byte.
+                packed_per_token = self.num_kv_heads * ((self.gqa_head_dim + 1) // 2)
+                self.k_radius_cache = torch.zeros(
+                    num_layers, max_pages, page_size, self.num_kv_heads,
+                    dtype=torch.float16, device=device,
+                )
+                self.k_angles_cache = torch.zeros(
+                    num_layers, max_pages, page_size, packed_per_token,
+                    dtype=torch.uint8, device=device,
+                )
+                self.v_radius_cache = torch.zeros(
+                    num_layers, max_pages, page_size, self.num_kv_heads * 2,
+                    dtype=torch.float16, device=device,
+                )
+                self.v_angles_cache = torch.zeros(
+                    num_layers, max_pages, page_size, packed_per_token,
+                    dtype=torch.uint8, device=device,
+                )
+                alloc_mb = (
+                    self.k_radius_cache.nbytes
+                    + self.k_angles_cache.nbytes
+                    + self.v_radius_cache.nbytes
+                    + self.v_angles_cache.nbytes
+                ) / (1024**2)
+                layout_str = "gqa-tq4"
             else:
                 # GQA: separate K and V caches [layers, pages, page_size, heads, head_dim]
                 self.k_cache = torch.zeros(
@@ -246,6 +325,32 @@ class PagedKVCache:
             kv_elems = self.num_kv_heads * self.gqa_head_dim
             num_blocks = kv_elems // 16
             return self.page_size * (kv_elems + num_blocks * 10) * self.num_layers
+        if self.kv_format == 5:
+            # k6v4: K scale + 12 packed bytes per 16 elements, plus Polar4 V.
+            kv_elems = self.num_kv_heads * self.gqa_head_dim
+            num_blocks = kv_elems // 16
+            return self.page_size * (num_blocks * 14 + num_blocks * 10) * self.num_layers
+        if self.kv_format == 6:
+            # k7v4: K scale + 14 packed bytes per 16 elements, plus Polar4 V.
+            kv_elems = self.num_kv_heads * self.gqa_head_dim
+            num_blocks = kv_elems // 16
+            return self.page_size * (num_blocks * 16 + num_blocks * 10) * self.num_layers
+        if self.kv_format == 7:
+            # k6v6: K and V each use scale + 12 packed bytes per 16 elements.
+            kv_elems = self.num_kv_heads * self.gqa_head_dim
+            num_blocks = kv_elems // 16
+            return self.page_size * (num_blocks * 14 + num_blocks * 14) * self.num_layers
+        if self.kv_format == 8:
+            # k8v6: K uses scale + 16 INT8 bytes; V uses scale + 12 INT6 bytes.
+            kv_elems = self.num_kv_heads * self.gqa_head_dim
+            num_blocks = kv_elems // 16
+            return self.page_size * (num_blocks * 18 + num_blocks * 14) * self.num_layers
+        if self.kv_format == 4:
+            # tq4: per token/layer = K packed indices + K norms + V packed
+            # indices + V scale/zero. This stays exact for arbitrary head_dim.
+            packed_per_token = self.num_kv_heads * ((self.gqa_head_dim + 1) // 2)
+            meta_per_token = self.num_kv_heads * 6  # 2-byte K norm + 2-byte V scale + 2-byte V zero
+            return self.page_size * (packed_per_token * 2 + meta_per_token) * self.num_layers
 
         elem_size = 1 if self.kv_dtype == torch.float8_e4m3fn else 2
         return self.page_size * self.kv_cache_dim * elem_size * self.num_layers

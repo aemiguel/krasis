@@ -694,9 +694,9 @@ def main():
     parser.add_argument("--port", type=int, default=8012)
     parser.add_argument("--krasis-threads", type=int, default=40,
                         help="CPU threads for expert computation")
-    parser.add_argument("--kv-dtype", default="polar4",
-                        choices=["polar4", "k8v4", "fp8_e4m3", "bf16"],
-                        help="KV cache format: polar4, k8v4 (FP8 K + Polar4 V), fp8_e4m3, or bf16")
+    parser.add_argument("--kv-dtype", default="k6v6",
+                        choices=["polar4", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", "tq4", "fp8_e4m3", "bf16"],
+                        help="KV cache format: k6v6 Quality default, k6v4 Compact, bf16 Full Precision, or explicit internal formats")
     parser.add_argument("--kv-cache-mb", type=int, default=1000,
                         help="KV cache size in MB (default: 1000)")
     parser.add_argument("--heatmap-path", default=None,
@@ -886,10 +886,10 @@ def main():
     global _model, _model_name
     import torch
 
-    kv_format_str = args.kv_dtype  # "fp8_e4m3", "bf16", "polar4", or "k8v4"
+    kv_format_str = args.kv_dtype  # "fp8_e4m3", "bf16", "polar4", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", or "tq4"
     if args.kv_dtype == "fp8_e4m3":
         kv_dtype = torch.float8_e4m3fn
-    elif args.kv_dtype in ("polar4", "k8v4"):
+    elif args.kv_dtype in ("polar4", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", "tq4"):
         kv_dtype = torch.float8_e4m3fn  # base dtype for size calc; custom formats allocate their own tensors
     else:
         kv_dtype = torch.bfloat16

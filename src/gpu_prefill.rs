@@ -2371,7 +2371,17 @@ pub struct PrefillKernels {
     kv_concat_bf16: RawCuFunc,
     kv_cache_append_polar4: RawCuFunc,
     kv_cache_append_k8v4: RawCuFunc,
+    kv_cache_append_k6v4: RawCuFunc,
+    kv_cache_append_k7v4: RawCuFunc,
+    kv_cache_append_k6v6: RawCuFunc,
+    kv_cache_append_k8v6: RawCuFunc,
+    kv_cache_append_tq4: RawCuFunc,
     kv_dequant_concat_polar4: RawCuFunc,
+    kv_dequant_concat_k6: RawCuFunc,
+    kv_dequant_concat_k7: RawCuFunc,
+    kv_dequant_concat_k8: RawCuFunc,
+    kv_dequant_concat_tq4_k: RawCuFunc,
+    kv_dequant_concat_tq4_v: RawCuFunc,
     causal_conv1d: RawCuFunc,
     mamba2_ssd: RawCuFunc,
     mamba2_extract: RawCuFunc,
@@ -3090,7 +3100,7 @@ pub struct PrefillEngine {
     pub kv_k_ptrs: Vec<u64>, // per-layer K cache pointers (FP8)
     pub kv_v_ptrs: Vec<u64>, // per-layer V cache pointers (FP8)
     pub kv_max_seq: usize,
-    /// KV cache format: 0=bf16, 1=fp8, 2=polar4
+    /// KV cache format: 0=bf16, 1=fp8, 2=polar4, 3=k8v4, 4=tq4, 5=k6v4, 6=k7v4, 7=k6v6, 8=k8v6
     pub kv_format: u32,
     /// Opt-in Polar4 radius norm correction mode.
     /// 0=off, 1=K only, 2=V only, 3=K+V. Cache layout is unchanged.
@@ -3100,6 +3110,7 @@ pub struct PrefillEngine {
     pub kv_v_radius_ptrs: Vec<u64>,
     pub kv_k_angles_ptrs: Vec<u64>,
     pub kv_v_angles_ptrs: Vec<u64>,
+    pub kv_tq4_sign_ptrs: Vec<u64>,
     pub kv_num_blocks: usize,
     pub stream: cuda_sys::CUstream,
     pub copy_stream: cuda_sys::CUstream,
@@ -12388,13 +12399,172 @@ impl PrefillEngine {
                     self.gqa_fa2_calls.set(self.gqa_fa2_calls.get() + 1);
                     self.gqa_bf16_calls.set(self.gqa_bf16_calls.get() + 1);
                 }
-            } else if self.kv_format == 3
-                && layer_k_ptr != 0
+            } else if self.kv_format == 4
+                && layer_idx < self.kv_k_radius_ptrs.len()
+                && layer_idx < self.kv_tq4_sign_ptrs.len()
+                && self.kv_k_radius_ptrs[layer_idx] != 0
+                && self.kv_tq4_sign_ptrs[layer_idx] != 0
+            {
+                attn_path = "fa2_tq4_cross_chunk";
+                let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+                let total_kv = start_pos + m;
+                let kv_buf_bytes = (total_kv * kv_stride * 2) as u64; // BF16
+                let scratch_bytes =
+                    (self.scratch.d_fp32_scratch.len * std::mem::size_of::<f32>()) as u64;
+                let required_bytes = kv_buf_bytes * 2;
+                if required_bytes > scratch_bytes {
+                    return Err(format!(
+                        "tq4 cross-chunk KV staging needs {} bytes, fp32 scratch has {}",
+                        required_bytes, scratch_bytes
+                    ));
+                }
+                let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
+                let full_k_bf16 = fp32_scratch;
+                let full_v_bf16 = fp32_scratch + kv_buf_bytes;
+
+                let gt_dequant = Instant::now();
+                let total_grid = (total_kv as u32, cfg.num_kv_heads as u32, 1);
+                let k_threads = std::cmp::max(32, ((std::cmp::min(256, cfg.head_dim) + 31) / 32) * 32) as u32;
+                unsafe {
+                    let mut k0 = full_k_bf16;
+                    let mut k1 = self.kv_k_radius_ptrs[layer_idx];
+                    let mut k2 = self.kv_k_angles_ptrs[layer_idx];
+                    let mut k3 = self.kv_tq4_sign_ptrs[layer_idx];
+                    let mut k4 = k;
+                    let mut k5 = start_pos as i32;
+                    let mut k6 = m as i32;
+                    let mut k7 = cfg.num_kv_heads as i32;
+                    let mut k8 = cfg.head_dim as i32;
+                    launch(
+                        self.kernels.kv_dequant_concat_tq4_k,
+                        total_grid,
+                        (k_threads, 1, 1),
+                        (cfg.head_dim * std::mem::size_of::<f32>()) as u32,
+                        self.stream,
+                        &mut [
+                            &mut k0 as *mut _ as *mut std::ffi::c_void,
+                            &mut k1 as *mut _ as *mut std::ffi::c_void,
+                            &mut k2 as *mut _ as *mut std::ffi::c_void,
+                            &mut k3 as *mut _ as *mut std::ffi::c_void,
+                            &mut k4 as *mut _ as *mut std::ffi::c_void,
+                            &mut k5 as *mut _ as *mut std::ffi::c_void,
+                            &mut k6 as *mut _ as *mut std::ffi::c_void,
+                            &mut k7 as *mut _ as *mut std::ffi::c_void,
+                            &mut k8 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+
+                    let mut v0 = full_v_bf16;
+                    let mut v1 = self.kv_v_radius_ptrs[layer_idx];
+                    let mut v2 = self.kv_v_angles_ptrs[layer_idx];
+                    let mut v3 = v;
+                    launch(
+                        self.kernels.kv_dequant_concat_tq4_v,
+                        total_grid,
+                        (k_threads, 1, 1),
+                        0,
+                        self.stream,
+                        &mut [
+                            &mut v0 as *mut _ as *mut std::ffi::c_void,
+                            &mut v1 as *mut _ as *mut std::ffi::c_void,
+                            &mut v2 as *mut _ as *mut std::ffi::c_void,
+                            &mut v3 as *mut _ as *mut std::ffi::c_void,
+                            &mut k5 as *mut _ as *mut std::ffi::c_void,
+                            &mut k6 as *mut _ as *mut std::ffi::c_void,
+                            &mut k7 as *mut _ as *mut std::ffi::c_void,
+                            &mut k8 as *mut _ as *mut std::ffi::c_void,
+                        ],
+                    )?;
+                }
+                if gt {
+                    self.stream_sync()?;
+                    self.t_gqa_kv_prep.set(
+                        self.t_gqa_kv_prep.get() + gt_dequant.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+
+                let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+                let lse_ptr = self
+                    .scratch
+                    .d_fa2_lse
+                    .as_ref()
+                    .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
+                    .unwrap_or(std::ptr::null_mut());
+                let cu_q_data: [i32; 2] = [0, m as i32];
+                let cu_k_data: [i32; 2] = [0, total_kv as i32];
+                let cu_ptr = *self.scratch.d_workspace.device_ptr();
+                let cu_k_ptr = cu_ptr + 8;
+                unsafe {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        cu_ptr,
+                        cu_q_data.as_ptr() as *const _,
+                        8,
+                        self.stream,
+                    );
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        cu_k_ptr,
+                        cu_k_data.as_ptr() as *const _,
+                        8,
+                        self.stream,
+                    );
+                }
+
+                let gt_fa2_bf16 = Instant::now();
+                let ret = unsafe {
+                    fa2_fwd(
+                        q as *const _,
+                        full_k_bf16 as *const _,
+                        full_v_bf16 as *const _,
+                        attn_out as *mut _,
+                        lse_ptr,
+                        cu_ptr as *const _,
+                        cu_k_ptr as *const _,
+                        1,
+                        m as i32,
+                        total_kv as i32,
+                        cfg.num_q_heads as i32,
+                        cfg.num_kv_heads as i32,
+                        cfg.head_dim as i32,
+                        m as i32,
+                        total_kv as i32,
+                        scale,
+                        1,
+                        1,
+                        self.stream as *mut _,
+                    )
+                };
+                if ret != 0 {
+                    return Err(format!(
+                        "FlashAttention-2 tq4 cross-chunk forward failed: {}",
+                        ret
+                    ));
+                }
+                if gt {
+                    self.stream_sync()?;
+                    self.t_gqa_fa2
+                        .set(self.t_gqa_fa2.get() + gt_fa2_bf16.elapsed().as_secs_f64() * 1000.0);
+                    self.gqa_fa2_calls.set(self.gqa_fa2_calls.get() + 1);
+                    self.gqa_bf16_calls.set(self.gqa_bf16_calls.get() + 1);
+                }
+            } else if ((self.kv_format == 3 && layer_k_ptr != 0)
+                || ((self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8)
+                    && layer_idx < self.kv_k_radius_ptrs.len()
+                    && self.kv_k_radius_ptrs[layer_idx] != 0))
                 && layer_idx < self.kv_v_radius_ptrs.len()
                 && self.kv_v_radius_ptrs[layer_idx] != 0
             {
-                attn_path = "fa2_k8v4_cross_chunk";
-                // Cross-chunk attention: reconstruct cached FP8 K and Polar4 V to
+                attn_path = if self.kv_format == 8 {
+                    "fa2_k8v6_cross_chunk"
+                } else if self.kv_format == 7 {
+                    "fa2_k6v6_cross_chunk"
+                } else if self.kv_format == 6 {
+                    "fa2_k7v4_cross_chunk"
+                } else if self.kv_format == 5 {
+                    "fa2_k6v4_cross_chunk"
+                } else {
+                    "fa2_k8v4_cross_chunk"
+                };
+                // Cross-chunk attention: reconstruct cached compressed K and Polar4 V to
                 // BF16, concat current BF16 chunk, then run standard BF16 FA2.
                 let kv_stride = cfg.num_kv_heads * cfg.head_dim;
                 let total_kv = start_pos + m;
@@ -12404,7 +12574,8 @@ impl PrefillEngine {
                 let required_bytes = kv_buf_bytes * 2;
                 if required_bytes > scratch_bytes {
                     return Err(format!(
-                        "k8v4 cross-chunk KV staging needs {} bytes, fp32 scratch has {}",
+                        "{} cross-chunk KV staging needs {} bytes, fp32 scratch has {}",
+                        if self.kv_format == 8 { "k8v6" } else if self.kv_format == 7 { "k6v6" } else if self.kv_format == 6 { "k7v4" } else if self.kv_format == 5 { "k6v4" } else { "k8v4" },
                         required_bytes, scratch_bytes
                     ));
                 }
@@ -12418,36 +12589,72 @@ impl PrefillEngine {
                     std::cmp::max(32, ((std::cmp::min(512, kv_stride) + 31) / 32) * 32) as u32;
                 unsafe {
                     let mut k0 = full_k_bf16;
-                    let mut k1 = layer_k_ptr;
+                    let mut k1 = if self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8 {
+                        self.kv_k_radius_ptrs[layer_idx]
+                    } else {
+                        layer_k_ptr
+                    };
                     let mut k2 = k;
                     let mut k3 = start_pos as i32;
                     let mut k4 = m as i32;
                     let mut k5 = kv_stride as i32;
-                    launch(
-                        self.kernels.kv_dequant_concat,
-                        grid,
-                        (kv_threads, 1, 1),
-                        0,
-                        self.stream,
-                        &mut [
-                            &mut k0 as *mut _ as *mut std::ffi::c_void,
-                            &mut k1 as *mut _ as *mut std::ffi::c_void,
-                            &mut k2 as *mut _ as *mut std::ffi::c_void,
-                            &mut k3 as *mut _ as *mut std::ffi::c_void,
-                            &mut k4 as *mut _ as *mut std::ffi::c_void,
-                            &mut k5 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
+                    if self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8 {
+                        let mut ka = self.kv_k_angles_ptrs[layer_idx];
+                        let dequant_kernel = if self.kv_format == 8 {
+                            self.kernels.kv_dequant_concat_k8
+                        } else if self.kv_format == 6 {
+                            self.kernels.kv_dequant_concat_k7
+                        } else {
+                            self.kernels.kv_dequant_concat_k6
+                        };
+                        launch(
+                            dequant_kernel,
+                            grid,
+                            (kv_threads, 1, 1),
+                            0,
+                            self.stream,
+                            &mut [
+                                &mut k0 as *mut _ as *mut std::ffi::c_void,
+                                &mut k1 as *mut _ as *mut std::ffi::c_void,
+                                &mut ka as *mut _ as *mut std::ffi::c_void,
+                                &mut k2 as *mut _ as *mut std::ffi::c_void,
+                                &mut k3 as *mut _ as *mut std::ffi::c_void,
+                                &mut k4 as *mut _ as *mut std::ffi::c_void,
+                                &mut k5 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    } else {
+                        launch(
+                            self.kernels.kv_dequant_concat,
+                            grid,
+                            (kv_threads, 1, 1),
+                            0,
+                            self.stream,
+                            &mut [
+                                &mut k0 as *mut _ as *mut std::ffi::c_void,
+                                &mut k1 as *mut _ as *mut std::ffi::c_void,
+                                &mut k2 as *mut _ as *mut std::ffi::c_void,
+                                &mut k3 as *mut _ as *mut std::ffi::c_void,
+                                &mut k4 as *mut _ as *mut std::ffi::c_void,
+                                &mut k5 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
 
+                    let mut v0 = full_v_bf16;
+	                    let mut v1 = self.kv_v_radius_ptrs[layer_idx];
+	                    let mut v2 = self.kv_v_angles_ptrs[layer_idx];
+                    let mut v3 = v;
                     let num_blocks = (kv_stride / 16) as u32;
                     let polar_threads =
                         std::cmp::max(32, ((std::cmp::min(256, num_blocks) + 31) / 32) * 32);
-                    let mut v0 = full_v_bf16;
-                    let mut v1 = self.kv_v_radius_ptrs[layer_idx];
-                    let mut v2 = self.kv_v_angles_ptrs[layer_idx];
-                    let mut v3 = v;
-                    launch(
-                        self.kernels.kv_dequant_concat_polar4,
+		                    let v_dequant_kernel = if self.kv_format == 7 || self.kv_format == 8 {
+		                        self.kernels.kv_dequant_concat_k6
+	                    } else {
+	                        self.kernels.kv_dequant_concat_polar4
+	                    };
+	                    launch(
+	                        v_dequant_kernel,
                         grid,
                         (polar_threads, 1, 1),
                         0,
@@ -12522,7 +12729,8 @@ impl PrefillEngine {
                 };
                 if ret != 0 {
                     return Err(format!(
-                        "FlashAttention-2 k8v4 cross-chunk forward failed: {}",
+                        "FlashAttention-2 {} cross-chunk forward failed: {}",
+		                        if self.kv_format == 8 { "k8v6" } else if self.kv_format == 7 { "k6v6" } else if self.kv_format == 6 { "k7v4" } else if self.kv_format == 5 { "k6v4" } else { "k8v4" },
                         ret
                     ));
                 }
@@ -12982,6 +13190,54 @@ impl PrefillEngine {
                 )?;
             }
         } else if capture_kv_cache
+            && self.kv_format == 4
+            && layer_idx < self.kv_k_radius_ptrs.len()
+            && layer_idx < self.kv_tq4_sign_ptrs.len()
+            && self.kv_k_radius_ptrs[layer_idx] != 0
+            && self.kv_tq4_sign_ptrs[layer_idx] != 0
+            && !kv_cache_already_stored
+        {
+            kv_append_path = "tq4_append";
+            let kv_threads = std::cmp::max(
+                32,
+                ((std::cmp::min(256, cfg.head_dim) + 31) / 32) * 32,
+            ) as u32;
+            let mut p0 = self.kv_k_radius_ptrs[layer_idx];
+            let mut p1 = self.kv_k_angles_ptrs[layer_idx];
+            let mut p2 = self.kv_v_radius_ptrs[layer_idx];
+            let mut p3 = self.kv_v_angles_ptrs[layer_idx];
+            let mut p4 = k;
+            let mut p5 = v;
+            let mut p6 = self.kv_tq4_sign_ptrs[layer_idx];
+            let mut p7 = m as i32;
+            let mut p8 = cfg.num_kv_heads as i32;
+            let mut p9 = cfg.head_dim as i32;
+            let mut p10 = self.kv_max_seq as i32;
+            let mut p11 = start_pos as i32;
+            unsafe {
+                launch(
+                    self.kernels.kv_cache_append_tq4,
+                    (m as u32, cfg.num_kv_heads as u32, 1),
+                    (kv_threads, 1, 1),
+                    (cfg.head_dim * std::mem::size_of::<f32>()) as u32,
+                    self.stream,
+                    &mut [
+                        &mut p0 as *mut _ as *mut std::ffi::c_void,
+                        &mut p1 as *mut _ as *mut std::ffi::c_void,
+                        &mut p2 as *mut _ as *mut std::ffi::c_void,
+                        &mut p3 as *mut _ as *mut std::ffi::c_void,
+                        &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        &mut p5 as *mut _ as *mut std::ffi::c_void,
+                        &mut p6 as *mut _ as *mut std::ffi::c_void,
+                        &mut p7 as *mut _ as *mut std::ffi::c_void,
+                        &mut p8 as *mut _ as *mut std::ffi::c_void,
+                        &mut p9 as *mut _ as *mut std::ffi::c_void,
+                        &mut p10 as *mut _ as *mut std::ffi::c_void,
+                        &mut p11 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+        } else if capture_kv_cache
             && self.kv_format == 3
             && layer_k_ptr != 0
             && layer_idx < self.kv_v_radius_ptrs.len()
@@ -13020,6 +13276,62 @@ impl PrefillEngine {
                         &mut p7 as *mut _ as *mut std::ffi::c_void,
                         &mut p8 as *mut _ as *mut std::ffi::c_void,
                         &mut p9 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+        } else if capture_kv_cache
+            && (self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8)
+            && layer_idx < self.kv_k_radius_ptrs.len()
+            && self.kv_k_radius_ptrs[layer_idx] != 0
+            && layer_idx < self.kv_v_radius_ptrs.len()
+            && self.kv_v_radius_ptrs[layer_idx] != 0
+            && !kv_cache_already_stored
+        {
+            let is_k7 = self.kv_format == 6;
+            let is_k6v6 = self.kv_format == 7;
+            let is_k8v6 = self.kv_format == 8;
+            kv_append_path = if is_k8v6 { "k8v6_append" } else if is_k6v6 { "k6v6_append" } else if is_k7 { "k7v4_append" } else { "k6v4_append" };
+            let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
+            let num_blocks = (kv_stride / 16) as u32;
+            let kv_threads = std::cmp::max(32, ((std::cmp::min(256, num_blocks) + 31) / 32) * 32);
+            let mut p0 = self.kv_k_radius_ptrs[layer_idx];
+            let mut p1 = self.kv_k_angles_ptrs[layer_idx];
+            let mut p2 = self.kv_v_radius_ptrs[layer_idx];
+            let mut p3 = self.kv_v_angles_ptrs[layer_idx];
+            let mut p4 = k;
+            let mut p5 = v;
+            let mut p6 = m as i32;
+            let mut p7 = kv_stride;
+            let mut p8 = self.kv_max_seq as i32;
+            let mut p9 = start_pos as i32;
+            let mut p10 = self.polar4_norm_correction_mode;
+            unsafe {
+                launch(
+		                    if is_k8v6 {
+		                        self.kernels.kv_cache_append_k8v6
+		                    } else if is_k6v6 {
+		                        self.kernels.kv_cache_append_k6v6
+	                    } else if is_k7 {
+	                        self.kernels.kv_cache_append_k7v4
+	                    } else {
+                        self.kernels.kv_cache_append_k6v4
+                    },
+                    (m as u32, 1, 1),
+                    (kv_threads, 1, 1),
+                    0,
+                    self.stream,
+                    &mut [
+                        &mut p0 as *mut _ as *mut std::ffi::c_void,
+                        &mut p1 as *mut _ as *mut std::ffi::c_void,
+                        &mut p2 as *mut _ as *mut std::ffi::c_void,
+                        &mut p3 as *mut _ as *mut std::ffi::c_void,
+                        &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        &mut p5 as *mut _ as *mut std::ffi::c_void,
+                        &mut p6 as *mut _ as *mut std::ffi::c_void,
+                        &mut p7 as *mut _ as *mut std::ffi::c_void,
+                        &mut p8 as *mut _ as *mut std::ffi::c_void,
+                        &mut p9 as *mut _ as *mut std::ffi::c_void,
+                        &mut p10 as *mut _ as *mut std::ffi::c_void,
                     ],
                 )?;
             }
@@ -27587,7 +27899,17 @@ impl PrefillKernels {
                     "kv_cache_concat_bf16_kernel",
                     "kv_cache_append_polar4_kernel",
                     "kv_cache_append_k8v4_kernel",
+                    "kv_cache_append_k6v4_kernel",
+                    "kv_cache_append_k7v4_kernel",
+                    "kv_cache_append_k6v6_kernel",
+                    "kv_cache_append_k8v6_kernel",
+                    "kv_cache_append_tq4_kernel",
                     "kv_cache_dequant_concat_polar4_kernel",
+                    "kv_cache_dequant_concat_k6_kernel",
+                    "kv_cache_dequant_concat_k7_kernel",
+                    "kv_cache_dequant_concat_k8_kernel",
+                    "kv_cache_dequant_concat_tq4_k_kernel",
+                    "kv_cache_dequant_concat_tq4_v_kernel",
                     // Optimized LA kernels (BF16 pipeline)
                     "la_fused_conv1d_silu_bf16_kernel",
                     "la_update_conv_state_kernel",
@@ -27673,7 +27995,17 @@ impl PrefillKernels {
             kv_concat_bf16: get("kv_cache_concat_bf16_kernel")?,
             kv_cache_append_polar4: get("kv_cache_append_polar4_kernel")?,
             kv_cache_append_k8v4: get("kv_cache_append_k8v4_kernel")?,
+            kv_cache_append_k6v4: get("kv_cache_append_k6v4_kernel")?,
+            kv_cache_append_k7v4: get("kv_cache_append_k7v4_kernel")?,
+            kv_cache_append_k6v6: get("kv_cache_append_k6v6_kernel")?,
+            kv_cache_append_k8v6: get("kv_cache_append_k8v6_kernel")?,
+            kv_cache_append_tq4: get("kv_cache_append_tq4_kernel")?,
             kv_dequant_concat_polar4: get("kv_cache_dequant_concat_polar4_kernel")?,
+            kv_dequant_concat_k6: get("kv_cache_dequant_concat_k6_kernel")?,
+            kv_dequant_concat_k7: get("kv_cache_dequant_concat_k7_kernel")?,
+            kv_dequant_concat_k8: get("kv_cache_dequant_concat_k8_kernel")?,
+            kv_dequant_concat_tq4_k: get("kv_cache_dequant_concat_tq4_k_kernel")?,
+            kv_dequant_concat_tq4_v: get("kv_cache_dequant_concat_tq4_v_kernel")?,
             causal_conv1d: get("causal_conv1d_fwd_kernel")?,
             mamba2_ssd: get("mamba2_ssd_sequential_kernel")?,
             mamba2_extract: get("mamba2_extract_kernel")?,
@@ -28962,7 +29294,17 @@ mod kernel_tests {
                     "kv_cache_append_fp8_kernel",
                     "kv_cache_append_polar4_kernel",
                     "kv_cache_append_k8v4_kernel",
+                    "kv_cache_append_k6v4_kernel",
+                    "kv_cache_append_k7v4_kernel",
+                    "kv_cache_append_k6v6_kernel",
+                    "kv_cache_append_k8v6_kernel",
+                    "kv_cache_append_tq4_kernel",
                     "kv_cache_dequant_concat_polar4_kernel",
+                    "kv_cache_dequant_concat_k6_kernel",
+                    "kv_cache_dequant_concat_k7_kernel",
+                    "kv_cache_dequant_concat_k8_kernel",
+                    "kv_cache_dequant_concat_tq4_k_kernel",
+                    "kv_cache_dequant_concat_tq4_v_kernel",
                     "flash_attn_tiled_kernel",
                     "la_l2norm_per_head_kernel",
                     "la_compute_gate_beta_kernel",

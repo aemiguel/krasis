@@ -68,6 +68,18 @@ from krasis.tokenizer import Tokenizer
 
 logger = logging.getLogger(__name__)
 
+_TQ4_SEED = 42
+_TQ4_LAYER_SEED_STRIDE = 1337
+
+
+def _tq4_wht_signs(layer_idx: int, head_dim: int, device: torch.device) -> torch.Tensor:
+    """vLLM-style deterministic WHT rotation signs for one attention layer."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(_TQ4_SEED + layer_idx * _TQ4_LAYER_SEED_STRIDE)
+    bits = torch.randint(0, 2, (head_dim,), generator=gen, device="cpu")
+    signs = bits.to(torch.float32).mul_(2.0).sub_(1.0)
+    return signs.to(device=device, non_blocking=True)
+
 
 def _python_trace_enabled(component: str) -> bool:
     if os.environ.get("KRASIS_TRACE") != "1":
@@ -5816,7 +5828,63 @@ class KrasisModel:
         # same GPU buffers that Rust prefill writes. No separate
         # allocation, no D2D export copy between prefill and decode.
         cache = self.kv_caches[0]
-        if cache is not None and cache.kv_format == 3 and cache.k_cache is not None and cache.v_radius_cache is not None:
+        if cache is not None and cache.kv_format == 4 and cache.k_radius_cache is not None:
+            # tq4 KV cache: K norm + packed Lloyd-Max indices, V scale/zero + packed uniform indices.
+            tq4_ptrs = []
+            self._tq4_sign_refs = []
+            gqa_cache_idx = 0
+            for layer_idx, layer in enumerate(self.layers):
+                if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
+                    and not hasattr(layer.attention, 'kv_a_proj')):
+                    kn = cache.k_radius_cache[gqa_cache_idx]
+                    ki = cache.k_angles_cache[gqa_cache_idx]
+                    vm = cache.v_radius_cache[gqa_cache_idx]
+                    vi = cache.v_angles_cache[gqa_cache_idx]
+                    signs = _tq4_wht_signs(layer_idx, cache.gqa_head_dim, cache.device)
+                    self._tq4_sign_refs.append(signs)
+                    gqa_cache_idx += 1
+                    tq4_ptrs.append((layer_idx,
+                                     kn.data_ptr(), ki.data_ptr(),
+                                     vm.data_ptr(), vi.data_ptr(),
+                                     signs.data_ptr()))
+            max_seq = cache.max_pages * cache.page_size
+            store.set_kv_cache_ptrs_tq4(tq4_ptrs, max_seq, cache.num_kv_heads, cache.gqa_head_dim)
+            logger.info("Shared tq4 KV cache: %d GQA layers, max_seq=%d (%d pages × %d), heads=%d head_dim=%d",
+                        len(tq4_ptrs), max_seq, cache.max_pages, cache.page_size,
+                        cache.num_kv_heads, cache.gqa_head_dim)
+        elif cache is not None and cache.kv_format in (5, 6, 7, 8) and cache.k_radius_cache is not None:
+            # k6v4/k7v4/k6v6/k8v6 KV cache: K is blockwise integer + BF16
+            # scale. k6v4/k7v4 use Polar4 V; k6v6/k8v6 use integer V.
+            kintv4_ptrs = []
+            gqa_cache_idx = 0
+            for layer_idx, layer in enumerate(self.layers):
+                if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
+                    and not hasattr(layer.attention, 'kv_a_proj')):
+                    kr = cache.k_radius_cache[gqa_cache_idx]
+                    ka = cache.k_angles_cache[gqa_cache_idx]
+                    vr = cache.v_radius_cache[gqa_cache_idx]
+                    va = cache.v_angles_cache[gqa_cache_idx]
+                    gqa_cache_idx += 1
+                    kintv4_ptrs.append((layer_idx,
+                                        kr.data_ptr(), ka.data_ptr(),
+                                        vr.data_ptr(), va.data_ptr()))
+            max_seq = cache.max_pages * cache.page_size
+            num_blocks = (cache.num_kv_heads * cache.gqa_head_dim) // 16
+            if cache.kv_format == 8:
+                store.set_kv_cache_ptrs_k8v6(kintv4_ptrs, max_seq, num_blocks)
+                fmt = "k8v6"
+            elif cache.kv_format == 7:
+                store.set_kv_cache_ptrs_k6v6(kintv4_ptrs, max_seq, num_blocks)
+                fmt = "k6v6"
+            elif cache.kv_format == 6:
+                store.set_kv_cache_ptrs_k7v4(kintv4_ptrs, max_seq, num_blocks)
+                fmt = "k7v4"
+            else:
+                store.set_kv_cache_ptrs_k6v4(kintv4_ptrs, max_seq, num_blocks)
+                fmt = "k6v4"
+            logger.info("Shared %s KV cache: %d GQA layers, max_seq=%d (%d pages × %d), %d blocks",
+                        fmt, len(kintv4_ptrs), max_seq, cache.max_pages, cache.page_size, num_blocks)
+        elif cache is not None and cache.kv_format == 3 and cache.k_cache is not None and cache.v_radius_cache is not None:
             # k8v4 KV cache: K is FP8, V is Polar4 radius + angle.
             k8v4_ptrs = []
             gqa_cache_idx = 0
@@ -6609,7 +6677,98 @@ class KrasisModel:
 
         # Allocate KV cache on aux GPU for GQA layers in this segment [split_layer..layer_end)
         cache = self.kv_caches[0]
-        if cache is not None and cache.kv_format == 3 and cache.k_cache is not None and cache.v_radius_cache is not None:
+        if cache is not None and cache.kv_format == 4 and cache.k_radius_cache is not None:
+            # tq4 KV cache: K norm/indices plus V scale-zero/indices.
+            tq4_ptrs = []
+            self._aux_tq4_sign_refs = []
+            gqa_cache_idx = 0
+            for layer_idx, layer in enumerate(self.layers):
+                if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
+                    and not hasattr(layer.attention, 'kv_a_proj')):
+                    if split_layer <= layer_idx < layer_end:
+                        kn_src = cache.k_radius_cache[gqa_cache_idx]
+                        ki_src = cache.k_angles_cache[gqa_cache_idx]
+                        vm_src = cache.v_radius_cache[gqa_cache_idx]
+                        vi_src = cache.v_angles_cache[gqa_cache_idx]
+                        kn_aux = torch.empty_like(kn_src, device=aux_device)
+                        ki_aux = torch.empty_like(ki_src, device=aux_device)
+                        vm_aux = torch.empty_like(vm_src, device=aux_device)
+                        vi_aux = torch.empty_like(vi_src, device=aux_device)
+                        signs_aux = _tq4_wht_signs(layer_idx, cache.gqa_head_dim, aux_device)
+                        if not hasattr(self, '_aux_kv_caches'):
+                            self._aux_kv_caches = []
+                        self._aux_kv_caches.extend([kn_aux, ki_aux, vm_aux, vi_aux, signs_aux])
+                        self._aux_tq4_sign_refs.append(signs_aux)
+                        tq4_ptrs.append((layer_idx,
+                                         kn_aux.data_ptr(), ki_aux.data_ptr(),
+                                         vm_aux.data_ptr(), vi_aux.data_ptr(),
+                                         signs_aux.data_ptr()))
+                    else:
+                        kn = cache.k_radius_cache[gqa_cache_idx]
+                        ki = cache.k_angles_cache[gqa_cache_idx]
+                        vm = cache.v_radius_cache[gqa_cache_idx]
+                        vi = cache.v_angles_cache[gqa_cache_idx]
+                        signs = _tq4_wht_signs(layer_idx, cache.gqa_head_dim, cache.device)
+                        self._aux_tq4_sign_refs.append(signs)
+                        tq4_ptrs.append((layer_idx,
+                                         kn.data_ptr(), ki.data_ptr(),
+                                         vm.data_ptr(), vi.data_ptr(),
+                                         signs.data_ptr()))
+                    gqa_cache_idx += 1
+            max_seq = cache.max_pages * cache.page_size
+            store.set_kv_cache_ptrs_tq4(tq4_ptrs, max_seq, cache.num_kv_heads, cache.gqa_head_dim)
+            logger.info("Aux tq4 KV cache on cuda:%d: %d GQA layers for [%d..%d), max_seq=%d, heads=%d head_dim=%d",
+                        gpu_idx, len(tq4_ptrs), split_layer, layer_end, max_seq,
+                        cache.num_kv_heads, cache.gqa_head_dim)
+        elif cache is not None and cache.kv_format in (5, 6, 7, 8) and cache.k_radius_cache is not None:
+            # k6v4/k7v4/k6v6/k8v6 KV cache: K is blockwise integer + BF16
+            # scale. k6v4/k7v4 use Polar4 V; k6v6/k8v6 use integer V.
+            kintv4_ptrs = []
+            gqa_cache_idx = 0
+            for layer_idx, layer in enumerate(self.layers):
+                if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
+                    and not hasattr(layer.attention, 'kv_a_proj')):
+                    if split_layer <= layer_idx < layer_end:
+                        kr_src = cache.k_radius_cache[gqa_cache_idx]
+                        ka_src = cache.k_angles_cache[gqa_cache_idx]
+                        vr_src = cache.v_radius_cache[gqa_cache_idx]
+                        va_src = cache.v_angles_cache[gqa_cache_idx]
+                        kr_aux = torch.empty_like(kr_src, device=aux_device)
+                        ka_aux = torch.empty_like(ka_src, device=aux_device)
+                        vr_aux = torch.empty_like(vr_src, device=aux_device)
+                        va_aux = torch.empty_like(va_src, device=aux_device)
+                        if not hasattr(self, '_aux_kv_caches'):
+                            self._aux_kv_caches = []
+                        self._aux_kv_caches.extend([kr_aux, ka_aux, vr_aux, va_aux])
+                        kintv4_ptrs.append((layer_idx,
+                                            kr_aux.data_ptr(), ka_aux.data_ptr(),
+                                            vr_aux.data_ptr(), va_aux.data_ptr()))
+                    else:
+                        kr = cache.k_radius_cache[gqa_cache_idx]
+                        ka = cache.k_angles_cache[gqa_cache_idx]
+                        vr = cache.v_radius_cache[gqa_cache_idx]
+                        va = cache.v_angles_cache[gqa_cache_idx]
+                        kintv4_ptrs.append((layer_idx,
+                                            kr.data_ptr(), ka.data_ptr(),
+                                            vr.data_ptr(), va.data_ptr()))
+                    gqa_cache_idx += 1
+            max_seq = cache.max_pages * cache.page_size
+            num_blocks = (cache.num_kv_heads * cache.gqa_head_dim) // 16
+            if cache.kv_format == 8:
+                store.set_kv_cache_ptrs_k8v6(kintv4_ptrs, max_seq, num_blocks)
+                fmt = "k8v6"
+            elif cache.kv_format == 7:
+                store.set_kv_cache_ptrs_k6v6(kintv4_ptrs, max_seq, num_blocks)
+                fmt = "k6v6"
+            elif cache.kv_format == 6:
+                store.set_kv_cache_ptrs_k7v4(kintv4_ptrs, max_seq, num_blocks)
+                fmt = "k7v4"
+            else:
+                store.set_kv_cache_ptrs_k6v4(kintv4_ptrs, max_seq, num_blocks)
+                fmt = "k6v4"
+            logger.info("Aux %s KV cache on cuda:%d: %d GQA layers for [%d..%d), max_seq=%d, blocks=%d",
+                        fmt, gpu_idx, len(kintv4_ptrs), split_layer, layer_end, max_seq, num_blocks)
+        elif cache is not None and cache.kv_format == 3 and cache.k_cache is not None and cache.v_radius_cache is not None:
             # k8v4 KV cache: K is FP8, V is Polar4 radius + angle.
             k8v4_ptrs = []
             gqa_cache_idx = 0

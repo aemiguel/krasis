@@ -1381,6 +1381,13 @@ fn handle_reference_test(
     // Disable thinking suppression for reference test (greedy, no thinking budget logic)
     store.set_think_end_suppress(None, 0);
     store.set_min_new_tokens_ext(0, vec![]);
+    let gqa_diag_layer = std::env::var("KRASIS_GQA_DIAG_LAYER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    if let Some(layer_idx) = gqa_diag_layer {
+        store.set_debug_gqa_diag_layer(Some(layer_idx));
+        log::info!("reference_test: enabled GQA decode diagnostic capture for layer {}", layer_idx);
+    }
 
     // ── Greedy decode with logprobs collection ──
     let t_decode = Instant::now();
@@ -1426,6 +1433,23 @@ fn handle_reference_test(
     }
 
     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+    if gqa_diag_layer.is_some() {
+        if let Ok(path) = std::env::var("KRASIS_GQA_DIAG_DUMP") {
+            match store.debug_gqa_diag_json() {
+                Ok(payload) => {
+                    if let Err(e) = std::fs::write(&path, payload) {
+                        log::error!("reference_test: failed to write GQA diagnostic {}: {}", path, e);
+                    } else {
+                        log::info!("reference_test: wrote GQA diagnostic {}", path);
+                    }
+                }
+                Err(e) => {
+                    log::error!("reference_test: failed to capture GQA diagnostic: {}", e);
+                }
+            }
+        }
+        store.set_debug_gqa_diag_layer(None);
+    }
 
     // ── Cleanup ──
     Python::with_gil(|py| {

@@ -76,7 +76,7 @@ Config files use `KEY=VALUE` format. CLI flags override config file values.
 | `--shared-expert-quant` | int8 | Shared expert quant: `int8` or `bf16` |
 | `--dense-mlp-quant` | int8 | Dense MLP quant: `int8` or `bf16` |
 | `--lm-head-quant` | int8 | LM head quant: `int8` or `bf16` |
-| `--kv-dtype` | fp8_e4m3 | KV cache dtype: `fp8_e4m3` or `bf16` |
+| `--kv-dtype` | k6v6 | KV cache format: `k6v6` Quality, `k6v4` Compact, or `bf16` Full Precision |
 
 Legacy `int4`/`int8` values for `--attention-quant` are auto-migrated to `awq`.
 

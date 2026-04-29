@@ -399,7 +399,7 @@ class LauncherConfig:
         self.pp_partition: str = ""
         self.layer_group_size: int = 2  # layers per group (must be even, min 2 for double buffering)
         self.kv_cache_mb: int = 1000
-        self.kv_dtype: str = "polar4"
+        self.kv_dtype: str = "k6v6"
         self.gpu_expert_bits: int = 4
         self.expert_group_size: int = 128
         self.gpu_expert_int4_calib: str = "amax"
@@ -692,7 +692,7 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
         elif current == "hqq4":
             return f"{DIM}{native_label} \u2192 HQQ4SC \u2014 low-memory self-correcting HQQ4{NC}"
         elif current == "hqq8":
-            return f"{DIM}{native_label} \u2192 HQQ8 \u2014 recommended native backend{NC}"
+            return f"{DIM}{native_label} \u2192 HQQ8 \u2014 default native fused two-scale backend{NC}"
         return f"{DIM}{native_label} \u2192 {current}{NC}"
 
     elif config_key == "gpu_expert_bits":
@@ -716,8 +716,18 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
             return f"{DIM}{native_label} \u2192 polar4 \u2014 compact 4-bit{NC}"
         elif current == "k8v4":
             return f"{DIM}{native_label} \u2192 k8v4 \u2014 FP8 K + 4-bit V{NC}"
+        elif current == "k8v6":
+            return f"{DIM}{native_label} \u2192 k8v6 \u2014 INT8 K + INT6 V{NC}"
+        elif current == "k7v4":
+            return f"{DIM}{native_label} \u2192 k7v4 \u2014 INT7 K + 4-bit V{NC}"
+        elif current == "k6v6":
+            return f"{DIM}{native_label} \u2192 k6v6 \u2014 Quality KV, INT6 K + INT6 V{NC}"
+        elif current == "k6v4":
+            return f"{DIM}{native_label} \u2192 k6v4 \u2014 Compact KV, INT6 K + 4-bit V{NC}"
+        elif current == "tq4":
+            return f"{DIM}{native_label} \u2192 tq4 \u2014 4-bit TurboQuant KV{NC}"
         elif current == "bf16":
-            return f"{DIM}{native_label} \u2192 bf16 \u2014 lossless{NC}"
+            return f"{DIM}{native_label} \u2192 bf16 \u2014 Full Precision KV{NC}"
         return f"{DIM}{native_label} \u2192 {current}{NC}"
 
     return ""
@@ -1215,6 +1225,11 @@ class Launcher:
             kv_label = (
                 "polar4" if self.cfg.kv_dtype == "polar4"
                 else "k8v4" if self.cfg.kv_dtype == "k8v4"
+                else "k8v6" if self.cfg.kv_dtype == "k8v6"
+                else "k7v4" if self.cfg.kv_dtype == "k7v4"
+                else "k6v6" if self.cfg.kv_dtype == "k6v6"
+                else "k6v4" if self.cfg.kv_dtype == "k6v4"
+                else "tq4" if self.cfg.kv_dtype == "tq4"
                 else "fp8" if self.cfg.kv_dtype == "fp8_e4m3"
                 else "bf16"
             )
@@ -1321,7 +1336,7 @@ class Launcher:
                     self.cfg.apply_saved(saved)
                     # Interactive TUI keeps KV on the supported default even if
                     # an older config file was saved with an internal mode.
-                    self.cfg.kv_dtype = "polar4"
+                    self.cfg.kv_dtype = "k6v6"
                     # Re-resolve GPUs and PP after loading
                     self._resolve_selected_gpus()
                     if self.model_info:
@@ -1467,13 +1482,13 @@ class Launcher:
         if self.hw["cpu_cores"] > 0:
             self.cfg.krasis_threads = min(self.hw["cpu_cores"], 40)
         # Keep the interactive launcher on the supported user-facing path:
-        # one expert quantization choice, Polar4 KV by default in the TUI.
+        # one expert quantization choice, Quality KV by default in the TUI.
         self.cfg.cpu_expert_bits = self.cfg.gpu_expert_bits
-        self.cfg.kv_dtype = "polar4"
+        self.cfg.kv_dtype = "k6v6"
 
         # Keep the interactive surface to the supported mainstream path.
         # Manual configs and CLI flags can still use other internal modes.
-        self.cfg.kv_dtype = "polar4"
+        self.cfg.kv_dtype = "k6v6"
 
         # Compute initial budget
         self.budget = self._compute_budget()
@@ -1653,6 +1668,11 @@ class Launcher:
             kv_label = (
                 "polar4" if self.cfg.kv_dtype == "polar4"
                 else "k8v4" if self.cfg.kv_dtype == "k8v4"
+                else "k8v6" if self.cfg.kv_dtype == "k8v6"
+                else "k7v4" if self.cfg.kv_dtype == "k7v4"
+                else "k6v6" if self.cfg.kv_dtype == "k6v6"
+                else "k6v4" if self.cfg.kv_dtype == "k6v4"
+                else "tq4" if self.cfg.kv_dtype == "tq4"
                 else "fp8" if self.cfg.kv_dtype == "fp8_e4m3"
                 else "bf16"
             )
@@ -1791,7 +1811,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vram-safety-margin", type=int, default=None,
                         help="VRAM safety margin in MB (default: 600)")
     parser.add_argument("--kv-dtype", default=None,
-                        help="KV cache dtype: fp8_e4m3, polar4, k8v4, or bf16")
+                        help="KV cache format: k6v6 Quality default, k6v4 Compact, bf16 Full Precision, or explicit internal formats")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
                         help="Model quantization: 4 or 8")
     parser.add_argument("--expert-group-size", type=int, default=None, choices=[32, 64, 128],

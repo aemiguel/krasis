@@ -179,11 +179,23 @@ def _lm_head_bytes(cfg: Dict[str, Any]) -> int:
     return cfg["vocab_size"] * cfg["hidden_size"] * 2
 
 
-def _kv_dtype_bytes(kv_cache_dtype: str) -> float:
+def _kv_dtype_bytes(kv_cache_dtype: str, cfg: Optional[Dict[str, Any]] = None) -> float:
+    if kv_cache_dtype == "tq4":
+        # TQ4 stores two 4-bit payload streams plus per-KV-head metadata:
+        # K norm (2 bytes) + V scale/zero (4 bytes). Return bytes per KV
+        # element, where the caller multiplies by K+V element count.
+        if cfg is not None and not _is_mla(cfg):
+            head_dim = cfg.get("head_dim", cfg["hidden_size"] // cfg["num_attention_heads"])
+            return 0.5 + (3.0 / head_dim)
+        return 0.5234375  # exact for head_dim=128
     dtypes = {
         "fp8_e4m3": 1, "fp8_e5m2": 1, "fp8": 1,
         "polar4": 0.625,
         "k8v4": 0.8125,
+        "k8v6": 1.0,
+        "k7v4": 0.8125,
+        "k6v6": 0.875,
+        "k6v4": 0.75,
         "bf16": 2, "bfloat16": 2, "fp16": 2, "float16": 2,
         "auto": 2,
     }
@@ -191,7 +203,7 @@ def _kv_dtype_bytes(kv_cache_dtype: str) -> float:
 
 
 def _kv_bytes_per_token_per_layer(cfg: Dict[str, Any], kv_cache_dtype: str) -> int:
-    dtype_bytes = _kv_dtype_bytes(kv_cache_dtype)
+    dtype_bytes = _kv_dtype_bytes(kv_cache_dtype, cfg)
     if _is_mla(cfg):
         kv_lora = cfg["kv_lora_rank"]
         qk_rope = cfg["qk_rope_head_dim"]
@@ -302,7 +314,7 @@ def compute_launcher_budget(
     model_path: str,
     pp_partition: List[int],
     layer_group_size: int = 1,
-    kv_dtype: str = "polar4",
+    kv_dtype: str = "k6v6",
     gpu_expert_bits: int = 4,
     expert_group_size: int = 128,
     attention_quant: str = "bf16",
@@ -405,7 +417,7 @@ def compute_launcher_budget(
     dense_mlp_params_per_layer = 3 * hidden * dense_inter
 
     # KV bytes per token per layer
-    kv_b = _kv_dtype_bytes(kv_dtype)
+    kv_b = _kv_dtype_bytes(kv_dtype, cfg)
     if is_mla:
         kv_ptl = (cfg["kv_lora_rank"] + cfg["qk_rope_head_dim"]) * kv_b
     else:
@@ -884,8 +896,8 @@ def main():
                         help="Path to HF model directory")
     parser.add_argument("--pp-partition", required=True,
                         help="Comma-separated layer counts per rank (e.g. 20,21,20)")
-    parser.add_argument("--kv-cache-dtype", default="auto",
-                        help="KV cache dtype (fp8_e4m3, polar4, bf16, etc.)")
+    parser.add_argument("--kv-cache-dtype", default="k6v6",
+                        help="KV cache format (default: k6v6 Quality; use k6v4 Compact or bf16 Full Precision)")
     parser.add_argument("--quantization", default="none",
                         help="Non-expert quantization (w8a8_int8 or none)")
     parser.add_argument("--gpu-vram-mb", type=int, default=None,

@@ -1,5 +1,37 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-28 (Phase 2CT QCN k8v4 HQQ8 faster prefill mode)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: QCN HQQ8 attention with `k8v4` KV cache, graph replay enabled, INT4
+GPU/CPU experts, timing instrumentation off. The run used
+`KRASIS_HQQ8_PREFILL_MODE=native-fused-marlin-twoscale`, which keeps the
+two-scale HQQ8 Marlin prefill slope correction but removes the intercept
+correction pass.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| QCN HQQ8/k8v4, INT4 experts, two-scale no-intercept | 5,922.8 | 78.24 | 14256/24576 (58.0%) | 740 MB | [log](20260428_204438_qcn_k8v4_hqq8_twoscale_int4_benchmark.log) |
+
+Notes:
+- Accuracy gate before the benchmark: `PASS`, avg exact `34.07`, total exact
+  `477/653`, containment `556/653` on `phase2bn_qcn_64tok`.
+- Follow-up: this mode is now the default HQQ8 prefill path when
+  `KRASIS_HQQ8_PREFILL_MODE` is unset.
+- Compared with the previous k8v4 HQQ8 INT4 benchmark using
+  `native-fused-marlin-twoscale-intercept`, prefill improved
+  `5,245.5 -> 5,922.8 tok/s` and decode moved `76.74 -> 78.24 tok/s`.
+- This mode still emitted a prefill-time VRAM monitor warning at `522 MB` free,
+  below the configured `600 MB` safety margin; decode min-free was `740 MB`.
+- Decode remains well below the old AWQ/Polar4 speed-test baseline
+  (`91.77 tok/s`), but timing attribution shows the remaining decode gap is
+  dominated by graph replay sync wait and cold expert DMA rather than HQQ
+  attention math.
+- Reduction: `logs/manual/phase2ct_qcn_hqq8_speed_followup_20260428.md`.
+
+---
+
 ## Standard Benchmarks — 2026-04-28 (Phase 2CS QCN k8v4 HQQ8 expert-bit comparison)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.

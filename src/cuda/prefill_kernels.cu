@@ -3982,6 +3982,46 @@ __device__ inline int quantize_polar4_p(float val) {
     return best_idx;
 }
 
+__device__ inline float tq4_codebook_value_p(int idx, int head_dim) {
+    // vLLM turboquant_4bit_nc Lloyd-Max centroids for N(0, 1), scaled to
+    // N(0, 1/head_dim). These are algorithm constants, not model calibration.
+    static const float lloyd4_unit[16] = {
+        -2.7309222221f, -2.0684471130f, -1.6178817749f, -1.2562575340f,
+        -0.9424482584f, -0.6568799019f, -0.3881377876f, -0.1284276545f,
+         0.1284276545f,  0.3881377876f,  0.6568799019f,  0.9424482584f,
+         1.2562575340f,  1.6178817749f,  2.0684471130f,  2.7309222221f,
+    };
+    return lloyd4_unit[idx] * rsqrtf((float)head_dim);
+}
+
+__device__ inline int quantize_tq4_p(float val, int head_dim) {
+    int best_idx = 0;
+    float best_diff = fabsf(val - tq4_codebook_value_p(0, head_dim));
+    #pragma unroll
+    for (int i = 1; i < 16; i++) {
+        float diff = fabsf(val - tq4_codebook_value_p(i, head_dim));
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+__device__ inline void fht_shared_serial_p(float* x, int n) {
+    for (int step = 1; step < n; step <<= 1) {
+        int jump = step << 1;
+        for (int base = 0; base < n; base += jump) {
+            for (int j = 0; j < step; j++) {
+                float a = x[base + j];
+                float b = x[base + j + step];
+                x[base + j] = a + b;
+                x[base + j + step] = a - b;
+            }
+        }
+    }
+}
+
 extern "C" __global__ void kv_cache_append_polar4_kernel(
     unsigned short* __restrict__ k_radius_cache,
     unsigned short* __restrict__ v_radius_cache,
@@ -4127,6 +4167,352 @@ extern "C" __global__ void kv_cache_append_k8v4_kernel(
     }
 }
 
+__device__ inline void pack_k6_16_p(unsigned char* dst, const unsigned char* codes) {
+    #pragma unroll
+    for (int i = 0; i < 12; i++) dst[i] = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        int bit = i * 6;
+        int byte = bit >> 3;
+        int shift = bit & 7;
+        unsigned int val = ((unsigned int)codes[i]) & 0x3fu;
+        dst[byte] |= (unsigned char)(val << shift);
+        if (shift > 2) {
+            dst[byte + 1] |= (unsigned char)(val >> (8 - shift));
+        }
+    }
+}
+
+__device__ inline int unpack_k6_p(const unsigned char* src, int idx) {
+    int bit = idx * 6;
+    int byte = bit >> 3;
+    int shift = bit & 7;
+    unsigned int val = ((unsigned int)src[byte]) >> shift;
+    if (shift > 2) {
+        val |= ((unsigned int)src[byte + 1]) << (8 - shift);
+    }
+    return (int)(val & 0x3fu);
+}
+
+__device__ inline float quantize_k6_one_pass_ls_p(const float* src, unsigned char* codes) {
+    float max_abs = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        max_abs = fmaxf(max_abs, fabsf(src[i]));
+    }
+
+    float k_scale = fmaxf(max_abs * (1.0f / 31.0f), 1e-8f);
+    float inv_k_scale = 1.0f / k_scale;
+    float ls_num = 0.0f;
+    float ls_den = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        float scaled = src[i] * inv_k_scale;
+        int q = (int)(scaled >= 0.0f ? floorf(scaled + 0.5f) : -floorf(-scaled + 0.5f));
+        q = max(-31, min(31, q));
+        codes[i] = (unsigned char)(q + 32);
+        float qf = (float)q;
+        ls_num += src[i] * qf;
+        ls_den += qf * qf;
+    }
+    if (ls_den > 1e-12f) {
+        k_scale = fmaxf(ls_num / ls_den, 1e-8f);
+    }
+    return k_scale;
+}
+
+__device__ inline void pack_k7_16_p(unsigned char* dst, const unsigned char* codes) {
+    #pragma unroll
+    for (int i = 0; i < 14; i++) dst[i] = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        int bit = i * 7;
+        int byte = bit >> 3;
+        int shift = bit & 7;
+        unsigned int val = ((unsigned int)codes[i]) & 0x7fu;
+        dst[byte] |= (unsigned char)(val << shift);
+        if (shift > 1) {
+            dst[byte + 1] |= (unsigned char)(val >> (8 - shift));
+        }
+    }
+}
+
+__device__ inline int unpack_k7_p(const unsigned char* src, int idx) {
+    int bit = idx * 7;
+    int byte = bit >> 3;
+    int shift = bit & 7;
+    unsigned int val = ((unsigned int)src[byte]) >> shift;
+    if (shift > 1) {
+        val |= ((unsigned int)src[byte + 1]) << (8 - shift);
+    }
+    return (int)(val & 0x7fu);
+}
+
+__device__ inline float quantize_k7_one_pass_ls_p(const float* src, unsigned char* codes) {
+    float max_abs = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        max_abs = fmaxf(max_abs, fabsf(src[i]));
+    }
+
+    float k_scale = fmaxf(max_abs * (1.0f / 63.0f), 1e-8f);
+    float inv_k_scale = 1.0f / k_scale;
+    float ls_num = 0.0f;
+    float ls_den = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        float scaled = src[i] * inv_k_scale;
+        int q = (int)(scaled >= 0.0f ? floorf(scaled + 0.5f) : -floorf(-scaled + 0.5f));
+        q = max(-63, min(63, q));
+        codes[i] = (unsigned char)(q + 64);
+        float qf = (float)q;
+        ls_num += src[i] * qf;
+        ls_den += qf * qf;
+    }
+    if (ls_den > 1e-12f) {
+        k_scale = fmaxf(ls_num / ls_den, 1e-8f);
+    }
+    return k_scale;
+}
+
+__device__ inline float quantize_k8_one_pass_ls_p(const float* src, unsigned char* codes) {
+    float max_abs = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        max_abs = fmaxf(max_abs, fabsf(src[i]));
+    }
+
+    float k_scale = fmaxf(max_abs * (1.0f / 127.0f), 1e-8f);
+    float inv_k_scale = 1.0f / k_scale;
+    float ls_num = 0.0f;
+    float ls_den = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        float scaled = src[i] * inv_k_scale;
+        int q = (int)(scaled >= 0.0f ? floorf(scaled + 0.5f) : -floorf(-scaled + 0.5f));
+        q = max(-127, min(127, q));
+        codes[i] = (unsigned char)(q + 128);
+        float qf = (float)q;
+        ls_num += src[i] * qf;
+        ls_den += qf * qf;
+    }
+    if (ls_den > 1e-12f) {
+        k_scale = fmaxf(ls_num / ls_den, 1e-8f);
+    }
+    return k_scale;
+}
+
+extern "C" __global__ void kv_cache_append_k6v4_kernel(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_radius_cache,
+    unsigned char* __restrict__ v_angles_cache,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    int M,
+    int kv_stride,
+    int max_seq,
+    int start_pos,
+    int norm_correction
+) {
+    int ti = blockIdx.x;
+    if (ti >= M) return;
+
+    int num_blocks = kv_stride / 16;
+    int dst_pos = start_pos + ti;
+    if (dst_pos >= max_seq) return;
+
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int src_offset = ti * kv_stride + block_idx * 16;
+        float k_local[16];
+        float v_local[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            float kval = __bfloat162float(k[src_offset + i]);
+            k_local[i] = kval;
+            v_local[i] = __bfloat162float(v[src_offset + i]) * polar4_signs_p[i];
+        }
+
+        unsigned char codes[16];
+        float k_scale = quantize_k6_one_pass_ls_p(k_local, codes);
+        unsigned char* k_pack = k_idx_cache + (dst_pos * num_blocks + block_idx) * 12;
+        pack_k6_16_p(k_pack, codes);
+        __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+        k_scale_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+        fht16_p(v_local);
+        #pragma unroll
+        for (int i = 0; i < 16; i++) v_local[i] *= 0.25f;
+
+        float v_r = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) v_r += v_local[i] * v_local[i];
+        v_r = sqrtf(v_r + 1e-12f);
+        float inv_v_r = 1.0f / v_r;
+        unsigned char* v_ang = v_angles_cache + (dst_pos * num_blocks + block_idx) * 8;
+        float v_qnorm2 = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int v0 = quantize_polar4_p(v_local[i*2] * inv_v_r);
+            int v1 = quantize_polar4_p(v_local[i*2+1] * inv_v_r);
+            v_ang[i] = (unsigned char)((v1 << 4) | v0);
+            float v0v = polar4_codebook_p[v0];
+            float v1v = polar4_codebook_p[v1];
+            v_qnorm2 += v0v * v0v + v1v * v1v;
+        }
+        if (norm_correction & 2) {
+            v_r = v_r / sqrtf(v_qnorm2 + 1e-12f);
+        }
+        __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+        v_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+    }
+}
+
+extern "C" __global__ void kv_cache_append_k7v4_kernel(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_radius_cache,
+    unsigned char* __restrict__ v_angles_cache,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    int M,
+    int kv_stride,
+    int max_seq,
+    int start_pos,
+    int norm_correction
+) {
+    int ti = blockIdx.x;
+    if (ti >= M) return;
+
+    int num_blocks = kv_stride / 16;
+    int dst_pos = start_pos + ti;
+    if (dst_pos >= max_seq) return;
+
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int src_offset = ti * kv_stride + block_idx * 16;
+        float k_local[16];
+        float v_local[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            float kval = __bfloat162float(k[src_offset + i]);
+            k_local[i] = kval;
+            v_local[i] = __bfloat162float(v[src_offset + i]) * polar4_signs_p[i];
+        }
+
+        unsigned char codes[16];
+        float k_scale = quantize_k7_one_pass_ls_p(k_local, codes);
+        unsigned char* k_pack = k_idx_cache + (dst_pos * num_blocks + block_idx) * 14;
+        pack_k7_16_p(k_pack, codes);
+        __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+        k_scale_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+        fht16_p(v_local);
+        #pragma unroll
+        for (int i = 0; i < 16; i++) v_local[i] *= 0.25f;
+
+        float v_r = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) v_r += v_local[i] * v_local[i];
+        v_r = sqrtf(v_r + 1e-12f);
+        float inv_v_r = 1.0f / v_r;
+        unsigned char* v_ang = v_angles_cache + (dst_pos * num_blocks + block_idx) * 8;
+        float v_qnorm2 = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int v0 = quantize_polar4_p(v_local[i*2] * inv_v_r);
+            int v1 = quantize_polar4_p(v_local[i*2+1] * inv_v_r);
+            v_ang[i] = (unsigned char)((v1 << 4) | v0);
+            float v0v = polar4_codebook_p[v0];
+            float v1v = polar4_codebook_p[v1];
+            v_qnorm2 += v0v * v0v + v1v * v1v;
+        }
+        if (norm_correction & 2) {
+            v_r = v_r / sqrtf(v_qnorm2 + 1e-12f);
+        }
+        __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+        v_radius_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+    }
+}
+
+extern "C" __global__ void kv_cache_append_tq4_kernel(
+    unsigned short* __restrict__ k_norm_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_meta_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const float* __restrict__ signs,
+    int M,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq,
+    int start_pos
+) {
+    int ti = blockIdx.x;
+    int kv_head = blockIdx.y;
+    if (ti >= M || kv_head >= num_kv_heads || threadIdx.x != 0) return;
+    int dst_pos = start_pos + ti;
+    if (dst_pos >= max_seq) return;
+
+    extern __shared__ float scratch[];
+    int kv_stride = num_kv_heads * head_dim;
+    int packed_hd = (head_dim + 1) >> 1;
+    int token_head = dst_pos * num_kv_heads + kv_head;
+    int src_off = ti * kv_stride + kv_head * head_dim;
+
+    float k_norm2 = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = __bfloat162float(k[src_off + d]);
+        scratch[d] = val * signs[d];
+        k_norm2 += val * val;
+    }
+    float k_norm = sqrtf(k_norm2 + 1e-12f);
+    fht_shared_serial_p(scratch, head_dim);
+    float inv_sqrt_hd = rsqrtf((float)head_dim);
+    float inv_norm = 1.0f / k_norm;
+    float q_norm2 = 0.0f;
+    unsigned char* k_pack = k_idx_cache + token_head * packed_hd;
+    for (int d = 0; d < head_dim; d += 2) {
+        int q0 = quantize_tq4_p(scratch[d] * inv_sqrt_hd * inv_norm, head_dim);
+        int q1 = 0;
+        q_norm2 += tq4_codebook_value_p(q0, head_dim) * tq4_codebook_value_p(q0, head_dim);
+        if (d + 1 < head_dim) {
+            q1 = quantize_tq4_p(scratch[d + 1] * inv_sqrt_hd * inv_norm, head_dim);
+            q_norm2 += tq4_codebook_value_p(q1, head_dim) * tq4_codebook_value_p(q1, head_dim);
+        }
+        k_pack[d >> 1] = (unsigned char)((q1 << 4) | q0);
+    }
+    float corrected_norm = k_norm / sqrtf(q_norm2 + 1e-12f);
+    __half k_nb = __float2half(corrected_norm);
+    k_norm_cache[token_head] = *reinterpret_cast<unsigned short*>(&k_nb);
+
+    float v_min = 1e30f;
+    float v_max = -1e30f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = __bfloat162float(v[src_off + d]);
+        v_min = fminf(v_min, val);
+        v_max = fmaxf(v_max, val);
+    }
+    float scale = (v_max - v_min) * (1.0f / 15.0f);
+    if (scale < 1e-8f) scale = 1e-8f;
+    float inv_scale = 1.0f / scale;
+    unsigned char* v_pack = v_idx_cache + token_head * packed_hd;
+    for (int d = 0; d < head_dim; d += 2) {
+        int q0 = (int)floorf((__bfloat162float(v[src_off + d]) - v_min) * inv_scale + 0.5f);
+        q0 = max(0, min(15, q0));
+        int q1 = 0;
+        if (d + 1 < head_dim) {
+            q1 = (int)floorf((__bfloat162float(v[src_off + d + 1]) - v_min) * inv_scale + 0.5f);
+            q1 = max(0, min(15, q1));
+        }
+        v_pack[d >> 1] = (unsigned char)((q1 << 4) | q0);
+    }
+    __half scale_b = __float2half(scale);
+    __half zero_b = __float2half(v_min);
+    v_meta_cache[token_head * 2] = *reinterpret_cast<unsigned short*>(&scale_b);
+    v_meta_cache[token_head * 2 + 1] = *reinterpret_cast<unsigned short*>(&zero_b);
+}
+
 /* ── Polar4 KV Cache Dequant + Concat for Cross-Chunk FA2 ───────────────
  * Reconstructs Polar4 cache [0..cache_len] back to BF16 K/V in the original
  * domain, then copies current-chunk BF16 K/V [0..m] into [cache_len..cache_len+m].
@@ -4178,6 +4564,283 @@ extern "C" __global__ void kv_cache_dequant_concat_polar4_kernel(
                 for (int i = 0; i < 16; i++) {
                     out[dst_off + i] = kv_new[src_off + i];
                 }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void kv_cache_append_k6v6_kernel(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_scale_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    int M,
+    int kv_stride,
+    int max_seq,
+    int start_pos,
+    int norm_correction
+) {
+    (void)norm_correction;
+    int ti = blockIdx.x;
+    if (ti >= M) return;
+
+    int num_blocks = kv_stride / 16;
+    int dst_pos = start_pos + ti;
+    if (dst_pos >= max_seq) return;
+
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int src_offset = ti * kv_stride + block_idx * 16;
+        float k_local[16];
+        float v_local[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            k_local[i] = __bfloat162float(k[src_offset + i]);
+            v_local[i] = __bfloat162float(v[src_offset + i]);
+        }
+
+        unsigned char codes[16];
+        float k_scale = quantize_k6_one_pass_ls_p(k_local, codes);
+        unsigned char* k_pack = k_idx_cache + (dst_pos * num_blocks + block_idx) * 12;
+        pack_k6_16_p(k_pack, codes);
+        __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+        k_scale_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+        float v_scale = quantize_k6_one_pass_ls_p(v_local, codes);
+        unsigned char* v_pack = v_idx_cache + (dst_pos * num_blocks + block_idx) * 12;
+        pack_k6_16_p(v_pack, codes);
+        __nv_bfloat16 v_sb = __float2bfloat16(v_scale);
+        v_scale_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_sb);
+    }
+}
+
+extern "C" __global__ void kv_cache_append_k8v6_kernel(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_scale_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    int M,
+    int kv_stride,
+    int max_seq,
+    int start_pos,
+    int norm_correction
+) {
+    (void)norm_correction;
+    int ti = blockIdx.x;
+    if (ti >= M) return;
+
+    int num_blocks = kv_stride / 16;
+    int dst_pos = start_pos + ti;
+    if (dst_pos >= max_seq) return;
+
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int src_offset = ti * kv_stride + block_idx * 16;
+        float k_local[16];
+        float v_local[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            k_local[i] = __bfloat162float(k[src_offset + i]);
+            v_local[i] = __bfloat162float(v[src_offset + i]);
+        }
+
+        unsigned char codes[16];
+        float k_scale = quantize_k8_one_pass_ls_p(k_local, codes);
+        unsigned char* k_pack = k_idx_cache + (dst_pos * num_blocks + block_idx) * 16;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) k_pack[i] = codes[i];
+        __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+        k_scale_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+        float v_scale = quantize_k6_one_pass_ls_p(v_local, codes);
+        unsigned char* v_pack = v_idx_cache + (dst_pos * num_blocks + block_idx) * 12;
+        pack_k6_16_p(v_pack, codes);
+        __nv_bfloat16 v_sb = __float2bfloat16(v_scale);
+        v_scale_cache[dst_pos * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_sb);
+    }
+}
+
+extern "C" __global__ void kv_cache_dequant_concat_k6_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const __nv_bfloat16* __restrict__ k_new,
+    int cache_len,
+    int m,
+    int kv_stride)
+{
+    int ti = blockIdx.x;
+    int num_blocks = kv_stride / 16;
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int base = block_idx * 16;
+        int64_t dst_off = (int64_t)ti * kv_stride + base;
+        if (ti < cache_len) {
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[ti * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (ti * num_blocks + block_idx) * 12;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                float val = scale * (float)(unpack_k6_p(k_pack, i) - 32);
+                out[dst_off + i] = __float2bfloat16(val);
+            }
+        } else {
+            int ci = ti - cache_len;
+            if (ci < m) {
+                int64_t src_off = (int64_t)ci * kv_stride + base;
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    out[dst_off + i] = k_new[src_off + i];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void kv_cache_dequant_concat_k7_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const __nv_bfloat16* __restrict__ k_new,
+    int cache_len,
+    int m,
+    int kv_stride)
+{
+    int ti = blockIdx.x;
+    int num_blocks = kv_stride / 16;
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int base = block_idx * 16;
+        int64_t dst_off = (int64_t)ti * kv_stride + base;
+        if (ti < cache_len) {
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[ti * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (ti * num_blocks + block_idx) * 14;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                float val = scale * (float)(unpack_k7_p(k_pack, i) - 64);
+                out[dst_off + i] = __float2bfloat16(val);
+            }
+        } else {
+            int ci = ti - cache_len;
+            if (ci < m) {
+                int64_t src_off = (int64_t)ci * kv_stride + base;
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    out[dst_off + i] = k_new[src_off + i];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void kv_cache_dequant_concat_k8_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const unsigned short* __restrict__ k_scale_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const __nv_bfloat16* __restrict__ k_new,
+    int cache_len,
+    int m,
+    int kv_stride)
+{
+    int ti = blockIdx.x;
+    int num_blocks = kv_stride / 16;
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int base = block_idx * 16;
+        int64_t dst_off = (int64_t)ti * kv_stride + base;
+        if (ti < cache_len) {
+            float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_scale_cache[ti * num_blocks + block_idx]));
+            const unsigned char* k_pack = k_idx_cache + (ti * num_blocks + block_idx) * 16;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                float val = scale * (float)((int)k_pack[i] - 128);
+                out[dst_off + i] = __float2bfloat16(val);
+            }
+        } else {
+            int ci = ti - cache_len;
+            if (ci < m) {
+                int64_t src_off = (int64_t)ci * kv_stride + base;
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    out[dst_off + i] = k_new[src_off + i];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void kv_cache_dequant_concat_tq4_k_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const unsigned short* __restrict__ k_norm_cache,
+    const unsigned char* __restrict__ k_idx_cache,
+    const float* __restrict__ signs,
+    const __nv_bfloat16* __restrict__ k_new,
+    int cache_len,
+    int m,
+    int num_kv_heads,
+    int head_dim)
+{
+    int ti = blockIdx.x;
+    int kv_head = blockIdx.y;
+    if (threadIdx.x != 0) return;
+    int packed_hd = (head_dim + 1) >> 1;
+    int kv_stride = num_kv_heads * head_dim;
+    int64_t dst_base = (int64_t)ti * kv_stride + kv_head * head_dim;
+    if (ti < cache_len) {
+        extern __shared__ float scratch[];
+        int token_head = ti * num_kv_heads + kv_head;
+        float kn = __half2float(*reinterpret_cast<const __half*>(
+            &k_norm_cache[token_head]));
+        for (int d = 0; d < head_dim; d++) {
+            unsigned char p = k_idx_cache[token_head * packed_hd + (d >> 1)];
+            int idx = ((d & 1) == 0) ? (p & 0xF) : (p >> 4);
+            scratch[d] = kn * tq4_codebook_value_p(idx, head_dim);
+        }
+        fht_shared_serial_p(scratch, head_dim);
+        float inv_sqrt_hd = rsqrtf((float)head_dim);
+        for (int d = 0; d < head_dim; d++) {
+            out[dst_base + d] = __float2bfloat16(scratch[d] * inv_sqrt_hd * signs[d]);
+        }
+    } else {
+        int ci = ti - cache_len;
+        if (ci < m) {
+            int64_t src_base = (int64_t)ci * kv_stride + kv_head * head_dim;
+            for (int d = 0; d < head_dim; d++) out[dst_base + d] = k_new[src_base + d];
+        }
+    }
+}
+
+extern "C" __global__ void kv_cache_dequant_concat_tq4_v_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const unsigned short* __restrict__ v_meta_cache,
+    const unsigned char* __restrict__ v_idx_cache,
+    const __nv_bfloat16* __restrict__ v_new,
+    int cache_len,
+    int m,
+    int num_kv_heads,
+    int head_dim)
+{
+    int ti = blockIdx.x;
+    int kv_head = blockIdx.y;
+    int packed_hd = (head_dim + 1) >> 1;
+    int kv_stride = num_kv_heads * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        int64_t dst_off = (int64_t)ti * kv_stride + kv_head * head_dim + d;
+        if (ti < cache_len) {
+            int token_head = ti * num_kv_heads + kv_head;
+            float scale = __half2float(*reinterpret_cast<const __half*>(
+                &v_meta_cache[token_head * 2]));
+            float zero = __half2float(*reinterpret_cast<const __half*>(
+                &v_meta_cache[token_head * 2 + 1]));
+            unsigned char p = v_idx_cache[token_head * packed_hd + (d >> 1)];
+            int idx = ((d & 1) == 0) ? (p & 0xF) : (p >> 4);
+            out[dst_off] = __float2bfloat16(zero + scale * (float)idx);
+        } else {
+            int ci = ti - cache_len;
+            if (ci < m) {
+                int64_t src_off = (int64_t)ci * kv_stride + kv_head * head_dim + d;
+                out[dst_off] = v_new[src_off];
             }
         }
     }
