@@ -1141,6 +1141,8 @@ fn handle_prefill_logits(
     if let Err(e) = engine.prepare_for_prefill(token_ids.len()) {
         let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
         let _ = store.prepare_runtime_for_decode_rust();
+        store.invalidate_cuda_graph();
+        log::info!("prefill_logits: invalidated CUDA graphs after failed scratch allocation restore");
         let _ = send_json(stream, 500, &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e));
         return;
     }
@@ -1154,6 +1156,8 @@ fn handle_prefill_logits(
             let _ = store.prepare_runtime_for_decode_rust();
             let _ = store.hcs_reload_after_prefill_async(token_ids.len());
             let _ = store.hcs_sync_soft_reload();
+            store.invalidate_cuda_graph();
+            log::info!("prefill_logits: invalidated CUDA graphs after failed diagnostic prefill restore");
             Python::with_gil(|py| {
                 let _ = state.py_model.call_method0(py, "server_cleanup");
             });
@@ -1173,6 +1177,8 @@ fn handle_prefill_logits(
     let _ = store.prepare_runtime_for_decode_rust();
     let _ = store.hcs_reload_after_prefill_async(token_ids.len());
     let _ = store.hcs_sync_soft_reload();
+    store.invalidate_cuda_graph();
+    log::info!("prefill_logits: invalidated CUDA graphs after diagnostic prefill restore");
 
     // Match the normal reference/inference cleanup path so diagnostic prefill
     // requests do not leak sequence state into the next prompt.

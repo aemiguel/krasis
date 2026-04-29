@@ -196,6 +196,7 @@ def _kv_dtype_bytes(kv_cache_dtype: str, cfg: Optional[Dict[str, Any]] = None) -
         "k7v4": 0.8125,
         "k6v6": 0.875,
         "k6v4": 0.75,
+        "k4v4": 0.625,
         "bf16": 2, "bfloat16": 2, "fp16": 2, "float16": 2,
         "auto": 2,
     }
@@ -897,7 +898,7 @@ def main():
     parser.add_argument("--pp-partition", required=True,
                         help="Comma-separated layer counts per rank (e.g. 20,21,20)")
     parser.add_argument("--kv-cache-dtype", default="k6v6",
-                        help="KV cache format (default: k6v6 Quality; use k6v4 Compact or bf16 Full Precision)")
+                        help="KV cache format (default: k6v6 Quality; use k4v4 Ultra Compact or bf16 Full Precision)")
     parser.add_argument("--quantization", default="none",
                         help="Non-expert quantization (w8a8_int8 or none)")
     parser.add_argument("--gpu-vram-mb", type=int, default=None,

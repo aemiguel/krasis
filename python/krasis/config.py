@@ -243,7 +243,7 @@ class QuantConfig:
     expert_group_size: int = 128   # routed expert quantization group size; 32 matches Q8_0-style block scale granularity
     gpu_expert_int4_calib: str = "amax"  # "amax" or "search_rmse" for routed-expert GPU INT4 cache build
     cpu_expert_bits: int = 4       # 4 or 8 for CPU expert quantization
-    kv_cache_format: str = "k6v6"  # default Quality KV; use "k6v4" for Compact or "bf16" for Full Precision
+    kv_cache_format: str = "k6v6"  # Quality default; public modes are "k6v6", "k4v4", and "bf16"
     hqq_cache_profile: str = HQQ_CACHE_PROFILE_BASELINE  # "baseline" or an explicit calibrated HQQ profile
     hqq_sidecar_manifest: Optional[str] = None  # explicit HQQ4-only sidecar manifest for switchable correction
 
@@ -259,12 +259,14 @@ class QuantConfig:
             "k7v4": "k7v4",
             "k6v6": "k6v6",
             "k6v4": "k6v4",
+            "k4v4": "k4v4",
             "tq4": "tq4",
         }
         if self.kv_cache_format not in kv_aliases:
             raise ValueError(
                 f"Unsupported kv_cache_format '{self.kv_cache_format}'. "
-                "Use 'bf16', 'fp8_e4m3', 'polar4', 'k8v4', 'k8v6', 'k7v4', 'k6v6', 'k6v4', or 'tq4'."
+                "Use public modes 'k6v6', 'k4v4', or 'bf16'; internal modes include "
+                "'fp8_e4m3', 'polar4', 'k8v4', 'k8v6', 'k7v4', 'k6v4', and 'tq4'."
             )
         self.kv_cache_format = kv_aliases[self.kv_cache_format]
 

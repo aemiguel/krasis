@@ -600,6 +600,7 @@ class ConfigOption:
         min_val: int = 1,
         max_val: int = 65536,
         step: int = 1,
+        advanced: bool = False,
     ):
         self.label = label
         self.key = key
@@ -610,6 +611,7 @@ class ConfigOption:
         self.min_val = min_val
         self.max_val = max_val
         self.step = step
+        self.advanced = advanced
 
 
 # Config options shown in TUI
@@ -618,12 +620,14 @@ OPTIONS = [
                  choices=[2, 4, 6, 8, 10, 12], affects_budget=True),
     ConfigOption("KV cache (MB)", "kv_cache_mb",
                  opt_type="number", min_val=200, max_val=65500, step=100, affects_budget=True),
+    ConfigOption("KV format", "kv_dtype",
+                 choices=["k4v4", "k6v6", "bf16"], affects_budget=True),
     ConfigOption("Model quantization", "gpu_expert_bits",
                  choices=[4, 8], affects_budget=True),
     ConfigOption("Expert group size", "expert_group_size",
-                 choices=[32, 64, 128], affects_budget=True),
+                 choices=[32, 64, 128], affects_budget=True, advanced=True),
     ConfigOption("Expert INT4 calib", "gpu_expert_int4_calib",
-                 choices=list(GPU_EXPERT_INT4_CALIB_CHOICES)),
+                 choices=list(GPU_EXPERT_INT4_CALIB_CHOICES), advanced=True),
     ConfigOption("Attention quant", "attention_quant",
                  choices=list(INTERACTIVE_ATTENTION_QUANT_CHOICES), affects_budget=True),
     ConfigOption("VRAM safety margin", "vram_safety_margin",
@@ -654,8 +658,15 @@ def _format_value(opt: ConfigOption, val: Any) -> str:
     return str(val)
 
 
-def _is_option_visible(opt: ConfigOption, model_info: Optional[Dict], cfg: Optional["LauncherConfig"] = None) -> bool:
+def _is_option_visible(
+    opt: ConfigOption,
+    model_info: Optional[Dict],
+    cfg: Optional["LauncherConfig"] = None,
+    show_advanced: bool = False,
+) -> bool:
     """Check if an option should be shown for the current model."""
+    if opt.advanced and not show_advanced:
+        return False
     if opt.key == "dense_mlp_quant":
         # Only show if model has dense (non-MoE) layers
         if model_info and model_info.get("dense_layers", 0) == 0:
@@ -672,7 +683,7 @@ _NATIVE_DTYPE_LABELS = {
 
 
 def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) -> str:
-    """Return a quality annotation string like 'bf16 → int8, ~lossless'.
+    """Return a quality annotation string like 'bf16 → int8, high fidelity'.
 
     Returns empty string for options that don't have a native/quality concept.
     """
@@ -684,7 +695,7 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
         if current == native_label or current == native_dtype:
             return f"{DIM}{native_label} \u2192 {current} \u2014 lossless{NC}"
         elif current == "int8":
-            return f"{DIM}{native_label} \u2192 int8 \u2014 ~lossless{NC}"
+            return f"{DIM}{native_label} \u2192 int8 \u2014 high fidelity{NC}"
         elif current == "int4":
             return f"{DIM}{native_label} \u2192 int4 \u2014 {YELLOW}slight loss{NC}{DIM}{NC}"
         elif current == "awq":
@@ -692,7 +703,7 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
         elif current == "hqq4":
             return f"{DIM}{native_label} \u2192 HQQ4SC \u2014 low-memory self-correcting HQQ4{NC}"
         elif current == "hqq8":
-            return f"{DIM}{native_label} \u2192 HQQ8 \u2014 default native fused two-scale backend{NC}"
+            return f"{DIM}{native_label} \u2192 HQQ8 \u2014 high fidelity{NC}"
         return f"{DIM}{native_label} \u2192 {current}{NC}"
 
     elif config_key == "gpu_expert_bits":
@@ -700,7 +711,7 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
         if bits == 16:
             return f"{DIM}{native_label} \u2192 {native_label} \u2014 lossless{NC}"
         elif bits == 8:
-            return f"{DIM}{native_label} \u2192 int8 \u2014 ~lossless{NC}"
+            return f"{DIM}{native_label} \u2192 int8 \u2014 high fidelity{NC}"
         elif bits == 4:
             return f"{DIM}{native_label} \u2192 int4 \u2014 {YELLOW}slight loss{NC}{DIM}{NC}"
         return f"{DIM}{native_label} \u2192 int{bits}{NC}"
@@ -711,7 +722,7 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
     elif config_key == "kv_dtype":
         current = str(current_val)
         if current == "fp8_e4m3":
-            return f"{DIM}{native_label} \u2192 fp8 \u2014 ~lossless{NC}"
+            return f"{DIM}{native_label} \u2192 fp8 \u2014 legacy FP8 KV{NC}"
         elif current == "polar4":
             return f"{DIM}{native_label} \u2192 polar4 \u2014 compact 4-bit{NC}"
         elif current == "k8v4":
@@ -723,7 +734,9 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
         elif current == "k6v6":
             return f"{DIM}{native_label} \u2192 k6v6 \u2014 Quality KV, INT6 K + INT6 V{NC}"
         elif current == "k6v4":
-            return f"{DIM}{native_label} \u2192 k6v4 \u2014 Compact KV, INT6 K + 4-bit V{NC}"
+            return f"{DIM}{native_label} \u2192 k6v4 \u2014 Legacy compact KV, INT6 K + 4-bit V{NC}"
+        elif current == "k4v4":
+            return f"{DIM}{native_label} \u2192 k4v4 \u2014 Ultra Compact KV, INT4 K + 4-bit V{NC}"
         elif current == "tq4":
             return f"{DIM}{native_label} \u2192 tq4 \u2014 4-bit TurboQuant KV{NC}"
         elif current == "bf16":
@@ -1119,7 +1132,15 @@ class Launcher:
         except Exception:
             return None
 
-    def _render_config_screen(self, cursor: int, editing: bool = False) -> str:
+    def _visible_config_options(self, show_advanced: bool = False) -> List[ConfigOption]:
+        """Return config options visible in the current TUI mode."""
+        return [
+            opt for opt in OPTIONS
+            if _is_option_visible(opt, self.model_info, self.cfg, show_advanced)
+        ]
+
+    def _render_config_screen(self, cursor: int, editing: bool = False,
+                              show_advanced: bool = False) -> str:
         """Render the full config screen as a string."""
         lines = []
 
@@ -1158,9 +1179,10 @@ class Launcher:
 
         # Config options (filter to visible ones for current model)
         native_dtype = (self.model_info or {}).get("native_dtype", "bfloat16")
-        visible_options = [opt for opt in OPTIONS if _is_option_visible(opt, self.model_info, self.cfg)]
+        visible_options = self._visible_config_options(show_advanced)
 
-        lines.append(f"  {DIM}\u2500\u2500\u2500 Configuration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
+        section_label = "Configuration + Advanced" if show_advanced else "Configuration"
+        lines.append(f"  {DIM}\u2500\u2500\u2500 {section_label} \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
 
         for i, opt in enumerate(visible_options):
             val = getattr(self.cfg, opt.key)
@@ -1229,6 +1251,7 @@ class Launcher:
                 else "k7v4" if self.cfg.kv_dtype == "k7v4"
                 else "k6v6" if self.cfg.kv_dtype == "k6v6"
                 else "k6v4" if self.cfg.kv_dtype == "k6v4"
+                else "k4v4" if self.cfg.kv_dtype == "k4v4"
                 else "tq4" if self.cfg.kv_dtype == "tq4"
                 else "fp8" if self.cfg.kv_dtype == "fp8_e4m3"
                 else "bf16"
@@ -1293,7 +1316,11 @@ class Launcher:
             lines.append(f"  {DIM}(budget unavailable){NC}")
 
         lines.append("")
-        lines.append(f"  {DIM}[\u2191\u2193] Navigate  [\u2190\u2192] Change  [Enter] Launch  [L] Load  [S] Save  [q] Quit{NC}")
+        advanced_state = "ON" if show_advanced else "off"
+        lines.append(
+            f"  {DIM}[\u2191\u2193] Navigate  [\u2190\u2192] Change  [Enter] Launch  "
+            f"[A] Advanced:{advanced_state}  [L] Load  [S] Save  [q] Quit{NC}"
+        )
 
         return "\n".join(lines)
 
@@ -1481,27 +1508,27 @@ class Launcher:
             self.cfg.pp_partition = self._compute_default_pp(self.model_info["layers"])
         if self.hw["cpu_cores"] > 0:
             self.cfg.krasis_threads = min(self.hw["cpu_cores"], 40)
-        # Keep the interactive launcher on the supported user-facing path:
-        # one expert quantization choice, Quality KV by default in the TUI.
+        # Keep expert quantization aligned; KV defaults to Quality and can be
+        # cycled among the supported public KV modes in the TUI.
         self.cfg.cpu_expert_bits = self.cfg.gpu_expert_bits
-        self.cfg.kv_dtype = "k6v6"
-
-        # Keep the interactive surface to the supported mainstream path.
-        # Manual configs and CLI flags can still use other internal modes.
         self.cfg.kv_dtype = "k6v6"
 
         # Compute initial budget
         self.budget = self._compute_budget()
 
         cursor = 0
+        show_advanced = False
         _hide_cursor()
         try:
             while True:
-                visible_options = [opt for opt in OPTIONS if _is_option_visible(opt, self.model_info, self.cfg)]
+                visible_options = self._visible_config_options(show_advanced)
                 n_visible = len(visible_options)
+                if n_visible == 0:
+                    return False
+                cursor = min(cursor, n_visible - 1)
 
                 _clear_screen()
-                screen = self._render_config_screen(cursor)
+                screen = self._render_config_screen(cursor, show_advanced=show_advanced)
                 sys.stdout.write(screen + "\n")
                 sys.stdout.flush()
 
@@ -1544,6 +1571,10 @@ class Launcher:
                     self._load_config_screen()
                 elif key in ("s", "S"):
                     self._save_config_screen()
+                elif key in ("a", "A"):
+                    show_advanced = not show_advanced
+                    visible_options = self._visible_config_options(show_advanced)
+                    cursor = min(cursor, max(0, len(visible_options) - 1))
                 elif key == KEY_ENTER:
                     if not self._ensure_interactive_attention_ready():
                         self._show_attention_unavailable()
@@ -1672,6 +1703,7 @@ class Launcher:
                 else "k7v4" if self.cfg.kv_dtype == "k7v4"
                 else "k6v6" if self.cfg.kv_dtype == "k6v6"
                 else "k6v4" if self.cfg.kv_dtype == "k6v4"
+                else "k4v4" if self.cfg.kv_dtype == "k4v4"
                 else "tq4" if self.cfg.kv_dtype == "tq4"
                 else "fp8" if self.cfg.kv_dtype == "fp8_e4m3"
                 else "bf16"
@@ -1811,7 +1843,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vram-safety-margin", type=int, default=None,
                         help="VRAM safety margin in MB (default: 600)")
     parser.add_argument("--kv-dtype", default=None,
-                        help="KV cache format: k6v6 Quality default, k6v4 Compact, bf16 Full Precision, or explicit internal formats")
+                        help="KV cache format: k6v6 Quality default, k4v4 Ultra Compact, bf16 Full Precision, or explicit internal formats")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
                         help="Model quantization: 4 or 8")
     parser.add_argument("--expert-group-size", type=int, default=None, choices=[32, 64, 128],
@@ -1820,7 +1852,7 @@ def parse_args() -> argparse.Namespace:
                         choices=list(GPU_EXPERT_INT4_CALIB_CHOICES),
                         help="Offline calibration mode for GPU routed-expert INT4 cache build")
     parser.add_argument("--attention-quant", default=None,
-                        help="Attention weight quant: hqq8 recommended; bf16, awq, and hqq4 remain explicit legacy/debug modes")
+                        help="Attention weight quant: hqq8 quality-first 8-bit default; bf16, awq, and hqq4 remain explicit legacy/debug modes")
     parser.add_argument("--hqq-cache-profile", default=None,
                         help="HQQ attention cache profile: baseline or selfcal_v1")
     parser.add_argument("--hqq-sidecar-manifest", default=None,

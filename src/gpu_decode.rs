@@ -636,6 +636,7 @@ const KERNEL_NAMES: &[&str] = &[
     "kv_cache_write",
     "kv_cache_write_bf16",
     "kv_cache_write_k8v4",
+    "kv_cache_write_k4v4",
     "kv_cache_write_k6v4",
     "kv_cache_write_k7v4",
     "kv_cache_write_k6v6",
@@ -644,6 +645,7 @@ const KERNEL_NAMES: &[&str] = &[
     "gqa_attention",
     "gqa_attention_bf16",
     "gqa_attention_k8v4",
+    "gqa_attention_k4v4",
     "gqa_attention_k6v4",
     "gqa_attention_k7v4",
     "gqa_attention_k6v6",
@@ -652,6 +654,7 @@ const KERNEL_NAMES: &[&str] = &[
     "gqa_attention_tiled",
     "gqa_attention_tiled_bf16",
     "gqa_attention_reduce",
+    "gqa_attention_k4v4_single_g",
     "split_gated_q",
     "apply_gated_attn",
     "bf16_to_fp32",
@@ -693,6 +696,7 @@ const KERNEL_NAMES: &[&str] = &[
     "kv_cache_write_g",
     "kv_cache_write_bf16_g",
     "kv_cache_write_k8v4_g",
+    "kv_cache_write_k4v4_g",
     "kv_cache_write_k6v4_g",
     "kv_cache_write_k7v4_g",
     "kv_cache_write_k6v6_g",
@@ -705,6 +709,7 @@ const KERNEL_NAMES: &[&str] = &[
     "gqa_attention_tiled_g",
     "gqa_attention_tiled_bf16_g",
     "gqa_attention_k8v4_tiled_g",
+    "gqa_attention_k4v4_tiled_g",
     "gqa_attention_k6v4_tiled_g",
     "gqa_attention_k7v4_tiled_g",
     "gqa_attention_k6v6_tiled_g",
@@ -3492,6 +3497,7 @@ struct CachedKernels {
     kv_cache_write: cudarc::driver::CudaFunction,
     kv_cache_write_bf16: cudarc::driver::CudaFunction,
     kv_cache_write_k8v4: cudarc::driver::CudaFunction,
+    kv_cache_write_k4v4: cudarc::driver::CudaFunction,
     kv_cache_write_k6v4: cudarc::driver::CudaFunction,
     kv_cache_write_k7v4: cudarc::driver::CudaFunction,
     kv_cache_write_k6v6: cudarc::driver::CudaFunction,
@@ -3500,6 +3506,7 @@ struct CachedKernels {
     gqa_attention: cudarc::driver::CudaFunction,
     gqa_attention_bf16: cudarc::driver::CudaFunction,
     gqa_attention_k8v4: cudarc::driver::CudaFunction,
+    gqa_attention_k4v4: cudarc::driver::CudaFunction,
     gqa_attention_k6v4: cudarc::driver::CudaFunction,
     gqa_attention_k7v4: cudarc::driver::CudaFunction,
     gqa_attention_k6v6: cudarc::driver::CudaFunction,
@@ -3508,6 +3515,7 @@ struct CachedKernels {
     gqa_attention_tiled: cudarc::driver::CudaFunction,
     gqa_attention_tiled_bf16: cudarc::driver::CudaFunction,
     gqa_attention_reduce: cudarc::driver::CudaFunction,
+    gqa_attention_k4v4_single_g: cudarc::driver::CudaFunction,
     apply_gated_attn: cudarc::driver::CudaFunction,
     // Fused v2 kernels with inline atomic reduction (no separate reduce kernel)
     marlin_gemv_int4_v2_fused_f32: cudarc::driver::CudaFunction,
@@ -3526,6 +3534,7 @@ struct CachedKernels {
     kv_cache_write_g: cudarc::driver::CudaFunction,
     kv_cache_write_bf16_g: cudarc::driver::CudaFunction,
     kv_cache_write_k8v4_g: cudarc::driver::CudaFunction,
+    kv_cache_write_k4v4_g: cudarc::driver::CudaFunction,
     kv_cache_write_k6v4_g: cudarc::driver::CudaFunction,
     kv_cache_write_k7v4_g: cudarc::driver::CudaFunction,
     kv_cache_write_k6v6_g: cudarc::driver::CudaFunction,
@@ -3540,6 +3549,7 @@ struct CachedKernels {
     gqa_attention_tiled_g: cudarc::driver::CudaFunction,
     gqa_attention_tiled_bf16_g: cudarc::driver::CudaFunction,
     gqa_attention_k8v4_tiled_g: cudarc::driver::CudaFunction,
+    gqa_attention_k4v4_tiled_g: cudarc::driver::CudaFunction,
     gqa_attention_k6v4_tiled_g: cudarc::driver::CudaFunction,
     gqa_attention_k7v4_tiled_g: cudarc::driver::CudaFunction,
     gqa_attention_k6v6_tiled_g: cudarc::driver::CudaFunction,
@@ -3790,7 +3800,7 @@ struct GpuDecodeGraph {
     kv_v_ptrs: Vec<u64>,
     kv_max_seq: usize,
     kv_current_pos: usize,
-    /// KV cache format: 0=bf16, 1=fp8, 2=polar4, 3=k8v4, 4=tq4, 5=k6v4, 6=k7v4, 7=k6v6, 8=k8v6
+    /// KV cache format: 0=bf16, 1=fp8, 2=polar4, 3=k8v4, 4=tq4, 5=k6v4, 6=k7v4, 7=k6v6, 8=k8v6, 9=k4v4
     kv_format: u32,
     /// Opt-in Polar4 radius norm correction mode.
     /// 0=off, 1=K only, 2=V only, 3=K+V. Cache layout is unchanged.
@@ -5094,6 +5104,15 @@ impl GpuDecodeStore {
         Ok(out)
     }
 
+    fn unpack_k4_cpu(src: &[u8], idx: usize) -> i32 {
+        let packed = src[idx >> 1];
+        if (idx & 1) != 0 {
+            (packed >> 4) as i32
+        } else {
+            (packed & 0x0f) as i32
+        }
+    }
+
     fn unpack_k6_cpu(src: &[u8], idx: usize) -> i32 {
         let bit = idx * 6;
         let byte = bit >> 3;
@@ -5123,7 +5142,7 @@ impl GpuDecodeStore {
         position: usize,
         kv_stride: usize,
     ) -> Result<Option<(Vec<f32>, Vec<f32>)>, String> {
-        if !(graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8) {
+        if !(graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 || graph.kv_format == 9) {
             return Ok(None);
         }
         if layer_idx >= graph.kv_k_radius_ptrs.len()
@@ -5150,6 +5169,7 @@ impl GpuDecodeStore {
         let (k_bytes_per_block, k_zero) = match graph.kv_format {
             6 => (14usize, 64i32),
             8 => (16usize, 128i32),
+            9 => (8usize, 8i32),
             _ => (12usize, 32i32),
         };
         let k_scales = self.download_device_u16(graph.kv_k_radius_ptrs[layer_idx], seq_len * num_blocks)?;
@@ -5165,6 +5185,7 @@ impl GpuDecodeStore {
                     let code = match graph.kv_format {
                         6 => Self::unpack_k7_cpu(&k_idx[base..base + k_bytes_per_block], i),
                         8 => k_idx[base + i] as i32,
+                        9 => Self::unpack_k4_cpu(&k_idx[base..base + k_bytes_per_block], i),
                         _ => Self::unpack_k6_cpu(&k_idx[base..base + k_bytes_per_block], i),
                     };
                     k_out[dst_base + i] = scale * ((code - k_zero) as f32);
@@ -6625,6 +6646,7 @@ impl GpuDecodeStore {
                 kv_cache_write: get("kv_cache_write")?,
                 kv_cache_write_bf16: get("kv_cache_write_bf16")?,
                 kv_cache_write_k8v4: get("kv_cache_write_k8v4")?,
+                kv_cache_write_k4v4: get("kv_cache_write_k4v4")?,
                 kv_cache_write_k6v4: get("kv_cache_write_k6v4")?,
                 kv_cache_write_k7v4: get("kv_cache_write_k7v4")?,
                 kv_cache_write_k6v6: get("kv_cache_write_k6v6")?,
@@ -6633,6 +6655,7 @@ impl GpuDecodeStore {
                 gqa_attention: get("gqa_attention")?,
                 gqa_attention_bf16: get("gqa_attention_bf16")?,
                 gqa_attention_k8v4: get("gqa_attention_k8v4")?,
+                gqa_attention_k4v4: get("gqa_attention_k4v4")?,
                 gqa_attention_k6v4: get("gqa_attention_k6v4")?,
                 gqa_attention_k7v4: get("gqa_attention_k7v4")?,
                 gqa_attention_k6v6: get("gqa_attention_k6v6")?,
@@ -6641,6 +6664,7 @@ impl GpuDecodeStore {
                 gqa_attention_tiled: get("gqa_attention_tiled")?,
                 gqa_attention_tiled_bf16: get("gqa_attention_tiled_bf16")?,
                 gqa_attention_reduce: get("gqa_attention_reduce")?,
+                gqa_attention_k4v4_single_g: get("gqa_attention_k4v4_single_g")?,
                 apply_gated_attn: get("apply_gated_attn")?,
                 // Fused v2 kernels (inline atomic reduction)
                 marlin_gemv_int4_v2_fused_f32: get("marlin_gemv_int4_v2_fused_f32")?,
@@ -6658,6 +6682,7 @@ impl GpuDecodeStore {
                 kv_cache_write_g: get("kv_cache_write_g")?,
                 kv_cache_write_bf16_g: get("kv_cache_write_bf16_g")?,
                 kv_cache_write_k8v4_g: get("kv_cache_write_k8v4_g")?,
+                kv_cache_write_k4v4_g: get("kv_cache_write_k4v4_g")?,
                 kv_cache_write_k6v4_g: get("kv_cache_write_k6v4_g")?,
                 kv_cache_write_k7v4_g: get("kv_cache_write_k7v4_g")?,
                 kv_cache_write_k6v6_g: get("kv_cache_write_k6v6_g")?,
@@ -6671,6 +6696,7 @@ impl GpuDecodeStore {
                 gqa_attention_tiled_g: get("gqa_attention_tiled_g")?,
                 gqa_attention_tiled_bf16_g: get("gqa_attention_tiled_bf16_g")?,
                 gqa_attention_k8v4_tiled_g: get("gqa_attention_k8v4_tiled_g")?,
+                gqa_attention_k4v4_tiled_g: get("gqa_attention_k4v4_tiled_g")?,
                 gqa_attention_k6v4_tiled_g: get("gqa_attention_k6v4_tiled_g")?,
                 gqa_attention_k7v4_tiled_g: get("gqa_attention_k7v4_tiled_g")?,
                 gqa_attention_k6v6_tiled_g: get("gqa_attention_k6v6_tiled_g")?,
@@ -11047,6 +11073,73 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    /// Register k4v4 KV cache pointers from Python's PagedKVCache.
+    /// k4v4_ptrs: list of (layer_idx, k_scale_ptr, k_idx_ptr, v_radius_ptr, v_angles_ptr)
+    #[pyo3(signature = (k4v4_ptrs, max_seq, num_blocks))]
+    fn set_kv_cache_ptrs_k4v4(
+        &mut self,
+        k4v4_ptrs: Vec<(usize, usize, usize, usize, usize)>,
+        max_seq: usize,
+        num_blocks: usize,
+    ) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let num_layers = graph.layers.len();
+        graph.kv_k_ptrs = vec![0u64; num_layers];
+        graph.kv_v_ptrs = vec![0u64; num_layers];
+        graph.kv_k_radius_ptrs = vec![0u64; num_layers];
+        graph.kv_v_radius_ptrs = vec![0u64; num_layers];
+        graph.kv_k_angles_ptrs = vec![0u64; num_layers];
+        graph.kv_v_angles_ptrs = vec![0u64; num_layers];
+        graph.kv_tq4_sign_ptrs = vec![0u64; num_layers];
+        graph.kv_max_seq = max_seq;
+        graph.kv_format = 9;
+        graph.kv_num_blocks = num_blocks;
+
+        let mut registered = 0usize;
+        for (layer_idx, ks_ptr, ki_ptr, vr_ptr, va_ptr) in k4v4_ptrs {
+            if layer_idx >= num_layers {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Layer {} out of range ({})", layer_idx, num_layers)));
+            }
+            graph.kv_k_radius_ptrs[layer_idx] = ks_ptr as u64;
+            graph.kv_k_angles_ptrs[layer_idx] = ki_ptr as u64;
+            graph.kv_v_radius_ptrs[layer_idx] = vr_ptr as u64;
+            graph.kv_v_angles_ptrs[layer_idx] = va_ptr as u64;
+            registered += 1;
+        }
+        log::info!(
+            "GpuDecodeStore: k4v4 KV cache pointers set ({} GQA layers, max_seq={}, blocks={}, norm_correction_mode={})",
+            registered, max_seq, num_blocks, graph.polar4_norm_correction_mode
+        );
+
+        let mut max_nh: usize = 0;
+        let mut max_hd: usize = 0;
+        for layer in &graph.layers {
+            if let GpuAttnConfig::GQA { num_heads, head_dim, .. } = &layer.attn {
+                max_nh = max_nh.max(*num_heads);
+                max_hd = max_hd.max(*head_dim);
+            }
+        }
+        if max_nh > 0 && max_hd > 0 {
+            let tile_size: usize = 256;
+            let max_tiles = (max_seq + tile_size - 1) / tile_size;
+            let partial_o_size = max_nh * max_tiles * max_hd;
+            let partial_lse_size = max_nh * max_tiles * 2;
+            let d_tiled_o = self.device.alloc_zeros::<f32>(partial_o_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            let d_tiled_lse = self.device.alloc_zeros::<f32>(partial_lse_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            graph.d_gqa_tiled_o = Some(d_tiled_o);
+            graph.d_gqa_tiled_lse = Some(d_tiled_lse);
+            graph.gqa_tile_size = tile_size;
+            graph.gqa_max_tiles = max_tiles;
+            graph.gqa_num_q_heads = max_nh;
+            graph.gqa_head_dim = max_hd;
+        }
+        Ok(())
+    }
+
     /// Register k6v4 KV cache pointers from Python's PagedKVCache.
     /// k6v4_ptrs: list of (layer_idx, k_scale_ptr, k_idx_ptr, v_radius_ptr, v_angles_ptr)
     #[pyo3(signature = (k6v4_ptrs, max_seq, num_blocks))]
@@ -14465,7 +14558,7 @@ impl GpuDecodeStore {
     }
 
     /// Invalidate per-layer CUDA graphs (e.g. when HCS layout changes around prefill).
-    fn invalidate_cuda_graph(&mut self) {
+    pub fn invalidate_cuda_graph(&mut self) {
         if let Some(ref mut graph) = self.graph {
             for exec in graph.per_layer_graphs.drain(..) {
                 unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
@@ -14945,8 +15038,8 @@ impl GpuDecodeStore {
 	                                graph.kv_tq4_sign_ptrs[li],
 	                            ));
                         }
-                    } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 {
-                        // k6v4/k7v4/k6v6/k8v6: track integer K pointers and V payload pointers.
+                    } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 || graph.kv_format == 9 {
+                        // k4v4/k6v4/k7v4/k6v6/k8v6: track integer K pointers and V payload pointers.
 	                            if li < graph.kv_k_radius_ptrs.len()
 	                            && li < graph.kv_k_angles_ptrs.len()
 	                            && li < graph.kv_v_radius_ptrs.len()
@@ -15755,12 +15848,13 @@ impl GpuDecodeStore {
 		                                    ),
 	                                ).map_err(|e| format!("kv_cache_write_k8v4_g[{}]: {:?}", layer_idx, e))?;
 	                            }
-		                        } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 {
+		                        } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 || graph.kv_format == 9 {
+		                            let is_k4 = graph.kv_format == 9;
 		                            let is_k7 = graph.kv_format == 6;
 		                            let is_k6v6 = graph.kv_format == 7;
 		                            let is_k8v6 = graph.kv_format == 8;
-		                            let fmt = if is_k8v6 { "k8v6" } else if is_k6v6 { "k6v6" } else if is_k7 { "k7v4" } else { "k6v4" };
-		                            // k6v4/k7v4/k6v6/k8v6: blockwise integer K plus compressed V.
+		                            let fmt = if is_k8v6 { "k8v6" } else if is_k6v6 { "k6v6" } else if is_k7 { "k7v4" } else if is_k4 { "k4v4" } else { "k6v4" };
+		                            // k4v4/k6v4/k7v4/k6v6/k8v6: blockwise integer K plus compressed V.
 	                            let num_blocks = graph.kv_num_blocks;
 	                            let threads = 256u32;
 	                            let blocks = ((num_blocks as u32) + threads - 1) / threads;
@@ -15781,15 +15875,17 @@ impl GpuDecodeStore {
 	                                ));
 		                            }
 		                            unsafe {
-				                                let func = if is_k8v6 {
-				                                    k.kv_cache_write_k8v6_g.clone()
-				                                } else if is_k6v6 {
-				                                    k.kv_cache_write_k6v6_g.clone()
-				                                } else if is_k7 {
-			                                    k.kv_cache_write_k7v4_g.clone()
-			                                } else {
-			                                    k.kv_cache_write_k6v4_g.clone()
-		                                };
+					                                let func = if is_k8v6 {
+					                                    k.kv_cache_write_k8v6_g.clone()
+					                                } else if is_k6v6 {
+					                                    k.kv_cache_write_k6v6_g.clone()
+					                                } else if is_k7 {
+				                                    k.kv_cache_write_k7v4_g.clone()
+				                                } else if is_k4 {
+				                                    k.kv_cache_write_k4v4_g.clone()
+				                                } else {
+				                                    k.kv_cache_write_k6v4_g.clone()
+			                                };
 		                                func.launch(
 	                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
 	                                    (
@@ -15910,11 +16006,11 @@ impl GpuDecodeStore {
                                     ),
                                 ).map_err(|e| format!("gqa_attention_polar4_tiled_g[{}]: {:?}", layer_idx, e))?;
 
-		                                let reduce_smem = ((max_tiles + hd) as u32) * 4;
-		                                k.gqa_attention_polar4_reduce_g.clone().launch(
-		                                    LaunchConfig {
-		                                        grid_dim: (nh as u32, 1, 1),
-		                                        block_dim: (threads, 1, 1),
+                                let reduce_smem = ((max_tiles + hd) as u32) * 4;
+                                k.gqa_attention_polar4_reduce_g.clone().launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, 1, 1),
+                                        block_dim: (threads, 1, 1),
                                         shared_mem_bytes: reduce_smem,
                                     },
                                     (
@@ -15981,83 +16077,110 @@ impl GpuDecodeStore {
                                     ),
 	                                ).map_err(|e| format!("gqa_attention_polar4_reduce_g[k8v4][{}]: {:?}", layer_idx, e))?;
 	                            }
-				                        } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 {
-				                            let is_k7 = graph.kv_format == 6;
-				                            let is_k6v6 = graph.kv_format == 7;
-				                            let is_k8v6 = graph.kv_format == 8;
-				                            let fmt = if is_k8v6 { "k8v6" } else if is_k6v6 { "k6v6" } else if is_k7 { "k7v4" } else { "k6v4" };
-				                            // k6v4/k7v4 use Polar4 V; k6v6/k8v6 accumulate INT6 V in original domain.
-	                            let threads = 256u32;
-	                            let tile_size = graph.gqa_tile_size;
-	                            let max_tiles = graph.gqa_max_tiles;
+					                        } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 || graph.kv_format == 9 {
+					                            let is_k4 = graph.kv_format == 9;
+					                            let is_k7 = graph.kv_format == 6;
+					                            let is_k6v6 = graph.kv_format == 7;
+					                            let is_k8v6 = graph.kv_format == 8;
+					                            let fmt = if is_k8v6 { "k8v6" } else if is_k6v6 { "k6v6" } else if is_k7 { "k7v4" } else if is_k4 { "k4v4" } else { "k6v4" };
+					                            // k4v4/k6v4/k7v4 use Polar4 V; k6v6/k8v6 accumulate INT6 V in original domain.
+				                            let threads = 256u32;
+				                            if is_k4 {
+				                                let num_warps = threads / 32;
+				                                let shared_mem_bytes = ((hd as u32) * (num_warps + 1) + 2 * num_warps) * 4 + 128;
+				                                unsafe {
+				                                    k.gqa_attention_k4v4_single_g.clone().launch(
+				                                        LaunchConfig {
+				                                            grid_dim: (nh as u32, 1, 1),
+				                                            block_dim: (threads, 1, 1),
+				                                            shared_mem_bytes,
+				                                        },
+				                                        (
+				                                            *graph.d_gqa_out.device_ptr(),
+				                                            *graph.d_gqa_q.device_ptr(),
+				                                            graph.kv_k_radius_ptrs[layer_idx],
+				                                            graph.kv_k_angles_ptrs[layer_idx],
+				                                            graph.kv_v_radius_ptrs[layer_idx],
+				                                            graph.kv_v_angles_ptrs[layer_idx],
+				                                            *sm_scale,
+				                                            nkv as i32,
+				                                            hd as i32,
+				                                            d_seq_len_ptr,
+				                                        ),
+				                                    ).map_err(|e| format!("gqa_attention_k4v4_single_g[{}]: {:?}", layer_idx, e))?;
+				                                }
+				                            } else {
+				                                let tile_size = graph.gqa_tile_size;
+				                                let max_tiles = graph.gqa_max_tiles;
 
-		                            let tiled_o = graph.d_gqa_tiled_o.as_ref()
-		                                .ok_or_else(|| format!("gqa_attention_{}_tiled_g[{}]: tiled buffers not allocated", fmt, layer_idx))?;
-		                            let tiled_lse = graph.d_gqa_tiled_lse.as_ref().unwrap();
-		                            if tile_size == 0 || max_tiles == 0 {
-		                                return Err(format!("gqa_attention_{}_tiled_g[{}]: tile_size={} max_tiles={} invalid", fmt, layer_idx, tile_size, max_tiles));
-		                            }
-		                            let tile_smem = ((tile_size + hd) as u32) * 4 + 128;
-		                            unsafe {
-				                                let func = if is_k8v6 {
-				                                    k.gqa_attention_k8v6_tiled_g.clone()
-				                                } else if is_k6v6 {
-				                                    k.gqa_attention_k6v6_tiled_g.clone()
-				                                } else if is_k7 {
-			                                    k.gqa_attention_k7v4_tiled_g.clone()
-			                                } else {
-			                                    k.gqa_attention_k6v4_tiled_g.clone()
-		                                };
-		                                func.launch(
-	                                    LaunchConfig {
-	                                        grid_dim: (nh as u32, max_tiles as u32, 1),
-	                                        block_dim: (threads, 1, 1),
-	                                        shared_mem_bytes: tile_smem,
-	                                    },
-	                                    (
-	                                        *tiled_o.device_ptr(),
-	                                        *tiled_lse.device_ptr(),
-	                                        *graph.d_gqa_q.device_ptr(),
-	                                        graph.kv_k_radius_ptrs[layer_idx],
-	                                        graph.kv_k_angles_ptrs[layer_idx],
-	                                        graph.kv_v_radius_ptrs[layer_idx],
-	                                        graph.kv_v_angles_ptrs[layer_idx],
-	                                        *sm_scale,
-	                                        nkv as i32,
-	                                        hd as i32,
-	                                        d_seq_len_ptr,
-	                                        tile_size as i32,
-	                                    ),
-		                                ).map_err(|e| format!("gqa_attention_{}_tiled_g[{}]: {:?}", fmt, layer_idx, e))?;
+				                                let tiled_o = graph.d_gqa_tiled_o.as_ref()
+				                                    .ok_or_else(|| format!("gqa_attention_{}_tiled_g[{}]: tiled buffers not allocated", fmt, layer_idx))?;
+				                                let tiled_lse = graph.d_gqa_tiled_lse.as_ref().unwrap();
+				                                if tile_size == 0 || max_tiles == 0 {
+				                                    return Err(format!("gqa_attention_{}_tiled_g[{}]: tile_size={} max_tiles={} invalid", fmt, layer_idx, tile_size, max_tiles));
+				                                }
+				                                let tile_smem = ((tile_size + hd) as u32) * 4 + 128;
+				                                unsafe {
+				                                    let func = if is_k8v6 {
+				                                        k.gqa_attention_k8v6_tiled_g.clone()
+				                                    } else if is_k6v6 {
+				                                        k.gqa_attention_k6v6_tiled_g.clone()
+				                                    } else if is_k7 {
+				                                        k.gqa_attention_k7v4_tiled_g.clone()
+				                                    } else {
+				                                        k.gqa_attention_k6v4_tiled_g.clone()
+				                                    };
+				                                    func.launch(
+				                                        LaunchConfig {
+				                                            grid_dim: (nh as u32, max_tiles as u32, 1),
+				                                            block_dim: (threads, 1, 1),
+				                                            shared_mem_bytes: tile_smem,
+				                                        },
+				                                        (
+				                                            *tiled_o.device_ptr(),
+				                                            *tiled_lse.device_ptr(),
+				                                            *graph.d_gqa_q.device_ptr(),
+				                                            graph.kv_k_radius_ptrs[layer_idx],
+				                                            graph.kv_k_angles_ptrs[layer_idx],
+				                                            graph.kv_v_radius_ptrs[layer_idx],
+				                                            graph.kv_v_angles_ptrs[layer_idx],
+				                                            *sm_scale,
+				                                            nkv as i32,
+				                                            hd as i32,
+				                                            d_seq_len_ptr,
+				                                            tile_size as i32,
+				                                        ),
+				                                    ).map_err(|e| format!("gqa_attention_{}_tiled_g[{}]: {:?}", fmt, layer_idx, e))?;
 
-			                                let reduce_smem = if is_k6v6 || is_k8v6 {
-			                                    (max_tiles as u32) * 4
-			                                } else {
-		                                    ((max_tiles + hd) as u32) * 4
-		                                };
-			                                let reduce_func = if is_k6v6 || is_k8v6 {
-			                                    k.gqa_attention_reduce_g.clone()
-			                                } else {
-		                                    k.gqa_attention_polar4_reduce_g.clone()
-		                                };
-			                                reduce_func.launch(
-	                                    LaunchConfig {
-	                                        grid_dim: (nh as u32, 1, 1),
-	                                        block_dim: (threads, 1, 1),
-	                                        shared_mem_bytes: reduce_smem,
-	                                    },
-	                                    (
-	                                        *graph.d_gqa_out.device_ptr(),
-	                                        *tiled_o.device_ptr(),
-	                                        *tiled_lse.device_ptr(),
-	                                        nh as i32, hd as i32,
-	                                        d_seq_len_ptr,
-		                                        tile_size as i32,
-		                                        max_tiles as i32,
-		                                    ),
-					                                ).map_err(|e| format!("gqa_attention_reduce_g[{}][{}]: {:?}", fmt, layer_idx, e))?;
-		                            }
-	                        } else if graph.kv_format == 4 {
+				                                    let reduce_smem = if is_k6v6 || is_k8v6 {
+				                                        (max_tiles as u32) * 4
+				                                    } else {
+				                                        ((max_tiles + hd) as u32) * 4
+				                                    };
+				                                    let reduce_func = if is_k6v6 || is_k8v6 {
+				                                        k.gqa_attention_reduce_g.clone()
+				                                    } else {
+				                                        k.gqa_attention_polar4_reduce_g.clone()
+				                                    };
+				                                    reduce_func.launch(
+				                                        LaunchConfig {
+				                                            grid_dim: (nh as u32, 1, 1),
+				                                            block_dim: (threads, 1, 1),
+				                                            shared_mem_bytes: reduce_smem,
+				                                        },
+				                                        (
+				                                            *graph.d_gqa_out.device_ptr(),
+				                                            *tiled_o.device_ptr(),
+				                                            *tiled_lse.device_ptr(),
+				                                            nh as i32, hd as i32,
+				                                            d_seq_len_ptr,
+				                                            tile_size as i32,
+				                                            max_tiles as i32,
+				                                        ),
+				                                    ).map_err(|e| format!("gqa_attention_reduce_g[{}][{}]: {:?}", fmt, layer_idx, e))?;
+				                                }
+				                            }
+			                        } else if graph.kv_format == 4 {
                             // tq4 attention: TQ key scores, uniform 4-bit V accumulation in original domain.
                             let threads = 256u32;
                             let tile_size = graph.gqa_tile_size;
@@ -18363,11 +18486,12 @@ impl GpuDecodeStore {
                                 graph.polar4_norm_correction_mode,
 	                            )).map_err(|e| format!("kv_cache_write_k8v4[{}]: {:?}", layer_idx, e))?;
 	                        }
-			                    } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 {
-			                        let is_k7 = graph.kv_format == 6;
-			                        let is_k6v6 = graph.kv_format == 7;
-			                        let is_k8v6 = graph.kv_format == 8;
-			                        let fmt = if is_k8v6 { "k8v6" } else if is_k6v6 { "k6v6" } else if is_k7 { "k7v4" } else { "k6v4" };
+				                    } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 || graph.kv_format == 9 {
+				                        let is_k4 = graph.kv_format == 9;
+				                        let is_k7 = graph.kv_format == 6;
+				                        let is_k6v6 = graph.kv_format == 7;
+				                        let is_k8v6 = graph.kv_format == 8;
+				                        let fmt = if is_k8v6 { "k8v6" } else if is_k6v6 { "k6v6" } else if is_k7 { "k7v4" } else if is_k4 { "k4v4" } else { "k6v4" };
 		                        let num_blocks = graph.kv_num_blocks;
 	                        let threads = 256u32;
 	                        let blocks = ((num_blocks as u32) + threads - 1) / threads;
@@ -18393,15 +18517,17 @@ impl GpuDecodeStore {
 	                            ));
 		                        }
 		                        unsafe {
-				                            let func = if is_k8v6 {
-				                                k.kv_cache_write_k8v6.clone()
-				                            } else if is_k6v6 {
-				                                k.kv_cache_write_k6v6.clone()
-				                            } else if is_k7 {
-			                                k.kv_cache_write_k7v4.clone()
-			                            } else {
-		                                k.kv_cache_write_k6v4.clone()
-		                            };
+					                            let func = if is_k8v6 {
+					                                k.kv_cache_write_k8v6.clone()
+					                            } else if is_k6v6 {
+					                                k.kv_cache_write_k6v6.clone()
+					                            } else if is_k7 {
+				                                k.kv_cache_write_k7v4.clone()
+				                            } else if is_k4 {
+				                                k.kv_cache_write_k4v4.clone()
+				                            } else {
+			                                k.kv_cache_write_k6v4.clone()
+			                            };
 		                            func.launch(cfg, (
 	                                graph.kv_k_radius_ptrs[layer_idx],
 	                                graph.kv_k_angles_ptrs[layer_idx],
@@ -18563,12 +18689,13 @@ impl GpuDecodeStore {
                                 graph.kv_max_seq as i32,
 	                            )).map_err(|e| format!("gqa_attention_k8v4[{}]: {:?}", layer_idx, e))?;
 	                        }
-		                    } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 {
-		                        let is_k7 = graph.kv_format == 6;
-		                        let is_k6v6 = graph.kv_format == 7;
-		                        let is_k8v6 = graph.kv_format == 8;
-		                        let fmt = if is_k8v6 { "k8v6" } else if is_k6v6 { "k6v6" } else if is_k7 { "k7v4" } else { "k6v4" };
-		                        // k6v4/k7v4/k6v6/k8v6 attention: single-block-per-head kernel.
+			                    } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 || graph.kv_format == 9 {
+			                        let is_k4 = graph.kv_format == 9;
+			                        let is_k7 = graph.kv_format == 6;
+			                        let is_k6v6 = graph.kv_format == 7;
+			                        let is_k8v6 = graph.kv_format == 8;
+			                        let fmt = if is_k8v6 { "k8v6" } else if is_k6v6 { "k6v6" } else if is_k7 { "k7v4" } else if is_k4 { "k4v4" } else { "k6v4" };
+			                        // k4v4/k6v4/k7v4/k6v6/k8v6 attention: single-block-per-head kernel.
 	                        let threads = 256u32;
 	                        let seq_len = (position + 1) as u32;
 	                        let num_warps = threads / 32;
@@ -18579,15 +18706,17 @@ impl GpuDecodeStore {
 	                            shared_mem_bytes,
 		                        };
 		                        unsafe {
-				                            let func = if is_k8v6 {
-				                                k.gqa_attention_k8v6.clone()
-				                            } else if is_k6v6 {
-				                                k.gqa_attention_k6v6.clone()
-				                            } else if is_k7 {
-			                                k.gqa_attention_k7v4.clone()
-			                            } else {
-		                                k.gqa_attention_k6v4.clone()
-		                            };
+					                            let func = if is_k8v6 {
+					                                k.gqa_attention_k8v6.clone()
+					                            } else if is_k6v6 {
+					                                k.gqa_attention_k6v6.clone()
+					                            } else if is_k7 {
+				                                k.gqa_attention_k7v4.clone()
+				                            } else if is_k4 {
+				                                k.gqa_attention_k4v4.clone()
+				                            } else {
+			                                k.gqa_attention_k6v4.clone()
+			                            };
 		                            func.launch(cfg, (
 	                                *graph.d_gqa_out.device_ptr(),
 	                                *graph.d_gqa_q.device_ptr(),
@@ -19980,18 +20109,19 @@ impl GpuDecodeStore {
                 }
                 copied += 1;
             }
-        } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 {
+        } else if graph.kv_format == 5 || graph.kv_format == 6 || graph.kv_format == 7 || graph.kv_format == 8 || graph.kv_format == 9 {
+            let is_k4 = graph.kv_format == 9;
             let is_k7 = graph.kv_format == 6;
             let is_k6v6 = graph.kv_format == 7;
             let is_k8v6 = graph.kv_format == 8;
-            let fmt = if is_k8v6 { "k8v6" } else if is_k6v6 { "k6v6" } else if is_k7 { "k7v4" } else { "k6v4" };
-            // k6v4/k7v4/k6v6/k8v6: K scale + packed integer indices, plus compressed V payload.
+            let fmt = if is_k8v6 { "k8v6" } else if is_k6v6 { "k6v6" } else if is_k7 { "k7v4" } else if is_k4 { "k4v4" } else { "k6v4" };
+            // k4v4/k6v4/k7v4/k6v6/k8v6: K scale + packed integer indices, plus compressed V payload.
             let num_blocks = graph.kv_num_blocks;
             if num_blocks == 0 {
                 return Err(format!("{} copy but kv_num_blocks=0", fmt));
             }
             let k_scale_bytes_per_pos = num_blocks * 2;
-            let k_idx_bytes_per_pos = num_blocks * if is_k8v6 { 16 } else if is_k7 { 14 } else { 12 };
+            let k_idx_bytes_per_pos = num_blocks * if is_k8v6 { 16 } else if is_k7 { 14 } else if is_k4 { 8 } else { 12 };
             let v_radius_bytes_per_pos = num_blocks * 2;
             let v_angles_bytes_per_pos = num_blocks * if is_k6v6 || is_k8v6 { 12 } else { 8 };
 

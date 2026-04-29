@@ -695,8 +695,8 @@ def main():
     parser.add_argument("--krasis-threads", type=int, default=40,
                         help="CPU threads for expert computation")
     parser.add_argument("--kv-dtype", default="k6v6",
-                        choices=["polar4", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", "tq4", "fp8_e4m3", "bf16"],
-                        help="KV cache format: k6v6 Quality default, k6v4 Compact, bf16 Full Precision, or explicit internal formats")
+                        choices=["polar4", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", "k4v4", "tq4", "fp8_e4m3", "bf16"],
+                        help="KV cache format: k6v6 Quality default, k4v4 Ultra Compact, bf16 Full Precision, or explicit internal formats")
     parser.add_argument("--kv-cache-mb", type=int, default=1000,
                         help="KV cache size in MB (default: 1000)")
     parser.add_argument("--heatmap-path", default=None,
@@ -710,7 +710,7 @@ def main():
     parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bits for CPU decode experts")
     parser.add_argument("--attention-quant", default="bf16", choices=list(ATTENTION_QUANT_CHOICES),
-                        help="Attention weight precision: bf16 (default), awq, hqq4, or hqq8")
+                        help="Attention weight precision: hqq8 is the quality-first high-fidelity option; bf16, awq, and hqq4 are explicit alternatives")
     parser.add_argument("--hqq-cache-profile", default="baseline", choices=list(HQQ_CACHE_PROFILE_CHOICES),
                         help="HQQ attention cache profile: baseline (default) or an explicit calibrated profile")
     parser.add_argument("--hqq-sidecar-manifest", default=None,
@@ -886,10 +886,10 @@ def main():
     global _model, _model_name
     import torch
 
-    kv_format_str = args.kv_dtype  # "fp8_e4m3", "bf16", "polar4", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", or "tq4"
+    kv_format_str = args.kv_dtype  # "fp8_e4m3", "bf16", "polar4", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", "k4v4", or "tq4"
     if args.kv_dtype == "fp8_e4m3":
         kv_dtype = torch.float8_e4m3fn
-    elif args.kv_dtype in ("polar4", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", "tq4"):
+    elif args.kv_dtype in ("polar4", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", "k4v4", "tq4"):
         kv_dtype = torch.float8_e4m3fn  # base dtype for size calc; custom formats allocate their own tensors
     else:
         kv_dtype = torch.bfloat16
@@ -1628,6 +1628,29 @@ def main():
                 soft_budget_mb=gpu0_soft,
                 safety_margin_mb=SAFETY_MARGIN_MB,
             )
+            clamp_soft_mb_raw = os.environ.get("KRASIS_HCS_CLAMP_SOFT_MB", "").strip()
+            if clamp_soft_mb_raw:
+                try:
+                    clamp_soft_mb = int(clamp_soft_mb_raw)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid KRASIS_HCS_CLAMP_SOFT_MB={clamp_soft_mb_raw!r}; "
+                        "expected an integer MB value"
+                    ) from exc
+                if clamp_soft_mb < 0:
+                    raise ValueError(
+                        f"Invalid KRASIS_HCS_CLAMP_SOFT_MB={clamp_soft_mb}; "
+                        "expected a non-negative integer MB value"
+                    )
+                applied_soft_mb, loaded_soft_mb = store.hcs_clamp_soft_budget_mb(clamp_soft_mb)
+                _warn(
+                    f"Diagnostic HCS soft clamp: requested {clamp_soft_mb:,} MB, "
+                    f"loaded {loaded_soft_mb:,} MB, applied soft max {applied_soft_mb:,} MB"
+                )
+                logger.warning(
+                    "Diagnostic HCS soft clamp: requested=%d MB loaded=%d MB applied=%d MB",
+                    clamp_soft_mb, loaded_soft_mb, applied_soft_mb,
+                )
             hcs_elapsed = time.time() - t_hcs
 
             vram_monitor.report_event("hcs_init_end")

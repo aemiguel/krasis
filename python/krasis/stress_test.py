@@ -462,7 +462,7 @@ def main():
     parser.add_argument("--gpu-expert-bits", type=int, default=4)
     parser.add_argument("--cpu-expert-bits", type=int, default=4)
     parser.add_argument("--attention-quant", default="bf16", choices=list(ATTENTION_QUANT_CHOICES),
-                        help="Attention weight precision: bf16 (default), awq (calibrated per-tensor via AWQ), or hqq4")
+                        help="Attention weight precision: hqq8 is the quality-first high-fidelity option; bf16, awq, and hqq4 are explicit alternatives")
     parser.add_argument("--shared-expert-quant", default="int8")
     parser.add_argument("--dense-mlp-quant", default="int8")
     parser.add_argument("--lm-head-quant", default="int8")

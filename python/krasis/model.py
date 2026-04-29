@@ -5852,9 +5852,9 @@ class KrasisModel:
             logger.info("Shared tq4 KV cache: %d GQA layers, max_seq=%d (%d pages × %d), heads=%d head_dim=%d",
                         len(tq4_ptrs), max_seq, cache.max_pages, cache.page_size,
                         cache.num_kv_heads, cache.gqa_head_dim)
-        elif cache is not None and cache.kv_format in (5, 6, 7, 8) and cache.k_radius_cache is not None:
-            # k6v4/k7v4/k6v6/k8v6 KV cache: K is blockwise integer + BF16
-            # scale. k6v4/k7v4 use Polar4 V; k6v6/k8v6 use integer V.
+        elif cache is not None and cache.kv_format in (5, 6, 7, 8, 9) and cache.k_radius_cache is not None:
+            # k4v4/k6v4/k7v4/k6v6/k8v6 KV cache: K is blockwise integer + BF16
+            # scale. k4v4/k6v4/k7v4 use Polar4 V; k6v6/k8v6 use integer V.
             kintv4_ptrs = []
             gqa_cache_idx = 0
             for layer_idx, layer in enumerate(self.layers):
@@ -5879,6 +5879,9 @@ class KrasisModel:
             elif cache.kv_format == 6:
                 store.set_kv_cache_ptrs_k7v4(kintv4_ptrs, max_seq, num_blocks)
                 fmt = "k7v4"
+            elif cache.kv_format == 9:
+                store.set_kv_cache_ptrs_k4v4(kintv4_ptrs, max_seq, num_blocks)
+                fmt = "k4v4"
             else:
                 store.set_kv_cache_ptrs_k6v4(kintv4_ptrs, max_seq, num_blocks)
                 fmt = "k6v4"
@@ -6720,9 +6723,9 @@ class KrasisModel:
             logger.info("Aux tq4 KV cache on cuda:%d: %d GQA layers for [%d..%d), max_seq=%d, heads=%d head_dim=%d",
                         gpu_idx, len(tq4_ptrs), split_layer, layer_end, max_seq,
                         cache.num_kv_heads, cache.gqa_head_dim)
-        elif cache is not None and cache.kv_format in (5, 6, 7, 8) and cache.k_radius_cache is not None:
-            # k6v4/k7v4/k6v6/k8v6 KV cache: K is blockwise integer + BF16
-            # scale. k6v4/k7v4 use Polar4 V; k6v6/k8v6 use integer V.
+        elif cache is not None and cache.kv_format in (5, 6, 7, 8, 9) and cache.k_radius_cache is not None:
+            # k4v4/k6v4/k7v4/k6v6/k8v6 KV cache: K is blockwise integer + BF16
+            # scale. k4v4/k6v4/k7v4 use Polar4 V; k6v6/k8v6 use integer V.
             kintv4_ptrs = []
             gqa_cache_idx = 0
             for layer_idx, layer in enumerate(self.layers):
@@ -6763,6 +6766,9 @@ class KrasisModel:
             elif cache.kv_format == 6:
                 store.set_kv_cache_ptrs_k7v4(kintv4_ptrs, max_seq, num_blocks)
                 fmt = "k7v4"
+            elif cache.kv_format == 9:
+                store.set_kv_cache_ptrs_k4v4(kintv4_ptrs, max_seq, num_blocks)
+                fmt = "k4v4"
             else:
                 store.set_kv_cache_ptrs_k6v4(kintv4_ptrs, max_seq, num_blocks)
                 fmt = "k6v4"

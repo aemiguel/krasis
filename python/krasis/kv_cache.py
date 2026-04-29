@@ -65,6 +65,7 @@ class PagedKVCache:
             "k7v4": "k7v4",
             "k6v6": "k6v6",
             "k6v4": "k6v4",
+            "k4v4": "k4v4",
             "tq4": "tq4",
         }
         self.kv_format_str = kv_aliases.get(kv_format, kv_format)
@@ -85,6 +86,8 @@ class PagedKVCache:
             self.kv_format = 7
         elif self.kv_format_str == "k8v6":
             self.kv_format = 8
+        elif self.kv_format_str == "k4v4":
+            self.kv_format = 9
 
         # Compute cache dimensions based on attention type
         if cfg.is_mla:
@@ -208,11 +211,11 @@ class PagedKVCache:
                     + self.v_angles_cache.nbytes
                 ) / (1024**2)
                 layout_str = "gqa-k8v4"
-            elif self.kv_format in (5, 6, 7, 8):
-                # k6v4/k7v4: integer K plus Polar4 V. k6v6/k8v6 use
+            elif self.kv_format in (5, 6, 7, 8, 9):
+                # k4v4/k6v4/k7v4: integer K plus Polar4 V. k6v6/k8v6 use
                 # the same slots with integer V scale/indices instead.
                 num_blocks = (self.num_kv_heads * self.gqa_head_dim) // 16
-                k_packed_bytes = 16 if self.kv_format == 8 else 14 if self.kv_format == 6 else 12
+                k_packed_bytes = 16 if self.kv_format == 8 else 14 if self.kv_format == 6 else 8 if self.kv_format == 9 else 12
                 v_packed_bytes = 12 if self.kv_format in (7, 8) else 8
                 self.k_radius_cache = torch.zeros(
                     num_layers, max_pages, page_size, num_blocks,
@@ -242,6 +245,8 @@ class PagedKVCache:
                     layout_str = "gqa-k6v6"
                 elif self.kv_format == 6:
                     layout_str = "gqa-k7v4"
+                elif self.kv_format == 9:
+                    layout_str = "gqa-k4v4"
                 else:
                     layout_str = "gqa-k6v4"
             elif self.kv_format == 4:
@@ -330,6 +335,11 @@ class PagedKVCache:
             kv_elems = self.num_kv_heads * self.gqa_head_dim
             num_blocks = kv_elems // 16
             return self.page_size * (num_blocks * 14 + num_blocks * 10) * self.num_layers
+        if self.kv_format == 9:
+            # k4v4: K scale + 8 packed bytes per 16 elements, plus Polar4 V.
+            kv_elems = self.num_kv_heads * self.gqa_head_dim
+            num_blocks = kv_elems // 16
+            return self.page_size * (num_blocks * 10 + num_blocks * 10) * self.num_layers
         if self.kv_format == 6:
             # k7v4: K scale + 14 packed bytes per 16 elements, plus Polar4 V.
             kv_elems = self.num_kv_heads * self.gqa_head_dim

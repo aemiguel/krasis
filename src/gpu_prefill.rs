@@ -2371,12 +2371,14 @@ pub struct PrefillKernels {
     kv_concat_bf16: RawCuFunc,
     kv_cache_append_polar4: RawCuFunc,
     kv_cache_append_k8v4: RawCuFunc,
+    kv_cache_append_k4v4: RawCuFunc,
     kv_cache_append_k6v4: RawCuFunc,
     kv_cache_append_k7v4: RawCuFunc,
     kv_cache_append_k6v6: RawCuFunc,
     kv_cache_append_k8v6: RawCuFunc,
     kv_cache_append_tq4: RawCuFunc,
     kv_dequant_concat_polar4: RawCuFunc,
+    kv_dequant_concat_k4: RawCuFunc,
     kv_dequant_concat_k6: RawCuFunc,
     kv_dequant_concat_k7: RawCuFunc,
     kv_dequant_concat_k8: RawCuFunc,
@@ -3100,7 +3102,7 @@ pub struct PrefillEngine {
     pub kv_k_ptrs: Vec<u64>, // per-layer K cache pointers (FP8)
     pub kv_v_ptrs: Vec<u64>, // per-layer V cache pointers (FP8)
     pub kv_max_seq: usize,
-    /// KV cache format: 0=bf16, 1=fp8, 2=polar4, 3=k8v4, 4=tq4, 5=k6v4, 6=k7v4, 7=k6v6, 8=k8v6
+    /// KV cache format: 0=bf16, 1=fp8, 2=polar4, 3=k8v4, 4=tq4, 5=k6v4, 6=k7v4, 7=k6v6, 8=k8v6, 9=k4v4
     pub kv_format: u32,
     /// Opt-in Polar4 radius norm correction mode.
     /// 0=off, 1=K only, 2=V only, 3=K+V. Cache layout is unchanged.
@@ -12547,7 +12549,7 @@ impl PrefillEngine {
                     self.gqa_bf16_calls.set(self.gqa_bf16_calls.get() + 1);
                 }
             } else if ((self.kv_format == 3 && layer_k_ptr != 0)
-                || ((self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8)
+                || ((self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8 || self.kv_format == 9)
                     && layer_idx < self.kv_k_radius_ptrs.len()
                     && self.kv_k_radius_ptrs[layer_idx] != 0))
                 && layer_idx < self.kv_v_radius_ptrs.len()
@@ -12561,6 +12563,8 @@ impl PrefillEngine {
                     "fa2_k7v4_cross_chunk"
                 } else if self.kv_format == 5 {
                     "fa2_k6v4_cross_chunk"
+                } else if self.kv_format == 9 {
+                    "fa2_k4v4_cross_chunk"
                 } else {
                     "fa2_k8v4_cross_chunk"
                 };
@@ -12575,7 +12579,7 @@ impl PrefillEngine {
                 if required_bytes > scratch_bytes {
                     return Err(format!(
                         "{} cross-chunk KV staging needs {} bytes, fp32 scratch has {}",
-                        if self.kv_format == 8 { "k8v6" } else if self.kv_format == 7 { "k6v6" } else if self.kv_format == 6 { "k7v4" } else if self.kv_format == 5 { "k6v4" } else { "k8v4" },
+                        if self.kv_format == 8 { "k8v6" } else if self.kv_format == 7 { "k6v6" } else if self.kv_format == 6 { "k7v4" } else if self.kv_format == 5 { "k6v4" } else if self.kv_format == 9 { "k4v4" } else { "k8v4" },
                         required_bytes, scratch_bytes
                     ));
                 }
@@ -12589,7 +12593,7 @@ impl PrefillEngine {
                     std::cmp::max(32, ((std::cmp::min(512, kv_stride) + 31) / 32) * 32) as u32;
                 unsafe {
                     let mut k0 = full_k_bf16;
-                    let mut k1 = if self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8 {
+                    let mut k1 = if self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8 || self.kv_format == 9 {
                         self.kv_k_radius_ptrs[layer_idx]
                     } else {
                         layer_k_ptr
@@ -12598,12 +12602,14 @@ impl PrefillEngine {
                     let mut k3 = start_pos as i32;
                     let mut k4 = m as i32;
                     let mut k5 = kv_stride as i32;
-                    if self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8 {
+                    if self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8 || self.kv_format == 9 {
                         let mut ka = self.kv_k_angles_ptrs[layer_idx];
                         let dequant_kernel = if self.kv_format == 8 {
                             self.kernels.kv_dequant_concat_k8
                         } else if self.kv_format == 6 {
                             self.kernels.kv_dequant_concat_k7
+                        } else if self.kv_format == 9 {
+                            self.kernels.kv_dequant_concat_k4
                         } else {
                             self.kernels.kv_dequant_concat_k6
                         };
@@ -12730,7 +12736,7 @@ impl PrefillEngine {
                 if ret != 0 {
                     return Err(format!(
                         "FlashAttention-2 {} cross-chunk forward failed: {}",
-		                        if self.kv_format == 8 { "k8v6" } else if self.kv_format == 7 { "k6v6" } else if self.kv_format == 6 { "k7v4" } else if self.kv_format == 5 { "k6v4" } else { "k8v4" },
+		                        if self.kv_format == 8 { "k8v6" } else if self.kv_format == 7 { "k6v6" } else if self.kv_format == 6 { "k7v4" } else if self.kv_format == 5 { "k6v4" } else if self.kv_format == 9 { "k4v4" } else { "k8v4" },
                         ret
                     ));
                 }
@@ -13280,17 +13286,18 @@ impl PrefillEngine {
                 )?;
             }
         } else if capture_kv_cache
-            && (self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8)
+            && (self.kv_format == 5 || self.kv_format == 6 || self.kv_format == 7 || self.kv_format == 8 || self.kv_format == 9)
             && layer_idx < self.kv_k_radius_ptrs.len()
             && self.kv_k_radius_ptrs[layer_idx] != 0
             && layer_idx < self.kv_v_radius_ptrs.len()
             && self.kv_v_radius_ptrs[layer_idx] != 0
             && !kv_cache_already_stored
         {
+            let is_k4 = self.kv_format == 9;
             let is_k7 = self.kv_format == 6;
             let is_k6v6 = self.kv_format == 7;
             let is_k8v6 = self.kv_format == 8;
-            kv_append_path = if is_k8v6 { "k8v6_append" } else if is_k6v6 { "k6v6_append" } else if is_k7 { "k7v4_append" } else { "k6v4_append" };
+            kv_append_path = if is_k8v6 { "k8v6_append" } else if is_k6v6 { "k6v6_append" } else if is_k7 { "k7v4_append" } else if is_k4 { "k4v4_append" } else { "k6v4_append" };
             let kv_stride = (cfg.num_kv_heads * cfg.head_dim) as i32;
             let num_blocks = (kv_stride / 16) as u32;
             let kv_threads = std::cmp::max(32, ((std::cmp::min(256, num_blocks) + 31) / 32) * 32);
@@ -13307,15 +13314,17 @@ impl PrefillEngine {
             let mut p10 = self.polar4_norm_correction_mode;
             unsafe {
                 launch(
-		                    if is_k8v6 {
-		                        self.kernels.kv_cache_append_k8v6
-		                    } else if is_k6v6 {
-		                        self.kernels.kv_cache_append_k6v6
-	                    } else if is_k7 {
-	                        self.kernels.kv_cache_append_k7v4
-	                    } else {
-                        self.kernels.kv_cache_append_k6v4
-                    },
+			                    if is_k8v6 {
+			                        self.kernels.kv_cache_append_k8v6
+			                    } else if is_k6v6 {
+			                        self.kernels.kv_cache_append_k6v6
+		                    } else if is_k7 {
+		                        self.kernels.kv_cache_append_k7v4
+		                    } else if is_k4 {
+		                        self.kernels.kv_cache_append_k4v4
+		                    } else {
+	                        self.kernels.kv_cache_append_k6v4
+	                    },
                     (m as u32, 1, 1),
                     (kv_threads, 1, 1),
                     0,
@@ -27899,12 +27908,14 @@ impl PrefillKernels {
                     "kv_cache_concat_bf16_kernel",
                     "kv_cache_append_polar4_kernel",
                     "kv_cache_append_k8v4_kernel",
+                    "kv_cache_append_k4v4_kernel",
                     "kv_cache_append_k6v4_kernel",
                     "kv_cache_append_k7v4_kernel",
                     "kv_cache_append_k6v6_kernel",
                     "kv_cache_append_k8v6_kernel",
                     "kv_cache_append_tq4_kernel",
                     "kv_cache_dequant_concat_polar4_kernel",
+                    "kv_cache_dequant_concat_k4_kernel",
                     "kv_cache_dequant_concat_k6_kernel",
                     "kv_cache_dequant_concat_k7_kernel",
                     "kv_cache_dequant_concat_k8_kernel",
@@ -27995,12 +28006,14 @@ impl PrefillKernels {
             kv_concat_bf16: get("kv_cache_concat_bf16_kernel")?,
             kv_cache_append_polar4: get("kv_cache_append_polar4_kernel")?,
             kv_cache_append_k8v4: get("kv_cache_append_k8v4_kernel")?,
+            kv_cache_append_k4v4: get("kv_cache_append_k4v4_kernel")?,
             kv_cache_append_k6v4: get("kv_cache_append_k6v4_kernel")?,
             kv_cache_append_k7v4: get("kv_cache_append_k7v4_kernel")?,
             kv_cache_append_k6v6: get("kv_cache_append_k6v6_kernel")?,
             kv_cache_append_k8v6: get("kv_cache_append_k8v6_kernel")?,
             kv_cache_append_tq4: get("kv_cache_append_tq4_kernel")?,
             kv_dequant_concat_polar4: get("kv_cache_dequant_concat_polar4_kernel")?,
+            kv_dequant_concat_k4: get("kv_cache_dequant_concat_k4_kernel")?,
             kv_dequant_concat_k6: get("kv_cache_dequant_concat_k6_kernel")?,
             kv_dequant_concat_k7: get("kv_cache_dequant_concat_k7_kernel")?,
             kv_dequant_concat_k8: get("kv_cache_dequant_concat_k8_kernel")?,
@@ -29294,12 +29307,14 @@ mod kernel_tests {
                     "kv_cache_append_fp8_kernel",
                     "kv_cache_append_polar4_kernel",
                     "kv_cache_append_k8v4_kernel",
+                    "kv_cache_append_k4v4_kernel",
                     "kv_cache_append_k6v4_kernel",
                     "kv_cache_append_k7v4_kernel",
                     "kv_cache_append_k6v6_kernel",
                     "kv_cache_append_k8v6_kernel",
                     "kv_cache_append_tq4_kernel",
                     "kv_cache_dequant_concat_polar4_kernel",
+                    "kv_cache_dequant_concat_k4_kernel",
                     "kv_cache_dequant_concat_k6_kernel",
                     "kv_cache_dequant_concat_k7_kernel",
                     "kv_cache_dequant_concat_k8_kernel",
