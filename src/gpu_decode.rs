@@ -4474,6 +4474,53 @@ impl GpuDecodeStore {
         bytes
     }
 
+    fn unpack_hqq6_row_major_to_u8(
+        packed: &[u8],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<Vec<u8>, String> {
+        if group_size == 0 {
+            return Err("HQQ6 unpack requires non-zero group_size".to_string());
+        }
+        let groups = cols.div_ceil(group_size);
+        let padded_cols = groups
+            .checked_mul(group_size)
+            .ok_or("HQQ6 unpack padded column overflow")?;
+        let packed_row_stride = padded_cols.div_ceil(4) * 3;
+        let expected = rows
+            .checked_mul(packed_row_stride)
+            .ok_or("HQQ6 unpack packed byte count overflow")?;
+        if packed.len() != expected {
+            return Err(format!(
+                "HQQ6 unpack byte count mismatch: got {} expected {} (rows={} cols={} group_size={} stride={})",
+                packed.len(),
+                expected,
+                rows,
+                cols,
+                group_size,
+                packed_row_stride,
+            ));
+        }
+        let total = rows
+            .checked_mul(cols)
+            .ok_or("HQQ6 unpack output byte count overflow")?;
+        let mut out = vec![0u8; total];
+        for row in 0..rows {
+            let src_row = &packed[row * packed_row_stride..(row + 1) * packed_row_stride];
+            let dst_row = &mut out[row * cols..(row + 1) * cols];
+            for col in 0..cols {
+                let triplet = (col >> 2) * 3;
+                let offset = (col & 3) * 6;
+                let bits = (src_row[triplet] as u32)
+                    | ((src_row[triplet + 1] as u32) << 8)
+                    | ((src_row[triplet + 2] as u32) << 16);
+                dst_row[col] = ((bits >> offset) & 0x3F) as u8;
+            }
+        }
+        Ok(out)
+    }
+
     fn build_hqq_runtime_tensors(
         &self,
         layer_idx: usize,
@@ -4763,6 +4810,97 @@ impl GpuDecodeStore {
                 row_blocks: rows,
                 rows_per_tile: 16,
                 packed_row_stride_bytes: rows * 2,
+                scales_row_stride_bytes: 2 * groups_exact * std::mem::size_of::<u16>(),
+                zeros_row_stride_bytes: groups_exact
+                    * (std::mem::size_of::<u16>() + std::mem::size_of::<f32>()),
+                build_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                kernel_ready: true,
+            });
+        }
+        if nbits == 6 {
+            let hqq6_mode = std::env::var("KRASIS_HQQ6_PREFILL_MODE")
+                .unwrap_or_else(|_| "native-fused-marlin-twoscale-intercept".to_string());
+            if hqq6_mode == "row-major" {
+                return Ok(HqqRuntimeFormatDescriptor {
+                    stage: "prefill",
+                    kind: HqqRuntimeFormatKind::PrefillRowMajorV1,
+                    layout: hqq_expected_layout(nbits as u8, "prefill")?.to_string(),
+                    packed_dtype: "uint8".to_string(),
+                    scales_dtype: "float32".to_string(),
+                    zeros_dtype: "float32".to_string(),
+                    packed_host: packed_host.to_vec(),
+                    scales_host: scales_host.to_vec(),
+                    zeros_host: zeros_host.to_vec(),
+                    packed_component_bytes: packed_cols,
+                    scales_component_bytes: groups * std::mem::size_of::<f32>(),
+                    zeros_component_bytes: groups * std::mem::size_of::<f32>(),
+                    row_blocks: rows,
+                    rows_per_tile: 1,
+                    packed_row_stride_bytes: packed_cols,
+                    scales_row_stride_bytes: groups * std::mem::size_of::<f32>(),
+                    zeros_row_stride_bytes: groups * std::mem::size_of::<f32>(),
+                    build_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                    kernel_ready: true,
+                });
+            }
+            if hqq6_mode != "native-fused-marlin-twoscale-intercept" {
+                return Err(format!(
+                    "Unsupported KRASIS_HQQ6_PREFILL_MODE='{}' (expected native-fused-marlin-twoscale-intercept or row-major)",
+                    hqq6_mode
+                ));
+            }
+            if cols % 16 != 0 || rows % 64 != 0 || cols % group_size != 0 {
+                return Err(format!(
+                    "HQQ6 fast prefill requires Marlin-compatible shape (rows%64==0, cols%16==0, cols%group_size==0), got rows={} cols={} group_size={}",
+                    rows, cols, group_size,
+                ));
+            }
+            let groups_exact = cols / group_size;
+            let scales = Self::decode_host_f32("scales", scales_host, rows * groups_exact)?;
+            let zeros = Self::decode_host_f32("zeros", zeros_host, rows * groups_exact)?;
+            let expanded = Self::unpack_hqq6_row_major_to_u8(
+                packed_host,
+                rows,
+                cols,
+                group_size,
+            )?;
+            let packed = crate::weights::marlin::marlin_repack_hqq8_native_zp_prefill(
+                &expanded,
+                &scales,
+                &zeros,
+                rows,
+                cols,
+                group_size,
+            );
+            let packed_host: Vec<u8> = packed
+                .marlin
+                .packed
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            let mut scales_host = Self::encode_host_u16(&packed.marlin.scales);
+            scales_host.extend_from_slice(&Self::encode_host_u16(&packed.delta_scales));
+            let mut zeros_host = Self::encode_host_u16(&packed.zeros);
+            zeros_host.extend_from_slice(&Self::encode_host_f32(
+                &packed.twoscale_intercept_correction,
+            ));
+            return Ok(HqqRuntimeFormatDescriptor {
+                stage: "prefill",
+                kind: HqqRuntimeFormatKind::PrefillMarlinU8FloatZpTwoScaleInterceptV1,
+                layout: "marlin_u8_float_zp_twoscale_intercept_axis1_grouped_uint8".to_string(),
+                packed_dtype: "uint32".to_string(),
+                scales_dtype: "bfloat16_base_delta".to_string(),
+                zeros_dtype: "bfloat16_plus_float32_twoscale_intercept_correction".to_string(),
+                packed_host,
+                scales_host,
+                zeros_host,
+                packed_component_bytes: rows * cols,
+                scales_component_bytes: 2 * groups_exact * std::mem::size_of::<u16>(),
+                zeros_component_bytes: groups_exact
+                    * (std::mem::size_of::<u16>() + std::mem::size_of::<f32>()),
+                row_blocks: rows,
+                rows_per_tile: 16,
+                packed_row_stride_bytes: rows * 4,
                 scales_row_stride_bytes: 2 * groups_exact * std::mem::size_of::<u16>(),
                 zeros_row_stride_bytes: groups_exact
                     * (std::mem::size_of::<u16>() + std::mem::size_of::<f32>()),

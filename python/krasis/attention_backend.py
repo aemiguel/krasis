@@ -256,6 +256,18 @@ def hqq_auto_promotion_policy_for_cache_nbits(nbits: int) -> dict:
     raise ValueError(f"HQQ cache nbits={nbits} is not an auto planner cache")
 
 
+def hqq_auto_direct_edge_nbits(attention_quant: str, budget_pct: Optional[float]) -> Optional[int]:
+    if not is_hqq_auto_attention(attention_quant) or budget_pct is None:
+        return None
+    pct = normalize_hqq_auto_budget_pct(budget_pct, attention_quant)
+    policy = hqq_auto_promotion_policy(attention_quant)
+    if pct == 0.0:
+        return int(policy["base_nbits"])
+    if pct == 100.0:
+        return int(policy["promoted_nbits"])
+    return None
+
+
 def hqq46_tensor_nbits(tensor_name: str) -> int:
     return 6 if tensor_name in HQQ46_PROMOTION_POLICY["promoted_tensors"] else 4
 

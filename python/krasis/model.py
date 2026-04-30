@@ -39,6 +39,7 @@ from krasis.attention_backend import (
     is_hqq_attention,
     is_quantized_attention,
     delete_hqq_attention_pending_manifest,
+    hqq_auto_direct_edge_nbits,
     load_hqq_attention_artifact,
     load_hqq_attention_manifest,
     load_hqq_attention_pending_manifest,
@@ -1304,15 +1305,19 @@ class KrasisModel:
 
         def _pending_has_all_layer_artifacts(candidate: dict) -> bool:
             if is_hqq_auto_attention(self.quant_cfg.attention):
-                entries = [
-                    record
-                    for candidate_entry in candidate.get("planner", {}).get("candidates", [])
-                    for record in (
-                        candidate_entry.get("base_record"),
-                        candidate_entry.get("promoted_record"),
-                    )
-                    if isinstance(record, dict)
-                ]
+                candidates = candidate.get("planner", {}).get("candidates", [])
+                if candidates:
+                    entries = [
+                        record
+                        for candidate_entry in candidates
+                        for record in (
+                            candidate_entry.get("base_record"),
+                            candidate_entry.get("promoted_record"),
+                        )
+                        if isinstance(record, dict)
+                    ]
+                else:
+                    entries = candidate.get("tensors", [])
             else:
                 entries = candidate.get("tensors", [])
             if not entries:
@@ -1405,7 +1410,7 @@ class KrasisModel:
                 cache_nbits=cache_nbits,
             )
 
-        def _existing_auto_candidate(tensor_name: str) -> Optional[dict]:
+        def _existing_auto_entry(tensor_name: str, entries_key: str) -> Optional[dict]:
             if not is_hqq_auto_attention(self.quant_cfg.attention):
                 return None
             cache_dir = hqq_attention_cache_dir(
@@ -1414,22 +1419,91 @@ class KrasisModel:
                 cache_nbits,
                 self.quant_cfg.hqq_group_size,
             )
-            for candidate in self._hqq_manifest.get("planner", {}).get("candidates", []):
-                if int(candidate.get("layer_idx", -1)) != int(layer_idx):
+            if entries_key == "planner":
+                entries = self._hqq_manifest.get("planner", {}).get("candidates", [])
+            else:
+                entries = self._hqq_manifest.get(entries_key, [])
+            for entry in entries:
+                if int(entry.get("layer_idx", -1)) != int(layer_idx):
                     continue
-                if str(candidate.get("tensor_name")) != tensor_name:
+                if str(entry.get("tensor_name")) != tensor_name:
                     continue
-                records = (candidate.get("base_record"), candidate.get("promoted_record"))
-                if all(isinstance(record, dict) and os.path.isfile(os.path.join(cache_dir, record.get("file", ""))) for record in records):
-                    return candidate
+                if entries_key == "tensors":
+                    records = (entry,)
+                else:
+                    records = (entry.get("base_record"), entry.get("promoted_record"))
+                if all(
+                    isinstance(record, dict)
+                    and os.path.isfile(os.path.join(cache_dir, record.get("file", "")))
+                    for record in records
+                ):
+                    return entry
             return None
+
+        def _update_auto_direct_edge_metadata(direct_nbits: int) -> None:
+            policy = hqq_auto_promotion_policy(self.quant_cfg.attention)
+            base_nbits = int(policy["base_nbits"])
+            promoted_nbits = int(policy["promoted_nbits"])
+            selected_count = (
+                len(self._hqq_manifest.get("tensors", []))
+                if int(direct_nbits) == promoted_nbits
+                else 0
+            )
+            selection_mode = (
+                "direct_full_budget"
+                if int(direct_nbits) == promoted_nbits
+                else "direct_zero_budget"
+            )
+            measured_budget_bytes = 0 if int(direct_nbits) == base_nbits else None
+            tensor_count = len(self._hqq_manifest.get("tensors", []))
+            total_bytes = int(self._hqq_manifest.get("totals", {}).get("tensor_bytes", 0))
+            mixed = self._hqq_manifest.setdefault("mixed_precision", {})
+            mixed["base_nbits"] = base_nbits
+            mixed["promoted_nbits"] = promoted_nbits
+            mixed["selected_promotions"] = selected_count
+            mixed["candidate_count"] = tensor_count
+            mixed["budget_used_bytes"] = measured_budget_bytes
+            mixed["direct_edge_nbits"] = int(direct_nbits)
+            mixed["selection_mode"] = selection_mode
+            planner = self._hqq_manifest.setdefault("planner", {})
+            planner["name"] = policy["name"]
+            planner["budget_pct"] = mixed.get("budget_pct")
+            planner["candidate_count"] = tensor_count
+            planner["selected_count"] = selected_count
+            planner["candidates"] = []
+            planner["summary"] = {
+                "budget_bytes": measured_budget_bytes,
+                "budget_used_bytes": measured_budget_bytes,
+                "budget_unit_bytes": 1,
+                "selected_count": selected_count,
+                "candidate_count": tensor_count,
+                "relative_rmse_reduction": 0.0,
+                "selection_mode": selection_mode,
+                "direct_edge_nbits": int(direct_nbits),
+                "tensor_bytes": total_bytes,
+            }
 
         def _write_selected_or_candidate(tensor_name: str, tensor: torch.Tensor) -> tuple[int, dict]:
             if is_hqq_auto_attention(self.quant_cfg.attention):
-                existing = _existing_auto_candidate(tensor_name)
+                policy = hqq_auto_promotion_policy(self.quant_cfg.attention)
+                direct_nbits = hqq_auto_direct_edge_nbits(
+                    self.quant_cfg.attention,
+                    self._hqq_manifest.get("mixed_precision", {}).get("budget_pct"),
+                )
+                if direct_nbits is not None:
+                    existing = _existing_auto_entry(tensor_name, "tensors")
+                    if existing is not None:
+                        return 0, existing
+                    record = _write_record(tensor_name, tensor, direct_nbits)
+                    self._hqq_manifest["tensors"].append(record)
+                    self._hqq_manifest["totals"]["tensor_bytes"] += record["tensor_bytes"]
+                    self._hqq_manifest["totals"]["num_tensors"] += 1
+                    _update_auto_direct_edge_metadata(direct_nbits)
+                    return record["tensor_bytes"], record
+
+                existing = _existing_auto_entry(tensor_name, "planner")
                 if existing is not None:
                     return 0, existing
-                policy = hqq_auto_promotion_policy(self.quant_cfg.attention)
                 base_record = _write_record(tensor_name, tensor, int(policy["base_nbits"]))
                 promoted_record = _write_record(tensor_name, tensor, int(policy["promoted_nbits"]))
                 candidate = hqq_auto_candidate_from_records(base_record, promoted_record)

@@ -28,6 +28,7 @@ from krasis.attention_backend import (
     hqq_attention_manifest_path,
     normalize_hqq_attention_cache_profile,
     hqq_auto_budget_bytes_from_pct,
+    hqq_auto_direct_edge_nbits,
     quantize_hqq6_tensor_probe,
     require_complete_hqq_attention_manifest,
     select_hqq_auto_promotions,
@@ -311,6 +312,15 @@ def test_hqq_auto_budget_pct_scales_from_promotion_span() -> None:
         lambda: hqq_auto_budget_bytes_from_pct(-0.1, 400, "hqq68_auto"),
         "0 <= hqq_auto_budget_pct <= 100",
     )
+
+
+def test_hqq_auto_direct_edge_nbits() -> None:
+    assert hqq_auto_direct_edge_nbits("hqq46_auto", 0.0) == 4
+    assert hqq_auto_direct_edge_nbits("hqq46_auto", 100.0) == 6
+    assert hqq_auto_direct_edge_nbits("hqq68_auto", 0.0) == 6
+    assert hqq_auto_direct_edge_nbits("hqq68_auto", 100.0) == 8
+    assert hqq_auto_direct_edge_nbits("hqq68_auto", 50.0) is None
+    assert hqq_auto_direct_edge_nbits("hqq6", 0.0) is None
 
 
 def test_hqq_auto_full_budget_selects_every_promotion() -> None:
