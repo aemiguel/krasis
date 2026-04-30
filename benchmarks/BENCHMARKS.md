@@ -1,5 +1,37 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-30 (Phase 2EJ Q35B no-cold-DMA HQQ ladder)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: Qwen3.5-35B-A3B 1-GPU configs, INT4 GPU/CPU experts, INT8
+shared/dense/lm-head, FP8 KV (`fp8_e4m3`, 4v4), layer group size 2, graph
+replay enabled, timing instrumentation off for the benchmark rows.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-----|--------------:|-----|
+| Q35B k4v4 HQQ4, INT4 experts | HQQ4 | fp8_e4m3 | 8,047.2 | 115.07 | 10240/10240 (100.0%) | 7852 MB | [log](20260430_2011_q35b_k4v4_hqq4_int4_benchmark.log) |
+| Q35B k4v4 HQQ6, INT4 experts | HQQ6 | fp8_e4m3 | 7,873.0 | 115.54 | 10240/10240 (100.0%) | 7148 MB | [log](20260430_2118_q35b_k4v4_hqq6_int4_benchmark.log) |
+| Q35B k4v4 HQQ8, INT4 experts | HQQ8 | fp8_e4m3 | 8,029.9 | 116.01 | 10240/10240 (100.0%) | 7180 MB | [log](20260430_2124_q35b_k4v4_hqq8_int4_benchmark.log) |
+
+Notes:
+- All three Q35B runs reached `100.0%` HCS coverage, so decode has no cold
+  expert DMA and is a useful code-side control lane.
+- HQQ4/HQQ6/HQQ8 decode is effectively tied at `115-116 tok/s` when cold DMA
+  is removed. That suggests the remaining HQQ decode difference on QCN is not
+  mainly attention quant kernel choice.
+- Prefill is also tightly clustered (`7.87k-8.05k tok/s`), with HQQ4 and HQQ8
+  slightly ahead of HQQ6.
+- Timing-enabled Q35B HQQ8 diagnostic:
+  `logs/manual/phase2ej_q35b_hqq8_component_timing_20260430.log`.
+  Long calibration: `39,920` tokens in `3,889.3 ms` (`10,264 tok/s`),
+  attention `2,301.7 ms`, MoE `1,366.5 ms`. Post-HCS decode had `0` cold
+  DMA calls and `0.00 MB/tok` cold DMA; graph launch stayed around
+  `0.13-0.15 ms/tok`, while graph sync wait accounted for most measured
+  decode wall time.
+
+---
+
 ## Standard Benchmarks — 2026-04-30 (Phase 2EI HQQ prefill fused correction)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
