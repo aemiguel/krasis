@@ -125,8 +125,39 @@ struct HttpRequest {
     body: String,
 }
 
-fn prepare_store_for_rust_prefill(store: &mut GpuDecodeStore) -> Result<bool, String> {
-    store.prepare_runtime_for_prefill_rust()
+fn prepare_store_for_rust_prefill(
+    store: &mut GpuDecodeStore,
+    engine: &mut crate::gpu_prefill::PrefillEngine,
+) -> Result<bool, String> {
+    let has_hqq = store.prepare_runtime_for_prefill_rust()?;
+    if has_hqq {
+        let patches = store.hqq_prefill_pointer_patches_rust()?;
+        engine.refresh_hqq_prefill_tensor_pointers(&patches)?;
+    }
+    Ok(has_hqq)
+}
+
+fn create_prefill_engine_for_server(
+    store: &mut GpuDecodeStore,
+    max_context_tokens: usize,
+) -> Result<crate::gpu_prefill::PrefillEngine, String> {
+    let has_hqq = store.has_hqq_runtime_slots();
+    if has_hqq {
+        store.prepare_runtime_for_prefill_rust()?;
+    }
+    let engine = match store.create_prefill_engine(max_context_tokens) {
+        Ok(engine) => engine,
+        Err(e) => {
+            if has_hqq {
+                let _ = store.prepare_runtime_for_decode_rust();
+            }
+            return Err(e);
+        }
+    };
+    if has_hqq {
+        store.prepare_runtime_for_decode_rust()?;
+    }
+    Ok(engine)
 }
 
 fn restore_store_after_rust_prefill(
@@ -828,7 +859,7 @@ fn handle_chat_completion(
 
         let _has_hqq_runtime_slots = {
             let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-            match prepare_store_for_rust_prefill(store) {
+            match prepare_store_for_rust_prefill(store, engine) {
                 Ok(has_hqq) => has_hqq,
                 Err(e) => {
                     let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill prepare failed: {}"}}"#, e));
@@ -1127,7 +1158,7 @@ fn handle_prefill_logits(
 
     let _has_hqq_runtime_slots = {
         let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-        match prepare_store_for_rust_prefill(store) {
+        match prepare_store_for_rust_prefill(store, engine) {
             Ok(has_hqq) => has_hqq,
             Err(e) => {
                 let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill prepare failed: {}"}}"#, e));
@@ -1287,7 +1318,7 @@ fn handle_reference_test(
 
     let has_hqq_runtime_slots = {
         let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-        match prepare_store_for_rust_prefill(store) {
+        match prepare_store_for_rust_prefill(store, engine) {
             Ok(has_hqq) => has_hqq,
             Err(e) => {
                 let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill prepare failed: {}"}}"#, e));
@@ -2104,7 +2135,7 @@ impl RustServer {
                 }
                 None => {
                     log::warn!("RustServer: no pre-allocated prefill engine, creating on demand");
-                    match store.create_prefill_engine(max_context_tokens) {
+                    match create_prefill_engine_for_server(store, max_context_tokens) {
                         Ok(engine) => {
                             log::info!("RustServer: prefill engine created on demand (max_tokens={})", max_context_tokens);
                             Some(engine)
@@ -2306,7 +2337,7 @@ impl RustServer {
                         }
                         None => {
                             log::warn!("No pre-allocated prefill engine — creating on demand");
-                            match store.create_prefill_engine(max_context_tokens) {
+                            match create_prefill_engine_for_server(store, max_context_tokens) {
                                 Ok(engine) => {
                                     log::info!("Rust prefill engine created on demand (max_tokens={})", max_context_tokens);
                                     Arc::new(std::sync::Mutex::new(Some(engine)))
@@ -2455,7 +2486,7 @@ impl RustServer {
 
         let kv_overflow = token_ids.len() > engine.kv_max_seq;
 
-        let _has_hqq_runtime_slots = prepare_store_for_rust_prefill(store)
+        let _has_hqq_runtime_slots = prepare_store_for_rust_prefill(store, engine)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("Failed to prepare runtime for prefill: {}", e)))?;
 

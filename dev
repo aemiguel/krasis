@@ -11,7 +11,7 @@
 #   ./dev network <port>            Run network tests against a running server
 #   ./dev network <port> --large    Include large-prompt tests
 #   ./dev benchmark <config>        Run standard benchmark (prefill/decode/round trip) and exit
-#   ./dev speed-test                Run the fixed standard speed benchmark (QCN INT4 AWQ Polar4)
+#   ./dev speed-test                Run the fixed standard speed benchmark (QCN INT4 HQQ8 k4v4)
 #   ./dev perplexity <config>       Run perplexity eval (WikiText-2 by default) and exit
 #   ./dev release-test <model>      Run full release test (4 configs, produces report)
 #   ./dev release-test-all [target]  Run release test on all supported models sequentially
@@ -35,7 +35,7 @@
 #   ./dev reference-prep <model>    ARCHIVED HF dependency/model prep; requires explicit override
 #   ./dev generate-reference <model>  ARCHIVED HF reference capture; requires explicit override
 #   ./dev trace-diff <expected> <actual>  Diff two KRASIS_TRACE logs offline
-#   ./dev awq-calibrate <config>    Run AWQ calibration, produce attention template
+#   ./dev awq-calibrate <config>    Deprecated AWQ calibration command (disabled)
 #   ./dev test-kernels [name]       Run CUDA kernel unit tests (or filter by name)
 #   ./dev chat [args]               Run krasis chat from source
 #   ./dev sanity                    Run sanity test prompts against running server
@@ -69,13 +69,10 @@
 #
 # Configs are short names that map to testconfigs/*.conf:
 #   qcn         -> testconfigs/qcn-4-4-a16.conf
-#   qcn-a4      -> testconfigs/qcn-4-4-awq.conf
 #   q235        -> testconfigs/q235-4-4-a16.conf
-#   q235-a4     -> testconfigs/q235-4-4-awq.conf
 #   v2lite      -> testconfigs/v2lite-4-4-a16.conf
 #   deepseek-vl -> testconfigs/deepseek-vl2-4-4-a16.conf
 #   qwen35      -> testconfigs/qwen35-4-4-a16.conf
-#   qwen35-a4   -> testconfigs/qwen35-4-4-awq.conf
 #   gemma       -> tests/gemma-4-4-a16.conf
 #   minimax     -> tests/minimax-m2-4-4-a16.conf
 #
@@ -123,7 +120,7 @@ SO_FILE="$SCRIPT_DIR/python/krasis/krasis.cpython-311-x86_64-linux-gnu.so"
 WHEEL_DIR="$SCRIPT_DIR/target/dev-wheels"
 REPO_PYTHONPATH="$SCRIPT_DIR/python"
 REPO_LIBPATH="$SCRIPT_DIR/python/krasis.libs"
-STANDARD_SPEED_TEST_CONFIG="$SCRIPT_DIR/tests/qcn-polar4-awq.conf"
+STANDARD_SPEED_TEST_CONFIG="$SCRIPT_DIR/tests/qcn-k4v4-hqq8-int4-benchmark.conf"
 REFERENCE_CAPTURE_MODELS_DIR="${REFERENCE_CAPTURE_ROOT}/models"
 REFERENCE_CAPTURE_VENV="${REFERENCE_CAPTURE_ROOT}/reference-capture-venv"
 REFERENCE_CAPTURE_READY_JSON="${REFERENCE_CAPTURE_ROOT}/capture-host-ready.json"
@@ -195,13 +192,10 @@ resolve_config() {
     local name="$1"
     case "$name" in
         qcn|QCN)            echo "$SCRIPT_DIR/testconfigs/qcn-4-4-a16.conf" ;;
-        qcn-a4)             echo "$SCRIPT_DIR/testconfigs/qcn-4-4-awq.conf" ;;
         q235)               echo "$SCRIPT_DIR/testconfigs/q235-4-4-a16.conf" ;;
-        q235-a4)            echo "$SCRIPT_DIR/testconfigs/q235-4-4-awq.conf" ;;
         v2lite|V2-Lite)     echo "$SCRIPT_DIR/testconfigs/v2lite-4-4-a16.conf" ;;
         deepseek-vl|vl2)    echo "$SCRIPT_DIR/testconfigs/deepseek-vl2-4-4-a16.conf" ;;
         qwen35|Qwen3.5)     echo "$SCRIPT_DIR/testconfigs/qwen35-4-4-a16.conf" ;;
-        qwen35-a4)          echo "$SCRIPT_DIR/testconfigs/qwen35-4-4-awq.conf" ;;
         gemma|Gemma)        echo "$SCRIPT_DIR/tests/gemma-4-4-a16.conf" ;;
         minimax|MiniMax)    echo "$SCRIPT_DIR/tests/minimax-m2-4-4-a16.conf" ;;
         *)
@@ -214,7 +208,7 @@ resolve_config() {
                 echo "$SCRIPT_DIR/tests/$name"
             else
                 err "Unknown config: $name
-  Available: qcn, qcn-a4, q235, q235-a4, v2lite, deepseek-vl, qwen35, qwen35-a4, gemma, minimax
+  Available: qcn, q235, v2lite, deepseek-vl, qwen35, gemma, minimax
   Or pass a path to a .conf file."
             fi
             ;;
@@ -933,9 +927,9 @@ Models: $(printf '%s, ' "${MODELS[@]}" | sed 's/, $//')" 2>/dev/null || warn "Co
     ok "$configs_msg"
     session-send "$SESSION_WS" "$configs_msg" 2>/dev/null || true
 
-    # ── Perplexity phase: one INT4/AWQ pass per model ──────────────
-    info "=== Perplexity Phase: INT4/AWQ for all models ==="
-    session-send "$SESSION_WS" "Starting perplexity phase: INT4/AWQ for $total models" 2>/dev/null || true
+    # ── Perplexity phase: one INT4/HQQ8/k6v6 pass per model ──────────────
+    info "=== Perplexity Phase: INT4/HQQ8/k6v6 for all models ==="
+    session-send "$SESSION_WS" "Starting perplexity phase: INT4/HQQ8/k6v6 for $total models" 2>/dev/null || true
 
     local ppl_passed=0
     local ppl_failed=0
@@ -969,11 +963,11 @@ print(tc.get('num_hidden_layers', 0))
             continue
         fi
 
-        # Generate temp INT4/AWQ config
+        # Generate temp INT4/HQQ8/k6v6 config
         local ppl_conf
         ppl_conf=$(mktemp /tmp/krasis-ppl-XXXXXX.conf)
         cat > "$ppl_conf" <<PPLCONF
-# Perplexity config — INT4/INT4 AWQ — $model
+# Perplexity config — INT4/INT4 HQQ8 k6v6 — $model
 MODEL_PATH="$model_dir"
 CFG_SELECTED_GPUS="$best_gpu_idx"
 CFG_PP_PARTITION="$num_layers"
@@ -981,13 +975,13 @@ CFG_LAYER_GROUP_SIZE="2"
 CFG_KV_DTYPE="k6v6"
 CFG_GPU_EXPERT_BITS="4"
 CFG_CPU_EXPERT_BITS="4"
-CFG_ATTENTION_QUANT="awq"
+CFG_ATTENTION_QUANT="hqq8"
 CFG_SHARED_EXPERT_QUANT="int8"
 CFG_DENSE_MLP_QUANT="int8"
 CFG_LM_HEAD_QUANT="int8"
 PPLCONF
 
-        info "=== [PPL] $model (INT4/AWQ) ==="
+        info "=== [PPL] $model (INT4/HQQ8/k6v6) ==="
         session-send "$SESSION_WS" "[PPL] Starting: $model" 2>/dev/null || true
         local ppl_start
         ppl_start=$(date +%s)
@@ -1090,22 +1084,7 @@ do_perplexity() {
 }
 
 do_awq_calibrate() {
-    [[ $# -lt 1 ]] && err "Usage: ./dev awq-calibrate <config> [--tokens 256000] [--dataset wikitext-2]"
-    local conf
-    conf=$(resolve_config "$1")
-    shift
-    if [[ "${KRASIS_SKIP_GPU_CLEANUP:-0}" != "1" ]]; then
-        cleanup_gpu "$conf"
-    else
-        info "Skipping GPU cleanup for nested AWQ calibration"
-    fi
-    auto_rebuild
-    local run_dir
-    run_dir=$(create_run_dir "dev-awq-calibrate")
-    info "Running AWQ calibration: $conf"
-    info "Run dir: $run_dir"
-    verify_repo_imports
-    cd "$SCRIPT_DIR" && KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="dev-awq-calibrate" run_repo_python -m krasis.awq_calibrate --config "$conf" "$@"
+    err "AWQ calibration is deprecated and disabled. Use HQQ attention modes (hqq4, hqq6, hqq8, hqq46_auto, hqq68_auto)."
 }
 
 do_network() {
@@ -2618,7 +2597,7 @@ case "$cmd" in
         echo "  speed-test                     Run the fixed standard speed benchmark"
         echo "  decode-harness <config>        Run synthetic GPU decode harness and exit"
         echo "  perplexity <config>            Run perplexity eval (WikiText-2) and exit"
-        echo "  awq-calibrate <config>         Run AWQ attention calibration (produces template)"
+        echo "  awq-calibrate <config>         Deprecated AWQ calibration command (disabled)"
         echo ""
         echo "Test and validation commands:"
         echo "  test <config>                  Short model test (benchmark + network tests)"
@@ -2674,7 +2653,7 @@ case "$cmd" in
         echo "  4. Capture a llama-witness first-token artifact from stored input_token_ids:"
         echo "       ./dev witness-capture qcn --max-cases 4 --output ../krasis-internal/reference-outputs/output/Qwen3-Coder-Next/llama_witness_first_token.json"
         echo "  5. Compare Krasis against that non-HF witness artifact:"
-        echo "       ./dev witness-compare tests/qcn-polar4-a16.conf"
+        echo "       ./dev witness-compare tests/qcn-bf16kv-hqq8-accuracy.conf"
         echo "  6. Inventory current historical artifacts:"
         echo "       ./dev reference-inventory"
         echo "  Archived HF workflow for forensic reruns only:"
@@ -2760,9 +2739,9 @@ case "$cmd" in
         echo "    KRASIS_TRACE=1 KRASIS_TRACE_COMPONENTS=config_contract ./dev reference-inventory"
         echo "    ./dev trace-diff /tmp/expected.log /tmp/actual.log --components config_contract --contexts reference_test_single --phases artifact,validation"
         echo ""
-        echo "Configs: qcn, qcn-a4, q235, q235-a4, v2lite, deepseek-vl, qwen35, qwen35-a4"
+        echo "Configs: qcn, q235, v2lite, deepseek-vl, qwen35, gemma, minimax"
         echo "         (or path to .conf file)"
-        echo "Standard speed benchmark config: tests/qcn-polar4-awq.conf"
+        echo "Standard speed benchmark config: tests/qcn-k4v4-hqq8-int4-benchmark.conf"
         echo ""
         echo "Examples:"
         echo "  ./dev build"
@@ -2781,7 +2760,7 @@ case "$cmd" in
         echo "  ./dev capture-box stage qcn gemma"
         echo "  ./dev capture-box generate Qwen3-Coder-Next --profile greedy_chat_thinking_off"
         echo "  ./dev reference-backfill-topk qwen35 --reference ../krasis-internal/reference-outputs/output/Qwen3.5-35B-A3B/greedy_reference.json"
-        echo "  ./dev awq-calibrate qcn    Build AWQ attention template"
+        echo "  ./dev awq-calibrate qcn    Deprecated; AWQ is disabled"
         echo "  ./dev perplexity qcn"
         echo "  ./dev trace-diff /tmp/expected.log /tmp/actual.log --events mark,tensor"
         echo "  ./dev trace-diff /tmp/expected.log /tmp/actual.log --components config_contract --contexts reference_inventory --show-window 3"

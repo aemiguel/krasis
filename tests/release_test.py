@@ -41,7 +41,7 @@ DEFAULT_PORT = 8012
 DEFAULT_HOST = "127.0.0.1"
 BENCHMARK_TIMEOUT = 1200  # 20 min for model load + warmup + benchmark
 CACHE_BUILD_TIMEOUT = 1800  # 30 min for cache building (INT8 takes longer)
-AWQ_CALIBRATE_TIMEOUT = 1800  # 30 min for AWQ calibration
+AWQ_CALIBRATE_TIMEOUT = 1800  # Deprecated AWQ calibration helper retained but no longer used by release variants
 PERPLEXITY_TIMEOUT = 1800  # 30 min for model load + 10K token eval
 PERPLEXITY_MAX_TOKENS = 20000
 PERPLEXITY_WARN_THRESHOLD = 0.05  # +5% PPL increase from baseline = WARN
@@ -59,9 +59,9 @@ SUPPORTED_MODELS = [
 
 CONFIG_VARIANTS = [
     {"name": "INT4 BF16", "bits": 4, "attention": "bf16"},
-    {"name": "INT4 AWQ", "bits": 4, "attention": "awq"},
-    {"name": "INT8 AWQ", "bits": 8, "attention": "awq"},
-    {"name": "INT4 AWQ Multi-GPU", "bits": 4, "attention": "awq", "multi_gpu": True},
+    {"name": "INT4 HQQ4", "bits": 4, "attention": "hqq4"},
+    {"name": "INT4 HQQ8", "bits": 4, "attention": "hqq8"},
+    {"name": "INT4 HQQ8 Multi-GPU", "bits": 4, "attention": "hqq8", "multi_gpu": True},
 ]
 
 REFERENCE_VALIDATE_MAX_PROMPTS = 4
@@ -243,7 +243,7 @@ def generate_config(model_name: str, variant: Dict, gpu_idx: int,
         f'CFG_SELECTED_GPUS="{gpu_selection}"',
         f'CFG_PP_PARTITION="{num_layers}"',
         f'CFG_LAYER_GROUP_SIZE="2"',
-        f'CFG_KV_DTYPE="polar4"',
+        f'CFG_KV_DTYPE="k6v6"',
         f'CFG_GPU_EXPERT_BITS="{bits}"',
         f'CFG_CPU_EXPERT_BITS="{bits}"',
         f'CFG_ATTENTION_QUANT="{variant["attention"]}"',
@@ -321,7 +321,7 @@ def build_caches(model_name: str, gpu_idx: int, num_layers: int,
                 f'CFG_SELECTED_GPUS="{gpu_idx}"',
                 f'CFG_PP_PARTITION="{num_layers}"',
                 f'CFG_LAYER_GROUP_SIZE="2"',
-                f'CFG_KV_DTYPE="polar4"',
+                f'CFG_KV_DTYPE="k6v6"',
                 f'CFG_GPU_EXPERT_BITS="{bits}"',
                 f'CFG_CPU_EXPERT_BITS="{bits}"',
                 f'CFG_ATTENTION_QUANT="bf16"',
@@ -457,7 +457,7 @@ def build_awq_template(model_name: str, gpu_idx: int, num_layers: int,
             f'CFG_SELECTED_GPUS="{gpu_idx}"',
             f'CFG_PP_PARTITION="{num_layers}"',
             f'CFG_LAYER_GROUP_SIZE="2"',
-            f'CFG_KV_DTYPE="polar4"',
+            f'CFG_KV_DTYPE="k6v6"',
             f'CFG_GPU_EXPERT_BITS="4"',
             f'CFG_CPU_EXPERT_BITS="4"',
             f'CFG_ATTENTION_QUANT="bf16"',
@@ -2277,7 +2277,7 @@ def main():
         die(f"Cache build failed for INT{', INT'.join(failed_bits)} — aborting release test")
     print()
 
-    # ── Pre-flight: build AWQ template ──────────────────────────
+    # ── Deprecated AWQ pre-flight (retained for old branches, inactive here) ──
 
     needs_awq = any(v["attention"] == "awq" and (not skip_int8 or v["bits"] != 8)
                     for v in CONFIG_VARIANTS)
@@ -2329,7 +2329,7 @@ def main():
             config_results.append(result)
             continue
 
-        # Skip AWQ configs if template wasn't built
+        # Deprecated AWQ skip path (inactive unless a legacy variant is restored)
         if variant["attention"] == "awq" and needs_awq and not awq_ok:
             result["error"] = "AWQ template not available — skipped"
             warn("Skipping (no AWQ template)")

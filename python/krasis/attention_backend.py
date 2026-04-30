@@ -17,6 +17,8 @@ from safetensors.torch import save_file
 import torch
 
 from krasis.config import (
+    ATTENTION_QUANT_CHOICES,
+    DEPRECATED_ATTENTION_QUANT_CHOICES,
     HQQ_ATTENTION_DEFAULT_GROUP_SIZE,
     HQQ_ATTENTION_GROUP_SIZE_CHOICES,
     HQQ_CACHE_PROFILE_BASELINE,
@@ -31,8 +33,6 @@ from krasis.krasis import (
     hqq4_solve_group_ptr,
 )
 
-
-ATTENTION_QUANT_CHOICES = ("bf16", "awq", "hqq4", "hqq46", "hqq46_auto", "hqq6", "hqq68_auto", "hqq8")
 
 HQQ_ATTENTION_CACHE_VERSION = 5
 HQQ_ATTENTION_CACHE_DIRNAME = f"attention_hqq_v{HQQ_ATTENTION_CACHE_VERSION}"
@@ -114,10 +114,10 @@ def get_attention_backend_spec(attention_quant: str) -> AttentionBackendSpec:
     if attention_quant == "awq":
         return AttentionBackendSpec(
             quant="awq",
-            label="AWQ",
+            label="AWQ (deprecated, disabled)",
             quantized=True,
             requires_template=True,
-            runtime_ready=True,
+            runtime_ready=False,
             nbits=4,
         )
     if attention_quant == "hqq4":
@@ -176,7 +176,8 @@ def get_attention_backend_spec(attention_quant: str) -> AttentionBackendSpec:
         )
     raise ValueError(
         f"Unsupported attention quant '{attention_quant}'. "
-        f"Use one of: {', '.join(ATTENTION_QUANT_CHOICES)}."
+        f"Use one of: {', '.join(ATTENTION_QUANT_CHOICES)}. "
+        f"Deprecated disabled modes: {', '.join(DEPRECATED_ATTENTION_QUANT_CHOICES)}."
     )
 
 

@@ -468,6 +468,16 @@ extern "C" __global__ void hqq8_marlin_intercept_correct_bf16_kernel(
     out[idx] = float_to_bf16(bf16_to_float(out[idx]) + acc);
 }
 
+extern "C" __global__ void hqq_marlin_add_correction_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const float* __restrict__ correction,
+    int total)
+{
+    int idx = (int)((long long)blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total) return;
+    out[idx] = float_to_bf16(bf16_to_float(out[idx]) + correction[idx]);
+}
+
 extern "C" __global__ void hqq_prefill_int8_exception_delta_bf16_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ input,

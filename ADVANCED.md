@@ -35,7 +35,7 @@ BF16 validation policy:
 | `./dev test <config> --thorough` | Thorough test (+ stress + large prompts) |
 | `./dev network <port> [--large] [--quick]` | Run network tests against a running server |
 | `./dev perplexity <config>` | Run perplexity eval (WikiText-2) and exit |
-| `./dev awq-calibrate <config>` | Run AWQ attention calibration (produces template) |
+| `./dev awq-calibrate <config>` | Deprecated AWQ calibration command; disabled in the active runtime surface |
 | `./dev kill` | Kill all krasis/GPU processes and reset |
 
 Add `--timing` to `run` or `benchmark` for a per-layer decode timing breakdown. This adds ~30-50% overhead so do not use it for speed benchmarks — only for profiling.
@@ -72,13 +72,15 @@ Config files use `KEY=VALUE` format. CLI flags override config file values.
 |------|---------|-------------|
 | `--gpu-expert-bits` | 4 | GPU Marlin expert bits: `4` or `8` |
 | `--cpu-expert-bits` | 4 | CPU decode expert bits: `4` or `8` |
-| `--attention-quant` | bf16 direct, hqq8 launcher | Attention weight precision: `hqq8` quality-first high-fidelity option, or explicit `bf16`, `awq`, `hqq4` |
+| `--attention-quant` | bf16 direct, hqq8 launcher | Attention weight precision: `hqq8`, `hqq6`, `hqq4`, or mixed planners `hqq68_auto` / `hqq46_auto`; `bf16` remains an explicit validation/debug mode |
 | `--shared-expert-quant` | int8 | Shared expert quant: `int8` or `bf16` |
 | `--dense-mlp-quant` | int8 | Dense MLP quant: `int8` or `bf16` |
 | `--lm-head-quant` | int8 | LM head quant: `int8` or `bf16` |
 | `--kv-dtype` | k6v6 | KV cache format: `k6v6` Quality, `k4v4` Ultra Compact, or `bf16` Full Precision |
 
-Legacy `int4`/`int8` values for `--attention-quant` are auto-migrated to `awq`.
+AWQ attention and Polar4 KV are deprecated and disabled for new runs. Their
+implementation remains in the tree for historical reference, but active
+configs should use HQQ attention plus `k6v6`, `k4v4`, or `bf16` KV.
 
 When BF16 is selected for experts or major components, treat that run as validation-only rather than production.
 
@@ -140,12 +142,12 @@ Krasis lets you quantize each component independently. The defaults are a good s
 |-----------|---------|---------|
 | GPU experts | INT4, INT8 | INT4 |
 | CPU experts | INT4, INT8 | INT4 |
-| Attention | AWQ, HQQ4, BF16 | BF16 |
+| Attention | HQQ4, HQQ6, HQQ8, HQQ46/HQQ68 auto, BF16 | BF16 |
 | Shared expert | INT8, BF16 | INT8 |
 | Dense MLP | INT8, BF16 | INT8 |
 | LM head | INT8, BF16 | INT8 |
-| KV cache | FP8, BF16 | FP8 |
+| KV cache | k6v6, k4v4, BF16 | k6v6 |
 
 Embeddings, norms, and routing gates are always kept at BF16.
 
-AWQ attention uses calibrated per-tensor quantization (run `./dev awq-calibrate <config>` to generate the template). `hqq4` is the native HQQ INT4 backend: artifacts live under the normal model cache tree and the runtime restores staged prefill/decode descriptors from that cache. Remaining HQQ work is parity closure against AWQ operational details such as cached-stage generation strategy, slot-reuse policy, and wider product validation. BF16 is full precision with no calibration needed.
+HQQ attention artifacts live under the normal model cache tree and the runtime restores staged prefill/decode descriptors from that cache. AWQ attention is deprecated and disabled for new runs; do not use it for production validation. BF16 is full precision with no calibration needed.

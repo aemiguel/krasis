@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from krasis.attention_backend import ATTENTION_QUANT_CHOICES, attention_quant_label
 from krasis.config import (
+    DEPRECATED_ATTENTION_QUANT_CHOICES,
+    DEPRECATED_KV_CACHE_FORMAT_CHOICES,
     cache_dir_for_model,
     HQQ_ATTENTION_DEFAULT_GROUP_SIZE,
     HQQ_ATTENTION_GROUP_SIZE_CHOICES,
@@ -466,6 +468,11 @@ class LauncherConfig:
             except ValueError:
                 pass
         if "CFG_KV_DTYPE" in saved:
+            if saved["CFG_KV_DTYPE"] in DEPRECATED_KV_CACHE_FORMAT_CHOICES:
+                raise ValueError(
+                    f"Saved CFG_KV_DTYPE={saved['CFG_KV_DTYPE']} is deprecated and disabled. "
+                    "Use k6v6, k4v4, or bf16."
+                )
             self.kv_dtype = saved["CFG_KV_DTYPE"]
         if "CFG_GPU_EXPERT_BITS" in saved:
             try:
@@ -493,7 +500,12 @@ class LauncherConfig:
             if val in ("int4", "int8"):
                 raise ValueError(
                     f"Unsupported saved CFG_ATTENTION_QUANT={val}. "
-                    "Naive int4/int8 attention has been removed; use hqq8, hqq68_auto, hqq6, hqq46_auto, hqq46, hqq4, awq, or bf16."
+                    "Naive int4/int8 attention has been removed; use hqq8, hqq68_auto, hqq6, hqq46_auto, hqq46, hqq4, or bf16."
+                )
+            if val in DEPRECATED_ATTENTION_QUANT_CHOICES:
+                raise ValueError(
+                    f"Saved CFG_ATTENTION_QUANT={val} is deprecated and disabled. "
+                    "Use HQQ attention modes: hqq8, hqq68_auto, hqq6, hqq46_auto, hqq46, or hqq4."
                 )
             if val not in ATTENTION_QUANT_CHOICES:
                 raise ValueError(
@@ -728,15 +740,13 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
 
     if config_key in ("attention_quant", "shared_expert_quant",
                       "dense_mlp_quant", "lm_head_quant"):
-        current = str(current_val)  # "int8"/"int4" for experts, "bf16" or "awq" for attention
+        current = str(current_val)  # "int8"/"int4" for experts, BF16/HQQ for attention
         if current == native_label or current == native_dtype:
             return f"{DIM}{native_label} \u2192 {current} \u2014 lossless{NC}"
         elif current == "int8":
             return f"{DIM}{native_label} \u2192 int8 \u2014 high fidelity{NC}"
         elif current == "int4":
             return f"{DIM}{native_label} \u2192 int4 \u2014 {YELLOW}slight loss{NC}{DIM}{NC}"
-        elif current == "awq":
-            return f"{DIM}{native_label} \u2192 AWQ \u2014 {GREEN}calibrated per-tensor{NC}{DIM}{NC}"
         elif current == "hqq4":
             return f"{DIM}{native_label} \u2192 HQQ4SC \u2014 low-memory self-correcting HQQ4{NC}"
         elif current == "hqq8":
@@ -760,8 +770,6 @@ def _quality_annotation(native_dtype: str, config_key: str, current_val: Any) ->
         current = str(current_val)
         if current == "fp8_e4m3":
             return f"{DIM}{native_label} \u2192 fp8 \u2014 legacy FP8 KV{NC}"
-        elif current == "polar4":
-            return f"{DIM}{native_label} \u2192 polar4 \u2014 compact 4-bit{NC}"
         elif current == "k8v4":
             return f"{DIM}{native_label} \u2192 k8v4 \u2014 FP8 K + 4-bit V{NC}"
         elif current == "k8v6":
@@ -1297,8 +1305,7 @@ class Launcher:
             free_before_kv = rank.get("free_mb", 0)
             kv_alloc = int(min(self.cfg.kv_cache_mb, max(0, free_before_kv)))
             kv_label = (
-                "polar4" if self.cfg.kv_dtype == "polar4"
-                else "k8v4" if self.cfg.kv_dtype == "k8v4"
+                "k8v4" if self.cfg.kv_dtype == "k8v4"
                 else "k8v6" if self.cfg.kv_dtype == "k8v6"
                 else "k7v4" if self.cfg.kv_dtype == "k7v4"
                 else "k6v6" if self.cfg.kv_dtype == "k6v6"
@@ -1749,8 +1756,7 @@ class Launcher:
                 rank.get("prefill_workspace_mb", 0) + rank.get("cuda_overhead_mb", 0)
             )
             kv_label = (
-                "polar4" if self.cfg.kv_dtype == "polar4"
-                else "k8v4" if self.cfg.kv_dtype == "k8v4"
+                "k8v4" if self.cfg.kv_dtype == "k8v4"
                 else "k8v6" if self.cfg.kv_dtype == "k8v6"
                 else "k7v4" if self.cfg.kv_dtype == "k7v4"
                 else "k6v6" if self.cfg.kv_dtype == "k6v6"
@@ -1904,7 +1910,7 @@ def parse_args() -> argparse.Namespace:
                         choices=list(GPU_EXPERT_INT4_CALIB_CHOICES),
                         help="Offline calibration mode for GPU routed-expert INT4 cache build")
     parser.add_argument("--attention-quant", default=None,
-                        help="Attention weight quant: hqq8 quality-first; hqq68_auto budget-planned mixed HQQ6/HQQ8; hqq6 packed middle-ground; hqq46_auto budget-planned mixed HQQ4/HQQ6; hqq46 fixed-policy mixed; bf16, awq, and hqq4 remain explicit legacy/debug modes")
+                        help="Attention weight quant: hqq8 quality-first; hqq68_auto budget-planned mixed HQQ6/HQQ8; hqq6 packed middle-ground; hqq46_auto budget-planned mixed HQQ4/HQQ6; hqq46 fixed-policy mixed; bf16 and hqq4 remain explicit legacy/debug modes")
     parser.add_argument("--hqq-cache-profile", default=None,
                         help="HQQ attention cache profile: baseline or selfcal_v1")
     parser.add_argument("--hqq-group-size", type=int, default=None, choices=list(HQQ_ATTENTION_GROUP_SIZE_CHOICES),
@@ -1972,6 +1978,11 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
     if args.vram_safety_margin is not None:
         cfg.vram_safety_margin = max(500, args.vram_safety_margin)
     if args.kv_dtype is not None:
+        if args.kv_dtype in DEPRECATED_KV_CACHE_FORMAT_CHOICES:
+            raise ValueError(
+                f"Unsupported --kv-dtype {args.kv_dtype}: Polar4 is deprecated and disabled. "
+                "Use k6v6, k4v4, or bf16."
+            )
         cfg.kv_dtype = args.kv_dtype
     if args.gpu_expert_bits is not None:
         cfg.gpu_expert_bits = args.gpu_expert_bits
@@ -1984,7 +1995,12 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         if val in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported --attention-quant {val}. "
-                "Naive int4/int8 attention has been removed; use hqq8, hqq68_auto, hqq6, hqq46_auto, hqq46, hqq4, awq, or bf16."
+                "Naive int4/int8 attention has been removed; use hqq8, hqq68_auto, hqq6, hqq46_auto, hqq46, hqq4, or bf16."
+            )
+        if val in DEPRECATED_ATTENTION_QUANT_CHOICES:
+            raise ValueError(
+                f"Unsupported --attention-quant {val}: AWQ is deprecated and disabled. "
+                "Use HQQ attention modes: hqq8, hqq68_auto, hqq6, hqq46_auto, hqq46, or hqq4."
             )
         if val not in ATTENTION_QUANT_CHOICES:
             raise ValueError(

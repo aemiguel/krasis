@@ -19,7 +19,7 @@ def test():
     print("=" * 60)
 
     quant = QuantConfig(
-        attention="awq", shared_expert="int8",
+        attention="hqq8", shared_expert="int8",
         dense_mlp="int8", lm_head="int8",
         gpu_expert_bits=4, cpu_expert_bits=4,
     )

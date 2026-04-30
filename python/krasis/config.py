@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 
-ATTENTION_QUANT_CHOICES = ("bf16", "awq", "hqq4", "hqq46", "hqq46_auto", "hqq6", "hqq68_auto", "hqq8")
+ATTENTION_QUANT_CHOICES = ("bf16", "hqq4", "hqq46", "hqq46_auto", "hqq6", "hqq68_auto", "hqq8")
+DEPRECATED_ATTENTION_QUANT_CHOICES = ("awq",)
+KV_CACHE_FORMAT_CHOICES = ("fp8", "fp8_e4m3", "bf16", "bfloat16", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", "k4v4", "tq4")
+DEPRECATED_KV_CACHE_FORMAT_CHOICES = ("polar4",)
 GPU_EXPERT_INT4_CALIB_CHOICES = ("amax", "search_rmse")
 HQQ_CACHE_PROFILE_BASELINE = "baseline"
 HQQ_CACHE_PROFILE_SELFCAL_V1 = "selfcal_v1"
@@ -238,7 +241,7 @@ class QuantConfig:
     layernorms, gate weight. These are either too quality-critical or too small.
     """
     lm_head: str = "int8"          # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
-    attention: str = "bf16" # "bf16", "awq", "hqq4", "hqq46", "hqq46_auto", "hqq6", "hqq68_auto", or "hqq8" (native HQQ attention; "bf16" is debug-oriented, not an oracle)
+    attention: str = "bf16" # "bf16", "hqq4", "hqq46", "hqq46_auto", "hqq6", "hqq68_auto", or "hqq8" (native HQQ attention; "bf16" is debug-oriented, not an oracle)
     shared_expert: str = "int8"    # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
     dense_mlp: str = "int8"        # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
     gpu_expert_bits: int = 4       # 4, 8 (Marlin), or 16 (UNVALIDATED BF16 debug-only path; do not use for validation)
@@ -258,7 +261,6 @@ class QuantConfig:
             "fp8_e4m3": "fp8",
             "bf16": "bf16",
             "bfloat16": "bf16",
-            "polar4": "polar4",
             "k8v4": "k8v4",
             "k8v6": "k8v6",
             "k7v4": "k7v4",
@@ -267,18 +269,28 @@ class QuantConfig:
             "k4v4": "k4v4",
             "tq4": "tq4",
         }
+        if self.kv_cache_format in DEPRECATED_KV_CACHE_FORMAT_CHOICES:
+            raise ValueError(
+                f"kv_cache_format='{self.kv_cache_format}' is deprecated and disabled. "
+                "Use 'k6v6' for quality, 'k4v4' for compact KV, or 'bf16' for full precision."
+            )
         if self.kv_cache_format not in kv_aliases:
             raise ValueError(
                 f"Unsupported kv_cache_format '{self.kv_cache_format}'. "
                 "Use public modes 'k6v6', 'k4v4', or 'bf16'; internal modes include "
-                "'fp8_e4m3', 'polar4', 'k8v4', 'k8v6', 'k7v4', 'k6v4', and 'tq4'."
+                "'fp8_e4m3', 'k8v4', 'k8v6', 'k7v4', 'k6v4', and 'tq4'."
             )
         self.kv_cache_format = kv_aliases[self.kv_cache_format]
 
         if self.attention in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported attention quant '{self.attention}'. "
-                "Naive int4/int8 attention has been removed; use 'awq', 'hqq4', 'hqq46', 'hqq46_auto', 'hqq6', 'hqq68_auto', 'hqq8', or 'bf16'."
+                "Naive int4/int8 attention has been removed; use 'hqq4', 'hqq46', 'hqq46_auto', 'hqq6', 'hqq68_auto', 'hqq8', or 'bf16'."
+            )
+        if self.attention in DEPRECATED_ATTENTION_QUANT_CHOICES:
+            raise ValueError(
+                f"attention='{self.attention}' is deprecated and disabled. "
+                "Use HQQ attention modes: 'hqq4', 'hqq46', 'hqq46_auto', 'hqq6', 'hqq68_auto', or 'hqq8'."
             )
         if self.attention not in ATTENTION_QUANT_CHOICES:
             raise ValueError(

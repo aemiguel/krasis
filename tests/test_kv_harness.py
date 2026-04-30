@@ -11,6 +11,12 @@ from krasis import GpuDecodeStore
 from krasis.config import ModelConfig
 
 def test_kv_harness(use_polar4=False):
+    if use_polar4 and os.environ.get("KRASIS_ALLOW_DEPRECATED_POLAR4_KV") != "1":
+        raise RuntimeError(
+            "Polar4 KV is deprecated and disabled. Set "
+            "KRASIS_ALLOW_DEPRECATED_POLAR4_KV=1 only for legacy implementation diagnostics."
+        )
+
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     
@@ -129,5 +135,6 @@ def test_kv_harness(use_polar4=False):
 
 if __name__ == "__main__":
     test_kv_harness(use_polar4=False)
-    print("-" * 40)
-    test_kv_harness(use_polar4=True)
+    if os.environ.get("KRASIS_ALLOW_DEPRECATED_POLAR4_KV") == "1":
+        print("-" * 40)
+        test_kv_harness(use_polar4=True)

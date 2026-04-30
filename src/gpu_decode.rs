@@ -4018,6 +4018,9 @@ struct GpuDecodeGraph {
     per_layer_moe_indices: Vec<usize>,
     /// Persistent cuBLAS workspace for CUDA graph capture (prevents internal cudaMalloc).
     d_cublas_workspace: Option<cudarc::driver::CudaSlice<u8>>,
+    /// Event used to order graph replay after cold-expert H2D DMA without blocking
+    /// the CPU on copy_stream.
+    graph_replay_dma_event: Option<CudaEvent>,
 }
 
 /// Backup storage for one LA layer's mutable state.
@@ -4217,6 +4220,24 @@ impl HqqRuntimeSlotEntry {
     fn is_registered(&self) -> bool {
         self.device_buffers.is_some()
     }
+
+    fn device_bytes(&self) -> usize {
+        if self.is_registered() {
+            self.packed_slot_bytes + self.scales_slot_bytes + self.zeros_slot_bytes
+        } else {
+            0
+        }
+    }
+}
+
+fn hqq_stage_compaction_enabled() -> bool {
+    matches!(
+        std::env::var("KRASIS_HQQ_STAGE_COMPACT")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 impl Default for HqqRuntimeSlotEntry {
@@ -4722,6 +4743,175 @@ impl GpuDecodeStore {
             kernel_ready: true,
             decode_sidecars: Vec::new(),
         })
+    }
+
+    pub fn hqq_prefill_pointer_patches_rust(
+        &self,
+    ) -> Result<Vec<crate::gpu_prefill::HqqPrefillPointerPatch>, String> {
+        let mut patches = Vec::with_capacity(self.hqq_runtime_slots.len());
+        for slot in &self.hqq_runtime_slots {
+            if slot.current_stage != "prefill" || !slot.is_registered() {
+                return Err(format!(
+                    "HQQ prefill pointer patch requested while slot is not in prefill stage: layer={} tensor={} stage={} registered={}",
+                    slot.layer_idx,
+                    slot.tensor_name,
+                    slot.current_stage,
+                    slot.is_registered()
+                ));
+            }
+            patches.push(crate::gpu_prefill::HqqPrefillPointerPatch {
+                layer_idx: slot.layer_idx,
+                tensor_name: slot.tensor_name.clone(),
+                packed_ptr: slot.packed_slot_ptr,
+                scales_ptr: slot.scales_slot_ptr,
+                zeros_ptr: slot.zeros_slot_ptr,
+            });
+        }
+        Ok(patches)
+    }
+
+    fn update_hqq_exec_tensor_pointers(
+        desc: &mut HqqTensorExecDescriptor,
+        new_desc: &HqqTensorExecDescriptor,
+    ) -> bool {
+        let changed = desc.packed_ptr != new_desc.packed_ptr
+            || desc.scales_ptr != new_desc.scales_ptr
+            || desc.zeros_ptr != new_desc.zeros_ptr;
+        desc.packed_ptr = new_desc.packed_ptr;
+        desc.scales_ptr = new_desc.scales_ptr;
+        desc.zeros_ptr = new_desc.zeros_ptr;
+        changed
+    }
+
+    fn update_hqq_exec_optional_tensor_pointers(
+        desc: &mut Option<HqqTensorExecDescriptor>,
+        new_desc: &HqqTensorExecDescriptor,
+    ) -> bool {
+        if let Some(desc) = desc.as_mut() {
+            Self::update_hqq_exec_tensor_pointers(desc, new_desc)
+        } else {
+            false
+        }
+    }
+
+    fn refresh_hqq_decode_exec_pointers_from_slots(&mut self) -> Result<bool, String> {
+        if self.hqq_runtime_slots.is_empty() {
+            return Ok(false);
+        }
+        let mut descriptors: HashMap<(usize, String), HqqTensorExecDescriptor> =
+            HashMap::with_capacity(self.hqq_runtime_slots.len());
+        for slot in &self.hqq_runtime_slots {
+            if slot.current_stage != "decode" || !slot.is_registered() {
+                return Err(format!(
+                    "HQQ decode pointer refresh requested while slot is not in decode stage: layer={} tensor={} stage={} registered={}",
+                    slot.layer_idx,
+                    slot.tensor_name,
+                    slot.current_stage,
+                    slot.is_registered()
+                ));
+            }
+            let desc = self.hqq_runtime_decode_exec_desc_for_tensor(
+                slot.layer_idx,
+                &slot.tensor_name,
+            )?;
+            descriptors.insert((slot.layer_idx, slot.tensor_name.clone()), desc);
+        }
+
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or_else(|| "Call configure first".to_string())?;
+        let mut changed = false;
+        for ((layer_idx, tensor_name), new_desc) in descriptors {
+            let Some(layer) = graph.layers.get_mut(layer_idx) else {
+                continue;
+            };
+            if let Some(registration) = layer.hqq.as_mut() {
+                if let Some(tensor) = registration.tensors.get_mut(&tensor_name) {
+                    tensor.packed_ptr = new_desc.packed_ptr;
+                    tensor.scales_ptr = new_desc.scales_ptr;
+                    tensor.zeros_ptr = new_desc.zeros_ptr;
+                }
+            }
+            let Some(exec) = layer.hqq_exec.as_mut() else {
+                continue;
+            };
+            match exec {
+                HqqExecutionDescriptor::Gqa(desc) => match tensor_name.as_str() {
+                    "q_proj" => {
+                        changed |= Self::update_hqq_exec_tensor_pointers(&mut desc.q_proj, &new_desc);
+                    }
+                    "k_proj" => {
+                        changed |= Self::update_hqq_exec_tensor_pointers(&mut desc.k_proj, &new_desc);
+                    }
+                    "v_proj" => {
+                        changed |= Self::update_hqq_exec_tensor_pointers(&mut desc.v_proj, &new_desc);
+                    }
+                    "o_proj" => {
+                        changed |= Self::update_hqq_exec_tensor_pointers(&mut desc.o_proj, &new_desc);
+                    }
+                    "fused_qkv" => {
+                        changed |= Self::update_hqq_exec_optional_tensor_pointers(
+                            &mut desc.fused_qkv,
+                            &new_desc,
+                        );
+                    }
+                    _ => {}
+                },
+                HqqExecutionDescriptor::Mla(desc) => match tensor_name.as_str() {
+                    "q_a_proj" => {
+                        changed |= Self::update_hqq_exec_optional_tensor_pointers(
+                            &mut desc.q_a_proj,
+                            &new_desc,
+                        );
+                    }
+                    "q_b_proj" => {
+                        changed |= Self::update_hqq_exec_optional_tensor_pointers(
+                            &mut desc.q_b_proj,
+                            &new_desc,
+                        );
+                    }
+                    "q_proj" => {
+                        changed |= Self::update_hqq_exec_optional_tensor_pointers(
+                            &mut desc.q_proj,
+                            &new_desc,
+                        );
+                    }
+                    "kv_a_proj_with_mqa" => {
+                        changed |= Self::update_hqq_exec_tensor_pointers(
+                            &mut desc.kv_a_proj_with_mqa,
+                            &new_desc,
+                        );
+                    }
+                    "o_proj" => {
+                        changed |= Self::update_hqq_exec_tensor_pointers(&mut desc.o_proj, &new_desc);
+                    }
+                    _ => {}
+                },
+                HqqExecutionDescriptor::LinearAttention(desc) => match tensor_name.as_str() {
+                    "in_proj_qkvz" => {
+                        changed |= Self::update_hqq_exec_tensor_pointers(
+                            &mut desc.in_proj_qkvz,
+                            &new_desc,
+                        );
+                    }
+                    "in_proj_ba" => {
+                        changed |= Self::update_hqq_exec_tensor_pointers(
+                            &mut desc.in_proj_ba,
+                            &new_desc,
+                        );
+                    }
+                    "out_proj" => {
+                        changed |= Self::update_hqq_exec_tensor_pointers(
+                            &mut desc.out_proj,
+                            &new_desc,
+                        );
+                    }
+                    _ => {}
+                },
+            }
+        }
+        Ok(changed)
     }
 
     fn build_hqq_prefill_runtime_format(
@@ -5261,6 +5451,18 @@ impl GpuDecodeStore {
             "decode" => Ok(&slot.decode),
             other => Err(format!("Unsupported HQQ runtime stage '{}'", other)),
         }
+    }
+
+    fn hqq_runtime_stage_component_bytes(
+        slot: &HqqRuntimeSlotEntry,
+        stage: &str,
+    ) -> Result<(usize, usize, usize), String> {
+        let desc = Self::hqq_runtime_stage_desc(slot, stage)?;
+        Ok((
+            desc.packed_host.len(),
+            desc.scales_host.len(),
+            desc.zeros_host.len(),
+        ))
     }
 
     fn download_device_f32(&self, ptr: u64, count: usize) -> Result<Vec<f32>, String> {
@@ -6437,12 +6639,24 @@ impl GpuDecodeStore {
     /// taken by the Rust server via take_prefill_engine().
     #[pyo3(signature = (max_context_tokens))]
     fn allocate_prefill_engine(&mut self, max_context_tokens: usize) -> PyResult<()> {
+        if self.has_hqq_runtime_slots() {
+            self.prepare_runtime_for_prefill_rust()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Failed to prepare HQQ runtime for prefill engine creation: {}", e)
+                ))?;
+        }
         match self.create_prefill_engine(max_context_tokens) {
             Ok(engine) => {
                 log::info!("Prefill engine pre-allocated (max_tokens={})", max_context_tokens);
                 // Cache scratch VRAM computation for eviction checks (survives take_prefill_engine)
                 self.prefill_scratch_info = Some(crate::gpu_prefill::compute_scratch_vram(&engine.config));
                 self.prefill_engine_slot = Some(engine);
+                if self.has_hqq_runtime_slots() {
+                    self.prepare_runtime_for_decode_rust()
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                            format!("Failed to restore HQQ runtime to decode after prefill engine creation: {}", e)
+                        ))?;
+                }
                 Ok(())
             }
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -6478,8 +6692,22 @@ impl GpuDecodeStore {
             let (cache_fast, ne) = self.export_hcs_snapshot();
             (cache_fast.to_vec(), ne)
         };
-        self.prepare_runtime_for_prefill_rust()
+        let has_hqq_runtime_slots = self
+            .prepare_runtime_for_prefill_rust()
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        if has_hqq_runtime_slots {
+            let patches = self
+                .hqq_prefill_pointer_patches_rust()
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            let engine = self.prefill_engine_slot.as_mut().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "Rust prefill engine not allocated. Call allocate_prefill_engine() first."
+                )
+            })?;
+            engine
+                .refresh_hqq_prefill_tensor_pointers(&patches)
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        }
 
         let prefill_hcs_guard_store_addr = self as *mut Self as usize;
         let (first_token, prompt_len, kv_overflow) = {
@@ -6924,6 +7152,7 @@ impl GpuDecodeStore {
             captured_k6v4_ptrs: Vec::new(),
             per_layer_moe_indices: Vec::new(),
             d_cublas_workspace: None,
+            graph_replay_dma_event: None,
         }));
 
         // Cache kernel function handles (avoid HashMap lookup per call)
@@ -7080,6 +7309,21 @@ impl GpuDecodeStore {
                 CudaEvent(raw_events[3]),
             ]);
             log::info!("GpuDecodeStore: pre-allocated 4 CUDA events");
+        }
+
+        {
+            let mut ev: cuda_sys::CUevent = std::ptr::null_mut();
+            unsafe {
+                let flags = cuda_sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32;
+                let err = cuda_sys::lib().cuEventCreate(&mut ev, flags);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("cuEventCreate graph replay DMA event: {:?}", err),
+                    ));
+                }
+            }
+            self.graph.as_mut().unwrap().graph_replay_dma_event = Some(CudaEvent(ev));
+            log::info!("GpuDecodeStore: pre-allocated graph replay DMA event");
         }
 
         // Cache v2 partial buffer pointer on self for attention Marlin GEMV v2
@@ -7438,28 +7682,28 @@ impl GpuDecodeStore {
             nbits,
         ).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
-        let packed_slot_bytes = prefill.packed_bytes().max(decode.packed_bytes());
-        let scales_slot_bytes = prefill.scales_bytes().max(decode.scales_bytes());
-        let zeros_slot_bytes = prefill.zeros_bytes().max(decode.zeros_bytes());
+        let max_packed_slot_bytes = prefill.packed_bytes().max(decode.packed_bytes());
+        let max_scales_slot_bytes = prefill.scales_bytes().max(decode.scales_bytes());
+        let max_zeros_slot_bytes = prefill.zeros_bytes().max(decode.zeros_bytes());
         let total_host_bytes = prefill.host_bytes() + decode.host_bytes();
 
         trace_emit_global_mark(
             self.active_trace(),
             "weights",
             &format!(
-                "phase=hqq_stage_tensor layer={} tensor={} prefill_ms={:.3} decode_ms={:.3} host_mb={:.3} slot_kb=({:.1},{:.1},{:.1})",
+                "phase=hqq_stage_tensor layer={} tensor={} prefill_ms={:.3} decode_ms={:.3} host_mb={:.3} max_slot_kb=({:.1},{:.1},{:.1})",
                 layer_idx,
                 tensor_name,
                 prefill.build_ms,
                 decode.build_ms,
                 total_host_bytes as f64 / 1024.0 / 1024.0,
-                packed_slot_bytes as f64 / 1024.0,
-                scales_slot_bytes as f64 / 1024.0,
-                zeros_slot_bytes as f64 / 1024.0,
+                max_packed_slot_bytes as f64 / 1024.0,
+                max_scales_slot_bytes as f64 / 1024.0,
+                max_zeros_slot_bytes as f64 / 1024.0,
             ),
         );
         log::info!(
-            "HQQ runtime staging: layer={} tensor={} prefill(kind={} layout={} ms={:.3} packed={} scales={} zeros={}) decode(kind={} layout={} ms={:.3} packed={} scales={} zeros={}) host_mb={:.3} slots=(packed {:.1} KB, scales {:.1} KB, zeros {:.1} KB) backend={} nbits={} format_v{}",
+            "HQQ runtime staging: layer={} tensor={} prefill(kind={} layout={} ms={:.3} packed={} scales={} zeros={}) decode(kind={} layout={} ms={:.3} packed={} scales={} zeros={}) host_mb={:.3} max_slots=(packed {:.1} KB, scales {:.1} KB, zeros {:.1} KB) backend={} nbits={} format_v{}",
             layer_idx,
             tensor_name,
             prefill.kind.as_str(),
@@ -7475,9 +7719,9 @@ impl GpuDecodeStore {
             decode.scales_bytes(),
             decode.zeros_bytes(),
             total_host_bytes as f64 / 1024.0 / 1024.0,
-            packed_slot_bytes as f64 / 1024.0,
-            scales_slot_bytes as f64 / 1024.0,
-            zeros_slot_bytes as f64 / 1024.0,
+            max_packed_slot_bytes as f64 / 1024.0,
+            max_scales_slot_bytes as f64 / 1024.0,
+            max_zeros_slot_bytes as f64 / 1024.0,
             backend,
             nbits,
             format_version,
@@ -7488,28 +7732,14 @@ impl GpuDecodeStore {
             .position(|slot| slot.layer_idx == layer_idx && slot.tensor_name == tensor_name);
         if let Some(slot_idx) = existing_slot_idx {
             let slot = &mut self.hqq_runtime_slots[slot_idx];
-            if slot.is_registered()
-                && (slot.packed_slot_bytes != packed_slot_bytes
-                    || slot.scales_slot_bytes != scales_slot_bytes
-                    || slot.zeros_slot_bytes != zeros_slot_bytes)
-            {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "HQQ restaging changed slot capacity for layer {} tensor {}: existing=({},{},{}) new=({},{},{})",
-                    layer_idx,
-                    tensor_name,
-                    slot.packed_slot_bytes,
-                    slot.scales_slot_bytes,
-                    slot.zeros_slot_bytes,
-                    packed_slot_bytes,
-                    scales_slot_bytes,
-                    zeros_slot_bytes,
-                )));
-            }
             let preserved_registration = slot.is_registered();
             let preserved_registered_ms = slot.registered_ms;
             let preserved_packed_slot_ptr = slot.packed_slot_ptr;
             let preserved_scales_slot_ptr = slot.scales_slot_ptr;
             let preserved_zeros_slot_ptr = slot.zeros_slot_ptr;
+            let preserved_packed_slot_bytes = slot.packed_slot_bytes;
+            let preserved_scales_slot_bytes = slot.scales_slot_bytes;
+            let preserved_zeros_slot_bytes = slot.zeros_slot_bytes;
             let preserved_device_buffers = slot.device_buffers.take();
             *slot = HqqRuntimeSlotEntry {
                 layer_idx,
@@ -7527,9 +7757,9 @@ impl GpuDecodeStore {
                 zeros_dtype: zeros_dtype.to_string(),
                 prefill,
                 decode,
-                packed_slot_bytes,
-                scales_slot_bytes,
-                zeros_slot_bytes,
+                packed_slot_bytes: preserved_packed_slot_bytes,
+                scales_slot_bytes: preserved_scales_slot_bytes,
+                zeros_slot_bytes: preserved_zeros_slot_bytes,
                 packed_slot_ptr: preserved_packed_slot_ptr,
                 scales_slot_ptr: preserved_scales_slot_ptr,
                 zeros_slot_ptr: preserved_zeros_slot_ptr,
@@ -7578,9 +7808,9 @@ impl GpuDecodeStore {
             zeros_dtype: zeros_dtype.to_string(),
             prefill,
             decode,
-            packed_slot_bytes,
-            scales_slot_bytes,
-            zeros_slot_bytes,
+            packed_slot_bytes: 0,
+            scales_slot_bytes: 0,
+            zeros_slot_bytes: 0,
             packed_slot_ptr: 0,
             scales_slot_ptr: 0,
             zeros_slot_ptr: 0,
@@ -7796,25 +8026,44 @@ impl GpuDecodeStore {
                 continue;
             }
             let t0 = std::time::Instant::now();
-            let packed = self.device.alloc_zeros::<u8>(slot.packed_slot_bytes)
+            let compact = hqq_stage_compaction_enabled();
+            let slot_packed_bytes = if compact {
+                slot.decode.packed_host.len()
+            } else {
+                slot.prefill.packed_host.len().max(slot.decode.packed_host.len())
+            };
+            let slot_scales_bytes = if compact {
+                slot.decode.scales_host.len()
+            } else {
+                slot.prefill.scales_host.len().max(slot.decode.scales_host.len())
+            };
+            let slot_zeros_bytes = if compact {
+                slot.decode.zeros_host.len()
+            } else {
+                slot.prefill.zeros_host.len().max(slot.decode.zeros_host.len())
+            };
+            let packed = self.device.alloc_zeros::<u8>(slot_packed_bytes)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("HQQ register packed slot layer={} tensor={}: {:?}", slot.layer_idx, slot.tensor_name, e)))?;
-            let scales = self.device.alloc_zeros::<u8>(slot.scales_slot_bytes)
+            let scales = self.device.alloc_zeros::<u8>(slot_scales_bytes)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("HQQ register scales slot layer={} tensor={}: {:?}", slot.layer_idx, slot.tensor_name, e)))?;
-            let zeros = self.device.alloc_zeros::<u8>(slot.zeros_slot_bytes)
+            let zeros = self.device.alloc_zeros::<u8>(slot_zeros_bytes)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("HQQ register zeros slot layer={} tensor={}: {:?}", slot.layer_idx, slot.tensor_name, e)))?;
             slot.packed_slot_ptr = *packed.device_ptr();
             slot.scales_slot_ptr = *scales.device_ptr();
             slot.zeros_slot_ptr = *zeros.device_ptr();
+            slot.packed_slot_bytes = slot_packed_bytes;
+            slot.scales_slot_bytes = slot_scales_bytes;
+            slot.zeros_slot_bytes = slot_zeros_bytes;
             slot.registered_ms = t0.elapsed().as_secs_f64() * 1000.0;
             slot.current_stage = "registered_unloaded".to_string();
             slot.device_buffers = Some(HqqRuntimeDeviceBuffers { packed, scales, zeros });
 
             registered += 1;
             total_ms += slot.registered_ms;
-            total_slot_bytes += slot.packed_slot_bytes + slot.scales_slot_bytes + slot.zeros_slot_bytes;
+            total_slot_bytes += slot.device_bytes();
             packed_slot_bytes += slot.packed_slot_bytes;
             scales_slot_bytes += slot.scales_slot_bytes;
             zeros_slot_bytes += slot.zeros_slot_bytes;
@@ -7842,6 +8091,7 @@ impl GpuDecodeStore {
         self.hqq_runtime_registration_stats.packed_slot_bytes += packed_slot_bytes;
         self.hqq_runtime_registration_stats.scales_slot_bytes += scales_slot_bytes;
         self.hqq_runtime_registration_stats.zeros_slot_bytes += zeros_slot_bytes;
+        self.recompute_hqq_runtime_staging_stats();
 
         log::info!(
             "HQQ runtime slot registration: new_slots={} reg_ms={:.3} device_mb={:.3} packed_mb={:.3} scales_mb={:.3} zeros_mb={:.3}",
@@ -12690,6 +12940,12 @@ impl GpuDecodeStore {
     pub fn prepare_runtime_for_decode_rust(&mut self) -> Result<(), String> {
         if self.has_hqq_runtime_slots() {
             self.swap_hqq_runtime_to_decode_rust()?;
+            if self.refresh_hqq_decode_exec_pointers_from_slots()? {
+                self.invalidate_cuda_graph();
+                log::info!(
+                    "HQQ runtime decode pointers changed; invalidated CUDA graphs for recapture"
+                );
+            }
         }
         self.swap_to_simple_int4_rust()
     }
@@ -12708,32 +12964,98 @@ impl GpuDecodeStore {
         let mut scales_memcpy_bytes = 0usize;
         let mut zeros_memcpy_bytes = 0usize;
 
-        for slot in &mut self.hqq_runtime_slots {
-            if !slot.is_registered() {
-                return Err(format!(
-                    "HQQ runtime slot for layer {} tensor {} is not registered",
-                    slot.layer_idx, slot.tensor_name
-                ));
+        let compact = hqq_stage_compaction_enabled();
+        for slot_idx in 0..self.hqq_runtime_slots.len() {
+            let (stage_packed_bytes, stage_scales_bytes, stage_zeros_bytes) = {
+                let slot = &self.hqq_runtime_slots[slot_idx];
+                Self::hqq_runtime_stage_component_bytes(slot, stage)?
+            };
+            let (target_packed_bytes, target_scales_bytes, target_zeros_bytes) = if compact {
+                (stage_packed_bytes, stage_scales_bytes, stage_zeros_bytes)
+            } else {
+                let slot = &self.hqq_runtime_slots[slot_idx];
+                (
+                    slot.prefill.packed_host.len().max(slot.decode.packed_host.len()),
+                    slot.prefill.scales_host.len().max(slot.decode.scales_host.len()),
+                    slot.prefill.zeros_host.len().max(slot.decode.zeros_host.len()),
+                )
+            };
+            let needs_realloc = {
+                let slot = &self.hqq_runtime_slots[slot_idx];
+                !slot.is_registered()
+                    || slot.packed_slot_bytes != target_packed_bytes
+                    || slot.scales_slot_bytes != target_scales_bytes
+                    || slot.zeros_slot_bytes != target_zeros_bytes
+            };
+            if needs_realloc {
+                let (layer_idx, tensor_name, old_bytes) = {
+                    let slot = &self.hqq_runtime_slots[slot_idx];
+                    (
+                        slot.layer_idx,
+                        slot.tensor_name.clone(),
+                        slot.device_bytes(),
+                    )
+                };
+                let t_alloc = std::time::Instant::now();
+                let packed = self.device.alloc_zeros::<u8>(target_packed_bytes)
+                    .map_err(|e| format!(
+                        "HQQ {} packed slot alloc layer={} tensor={} bytes={}: {:?}",
+                        stage, layer_idx, tensor_name, target_packed_bytes, e
+                    ))?;
+                let scales = self.device.alloc_zeros::<u8>(target_scales_bytes)
+                    .map_err(|e| format!(
+                        "HQQ {} scales slot alloc layer={} tensor={} bytes={}: {:?}",
+                        stage, layer_idx, tensor_name, target_scales_bytes, e
+                    ))?;
+                let zeros = self.device.alloc_zeros::<u8>(target_zeros_bytes)
+                    .map_err(|e| format!(
+                        "HQQ {} zeros slot alloc layer={} tensor={} bytes={}: {:?}",
+                        stage, layer_idx, tensor_name, target_zeros_bytes, e
+                    ))?;
+                let slot = &mut self.hqq_runtime_slots[slot_idx];
+                slot.packed_slot_ptr = *packed.device_ptr();
+                slot.scales_slot_ptr = *scales.device_ptr();
+                slot.zeros_slot_ptr = *zeros.device_ptr();
+                slot.packed_slot_bytes = target_packed_bytes;
+                slot.scales_slot_bytes = target_scales_bytes;
+                slot.zeros_slot_bytes = target_zeros_bytes;
+                slot.registered_ms = t_alloc.elapsed().as_secs_f64() * 1000.0;
+                slot.current_stage = "registered_unloaded".to_string();
+                slot.device_buffers = Some(HqqRuntimeDeviceBuffers { packed, scales, zeros });
+                log::info!(
+                    "HQQ runtime slot resized: stage={} layer={} tensor={} old_mb={:.3} new_mb={:.3} alloc_ms={:.3}",
+                    stage,
+                    layer_idx,
+                    tensor_name,
+                    old_bytes as f64 / 1024.0 / 1024.0,
+                    slot.device_bytes() as f64 / 1024.0 / 1024.0,
+                    slot.registered_ms,
+                );
             }
-            let desc = Self::hqq_runtime_stage_desc(slot, stage)?;
-            let packed_bytes = Self::hqq_runtime_copy_component(
-                slot.packed_slot_ptr,
-                slot.packed_slot_bytes,
-                &desc.packed_host,
-                "packed",
-            )?;
-            let scales_bytes = Self::hqq_runtime_copy_component(
-                slot.scales_slot_ptr,
-                slot.scales_slot_bytes,
-                &desc.scales_host,
-                "scales",
-            )?;
-            let zeros_bytes = Self::hqq_runtime_copy_component(
-                slot.zeros_slot_ptr,
-                slot.zeros_slot_bytes,
-                &desc.zeros_host,
-                "zeros",
-            )?;
+            let (packed_bytes, scales_bytes, zeros_bytes) = {
+                let slot = &self.hqq_runtime_slots[slot_idx];
+                let desc = Self::hqq_runtime_stage_desc(slot, stage)?;
+                let packed_bytes = Self::hqq_runtime_copy_component(
+                    slot.packed_slot_ptr,
+                    slot.packed_slot_bytes,
+                    &desc.packed_host,
+                    "packed",
+                )?;
+                let scales_bytes = Self::hqq_runtime_copy_component(
+                    slot.scales_slot_ptr,
+                    slot.scales_slot_bytes,
+                    &desc.scales_host,
+                    "scales",
+                )?;
+                let zeros_bytes = Self::hqq_runtime_copy_component(
+                    slot.zeros_slot_ptr,
+                    slot.zeros_slot_bytes,
+                    &desc.zeros_host,
+                    "zeros",
+                )?;
+                (packed_bytes, scales_bytes, zeros_bytes)
+            };
+            let slot = &mut self.hqq_runtime_slots[slot_idx];
             slot.current_stage = stage.to_string();
             slot.last_packed_memcpy_bytes = packed_bytes;
             slot.last_scales_memcpy_bytes = scales_bytes;
@@ -12779,6 +13101,7 @@ impl GpuDecodeStore {
             scales_memcpy_bytes as f64 / 1024.0 / 1024.0,
             zeros_memcpy_bytes as f64 / 1024.0 / 1024.0,
         );
+        self.recompute_hqq_runtime_staging_stats();
         Ok(())
     }
 
@@ -14052,12 +14375,18 @@ impl GpuDecodeStore {
             t_gqa_norm: std::cell::Cell::new(0.0),
             t_gqa_rope: std::cell::Cell::new(0.0),
             t_gqa_kv_prep: std::cell::Cell::new(0.0),
+            t_gqa_kv_cross_stage: std::cell::Cell::new(0.0),
+            t_gqa_kv_append: std::cell::Cell::new(0.0),
             t_gqa_fa2: std::cell::Cell::new(0.0),
             t_gqa_gate: std::cell::Cell::new(0.0),
             t_gqa_oproj: std::cell::Cell::new(0.0),
             gqa_fa2_calls: std::cell::Cell::new(0),
             gqa_fp8_calls: std::cell::Cell::new(0),
             gqa_bf16_calls: std::cell::Cell::new(0),
+            gqa_kv_cross_stage_calls: std::cell::Cell::new(0),
+            gqa_kv_append_calls: std::cell::Cell::new(0),
+            gqa_kv_cross_current_tokens: std::cell::Cell::new(0),
+            gqa_kv_cross_total_tokens: std::cell::Cell::new(0),
             t_la_proj: std::cell::Cell::new(0.0),
             t_la_uninterleave: std::cell::Cell::new(0.0),
             t_la_conv: std::cell::Cell::new(0.0),
@@ -17286,6 +17615,11 @@ impl GpuDecodeStore {
         let w13s_off = graph.expert_buf_w13s_offset;
         let w2p_off = graph.expert_buf_w2p_offset;
         let w2s_off = graph.expert_buf_w2s_offset;
+        let graph_replay_dma_event = graph
+            .graph_replay_dma_event
+            .as_ref()
+            .map(|ev| ev.0)
+            .ok_or_else(|| "Graph replay DMA event was not initialized".to_string())?;
 
         // GPU-side route sync state
         let gpu_rs = graph.gpu_route_sync;
@@ -17344,6 +17678,7 @@ impl GpuDecodeStore {
         let timing = graph.timing_enabled;
 
         for graph_idx in 0..num_graphs {
+            let mut wait_for_cold_dma = false;
             // ── If not first graph: populate d_batch_upload with expert pointers ──
             if graph_idx > 0 {
                 let moe_layer_idx = moe_indices[graph_idx - 1];
@@ -17464,10 +17799,16 @@ impl GpuDecodeStore {
                             ));
                         }
 
-                        // Single sync after all DMAs complete (replaces N per-expert syncs)
-                        unsafe {
-                            cuda_sys::lib().cuStreamSynchronize(copy_stream);
+                        let err = unsafe {
+                            cuda_sys::lib().cuEventRecord(graph_replay_dma_event, copy_stream)
+                        };
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(format!(
+                                "graph replay mapped cold DMA event record layer={}: {:?}",
+                                moe_layer_idx, err
+                            ));
                         }
+                        wait_for_cold_dma = true;
 
                         // Update batch_upload slots for all cold experts
                         let d_upload_base = *graph.d_batch_upload.device_ptr();
@@ -17632,9 +17973,19 @@ impl GpuDecodeStore {
                         cold_ptrs_list.push((w13p, w13s, w2p, w2s));
                     }
 
-                    // Single sync after all DMAs (replaces N per-expert syncs)
+                    // Record copy-stream completion instead of blocking the CPU.
+                    // The replay stream waits on this event after d_batch_upload is queued.
                     if !cold_experts.is_empty() {
-                        unsafe { cuda_sys::lib().cuStreamSynchronize(copy_stream); }
+                        let err = unsafe {
+                            cuda_sys::lib().cuEventRecord(graph_replay_dma_event, copy_stream)
+                        };
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(format!(
+                                "graph replay cold DMA event record layer={}: {:?}",
+                                moe_layer_idx, err
+                            ));
+                        }
+                        wait_for_cold_dma = true;
                     }
 
                     if let Some(t) = t_cold_dma_start {
@@ -17689,6 +18040,18 @@ impl GpuDecodeStore {
                     if let Some(t) = t_upload_start {
                         graph.t_graph_upload += t.elapsed().as_secs_f64();
                     }
+                }
+            }
+
+            if wait_for_cold_dma {
+                let err = unsafe {
+                    cuda_sys::lib().cuStreamWaitEvent(replay_stream, graph_replay_dma_event, 0)
+                };
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!(
+                        "graph replay wait for cold DMA graph_idx={}: {:?}",
+                        graph_idx, err
+                    ));
                 }
             }
 

@@ -61,9 +61,9 @@ except ModuleNotFoundError:
 COMPARE_CONFIGS = {
     "qcn": [
         ("INT8/BF16", "tests/qcn-8-8-a16.conf"),
-        ("INT8/AWQ",  "tests/qcn-8-8-awq.conf"),
+        ("INT4/HQQ8", "tests/qcn-bf16kv-hqq8-accuracy.conf"),
+        ("INT4/HQQ4", "tests/qcn-bf16kv-hqq4-g128-accuracy.conf"),
         ("INT4/BF16", "tests/qcn-bf16.conf"),
-        ("INT4/AWQ",  "tests/qcn-awq.conf"),
     ],
     "q35b": [
         ("INT8/BF16", "tests/qwen35-8-8-a16.conf"),
@@ -71,15 +71,14 @@ COMPARE_CONFIGS = {
     ],
     "q122b": [
         ("INT4/BF16", "tests/q122b-4-4-a16.conf"),
-        ("INT4/AWQ",  "tests/q122b-4-4-awq.conf"),
     ],
 }
 
 CONFIG_COLORS = {
     "INT8/BF16": "#58a6ff",
-    "INT8/AWQ":  "#3fb950",
+    "INT4/HQQ8": "#3fb950",
+    "INT4/HQQ4": "#d2a8ff",
     "INT4/BF16": "#d29922",
-    "INT4/AWQ":  "#d2a8ff",
 }
 
 

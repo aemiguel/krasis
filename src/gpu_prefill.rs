@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cudarc::driver::sys as cuda_sys;
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr};
 use pyo3::prelude::*;
@@ -2356,6 +2357,7 @@ pub struct PrefillKernels {
     hqq_prefill_group_sums_bf16: RawCuFunc,
     hqq8_marlin_zero_correct_bf16: RawCuFunc,
     hqq8_marlin_intercept_correct_bf16: RawCuFunc,
+    hqq_marlin_add_correction_bf16: RawCuFunc,
     hqq_prefill_int8_exception_delta_bf16: RawCuFunc,
     hqq_apply_sidecar_bf16: RawCuFunc,
     rope: RawCuFunc,
@@ -2831,6 +2833,15 @@ pub struct HqqTensorExecDescriptor {
 }
 
 #[derive(Debug, Clone)]
+pub struct HqqPrefillPointerPatch {
+    pub layer_idx: usize,
+    pub tensor_name: String,
+    pub packed_ptr: u64,
+    pub scales_ptr: u64,
+    pub zeros_ptr: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct HqqPrefillSidecarDescriptor {
     pub tensor_name: String,
     pub mode: String,
@@ -3229,12 +3240,18 @@ pub struct PrefillEngine {
     pub t_gqa_norm: Cell<f64>,     // QK LayerNorm
     pub t_gqa_rope: Cell<f64>,     // RoPE
     pub t_gqa_kv_prep: Cell<f64>,  // KV cache store (FP8 path) or dequant+concat (BF16 path)
+    pub t_gqa_kv_cross_stage: Cell<f64>, // Cross-chunk compressed/BF16 KV staging
+    pub t_gqa_kv_append: Cell<f64>, // Current chunk K/V append into cache
     pub t_gqa_fa2: Cell<f64>,      // FlashAttention-2 kernel call
     pub t_gqa_gate: Cell<f64>,     // sigmoid gate (gated attention)
     pub t_gqa_oproj: Cell<f64>,    // O projection GEMM
     pub gqa_fa2_calls: Cell<u64>,  // number of FA2 calls (for averaging)
     pub gqa_fp8_calls: Cell<u64>,  // how many used FP8 path
     pub gqa_bf16_calls: Cell<u64>, // how many used BF16 dequant path
+    pub gqa_kv_cross_stage_calls: Cell<u64>,
+    pub gqa_kv_append_calls: Cell<u64>,
+    pub gqa_kv_cross_current_tokens: Cell<u64>,
+    pub gqa_kv_cross_total_tokens: Cell<u64>,
     // LA sub-component timing accumulators
     pub t_la_proj: Cell<f64>,         // in_proj_qkvz + in_proj_ba GEMMs
     pub t_la_uninterleave: Cell<f64>, // uninterleave qkvz + ba
@@ -3335,6 +3352,114 @@ impl PrefillEngine {
         self.reference_debug_trace_enabled = enabled;
         self.last_reference_debug_trace = None;
         self.reference_prefill_stage_snapshots.borrow_mut().clear();
+    }
+
+    pub fn refresh_hqq_prefill_tensor_pointers(
+        &mut self,
+        patches: &[HqqPrefillPointerPatch],
+    ) -> Result<(), String> {
+        fn apply_tensor_patch(
+            desc: &mut HqqTensorExecDescriptor,
+            patch: &HqqPrefillPointerPatch,
+        ) {
+            desc.packed_ptr = patch.packed_ptr;
+            desc.scales_ptr = patch.scales_ptr;
+            desc.zeros_ptr = patch.zeros_ptr;
+        }
+
+        fn apply_optional_tensor_patch(
+            desc: &mut Option<HqqTensorExecDescriptor>,
+            patch: &HqqPrefillPointerPatch,
+        ) -> bool {
+            if let Some(desc) = desc.as_mut() {
+                apply_tensor_patch(desc, patch);
+                true
+            } else {
+                false
+            }
+        }
+
+        for patch in patches {
+            let Some(layer) = self.layer_weights.get_mut(patch.layer_idx) else {
+                return Err(format!(
+                    "HQQ prefill pointer patch references missing layer {} tensor {}",
+                    patch.layer_idx, patch.tensor_name
+                ));
+            };
+            let mut applied = false;
+            if let Some(hqq) = layer.hqq_gqa.as_mut() {
+                match patch.tensor_name.as_str() {
+                    "q_proj" => {
+                        apply_tensor_patch(&mut hqq.q_proj, patch);
+                        applied = true;
+                    }
+                    "k_proj" => {
+                        apply_tensor_patch(&mut hqq.k_proj, patch);
+                        applied = true;
+                    }
+                    "v_proj" => {
+                        apply_tensor_patch(&mut hqq.v_proj, patch);
+                        applied = true;
+                    }
+                    "o_proj" => {
+                        apply_tensor_patch(&mut hqq.o_proj, patch);
+                        applied = true;
+                    }
+                    "fused_qkv" => {
+                        // Decode can use a fused GQA tensor while prefill keeps separate
+                        // q/k/v descriptors. There is no prefill descriptor to patch.
+                        applied = true;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(hqq) = layer.hqq_mla.as_mut() {
+                match patch.tensor_name.as_str() {
+                    "q_a_proj" => {
+                        applied |= apply_optional_tensor_patch(&mut hqq.q_a_proj, patch);
+                    }
+                    "q_b_proj" => {
+                        applied |= apply_optional_tensor_patch(&mut hqq.q_b_proj, patch);
+                    }
+                    "q_proj" => {
+                        applied |= apply_optional_tensor_patch(&mut hqq.q_proj, patch);
+                    }
+                    "kv_a_proj_with_mqa" => {
+                        apply_tensor_patch(&mut hqq.kv_a_proj_with_mqa, patch);
+                        applied = true;
+                    }
+                    "o_proj" => {
+                        apply_tensor_patch(&mut hqq.o_proj, patch);
+                        applied = true;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(hqq) = layer.hqq_linear_attention.as_mut() {
+                match patch.tensor_name.as_str() {
+                    "in_proj_qkvz" => {
+                        apply_tensor_patch(&mut hqq.in_proj_qkvz, patch);
+                        applied = true;
+                    }
+                    "in_proj_ba" => {
+                        apply_tensor_patch(&mut hqq.in_proj_ba, patch);
+                        applied = true;
+                    }
+                    "out_proj" => {
+                        apply_tensor_patch(&mut hqq.out_proj, patch);
+                        applied = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !applied {
+                return Err(format!(
+                    "HQQ prefill pointer patch did not match layer {} tensor {}",
+                    patch.layer_idx, patch.tensor_name
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn take_reference_debug_trace(&mut self) -> Option<serde_json::Value> {
@@ -5738,6 +5863,29 @@ impl PrefillEngine {
             .count()
     }
 
+    fn record_gqa_kv_cross_stage(&self, elapsed_ms: f64, current_tokens: usize, total_kv_tokens: usize) {
+        self.t_gqa_kv_prep
+            .set(self.t_gqa_kv_prep.get() + elapsed_ms);
+        self.t_gqa_kv_cross_stage
+            .set(self.t_gqa_kv_cross_stage.get() + elapsed_ms);
+        self.gqa_kv_cross_stage_calls
+            .set(self.gqa_kv_cross_stage_calls.get() + 1);
+        self.gqa_kv_cross_current_tokens.set(
+            self.gqa_kv_cross_current_tokens.get() + current_tokens as u64,
+        );
+        self.gqa_kv_cross_total_tokens
+            .set(self.gqa_kv_cross_total_tokens.get() + total_kv_tokens as u64);
+    }
+
+    fn record_gqa_kv_append(&self, elapsed_ms: f64) {
+        self.t_gqa_kv_prep
+            .set(self.t_gqa_kv_prep.get() + elapsed_ms);
+        self.t_gqa_kv_append
+            .set(self.t_gqa_kv_append.get() + elapsed_ms);
+        self.gqa_kv_append_calls
+            .set(self.gqa_kv_append_calls.get() + 1);
+    }
+
     pub fn set_prefill_hcs_guard_store_addr(&mut self, store_addr: usize) {
         self.prefill_hcs_store_addr = store_addr;
     }
@@ -5861,13 +6009,15 @@ impl PrefillEngine {
         let ctmp_len = m
             .checked_mul(n)
             .ok_or("Marlin float-zp C_tmp element count overflow")?;
-        unsafe {
-            cuda_sys::lib().cuMemsetD32Async(
-                *self.scratch.d_fp32_scratch.device_ptr(),
-                0,
-                ctmp_len,
-                self.stream,
-            );
+        if Self::marlin_ctmp_clear_required(m, n) {
+            unsafe {
+                cuda_sys::lib().cuMemsetD32Async(
+                    *self.scratch.d_fp32_scratch.device_ptr(),
+                    0,
+                    ctmp_len,
+                    self.stream,
+                );
+            }
         }
 
         unsafe {
@@ -5902,6 +6052,235 @@ impl PrefillEngine {
                 true,
                 true,
             );
+        }
+        Ok(())
+    }
+
+    fn marlin_ctmp_clear_required(m: usize, n: usize) -> bool {
+        if m == 0 || n == 0 {
+            return false;
+        }
+
+        // The vendored Marlin wrapper enables the atomic-add reduction path only
+        // for small split shapes. In the non-atomic path, the first reduction
+        // slice writes C_tmp before later slices read it, so stale C_tmp contents
+        // are irrelevant and clearing m*n FP32 elements is pure overhead.
+        let max_thread_m_blocks = 4usize;
+        let split_granularity = max_thread_m_blocks * 16;
+        let max_par_local = if n <= 4096 { 16 * 8 } else { 16 };
+        let mut rest_m = m;
+        while rest_m > 0 {
+            let par_count = (rest_m / split_granularity).min(max_par_local);
+            let split_m = if par_count > 0 {
+                par_count * split_granularity
+            } else {
+                rest_m
+            };
+            if split_m.div_ceil(64) * n <= 2048 {
+                return true;
+            }
+            rest_m -= split_m;
+        }
+        false
+    }
+
+    fn hqq_intercept_correction_legacy_bf16(
+        &self,
+        output_ptr: u64,
+        input_ptr: u64,
+        correction_ptr: u64,
+        m: usize,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        groups: usize,
+    ) -> Result<(), String> {
+        let group_sum_elems = m
+            .checked_mul(groups)
+            .ok_or("HQQ Marlin group-sum element count overflow")?;
+        if self.scratch.d_fp32_scratch.len < group_sum_elems {
+            return Err(format!(
+                "HQQ Marlin legacy correction needs {} FP32 scratch elements, have {}",
+                group_sum_elems, self.scratch.d_fp32_scratch.len
+            ));
+        }
+        let group_sums_ptr = *self.scratch.d_fp32_scratch.device_ptr();
+        let threads = 256u32;
+        let mut s0 = group_sums_ptr;
+        let mut s1 = input_ptr;
+        let mut s2 = m as i32;
+        let mut s3 = cols as i32;
+        let mut s4 = group_size as i32;
+        let mut s5 = groups as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq_prefill_group_sums_bf16,
+                (m as u32, groups as u32, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut s0 as *mut _ as *mut std::ffi::c_void,
+                    &mut s1 as *mut _ as *mut std::ffi::c_void,
+                    &mut s2 as *mut _ as *mut std::ffi::c_void,
+                    &mut s3 as *mut _ as *mut std::ffi::c_void,
+                    &mut s4 as *mut _ as *mut std::ffi::c_void,
+                    &mut s5 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+
+        let total = m
+            .checked_mul(rows)
+            .ok_or("HQQ Marlin legacy correction output element count overflow")?;
+        let blocks = (total as u32).div_ceil(threads);
+        let mut c0 = output_ptr;
+        let mut c1 = group_sums_ptr;
+        let mut c2 = correction_ptr;
+        let mut c3 = m as i32;
+        let mut c4 = rows as i32;
+        let mut c5 = groups as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq8_marlin_intercept_correct_bf16,
+                (blocks, 1, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut c0 as *mut _ as *mut std::ffi::c_void,
+                    &mut c1 as *mut _ as *mut std::ffi::c_void,
+                    &mut c2 as *mut _ as *mut std::ffi::c_void,
+                    &mut c3 as *mut _ as *mut std::ffi::c_void,
+                    &mut c4 as *mut _ as *mut std::ffi::c_void,
+                    &mut c5 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn hqq_intercept_correction_gemm_bf16(
+        &self,
+        output_ptr: u64,
+        input_ptr: u64,
+        correction_ptr: u64,
+        m: usize,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        groups: usize,
+    ) -> Result<(), String> {
+        if std::env::var("KRASIS_HQQ_PREFILL_CORRECTION")
+            .map(|v| v == "legacy")
+            .unwrap_or(false)
+        {
+            return self.hqq_intercept_correction_legacy_bf16(
+                output_ptr,
+                input_ptr,
+                correction_ptr,
+                m,
+                rows,
+                cols,
+                group_size,
+                groups,
+            );
+        }
+        let correction_elems = m
+            .checked_mul(rows)
+            .ok_or("HQQ Marlin correction output element count overflow")?;
+        let group_sum_elems = m
+            .checked_mul(groups)
+            .ok_or("HQQ Marlin group-sum element count overflow")?;
+        let required_fp32 = correction_elems
+            .checked_add(group_sum_elems)
+            .ok_or("HQQ Marlin correction scratch element count overflow")?;
+        if self.scratch.d_fp32_scratch.len < required_fp32 {
+            return Err(format!(
+                "HQQ Marlin fused correction needs {} FP32 scratch elements (correction={} group_sums={}), have {}",
+                required_fp32,
+                correction_elems,
+                group_sum_elems,
+                self.scratch.d_fp32_scratch.len
+            ));
+        }
+
+        let correction_out_ptr = *self.scratch.d_fp32_scratch.device_ptr();
+        let group_sums_ptr = correction_out_ptr
+            .checked_add((correction_elems * std::mem::size_of::<f32>()) as u64)
+            .ok_or("HQQ Marlin group-sum scratch pointer overflow")?;
+
+        let threads = 256u32;
+        let mut s0 = group_sums_ptr;
+        let mut s1 = input_ptr;
+        let mut s2 = m as i32;
+        let mut s3 = cols as i32;
+        let mut s4 = group_size as i32;
+        let mut s5 = groups as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq_prefill_group_sums_bf16,
+                (m as u32, groups as u32, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut s0 as *mut _ as *mut std::ffi::c_void,
+                    &mut s1 as *mut _ as *mut std::ffi::c_void,
+                    &mut s2 as *mut _ as *mut std::ffi::c_void,
+                    &mut s3 as *mut _ as *mut std::ffi::c_void,
+                    &mut s4 as *mut _ as *mut std::ffi::c_void,
+                    &mut s5 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        unsafe {
+            cublas_result::set_stream(self.cublas_handle, self.stream as cublas_sys::cudaStream_t)
+                .map_err(|e| format!("cublas set_stream for HQQ correction: {:?}", e))?;
+            cublas_result::gemm_ex(
+                self.cublas_handle,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                rows as i32,
+                m as i32,
+                groups as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                correction_ptr as *const std::ffi::c_void,
+                cublas_sys::cudaDataType::CUDA_R_32F,
+                groups as i32,
+                group_sums_ptr as *const std::ffi::c_void,
+                cublas_sys::cudaDataType::CUDA_R_32F,
+                groups as i32,
+                &beta as *const f32 as *const std::ffi::c_void,
+                correction_out_ptr as *mut std::ffi::c_void,
+                cublas_sys::cudaDataType::CUDA_R_32F,
+                rows as i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .map_err(|e| format!("HQQ Marlin correction SGEMM: {:?}", e))?;
+        }
+
+        let blocks = (correction_elems as u32).div_ceil(threads);
+        let mut a0 = output_ptr;
+        let mut a1 = correction_out_ptr;
+        let mut a2 = correction_elems as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq_marlin_add_correction_bf16,
+                (blocks, 1, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut a0 as *mut _ as *mut std::ffi::c_void,
+                    &mut a1 as *mut _ as *mut std::ffi::c_void,
+                    &mut a2 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
         }
         Ok(())
     }
@@ -6870,6 +7249,17 @@ impl PrefillEngine {
                 scratch_tokens = scratch_tokens.min(measured_cap.max(128));
             }
         }
+        if let Ok(raw) = std::env::var("KRASIS_PREFILL_DIAG_MAX_CHUNK_TOKENS") {
+            let diag_cap = raw.parse::<usize>().map_err(|e| {
+                format!("KRASIS_PREFILL_DIAG_MAX_CHUNK_TOKENS must be an integer: {e}")
+            })?;
+            if diag_cap < 128 {
+                return Err(
+                    "KRASIS_PREFILL_DIAG_MAX_CHUNK_TOKENS must be at least 128".to_string(),
+                );
+            }
+            scratch_tokens = scratch_tokens.min(diag_cap);
+        }
         if debug_prefill {
             eprintln!(
                 "[PREFILL-DEBUG] prepare prompt_tokens={} free_mb={} total_mb={} safety_mb={} fixed_mb={:.1} per_tok_kb={:.1} usable_mb={:.1} target={} max_by_vram={} measured_cap={} initial_scratch={}",
@@ -7008,7 +7398,8 @@ impl PrefillEngine {
                 );
             }
 
-            self.scratch = allocate_scratch(&self.device, &self.config, scratch_tokens)?;
+            self.scratch =
+                allocate_scratch_for_prompt(&self.device, &self.config, scratch_tokens, target)?;
 
             unsafe {
                 cuda_sys::lib().cuCtxSynchronize();
@@ -7507,12 +7898,18 @@ impl PrefillEngine {
             self.t_gqa_norm.set(0.0);
             self.t_gqa_rope.set(0.0);
             self.t_gqa_kv_prep.set(0.0);
+            self.t_gqa_kv_cross_stage.set(0.0);
+            self.t_gqa_kv_append.set(0.0);
             self.t_gqa_fa2.set(0.0);
             self.t_gqa_gate.set(0.0);
             self.t_gqa_oproj.set(0.0);
             self.gqa_fa2_calls.set(0);
             self.gqa_fp8_calls.set(0);
             self.gqa_bf16_calls.set(0);
+            self.gqa_kv_cross_stage_calls.set(0);
+            self.gqa_kv_append_calls.set(0);
+            self.gqa_kv_cross_current_tokens.set(0);
+            self.gqa_kv_cross_total_tokens.set(0);
             self.t_la_proj.set(0.0);
             self.t_la_uninterleave.set(0.0);
             self.t_la_conv.set(0.0);
@@ -9311,6 +9708,8 @@ impl PrefillEngine {
             let gn = self.t_gqa_norm.get();
             let gr = self.t_gqa_rope.get();
             let gk = self.t_gqa_kv_prep.get();
+            let gkc = self.t_gqa_kv_cross_stage.get();
+            let gka = self.t_gqa_kv_append.get();
             let gf = self.t_gqa_fa2.get();
             let gg = self.t_gqa_gate.get();
             let go = self.t_gqa_oproj.get();
@@ -9318,6 +9717,10 @@ impl PrefillEngine {
             let fc = self.gqa_fa2_calls.get();
             let fp8c = self.gqa_fp8_calls.get();
             let bf16c = self.gqa_bf16_calls.get();
+            let cross_calls = self.gqa_kv_cross_stage_calls.get();
+            let append_calls = self.gqa_kv_append_calls.get();
+            let cross_cur = self.gqa_kv_cross_current_tokens.get();
+            let cross_total = self.gqa_kv_cross_total_tokens.get();
             if ga > 0.0 {
                 eprintln!(
                     "[PREFILL-TIMING]     gqa breakdown ({} FA2 calls: {} bf16, {} fp8):",
@@ -9359,6 +9762,20 @@ impl PrefillEngine {
                         0.0
                     }
                 );
+                if gkc > 0.0 || gka > 0.0 || cross_calls > 0 || append_calls > 0 {
+                    eprintln!(
+                        "[PREFILL-TIMING]         kv_cross_stage: {:>8.1}ms over {} calls (current_tokens={} total_kv_tokens={})",
+                        gkc,
+                        cross_calls,
+                        cross_cur,
+                        cross_total
+                    );
+                    eprintln!(
+                        "[PREFILL-TIMING]         kv_append:      {:>8.1}ms over {} calls",
+                        gka,
+                        append_calls
+                    );
+                }
                 eprintln!("[PREFILL-TIMING]       fa2:     {:>8.1}ms ({:>5.1}% of gqa)  [{:.1}ms/call avg]",
                     gf, if t_gqa_ms > 0.0 { gf / t_gqa_ms * 100.0 } else { 0.0 },
                     if fc > 0 { gf / fc as f64 } else { 0.0 });
@@ -10164,14 +10581,15 @@ impl PrefillEngine {
             cuda_sys::lib().cuMemsetD32Async(workspace, 0, ws_len, stream);
         }
 
-        // Zero the C_tmp (FP32 scratch) region used by this GEMM call.
-        // When use_fp32_reduce=true and use_atomic_add=true, the Marlin kernel
-        // atomicAdds partial results to C_tmp. Stale values from prior GEMM calls
-        // accumulate, inflating output norms. This is critical for sequential
-        // expert GEMM dispatch where hundreds of calls share the same C_tmp buffer.
-        let ctmp_len = m * w.n; // FP32 elements needed for this call
-        unsafe {
-            cuda_sys::lib().cuMemsetD32Async(fp32_scratch, 0, ctmp_len, stream);
+        // Only clear C_tmp for shapes that can take Marlin's atomic-add
+        // reduction path. Large prefill projections use non-atomic FP32
+        // reduction, where the first slice writes C_tmp before later slices read
+        // it, so a pre-clear just burns bandwidth.
+        if Self::marlin_ctmp_clear_required(m, w.n) {
+            let ctmp_len = m * w.n; // FP32 elements needed for this call
+            unsafe {
+                cuda_sys::lib().cuMemsetD32Async(fp32_scratch, 0, ctmp_len, stream);
+            }
         }
 
         unsafe {
@@ -10491,59 +10909,16 @@ impl PrefillEngine {
             desc.group_size,
         )?;
 
-        let group_sums_ptr = *self.scratch.d_fp32_scratch.device_ptr();
-        let threads = 256u32;
-        let mut s0 = group_sums_ptr;
-        let mut s1 = input_ptr;
-        let mut s2 = m as i32;
-        let mut s3 = desc.cols as i32;
-        let mut s4 = desc.group_size as i32;
-        let mut s5 = groups as i32;
-        unsafe {
-            launch(
-                self.kernels.hqq_prefill_group_sums_bf16,
-                (m as u32, groups as u32, 1),
-                (threads, 1, 1),
-                0,
-                self.stream,
-                &mut [
-                    &mut s0 as *mut _ as *mut std::ffi::c_void,
-                    &mut s1 as *mut _ as *mut std::ffi::c_void,
-                    &mut s2 as *mut _ as *mut std::ffi::c_void,
-                    &mut s3 as *mut _ as *mut std::ffi::c_void,
-                    &mut s4 as *mut _ as *mut std::ffi::c_void,
-                    &mut s5 as *mut _ as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-
-        let total = m
-            .checked_mul(desc.rows)
-            .ok_or("HQQ4 native fused two-scale-intercept output element count overflow")?;
-        let blocks = (total as u32).div_ceil(threads);
-        let mut c0 = output_ptr;
-        let mut c1 = group_sums_ptr;
-        let mut c2 = correction_ptr;
-        let mut c3 = m as i32;
-        let mut c4 = desc.rows as i32;
-        let mut c5 = groups as i32;
-        unsafe {
-            launch(
-                self.kernels.hqq8_marlin_intercept_correct_bf16,
-                (blocks, 1, 1),
-                (threads, 1, 1),
-                0,
-                self.stream,
-                &mut [
-                    &mut c0 as *mut _ as *mut std::ffi::c_void,
-                    &mut c1 as *mut _ as *mut std::ffi::c_void,
-                    &mut c2 as *mut _ as *mut std::ffi::c_void,
-                    &mut c3 as *mut _ as *mut std::ffi::c_void,
-                    &mut c4 as *mut _ as *mut std::ffi::c_void,
-                    &mut c5 as *mut _ as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
+        self.hqq_intercept_correction_gemm_bf16(
+            output_ptr,
+            input_ptr,
+            correction_ptr,
+            m,
+            desc.rows,
+            desc.cols,
+            desc.group_size,
+            groups,
+        )?;
 
         self.apply_hqq_prefill_quantized_int8_exceptions(
             layer_idx,
@@ -10935,60 +11310,16 @@ impl PrefillEngine {
             desc.group_size,
         )?;
 
-        let group_sums_ptr = *self.scratch.d_fp32_scratch.device_ptr();
-        let threads = 256u32;
-        let mut s0 = group_sums_ptr;
-        let mut s1 = input_ptr;
-        let mut s2 = m as i32;
-        let mut s3 = desc.cols as i32;
-        let mut s4 = desc.group_size as i32;
-        let mut s5 = groups as i32;
-        unsafe {
-            launch(
-                self.kernels.hqq_prefill_group_sums_bf16,
-                (m as u32, groups as u32, 1),
-                (threads, 1, 1),
-                0,
-                self.stream,
-                &mut [
-                    &mut s0 as *mut _ as *mut std::ffi::c_void,
-                    &mut s1 as *mut _ as *mut std::ffi::c_void,
-                    &mut s2 as *mut _ as *mut std::ffi::c_void,
-                    &mut s3 as *mut _ as *mut std::ffi::c_void,
-                    &mut s4 as *mut _ as *mut std::ffi::c_void,
-                    &mut s5 as *mut _ as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-
-        let total = m
-            .checked_mul(desc.rows)
-            .ok_or("HQQ8 native fused v2 output element count overflow")?;
-        let blocks = (total as u32).div_ceil(threads);
-        let mut c0 = output_ptr;
-        let mut c1 = group_sums_ptr;
-        let mut c2 = correction_ptr;
-        let mut c3 = m as i32;
-        let mut c4 = desc.rows as i32;
-        let mut c5 = groups as i32;
-        unsafe {
-            launch(
-                self.kernels.hqq8_marlin_intercept_correct_bf16,
-                (blocks, 1, 1),
-                (threads, 1, 1),
-                0,
-                self.stream,
-                &mut [
-                    &mut c0 as *mut _ as *mut std::ffi::c_void,
-                    &mut c1 as *mut _ as *mut std::ffi::c_void,
-                    &mut c2 as *mut _ as *mut std::ffi::c_void,
-                    &mut c3 as *mut _ as *mut std::ffi::c_void,
-                    &mut c4 as *mut _ as *mut std::ffi::c_void,
-                    &mut c5 as *mut _ as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-        Ok(())
+        self.hqq_intercept_correction_gemm_bf16(
+            output_ptr,
+            input_ptr,
+            correction_ptr,
+            m,
+            desc.rows,
+            desc.cols,
+            desc.group_size,
+            groups,
+        )
     }
 
     fn hqq8_native_zp_twoscale_marlin_prefill_gemm_bf16(
@@ -11085,60 +11416,16 @@ impl PrefillEngine {
             desc.group_size,
         )?;
 
-        let group_sums_ptr = *self.scratch.d_fp32_scratch.device_ptr();
-        let threads = 256u32;
-        let mut s0 = group_sums_ptr;
-        let mut s1 = input_ptr;
-        let mut s2 = m as i32;
-        let mut s3 = desc.cols as i32;
-        let mut s4 = desc.group_size as i32;
-        let mut s5 = groups as i32;
-        unsafe {
-            launch(
-                self.kernels.hqq_prefill_group_sums_bf16,
-                (m as u32, groups as u32, 1),
-                (threads, 1, 1),
-                0,
-                self.stream,
-                &mut [
-                    &mut s0 as *mut _ as *mut std::ffi::c_void,
-                    &mut s1 as *mut _ as *mut std::ffi::c_void,
-                    &mut s2 as *mut _ as *mut std::ffi::c_void,
-                    &mut s3 as *mut _ as *mut std::ffi::c_void,
-                    &mut s4 as *mut _ as *mut std::ffi::c_void,
-                    &mut s5 as *mut _ as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-
-        let total = m
-            .checked_mul(desc.rows)
-            .ok_or("HQQ8 native fused two-scale-intercept output element count overflow")?;
-        let blocks = (total as u32).div_ceil(threads);
-        let mut c0 = output_ptr;
-        let mut c1 = group_sums_ptr;
-        let mut c2 = correction_ptr;
-        let mut c3 = m as i32;
-        let mut c4 = desc.rows as i32;
-        let mut c5 = groups as i32;
-        unsafe {
-            launch(
-                self.kernels.hqq8_marlin_intercept_correct_bf16,
-                (blocks, 1, 1),
-                (threads, 1, 1),
-                0,
-                self.stream,
-                &mut [
-                    &mut c0 as *mut _ as *mut std::ffi::c_void,
-                    &mut c1 as *mut _ as *mut std::ffi::c_void,
-                    &mut c2 as *mut _ as *mut std::ffi::c_void,
-                    &mut c3 as *mut _ as *mut std::ffi::c_void,
-                    &mut c4 as *mut _ as *mut std::ffi::c_void,
-                    &mut c5 as *mut _ as *mut std::ffi::c_void,
-                ],
-            )?;
-        }
-        Ok(())
+        self.hqq_intercept_correction_gemm_bf16(
+            output_ptr,
+            input_ptr,
+            correction_ptr,
+            m,
+            desc.rows,
+            desc.cols,
+            desc.group_size,
+            groups,
+        )
     }
 
     fn hqq_quantized_prefill_gemm_bf16(
@@ -12519,8 +12806,10 @@ impl PrefillEngine {
 
                 if gt {
                     self.stream_sync()?;
-                    self.t_gqa_kv_prep.set(
-                        self.t_gqa_kv_prep.get() + gt_dequant.elapsed().as_secs_f64() * 1000.0,
+                    self.record_gqa_kv_cross_stage(
+                        gt_dequant.elapsed().as_secs_f64() * 1000.0,
+                        m,
+                        total_kv,
                     );
                 }
 
@@ -12666,8 +12955,10 @@ impl PrefillEngine {
                 }
                 if gt {
                     self.stream_sync()?;
-                    self.t_gqa_kv_prep.set(
-                        self.t_gqa_kv_prep.get() + gt_dequant.elapsed().as_secs_f64() * 1000.0,
+                    self.record_gqa_kv_cross_stage(
+                        gt_dequant.elapsed().as_secs_f64() * 1000.0,
+                        m,
+                        total_kv,
                     );
                 }
 
@@ -12864,8 +13155,10 @@ impl PrefillEngine {
                 }
                 if gt {
                     self.stream_sync()?;
-                    self.t_gqa_kv_prep.set(
-                        self.t_gqa_kv_prep.get() + gt_dequant.elapsed().as_secs_f64() * 1000.0,
+                    self.record_gqa_kv_cross_stage(
+                        gt_dequant.elapsed().as_secs_f64() * 1000.0,
+                        m,
+                        total_kv,
                     );
                 }
 
@@ -12984,9 +13277,7 @@ impl PrefillEngine {
                     }
                     if gt {
                         self.stream_sync()?;
-                        self.t_gqa_kv_prep.set(
-                            self.t_gqa_kv_prep.get() + gt_kv_store.elapsed().as_secs_f64() * 1000.0,
-                        );
+                        self.record_gqa_kv_append(gt_kv_store.elapsed().as_secs_f64() * 1000.0);
                     }
 
                     // FA2 FP8: Q (BF16) attends to K/V (FP8 in cache [0..total_kv])
@@ -13131,8 +13422,10 @@ impl PrefillEngine {
 
                     if gt {
                         self.stream_sync()?;
-                        self.t_gqa_kv_prep.set(
-                            self.t_gqa_kv_prep.get() + gt_dequant.elapsed().as_secs_f64() * 1000.0,
+                        self.record_gqa_kv_cross_stage(
+                            gt_dequant.elapsed().as_secs_f64() * 1000.0,
+                            m,
+                            total_kv,
                         );
                     }
 
@@ -13338,6 +13631,8 @@ impl PrefillEngine {
 
         // KV cache append: BF16 K,V -> cache format into separate per-layer caches
         // Skip if cross-chunk path already stored K/V before attention.
+        let gt_kv_append = Instant::now();
+        let kv_append_path_before = kv_append_path;
         if capture_kv_cache
             && self.kv_format == 2
             && layer_idx < self.kv_k_radius_ptrs.len()
@@ -13577,6 +13872,10 @@ impl PrefillEngine {
                     ],
                 )?;
             }
+        }
+        if gt && kv_append_path != kv_append_path_before && kv_append_path != "fp8_pre_attn" {
+            self.stream_sync()?;
+            self.record_gqa_kv_append(gt_kv_append.elapsed().as_secs_f64() * 1000.0);
         }
 
         // Gated attention: apply sigmoid(gate) to attention output
@@ -28032,6 +28331,7 @@ impl PrefillKernels {
                     "hqq_prefill_group_sums_bf16_kernel",
                     "hqq8_marlin_zero_correct_bf16_kernel",
                     "hqq8_marlin_intercept_correct_bf16_kernel",
+                    "hqq_marlin_add_correction_bf16_kernel",
                     "hqq_prefill_int8_exception_delta_bf16_kernel",
                     "hqq_apply_sidecar_bf16_kernel",
                     "rope_batched_kernel",
@@ -28182,6 +28482,7 @@ impl PrefillKernels {
             hqq_prefill_group_sums_bf16: get("hqq_prefill_group_sums_bf16_kernel")?,
             hqq8_marlin_zero_correct_bf16: get("hqq8_marlin_zero_correct_bf16_kernel")?,
             hqq8_marlin_intercept_correct_bf16: get("hqq8_marlin_intercept_correct_bf16_kernel")?,
+            hqq_marlin_add_correction_bf16: get("hqq_marlin_add_correction_bf16_kernel")?,
             hqq_prefill_int8_exception_delta_bf16: get("hqq_prefill_int8_exception_delta_bf16_kernel")?,
             hqq_apply_sidecar_bf16: get("hqq_apply_sidecar_bf16_kernel")?,
             rope: get("rope_batched_kernel")?,
@@ -28542,11 +28843,21 @@ pub fn allocate_scratch(
     config: &PrefillModelConfig,
     max_tokens: usize,
 ) -> Result<PrefillScratch, String> {
+    allocate_scratch_for_prompt(_device, config, max_tokens, max_tokens)
+}
+
+pub fn allocate_scratch_for_prompt(
+    _device: &Arc<CudaDevice>,
+    config: &PrefillModelConfig,
+    max_tokens: usize,
+    fp32_scratch_tokens: usize,
+) -> Result<PrefillScratch, String> {
     let h = config.hidden_size;
     let inter = config.intermediate_size; // max of dense + moe for general scratch
     let moe_inter = config.moe_intermediate_size; // actual MoE expert intermediate
     let shared_inter = config.shared_expert_intermediate_size.max(moe_inter);
     let topk = config.num_experts_per_tok.max(1);
+    let fp32_tokens = fp32_scratch_tokens.max(max_tokens);
 
     // Fused sorted count: max_tokens * topk + n_routed * block_size (block padding for Marlin).
     // When max_tokens=0 (init/release), use fsc=1 to avoid allocating ~608 MB of block-padding
@@ -28632,16 +28943,23 @@ pub fn allocate_scratch(
                     max_gemm_n = qkvz_n;
                 }
             }
-            let marlin_ctmp = max_tokens * max_gemm_n;
+            let max_hqq_input_cols = h
+                .max(config.num_q_heads * config.head_dim)
+                .max(config.num_kv_heads * config.head_dim)
+                .max(config.la_num_v_heads * config.la_v_head_dim);
+            let max_hqq_groups = max_hqq_input_cols.div_ceil(config.group_size.max(1));
+            let marlin_ctmp = fp32_tokens * max_gemm_n;
+            let hqq_correction = fp32_tokens * (max_gemm_n + max_hqq_groups);
             let la_size = if has_la {
                 let nv = config.la_num_v_heads;
                 let dk = config.la_k_head_dim;
                 let dv = config.la_v_head_dim;
                 let cs = config.la_chunk_size;
                 let conv_dim = config.la_conv_dim;
-                let output_buf = nv * la_max_len * dv;
+                let fp32_la_max_len = fp32_tokens + config.la_chunk_size;
+                let output_buf = nv * fp32_la_max_len * dv;
                 let chunk_temps = nv * cs * (2 * dk + dv) + nv * cs;
-                let conv_transpose = la_max_len * conv_dim;
+                let conv_transpose = fp32_la_max_len * conv_dim;
                 std::cmp::max(output_buf + chunk_temps, conv_transpose)
             } else {
                 0
@@ -28650,7 +28968,10 @@ pub fn allocate_scratch(
                 .fused_moe_w1_ctmp_floats
                 .max(config.fused_moe_w2_ctmp_floats);
             alloc_f32(
-                std::cmp::max(std::cmp::max(marlin_ctmp, la_size), fused_moe_ctmp_floor),
+                std::cmp::max(
+                    std::cmp::max(std::cmp::max(marlin_ctmp, hqq_correction), la_size),
+                    fused_moe_ctmp_floor,
+                ),
                 "fp32_scratch",
             )?
         },

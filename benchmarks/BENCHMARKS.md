@@ -1,5 +1,116 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-30 (Phase 2EI HQQ prefill fused correction)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: QCN 1-GPU benchmark-style configs, INT4 GPU/CPU experts, INT8
+shared/dense/lm-head, layer group size 2, graph replay enabled, timing
+instrumentation off. These runs were made after the Phase 2EI HQQ correction
+change that replaces the old custom intercept-correction pass with an FP32
+correction GEMM plus a BF16 add kernel after the Marlin projection.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-----|--------------:|-----|
+| QCN k4v4 HQQ6, INT4 experts | HQQ6 | k4v4 | 6,186.5 | 76.66 | 14256/24576 (58.0%) | 700 MB | [log](20260430_2030_qcn_k4v4_hqq6_int4_fused_correction_benchmark.log) |
+| QCN k6v6 HQQ8, INT4 experts | HQQ8 | k6v6 | 6,314.2 | 79.89 | 14256/24576 (58.0%) | 740 MB | [log](20260430_2054_qcn_k6v6_hqq8_int4_fused_correction_benchmark.log) |
+
+Notes:
+- Runs executed via `./dev benchmark ...`, not timing-instrumented profiling.
+- Decode values are the benchmark's internal engine numbers. Network round-trip
+  numbers are present in the full logs but are not used as decode speed.
+- The HQQ6/k4v4 prefill row improved materially over the previous Phase 2EG
+  ladder row (`5,363.4 -> 6,186.5 tok/s`), while decode stayed in the same
+  class (`75.61 -> 76.66 tok/s`).
+- The HQQ8/k6v6 row improved over the previous Phase 2EG comparator
+  (`5,992.3 -> 6,314.2 tok/s`), with decode essentially unchanged
+  (`81.96 -> 79.89 tok/s`).
+- A timing-enabled forced multi-chunk diagnostic measured compressed-KV
+  cross-chunk staging at only `37.5 ms` over `108` calls during a
+  `39,920`-token prefill capped to `4096`-token chunks. That is about `3.7%`
+  of GQA time and about `0.4%` of total prefill time in that diagnostic, so KV
+  cross-chunk staging is not currently the main prefill limiter.
+
+---
+
+## Standard Benchmarks — 2026-04-30 (Phase 2EG QCN k4v4 HQQ4/HQQ6/HQQ8 attention ladder + k6v6 comparators)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: QCN 1-GPU benchmark-style configs, INT8 shared/dense/lm-head, layer
+group size 2, graph replay enabled, timing instrumentation off. The first
+three rows keep INT4 GPU/CPU experts and k4v4 KV fixed while varying only
+`CFG_ATTENTION_QUANT`. The final two rows are k6v6/HQQ8 comparators requested
+after the ladder, first with INT8 experts and then with INT4 experts.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-----|--------------:|-----|
+| QCN k4v4 HQQ4, INT4 experts | HQQ4 | k4v4 | 5,851.5 | 78.76 | 14823/24576 (60.3%) | 698 MB | [log](20260430_1536_qcn_k4v4_hqq4_int4_benchmark.log) |
+| QCN k4v4 HQQ6, INT4 experts | HQQ6 | k4v4 | 5,363.4 | 75.61 | 14256/24576 (58.0%) | 700 MB | [log](20260430_1542_qcn_k4v4_hqq6_int4_benchmark.log) |
+| QCN k4v4 HQQ8, INT4 experts | HQQ8 | k4v4 | 6,191.3 | 80.03 | 14256/24576 (58.0%) | 732 MB | [log](20260430_1502_qcn_k4v4_hqq8_int4_benchmark.log) |
+| QCN k6v6 HQQ8, INT8 experts | HQQ8 | k6v6 | 4,910.6 | 36.85 | 7216/24576 (29.4%) | 656 MB | [log](20260430_1552_qcn_k6v6_hqq8_int8_benchmark.log) |
+| QCN k6v6 HQQ8, INT4 experts | HQQ8 | k6v6 | 5,992.3 | 81.96 | 14256/24576 (58.0%) | 740 MB | [log](20260430_1601_qcn_k6v6_hqq8_int4_benchmark.log) |
+
+Notes:
+- Runs executed via `./dev benchmark ...`, not timing-instrumented profiling.
+- Decode values are the benchmark's internal engine numbers. Network round-trip
+  numbers are present in the full logs but are not used as decode speed.
+- On this k4v4/INT4 surface, HQQ8 is fastest overall: `6,191.3 tok/s`
+  prefill and `80.03 tok/s` internal decode.
+- HQQ4 has slightly higher HCS coverage than HQQ6/HQQ8 (`60.3%` versus
+  `58.0%`) but still trails HQQ8 on both prefill and decode.
+- HQQ6 is currently the slowest row in this clean ladder despite the fast
+  prefill staging work; the HQQ6 run emitted prefill-time VRAM monitor lows of
+  `518 MB`, below the configured `600 MB` safety margin.
+- The INT8/k6v6/HQQ8 comparator is much slower on decode (`36.85 tok/s`)
+  because INT8 experts cut HCS soft coverage to `29.4%`; this matches earlier
+  INT8 expert findings and argues against INT8 experts for maximum decode speed
+  on this hardware.
+- The INT4/k6v6/HQQ8 comparator is essentially tied with k4v4/HQQ8 on this
+  hardware and current tree: lower prefill (`5,992.3` vs `6,191.3 tok/s`) but
+  slightly higher internal decode (`81.96` vs `80.03 tok/s`) with the same HCS
+  coverage.
+
+---
+
+## Standard Benchmarks — 2026-04-30 (Phase 2EE QCN INT4 / k4v4 / HQQ4 / HQQ8 sweep)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: QCN 1-GPU benchmark-style configs with INT4 GPU/CPU experts, INT8
+shared/dense/lm-head, layer group size 2, graph replay enabled, timing
+instrumentation off. These runs were made on the current working tree after
+the Phase 2EC/2ED speed patches; those patches were not committed at run time.
+Post-run decision: AWQ attention and Polar4 KV are now deprecated and disabled
+for new runs. The AWQ/Polar4 rows below are retained only as historical
+baselines; current speed work should use HQQ attention with `k4v4`, `k6v6`, or
+BF16 KV.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-----|--------------:|-----|
+| QCN INT4 baseline (deprecated) | AWQ | Polar4 | 7,325.1 | 96.69 | 16848/24576 (68.6%) | 654 MB | [log](20260430_1458_qcn_polar4_awq_int4_benchmark.log) |
+| QCN k4v4 | HQQ8 | k4v4 | 6,191.3 | 80.03 | 14256/24576 (58.0%) | 732 MB | [log](20260430_1502_qcn_k4v4_hqq8_int4_benchmark.log) |
+| QCN HQQ4 | HQQ4 | FP8 E4M3 | 5,746.9 | 77.19 | 14823/24576 (60.3%) | 710 MB | [log](20260430_1508_qcn_hqq4_int4_benchmark.log) |
+| QCN HQQ8 (deprecated KV) | HQQ8 | Polar4 | 6,131.7 | 80.62 | 14256/24576 (58.0%) | 732 MB | [log](20260430_1513_qcn_polar4_hqq8_int4_benchmark.log) |
+
+Notes:
+- Runs executed via `./dev benchmark ...`, not timing-instrumented profiling.
+- Decode values are the benchmark's internal engine numbers. Network round-trip
+  numbers are present in the full logs but are not used as decode speed.
+- AWQ/Polar4 was the fastest measured row in this sweep, but is deprecated
+  after this run and should not be used for future speed targets.
+- HQQ8 is now in the same prefill speed class across `k4v4` and Polar4 KV:
+  `6,191.3` versus `6,131.7 tok/s`; decode is also essentially tied
+  (`80.03` versus `80.62 tok/s`).
+- HQQ4 is a little slower than HQQ8 on this benchmark surface despite slightly
+  higher HCS coverage (`60.3%` versus `58.0%`), landing at `5,746.9 tok/s`
+  prefill and `77.19 tok/s` decode.
+- The HQQ8 runs emitted prefill-time VRAM monitor lows of `514 MB`, below the
+  configured `600 MB` safety margin. The table's min-free VRAM value is the
+  benchmark summary's decode min-free value.
+
+---
+
 ## Standard Benchmarks — 2026-04-29 (Phase 2DK QCN INT4/HQQ8 KV comparison)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.

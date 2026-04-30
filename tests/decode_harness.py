@@ -641,7 +641,9 @@ def _default_max_experts(cfg: ModelConfig) -> int:
 
 def _default_attn_mode(conf: Dict[str, str]) -> str:
     quant = conf.get("CFG_ATTENTION_QUANT", "bf16").strip().lower()
-    return "int4" if quant == "awq" else "bf16"
+    if quant == "awq":
+        raise SystemExit("CFG_ATTENTION_QUANT=awq is deprecated and disabled; use HQQ runtime tests instead.")
+    return "bf16"
 
 
 def main() -> None:
@@ -657,7 +659,7 @@ def main() -> None:
                         help="Synthetic routed experts per token (0 = model default)")
     parser.add_argument("--expert-bits", type=int, choices=[4, 8, 16], default=None)
     parser.add_argument("--attn-mode", choices=["bf16", "int4", "int8"], default=None)
-    parser.add_argument("--kv-format", choices=["fp8", "bf16", "polar4"], default=None)
+    parser.add_argument("--kv-format", choices=["fp8", "bf16"], default=None)
     parser.add_argument("--vocab-size", type=int, default=4096)
     parser.add_argument("--timing", action="store_true")
     parser.add_argument("--no-graph", action="store_true",
@@ -692,7 +694,9 @@ def main() -> None:
     if expert_bits is None:
         expert_bits = int(conf.get("CFG_GPU_EXPERT_BITS", "4"))
     attn_mode = args.attn_mode or _default_attn_mode(conf)
-    kv_format = args.kv_format or conf.get("CFG_KV_DTYPE", "polar4").replace("fp8_e4m3", "fp8")
+    kv_format = args.kv_format or conf.get("CFG_KV_DTYPE", "fp8").replace("fp8_e4m3", "fp8")
+    if kv_format == "polar4":
+        raise SystemExit("CFG_KV_DTYPE=polar4 is deprecated and disabled; use k6v6/k4v4 runtime benchmarks instead.")
 
     print("Synthetic GPU decode harness")
     print(f"  model: {os.path.basename(model_path)}")
