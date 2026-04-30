@@ -321,9 +321,9 @@ class QuantConfig:
                 raise ValueError(
                     f"hqq_auto_budget_pct must be a numeric percentage, got {self.hqq_auto_budget_pct!r}"
                 ) from exc
-            if self.hqq_auto_budget_pct <= 0.0 or self.hqq_auto_budget_pct > 100.0:
+            if self.hqq_auto_budget_pct < 0.0 or self.hqq_auto_budget_pct > 100.0:
                 raise ValueError(
-                    f"hqq_auto_budget_pct must satisfy 0 < pct <= 100, got {self.hqq_auto_budget_pct!r}"
+                    f"hqq_auto_budget_pct must satisfy 0 <= pct <= 100, got {self.hqq_auto_budget_pct!r}"
                 )
         if isinstance(self.hqq46_auto_budget_mib, str) and not self.hqq46_auto_budget_mib.strip():
             self.hqq46_auto_budget_mib = None

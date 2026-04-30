@@ -427,9 +427,9 @@ def normalize_hqq_auto_budget_pct(value: Optional[float], attention_quant: str =
         budget_pct = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"hqq_auto_budget_pct must be a percentage, got {value!r}") from exc
-    if not math.isfinite(budget_pct) or budget_pct <= 0.0 or budget_pct > 100.0:
+    if not math.isfinite(budget_pct) or budget_pct < 0.0 or budget_pct > 100.0:
         raise ValueError(
-            f"attention_quant={attention_quant} requires 0 < hqq_auto_budget_pct <= 100, "
+            f"attention_quant={attention_quant} requires 0 <= hqq_auto_budget_pct <= 100, "
             f"got {budget_pct!r}."
         )
     return budget_pct
@@ -442,6 +442,8 @@ def hqq_auto_budget_bytes_from_pct(value: float, promotion_span_bytes: int, atte
         raise ValueError(
             f"attention_quant={attention_quant} has non-positive promotion span: {promotion_span_bytes}"
         )
+    if budget_pct == 0.0:
+        return 0
     if budget_pct == 100.0:
         return span
     return max(1, math.floor(span * (budget_pct / 100.0)))

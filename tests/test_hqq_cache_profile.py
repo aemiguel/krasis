@@ -121,6 +121,7 @@ def test_quant_config_profile_validation() -> None:
     assert QuantConfig().hqq_cache_profile == HQQ_CACHE_PROFILE_BASELINE
     assert QuantConfig(attention="hqq4", hqq_group_size=32).hqq_group_size == 32
     assert QuantConfig(attention="hqq46", hqq_group_size=128).attention == "hqq46"
+    assert QuantConfig(attention="hqq46_auto", hqq_auto_budget_pct=0.0).attention == "hqq46_auto"
     assert QuantConfig(attention="hqq46_auto", hqq_auto_budget_pct=35.5).attention == "hqq46_auto"
     assert QuantConfig(attention="hqq68_auto", hqq_auto_budget_pct=50.0).attention == "hqq68_auto"
     assert QuantConfig(attention="hqq4", hqq_cache_profile="selfcal_v1").hqq_cache_profile == "selfcal_v1"
@@ -286,11 +287,12 @@ def test_hqq46_auto_planner_selects_by_global_budget() -> None:
 
 
 def test_hqq_auto_budget_pct_scales_from_promotion_span() -> None:
+    assert hqq_auto_budget_bytes_from_pct(0.0, 400, "hqq68_auto") == 0
     assert hqq_auto_budget_bytes_from_pct(25.0, 400, "hqq68_auto") == 100
     assert hqq_auto_budget_bytes_from_pct(100.0, 400, "hqq68_auto") == 400
     assert_raises_contains(
-        lambda: hqq_auto_budget_bytes_from_pct(0.0, 400, "hqq68_auto"),
-        "0 < hqq_auto_budget_pct <= 100",
+        lambda: hqq_auto_budget_bytes_from_pct(-0.1, 400, "hqq68_auto"),
+        "0 <= hqq_auto_budget_pct <= 100",
     )
 
 
