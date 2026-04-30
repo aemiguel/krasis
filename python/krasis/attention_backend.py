@@ -506,8 +506,8 @@ def select_hqq_auto_promotions(
     optimizing globally instead of choosing broad tensor families.
     """
     budget_bytes = int(budget_bytes)
-    if budget_bytes <= 0:
-        raise ValueError(f"HQQ auto promotion budget must be positive, got {budget_bytes}")
+    if budget_bytes < 0:
+        raise ValueError(f"HQQ auto promotion budget must be non-negative, got {budget_bytes}")
     if not candidates:
         return set(), {
             "budget_bytes": budget_bytes,
@@ -517,6 +517,16 @@ def select_hqq_auto_promotions(
             "candidate_count": 0,
             "relative_rmse_reduction": 0.0,
             "selection_mode": "empty",
+        }
+    if budget_bytes == 0:
+        return set(), {
+            "budget_bytes": 0,
+            "budget_used_bytes": 0,
+            "budget_unit_bytes": 1,
+            "selected_count": 0,
+            "candidate_count": len(candidates),
+            "relative_rmse_reduction": 0.0,
+            "selection_mode": "zero_budget",
         }
 
     promotion_span_bytes = sum(int(candidate["extra_bytes"]) for candidate in candidates)

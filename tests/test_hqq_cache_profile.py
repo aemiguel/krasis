@@ -286,6 +286,23 @@ def test_hqq46_auto_planner_selects_by_global_budget() -> None:
     assert summary["selected_count"] == 2
 
 
+def test_hqq_auto_zero_budget_selects_no_promotions() -> None:
+    candidates = [
+        {
+            "layer_idx": 0,
+            "tensor_name": "candidate",
+            "extra_bytes": 10,
+            "relative_rmse_reduction": 9.0,
+        }
+    ]
+    selected, summary = select_hqq_auto_promotions(candidates, budget_bytes=0)
+    assert selected == set()
+    assert summary["budget_used_bytes"] == 0
+    assert summary["selected_count"] == 0
+    assert summary["candidate_count"] == 1
+    assert summary["selection_mode"] == "zero_budget"
+
+
 def test_hqq_auto_budget_pct_scales_from_promotion_span() -> None:
     assert hqq_auto_budget_bytes_from_pct(0.0, 400, "hqq68_auto") == 0
     assert hqq_auto_budget_bytes_from_pct(25.0, 400, "hqq68_auto") == 100
