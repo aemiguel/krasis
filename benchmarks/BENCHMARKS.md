@@ -1,5 +1,38 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-29 (Phase 2DK QCN INT4/HQQ8 KV comparison)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: QCN HQQ8 attention with INT4 GPU/CPU experts, INT8 shared/dense/lm
+head, graph replay enabled, timing instrumentation off. Only the KV format
+differs. Both runs used the default HQQ8 prefill path with
+`KRASIS_HQQ8_PREFILL_MODE` unset.
+
+| Variant | KV bpe | Context @ 1GB KV | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|-------:|-----------------:|----------------:|---------------:|-----|--------------:|-----|
+| QCN HQQ8/k4v4, INT4 experts | 5.0 | 136,528 | 5,941.9 | 78.14 | 14256/24576 (58.0%) | 732 MB | [log](20260429_154355_qcn_k4v4_hqq8_int4_benchmark.log) |
+| QCN HQQ8/k6v6, INT4 experts | 7.0 | 97,520 | 6,014.9 | 78.05 | 14256/24576 (58.0%) | 740 MB | [log](20260429_154908_qcn_k6v6_hqq8_int4_benchmark.log) |
+
+Notes:
+- Runs executed via `./dev benchmark ...`, not timing-instrumented profiling.
+- Decode values are the benchmark's internal engine numbers. Network round-trip
+  numbers are present in the full logs but are not used as decode speed.
+- `k4v4` and `k6v6` are effectively tied on internal decode in this run
+  (`78.14` vs `78.05 tok/s`); `k6v6` is slightly faster on best prefill
+  (`6,014.9` vs `5,941.9 tok/s`).
+- With a fixed `1000 MB` KV cache, `k4v4` provides a larger context window
+  (`136,528` tokens) than `k6v6` (`97,520` tokens), matching the expected
+  `5.0` versus `7.0` bpe footprint.
+- Both runs emitted a prefill-time VRAM monitor warning below the configured
+  `600 MB` safety margin (`514 MB` for `k4v4`, `522 MB` for `k6v6`). The table's
+  min-free VRAM value is the benchmark summary's decode min-free value.
+- A benchmark-report metadata bug was fixed during this pass: newer KV formats
+  were previously displayed as `FP8 E4M3` in `benchmark_report.log` even when
+  runtime logs correctly showed `Shared k4v4/k6v6 KV cache`.
+
+---
+
 ## Standard Benchmarks — 2026-04-28 (Phase 2CT QCN k8v4 HQQ8 faster prefill mode)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.

@@ -320,6 +320,7 @@ def compute_launcher_budget(
     expert_group_size: int = 128,
     attention_quant: str = "bf16",
     hqq_cache_profile: str = "baseline",
+    hqq_group_size: int = 128,
     shared_expert_quant: str = "int8",
     dense_mlp_quant: str = "int8",
     lm_head_quant: str = "int8",
@@ -391,13 +392,21 @@ def compute_launcher_budget(
         )
 
     hqq_layer_bytes = None
-    if attention_quant == "hqq4":
-        hqq_layer_bytes = hqq_attention_cache_layer_bytes(model_path, hqq_cache_profile)
+    if attention_quant in ("hqq4", "hqq46", "hqq46_auto", "hqq6", "hqq68_auto", "hqq8"):
+        from krasis.attention_backend import attention_quant_cache_nbits
+
+        hqq_nbits = attention_quant_cache_nbits(attention_quant)
+        hqq_layer_bytes = hqq_attention_cache_layer_bytes(
+            model_path,
+            hqq_cache_profile,
+            nbits=hqq_nbits or 4,
+            group_size=hqq_group_size,
+        )
         if hqq_layer_bytes is None:
             raise RuntimeError(
-                "attention_quant=hqq4 requires a complete validated HQQ artifact set. "
+                f"attention_quant={attention_quant} requires a complete validated HQQ artifact set. "
                 "No HQQ VRAM estimate is allowed before "
-                f"{hqq_attention_cache_dir(model_path, hqq_cache_profile)} is complete."
+                f"{hqq_attention_cache_dir(model_path, hqq_cache_profile, nbits=hqq_nbits or 4, group_size=hqq_group_size)} is complete."
             )
 
     # Expert buffer bytes per expert (GPU Marlin format)

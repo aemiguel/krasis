@@ -272,6 +272,12 @@ __device__ __forceinline__ float hqq_load_weight(
     if constexpr (NBITS == 4) {
         unsigned char packed = row[col >> 1];
         q = (col & 1) ? (int)(packed >> 4) : (int)(packed & 0x0F);
+    } else if constexpr (NBITS == 6) {
+        int group4 = col >> 2;
+        int offset = col & 3;
+        const unsigned char* tri = row + group4 * 3;
+        unsigned int bits = ((unsigned int)tri[0]) | (((unsigned int)tri[1]) << 8) | (((unsigned int)tri[2]) << 16);
+        q = (bits >> (offset * 6)) & 0x3F;
     } else {
         q = (int)row[col];
     }
@@ -358,6 +364,25 @@ extern "C" __global__ void hqq8_prefill_gemm_bf16_kernel(
     int zeros_row_stride_bytes)
 {
     hqq_quantized_prefill_gemm_bf16_device<8>(
+        out, input, packed, scales, zeros, M, rows, cols, group_size,
+        packed_row_stride_bytes, scales_row_stride_bytes, zeros_row_stride_bytes);
+}
+
+extern "C" __global__ void hqq6_prefill_gemm_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ input,
+    const unsigned char* __restrict__ packed,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    int M,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes)
+{
+    hqq_quantized_prefill_gemm_bf16_device<6>(
         out, input, packed, scales, zeros, M, rows, cols, group_size,
         packed_row_stride_bytes, scales_row_stride_bytes, zeros_row_stride_bytes);
 }
@@ -451,6 +476,7 @@ extern "C" __global__ void hqq_prefill_int8_exception_delta_bf16_kernel(
     const int* __restrict__ output_rows,
     const int* __restrict__ start_cols,
     const int* __restrict__ widths,
+    const float* __restrict__ hqq_base_f32,
     const unsigned char* __restrict__ hqq_packed_w,
     const float* __restrict__ hqq_scales,
     const float* __restrict__ hqq_zeros,
@@ -474,9 +500,6 @@ extern "C" __global__ void hqq_prefill_int8_exception_delta_bf16_kernel(
     int row = output_rows[entry];
     int start_col = start_cols[entry];
     int width = widths[entry];
-    const unsigned char* w_row = hqq_packed_w + (long long)row * packed_row_stride_bytes;
-    const float* s_row = (const float*)((const char*)hqq_scales + (long long)row * scales_row_stride_bytes);
-    const float* z_row = (const float*)((const char*)hqq_zeros + (long long)row * zeros_row_stride_bytes);
     const __nv_bfloat16* x_row = input + (long long)token * cols;
     float exc_scale = exception_scales[entry];
 
@@ -484,15 +507,23 @@ extern "C" __global__ void hqq_prefill_int8_exception_delta_bf16_kernel(
     for (int local = tid; local < width; local += blockDim.x) {
         int col = start_col + local;
         if (col >= cols) continue;
-        int q;
-        if (nbits == 4) {
-            unsigned char packed_byte = w_row[col >> 1];
-            q = (col & 1) ? (int)(packed_byte >> 4) : (int)(packed_byte & 0x0F);
+        float hqq_w;
+        if (hqq_base_f32 != nullptr) {
+            hqq_w = hqq_base_f32[entry * max_width + local];
         } else {
-            q = (int)w_row[col];
+            const unsigned char* w_row = hqq_packed_w + (long long)row * packed_row_stride_bytes;
+            const float* s_row = (const float*)((const char*)hqq_scales + (long long)row * scales_row_stride_bytes);
+            const float* z_row = (const float*)((const char*)hqq_zeros + (long long)row * zeros_row_stride_bytes);
+            int q;
+            if (nbits == 4) {
+                unsigned char packed_byte = w_row[col >> 1];
+                q = (col & 1) ? (int)(packed_byte >> 4) : (int)(packed_byte & 0x0F);
+            } else {
+                q = (int)w_row[col];
+            }
+            int group = hqq_group_idx(col, group_size);
+            hqq_w = ((float)q - z_row[group]) * s_row[group];
         }
-        int group = hqq_group_idx(col, group_size);
-        float hqq_w = ((float)q - z_row[group]) * s_row[group];
         float int8_w = (float)exception_qint8[entry * max_width + local] * exc_scale;
         float x = bf16_to_float(x_row[col]);
         acc += (int8_w - hqq_w) * x;

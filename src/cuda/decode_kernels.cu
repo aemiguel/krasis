@@ -5442,6 +5442,111 @@ extern "C" __global__ void hqq4_decode_gemv_bf16(
     }
 }
 
+__device__ __forceinline__ int hqq6_load_q(const unsigned char* __restrict__ row, int col) {
+    int group4 = col >> 2;
+    int offset = col & 3;
+    const unsigned char* tri = row + group4 * 3;
+    unsigned int bits = ((unsigned int)tri[0]) | (((unsigned int)tri[1]) << 8) | (((unsigned int)tri[2]) << 16);
+    return (bits >> (offset * 6)) & 0x3F;
+}
+
+extern "C" __global__ void hqq6_decode_gemv_f32(
+    const unsigned char* __restrict__ packed_w,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    const unsigned short* __restrict__ input,
+    float* __restrict__ output,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes
+) {
+    extern __shared__ unsigned short s_input[];
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < cols; i += 256) {
+        s_input[i] = input[i];
+    }
+    __syncthreads();
+
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int row = blockIdx.x * 8 + warp_id;
+    if (row >= rows) return;
+
+    const unsigned char* w_row = packed_w + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)zeros + (long long)row * zeros_row_stride_bytes);
+
+    float acc = 0.0f;
+    for (int col = lane; col < cols; col += 32) {
+        int group = (group_size == 128) ? (col >> 7) : (col / group_size);
+        int q = hqq6_load_q(w_row, col);
+        float w = ((float)q - z_row[group]) * s_row[group];
+        float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[col]));
+        acc += w * x;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (lane == 0) {
+        output[row] = acc;
+    }
+}
+
+extern "C" __global__ void hqq6_decode_gemv_bf16(
+    const unsigned char* __restrict__ packed_w,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    const unsigned short* __restrict__ input,
+    unsigned short* __restrict__ output,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes
+) {
+    extern __shared__ unsigned short s_input[];
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < cols; i += 256) {
+        s_input[i] = input[i];
+    }
+    __syncthreads();
+
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int row = blockIdx.x * 8 + warp_id;
+    if (row >= rows) return;
+
+    const unsigned char* w_row = packed_w + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)zeros + (long long)row * zeros_row_stride_bytes);
+
+    float acc = 0.0f;
+    for (int col = lane; col < cols; col += 32) {
+        int group = (group_size == 128) ? (col >> 7) : (col / group_size);
+        int q = hqq6_load_q(w_row, col);
+        float w = ((float)q - z_row[group]) * s_row[group];
+        float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[col]));
+        acc += w * x;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (lane == 0) {
+        __nv_bfloat16 result = __float2bfloat16(acc);
+        output[row] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
 extern "C" __global__ void hqq8_decode_gemv_f32(
     const unsigned char* __restrict__ packed_w,
     const float* __restrict__ scales,

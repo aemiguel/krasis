@@ -187,12 +187,19 @@ class KrasisBenchmark:
             decode_mode = f"pure_cpu decode, {expert_mode} prefill"
 
         kv_format = getattr(qcfg, 'kv_cache_format', None)
-        if kv_format == "polar4":
-            kv_dtype_str = "Polar4"
-        elif kv_format == "bf16":
-            kv_dtype_str = "BF16"
-        else:
-            kv_dtype_str = "FP8 E4M3"
+        kv_labels = {
+            "bf16": "BF16",
+            "fp8_e4m3": "FP8 E4M3",
+            "polar4": "Polar4",
+            "tq4": "TQ4",
+            "k8v4": "k8v4",
+            "k8v6": "k8v6",
+            "k7v4": "k7v4",
+            "k6v6": "k6v6",
+            "k6v4": "k6v4",
+            "k4v4": "k4v4",
+        }
+        kv_dtype_str = kv_labels.get(kv_format, str(kv_format or "unknown"))
         num_gpus_used = getattr(self.model, '_num_gpus', len(self.model.pp_partition))
 
         return {
@@ -843,7 +850,10 @@ class KrasisBenchmark:
         # 9. Final summary
         attn_label = model_info['attention_quant'].upper()
         gpu_label = f"{model_info['num_gpus']} GPU" if model_info['num_gpus'] > 1 else "1 GPU"
-        config_label = f"INT{model_info['gpu_expert_bits']}/{model_info['cpu_expert_bits']} {attn_label} {gpu_label}"
+        config_label = (
+            f"INT{model_info['gpu_expert_bits']}/{model_info['cpu_expert_bits']} "
+            f"{attn_label} KV={model_info['kv_dtype']} {gpu_label}"
+        )
 
         print(f"\n{BOLD}{'─' * 48}")
         print(f"  BENCHMARK COMPLETE")

@@ -90,6 +90,10 @@ ACTIVATION_TARGET_TENSORS = {
     "gqa_input_norm_last": ("fused_qkv", "q_proj", "k_proj", "v_proj"),
     "gqa_o_proj_input_last": ("o_proj",),
 }
+LINEAR_ATTENTION_HQQ_TENSORS = {"in_proj_qkvz", "in_proj_ba", "out_proj"}
+GQA_SPLIT_HQQ_TENSORS = {"q_proj", "k_proj", "v_proj"}
+GQA_DECODE_TENSORS = {"fused_qkv", "o_proj"}
+MLA_HQQ_TENSORS = {"q_a_proj", "q_b_proj", "q_proj", "kv_a_proj_with_mqa", "o_proj"}
 SHARED_ACTIVATION_FIELDS = {
     (0, "la_input_row_for_qkvz_last"),
 }
@@ -378,6 +382,13 @@ def write_json(path: str, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
     os.replace(tmp, path)
+
+
+def evidence_trace_log_path(output_path: str) -> str:
+    base = os.path.basename(output_path)
+    stem, _ = os.path.splitext(base)
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._") or "evidence"
+    return os.path.join(os.path.dirname(output_path), f"{safe_stem}.trace.log")
 
 
 def wait_for_server(port: int, timeout: int) -> None:
@@ -1080,6 +1091,7 @@ def build_sensitivity_candidates(
         expected_num_hidden_layers=expected_layers,
     )
     entries = _manifest_tensor_entries(manifest)
+    tensor_names_by_layer = _manifest_tensor_names_by_layer(entries)
     cache_dir = hqq_attention_cache_dir(model_path, source_profile)
     source_contract_lookup = (
         _source_contract_lookup_from_audit(source_contract_audit_path)
@@ -1276,6 +1288,21 @@ def _evidence_trace_path(evidence_path: str, evidence: Dict[str, Any]) -> str:
     raise RuntimeError(f"Evidence trace path is not readable: {trace_path}")
 
 
+def _ensure_distinct_evidence_traces(
+    *,
+    train_evidence_path: str,
+    train_trace_path: str,
+    heldout_evidence_path: str,
+    heldout_trace_path: str,
+) -> None:
+    if os.path.abspath(train_trace_path) == os.path.abspath(heldout_trace_path):
+        raise RuntimeError(
+            "Train and heldout evidence resolve to the same trace log. "
+            "Evidence trace logs are mutable calibration outputs and must be unique per evidence file: "
+            f"train={train_evidence_path} heldout={heldout_evidence_path} trace={train_trace_path}"
+        )
+
+
 def _activation_fields_by_key(evidence: Dict[str, Any]) -> Dict[Tuple[int, str], Dict[str, Any]]:
     out: Dict[Tuple[int, str], Dict[str, Any]] = {}
     for field in evidence.get("activation_stats", {}).get("fields", []) or []:
@@ -1284,6 +1311,65 @@ def _activation_fields_by_key(evidence: Dict[str, Any]) -> Dict[Tuple[int, str],
             raise RuntimeError(f"Duplicate activation field in evidence: layer={key[0]} tensor={key[1]}")
         out[key] = field
     return out
+
+
+def _manifest_tensor_names_by_layer(entries: Dict[Tuple[int, str], Dict[str, Any]]) -> Dict[int, set[str]]:
+    by_layer: Dict[int, set[str]] = {}
+    for layer_idx, tensor_name in entries:
+        by_layer.setdefault(int(layer_idx), set()).add(str(tensor_name))
+    return by_layer
+
+
+def _int8_exception_runtime_activity(
+    *,
+    layer: int,
+    tensor_name: str,
+    tensor_names_by_layer: Dict[int, set[str]],
+) -> Dict[str, Any]:
+    layer_tensors = tensor_names_by_layer.get(int(layer), set())
+    tensor_name = str(tensor_name)
+    prefill_active = False
+    decode_active = False
+    inactive_reason: Optional[str] = None
+
+    if tensor_name in LINEAR_ATTENTION_HQQ_TENSORS:
+        prefill_active = True
+        decode_active = True
+    elif tensor_name == "fused_qkv":
+        prefill_active = False
+        decode_active = "fused_qkv" in layer_tensors
+    elif tensor_name in GQA_SPLIT_HQQ_TENSORS:
+        prefill_active = True
+        if "fused_qkv" in layer_tensors:
+            decode_active = False
+            inactive_reason = "decode uses fused_qkv for this layer; split q/k/v sidecars are prefill-only"
+        else:
+            decode_active = True
+    elif tensor_name == "o_proj":
+        prefill_active = True
+        decode_active = True
+    elif tensor_name in MLA_HQQ_TENSORS:
+        prefill_active = True
+        decode_active = True
+    else:
+        inactive_reason = "tensor is not mapped to an active HQQ prefill/decode sidecar surface"
+
+    if prefill_active and decode_active:
+        surface = "both"
+    elif decode_active:
+        surface = "decode_only"
+    elif prefill_active:
+        surface = "prefill_only"
+    else:
+        surface = "inactive"
+
+    return {
+        "prefill_active": bool(prefill_active),
+        "decode_active": bool(decode_active),
+        "active": bool(prefill_active or decode_active),
+        "surface": surface,
+        "inactive_reason": inactive_reason,
+    }
 
 
 def _safe_ratio(numer: float, denom: float) -> float:
@@ -1330,6 +1416,10 @@ def _write_int8_exception_candidates_tsv(path: str, rows: List[Dict[str, Any]]) 
         "heldout_hqq_rms",
         "heldout_int8_rms",
         "int8_total_bytes",
+        "runtime_total_bytes",
+        "runtime_surface",
+        "decode_active",
+        "prefill_active",
         "candidate_ready",
     ]
     with open(path, "w", encoding="utf-8") as f:
@@ -1353,6 +1443,10 @@ def _write_int8_exception_candidates_tsv(path: str, rows: List[Dict[str, Any]]) 
                         f"{float(row['projection']['heldout']['hqq']['rms']):.10g}",
                         f"{float(row['projection']['heldout']['int8_exception']['rms']):.10g}",
                         str(row["cost"]["int8_total_bytes"]),
+                        str(row["cost"].get("runtime_total_bytes", "")),
+                        str(row.get("runtime_activity", {}).get("surface", "")),
+                        str(bool(row.get("runtime_activity", {}).get("decode_active", False))).lower(),
+                        str(bool(row.get("runtime_activity", {}).get("prefill_active", False))).lower(),
                         str(bool(row["candidate_ready"])).lower(),
                     ]
                 )
@@ -1412,6 +1506,7 @@ def build_int8_exception_candidates(
         expected_num_hidden_layers=int(manifest_probe.get("num_hidden_layers", 0)),
     )
     entries = _manifest_tensor_entries(manifest)
+    tensor_names_by_layer = _manifest_tensor_names_by_layer(entries)
     cache_dir = hqq_attention_cache_dir(model_path, source_profile)
     source_contract_lookup = _source_contract_lookup_from_audit(source_contract_audit_path)
     source_contract_validations: Dict[Tuple[int, str], Dict[str, Any]] = {}
@@ -1419,6 +1514,12 @@ def build_int8_exception_candidates(
 
     train_trace_path = _evidence_trace_path(train_evidence_path, train_evidence)
     heldout_trace_path = _evidence_trace_path(heldout_evidence_path, heldout_evidence)
+    _ensure_distinct_evidence_traces(
+        train_evidence_path=train_evidence_path,
+        train_trace_path=train_trace_path,
+        heldout_evidence_path=heldout_evidence_path,
+        heldout_trace_path=heldout_trace_path,
+    )
     train_fields = _activation_fields_by_key(train_evidence)
     heldout_fields = _activation_fields_by_key(heldout_evidence)
 
@@ -1547,6 +1648,11 @@ def build_int8_exception_candidates(
                         and float(int8_weight_error["rms"]) < float(hqq_weight_error["rms"])
                     )
                     q_extreme = int(((q_int8 == -127) | (q_int8 == 127)).sum().item())
+                    runtime_activity = _int8_exception_runtime_activity(
+                        layer=layer,
+                        tensor_name=tensor_name,
+                        tensor_names_by_layer=tensor_names_by_layer,
+                    )
                     candidates.append(
                         {
                             "layer": layer,
@@ -1567,6 +1673,7 @@ def build_int8_exception_candidates(
                             "risk_score": risk_score,
                             "benefit_score": benefit_score,
                             "candidate_ready": candidate_ready,
+                            "runtime_activity": runtime_activity,
                             "not_runtime_ready_reason": (
                                 "Candidate report only. Use --write-int8-exception-manifest to create an explicit "
                                 "opt-in runtime manifest; no default enablement is allowed."
@@ -1619,11 +1726,18 @@ def build_int8_exception_candidates(
                             "cost": {
                                 "int8_weight_bytes": int(source_group.numel()),
                                 "int8_scale_bytes": int(int8_scales.numel()) * 4,
+                                "runtime_base_f32_bytes": int(source_group.numel()) * 4,
                                 "metadata_bytes_estimate": int(source_group.shape[0]) * 4 * 4,
                                 "int8_total_bytes": (
                                     int(source_group.numel())
                                     + int(int8_scales.numel()) * 4
                                     + int(source_group.shape[0]) * 4 * 4
+                                ),
+                                "runtime_total_bytes": (
+                                    int(source_group.numel())
+                                    + int(int8_scales.numel()) * 4
+                                    + int(source_group.shape[0]) * 4 * 4
+                                    + int(source_group.numel()) * 4
                                 ),
                                 "prefill_extra_fma_estimate": int(source_group.numel()),
                             },
@@ -1656,6 +1770,11 @@ def build_int8_exception_candidates(
     )
     selected = candidates[:top_candidates]
     total_exception_bytes = sum(int(item["cost"]["int8_total_bytes"]) for item in selected)
+    total_runtime_sidecar_bytes = sum(int(item["cost"]["runtime_total_bytes"]) for item in selected)
+    runtime_surface_counts: Dict[str, int] = {}
+    for item in candidates:
+        surface = str(item.get("runtime_activity", {}).get("surface", "missing"))
+        runtime_surface_counts[surface] = runtime_surface_counts.get(surface, 0) + 1
     payload = {
         "format": INT8_EXCEPTION_CANDIDATES_FORMAT,
         "format_version": INT8_EXCEPTION_CANDIDATES_FORMAT_VERSION,
@@ -1702,6 +1821,8 @@ def build_int8_exception_candidates(
             "candidate_ready_count": sum(1 for item in candidates if item.get("candidate_ready")),
             "top_candidate_count": len(selected),
             "top_candidate_total_exception_bytes": total_exception_bytes,
+            "top_candidate_runtime_sidecar_bytes": total_runtime_sidecar_bytes,
+            "runtime_surface_counts": runtime_surface_counts,
             "skipped_count": len(skipped),
             "source_contract": _source_contract_summary(source_contract_validations.values()),
         },
@@ -1749,19 +1870,136 @@ def _int8_exception_candidate_key(candidate: Dict[str, Any]) -> Tuple[int, str, 
     return (int(candidate["layer"]), str(candidate["target_tensor"]), int(candidate["group"]))
 
 
+def _int8_exception_candidate_cost(candidate: Dict[str, Any]) -> int:
+    try:
+        cost = int(candidate["cost"]["runtime_total_bytes"])
+    except Exception as exc:
+        raise RuntimeError(f"INT8 exception candidate lacks cost.runtime_total_bytes: {candidate}") from exc
+    if cost <= 0:
+        raise RuntimeError(f"INT8 exception candidate has non-positive runtime sidecar cost: {candidate}")
+    return cost
+
+
+def _int8_exception_candidate_activity(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    activity = candidate.get("runtime_activity")
+    if not isinstance(activity, dict):
+        raise RuntimeError(
+            "INT8 exception candidate lacks runtime_activity metadata; "
+            "rebuild the candidate report with the current hqq-self-calibrate."
+        )
+    surface = str(activity.get("surface") or "")
+    if surface not in {"both", "decode_only", "prefill_only", "inactive"}:
+        raise RuntimeError(f"INT8 exception candidate has invalid runtime_activity surface: {activity}")
+    return activity
+
+
+def _int8_exception_candidate_is_active(candidate: Dict[str, Any]) -> bool:
+    return bool(_int8_exception_candidate_activity(candidate).get("active"))
+
+
+def _int8_exception_candidate_decode_active(candidate: Dict[str, Any]) -> bool:
+    return bool(_int8_exception_candidate_activity(candidate).get("decode_active"))
+
+
+def _int8_exception_candidate_prefill_only(candidate: Dict[str, Any]) -> bool:
+    activity = _int8_exception_candidate_activity(candidate)
+    return bool(activity.get("prefill_active")) and not bool(activity.get("decode_active"))
+
+
+def _int8_exception_selection_score(candidate: Dict[str, Any]) -> Tuple[float, float, float]:
+    cost = _int8_exception_candidate_cost(candidate)
+    benefit = float(candidate.get("benefit_score", 0.0))
+    risk = float(candidate.get("risk_score", 0.0))
+    return (benefit / float(cost), benefit, risk)
+
+
+def _validate_int8_exception_ratio(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    ratio = float(value)
+    if not math.isfinite(ratio) or ratio <= 0.0:
+        raise ValueError("--int8-exception-max-sidecar-ratio must be finite and > 0")
+    return ratio
+
+
+def _validate_int8_exception_byte_cap(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    cap = int(value)
+    if cap <= 0:
+        raise ValueError("--int8-exception-max-sidecar-bytes must be positive")
+    return cap
+
+
+def _hqq_manifest_tensor_bytes(manifest: Dict[str, Any]) -> int:
+    totals = manifest.get("totals")
+    if isinstance(totals, dict):
+        for key in ("tensor_bytes", "total_cache_bytes", "cache_total_bytes", "total_bytes"):
+            raw = totals.get(key)
+            if raw is None:
+                continue
+            value = int(raw)
+            if value > 0:
+                return value
+    for key in ("total_cache_bytes", "cache_total_bytes", "total_bytes"):
+        raw = manifest.get(key)
+        if raw is None:
+            continue
+        value = int(raw)
+        if value > 0:
+            return value
+    return 0
+
+
+def _int8_exception_budget_bytes(
+    *,
+    source_hqq_bytes: int,
+    max_sidecar_ratio: Optional[float],
+    max_sidecar_bytes: Optional[int],
+) -> Optional[int]:
+    ratio = _validate_int8_exception_ratio(max_sidecar_ratio)
+    byte_cap = _validate_int8_exception_byte_cap(max_sidecar_bytes)
+    budget: Optional[int] = byte_cap
+    if ratio is not None:
+        if source_hqq_bytes <= 0:
+            raise RuntimeError(
+                "--int8-exception-max-sidecar-ratio requires positive source HQQ tensor bytes "
+                "in the HQQ manifest totals"
+            )
+        ratio_budget = int(math.floor(float(source_hqq_bytes) * ratio))
+        if ratio_budget <= 0:
+            raise RuntimeError(
+                "--int8-exception-max-sidecar-ratio produced a zero-byte sidecar budget; "
+                "increase the ratio or check HQQ manifest totals"
+            )
+        budget = ratio_budget if budget is None else min(budget, ratio_budget)
+    return budget
+
+
 def _select_int8_exception_candidates(
     candidate_report: Dict[str, Any],
     *,
     requested_groups: Optional[set[Tuple[int, str, int]]],
     top_groups: Optional[int],
+    max_sidecar_bytes: Optional[int],
+    max_decode_sidecar_bytes: Optional[int] = None,
+    max_prefill_sidecar_bytes: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    if requested_groups is None and top_groups is None:
+    if (
+        requested_groups is None
+        and top_groups is None
+        and max_sidecar_bytes is None
+        and max_decode_sidecar_bytes is None
+        and max_prefill_sidecar_bytes is None
+    ):
         raise RuntimeError(
             "--write-int8-exception-manifest requires either --int8-exception-groups or "
-            "--int8-exception-top-groups. Implicit single-group writes are not allowed."
+            "--int8-exception-top-groups or an explicit sidecar byte/ratio cap. "
+            "Implicit single-group writes are not allowed."
         )
     if top_groups is not None and top_groups <= 0:
         raise ValueError("--int8-exception-top-groups must be positive")
+    max_sidecar_bytes = _validate_int8_exception_byte_cap(max_sidecar_bytes)
 
     all_candidates = candidate_report.get("candidates")
     if not isinstance(all_candidates, list) or not all_candidates:
@@ -1775,6 +2013,8 @@ def _select_int8_exception_candidates(
         if key in seen:
             raise RuntimeError(f"Duplicate INT8 exception candidate key in report: {key}")
         seen.add(key)
+        if not _int8_exception_candidate_is_active(item):
+            continue
         deduped.append(item)
 
     if requested_groups is not None:
@@ -1783,9 +2023,71 @@ def _select_int8_exception_candidates(
         if missing:
             missing_s = ", ".join(f"{layer}:{tensor}:{group}" for layer, tensor, group in missing)
             raise RuntimeError(f"Requested INT8 exception groups are absent or not candidate_ready: {missing_s}")
-        return [by_key[key] for key in sorted(requested_groups)]
+        selected = [by_key[key] for key in sorted(requested_groups)]
+        if max_sidecar_bytes is not None:
+            selected_bytes = sum(_int8_exception_candidate_cost(item) for item in selected)
+            if selected_bytes > max_sidecar_bytes:
+                raise RuntimeError(
+                    "Requested INT8 exception groups exceed sidecar byte budget: "
+                    f"{selected_bytes} > {max_sidecar_bytes}"
+                )
+        return selected
 
-    return deduped[: int(top_groups)]
+    max_decode_sidecar_bytes = _validate_int8_exception_byte_cap(max_decode_sidecar_bytes)
+    max_prefill_sidecar_bytes = _validate_int8_exception_byte_cap(max_prefill_sidecar_bytes)
+    if max_decode_sidecar_bytes is not None or max_prefill_sidecar_bytes is not None:
+        decode_budget = max_decode_sidecar_bytes if max_decode_sidecar_bytes is not None else 0
+        prefill_budget = max_prefill_sidecar_bytes if max_prefill_sidecar_bytes is not None else 0
+        selected = []
+        selected_keys: set[Tuple[int, str, int]] = set()
+        selected_total_bytes = 0
+
+        def add_ranked(bucket: List[Dict[str, Any]], bucket_budget: int) -> int:
+            nonlocal selected_total_bytes
+            used = 0
+            for candidate in bucket:
+                if top_groups is not None and len(selected) >= int(top_groups):
+                    break
+                key = _int8_exception_candidate_key(candidate)
+                if key in selected_keys:
+                    continue
+                cost = _int8_exception_candidate_cost(candidate)
+                if used + cost > bucket_budget:
+                    continue
+                if max_sidecar_bytes is not None and selected_total_bytes + cost > max_sidecar_bytes:
+                    continue
+                selected.append(candidate)
+                selected_keys.add(key)
+                used += cost
+                selected_total_bytes += cost
+            return used
+
+        ranked_decode = sorted(
+            [item for item in deduped if _int8_exception_candidate_decode_active(item)],
+            key=_int8_exception_selection_score,
+            reverse=True,
+        )
+        ranked_prefill_only = sorted(
+            [item for item in deduped if _int8_exception_candidate_prefill_only(item)],
+            key=_int8_exception_selection_score,
+            reverse=True,
+        )
+        add_ranked(ranked_decode, decode_budget)
+        add_ranked(ranked_prefill_only, prefill_budget)
+        return selected
+
+    ranked = sorted(deduped, key=_int8_exception_selection_score, reverse=True)
+    selected = []
+    selected_bytes = 0
+    for candidate in ranked:
+        if top_groups is not None and len(selected) >= int(top_groups):
+            break
+        cost = _int8_exception_candidate_cost(candidate)
+        if max_sidecar_bytes is not None and selected_bytes + cost > max_sidecar_bytes:
+            continue
+        selected.append(candidate)
+        selected_bytes += cost
+    return selected
 
 
 def _int8_exception_artifact_file(layer: int, tensor_name: str, variant_name: str) -> str:
@@ -1802,6 +2104,12 @@ def write_int8_exception_manifest(
     variant_name: str,
     int8_exception_groups: Optional[str],
     int8_exception_top_groups: Optional[int],
+    int8_exception_max_sidecar_ratio: Optional[float],
+    int8_exception_max_sidecar_bytes: Optional[int],
+    int8_exception_decode_sidecar_ratio: Optional[float],
+    int8_exception_decode_sidecar_bytes: Optional[int],
+    int8_exception_prefill_sidecar_ratio: Optional[float],
+    int8_exception_prefill_sidecar_bytes: Optional[int],
 ) -> Dict[str, Any]:
     with open(candidates_path, encoding="utf-8") as f:
         candidate_report = json.load(f)
@@ -1832,15 +2140,35 @@ def write_int8_exception_manifest(
     source_manifest_path = hqq_attention_manifest_path(model_path, str(source_profile))
     source_cache_dir = hqq_attention_cache_dir(model_path, str(source_profile))
     entries = _manifest_tensor_entries(source_manifest)
+    source_hqq_bytes = _hqq_manifest_tensor_bytes(source_manifest)
+    budget_bytes = _int8_exception_budget_bytes(
+        source_hqq_bytes=source_hqq_bytes,
+        max_sidecar_ratio=int8_exception_max_sidecar_ratio,
+        max_sidecar_bytes=int8_exception_max_sidecar_bytes,
+    )
+    decode_budget_bytes = _int8_exception_budget_bytes(
+        source_hqq_bytes=source_hqq_bytes,
+        max_sidecar_ratio=int8_exception_decode_sidecar_ratio,
+        max_sidecar_bytes=int8_exception_decode_sidecar_bytes,
+    )
+    prefill_budget_bytes = _int8_exception_budget_bytes(
+        source_hqq_bytes=source_hqq_bytes,
+        max_sidecar_ratio=int8_exception_prefill_sidecar_ratio,
+        max_sidecar_bytes=int8_exception_prefill_sidecar_bytes,
+    )
 
     requested_groups = _parse_int8_exception_groups(int8_exception_groups)
     candidates = _select_int8_exception_candidates(
         candidate_report,
         requested_groups=requested_groups,
         top_groups=int8_exception_top_groups,
+        max_sidecar_bytes=budget_bytes,
+        max_decode_sidecar_bytes=decode_budget_bytes,
+        max_prefill_sidecar_bytes=prefill_budget_bytes,
     )
     if not candidates:
-        raise RuntimeError("No INT8 exception candidates selected for manifest write")
+        raise RuntimeError("No INT8 exception candidates selected for manifest write under the requested limits")
+    selected_runtime_sidecar_bytes = sum(_int8_exception_candidate_cost(item) for item in candidates)
 
     target_sidecar_dir = sidecar_variant_dir(
         model_path,
@@ -2049,11 +2377,11 @@ def write_int8_exception_manifest(
         "model_path": model_path,
         "variant_name": variant_name,
         "sidecar_mode": "int8_exception",
-        "exception_semantics": "replace selected HQQ-dequantized BF16 blocks with per-output-row symmetric INT8 dequantized source values before existing prefill matmul",
+        "exception_semantics": "replace selected HQQ-dequantized blocks with per-output-row symmetric INT8 dequantized source values on active prefill/decode sidecar surfaces",
         "main_int4_path": "unchanged regular HQQ INT4",
         "runtime_application_implemented": True,
         "runtime_ready": True,
-        "decode_application_implemented": False,
+        "decode_application_implemented": True,
         "source": {
             "cache_profile": source_profile,
             "baseline_manifest_path": source_manifest_path,
@@ -2073,7 +2401,28 @@ def write_int8_exception_manifest(
             "sidecar_weight_bytes": total_weight_bytes,
             "sidecar_metadata_bytes": total_metadata_bytes,
             "sidecar_total_bytes": total_weight_bytes + total_metadata_bytes,
+            "runtime_sidecar_total_bytes_estimate": selected_runtime_sidecar_bytes,
+            "source_hqq_tensor_bytes": source_hqq_bytes,
+            "sidecar_ratio_to_source_hqq": _safe_ratio(
+                float(total_weight_bytes + total_metadata_bytes),
+                float(source_hqq_bytes),
+            )
+            if source_hqq_bytes > 0
+            else None,
+            "runtime_sidecar_ratio_to_source_hqq": _safe_ratio(
+                float(selected_runtime_sidecar_bytes),
+                float(source_hqq_bytes),
+            )
+            if source_hqq_bytes > 0
+            else None,
             "decode_fma_per_token": total_fmas,
+            "selected_runtime_sidecar_bytes": selected_runtime_sidecar_bytes,
+            "selected_decode_attached_groups": sum(
+                1 for item in candidates if _int8_exception_candidate_decode_active(item)
+            ),
+            "selected_prefill_only_groups": sum(
+                1 for item in candidates if _int8_exception_candidate_prefill_only(item)
+            ),
             "source_contract": _source_contract_summary(validations.values()),
         },
         "selection": {
@@ -2083,6 +2432,21 @@ def write_int8_exception_manifest(
             ],
             "group_filter": _int8_exception_group_filter_to_list(requested_groups),
             "top_groups": int8_exception_top_groups,
+            "max_sidecar_ratio": int8_exception_max_sidecar_ratio,
+            "max_sidecar_bytes": int8_exception_max_sidecar_bytes,
+            "decode_sidecar_ratio": int8_exception_decode_sidecar_ratio,
+            "decode_sidecar_bytes": int8_exception_decode_sidecar_bytes,
+            "prefill_sidecar_ratio": int8_exception_prefill_sidecar_ratio,
+            "prefill_sidecar_bytes": int8_exception_prefill_sidecar_bytes,
+            "effective_sidecar_budget_bytes": budget_bytes,
+            "effective_decode_sidecar_budget_bytes": decode_budget_bytes,
+            "effective_prefill_sidecar_budget_bytes": prefill_budget_bytes,
+            "selection_score": "benefit_score_per_sidecar_byte_then_benefit_then_risk",
+            "candidate_ready_count": sum(
+                1
+                for item in (candidate_report.get("candidates") or candidate_report.get("top_candidates") or [])
+                if item.get("candidate_ready")
+            ),
         },
         "artifacts": artifact_summaries,
         "switchability": {
@@ -4679,6 +5043,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             variant_name=args.variant_name,
             int8_exception_groups=args.int8_exception_groups,
             int8_exception_top_groups=args.int8_exception_top_groups,
+            int8_exception_max_sidecar_ratio=args.int8_exception_max_sidecar_ratio,
+            int8_exception_max_sidecar_bytes=args.int8_exception_max_sidecar_bytes,
+            int8_exception_decode_sidecar_ratio=args.int8_exception_decode_sidecar_ratio,
+            int8_exception_decode_sidecar_bytes=args.int8_exception_decode_sidecar_bytes,
+            int8_exception_prefill_sidecar_ratio=args.int8_exception_prefill_sidecar_ratio,
+            int8_exception_prefill_sidecar_bytes=args.int8_exception_prefill_sidecar_bytes,
         )
     if args.write_sidecar_contract_manifest:
         output_path = args.output or sidecar_write_default_path(model_path, target_profile)
@@ -4736,7 +5106,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 "trace_log_source": "provided",
             }
         else:
-            server_log_path = os.path.join(os.path.dirname(output_path), "server_trace.log")
+            server_log_path = evidence_trace_log_path(output_path)
             run_info = run_calibration_requests(
                 config_path=args.config,
                 cfg=cfg,
@@ -4754,6 +5124,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             )
             trace_path = server_log_path
         activation_stats = parse_trace_activation_stats(trace_path)
+        if os.path.isfile(trace_path):
+            activation_stats["trace_sha256"] = _file_sha256(trace_path)
 
     payload = build_evidence_payload(
         config_path=args.config,
@@ -4857,8 +5229,56 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help=(
             "Write the first N ready groups from --write-int8-exception-manifest when no explicit group list "
-            "is supplied. One of --int8-exception-groups or --int8-exception-top-groups is required."
+            "is supplied. Use this with optional sidecar byte/ratio caps for HQQ4SC budget ladders."
         ),
+    )
+    parser.add_argument(
+        "--int8-exception-max-sidecar-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Limit --write-int8-exception-manifest runtime sidecar bytes to this fraction of the "
+            "source HQQ4 attention cache tensor bytes, e.g. 0.10 for a +10%% HQQ4SC memory budget."
+        ),
+    )
+    parser.add_argument(
+        "--int8-exception-max-sidecar-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Hard runtime-sidecar byte cap for --write-int8-exception-manifest. When combined with "
+            "--int8-exception-max-sidecar-ratio, the lower cap wins."
+        ),
+    )
+    parser.add_argument(
+        "--int8-exception-decode-sidecar-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Runtime-sidecar byte budget for decode-attached INT8 exception candidates as a fraction "
+            "of source HQQ4 attention cache tensor bytes."
+        ),
+    )
+    parser.add_argument(
+        "--int8-exception-decode-sidecar-bytes",
+        type=int,
+        default=None,
+        help="Hard runtime-sidecar byte cap for decode-attached INT8 exception candidates.",
+    )
+    parser.add_argument(
+        "--int8-exception-prefill-sidecar-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Runtime-sidecar byte budget for prefill-only INT8 exception candidates as a fraction "
+            "of source HQQ4 attention cache tensor bytes."
+        ),
+    )
+    parser.add_argument(
+        "--int8-exception-prefill-sidecar-bytes",
+        type=int,
+        default=None,
+        help="Hard runtime-sidecar byte cap for prefill-only INT8 exception candidates.",
     )
     parser.add_argument(
         "--source-contract-audit",

@@ -674,6 +674,8 @@ const KERNEL_NAMES: &[&str] = &[
     "simple_int4_gemv_bf16",
     "hqq4_decode_gemv_f32",
     "hqq4_decode_gemv_bf16",
+    "hqq6_decode_gemv_f32",
+    "hqq6_decode_gemv_bf16",
     "hqq8_decode_gemv_f32",
     "hqq8_decode_gemv_bf16",
     "hqq_decode_int8_exception_delta_f32",
@@ -1873,6 +1875,8 @@ struct HqqPrefillSidecarRegistration {
     correction_bytes: usize,
     scales_ptr: u64,
     scales_bytes: usize,
+    base_f32_ptr: u64,
+    base_f32_bytes: usize,
     output_rows_ptr: u64,
     output_rows_bytes: usize,
     groups_ptr: u64,
@@ -2189,6 +2193,8 @@ fn hqq_tensor_exec_json(desc: &HqqTensorExecDescriptor, tensor_name: &str) -> se
         "logical_rows": desc.logical_rows,
         "gated_split_interleaved": desc.gated_split_interleaved,
         "kernel_ready": desc.kernel_ready,
+        "decode_sidecar_count": desc.decode_sidecars.len(),
+        "decode_sidecar_row_groups": desc.decode_sidecars.iter().map(|sidecar| sidecar.row_group_count).sum::<usize>(),
     })
 }
 
@@ -2518,6 +2524,8 @@ fn hqq_expected_layout(nbits: u8, stage: &str) -> Result<&'static str, String> {
     match (nbits, stage) {
         (4, "prefill") => Ok("row_major_axis1_grouped_uint4_packed"),
         (4, "decode") => Ok("row_aligned_grouped_uint4_decode_v1"),
+        (6, "prefill") => Ok("row_major_axis1_grouped_uint6_packed"),
+        (6, "decode") => Ok("row_aligned_grouped_uint6_decode_v1"),
         (8, "prefill") => Ok("row_major_axis1_grouped_uint8"),
         (8, "decode") => Ok("row_aligned_grouped_uint8_decode_v1"),
         _ => Err(format!("Unsupported HQQ nbits={} stage={}", nbits, stage)),
@@ -2609,6 +2617,8 @@ fn validate_hqq_tensor_desc_for_layout(
 fn hqq_nbits_from_desc(desc: &HqqTensorExecDescriptor) -> Result<u8, String> {
     if desc.layout.contains("uint4") {
         Ok(4)
+    } else if desc.layout.contains("uint6") {
+        Ok(6)
     } else if desc.layout.contains("uint8") || desc.layout.contains("int8") {
         Ok(8)
     } else {
@@ -2859,9 +2869,9 @@ fn register_hqq_attention_layer_common(
     metadata: HqqLayerMetadata,
     tensors: HashMap<String, HqqTensorRegistration>,
 ) -> PyResult<()> {
-    if nbits != 4 && nbits != 8 {
+    if nbits != 4 && nbits != 6 && nbits != 8 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Native HQQ registration only accepts nbits=4 or nbits=8 today, got {}",
+            "Native HQQ registration only accepts nbits=4, nbits=6, or nbits=8 today, got {}",
             nbits
         )));
     }
@@ -4072,6 +4082,7 @@ enum HqqRuntimeFormatKind {
     PrefillMarlinU8FloatZpInterceptV1,
     PrefillMarlinU8FloatZpTwoScaleV1,
     PrefillMarlinU8FloatZpTwoScaleInterceptV1,
+    PrefillMarlinU4FloatZpTwoScaleInterceptV1,
     DecodeRowAlignedV1,
 }
 
@@ -4085,6 +4096,7 @@ impl HqqRuntimeFormatKind {
             Self::PrefillMarlinU8FloatZpInterceptV1 => "prefill_marlin_u8_float_zp_intercept_v1",
             Self::PrefillMarlinU8FloatZpTwoScaleV1 => "prefill_marlin_u8_float_zp_twoscale_v1",
             Self::PrefillMarlinU8FloatZpTwoScaleInterceptV1 => "prefill_marlin_u8_float_zp_twoscale_intercept_v1",
+            Self::PrefillMarlinU4FloatZpTwoScaleInterceptV1 => "prefill_marlin_u4_float_zp_twoscale_intercept_v1",
             Self::DecodeRowAlignedV1 => "decode_row_aligned_v1",
         }
     }
@@ -4675,12 +4687,17 @@ impl GpuDecodeStore {
         nbits: usize,
     ) -> Result<HqqRuntimeFormatDescriptor, String> {
         let t0 = std::time::Instant::now();
-        if nbits != 4 && nbits != 8 {
+        if nbits != 4 && nbits != 6 && nbits != 8 {
             return Err(format!("Unsupported HQQ prefill nbits={}", nbits));
         }
         let groups = cols.div_ceil(group_size);
         let padded_cols = groups * group_size;
-        let packed_cols = if nbits == 4 { padded_cols.div_ceil(2) } else { padded_cols };
+        let packed_cols = match nbits {
+            4 => padded_cols.div_ceil(2),
+            6 => padded_cols.div_ceil(4) * 3,
+            8 => padded_cols,
+            _ => unreachable!(),
+        };
         let canonical_packed_bytes = rows * packed_cols;
         if packed_host.len() != canonical_packed_bytes {
             return Err(format!(
@@ -4690,6 +4707,68 @@ impl GpuDecodeStore {
                 rows,
                 packed_cols,
             ));
+        }
+        if nbits == 4 {
+            if cols % 16 != 0 || rows % 64 != 0 || cols % group_size != 0 {
+                return Err(format!(
+                    "HQQ4 fast prefill requires Marlin-compatible shape (rows%64==0, cols%16==0, cols%group_size==0), got rows={} cols={} group_size={}",
+                    rows, cols, group_size,
+                ));
+            }
+            let hqq4_mode = std::env::var("KRASIS_HQQ4_PREFILL_MODE")
+                .unwrap_or_else(|_| "native-fused-marlin-twoscale-intercept".to_string());
+            if hqq4_mode != "native-fused-marlin-twoscale-intercept" {
+                return Err(format!(
+                    "Unsupported KRASIS_HQQ4_PREFILL_MODE='{}' (expected native-fused-marlin-twoscale-intercept)",
+                    hqq4_mode
+                ));
+            }
+            let groups_exact = cols / group_size;
+            let scales = Self::decode_host_f32("scales", scales_host, rows * groups_exact)?;
+            let zeros = Self::decode_host_f32("zeros", zeros_host, rows * groups_exact)?;
+            let packed = crate::weights::marlin::marlin_repack_hqq4_native_zp_prefill(
+                packed_host,
+                &scales,
+                &zeros,
+                rows,
+                cols,
+                group_size,
+            );
+            let packed_host: Vec<u8> = packed
+                .marlin
+                .packed
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            let mut scales_host = Self::encode_host_u16(&packed.marlin.scales);
+            scales_host.extend_from_slice(&Self::encode_host_u16(&packed.delta_scales));
+            let mut zeros_host = Self::encode_host_u16(&packed.zeros);
+            zeros_host.extend_from_slice(&Self::encode_host_f32(
+                &packed.twoscale_intercept_correction,
+            ));
+            return Ok(HqqRuntimeFormatDescriptor {
+                stage: "prefill",
+                kind: HqqRuntimeFormatKind::PrefillMarlinU4FloatZpTwoScaleInterceptV1,
+                layout: "marlin_u4_float_zp_twoscale_intercept_axis1_grouped_uint4".to_string(),
+                packed_dtype: "uint32".to_string(),
+                scales_dtype: "bfloat16_base_delta".to_string(),
+                zeros_dtype: "bfloat16_plus_float32_twoscale_intercept_correction".to_string(),
+                packed_host,
+                scales_host,
+                zeros_host,
+                packed_component_bytes: rows * cols / 2,
+                scales_component_bytes: 2 * groups_exact * std::mem::size_of::<u16>(),
+                zeros_component_bytes: groups_exact
+                    * (std::mem::size_of::<u16>() + std::mem::size_of::<f32>()),
+                row_blocks: rows,
+                rows_per_tile: 16,
+                packed_row_stride_bytes: rows * 2,
+                scales_row_stride_bytes: 2 * groups_exact * std::mem::size_of::<u16>(),
+                zeros_row_stride_bytes: groups_exact
+                    * (std::mem::size_of::<u16>() + std::mem::size_of::<f32>()),
+                build_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                kernel_ready: true,
+            });
         }
         if nbits == 8 {
             if cols % 16 != 0 || rows % 64 != 0 || cols % group_size != 0 {
@@ -4914,12 +4993,17 @@ impl GpuDecodeStore {
         nbits: usize,
     ) -> Result<HqqRuntimeFormatDescriptor, String> {
         let t0 = std::time::Instant::now();
-        if nbits != 4 && nbits != 8 {
+        if nbits != 4 && nbits != 6 && nbits != 8 {
             return Err(format!("Unsupported HQQ decode nbits={}", nbits));
         }
         let groups = cols.div_ceil(group_size);
         let padded_cols = groups * group_size;
-        let packed_cols = if nbits == 4 { padded_cols.div_ceil(2) } else { padded_cols };
+        let packed_cols = match nbits {
+            4 => padded_cols.div_ceil(2),
+            6 => padded_cols.div_ceil(4) * 3,
+            8 => padded_cols,
+            _ => unreachable!(),
+        };
         let canonical_packed_bytes = rows * packed_cols;
         if packed_host.len() != canonical_packed_bytes {
             return Err(format!(
@@ -5462,6 +5546,55 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    fn launch_hqq6_decode_gemv_f32(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        validate_hqq_tensor_desc_for_layout(
+            tensor_name,
+            desc,
+            6,
+            hqq_expected_layout(6, "decode")?,
+            true,
+        )?;
+        let rows = desc.rows;
+        let cols = desc.cols;
+        let blocks = ((rows + 7) / 8) as u32;
+        let smem = (cols as u32) * 2;
+        let kernel = self
+            .device
+            .get_func(MODULE_NAME, "hqq6_decode_gemv_f32")
+            .ok_or_else(|| "hqq6_decode_gemv_f32 kernel not found".to_string())?;
+        unsafe {
+            kernel
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (blocks, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    },
+                    (
+                        desc.packed_ptr,
+                        desc.scales_ptr,
+                        desc.zeros_ptr,
+                        input_ptr,
+                        output_ptr,
+                        rows as i32,
+                        cols as i32,
+                        desc.group_size as i32,
+                        desc.packed_row_stride_bytes as i32,
+                        desc.scales_row_stride_bytes as i32,
+                        desc.zeros_row_stride_bytes as i32,
+                    ),
+                )
+                .map_err(|e| format!("hqq6_decode_gemv_f32 {tensor_name}: {:?}", e))?;
+        }
+        Ok(())
+    }
+
     fn launch_fp32_to_bf16(
         &self,
         output_ptr: u64,
@@ -5542,6 +5675,7 @@ impl GpuDecodeStore {
         let nbits = hqq_nbits_from_desc(desc)?;
         match nbits {
             4 => self.launch_hqq4_decode_gemv_f32(tensor_name, desc, input_ptr, output_ptr),
+            6 => self.launch_hqq6_decode_gemv_f32(tensor_name, desc, input_ptr, output_ptr),
             8 => self.launch_hqq8_decode_gemv_f32(tensor_name, desc, input_ptr, output_ptr),
             _ => Err(format!("Unsupported HQQ decode nbits={}", nbits)),
         }
@@ -5597,6 +5731,55 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    fn launch_hqq6_decode_gemv_bf16(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        validate_hqq_tensor_desc_for_layout(
+            tensor_name,
+            desc,
+            6,
+            hqq_expected_layout(6, "decode")?,
+            true,
+        )?;
+        let rows = desc.rows;
+        let cols = desc.cols;
+        let blocks = ((rows + 7) / 8) as u32;
+        let smem = (cols as u32) * 2;
+        let kernel = self
+            .device
+            .get_func(MODULE_NAME, "hqq6_decode_gemv_bf16")
+            .ok_or_else(|| "hqq6_decode_gemv_bf16 kernel not found".to_string())?;
+        unsafe {
+            kernel
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (blocks, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    },
+                    (
+                        desc.packed_ptr,
+                        desc.scales_ptr,
+                        desc.zeros_ptr,
+                        input_ptr,
+                        output_ptr,
+                        rows as i32,
+                        cols as i32,
+                        desc.group_size as i32,
+                        desc.packed_row_stride_bytes as i32,
+                        desc.scales_row_stride_bytes as i32,
+                        desc.zeros_row_stride_bytes as i32,
+                    ),
+                )
+                .map_err(|e| format!("hqq6_decode_gemv_bf16 {tensor_name}: {:?}", e))?;
+        }
+        Ok(())
+    }
+
     fn launch_hqq_decode_gemv_bf16(
         &self,
         tensor_name: &str,
@@ -5607,6 +5790,7 @@ impl GpuDecodeStore {
         let nbits = hqq_nbits_from_desc(desc)?;
         match nbits {
             4 => self.launch_hqq4_decode_gemv_bf16(tensor_name, desc, input_ptr, output_ptr),
+            6 => self.launch_hqq6_decode_gemv_bf16(tensor_name, desc, input_ptr, output_ptr),
             8 => self.launch_hqq8_decode_gemv_bf16(tensor_name, desc, input_ptr, output_ptr),
             _ => Err(format!("Unsupported HQQ decode nbits={}", nbits)),
         }
@@ -7291,6 +7475,8 @@ impl GpuDecodeStore {
         start_cols_bytes,
         widths_ptr,
         widths_bytes,
+        base_f32_ptr,
+        base_f32_bytes,
         row_group_count,
         max_width
     ))]
@@ -7313,6 +7499,8 @@ impl GpuDecodeStore {
         start_cols_bytes: usize,
         widths_ptr: usize,
         widths_bytes: usize,
+        base_f32_ptr: usize,
+        base_f32_bytes: usize,
         row_group_count: usize,
         max_width: usize,
     ) -> PyResult<()> {
@@ -7376,12 +7564,44 @@ impl GpuDecodeStore {
                 layer_idx, tensor_name, correction_bytes, min_correction_bytes
             )));
         }
+        let expected_base_bytes = row_group_count * max_width * std::mem::size_of::<f32>();
+        if mode == "int8_exception" {
+            if base_f32_ptr == 0 || base_f32_bytes < expected_base_bytes {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "HQQ INT8-exception sidecar base FP32 payload mismatch for layer {} tensor {}: ptr={:#x} bytes={} expected at least {}",
+                    layer_idx, tensor_name, base_f32_ptr, base_f32_bytes, expected_base_bytes
+                )));
+            }
+        } else if base_f32_ptr != 0 || base_f32_bytes != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "HQQ sidecar mode {} for layer {} tensor {} must not provide base FP32 payload",
+                mode, layer_idx, tensor_name
+            )));
+        }
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         while graph.layers.len() <= layer_idx {
             graph.layers.push(GpuDecodeLayer::placeholder());
         }
-        graph.layers[layer_idx].hqq_prefill_sidecars.push(HqqPrefillSidecarRegistration {
+        let layer = &mut graph.layers[layer_idx];
+        let before_sidecars = layer.hqq_prefill_sidecars.len();
+        layer.hqq_prefill_sidecars.retain(|existing| {
+            !(existing.tensor_name == tensor_name
+                && existing.mode == mode
+                && existing.variant_name == variant_name)
+        });
+        let replaced_sidecars = before_sidecars.saturating_sub(layer.hqq_prefill_sidecars.len());
+        if replaced_sidecars > 0 {
+            log::info!(
+                "HQQ prefill sidecar replaced existing registration: layer={} tensor={} mode={} variant={} replaced={}",
+                layer_idx,
+                tensor_name,
+                mode,
+                variant_name,
+                replaced_sidecars,
+            );
+        }
+        layer.hqq_prefill_sidecars.push(HqqPrefillSidecarRegistration {
             tensor_name: tensor_name.to_string(),
             mode: mode.to_string(),
             variant_name: variant_name.to_string(),
@@ -7389,6 +7609,8 @@ impl GpuDecodeStore {
             correction_bytes,
             scales_ptr: scales_ptr as u64,
             scales_bytes,
+            base_f32_ptr: base_f32_ptr as u64,
+            base_f32_bytes,
             output_rows_ptr: output_rows_ptr as u64,
             output_rows_bytes,
             groups_ptr: groups_ptr as u64,
@@ -7408,7 +7630,7 @@ impl GpuDecodeStore {
             variant_name,
             row_group_count,
             max_width,
-            correction_bytes + scales_bytes + output_rows_bytes + groups_bytes + start_cols_bytes + widths_bytes,
+            correction_bytes + scales_bytes + base_f32_bytes + output_rows_bytes + groups_bytes + start_cols_bytes + widths_bytes,
         );
         Ok(())
     }
@@ -12934,6 +13156,7 @@ impl GpuDecodeStore {
                         variant_name: sidecar.variant_name.clone(),
                         correction_ptr: sidecar.correction_ptr,
                         scales_ptr: sidecar.scales_ptr,
+                        base_f32_ptr: sidecar.base_f32_ptr,
                         output_rows_ptr: sidecar.output_rows_ptr,
                         start_cols_ptr: sidecar.start_cols_ptr,
                         widths_ptr: sidecar.widths_ptr,

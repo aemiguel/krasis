@@ -6,11 +6,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 
-ATTENTION_QUANT_CHOICES = ("bf16", "awq", "hqq4", "hqq8")
+ATTENTION_QUANT_CHOICES = ("bf16", "awq", "hqq4", "hqq46", "hqq46_auto", "hqq6", "hqq68_auto", "hqq8")
 GPU_EXPERT_INT4_CALIB_CHOICES = ("amax", "search_rmse")
 HQQ_CACHE_PROFILE_BASELINE = "baseline"
 HQQ_CACHE_PROFILE_SELFCAL_V1 = "selfcal_v1"
 HQQ_CACHE_PROFILE_CHOICES = (HQQ_CACHE_PROFILE_BASELINE, HQQ_CACHE_PROFILE_SELFCAL_V1)
+HQQ_ATTENTION_GROUP_SIZE_CHOICES = (32, 64, 128)
+HQQ_ATTENTION_DEFAULT_GROUP_SIZE = 128
 
 
 def cache_dir_for_model(model_path: str) -> str:
@@ -236,7 +238,7 @@ class QuantConfig:
     layernorms, gate weight. These are either too quality-critical or too small.
     """
     lm_head: str = "int8"          # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
-    attention: str = "bf16" # "bf16", "awq", "hqq4", or "hqq8" (native HQQ attention; "bf16" is debug-oriented, not an oracle)
+    attention: str = "bf16" # "bf16", "awq", "hqq4", "hqq46", "hqq46_auto", "hqq6", "hqq68_auto", or "hqq8" (native HQQ attention; "bf16" is debug-oriented, not an oracle)
     shared_expert: str = "int8"    # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
     dense_mlp: str = "int8"        # "bf16" or "int8" ("bf16" remains an unvalidated debug path)
     gpu_expert_bits: int = 4       # 4, 8 (Marlin), or 16 (UNVALIDATED BF16 debug-only path; do not use for validation)
@@ -245,6 +247,9 @@ class QuantConfig:
     cpu_expert_bits: int = 4       # 4 or 8 for CPU expert quantization
     kv_cache_format: str = "k6v6"  # Quality default; public modes are "k6v6", "k4v4", and "bf16"
     hqq_cache_profile: str = HQQ_CACHE_PROFILE_BASELINE  # "baseline" or an explicit calibrated HQQ profile
+    hqq_group_size: int = HQQ_ATTENTION_DEFAULT_GROUP_SIZE  # HQQ attention quantization group size
+    hqq_auto_budget_pct: Optional[float] = None  # auto promotion budget as % of base-to-target attention span
+    hqq46_auto_budget_mib: Optional[int] = None  # legacy HQQ4/6 auto promotion budget in MiB
     hqq_sidecar_manifest: Optional[str] = None  # explicit HQQ4-only sidecar manifest for switchable correction
 
     def __post_init__(self):
@@ -273,7 +278,7 @@ class QuantConfig:
         if self.attention in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported attention quant '{self.attention}'. "
-                "Naive int4/int8 attention has been removed; use 'awq', 'hqq4', 'hqq8', or 'bf16'."
+                "Naive int4/int8 attention has been removed; use 'awq', 'hqq4', 'hqq46', 'hqq46_auto', 'hqq6', 'hqq68_auto', 'hqq8', or 'bf16'."
             )
         if self.attention not in ATTENTION_QUANT_CHOICES:
             raise ValueError(
@@ -286,18 +291,81 @@ class QuantConfig:
                 f"Unsupported hqq_cache_profile '{self.hqq_cache_profile}'. "
                 f"Use one of: {', '.join(HQQ_CACHE_PROFILE_CHOICES)}."
             )
+        try:
+            self.hqq_group_size = int(self.hqq_group_size)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"hqq_group_size must be an integer, got {self.hqq_group_size!r}"
+            ) from exc
+        if self.hqq_group_size not in HQQ_ATTENTION_GROUP_SIZE_CHOICES:
+            raise ValueError(
+                f"Unsupported hqq_group_size={self.hqq_group_size}. "
+                "Use 32, 64, or 128."
+            )
         if not self.attention.startswith("hqq") and self.hqq_cache_profile != HQQ_CACHE_PROFILE_BASELINE:
             raise ValueError(
-                f"hqq_cache_profile={self.hqq_cache_profile} requires attention='hqq4' or attention='hqq8'. "
+                f"hqq_cache_profile={self.hqq_cache_profile} requires attention='hqq4', attention='hqq46', attention='hqq46_auto', attention='hqq6', attention='hqq68_auto', or attention='hqq8'. "
                 "Non-HQQ attention backends must use hqq_cache_profile='baseline'."
             )
+        if not self.attention.startswith("hqq") and self.hqq_group_size != HQQ_ATTENTION_DEFAULT_GROUP_SIZE:
+            raise ValueError(
+                f"hqq_group_size={self.hqq_group_size} requires attention='hqq4', attention='hqq46', attention='hqq46_auto', attention='hqq6', attention='hqq68_auto', or attention='hqq8'. "
+                "Non-HQQ attention backends must use the default HQQ group size."
+            )
+        if isinstance(self.hqq_auto_budget_pct, str) and not self.hqq_auto_budget_pct.strip():
+            self.hqq_auto_budget_pct = None
+        if self.hqq_auto_budget_pct is not None:
+            try:
+                self.hqq_auto_budget_pct = float(self.hqq_auto_budget_pct)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"hqq_auto_budget_pct must be a numeric percentage, got {self.hqq_auto_budget_pct!r}"
+                ) from exc
+            if self.hqq_auto_budget_pct <= 0.0 or self.hqq_auto_budget_pct > 100.0:
+                raise ValueError(
+                    f"hqq_auto_budget_pct must satisfy 0 < pct <= 100, got {self.hqq_auto_budget_pct!r}"
+                )
+        if isinstance(self.hqq46_auto_budget_mib, str) and not self.hqq46_auto_budget_mib.strip():
+            self.hqq46_auto_budget_mib = None
+        if self.hqq46_auto_budget_mib is not None:
+            try:
+                self.hqq46_auto_budget_mib = int(self.hqq46_auto_budget_mib)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"hqq46_auto_budget_mib must be an integer MiB budget, got {self.hqq46_auto_budget_mib!r}"
+                ) from exc
+        if self.attention == "hqq46_auto":
+            if self.hqq_auto_budget_pct is None and (
+                self.hqq46_auto_budget_mib is None or self.hqq46_auto_budget_mib <= 0
+            ):
+                raise ValueError(
+                    "attention='hqq46_auto' requires hqq_auto_budget_pct. "
+                    "Legacy hqq46_auto_budget_mib remains accepted only for existing configs."
+                )
+        elif self.attention == "hqq68_auto":
+            if self.hqq_auto_budget_pct is None:
+                raise ValueError(
+                    "attention='hqq68_auto' requires hqq_auto_budget_pct. "
+                    "Auto planner budgets are percentages of the HQQ6-to-HQQ8 promotion span."
+                )
+            if self.hqq46_auto_budget_mib not in (None, 0):
+                raise ValueError("hqq46_auto_budget_mib is not valid with attention='hqq68_auto'.")
+        elif self.hqq46_auto_budget_mib not in (None, 0):
+            raise ValueError("hqq46_auto_budget_mib is only valid with attention='hqq46_auto'.")
+        if self.attention not in ("hqq46_auto", "hqq68_auto") and self.hqq_auto_budget_pct is not None:
+            raise ValueError("hqq_auto_budget_pct is only valid with attention='hqq46_auto' or attention='hqq68_auto'.")
         if self.hqq_sidecar_manifest is not None:
             sidecar_path = str(self.hqq_sidecar_manifest).strip()
             self.hqq_sidecar_manifest = os.path.expanduser(sidecar_path) if sidecar_path else None
         if self.hqq_sidecar_manifest is not None and self.attention != "hqq4":
             raise ValueError(
                 "hqq_sidecar_manifest requires attention='hqq4'. "
-                "HQQ8 is a clean higher-precision attention mode and does not support sidecar/self-correction."
+                "HQQ4/6, HQQ6, HQQ6/8, and HQQ8 are clean higher-precision attention modes and do not support sidecar/self-correction."
+            )
+        if self.hqq_sidecar_manifest is not None and self.hqq_group_size != HQQ_ATTENTION_DEFAULT_GROUP_SIZE:
+            raise ValueError(
+                "hqq_sidecar_manifest currently requires hqq_group_size=128 because sidecar manifests "
+                "are tied to source HQQ group boundaries."
             )
         self.gpu_expert_int4_calib = self.gpu_expert_int4_calib.lower()
         if self.gpu_expert_int4_calib not in GPU_EXPERT_INT4_CALIB_CHOICES:

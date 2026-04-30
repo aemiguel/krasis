@@ -17,6 +17,8 @@ from safetensors.torch import save_file
 import torch
 
 from krasis.config import (
+    HQQ_ATTENTION_DEFAULT_GROUP_SIZE,
+    HQQ_ATTENTION_GROUP_SIZE_CHOICES,
     HQQ_CACHE_PROFILE_BASELINE,
     HQQ_CACHE_PROFILE_CHOICES,
     HQQ_CACHE_PROFILE_SELFCAL_V1,
@@ -30,25 +32,61 @@ from krasis.krasis import (
 )
 
 
-ATTENTION_QUANT_CHOICES = ("bf16", "awq", "hqq4", "hqq8")
+ATTENTION_QUANT_CHOICES = ("bf16", "awq", "hqq4", "hqq46", "hqq46_auto", "hqq6", "hqq68_auto", "hqq8")
 
 HQQ_ATTENTION_CACHE_VERSION = 5
 HQQ_ATTENTION_CACHE_DIRNAME = f"attention_hqq_v{HQQ_ATTENTION_CACHE_VERSION}"
+HQQ46_ATTENTION_CACHE_DIRNAME = f"attention_hqq46_v{HQQ_ATTENTION_CACHE_VERSION}"
+HQQ46_AUTO_ATTENTION_CACHE_DIRNAME = f"attention_hqq46_auto_v{HQQ_ATTENTION_CACHE_VERSION}"
+HQQ6_ATTENTION_CACHE_DIRNAME = f"attention_hqq6_v{HQQ_ATTENTION_CACHE_VERSION}"
+HQQ68_AUTO_ATTENTION_CACHE_DIRNAME = f"attention_hqq68_auto_v{HQQ_ATTENTION_CACHE_VERSION}"
 HQQ8_ATTENTION_CACHE_DIRNAME = f"attention_hqq8_v{HQQ_ATTENTION_CACHE_VERSION}"
-HQQ_ATTENTION_CALIBRATED_CACHE_DIRNAMES = {
-    HQQ_CACHE_PROFILE_SELFCAL_V1: f"{HQQ_ATTENTION_CACHE_DIRNAME}_calib_selfcal_v1",
-}
 HQQ_ATTENTION_MANIFEST = "manifest.json"
 HQQ_ATTENTION_PENDING_MANIFEST = "manifest.build.json"
-HQQ_DEFAULT_GROUP_SIZE = 128
+HQQ_DEFAULT_GROUP_SIZE = HQQ_ATTENTION_DEFAULT_GROUP_SIZE
 HQQ_DEFAULT_AXIS = 1
 HQQ_LAYOUT = "row_major_axis1_grouped_uint4_packed"
+HQQ6_LAYOUT = "row_major_axis1_grouped_uint6_packed"
 HQQ8_LAYOUT = "row_major_axis1_grouped_uint8"
 HQQ_LAYOUT_BY_NBITS = {
     4: HQQ_LAYOUT,
+    6: HQQ6_LAYOUT,
     8: HQQ8_LAYOUT,
 }
-HQQ_ENABLED_NBITS = (4, 8)
+HQQ_ENABLED_NBITS = (4, 6, 8)
+HQQ_STORAGE_NBITS = (4, 6, 8)
+HQQ_MIXED_46_CACHE_NBITS = 46
+HQQ_MIXED_46_AUTO_CACHE_NBITS = 460
+HQQ_MIXED_68_AUTO_CACHE_NBITS = 680
+HQQ_CACHE_NBITS = (
+    4,
+    HQQ_MIXED_46_CACHE_NBITS,
+    HQQ_MIXED_46_AUTO_CACHE_NBITS,
+    6,
+    HQQ_MIXED_68_AUTO_CACHE_NBITS,
+    8,
+)
+HQQ46_LAYOUT = "mixed_hqq4_hqq6_axis1_grouped"
+HQQ68_LAYOUT = "mixed_hqq6_hqq8_axis1_grouped"
+HQQ46_PROMOTION_POLICY = {
+    "name": "output_fused_v1",
+    "description": "HQQ4 base with HQQ6 for fused_qkv, o_proj, and out_proj tensors.",
+    "base_nbits": 4,
+    "promoted_nbits": 6,
+    "promoted_tensors": ("fused_qkv", "o_proj", "out_proj"),
+}
+HQQ46_AUTO_PROMOTION_POLICY = {
+    "name": "weight_error_v1",
+    "description": "HQQ4 base with per-tensor HQQ6 promotions selected by normalized error reduction per byte.",
+    "base_nbits": 4,
+    "promoted_nbits": 6,
+}
+HQQ68_AUTO_PROMOTION_POLICY = {
+    "name": "weight_error_v1",
+    "description": "HQQ6 base with per-tensor HQQ8 promotions selected by normalized error reduction per byte.",
+    "base_nbits": 6,
+    "promoted_nbits": 8,
+}
 HQQ_SIDECAR_MANIFEST_FORMAT = "krasis_hqq_selfcal_sidecar_manifest"
 HQQ_SIDECAR_MANIFEST_FORMAT_VERSION = 1
 HQQ_SIDECAR_MODES = ("int8_symmetric", "exact_bf16", "int8_exception")
@@ -100,6 +138,42 @@ def get_attention_backend_spec(attention_quant: str) -> AttentionBackendSpec:
             runtime_ready=True,
             nbits=8,
         )
+    if attention_quant == "hqq46":
+        return AttentionBackendSpec(
+            quant="hqq46",
+            label="HQQ4/6",
+            quantized=True,
+            requires_template=False,
+            runtime_ready=True,
+            nbits=HQQ_MIXED_46_CACHE_NBITS,
+        )
+    if attention_quant == "hqq46_auto":
+        return AttentionBackendSpec(
+            quant="hqq46_auto",
+            label="HQQ4/6-auto",
+            quantized=True,
+            requires_template=False,
+            runtime_ready=True,
+            nbits=HQQ_MIXED_46_AUTO_CACHE_NBITS,
+        )
+    if attention_quant == "hqq68_auto":
+        return AttentionBackendSpec(
+            quant="hqq68_auto",
+            label="HQQ6/8-auto",
+            quantized=True,
+            requires_template=False,
+            runtime_ready=True,
+            nbits=HQQ_MIXED_68_AUTO_CACHE_NBITS,
+        )
+    if attention_quant == "hqq6":
+        return AttentionBackendSpec(
+            quant="hqq6",
+            label="HQQ6",
+            quantized=True,
+            requires_template=False,
+            runtime_ready=True,
+            nbits=6,
+        )
     raise ValueError(
         f"Unsupported attention quant '{attention_quant}'. "
         f"Use one of: {', '.join(ATTENTION_QUANT_CHOICES)}."
@@ -123,6 +197,12 @@ def is_hqq_attention(attention_quant: str) -> bool:
 
 
 def hqq_backend_name(nbits: int) -> str:
+    if nbits == HQQ_MIXED_46_CACHE_NBITS:
+        return "hqq46"
+    if nbits == HQQ_MIXED_46_AUTO_CACHE_NBITS:
+        return "hqq46_auto"
+    if nbits == HQQ_MIXED_68_AUTO_CACHE_NBITS:
+        return "hqq68_auto"
     return f"hqq{nbits}"
 
 
@@ -132,7 +212,59 @@ def validate_hqq_nbits(nbits: int) -> None:
         raise ValueError(f"Unsupported HQQ nbits={nbits}. Enabled HQQ backends: {enabled}")
 
 
+def validate_hqq_storage_nbits(nbits: int) -> None:
+    if nbits not in HQQ_STORAGE_NBITS:
+        enabled = ", ".join(str(v) for v in HQQ_STORAGE_NBITS)
+        raise ValueError(f"Unsupported HQQ storage nbits={nbits}. Supported packed layouts: {enabled}")
+
+
+def validate_hqq_cache_nbits(nbits: int) -> None:
+    if nbits not in HQQ_CACHE_NBITS:
+        enabled = ", ".join(str(v) for v in HQQ_CACHE_NBITS)
+        raise ValueError(f"Unsupported HQQ cache nbits={nbits}. Enabled HQQ cache backends: {enabled}")
+
+
+def attention_quant_cache_nbits(attention_quant: str) -> Optional[int]:
+    return get_attention_backend_spec(attention_quant).nbits
+
+
+def is_hqq_mixed_attention(attention_quant: str) -> bool:
+    return attention_quant in ("hqq46", "hqq46_auto", "hqq68_auto")
+
+
+def is_hqq46_auto_attention(attention_quant: str) -> bool:
+    return attention_quant == "hqq46_auto"
+
+
+def is_hqq_auto_attention(attention_quant: str) -> bool:
+    return attention_quant in ("hqq46_auto", "hqq68_auto")
+
+
+def hqq_auto_promotion_policy(attention_quant: str) -> dict:
+    if attention_quant == "hqq46_auto":
+        return HQQ46_AUTO_PROMOTION_POLICY
+    if attention_quant == "hqq68_auto":
+        return HQQ68_AUTO_PROMOTION_POLICY
+    raise ValueError(f"attention_quant={attention_quant!r} is not an HQQ auto planner mode")
+
+
+def hqq_auto_promotion_policy_for_cache_nbits(nbits: int) -> dict:
+    if nbits == HQQ_MIXED_46_AUTO_CACHE_NBITS:
+        return HQQ46_AUTO_PROMOTION_POLICY
+    if nbits == HQQ_MIXED_68_AUTO_CACHE_NBITS:
+        return HQQ68_AUTO_PROMOTION_POLICY
+    raise ValueError(f"HQQ cache nbits={nbits} is not an auto planner cache")
+
+
+def hqq46_tensor_nbits(tensor_name: str) -> int:
+    return 6 if tensor_name in HQQ46_PROMOTION_POLICY["promoted_tensors"] else 4
+
+
 def hqq_layout_for_nbits(nbits: int) -> str:
+    if nbits in (HQQ_MIXED_46_CACHE_NBITS, HQQ_MIXED_46_AUTO_CACHE_NBITS):
+        return HQQ46_LAYOUT
+    if nbits == HQQ_MIXED_68_AUTO_CACHE_NBITS:
+        return HQQ68_LAYOUT
     validate_hqq_nbits(nbits)
     return HQQ_LAYOUT_BY_NBITS[nbits]
 
@@ -152,23 +284,47 @@ def normalize_hqq_attention_cache_profile(cache_profile: Optional[str]) -> str:
     return profile
 
 
+def normalize_hqq_attention_group_size(group_size: Optional[int]) -> int:
+    value = HQQ_DEFAULT_GROUP_SIZE if group_size is None else int(group_size)
+    if value not in HQQ_ATTENTION_GROUP_SIZE_CHOICES:
+        choices = ", ".join(str(v) for v in HQQ_ATTENTION_GROUP_SIZE_CHOICES)
+        raise ValueError(f"Unsupported HQQ attention group_size={value}. Use one of: {choices}.")
+    return value
+
+
+def _hqq_attention_cache_dirname(nbits: int, group_size: int) -> str:
+    if nbits == 4:
+        baseline = HQQ_ATTENTION_CACHE_DIRNAME
+    elif nbits == HQQ_MIXED_46_CACHE_NBITS:
+        baseline = HQQ46_ATTENTION_CACHE_DIRNAME
+    elif nbits == HQQ_MIXED_46_AUTO_CACHE_NBITS:
+        baseline = HQQ46_AUTO_ATTENTION_CACHE_DIRNAME
+    elif nbits == 6:
+        baseline = HQQ6_ATTENTION_CACHE_DIRNAME
+    elif nbits == HQQ_MIXED_68_AUTO_CACHE_NBITS:
+        baseline = HQQ68_AUTO_ATTENTION_CACHE_DIRNAME
+    else:
+        baseline = HQQ8_ATTENTION_CACHE_DIRNAME
+    if group_size == HQQ_DEFAULT_GROUP_SIZE:
+        return baseline
+    return f"{baseline}_g{group_size}"
+
+
 def hqq_attention_cache_dir(
     model_path: str,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> str:
     """Return the native HQQ attention artifact directory under the model cache."""
-    validate_hqq_nbits(nbits)
+    validate_hqq_cache_nbits(nbits)
     profile = normalize_hqq_attention_cache_profile(cache_profile)
-    baseline_dirname = HQQ_ATTENTION_CACHE_DIRNAME if nbits == 4 else HQQ8_ATTENTION_CACHE_DIRNAME
+    normalized_group_size = normalize_hqq_attention_group_size(group_size)
+    baseline_dirname = _hqq_attention_cache_dirname(nbits, normalized_group_size)
     dirname = (
         baseline_dirname
         if profile == HQQ_CACHE_PROFILE_BASELINE
-        else (
-            HQQ_ATTENTION_CALIBRATED_CACHE_DIRNAMES[profile]
-            if nbits == 4
-            else f"{baseline_dirname}_calib_selfcal_v1"
-        )
+        else f"{baseline_dirname}_calib_selfcal_v1"
     )
     return os.path.join(cache_dir_for_model(model_path), dirname)
 
@@ -177,17 +333,19 @@ def hqq_attention_manifest_path(
     model_path: str,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> str:
-    return os.path.join(hqq_attention_cache_dir(model_path, cache_profile, nbits), HQQ_ATTENTION_MANIFEST)
+    return os.path.join(hqq_attention_cache_dir(model_path, cache_profile, nbits, group_size), HQQ_ATTENTION_MANIFEST)
 
 
 def hqq_attention_pending_manifest_path(
     model_path: str,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> str:
     return os.path.join(
-        hqq_attention_cache_dir(model_path, cache_profile, nbits),
+        hqq_attention_cache_dir(model_path, cache_profile, nbits, group_size),
         HQQ_ATTENTION_PENDING_MANIFEST,
     )
 
@@ -203,9 +361,12 @@ def hqq_attention_tensor_path(
     tensor_name: str,
     nbits: int = 4,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
+    cache_nbits: Optional[int] = None,
 ) -> str:
+    actual_cache_nbits = nbits if cache_nbits is None else int(cache_nbits)
     return os.path.join(
-        hqq_attention_cache_dir(model_path, cache_profile, nbits),
+        hqq_attention_cache_dir(model_path, cache_profile, actual_cache_nbits, group_size),
         f"{hqq_attention_cache_key(layer_idx, tensor_name, nbits)}.safetensors",
     )
 
@@ -248,12 +409,185 @@ def _artifact_tensor_bytes(path: str) -> int:
     return total
 
 
+def hqq46_auto_budget_bytes_from_mib(value: Optional[int]) -> int:
+    if value is None:
+        raise ValueError("attention_quant=hqq46_auto requires hqq46_auto_budget_mib to be set.")
+    budget_mib = int(value)
+    if budget_mib <= 0:
+        raise ValueError(
+            f"attention_quant=hqq46_auto requires a positive hqq46_auto_budget_mib, got {budget_mib}."
+        )
+    return budget_mib * 1024 * 1024
+
+
+def normalize_hqq_auto_budget_pct(value: Optional[float], attention_quant: str = "hqq_auto") -> float:
+    if value is None:
+        raise ValueError(f"attention_quant={attention_quant} requires hqq_auto_budget_pct to be set.")
+    try:
+        budget_pct = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"hqq_auto_budget_pct must be a percentage, got {value!r}") from exc
+    if not math.isfinite(budget_pct) or budget_pct <= 0.0 or budget_pct > 100.0:
+        raise ValueError(
+            f"attention_quant={attention_quant} requires 0 < hqq_auto_budget_pct <= 100, "
+            f"got {budget_pct!r}."
+        )
+    return budget_pct
+
+
+def hqq_auto_budget_bytes_from_pct(value: float, promotion_span_bytes: int, attention_quant: str = "hqq_auto") -> int:
+    budget_pct = normalize_hqq_auto_budget_pct(value, attention_quant)
+    span = int(promotion_span_bytes)
+    if span <= 0:
+        raise ValueError(
+            f"attention_quant={attention_quant} has non-positive promotion span: {promotion_span_bytes}"
+        )
+    if budget_pct == 100.0:
+        return span
+    return max(1, math.floor(span * (budget_pct / 100.0)))
+
+
+def _quality_relative_rmse(record: dict) -> float:
+    quality = record.get("quality") if isinstance(record.get("quality"), dict) else {}
+    if "relative_rmse" in quality:
+        return float(quality["relative_rmse"])
+    rmse = float(quality.get("rmse", 0.0))
+    source_rms = float(quality.get("source_rms", 0.0))
+    return rmse / source_rms if source_rms > 0.0 else 0.0
+
+
+def hqq_auto_candidate_from_records(base_record: dict, promoted_record: dict) -> dict:
+    base_bytes = int(base_record["tensor_bytes"])
+    promoted_bytes = int(promoted_record["tensor_bytes"])
+    extra_bytes = promoted_bytes - base_bytes
+    if extra_bytes <= 0:
+        raise ValueError(
+            f"HQQ auto candidate for layer {base_record.get('layer_idx')} "
+            f"{base_record.get('tensor_name')} has non-positive promotion cost: {extra_bytes}"
+        )
+    base_rel_rmse = _quality_relative_rmse(base_record)
+    promoted_rel_rmse = _quality_relative_rmse(promoted_record)
+    gain = max(0.0, base_rel_rmse - promoted_rel_rmse)
+    score = gain / float(extra_bytes)
+    return {
+        "layer_idx": int(base_record["layer_idx"]),
+        "layer_type": base_record["layer_type"],
+        "tensor_name": base_record["tensor_name"],
+        "base_nbits": int(base_record["nbits"]),
+        "promoted_nbits": int(promoted_record["nbits"]),
+        "base_bytes": base_bytes,
+        "promoted_bytes": promoted_bytes,
+        "extra_bytes": extra_bytes,
+        "base_relative_rmse": base_rel_rmse,
+        "promoted_relative_rmse": promoted_rel_rmse,
+        "relative_rmse_reduction": gain,
+        "score": score,
+        "base_record": base_record,
+        "promoted_record": promoted_record,
+    }
+
+
+def hqq46_auto_candidate_from_records(base_record: dict, promoted_record: dict) -> dict:
+    return hqq_auto_candidate_from_records(base_record, promoted_record)
+
+
+def select_hqq_auto_promotions(
+    candidates: List[dict],
+    budget_bytes: int,
+    *,
+    max_dp_units: int = 4096,
+) -> tuple[set[tuple[int, str]], dict]:
+    """Select HQQ promotions by budgeted normalized-error reduction.
+
+    Uses a bounded-resolution 0/1 knapsack. The unit size is derived from the
+    requested budget so the planner remains cheap for large models while still
+    optimizing globally instead of choosing broad tensor families.
+    """
+    budget_bytes = int(budget_bytes)
+    if budget_bytes <= 0:
+        raise ValueError(f"HQQ auto promotion budget must be positive, got {budget_bytes}")
+    if not candidates:
+        return set(), {
+            "budget_bytes": budget_bytes,
+            "budget_used_bytes": 0,
+            "budget_unit_bytes": 1,
+            "selected_count": 0,
+            "candidate_count": 0,
+            "relative_rmse_reduction": 0.0,
+            "selection_mode": "empty",
+        }
+
+    promotion_span_bytes = sum(int(candidate["extra_bytes"]) for candidate in candidates)
+    if budget_bytes >= promotion_span_bytes:
+        selected_keys = {
+            (int(candidate["layer_idx"]), str(candidate["tensor_name"]))
+            for candidate in candidates
+        }
+        reduction = sum(float(candidate["relative_rmse_reduction"]) for candidate in candidates)
+        return selected_keys, {
+            "budget_bytes": budget_bytes,
+            "budget_used_bytes": int(promotion_span_bytes),
+            "budget_unit_bytes": 1,
+            "selected_count": len(candidates),
+            "candidate_count": len(candidates),
+            "relative_rmse_reduction": reduction,
+            "selection_mode": "full_span",
+        }
+
+    unit_bytes = max(1, math.ceil(budget_bytes / max(1, int(max_dp_units))))
+    capacity = max(1, budget_bytes // unit_bytes)
+    dp_gain = [0.0] * (capacity + 1)
+    dp_choice: list[list[int]] = [[] for _ in range(capacity + 1)]
+
+    for idx, candidate in enumerate(candidates):
+        gain = float(candidate["relative_rmse_reduction"])
+        if gain <= 0.0:
+            continue
+        cost_units = max(1, math.ceil(int(candidate["extra_bytes"]) / unit_bytes))
+        if cost_units > capacity:
+            continue
+        for cap in range(capacity, cost_units - 1, -1):
+            new_gain = dp_gain[cap - cost_units] + gain
+            if new_gain > dp_gain[cap]:
+                dp_gain[cap] = new_gain
+                dp_choice[cap] = dp_choice[cap - cost_units] + [idx]
+
+    best_cap = max(range(capacity + 1), key=lambda cap: dp_gain[cap])
+    selected_indices = set(dp_choice[best_cap])
+    selected_keys = {
+        (int(candidates[idx]["layer_idx"]), str(candidates[idx]["tensor_name"]))
+        for idx in selected_indices
+    }
+    budget_used = sum(int(candidates[idx]["extra_bytes"]) for idx in selected_indices)
+    reduction = sum(float(candidates[idx]["relative_rmse_reduction"]) for idx in selected_indices)
+    summary = {
+        "budget_bytes": budget_bytes,
+        "budget_used_bytes": int(budget_used),
+        "budget_unit_bytes": int(unit_bytes),
+        "selected_count": len(selected_indices),
+        "candidate_count": len(candidates),
+        "relative_rmse_reduction": reduction,
+        "selection_mode": "knapsack",
+    }
+    return selected_keys, summary
+
+
+def select_hqq46_auto_promotions(
+    candidates: List[dict],
+    budget_bytes: int,
+    *,
+    max_dp_units: int = 4096,
+) -> tuple[set[tuple[int, str]], dict]:
+    return select_hqq_auto_promotions(candidates, budget_bytes, max_dp_units=max_dp_units)
+
+
 def load_hqq_attention_manifest(
     model_path: str,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> Optional[dict]:
-    path = hqq_attention_manifest_path(model_path, cache_profile, nbits)
+    path = hqq_attention_manifest_path(model_path, cache_profile, nbits, group_size)
     if not os.path.isfile(path):
         return None
     with open(path) as f:
@@ -489,16 +823,21 @@ def save_hqq_attention_manifest(
     manifest: dict,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> None:
-    _save_hqq_attention_manifest_to_path(hqq_attention_manifest_path(model_path, cache_profile, nbits), manifest)
+    _save_hqq_attention_manifest_to_path(
+        hqq_attention_manifest_path(model_path, cache_profile, nbits, group_size),
+        manifest,
+    )
 
 
 def load_hqq_attention_pending_manifest(
     model_path: str,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> Optional[dict]:
-    path = hqq_attention_pending_manifest_path(model_path, cache_profile, nbits)
+    path = hqq_attention_pending_manifest_path(model_path, cache_profile, nbits, group_size)
     if not os.path.isfile(path):
         return None
     with open(path) as f:
@@ -510,9 +849,10 @@ def save_hqq_attention_pending_manifest(
     manifest: dict,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> None:
     _save_hqq_attention_manifest_to_path(
-        hqq_attention_pending_manifest_path(model_path, cache_profile, nbits),
+        hqq_attention_pending_manifest_path(model_path, cache_profile, nbits, group_size),
         manifest,
     )
 
@@ -521,20 +861,27 @@ def delete_hqq_attention_pending_manifest(
     model_path: str,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> None:
-    path = hqq_attention_pending_manifest_path(model_path, cache_profile, nbits)
+    path = hqq_attention_pending_manifest_path(model_path, cache_profile, nbits, group_size)
     if os.path.isfile(path):
         os.remove(path)
 
 
-def init_hqq_attention_manifest(model_path: str, num_hidden_layers: int, nbits: int = 4) -> dict:
-    validate_hqq_nbits(nbits)
+def init_hqq_attention_manifest(
+    model_path: str,
+    num_hidden_layers: int,
+    nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
+) -> dict:
+    validate_hqq_cache_nbits(nbits)
+    normalized_group_size = normalize_hqq_attention_group_size(group_size)
     layout = hqq_layout_for_nbits(nbits)
-    return {
+    manifest = {
         "format_version": HQQ_ATTENTION_CACHE_VERSION,
         "backend": hqq_backend_name(nbits),
         "nbits": nbits,
-        "group_size": HQQ_DEFAULT_GROUP_SIZE,
+        "group_size": normalized_group_size,
         "axis": HQQ_DEFAULT_AXIS,
         "layout": layout,
         "num_hidden_layers": num_hidden_layers,
@@ -545,6 +892,28 @@ def init_hqq_attention_manifest(model_path: str, num_hidden_layers: int, nbits: 
             "num_tensors": 0,
         },
     }
+    if nbits == HQQ_MIXED_46_CACHE_NBITS:
+        manifest["mixed_precision"] = {
+            "base_nbits": HQQ46_PROMOTION_POLICY["base_nbits"],
+            "promoted_nbits": HQQ46_PROMOTION_POLICY["promoted_nbits"],
+            "policy": HQQ46_PROMOTION_POLICY["name"],
+            "promoted_tensors": list(HQQ46_PROMOTION_POLICY["promoted_tensors"]),
+            "description": HQQ46_PROMOTION_POLICY["description"],
+        }
+    elif nbits in (HQQ_MIXED_46_AUTO_CACHE_NBITS, HQQ_MIXED_68_AUTO_CACHE_NBITS):
+        policy = hqq_auto_promotion_policy_for_cache_nbits(nbits)
+        manifest["mixed_precision"] = {
+            "base_nbits": policy["base_nbits"],
+            "promoted_nbits": policy["promoted_nbits"],
+            "policy": policy["name"],
+            "description": policy["description"],
+        }
+        manifest["planner"] = {
+            "name": policy["name"],
+            "candidate_count": 0,
+            "candidates": [],
+        }
+    return manifest
 
 
 def require_complete_hqq_attention_manifest(
@@ -552,16 +921,18 @@ def require_complete_hqq_attention_manifest(
     cache_profile: Optional[str],
     expected_nbits: int,
     expected_num_hidden_layers: int,
+    expected_group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> dict:
     """Load a selected complete HQQ manifest, failing visibly without fallback."""
-    validate_hqq_nbits(expected_nbits)
+    validate_hqq_cache_nbits(expected_nbits)
+    normalized_group_size = normalize_hqq_attention_group_size(expected_group_size)
     profile = normalize_hqq_attention_cache_profile(cache_profile)
-    path = hqq_attention_manifest_path(model_path, profile, expected_nbits)
-    manifest = load_hqq_attention_manifest(model_path, profile, expected_nbits)
+    path = hqq_attention_manifest_path(model_path, profile, expected_nbits, normalized_group_size)
+    manifest = load_hqq_attention_manifest(model_path, profile, expected_nbits, normalized_group_size)
     if manifest is None:
         if profile == HQQ_CACHE_PROFILE_BASELINE:
             raise RuntimeError(
-                "attention_quant=hqq4 requested but no HQQ attention manifest exists. "
+                f"attention_quant=hqq{expected_nbits} requested but no HQQ attention manifest exists. "
                 f"Expected {path}"
             )
         raise RuntimeError(
@@ -579,7 +950,7 @@ def require_complete_hqq_attention_manifest(
         errors.append(f"nbits={manifest.get('nbits')}")
     if manifest.get("num_hidden_layers") != expected_num_hidden_layers:
         errors.append(f"num_hidden_layers={manifest.get('num_hidden_layers')}")
-    if manifest.get("group_size") != HQQ_DEFAULT_GROUP_SIZE:
+    if manifest.get("group_size") != normalized_group_size:
         errors.append(f"group_size={manifest.get('group_size')}")
     if manifest.get("axis") != HQQ_DEFAULT_AXIS:
         errors.append(f"axis={manifest.get('axis')}")
@@ -627,9 +998,42 @@ def _unpack_uint4(packed: torch.Tensor, cols: int) -> torch.Tensor:
     return q[:, :cols].contiguous()
 
 
+def _pack_uint6(q: torch.Tensor) -> torch.Tensor:
+    if q.dtype != torch.uint8:
+        q = q.to(torch.uint8)
+    if q.shape[-1] % 4 != 0:
+        q = torch.nn.functional.pad(q, (0, 4 - (q.shape[-1] % 4)))
+    q = q.contiguous()
+    a = q[..., 0::4] & 0x3F
+    b = q[..., 1::4] & 0x3F
+    c = q[..., 2::4] & 0x3F
+    d = q[..., 3::4] & 0x3F
+    packed = torch.empty((*q.shape[:-1], (q.shape[-1] // 4) * 3), dtype=torch.uint8)
+    packed[..., 0::3] = a | ((b & 0x03) << 6)
+    packed[..., 1::3] = (b >> 2) | ((c & 0x0F) << 4)
+    packed[..., 2::3] = (c >> 4) | (d << 2)
+    return packed.contiguous()
+
+
+def _unpack_uint6(packed: torch.Tensor, cols: int) -> torch.Tensor:
+    if packed.shape[-1] % 3 != 0:
+        raise ValueError(f"Packed uint6 columns must be divisible by 3, got {packed.shape[-1]}")
+    a = packed[..., 0::3]
+    b = packed[..., 1::3]
+    c = packed[..., 2::3]
+    q = torch.empty((*packed.shape[:-1], (packed.shape[-1] // 3) * 4), dtype=torch.uint8)
+    q[..., 0::4] = a & 0x3F
+    q[..., 1::4] = ((a >> 6) | ((b & 0x0F) << 2)) & 0x3F
+    q[..., 2::4] = ((b >> 4) | ((c & 0x03) << 4)) & 0x3F
+    q[..., 3::4] = (c >> 2) & 0x3F
+    return q[..., :cols].contiguous()
+
+
 def _pack_hqq_quant(quant: torch.Tensor, nbits: int) -> torch.Tensor:
     if nbits == 4:
         return _pack_uint4(quant)
+    if nbits == 6:
+        return _pack_uint6(quant)
     if nbits == 8:
         if quant.dtype != torch.uint8:
             quant = quant.to(torch.uint8)
@@ -640,6 +1044,8 @@ def _pack_hqq_quant(quant: torch.Tensor, nbits: int) -> torch.Tensor:
 def _unpack_hqq_quant(packed: torch.Tensor, cols: int, nbits: int) -> torch.Tensor:
     if nbits == 4:
         return _unpack_uint4(packed, cols)
+    if nbits == 6:
+        return _unpack_uint6(packed, cols)
     if nbits == 8:
         return packed[:, :cols].contiguous()
     raise ValueError(f"Unsupported HQQ nbits={nbits}")
@@ -658,9 +1064,13 @@ def _hqq_packed_cols(cols: int, group_size: int) -> int:
 
 
 def _hqq_packed_cols_for_nbits(cols: int, group_size: int, nbits: int) -> int:
-    validate_hqq_nbits(nbits)
+    validate_hqq_storage_nbits(nbits)
     padded_cols = _hqq_padded_cols(cols, group_size)
-    return (padded_cols + 1) // 2 if nbits == 4 else padded_cols
+    if nbits == 4:
+        return (padded_cols + 1) // 2
+    if nbits == 6:
+        return ((padded_cols + 3) // 4) * 3
+    return padded_cols
 
 
 def _hqq_tensor_shape_list(tensor: torch.Tensor) -> List[int]:
@@ -734,6 +1144,8 @@ def validate_hqq_attention_tensors(
     padded_cols = _hqq_padded_cols(cols, group_size)
     if nbits == 4:
         packed_cols = _hqq_packed_cols(cols, group_size)
+    elif nbits == 6:
+        packed_cols = _hqq_packed_cols_for_nbits(cols, group_size, 6)
     elif nbits == 8:
         packed_cols = padded_cols
     else:
@@ -1513,6 +1925,113 @@ def quantize_hqq8_tensor(
     return result
 
 
+def quantize_hqq6_tensor(
+    weight: torch.Tensor,
+    group_size: int = HQQ_DEFAULT_GROUP_SIZE,
+    *,
+    collect_stats: bool = False,
+    worst_groups_limit: int = 8,
+) -> Dict[str, torch.Tensor]:
+    """HQQ6 tensor quantizer with true packed 6-bit storage."""
+    if weight.ndim != 2:
+        raise ValueError(f"HQQ attention expects 2D weights, got shape {tuple(weight.shape)}")
+    if group_size <= 0:
+        raise ValueError(f"Invalid HQQ group_size {group_size}")
+
+    w = weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    rows, cols = w.shape
+    groups = _hqq_num_groups(cols, group_size)
+    padded_cols = _hqq_padded_cols(cols, group_size)
+    quant = torch.zeros((rows, padded_cols), dtype=torch.uint8)
+    scales = torch.empty((rows, groups), dtype=torch.float32)
+    zeros = torch.empty((rows, groups), dtype=torch.float32)
+    qmax = 63.0
+    stats = {
+        "numel": 0,
+        "sum_abs": 0.0,
+        "sum_sq": 0.0,
+        "max_abs": 0.0,
+        "worst_groups": [],
+    } if collect_stats else None
+
+    for g in range(groups):
+        start = g * group_size
+        end = min(start + group_size, cols)
+        chunk = w[:, start:end]
+        q, scale, zero = _quantize_hqq4_group_current(chunk, qmax)
+        quant[:, start:end] = q[:, : end - start]
+        scales[:, g] = scale
+        zeros[:, g] = zero
+        if collect_stats:
+            deq = (q[:, : end - start].to(torch.float32) - zero.unsqueeze(1)) * scale.unsqueeze(1)
+            diff = deq - chunk
+            abs_diff = diff.abs()
+            stats["numel"] += diff.numel()
+            stats["sum_abs"] += float(abs_diff.sum().item())
+            stats["sum_sq"] += float((diff * diff).sum().item())
+            stats["max_abs"] = max(stats["max_abs"], float(abs_diff.max().item()))
+            group_mean_abs = abs_diff.mean(dim=1)
+            group_rmse = torch.sqrt(torch.mean(diff * diff, dim=1))
+            if worst_groups_limit > 0:
+                for row_idx in range(rows):
+                    entry = {
+                        "row": int(row_idx),
+                        "group": int(g),
+                        "start_col": int(start),
+                        "end_col": int(end),
+                        "mean_abs": float(group_mean_abs[row_idx].item()),
+                        "rmse": float(group_rmse[row_idx].item()),
+                        "max_abs": float(abs_diff[row_idx].max().item()),
+                        "scale": float(scale[row_idx].item()),
+                        "zero": float(zero[row_idx].item()),
+                    }
+                    if len(stats["worst_groups"]) < worst_groups_limit:
+                        stats["worst_groups"].append(entry)
+                    else:
+                        min_idx = min(
+                            range(len(stats["worst_groups"])),
+                            key=lambda idx: stats["worst_groups"][idx]["mean_abs"],
+                        )
+                        if entry["mean_abs"] > stats["worst_groups"][min_idx]["mean_abs"]:
+                            stats["worst_groups"][min_idx] = entry
+
+    result = {
+        "packed": _pack_uint6(quant),
+        "scales": scales,
+        "zeros": zeros,
+        "orig_shape": torch.tensor([rows, cols], dtype=torch.int32),
+        "group_size": torch.tensor([group_size], dtype=torch.int32),
+        "axis": torch.tensor([HQQ_DEFAULT_AXIS], dtype=torch.int32),
+        "nbits": torch.tensor([6], dtype=torch.int32),
+    }
+    if collect_stats:
+        stats["worst_groups"].sort(key=lambda item: item["mean_abs"], reverse=True)
+        denom = max(1, stats["numel"])
+        result["stats"] = {
+            "numel": int(stats["numel"]),
+            "mean_abs": stats["sum_abs"] / denom,
+            "rmse": math.sqrt(stats["sum_sq"] / denom),
+            "max_abs": stats["max_abs"],
+            "worst_groups": stats["worst_groups"],
+        }
+    return result
+
+
+def quantize_hqq6_tensor_probe(
+    weight: torch.Tensor,
+    group_size: int = HQQ_DEFAULT_GROUP_SIZE,
+    *,
+    collect_stats: bool = False,
+    worst_groups_limit: int = 8,
+) -> Dict[str, torch.Tensor]:
+    return quantize_hqq6_tensor(
+        weight,
+        group_size=group_size,
+        collect_stats=collect_stats,
+        worst_groups_limit=worst_groups_limit,
+    )
+
+
 def write_hqq_attention_artifact(
     model_path: str,
     layer_idx: int,
@@ -1520,10 +2039,24 @@ def write_hqq_attention_artifact(
     tensor_name: str,
     weight: torch.Tensor,
     nbits: int = 4,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
+    cache_nbits: Optional[int] = None,
 ) -> dict:
     validate_hqq_nbits(nbits)
+    normalized_group_size = normalize_hqq_attention_group_size(group_size)
+    actual_cache_nbits = nbits if cache_nbits is None else int(cache_nbits)
+    validate_hqq_cache_nbits(actual_cache_nbits)
 
-    path = hqq_attention_tensor_path(model_path, layer_idx, tensor_name, nbits=nbits)
+    path = hqq_attention_tensor_path(
+        model_path,
+        layer_idx,
+        tensor_name,
+        nbits=nbits,
+        cache_profile=cache_profile,
+        group_size=normalized_group_size,
+        cache_nbits=actual_cache_nbits,
+    )
     os.makedirs(os.path.dirname(path), exist_ok=True)
     timing_context = {
         "layer_idx": int(layer_idx),
@@ -1531,16 +2064,21 @@ def write_hqq_attention_artifact(
         "tensor_name": tensor_name,
     }
     if nbits == 4:
-        tensors = quantize_hqq4_tensor(
+        tensors = quantize_hqq4_tensor_rust(
             weight,
-            group_size=HQQ_DEFAULT_GROUP_SIZE,
+            group_size=normalized_group_size,
             collect_stats=True,
-            timing_context=timing_context,
+        )
+    elif nbits == 6:
+        tensors = quantize_hqq6_tensor(
+            weight,
+            group_size=normalized_group_size,
+            collect_stats=True,
         )
     elif nbits == 8:
         tensors = quantize_hqq8_tensor(
             weight,
-            group_size=HQQ_DEFAULT_GROUP_SIZE,
+            group_size=normalized_group_size,
             collect_stats=True,
             timing_context=timing_context,
         )
@@ -1586,6 +2124,14 @@ def write_hqq_attention_artifact(
         )
     orig_shape = payload_tensors["orig_shape"].tolist()
     stats = tensors["stats"]
+    source_f32 = weight.detach().to(device="cpu", dtype=torch.float32)
+    source_numel = max(1, source_f32.numel())
+    source_rms = math.sqrt(float((source_f32 * source_f32).sum().item()) / source_numel)
+    source_mean_abs = float(source_f32.abs().sum().item()) / source_numel
+    stats["source_rms"] = source_rms
+    stats["source_mean_abs"] = source_mean_abs
+    stats["relative_rmse"] = stats["rmse"] / source_rms if source_rms > 0.0 else 0.0
+    stats["relative_mean_abs"] = stats["mean_abs"] / source_mean_abs if source_mean_abs > 0.0 else 0.0
     return {
         "layer_idx": layer_idx,
         "layer_type": layer_type,
@@ -1610,6 +2156,8 @@ def load_hqq_attention_artifact(
     expected_nbits: int,
     device: str = "cpu",
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    group_size: Optional[int] = None,
+    cache_nbits: Optional[int] = None,
 ) -> dict:
     validate_hqq_nbits(expected_nbits)
     if entry.get("nbits") != expected_nbits:
@@ -1619,7 +2167,13 @@ def load_hqq_attention_artifact(
             f"expected {expected_nbits}"
         )
 
-    path = os.path.join(hqq_attention_cache_dir(model_path, cache_profile, expected_nbits), entry["file"])
+    artifact_group_size = normalize_hqq_attention_group_size(group_size or entry.get("group_size", HQQ_DEFAULT_GROUP_SIZE))
+    actual_cache_nbits = expected_nbits if cache_nbits is None else int(cache_nbits)
+    validate_hqq_cache_nbits(actual_cache_nbits)
+    path = os.path.join(
+        hqq_attention_cache_dir(model_path, cache_profile, actual_cache_nbits, artifact_group_size),
+        entry["file"],
+    )
     if not os.path.isfile(path):
         raise RuntimeError(f"Missing HQQ artifact file: {path}")
 
@@ -1659,13 +2213,15 @@ def hqq_attention_cache_layer_bytes(
     model_path: str,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> Optional[Dict[int, int]]:
-    manifest = load_hqq_attention_manifest(model_path, cache_profile, nbits)
+    normalized_group_size = normalize_hqq_attention_group_size(group_size)
+    manifest = load_hqq_attention_manifest(model_path, cache_profile, nbits, normalized_group_size)
     if not manifest:
         return None
     per_layer: Dict[int, int] = {}
     for entry in manifest.get("tensors", []):
-        path = os.path.join(hqq_attention_cache_dir(model_path, cache_profile, nbits), entry["file"])
+        path = os.path.join(hqq_attention_cache_dir(model_path, cache_profile, nbits, normalized_group_size), entry["file"])
         if not os.path.isfile(path):
             return None
         per_layer[entry["layer_idx"]] = per_layer.get(entry["layer_idx"], 0) + _artifact_tensor_bytes(path)
@@ -1676,8 +2232,9 @@ def hqq_attention_cache_total_bytes(
     model_path: str,
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     nbits: int = 4,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
 ) -> Optional[int]:
-    per_layer = hqq_attention_cache_layer_bytes(model_path, cache_profile, nbits)
+    per_layer = hqq_attention_cache_layer_bytes(model_path, cache_profile, nbits, group_size)
     if per_layer is None:
         return None
     return sum(per_layer.values())

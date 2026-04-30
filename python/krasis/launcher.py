@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from krasis.attention_backend import ATTENTION_QUANT_CHOICES, attention_quant_label
 from krasis.config import (
     cache_dir_for_model,
+    HQQ_ATTENTION_DEFAULT_GROUP_SIZE,
+    HQQ_ATTENTION_GROUP_SIZE_CHOICES,
     HQQ_CACHE_PROFILE_BASELINE,
     HQQ_CACHE_PROFILE_CHOICES,
 )
@@ -51,7 +53,7 @@ import re
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 
-INTERACTIVE_ATTENTION_QUANT_CHOICES = ("hqq8", "hqq4")
+INTERACTIVE_ATTENTION_QUANT_CHOICES = ("hqq8", "hqq6", "hqq4")
 
 
 def _visible_len(s: str) -> int:
@@ -346,7 +348,7 @@ CONFIG_KEYS = [
     "MODEL_PATH", "CFG_SELECTED_GPUS", "CFG_PP_PARTITION", "CFG_LAYER_GROUP_SIZE",
     "CFG_KV_CACHE_MB", "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS", "CFG_CPU_EXPERT_BITS",
     "CFG_GPU_EXPERT_INT4_CALIB",
-    "CFG_ATTENTION_QUANT", "CFG_HQQ_CACHE_PROFILE", "CFG_HQQ_SIDECAR_MANIFEST",
+    "CFG_ATTENTION_QUANT", "CFG_HQQ_CACHE_PROFILE", "CFG_HQQ_GROUP_SIZE", "CFG_HQQ_AUTO_BUDGET_PCT", "CFG_HQQ46_AUTO_BUDGET_MB", "CFG_HQQ_SIDECAR_MANIFEST",
     "CFG_SHARED_EXPERT_QUANT", "CFG_DENSE_MLP_QUANT",
     "CFG_LM_HEAD_QUANT", "CFG_KRASIS_THREADS", "CFG_HOST", "CFG_PORT",
     "CFG_GPU_PREFILL_THRESHOLD", "CFG_GGUF_PATH", "CFG_VRAM_SAFETY_MARGIN",
@@ -408,6 +410,9 @@ class LauncherConfig:
         self._attention_quant_explicit: bool = False  # set when user/config explicitly chose
         self.hqq_cache_profile: str = HQQ_CACHE_PROFILE_BASELINE
         self._hqq_cache_profile_explicit: bool = False
+        self.hqq_group_size: int = HQQ_ATTENTION_DEFAULT_GROUP_SIZE
+        self.hqq_auto_budget_pct: float = 0.0
+        self.hqq46_auto_budget_mib: int = 0
         self.hqq_sidecar_manifest: str = ""
         self.shared_expert_quant: str = "int8"
         self.dense_mlp_quant: str = "int8"
@@ -488,7 +493,7 @@ class LauncherConfig:
             if val in ("int4", "int8"):
                 raise ValueError(
                     f"Unsupported saved CFG_ATTENTION_QUANT={val}. "
-                    "Naive int4/int8 attention has been removed; use hqq8, hqq4, awq, or bf16."
+                    "Naive int4/int8 attention has been removed; use hqq8, hqq68_auto, hqq6, hqq46_auto, hqq46, hqq4, awq, or bf16."
                 )
             if val not in ATTENTION_QUANT_CHOICES:
                 raise ValueError(
@@ -506,6 +511,35 @@ class LauncherConfig:
                 )
             self.hqq_cache_profile = val
             self._hqq_cache_profile_explicit = True
+        if "CFG_HQQ_GROUP_SIZE" in saved and saved["CFG_HQQ_GROUP_SIZE"]:
+            try:
+                self.hqq_group_size = int(saved["CFG_HQQ_GROUP_SIZE"])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unsupported saved CFG_HQQ_GROUP_SIZE={saved['CFG_HQQ_GROUP_SIZE']!r}. "
+                    "Use 32, 64, or 128."
+                ) from exc
+            if self.hqq_group_size not in HQQ_ATTENTION_GROUP_SIZE_CHOICES:
+                raise ValueError(
+                    f"Unsupported saved CFG_HQQ_GROUP_SIZE={self.hqq_group_size}. "
+                    "Use 32, 64, or 128."
+                )
+        if "CFG_HQQ_AUTO_BUDGET_PCT" in saved and saved["CFG_HQQ_AUTO_BUDGET_PCT"]:
+            try:
+                self.hqq_auto_budget_pct = float(saved["CFG_HQQ_AUTO_BUDGET_PCT"])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unsupported saved CFG_HQQ_AUTO_BUDGET_PCT={saved['CFG_HQQ_AUTO_BUDGET_PCT']!r}. "
+                    "Use a numeric percentage in (0, 100]."
+                ) from exc
+        if "CFG_HQQ46_AUTO_BUDGET_MB" in saved and saved["CFG_HQQ46_AUTO_BUDGET_MB"]:
+            try:
+                self.hqq46_auto_budget_mib = int(saved["CFG_HQQ46_AUTO_BUDGET_MB"])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unsupported saved CFG_HQQ46_AUTO_BUDGET_MB={saved['CFG_HQQ46_AUTO_BUDGET_MB']!r}. "
+                    "Use a positive integer MiB budget."
+                ) from exc
         if "CFG_HQQ_SIDECAR_MANIFEST" in saved and saved["CFG_HQQ_SIDECAR_MANIFEST"]:
             self.hqq_sidecar_manifest = os.path.expanduser(saved["CFG_HQQ_SIDECAR_MANIFEST"])
         if "CFG_SHARED_EXPERT_QUANT" in saved:
@@ -564,6 +598,9 @@ class LauncherConfig:
             "CFG_CPU_EXPERT_BITS": str(self.cpu_expert_bits),
             "CFG_ATTENTION_QUANT": self.attention_quant,
             "CFG_HQQ_CACHE_PROFILE": self.hqq_cache_profile,
+            "CFG_HQQ_GROUP_SIZE": str(self.hqq_group_size),
+            "CFG_HQQ_AUTO_BUDGET_PCT": str(self.hqq_auto_budget_pct or ""),
+            "CFG_HQQ46_AUTO_BUDGET_MB": str(self.hqq46_auto_budget_mib or ""),
             "CFG_HQQ_SIDECAR_MANIFEST": self.hqq_sidecar_manifest,
             "CFG_SHARED_EXPERT_QUANT": self.shared_expert_quant,
             "CFG_DENSE_MLP_QUANT": self.dense_mlp_quant,
@@ -1061,12 +1098,23 @@ class Launcher:
     def _set_interactive_attention_quant(self, value: str) -> bool:
         """Apply an interactive attention preset.
 
-        The TUI exposes only HQQ8 and HQQ4SC.  HQQ4SC is represented by the
+        The TUI exposes HQQ8, HQQ6, and HQQ4SC. HQQ4SC is represented by the
         runtime as HQQ4 plus an explicit INT8-exception sidecar manifest.
         """
         if value == "hqq8":
             self.cfg.attention_quant = "hqq8"
             self.cfg.hqq_cache_profile = HQQ_CACHE_PROFILE_BASELINE
+            self.cfg.hqq_group_size = HQQ_ATTENTION_DEFAULT_GROUP_SIZE
+            self.cfg.hqq_auto_budget_pct = 0.0
+            self.cfg.hqq46_auto_budget_mib = 0
+            self.cfg.hqq_sidecar_manifest = ""
+            return True
+        if value == "hqq6":
+            self.cfg.attention_quant = "hqq6"
+            self.cfg.hqq_cache_profile = HQQ_CACHE_PROFILE_BASELINE
+            self.cfg.hqq_group_size = HQQ_ATTENTION_DEFAULT_GROUP_SIZE
+            self.cfg.hqq_auto_budget_pct = 0.0
+            self.cfg.hqq46_auto_budget_mib = 0
             self.cfg.hqq_sidecar_manifest = ""
             return True
         if value == "hqq4":
@@ -1075,6 +1123,9 @@ class Launcher:
                 return False
             self.cfg.attention_quant = "hqq4"
             self.cfg.hqq_cache_profile = HQQ_CACHE_PROFILE_BASELINE
+            self.cfg.hqq_group_size = HQQ_ATTENTION_DEFAULT_GROUP_SIZE
+            self.cfg.hqq_auto_budget_pct = 0.0
+            self.cfg.hqq46_auto_budget_mib = 0
             self.cfg.hqq_sidecar_manifest = sidecar
             return True
         return False
@@ -1084,7 +1135,7 @@ class Launcher:
             if self.cfg.hqq_sidecar_manifest:
                 return True
             return self._set_interactive_attention_quant("hqq4")
-        if self.cfg.attention_quant != "hqq8":
+        if self.cfg.attention_quant not in ("hqq8", "hqq6"):
             return self._set_interactive_attention_quant("hqq8")
         return True
 
@@ -1122,6 +1173,7 @@ class Launcher:
                 expert_group_size=self.cfg.expert_group_size,
                 attention_quant=self.cfg.attention_quant,
                 hqq_cache_profile=self.cfg.hqq_cache_profile,
+                hqq_group_size=self.cfg.hqq_group_size,
                 shared_expert_quant=self.cfg.shared_expert_quant,
                 dense_mlp_quant=self.cfg.dense_mlp_quant,
                 lm_head_quant=self.cfg.lm_head_quant,
@@ -1405,7 +1457,7 @@ class Launcher:
             if opt.key == "attention_quant":
                 choices = [
                     choice for choice in INTERACTIVE_ATTENTION_QUANT_CHOICES
-                    if choice == "hqq8" or self._discover_hqq4sc_manifest()
+                    if choice in ("hqq8", "hqq6") or self._discover_hqq4sc_manifest()
                 ]
                 if not choices:
                     choices = ["hqq8"]
@@ -1852,9 +1904,15 @@ def parse_args() -> argparse.Namespace:
                         choices=list(GPU_EXPERT_INT4_CALIB_CHOICES),
                         help="Offline calibration mode for GPU routed-expert INT4 cache build")
     parser.add_argument("--attention-quant", default=None,
-                        help="Attention weight quant: hqq8 quality-first 8-bit default; bf16, awq, and hqq4 remain explicit legacy/debug modes")
+                        help="Attention weight quant: hqq8 quality-first; hqq68_auto budget-planned mixed HQQ6/HQQ8; hqq6 packed middle-ground; hqq46_auto budget-planned mixed HQQ4/HQQ6; hqq46 fixed-policy mixed; bf16, awq, and hqq4 remain explicit legacy/debug modes")
     parser.add_argument("--hqq-cache-profile", default=None,
                         help="HQQ attention cache profile: baseline or selfcal_v1")
+    parser.add_argument("--hqq-group-size", type=int, default=None, choices=list(HQQ_ATTENTION_GROUP_SIZE_CHOICES),
+                        help="HQQ attention quantization group size: 32, 64, or 128")
+    parser.add_argument("--hqq-auto-budget-pct", type=float, default=None,
+                        help="HQQ auto planner promotion budget as percentage of the base-to-target attention-memory span")
+    parser.add_argument("--hqq46-auto-budget-mib", type=int, default=None,
+                        help="Legacy HQQ4/6 auto planner HQQ6 promotion budget in MiB")
     parser.add_argument("--hqq-sidecar-manifest", default=None,
                         help="Explicit HQQ4-only sidecar manifest; HQQ8 rejects sidecar/self-correction")
     parser.add_argument("--shared-expert-quant", default=None,
@@ -1926,7 +1984,7 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         if val in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported --attention-quant {val}. "
-                "Naive int4/int8 attention has been removed; use hqq8, hqq4, awq, or bf16."
+                "Naive int4/int8 attention has been removed; use hqq8, hqq68_auto, hqq6, hqq46_auto, hqq46, hqq4, awq, or bf16."
             )
         if val not in ATTENTION_QUANT_CHOICES:
             raise ValueError(
@@ -1944,6 +2002,12 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
             )
         cfg.hqq_cache_profile = val
         cfg._hqq_cache_profile_explicit = True
+    if args.hqq_group_size is not None:
+        cfg.hqq_group_size = int(args.hqq_group_size)
+    if args.hqq_auto_budget_pct is not None:
+        cfg.hqq_auto_budget_pct = float(args.hqq_auto_budget_pct)
+    if args.hqq46_auto_budget_mib is not None:
+        cfg.hqq46_auto_budget_mib = int(args.hqq46_auto_budget_mib)
     if args.hqq_sidecar_manifest is not None:
         cfg.hqq_sidecar_manifest = os.path.expanduser(args.hqq_sidecar_manifest)
     if args.shared_expert_quant is not None:

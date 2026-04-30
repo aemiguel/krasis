@@ -23,6 +23,9 @@ from krasis.attention_backend import (
 )
 from krasis.config import HQQ_CACHE_PROFILE_BASELINE, HQQ_CACHE_PROFILE_SELFCAL_V1
 from krasis.hqq_self_calibrate import main as hqq_self_calibrate_main
+from krasis.hqq_self_calibrate import _int8_exception_budget_bytes
+from krasis.hqq_self_calibrate import _select_int8_exception_candidates
+from krasis.hqq_self_calibrate import evidence_trace_log_path
 
 
 @contextmanager
@@ -149,6 +152,164 @@ def assert_raises_contains(fn, text: str) -> None:
             raise AssertionError(f"Expected {text!r} in {str(exc)!r}") from exc
         return
     raise AssertionError(f"Expected exception containing {text!r}")
+
+
+def make_int8_exception_candidate(
+    *,
+    layer: int,
+    tensor: str,
+    group: int,
+    benefit: float,
+    cost: int,
+    ready: bool = True,
+    surface: str = "both",
+) -> dict:
+    prefill_active = surface in ("both", "prefill_only")
+    decode_active = surface in ("both", "decode_only")
+    return {
+        "layer": layer,
+        "target_tensor": tensor,
+        "group": group,
+        "candidate_ready": ready,
+        "benefit_score": benefit,
+        "risk_score": benefit,
+        "cost": {"int8_total_bytes": cost, "runtime_total_bytes": cost},
+        "runtime_activity": {
+            "prefill_active": prefill_active,
+            "decode_active": decode_active,
+            "active": prefill_active or decode_active,
+            "surface": surface,
+            "inactive_reason": None if prefill_active or decode_active else "test inactive",
+        },
+    }
+
+
+def test_int8_exception_budget_selection_uses_ratio_and_top_limit() -> None:
+    report = {
+        "candidates": [
+            make_int8_exception_candidate(
+                layer=0,
+                tensor="in_proj_qkvz",
+                group=0,
+                benefit=90.0,
+                cost=60,
+            ),
+            make_int8_exception_candidate(
+                layer=0,
+                tensor="out_proj",
+                group=0,
+                benefit=30.0,
+                cost=10,
+            ),
+            make_int8_exception_candidate(
+                layer=1,
+                tensor="fused_qkv",
+                group=0,
+                benefit=10.0,
+                cost=10,
+            ),
+        ]
+    }
+    budget = _int8_exception_budget_bytes(
+        source_hqq_bytes=1000,
+        max_sidecar_ratio=0.07,
+        max_sidecar_bytes=None,
+    )
+    selected = _select_int8_exception_candidates(
+        report,
+        requested_groups=None,
+        top_groups=2,
+        max_sidecar_bytes=budget,
+    )
+    assert [(item["target_tensor"], item["group"]) for item in selected] == [
+        ("out_proj", 0),
+        ("in_proj_qkvz", 0),
+    ]
+    assert sum(item["cost"]["runtime_total_bytes"] for item in selected) <= 70
+
+
+def test_int8_exception_budget_rejects_explicit_groups_over_cap() -> None:
+    report = {
+        "candidates": [
+            make_int8_exception_candidate(
+                layer=0,
+                tensor="in_proj_qkvz",
+                group=0,
+                benefit=90.0,
+                cost=60,
+            )
+        ]
+    }
+    assert_raises_contains(
+        lambda: _select_int8_exception_candidates(
+            report,
+            requested_groups={(0, "in_proj_qkvz", 0)},
+            top_groups=None,
+            max_sidecar_bytes=50,
+        ),
+        "exceed sidecar byte budget",
+    )
+    assert_raises_contains(
+        lambda: _int8_exception_budget_bytes(
+            source_hqq_bytes=0,
+            max_sidecar_ratio=0.10,
+            max_sidecar_bytes=None,
+        ),
+        "requires positive source HQQ tensor bytes",
+    )
+
+
+def test_int8_exception_split_budget_prefers_decode_and_excludes_inactive() -> None:
+    report = {
+        "candidates": [
+            make_int8_exception_candidate(
+                layer=0,
+                tensor="q_proj",
+                group=0,
+                benefit=500.0,
+                cost=20,
+                surface="prefill_only",
+            ),
+            make_int8_exception_candidate(
+                layer=0,
+                tensor="fused_qkv",
+                group=0,
+                benefit=100.0,
+                cost=60,
+                surface="decode_only",
+            ),
+            make_int8_exception_candidate(
+                layer=1,
+                tensor="out_proj",
+                group=0,
+                benefit=70.0,
+                cost=30,
+                surface="both",
+            ),
+            make_int8_exception_candidate(
+                layer=2,
+                tensor="unused_alias",
+                group=0,
+                benefit=999.0,
+                cost=1,
+                surface="inactive",
+            ),
+        ]
+    }
+    selected = _select_int8_exception_candidates(
+        report,
+        requested_groups=None,
+        top_groups=None,
+        max_sidecar_bytes=100,
+        max_decode_sidecar_bytes=80,
+        max_prefill_sidecar_bytes=20,
+    )
+    assert [(item["target_tensor"], item["group"]) for item in selected] == [
+        ("out_proj", 0),
+        ("q_proj", 0),
+    ]
+    assert all(item["target_tensor"] != "unused_alias" for item in selected)
+    assert sum(item["cost"]["runtime_total_bytes"] for item in selected) <= 100
 
 
 def test_hqq8_rejects_self_calibration_and_sidecar_workflows() -> None:
@@ -608,6 +769,79 @@ def test_int8_exception_candidates_are_intrinsic_and_non_loadable() -> None:
             ),
             "No fallback to baseline is allowed",
         )
+
+
+def test_int8_exception_candidate_build_rejects_shared_train_heldout_trace() -> None:
+    with isolated_home() as home:
+        model_path = home / "models" / "TinyModel"
+        model_path.mkdir(parents=True)
+        config_path = home / "tiny.conf"
+        trace_path = home / "shared.trace.log"
+        calib_dir = Path(hqq_attention_cache_dir(str(model_path), HQQ_CACHE_PROFILE_SELFCAL_V1)) / "calibration"
+        train_evidence_path = calib_dir / "train_evidence_test.json"
+        heldout_evidence_path = calib_dir / "heldout_evidence_test.json"
+        exception_path = calib_dir / "int8_exception_candidates_test.json"
+        source_contract_path = home / "source_contract_audit.json"
+
+        write_baseline_manifest(model_path)
+        write_config(config_path, model_path)
+        write_trace(trace_path)
+        write_source_contract_audit(source_contract_path, model_path)
+
+        assert hqq_self_calibrate_main(
+            [
+                "--config",
+                str(config_path),
+                "--trace-log",
+                str(trace_path),
+                "--output",
+                str(train_evidence_path),
+                "--duration-seconds",
+                "1",
+            ]
+        ) == 0
+        assert hqq_self_calibrate_main(
+            [
+                "--config",
+                str(config_path),
+                "--trace-log",
+                str(trace_path),
+                "--output",
+                str(heldout_evidence_path),
+                "--duration-seconds",
+                "1",
+            ]
+        ) == 0
+
+        assert_raises_contains(
+            lambda: hqq_self_calibrate_main(
+                [
+                    "--config",
+                    str(config_path),
+                    "--build-int8-exception-candidates",
+                    str(train_evidence_path),
+                    "--heldout-evidence",
+                    str(heldout_evidence_path),
+                    "--source-contract-audit",
+                    str(source_contract_path),
+                    "--output",
+                    str(exception_path),
+                    "--patch-tensors",
+                    "in_proj_qkvz",
+                    "--top-candidates",
+                    "1",
+                ]
+            ),
+            "same trace log",
+        )
+
+
+def test_evidence_trace_log_path_is_unique_per_output() -> None:
+    first = evidence_trace_log_path("/tmp/calibration/train evidence.json")
+    second = evidence_trace_log_path("/tmp/calibration/heldout_evidence.json")
+    assert first.endswith("train_evidence.trace.log")
+    assert second.endswith("heldout_evidence.trace.log")
+    assert first != second
 
 
 def test_refit_evaluation_is_not_loadable_calibrated_manifest() -> None:
@@ -1375,9 +1609,14 @@ def test_sidecar_conflict_search_prefers_zero_regression_then_gain() -> None:
 if __name__ == "__main__":
     if os.environ.get("KRASIS_DEV_SCRIPT") != "1":
         raise SystemExit("ERROR: run via ./dev hqq-self-calibrate-test")
+    test_int8_exception_budget_selection_uses_ratio_and_top_limit()
+    test_int8_exception_budget_rejects_explicit_groups_over_cap()
+    test_int8_exception_split_budget_prefers_decode_and_excludes_inactive()
     test_evidence_file_is_not_loadable_calibrated_manifest()
     test_sensitivity_candidates_are_not_loadable_calibrated_manifest()
     test_int8_exception_candidates_are_intrinsic_and_non_loadable()
+    test_int8_exception_candidate_build_rejects_shared_train_heldout_trace()
+    test_evidence_trace_log_path_is_unique_per_output()
     test_refit_evaluation_is_not_loadable_calibrated_manifest()
     test_sidecar_simulation_is_non_loadable_and_reports_estimates()
     test_sidecar_artifact_writer_stays_separate_from_hqq_manifest()

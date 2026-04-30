@@ -599,6 +599,9 @@ def main():
             "CFG_CPU_EXPERT_BITS": "cpu_expert_bits",
             "CFG_ATTENTION_QUANT": "attention_quant",
             "CFG_HQQ_CACHE_PROFILE": "hqq_cache_profile",
+            "CFG_HQQ_GROUP_SIZE": "hqq_group_size",
+            "CFG_HQQ_AUTO_BUDGET_PCT": "hqq_auto_budget_pct",
+            "CFG_HQQ46_AUTO_BUDGET_MB": "hqq46_auto_budget_mib",
             "CFG_HQQ_SIDECAR_MANIFEST": "hqq_sidecar_manifest",
             "CFG_SHARED_EXPERT_QUANT": "shared_expert_quant",
             "CFG_DENSE_MLP_QUANT": "dense_mlp_quant",
@@ -671,7 +674,7 @@ def main():
         if config_defaults.get("attention_quant") in ("int4", "int8"):
             raise ValueError(
                 f"Unsupported attention_quant={config_defaults['attention_quant']} in {config_path}. "
-                "Naive int4/int8 attention has been removed; use 'awq', 'hqq4', 'hqq8', or 'bf16'."
+                "Naive int4/int8 attention has been removed; use 'awq', 'hqq4', 'hqq46', 'hqq46_auto', 'hqq6', 'hqq68_auto', 'hqq8', or 'bf16'."
             )
         # Expand ~ in model_path
         if "model_path" in config_defaults and isinstance(config_defaults["model_path"], str):
@@ -710,9 +713,15 @@ def main():
     parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bits for CPU decode experts")
     parser.add_argument("--attention-quant", default="bf16", choices=list(ATTENTION_QUANT_CHOICES),
-                        help="Attention weight precision: hqq8 is the quality-first high-fidelity option; bf16, awq, and hqq4 are explicit alternatives")
+                        help="Attention weight precision: hqq8 is quality-first; hqq68_auto is budget-planned mixed HQQ6/HQQ8; hqq6 is packed middle-ground; hqq46_auto is budget-planned mixed HQQ4/HQQ6; hqq46 is fixed-policy mixed; bf16, awq, and hqq4 are explicit alternatives")
     parser.add_argument("--hqq-cache-profile", default="baseline", choices=list(HQQ_CACHE_PROFILE_CHOICES),
                         help="HQQ attention cache profile: baseline (default) or an explicit calibrated profile")
+    parser.add_argument("--hqq-group-size", type=int, default=128, choices=[32, 64, 128],
+                        help="HQQ attention quantization group size; default 128")
+    parser.add_argument("--hqq-auto-budget-pct", type=float, default=None,
+                        help="HQQ auto planner promotion budget as percentage of the base-to-target attention-memory span")
+    parser.add_argument("--hqq46-auto-budget-mib", type=int, default=None,
+                        help="Legacy HQQ4/6 auto planner HQQ6 promotion budget in MiB")
     parser.add_argument("--hqq-sidecar-manifest", default=None,
                         help="Explicit HQQ4-only sidecar manifest; HQQ8 rejects sidecar/self-correction")
     parser.add_argument("--shared-expert-quant", default="int8", choices=["bf16", "int8"],
@@ -898,6 +907,9 @@ def main():
         lm_head=args.lm_head_quant,
         attention=args.attention_quant,
         hqq_cache_profile=args.hqq_cache_profile,
+        hqq_group_size=args.hqq_group_size,
+        hqq_auto_budget_pct=args.hqq_auto_budget_pct,
+        hqq46_auto_budget_mib=args.hqq46_auto_budget_mib,
         hqq_sidecar_manifest=args.hqq_sidecar_manifest,
         shared_expert=args.shared_expert_quant,
         dense_mlp=args.dense_mlp_quant,

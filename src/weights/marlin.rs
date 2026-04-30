@@ -336,6 +336,19 @@ pub struct Hqq8NativeZpMarlinPrefill {
     pub twoscale_intercept_correction: Vec<f32>,
 }
 
+/// HQQ4 weights repacked for Marlin's native U4 + float zero-point path.
+///
+/// This preserves canonical HQQ4 affine semantics:
+/// `(q - zero) * scale`, with unsigned 4-bit `q` values and BF16 zero points
+/// consumed inside the Marlin tiled path.
+pub struct Hqq4NativeZpMarlinPrefill {
+    pub marlin: MarlinRepacked,
+    pub delta_scales: Vec<u16>,
+    pub zeros: Vec<u16>,
+    pub intercept_correction: Vec<f32>,
+    pub twoscale_intercept_correction: Vec<f32>,
+}
+
 /// Generate the Marlin weight permutation table for INT4.
 ///
 /// Returns a 1024-element array mapping destination → source index within a
@@ -1210,6 +1223,154 @@ pub fn marlin_repack_hqq8_native_zp_prefill(
     }
 
     Hqq8NativeZpMarlinPrefill {
+        marlin: MarlinRepacked {
+            packed: out_packed,
+            scales: scales_permuted,
+            k,
+            n,
+            group_size,
+        },
+        delta_scales: delta_scales_permuted,
+        zeros: zeros_permuted,
+        intercept_correction,
+        twoscale_intercept_correction,
+    }
+}
+
+/// Repack canonical HQQ4 row-major packed weights into native Marlin U4 with
+/// BF16 zero points. `packed` is HQQ's raw unsigned 4-bit q values, shape
+/// `[rows, cols/2]`; `scales` and `zeros` are FP32, shape
+/// `[rows, cols/group_size]`.
+pub fn marlin_repack_hqq4_native_zp_prefill(
+    packed: &[u8],
+    scales: &[f32],
+    zeros: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Hqq4NativeZpMarlinPrefill {
+    let t0 = std::time::Instant::now();
+    assert!(group_size > 0, "group_size must be non-zero");
+    assert!(cols % group_size == 0, "cols ({cols}) must be divisible by group_size ({group_size})");
+    assert_eq!(packed.len(), rows * cols / 2);
+    assert_eq!(scales.len(), rows * (cols / group_size));
+    assert_eq!(zeros.len(), scales.len());
+    assert!(cols % MARLIN_TILE == 0, "K ({cols}) must be divisible by {MARLIN_TILE}");
+    assert!(rows % 64 == 0, "N ({rows}) must be divisible by 64 (Marlin tile constraint)");
+
+    let n = rows;
+    let k = cols;
+    let k_tiles = k / MARLIN_TILE;
+    let n_tiles = n / MARLIN_TILE;
+    let row_len = n * MARLIN_TILE;
+
+    let mut unpacked = vec![0u8; n * k];
+    for row in 0..n {
+        let packed_row = &packed[row * (k / 2)..(row + 1) * (k / 2)];
+        for col_pair in 0..(k / 2) {
+            let byte = packed_row[col_pair];
+            unpacked[row * k + col_pair * 2] = byte & 0x0F;
+            unpacked[row * k + col_pair * 2 + 1] = byte >> 4;
+        }
+    }
+
+    let mut permuted = vec![0u8; k_tiles * row_len];
+    for kt in 0..k_tiles {
+        for nt in 0..n_tiles {
+            for tk in 0..MARLIN_TILE {
+                for tn in 0..MARLIN_TILE {
+                    let src_k = kt * MARLIN_TILE + tk;
+                    let src_n = nt * MARLIN_TILE + tn;
+                    let dst_col = nt * MARLIN_TILE * MARLIN_TILE + tk * MARLIN_TILE + tn;
+                    permuted[kt * row_len + dst_col] = unpacked[src_n * k + src_k];
+                }
+            }
+        }
+    }
+
+    let perm = generate_weight_perm_int4();
+    let num_chunks = row_len / 1024;
+    let mut perm_applied = vec![0u8; k_tiles * row_len];
+    for kt in 0..k_tiles {
+        for chunk in 0..num_chunks {
+            let base = kt * row_len + chunk * 1024;
+            for i in 0..1024 {
+                perm_applied[base + i] = permuted[base + perm[i]];
+            }
+        }
+    }
+
+    let out_cols = row_len / PACK_FACTOR;
+    let mut out_packed = vec![0u32; k_tiles * out_cols];
+    for row in 0..k_tiles {
+        for col in 0..out_cols {
+            let mut word: u32 = 0;
+            for i in 0..PACK_FACTOR {
+                let src_col = col * PACK_FACTOR + i;
+                word |= (perm_applied[row * row_len + src_col] as u32) << (i as u32 * 4);
+            }
+            out_packed[row * out_cols + col] = word;
+        }
+    }
+
+    let num_groups_k = k / group_size;
+    let mut scales_transposed = vec![0u16; num_groups_k * n];
+    let mut delta_scales_transposed = vec![0u16; num_groups_k * n];
+    let mut zeros_transposed = vec![0u16; num_groups_k * n];
+    let mut intercept_correction = vec![0.0f32; n * num_groups_k];
+    let mut twoscale_intercept_correction = vec![0.0f32; n * num_groups_k];
+    for row in 0..n {
+        for g in 0..num_groups_k {
+            let idx = row * num_groups_k + g;
+            let scale_bf16 = f32_to_bf16(scales[idx]);
+            let scale_bf16_f32 = bf16_to_f32(scale_bf16);
+            let delta_scale_bf16 = f32_to_bf16(scales[idx] - scale_bf16_f32);
+            let delta_scale_bf16_f32 = bf16_to_f32(delta_scale_bf16);
+            let zero_bf16 = f32_to_bf16(zeros[idx]);
+            scales_transposed[g * n + row] = scale_bf16;
+            delta_scales_transposed[g * n + row] = delta_scale_bf16;
+            zeros_transposed[g * n + row] = zero_bf16;
+            let rounded_intercept = bf16_to_f32(zero_bf16) * bf16_to_f32(scale_bf16);
+            let rounded_twoscale_intercept =
+                bf16_to_f32(zero_bf16) * (scale_bf16_f32 + delta_scale_bf16_f32);
+            let reference_intercept = zeros[idx] * scales[idx];
+            intercept_correction[idx] = rounded_intercept - reference_intercept;
+            twoscale_intercept_correction[idx] =
+                rounded_twoscale_intercept - reference_intercept;
+        }
+    }
+
+    let (scale_perm, scale_perm_single) = generate_scale_perms();
+    let is_grouped = group_size < k;
+    let sperm: &[usize] = if is_grouped { &scale_perm } else { &scale_perm_single };
+    let perm_len = sperm.len();
+    let total_scale_vals = num_groups_k * n;
+    let num_scale_chunks = total_scale_vals / perm_len;
+
+    let mut scales_permuted = vec![0u16; total_scale_vals];
+    let mut delta_scales_permuted = vec![0u16; total_scale_vals];
+    let mut zeros_permuted = vec![0u16; total_scale_vals];
+    for chunk in 0..num_scale_chunks {
+        let base = chunk * perm_len;
+        for i in 0..perm_len {
+            scales_permuted[base + i] = scales_transposed[base + sperm[i]];
+            delta_scales_permuted[base + i] = delta_scales_transposed[base + sperm[i]];
+            zeros_permuted[base + i] = zeros_transposed[base + sperm[i]];
+        }
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static HQQ4_NATIVE_ZP_MARLIN_REPACK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let count = HQQ4_NATIVE_ZP_MARLIN_REPACK_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 5 || count % 384 == 0 {
+        log::info!(
+            "marlin_repack_hqq4_native_zp_prefill [{rows}x{cols}] total={:.1}ms groups={}",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            num_groups_k,
+        );
+    }
+
+    Hqq4NativeZpMarlinPrefill {
         marlin: MarlinRepacked {
             packed: out_packed,
             scales: scales_permuted,

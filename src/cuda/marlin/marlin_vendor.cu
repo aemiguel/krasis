@@ -197,9 +197,10 @@ MarlinFuncPtr get_marlin_kernel(
     auto kernel = MarlinDefault;
     if (false) {}
 
-    // U8 is used for native fused HQQ8 prefill with BF16 zero points.
+    // U4/U8 are used for native fused HQQ4/HQQ8 prefill with BF16 zero points.
     COMMON_GET_IF(sglang::kU4B8)
     COMMON_GET_IF(sglang::kU8B128)
+    COMMON_GET_IF_FLOAT_ZP(sglang::kU4)
     COMMON_GET_IF_FLOAT_ZP(sglang::kU8)
 
     return kernel;
