@@ -1220,9 +1220,14 @@ witness_model_paths() {
             echo "$SCRIPT_DIR/../krasis-internal/reference-outputs/output/Qwen3.5-35B-A3B/greedy_reference.json"
             echo "$HOME/.krasis/witness-gguf/Qwen3.5-35B-A3B-bf16.gguf"
             ;;
+        q122b|qwen122|qwen3.5-122b-a10b)
+            echo "$HOME/.krasis/models/Qwen3.5-122B-A10B"
+            echo "$SCRIPT_DIR/../krasis-internal/reference-outputs/output/Qwen3.5-122B-A10B/greedy_reference.json"
+            echo "$HOME/.krasis/witness-gguf/Qwen3.5-122B-A10B-bf16.gguf"
+            ;;
         *)
             err "Unknown witness model: $model
-  Available: qcn, qwen35"
+  Available: qcn, qwen35, q122b"
             ;;
     esac
 }
@@ -1231,7 +1236,7 @@ do_witness_model_check() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         echo "Usage: ./dev witness-model-check <model> [--hash]"
         echo "  Checks local readiness for BF16 llama-witness capture."
-        echo "  Models: qcn, qwen35"
+        echo "  Models: qcn, qwen35, q122b"
         echo "  --hash computes the GGUF SHA-256 when the expected BF16 file exists."
         return 0
     fi
@@ -1248,7 +1253,7 @@ do_witness_model_check() {
             --help|-h)
                 echo "Usage: ./dev witness-model-check <model> [--hash]"
                 echo "  Checks local readiness for BF16 llama-witness capture."
-                echo "  Models: qcn, qwen35"
+                echo "  Models: qcn, qwen35, q122b"
                 return 0
                 ;;
             *)
@@ -1617,7 +1622,7 @@ do_witness_gguf_preflight() {
         echo "Usage: ./dev witness-gguf-preflight <model> [--output PATH] [--outtype bf16]"
         echo "  Preflights BF16 GGUF witness conversion without starting conversion."
         echo "  Records source files, expected output, resource estimates, converter command, and support gates."
-        echo "  Models: qwen35"
+        echo "  Models: qwen35, q122b"
         return 0
     fi
     [[ $# -lt 1 ]] && err "Usage: ./dev witness-gguf-preflight <model> [--output PATH] [--outtype bf16]"
@@ -1640,7 +1645,7 @@ do_witness_gguf_preflight() {
             --help|-h)
                 echo "Usage: ./dev witness-gguf-preflight <model> [--output PATH] [--outtype bf16]"
                 echo "  Preflights BF16 GGUF witness conversion without starting conversion."
-                echo "  Models: qwen35"
+                echo "  Models: qwen35, q122b"
                 return 0
                 ;;
             *)
@@ -1845,7 +1850,7 @@ do_witness_gguf_convert() {
         echo "  Converts a local safetensors model to BF16 GGUF only after the built preflight gate passes."
         echo "  Writes logs and conversion manifest under logs/witness-gguf-convert_*."
         echo "  Refuses to overwrite an existing expected output unless --force is supplied."
-        echo "  Models: qwen35"
+        echo "  Models: qwen35, q122b"
         return 0
     fi
     [[ $# -lt 1 ]] && err "Usage: ./dev witness-gguf-convert <model> [--output PATH] [--outtype bf16] [--force]"
@@ -1873,7 +1878,7 @@ do_witness_gguf_convert() {
             --help|-h)
                 echo "Usage: ./dev witness-gguf-convert <model> [--output PATH] [--outtype bf16] [--force]"
                 echo "  Converts a local safetensors model to BF16 GGUF only after the built preflight gate passes."
-                echo "  Models: qwen35"
+                echo "  Models: qwen35, q122b"
                 return 0
                 ;;
             *)
@@ -2005,7 +2010,7 @@ do_witness_capture() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         echo "Usage: ./dev witness-capture <model> [--output PATH] [--reference PATH] [--profile ID] [--max-cases N] [validator args...]"
         echo "  Captures llama-witness JSON from stored input_token_ids only."
-        echo "  Models: qcn, qwen35"
+        echo "  Models: qcn, qwen35, q122b"
         return 0
     fi
     [[ $# -lt 1 ]] && err "Usage: ./dev witness-capture <model> [--output PATH] [--reference PATH] [--profile ID] [--max-cases N] [validator args...]
@@ -2022,7 +2027,7 @@ do_witness_capture() {
             --help|-h)
                 echo "Usage: ./dev witness-capture <model> [--output PATH] [--reference PATH] [--profile ID] [--max-cases N] [validator args...]"
                 echo "  Captures llama-witness JSON from stored input_token_ids only."
-                echo "  Models: qcn, qwen35"
+                echo "  Models: qcn, qwen35, q122b"
                 return 0
                 ;;
             --reference)
@@ -2090,9 +2095,9 @@ do_witness_capture() {
 do_witness_inputs() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         echo "Usage: ./dev witness-inputs <model> --prompt-source PATH --output PATH [--profile ID] [validator args...]"
-	        echo "  Tokenizes fixed prompt-source JSON into a stored llama-witness input_token_ids artifact."
-	        echo "  qwen35 requires proven chat-template enable_thinking=false application."
-        echo "  Models: qcn, qwen35"
+        echo "  Tokenizes fixed prompt-source JSON into a stored llama-witness input_token_ids artifact."
+        echo "  Qwen3.5 models require proven chat-template enable_thinking=false application."
+        echo "  Models: qcn, qwen35, q122b"
         return 0
     fi
     [[ $# -lt 1 ]] && err "Usage: ./dev witness-inputs <model> --prompt-source PATH --output PATH [--profile ID] [validator args...]"
@@ -2106,9 +2111,9 @@ do_witness_inputs() {
         case "$1" in
             --help|-h)
                 echo "Usage: ./dev witness-inputs <model> --prompt-source PATH --output PATH [--profile ID] [validator args...]"
-	                echo "  Tokenizes fixed prompt-source JSON into a stored llama-witness input_token_ids artifact."
-	                echo "  qwen35 requires proven chat-template enable_thinking=false application."
-                echo "  Models: qcn, qwen35"
+                echo "  Tokenizes fixed prompt-source JSON into a stored llama-witness input_token_ids artifact."
+                echo "  Qwen3.5 models require proven chat-template enable_thinking=false application."
+                echo "  Models: qcn, qwen35, q122b"
                 return 0
                 ;;
             --prompt-source)
@@ -2138,15 +2143,17 @@ do_witness_inputs() {
     local validator_bin="$WITNESS_REPO/build/bin/llama-witness-validate"
 
     mapfile -t paths < <(witness_model_paths "$model")
-	    local model_dir="${paths[0]}"
-	    local model_gguf="${paths[2]}"
-	    [[ -d "$model_dir" ]] || err "witness model dir not found: $model_dir"
-	    [[ -f "$prompt_source" ]] || err "prompt source not found: $prompt_source"
-	    [[ -f "$model_gguf" ]] || err "witness GGUF not found: $model_gguf"
-	    if [[ "$model" == "qwen35" ]]; then
-	        validator_args+=(--require-thinking-off-proof)
-	    fi
-	    local run_dir
+    local model_dir="${paths[0]}"
+    local model_gguf="${paths[2]}"
+    [[ -d "$model_dir" ]] || err "witness model dir not found: $model_dir"
+    [[ -f "$prompt_source" ]] || err "prompt source not found: $prompt_source"
+    [[ -f "$model_gguf" ]] || err "witness GGUF not found: $model_gguf"
+    case "${model,,}" in
+        qwen35|q35b|qwen3.5-35b-a3b|q122b|qwen122|qwen3.5-122b-a10b)
+            validator_args+=(--require-thinking-off-proof)
+            ;;
+    esac
+    local run_dir
     run_dir=$(create_run_dir "witness-inputs")
     mkdir -p "$(dirname "$output")"
 

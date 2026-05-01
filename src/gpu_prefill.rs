@@ -7494,8 +7494,62 @@ impl PrefillEngine {
                 );
             }
 
-            self.scratch =
-                allocate_scratch_for_prompt(&self.device, &self.config, scratch_tokens, target)?;
+            match allocate_scratch_for_prompt(&self.device, &self.config, scratch_tokens, target) {
+                Ok(scratch) => {
+                    self.scratch = scratch;
+                }
+                Err(e) => {
+                    self.scratch = allocate_scratch(&self.device, &self.config, 0)
+                        .map_err(|reset_e| format!("alloc empty scratch after failed prefill allocation ({e}): {reset_e}"))?;
+                    self.d_cold_staging = None;
+                    self.d_shared_bf16_scratch1 = None;
+                    self.d_shared_bf16_scratch2 = None;
+                    self.d_shared_fp32_scratch = None;
+                    self.d_shared_workspace = None;
+                    self.d_fla_g_cumsum = None;
+                    self.d_fla_a = None;
+                    self.d_fla_ai = None;
+                    self.d_fla_w = None;
+                    self.d_fla_u = None;
+                    self.d_fla_h = None;
+                    self.d_fla_h0 = None;
+                    self.d_fla_final_state = None;
+                    self.d_fla_v_new = None;
+                    self.d_fla_o = None;
+                    unsafe {
+                        cuda_sys::lib().cuCtxSynchronize();
+                    }
+                    unsafe {
+                        let mut pool: cuda_sys::CUmemoryPool = std::ptr::null_mut();
+                        let mut dev: i32 = 0;
+                        cuda_sys::lib().cuCtxGetDevice(&mut dev);
+                        let err = cuda_sys::lib().cuDeviceGetDefaultMemPool(&mut pool, dev);
+                        if err == cuda_sys::CUresult::CUDA_SUCCESS && !pool.is_null() {
+                            let _ = cuda_sys::lib().cuMemPoolTrimTo(pool, 0);
+                        }
+                    }
+                    if scratch_tokens <= 128 {
+                        return Err(e);
+                    }
+                    let next_tokens = (scratch_tokens / 2).max(128);
+                    if debug_prefill || stderr_debug_enabled() {
+                        eprintln!(
+                            "[PREFILL] Retry chunk size {} -> {} after allocation failure on attempt {}: {}",
+                            scratch_tokens, next_tokens, attempt, e
+                        );
+                    }
+                    trace_emit_prefill_global_mark(
+                        self.trace.as_ref(),
+                        "prefill",
+                        &format!(
+                            "phase=alloc_failure attempt={} scratch_tokens={} next_tokens={} error={:?}",
+                            attempt, scratch_tokens, next_tokens, e
+                        ),
+                    );
+                    scratch_tokens = next_tokens;
+                    continue;
+                }
+            }
 
             unsafe {
                 cuda_sys::lib().cuCtxSynchronize();
