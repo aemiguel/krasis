@@ -3888,6 +3888,15 @@ struct GpuDecodeGraph {
     t_graph_cold_dma: f64,    // cold expert DMA + copy_stream sync
     t_graph_upload: f64,      // batch pointer upload H2D
     t_graph_launch: f64,      // cuGraphLaunch calls (just the CPU-side launch cost)
+    graph_internal_timing: bool,
+    graph_timing_events: Option<DecodeGraphTimingEvents>,
+    t_graph_segment_total: f64,   // captured graph event elapsed time
+    t_graph_segment_expert: f64,  // expert-compute region inside captured graphs
+    t_graph_segment_routing: f64, // routing/attention/gate region inside captured graphs
+    t_graph_segment_final: f64,   // final norm + LM head region inside captured graphs
+    graph_segment_labels: Vec<String>,
+    graph_segment_kinds: Vec<u8>,
+    graph_segment_elapsed: Vec<f64>,
     // DMA instrumentation (accumulated across all layers per token, then across tokens)
     dma_bytes_total: u64,    // total bytes DMA'd (cold experts only)
     dma_call_count: u64,     // number of cuMemcpyHtoDAsync calls
@@ -4057,6 +4066,148 @@ unsafe impl Sync for CudaFunc {}
 struct CudaGraphExecPtr(CUgraphExec);
 unsafe impl Send for CudaGraphExecPtr {}
 unsafe impl Sync for CudaGraphExecPtr {}
+
+struct DecodeGraphEventSet {
+    start: Vec<CudaEvent>,
+    end: Vec<CudaEvent>,
+}
+
+struct DecodeGraphTimingEvents {
+    total: DecodeGraphEventSet,
+    expert: DecodeGraphEventSet,
+    routing: DecodeGraphEventSet,
+    final_part: DecodeGraphEventSet,
+}
+
+impl DecodeGraphEventSet {
+    fn new(num_graphs: usize) -> Result<Self, String> {
+        let mut start = Vec::with_capacity(num_graphs);
+        let mut end = Vec::with_capacity(num_graphs);
+        for _ in 0..num_graphs {
+            start.push(create_decode_timing_event()?);
+            end.push(create_decode_timing_event()?);
+        }
+        Ok(Self { start, end })
+    }
+
+    fn record_start(&self, graph_idx: usize, stream: cuda_sys::CUstream) -> Result<(), String> {
+        self.record(graph_idx, stream, true)
+    }
+
+    fn record_end(&self, graph_idx: usize, stream: cuda_sys::CUstream) -> Result<(), String> {
+        self.record(graph_idx, stream, false)
+    }
+
+    fn record(&self, graph_idx: usize, stream: cuda_sys::CUstream, start: bool) -> Result<(), String> {
+        let events = if start { &self.start } else { &self.end };
+        let Some(ev) = events.get(graph_idx) else {
+            return Err(format!("decode graph timing event OOB graph_idx={}", graph_idx));
+        };
+        let err = unsafe { cuda_sys::lib().cuEventRecord(ev.0, stream) };
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!("decode graph timing cuEventRecord graph_idx={} start={}: {:?}", graph_idx, start, err));
+        }
+        Ok(())
+    }
+
+    fn elapsed_ms(&self, graph_idx: usize) -> Result<f64, String> {
+        let Some(start) = self.start.get(graph_idx) else {
+            return Err(format!("decode graph timing elapsed start OOB graph_idx={}", graph_idx));
+        };
+        let Some(end) = self.end.get(graph_idx) else {
+            return Err(format!("decode graph timing elapsed end OOB graph_idx={}", graph_idx));
+        };
+        let mut ms = 0.0f32;
+        let err = unsafe { cuda_sys::lib().cuEventElapsedTime(&mut ms as *mut f32, start.0, end.0) };
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!("decode graph timing cuEventElapsedTime graph_idx={}: {:?}", graph_idx, err));
+        }
+        Ok(ms as f64)
+    }
+}
+
+impl DecodeGraphTimingEvents {
+    fn new(num_graphs: usize) -> Result<Self, String> {
+        Ok(Self {
+            total: DecodeGraphEventSet::new(num_graphs)?,
+            expert: DecodeGraphEventSet::new(num_graphs)?,
+            routing: DecodeGraphEventSet::new(num_graphs)?,
+            final_part: DecodeGraphEventSet::new(num_graphs)?,
+        })
+    }
+
+    fn destroy(&self) {
+        for set in [&self.total, &self.expert, &self.routing, &self.final_part] {
+            for ev in set.start.iter().chain(set.end.iter()) {
+                if !ev.0.is_null() {
+                    unsafe {
+                        let _ = cuda_sys::lib().cuEventDestroy_v2(ev.0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn create_decode_timing_event() -> Result<CudaEvent, String> {
+    let mut ev: cuda_sys::CUevent = std::ptr::null_mut();
+    let err = unsafe { cuda_sys::lib().cuEventCreate(&mut ev, 0) };
+    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+        return Err(format!("cuEventCreate decode graph timing: {:?}", err));
+    }
+    Ok(CudaEvent(ev))
+}
+
+const GRAPH_SEG_FIRST_ROUTE: u8 = 0;
+const GRAPH_SEG_ROUTE_LA: u8 = 1;
+const GRAPH_SEG_ROUTE_GQA: u8 = 2;
+const GRAPH_SEG_ROUTE_MLA: u8 = 3;
+const GRAPH_SEG_ROUTE_MAMBA: u8 = 4;
+const GRAPH_SEG_ROUTE_OTHER: u8 = 5;
+const GRAPH_SEG_FINAL: u8 = 6;
+
+fn decode_graph_route_kind(graph: &GpuDecodeGraph, layer_idx: usize) -> (&'static str, u8) {
+    match graph.layers.get(layer_idx).map(|layer| &layer.attn) {
+        Some(GpuAttnConfig::LinearAttention { .. }) => ("LA", GRAPH_SEG_ROUTE_LA),
+        Some(GpuAttnConfig::GQA { .. }) => ("GQA", GRAPH_SEG_ROUTE_GQA),
+        Some(GpuAttnConfig::MLA { .. }) => ("MLA", GRAPH_SEG_ROUTE_MLA),
+        Some(GpuAttnConfig::Mamba2 { .. }) => ("Mamba2", GRAPH_SEG_ROUTE_MAMBA),
+        None => ("unknown", GRAPH_SEG_ROUTE_OTHER),
+    }
+}
+
+fn decode_graph_segment_timing_label(
+    graph: &GpuDecodeGraph,
+    graph_idx: usize,
+    moe_indices: &[usize],
+) -> (u8, String) {
+    let num_moe = moe_indices.len();
+    if graph_idx == 0 {
+        let route_layer = moe_indices.first().copied().unwrap_or(0);
+        let (route_name, _) = decode_graph_route_kind(graph, route_layer);
+        return (
+            GRAPH_SEG_FIRST_ROUTE,
+            format!("graph{} first route L{} {}", graph_idx, route_layer, route_name),
+        );
+    }
+    if graph_idx == num_moe {
+        let expert_layer = moe_indices.last().copied().unwrap_or(0);
+        return (
+            GRAPH_SEG_FINAL,
+            format!("graph{} experts L{} + final", graph_idx, expert_layer),
+        );
+    }
+    let expert_layer = moe_indices.get(graph_idx - 1).copied().unwrap_or(0);
+    let route_layer = moe_indices.get(graph_idx).copied().unwrap_or(expert_layer);
+    let (route_name, route_kind) = decode_graph_route_kind(graph, route_layer);
+    (
+        route_kind,
+        format!(
+            "graph{} experts L{} + route L{} {}",
+            graph_idx, expert_layer, route_layer, route_name,
+        ),
+    )
+}
 
 /// Single-slot AWQ: one GPU allocation per weight, shared between Marlin (prefill) and
 /// simple INT4 (decode). Host copies of both formats are kept for DMA swaps.
@@ -7089,6 +7240,15 @@ impl GpuDecodeStore {
             t_graph_cold_dma: 0.0,
             t_graph_upload: 0.0,
             t_graph_launch: 0.0,
+            graph_internal_timing: false,
+            graph_timing_events: None,
+            t_graph_segment_total: 0.0,
+            t_graph_segment_expert: 0.0,
+            t_graph_segment_routing: 0.0,
+            t_graph_segment_final: 0.0,
+            graph_segment_labels: Vec::new(),
+            graph_segment_kinds: Vec::new(),
+            graph_segment_elapsed: Vec::new(),
             dma_bytes_total: 0,
             dma_call_count: 0,
             dma_cold_experts: 0,
@@ -8679,6 +8839,13 @@ impl GpuDecodeStore {
                 graph.t_graph_cold_dma = 0.0;
                 graph.t_graph_upload = 0.0;
                 graph.t_graph_launch = 0.0;
+                graph.t_graph_segment_total = 0.0;
+                graph.t_graph_segment_expert = 0.0;
+                graph.t_graph_segment_routing = 0.0;
+                graph.t_graph_segment_final = 0.0;
+                for elapsed in &mut graph.graph_segment_elapsed {
+                    *elapsed = 0.0;
+                }
                 graph.dma_bytes_total = 0;
                 graph.dma_call_count = 0;
                 graph.dma_cold_experts = 0;
@@ -14380,6 +14547,14 @@ impl GpuDecodeStore {
             t_gqa_fa2: std::cell::Cell::new(0.0),
             t_gqa_gate: std::cell::Cell::new(0.0),
             t_gqa_oproj: std::cell::Cell::new(0.0),
+            t_hqq_marlin_float_zp: std::cell::Cell::new(0.0),
+            t_hqq_group_sums: std::cell::Cell::new(0.0),
+            t_hqq_correction_gemm: std::cell::Cell::new(0.0),
+            t_hqq_correction_add: std::cell::Cell::new(0.0),
+            hqq_marlin_float_zp_calls: std::cell::Cell::new(0),
+            hqq_group_sum_calls: std::cell::Cell::new(0),
+            hqq_correction_gemm_calls: std::cell::Cell::new(0),
+            hqq_correction_add_calls: std::cell::Cell::new(0),
             gqa_fa2_calls: std::cell::Cell::new(0),
             gqa_fp8_calls: std::cell::Cell::new(0),
             gqa_bf16_calls: std::cell::Cell::new(0),
@@ -14388,16 +14563,30 @@ impl GpuDecodeStore {
             gqa_kv_cross_current_tokens: std::cell::Cell::new(0),
             gqa_kv_cross_total_tokens: std::cell::Cell::new(0),
             t_la_proj: std::cell::Cell::new(0.0),
+            t_la_qkvz_proj: std::cell::Cell::new(0.0),
+            t_la_ba_proj: std::cell::Cell::new(0.0),
             t_la_uninterleave: std::cell::Cell::new(0.0),
             t_la_conv: std::cell::Cell::new(0.0),
             t_la_prep: std::cell::Cell::new(0.0),
             t_la_convert: std::cell::Cell::new(0.0),
             t_la_fla: std::cell::Cell::new(0.0),
+            t_la_fla_cumsum: std::cell::Cell::new(0.0),
+            t_la_fla_kkt: std::cell::Cell::new(0.0),
+            t_la_fla_solve: std::cell::Cell::new(0.0),
+            t_la_fla_wy: std::cell::Cell::new(0.0),
+            t_la_fla_state: std::cell::Cell::new(0.0),
+            t_la_fla_output: std::cell::Cell::new(0.0),
             t_la_postfla: std::cell::Cell::new(0.0),
             t_la_norm: std::cell::Cell::new(0.0),
             t_la_oproj: std::cell::Cell::new(0.0),
             t_moe_gate: std::cell::Cell::new(0.0),
             t_moe_dma: std::cell::Cell::new(0.0),
+            t_moe_route_d2h: std::cell::Cell::new(0.0),
+            t_moe_ptr_alloc: std::cell::Cell::new(0.0),
+            t_moe_ptr_build: std::cell::Cell::new(0.0),
+            t_moe_cold_h2d: std::cell::Cell::new(0.0),
+            t_moe_ptr_upload: std::cell::Cell::new(0.0),
+            t_moe_dma_wait: std::cell::Cell::new(0.0),
             t_moe_w1: std::cell::Cell::new(0.0),
             t_moe_w2: std::cell::Cell::new(0.0),
             t_moe_scatter: std::cell::Cell::new(0.0),
@@ -15465,6 +15654,9 @@ impl GpuDecodeStore {
         for exec in graph.per_layer_graphs.drain(..) {
             unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
         }
+        if let Some(events) = graph.graph_timing_events.take() {
+            events.destroy();
+        }
         graph.per_layer_graphs_valid = false;
 
         // Identify which layers have MoE data (within our range)
@@ -15479,6 +15671,28 @@ impl GpuDecodeStore {
         graph.per_layer_moe_indices = moe_indices.clone();
         let num_moe = moe_indices.len();
         let num_graphs = num_moe + 1; // routing(0) + (num_moe-1) combined + final
+        graph.graph_internal_timing = graph.timing_enabled
+            && std::env::var("KRASIS_DECODE_GRAPH_INTERNAL_TIMING")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        if graph.graph_internal_timing {
+            graph.graph_timing_events = Some(DecodeGraphTimingEvents::new(num_graphs)?);
+            graph.graph_segment_labels.clear();
+            graph.graph_segment_kinds.clear();
+            graph.graph_segment_elapsed.clear();
+            graph.graph_segment_labels.reserve(num_graphs);
+            graph.graph_segment_kinds.reserve(num_graphs);
+            graph.graph_segment_elapsed.resize(num_graphs, 0.0);
+            for graph_idx in 0..num_graphs {
+                let (kind, label) = decode_graph_segment_timing_label(&graph, graph_idx, &moe_indices);
+                graph.graph_segment_kinds.push(kind);
+                graph.graph_segment_labels.push(label);
+            }
+        } else {
+            graph.graph_segment_labels.clear();
+            graph.graph_segment_kinds.clear();
+            graph.graph_segment_elapsed.clear();
+        }
 
         trace_emit_global_mark(
             trace_cfg.as_ref(),
@@ -15842,7 +16056,7 @@ impl GpuDecodeStore {
 
         // moe_seq_idx: the index of the MoE layer being routed in this segment
         let moe_seq_idx = if !is_last { graph_idx } else { 0 };
-        self.run_segment_kernels(graph, expert_layer, routing_range, include_embedding, include_final, moe_seq_idx)
+        self.run_segment_kernels(graph, graph_idx, expert_layer, routing_range, include_embedding, include_final, moe_seq_idx)
     }
 
     /// Run the actual kernels for one graph segment.
@@ -15854,6 +16068,7 @@ impl GpuDecodeStore {
     fn run_segment_kernels(
         &self,
         graph: &mut GpuDecodeGraph,
+        graph_idx: usize,
         expert_layer: Option<usize>,
         routing_range: Option<(usize, usize)>,
         include_embedding: bool,
@@ -15867,7 +16082,6 @@ impl GpuDecodeStore {
         let eps = graph.eps;
         let k = graph.kernels.as_ref()
             .ok_or_else(|| "Kernels not cached".to_string())?.clone();
-
         let intermediate = graph.moe_intermediate_size;
         let shared_intermediate = graph.shared_expert_intermediate_size;
         let gs = graph.group_size;
@@ -15937,14 +16151,6 @@ impl GpuDecodeStore {
                         ((target + effective - 1) / effective).clamp(1, w13_max_ksplits.min(8))
                     }
                 } else { 1 };
-                let use_v2_w13 = w13_ksplits_batched > 1;
-                if !use_v2_w13 {
-                    return Err(format!(
-                        "graph replay MoE layer {} requires batched v2 Marlin path, but computed k_splits={}; use ungraphed decode for this shape",
-                        layer_idx, w13_ksplits_batched
-                    ));
-                }
-
                 let max_ept = graph.max_experts_per_tok;
                 let d_upload_base = *graph.d_batch_upload.device_ptr();
                 let ptr_stride = max_ept * 8;
@@ -15955,48 +16161,48 @@ impl GpuDecodeStore {
                 let d_wts = d_upload_base + (ptr_stride * 4) as u64;
 
                 // Batched w13 GEMV v2
-                if use_v2_w13 {
-                    let w13_n_tiles = (w13_n + 15) / 16;
-                    let w13_smem = (expert_hs * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
-                    let w13_kernel = if is_int8 {
-                        k.marlin_gemv_int8_v2_batched.clone()
-                    } else {
-                        k.marlin_gemv_int4_v2_batched.clone()
-                    };
-                    unsafe {
-                        w13_kernel.launch(
-                            LaunchConfig {
-                                grid_dim: (w13_n_tiles as u32, w13_ksplits_batched as u32, topk as u32),
-                                block_dim: (256, 1, 1),
-                                shared_mem_bytes: w13_smem,
-                            },
-                            (
-                                d_w13p, d_w13s,
-                                expert_input_ptr,
-                                *graph.d_batch_partials.device_ptr(),
-                                inv_wp, inv_sp,
-                                expert_hs as i32, w13_n as i32, gs as i32, w13_ksplits_batched as i32,
-                                d_wts,
-                            ),
-                        ).map_err(|e| format!("batched w13 v2[{}]: {:?}", layer_idx, e))?;
-                    }
+                let w13_n_tiles = (w13_n + 15) / 16;
+                let w13_smem = (expert_hs * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
+                let w13_kernel = if is_int8 {
+                    k.marlin_gemv_int8_v2_batched.clone()
+                } else {
+                    k.marlin_gemv_int4_v2_batched.clone()
+                };
+                unsafe {
+                    w13_kernel.launch(
+                        LaunchConfig {
+                            grid_dim: (w13_n_tiles as u32, w13_ksplits_batched as u32, topk as u32),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: w13_smem,
+                        },
+                        (
+                            d_w13p, d_w13s,
+                            expert_input_ptr,
+                            *graph.d_batch_partials.device_ptr(),
+                            inv_wp, inv_sp,
+                            expert_hs as i32, w13_n as i32, gs as i32, w13_ksplits_batched as i32,
+                            d_wts,
+                        ),
+                    ).map_err(|e| format!("batched w13 v2[{}]: {:?}", layer_idx, e))?;
+                }
 
-                    // Batched reduce
-                    unsafe {
-                        k.reduce_ksplits_bf16_batched.clone().launch(
-                            LaunchConfig {
-                                grid_dim: (((w13_n + 255) / 256) as u32, 1, topk as u32),
-                                block_dim: (256, 1, 1),
-                                shared_mem_bytes: 0,
-                            },
-                            (
-                                *graph.d_batch_gate_ups.device_ptr(),
-                                *graph.d_batch_partials.device_ptr(),
-                                w13_n as i32, w13_ksplits_batched as i32,
-                                d_wts,
-                            ),
-                        ).map_err(|e| format!("batched reduce[{}]: {:?}", layer_idx, e))?;
-                    }
+                // Batched reduce. Keep the same reduction kernel even when
+                // k_splits == 1 so the graph path stays grouped for small-K
+                // expert shapes instead of falling back or failing capture.
+                unsafe {
+                    k.reduce_ksplits_bf16_batched.clone().launch(
+                        LaunchConfig {
+                            grid_dim: (((w13_n + 255) / 256) as u32, 1, topk as u32),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        (
+                            *graph.d_batch_gate_ups.device_ptr(),
+                            *graph.d_batch_partials.device_ptr(),
+                            w13_n as i32, w13_ksplits_batched as i32,
+                            d_wts,
+                        ),
+                    ).map_err(|e| format!("batched reduce[{}]: {:?}", layer_idx, e))?;
                 }
 
                 // Batched activation + w2
@@ -17538,7 +17744,6 @@ impl GpuDecodeStore {
                 }
             }
         }
-
         Ok(())
     }
 
@@ -17643,9 +17848,15 @@ impl GpuDecodeStore {
             // Just launch all graphs back-to-back on the same stream.
             for graph_idx in 0..num_graphs {
                 let exec = &graph.per_layer_graphs[graph_idx];
+                if let Some(events) = graph.graph_timing_events.as_ref() {
+                    events.total.record_start(graph_idx, replay_stream)?;
+                }
                 let err = unsafe { cuda_sys::lib().cuGraphLaunch(exec.0, replay_stream) };
                 if err != cuda_sys::CUresult::CUDA_SUCCESS {
                     return Err(format!("cuGraphLaunch[{}]: {:?}", graph_idx, err));
+                }
+                if let Some(events) = graph.graph_timing_events.as_ref() {
+                    events.total.record_end(graph_idx, replay_stream)?;
                 }
             }
 
@@ -17654,6 +17865,32 @@ impl GpuDecodeStore {
                 let err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
                 if err != cuda_sys::CUresult::CUDA_SUCCESS {
                     return Err(format!("mapped reads final sync: {:?}", err));
+                }
+            }
+            if graph.graph_internal_timing {
+                if let Some(events) = graph.graph_timing_events.as_ref() {
+                    let mut total_ms = 0.0f64;
+                    let mut first_ms = 0.0f64;
+                    let mut middle_ms = 0.0f64;
+                    let mut last_ms = 0.0f64;
+                    for idx in 0..num_graphs {
+                        let elapsed = events.total.elapsed_ms(idx)?;
+                        if let Some(slot) = graph.graph_segment_elapsed.get_mut(idx) {
+                            *slot += elapsed / 1000.0;
+                        }
+                        total_ms += elapsed;
+                        if idx == 0 {
+                            first_ms += elapsed;
+                        } else if idx + 1 == num_graphs {
+                            last_ms += elapsed;
+                        } else {
+                            middle_ms += elapsed;
+                        }
+                    }
+                    graph.t_graph_segment_total += total_ms / 1000.0;
+                    graph.t_graph_segment_routing += first_ms / 1000.0;
+                    graph.t_graph_segment_expert += middle_ms / 1000.0;
+                    graph.t_graph_segment_final += last_ms / 1000.0;
                 }
             }
 
@@ -18068,9 +18305,15 @@ impl GpuDecodeStore {
             // ── Replay graph ──
             let t_launch_start = if timing { Some(std::time::Instant::now()) } else { None };
             let exec = &graph.per_layer_graphs[graph_idx];
+            if let Some(events) = graph.graph_timing_events.as_ref() {
+                events.total.record_start(graph_idx, replay_stream)?;
+            }
             let err = unsafe { cuda_sys::lib().cuGraphLaunch(exec.0, replay_stream) };
             if err != cuda_sys::CUresult::CUDA_SUCCESS {
                 return Err(format!("cuGraphLaunch[{}]: {:?}", graph_idx, err));
+            }
+            if let Some(events) = graph.graph_timing_events.as_ref() {
+                events.total.record_end(graph_idx, replay_stream)?;
             }
             if let Some(t) = t_launch_start {
                 graph.t_graph_launch += t.elapsed().as_secs_f64();
@@ -18099,6 +18342,32 @@ impl GpuDecodeStore {
             let err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
             if err != cuda_sys::CUresult::CUDA_SUCCESS {
                 return Err(format!("final sync: {:?}", err));
+            }
+        }
+        if graph.graph_internal_timing {
+            if let Some(events) = graph.graph_timing_events.as_ref() {
+                let mut total_ms = 0.0f64;
+                let mut first_ms = 0.0f64;
+                let mut middle_ms = 0.0f64;
+                let mut last_ms = 0.0f64;
+                for idx in 0..num_graphs {
+                    let elapsed = events.total.elapsed_ms(idx)?;
+                    if let Some(slot) = graph.graph_segment_elapsed.get_mut(idx) {
+                        *slot += elapsed / 1000.0;
+                    }
+                    total_ms += elapsed;
+                    if idx == 0 {
+                        first_ms += elapsed;
+                    } else if idx + 1 == num_graphs {
+                        last_ms += elapsed;
+                    } else {
+                        middle_ms += elapsed;
+                    }
+                }
+                graph.t_graph_segment_total += total_ms / 1000.0;
+                graph.t_graph_segment_routing += first_ms / 1000.0;
+                graph.t_graph_segment_expert += middle_ms / 1000.0;
+                graph.t_graph_segment_final += last_ms / 1000.0;
             }
         }
 
@@ -24549,6 +24818,11 @@ impl GpuDecodeStore {
                 g.t_graph_sync_wait = 0.0; g.t_graph_classify = 0.0;
                 g.t_graph_cold_dma = 0.0; g.t_graph_upload = 0.0;
                 g.t_graph_launch = 0.0;
+                g.t_graph_segment_total = 0.0; g.t_graph_segment_expert = 0.0;
+                g.t_graph_segment_routing = 0.0; g.t_graph_segment_final = 0.0;
+                for elapsed in &mut g.graph_segment_elapsed {
+                    *elapsed = 0.0;
+                }
             }
         }
 
@@ -25376,6 +25650,90 @@ impl GpuDecodeStore {
                     eprintln!("  \x1b[36m│\x1b[0m    Cold DMA:    {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_cold_dma, avg_cold_dma / avg_total * 100.0);
                     eprintln!("  \x1b[36m│\x1b[0m    Upload:      {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_upload, avg_upload / avg_total * 100.0);
                     eprintln!("  \x1b[36m│\x1b[0m    Launch:      {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_launch, avg_launch / avg_total * 100.0);
+                    if graph.graph_internal_timing && graph.t_graph_segment_total > 0.0 {
+                        let avg_seg_total = graph.t_graph_segment_total / n * 1000.0;
+                        let avg_seg_expert = graph.t_graph_segment_expert / n * 1000.0;
+                        let avg_seg_routing = graph.t_graph_segment_routing / n * 1000.0;
+                        let avg_seg_final = graph.t_graph_segment_final / n * 1000.0;
+                        let avg_seg_other = avg_seg_total - avg_seg_expert - avg_seg_routing - avg_seg_final;
+                        eprintln!("  \x1b[36m│\x1b[0m  Graph replay segment CUDA events:            \x1b[36m│\x1b[0m");
+                        eprintln!("  \x1b[36m│\x1b[0m    Segment total:{:6.2} ms                  \x1b[36m│\x1b[0m", avg_seg_total);
+                        eprintln!("  \x1b[36m│\x1b[0m    First route: {:6.2} ms  ({:4.1}%)        \x1b[36m│\x1b[0m", avg_seg_routing, if avg_seg_total > 0.001 { avg_seg_routing / avg_seg_total * 100.0 } else { 0.0 });
+                        eprintln!("  \x1b[36m│\x1b[0m    Middle segs: {:6.2} ms  ({:4.1}%)        \x1b[36m│\x1b[0m", avg_seg_expert, if avg_seg_total > 0.001 { avg_seg_expert / avg_seg_total * 100.0 } else { 0.0 });
+                        eprintln!("  \x1b[36m│\x1b[0m    Final seg:   {:6.2} ms  ({:4.1}%)        \x1b[36m│\x1b[0m", avg_seg_final, if avg_seg_total > 0.001 { avg_seg_final / avg_seg_total * 100.0 } else { 0.0 });
+                        if avg_seg_other.abs() > 0.01 {
+                            eprintln!("  \x1b[36m│\x1b[0m    Other:       {:6.2} ms                  \x1b[36m│\x1b[0m", avg_seg_other);
+                        }
+                        if !graph.graph_segment_elapsed.is_empty() {
+                            let mut kind_sum = [0.0f64; 7];
+                            let mut kind_count = [0usize; 7];
+                            for (idx, &seconds) in graph.graph_segment_elapsed.iter().enumerate() {
+                                let kind = graph.graph_segment_kinds.get(idx).copied()
+                                    .unwrap_or(GRAPH_SEG_ROUTE_OTHER) as usize;
+                                if kind < kind_sum.len() {
+                                    kind_sum[kind] += seconds;
+                                    kind_count[kind] += 1;
+                                }
+                            }
+                            let print_kind = |name: &str, kind: u8| {
+                                let k = kind as usize;
+                                if kind_count[k] > 0 {
+                                    let total_ms_tok = kind_sum[k] / n * 1000.0;
+                                    let avg_ms_seg = total_ms_tok / kind_count[k] as f64;
+                                    eprintln!(
+                                        "  \x1b[36m│\x1b[0m    {:<11}{:6.2} ms/tok ({:4.2} ms/seg) \x1b[36m│\x1b[0m",
+                                        name, total_ms_tok, avg_ms_seg,
+                                    );
+                                }
+                            };
+                            eprintln!("  \x1b[36m│\x1b[0m  Graph replay typed segment totals:          \x1b[36m│\x1b[0m");
+                            print_kind("First:", GRAPH_SEG_FIRST_ROUTE);
+                            print_kind("LA route:", GRAPH_SEG_ROUTE_LA);
+                            print_kind("GQA route:", GRAPH_SEG_ROUTE_GQA);
+                            print_kind("MLA route:", GRAPH_SEG_ROUTE_MLA);
+                            print_kind("Mamba2:", GRAPH_SEG_ROUTE_MAMBA);
+                            print_kind("Other:", GRAPH_SEG_ROUTE_OTHER);
+                            print_kind("Final:", GRAPH_SEG_FINAL);
+
+                            let mut per_graph: Vec<(usize, f64)> = graph.graph_segment_elapsed
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, &seconds)| (idx, seconds / n * 1000.0))
+                                .collect();
+                            per_graph.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                            let top_segments: Vec<String> = per_graph
+                                .iter()
+                                .take(6)
+                                .map(|(idx, avg_ms)| {
+                                    let label = graph.graph_segment_labels.get(*idx)
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("unlabelled");
+                                    format!("#{}={:.3}ms:{}", idx, avg_ms, label)
+                                })
+                                .collect();
+                            log::info!(
+                                "DECODE GRAPH SEGMENTS avg_ms_per_tok first={:.3} la_route={:.3} gqa_route={:.3} mla_route={:.3} mamba2_route={:.3} other={:.3} final={:.3} top=[{}]",
+                                kind_sum[GRAPH_SEG_FIRST_ROUTE as usize] / n * 1000.0,
+                                kind_sum[GRAPH_SEG_ROUTE_LA as usize] / n * 1000.0,
+                                kind_sum[GRAPH_SEG_ROUTE_GQA as usize] / n * 1000.0,
+                                kind_sum[GRAPH_SEG_ROUTE_MLA as usize] / n * 1000.0,
+                                kind_sum[GRAPH_SEG_ROUTE_MAMBA as usize] / n * 1000.0,
+                                kind_sum[GRAPH_SEG_ROUTE_OTHER as usize] / n * 1000.0,
+                                kind_sum[GRAPH_SEG_FINAL as usize] / n * 1000.0,
+                                top_segments.join("; "),
+                            );
+                            eprintln!("  \x1b[36m│\x1b[0m  Slowest graph replay segments:              \x1b[36m│\x1b[0m");
+                            for (idx, avg_ms) in per_graph.into_iter().take(6) {
+                                let label = graph.graph_segment_labels.get(idx)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("unlabelled");
+                                eprintln!(
+                                    "  \x1b[36m│\x1b[0m    #{:<2} {:6.2} ms  {:<38.38}\x1b[36m│\x1b[0m",
+                                    idx, avg_ms, label,
+                                );
+                            }
+                        }
+                    }
                 }
                 let avg_attn_la = graph.t_attn_la / n * 1000.0;
                 let avg_attn_gqa = graph.t_attn_gqa / n * 1000.0;
@@ -27391,7 +27749,7 @@ impl GpuDecodeStore {
 
         // ── Phase 2: Batched HCS expert compute (4 launches instead of 3*N) ──
         // Runs on default_stream while pre-queued cold DMAs proceed on copy_stream.
-        if hcs_batch_count > 0 && use_v2_w13 && hcs_batch_count >= 2 {
+        if hcs_batch_count >= 2 {
             let t_w13 = Instant::now();
 
             // Pack all pointer arrays + weights into contiguous host buffer, then single H2D
@@ -30955,6 +31313,9 @@ impl Drop for GpuDecodeStore {
                         }
                     }
                 }
+            }
+            if let Some(ref events) = graph.graph_timing_events {
+                events.destroy();
             }
         }
         unsafe {

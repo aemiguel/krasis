@@ -395,27 +395,26 @@ extern "C" __global__ void hqq_prefill_group_sums_bf16_kernel(
     int group_size,
     int groups)
 {
-    __shared__ float smem[256];
+    constexpr int GROUPS_PER_BLOCK = 8;
     int token = blockIdx.x;
-    int group = blockIdx.y;
-    int tid = threadIdx.x;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int group = blockIdx.y * GROUPS_PER_BLOCK + warp;
     if (token >= M || group >= groups) return;
 
     int start = group * group_size;
     int end = min(start + group_size, cols);
     float acc = 0.0f;
     const __nv_bfloat16* x_row = input + (long long)token * cols;
-    for (int col = start + tid; col < end; col += blockDim.x) {
+    for (int col = start + lane; col < end; col += 32) {
         acc += bf16_to_float(x_row[col]);
     }
-    smem[tid] = acc;
-    __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) smem[tid] += smem[tid + stride];
-        __syncthreads();
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
     }
-    if (tid == 0) {
-        group_sums[(long long)token * groups + group] = smem[0];
+    if (lane == 0) {
+        group_sums[(long long)token * groups + group] = acc;
     }
 }
 

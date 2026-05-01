@@ -46,7 +46,7 @@ struct PhiloxCudaState {
 // ---- Stub for C10_CUDA_KERNEL_LAUNCH_CHECK ----
 #define C10_CUDA_KERNEL_LAUNCH_CHECK()                                         \
   do {                                                                         \
-    cudaError_t err = cudaGetLastError();                                       \
+    cudaError_t err = cudaPeekAtLastError();                                   \
     if (err != cudaSuccess) {                                                  \
       fprintf(stderr, "CUDA kernel launch error (%s:%d): %s\n",               \
               __FILE__, __LINE__, cudaGetErrorString(err));                    \

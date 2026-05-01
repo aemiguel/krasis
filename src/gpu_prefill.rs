@@ -2589,6 +2589,8 @@ pub struct FlaKernels {
     pub wy_repr: FlaWyReprFn,
     // 5. chunk_gated_delta_rule_fwd_kernel_h_blockdim64(k, v, w, v_new, g, h, h0, ht, T, grid_x, grid_y, stream)
     pub state_recurrence: FlaStateRecurrenceFn,
+    pub state_recurrence_bv64: Option<FlaStateRecurrenceFn>,
+    pub state_recurrence_bv64_enabled: bool,
     // 6. chunk_fwd_kernel_o(q, k, v, h, g, o, scale, T, grid_x, grid_y, stream)
     pub output: FlaOutputFn,
 }
@@ -3245,6 +3247,14 @@ pub struct PrefillEngine {
     pub t_gqa_fa2: Cell<f64>,      // FlashAttention-2 kernel call
     pub t_gqa_gate: Cell<f64>,     // sigmoid gate (gated attention)
     pub t_gqa_oproj: Cell<f64>,    // O projection GEMM
+    pub t_hqq_marlin_float_zp: Cell<f64>, // HQQ Marlin float-zp projection kernels
+    pub t_hqq_group_sums: Cell<f64>, // HQQ grouped input-sum kernel
+    pub t_hqq_correction_gemm: Cell<f64>, // HQQ correction SGEMM
+    pub t_hqq_correction_add: Cell<f64>, // HQQ correction add-to-BF16 kernel
+    pub hqq_marlin_float_zp_calls: Cell<u64>,
+    pub hqq_group_sum_calls: Cell<u64>,
+    pub hqq_correction_gemm_calls: Cell<u64>,
+    pub hqq_correction_add_calls: Cell<u64>,
     pub gqa_fa2_calls: Cell<u64>,  // number of FA2 calls (for averaging)
     pub gqa_fp8_calls: Cell<u64>,  // how many used FP8 path
     pub gqa_bf16_calls: Cell<u64>, // how many used BF16 dequant path
@@ -3254,17 +3264,31 @@ pub struct PrefillEngine {
     pub gqa_kv_cross_total_tokens: Cell<u64>,
     // LA sub-component timing accumulators
     pub t_la_proj: Cell<f64>,         // in_proj_qkvz + in_proj_ba GEMMs
+    pub t_la_qkvz_proj: Cell<f64>,    // in_proj_qkvz GEMM
+    pub t_la_ba_proj: Cell<f64>,      // in_proj_ba GEMM
     pub t_la_uninterleave: Cell<f64>, // uninterleave qkvz + ba
     pub t_la_conv: Cell<f64>,         // concat + conv1d + split
     pub t_la_prep: Cell<f64>,         // gate/beta + repeat_interleave + l2norm
     pub t_la_convert: Cell<f64>,      // FP32->BF16 conversions for FLA
     pub t_la_fla: Cell<f64>,          // FLA kernel calls (6 steps)
+    pub t_la_fla_cumsum: Cell<f64>,   // FLA gate/cumsum preparation
+    pub t_la_fla_kkt: Cell<f64>,      // FLA KKT kernel
+    pub t_la_fla_solve: Cell<f64>,    // FLA triangular solve
+    pub t_la_fla_wy: Cell<f64>,       // FLA WY representation
+    pub t_la_fla_state: Cell<f64>,    // FLA state recurrence
+    pub t_la_fla_output: Cell<f64>,   // FLA output kernel
     pub t_la_postfla: Cell<f64>,      // BF16->FP32 conversion + state copy
     pub t_la_norm: Cell<f64>,         // gated RMSNorm
     pub t_la_oproj: Cell<f64>,        // output projection GEMM
     // MoE sub-component timing accumulators
     pub t_moe_gate: Cell<f64>,    // gate GEMM + top-k routing + alignment
     pub t_moe_dma: Cell<f64>,     // expert weight DMA + sync
+    pub t_moe_route_d2h: Cell<f64>, // expert-count + sorted-token D2H reads
+    pub t_moe_ptr_alloc: Cell<f64>, // transient pointer table allocation
+    pub t_moe_ptr_build: Cell<f64>, // active expert classification + host table build
+    pub t_moe_cold_h2d: Cell<f64>,  // cold expert H2D enqueue work
+    pub t_moe_ptr_upload: Cell<f64>, // pointer-table upload + copy stream sync
+    pub t_moe_dma_wait: Cell<f64>,  // main-stream wait for DMA event
     pub t_moe_w1: Cell<f64>,      // fused w1 GEMM + activation
     pub t_moe_w2: Cell<f64>,      // fused w2 GEMM
     pub t_moe_scatter: Cell<f64>, // scatter-add + accum_to_bf16
@@ -6020,6 +6044,11 @@ impl PrefillEngine {
             }
         }
 
+        let t0 = if self.gqa_timing_enabled.get() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         unsafe {
             f(
                 a as *const _,
@@ -6052,6 +6081,13 @@ impl PrefillEngine {
                 true,
                 true,
             );
+        }
+        if let Some(t0) = t0 {
+            self.stream_sync()?;
+            self.t_hqq_marlin_float_zp
+                .set(self.t_hqq_marlin_float_zp.get() + t0.elapsed().as_secs_f64() * 1000.0);
+            self.hqq_marlin_float_zp_calls
+                .set(self.hqq_marlin_float_zp_calls.get() + 1);
         }
         Ok(())
     }
@@ -6106,6 +6142,11 @@ impl PrefillEngine {
         }
         let group_sums_ptr = *self.scratch.d_fp32_scratch.device_ptr();
         let threads = 256u32;
+        let t_group = if self.gqa_timing_enabled.get() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let mut s0 = group_sums_ptr;
         let mut s1 = input_ptr;
         let mut s2 = m as i32;
@@ -6115,7 +6156,7 @@ impl PrefillEngine {
         unsafe {
             launch(
                 self.kernels.hqq_prefill_group_sums_bf16,
-                (m as u32, groups as u32, 1),
+                (m as u32, (groups as u32).div_ceil(8), 1),
                 (threads, 1, 1),
                 0,
                 self.stream,
@@ -6129,11 +6170,23 @@ impl PrefillEngine {
                 ],
             )?;
         }
+        if let Some(t_group) = t_group {
+            self.stream_sync()?;
+            self.t_hqq_group_sums
+                .set(self.t_hqq_group_sums.get() + t_group.elapsed().as_secs_f64() * 1000.0);
+            self.hqq_group_sum_calls
+                .set(self.hqq_group_sum_calls.get() + 1);
+        }
 
         let total = m
             .checked_mul(rows)
             .ok_or("HQQ Marlin legacy correction output element count overflow")?;
         let blocks = (total as u32).div_ceil(threads);
+        let t_add = if self.gqa_timing_enabled.get() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let mut c0 = output_ptr;
         let mut c1 = group_sums_ptr;
         let mut c2 = correction_ptr;
@@ -6156,6 +6209,13 @@ impl PrefillEngine {
                     &mut c5 as *mut _ as *mut std::ffi::c_void,
                 ],
             )?;
+        }
+        if let Some(t_add) = t_add {
+            self.stream_sync()?;
+            self.t_hqq_correction_add
+                .set(self.t_hqq_correction_add.get() + t_add.elapsed().as_secs_f64() * 1000.0);
+            self.hqq_correction_add_calls
+                .set(self.hqq_correction_add_calls.get() + 1);
         }
         Ok(())
     }
@@ -6211,6 +6271,11 @@ impl PrefillEngine {
             .ok_or("HQQ Marlin group-sum scratch pointer overflow")?;
 
         let threads = 256u32;
+        let t_group = if self.gqa_timing_enabled.get() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let mut s0 = group_sums_ptr;
         let mut s1 = input_ptr;
         let mut s2 = m as i32;
@@ -6220,7 +6285,7 @@ impl PrefillEngine {
         unsafe {
             launch(
                 self.kernels.hqq_prefill_group_sums_bf16,
-                (m as u32, groups as u32, 1),
+                (m as u32, (groups as u32).div_ceil(8), 1),
                 (threads, 1, 1),
                 0,
                 self.stream,
@@ -6234,9 +6299,21 @@ impl PrefillEngine {
                 ],
             )?;
         }
+        if let Some(t_group) = t_group {
+            self.stream_sync()?;
+            self.t_hqq_group_sums
+                .set(self.t_hqq_group_sums.get() + t_group.elapsed().as_secs_f64() * 1000.0);
+            self.hqq_group_sum_calls
+                .set(self.hqq_group_sum_calls.get() + 1);
+        }
 
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
+        let t_gemm = if self.gqa_timing_enabled.get() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         unsafe {
             cublas_result::set_stream(self.cublas_handle, self.stream as cublas_sys::cudaStream_t)
                 .map_err(|e| format!("cublas set_stream for HQQ correction: {:?}", e))?;
@@ -6263,8 +6340,20 @@ impl PrefillEngine {
             )
             .map_err(|e| format!("HQQ Marlin correction SGEMM: {:?}", e))?;
         }
+        if let Some(t_gemm) = t_gemm {
+            self.stream_sync()?;
+            self.t_hqq_correction_gemm
+                .set(self.t_hqq_correction_gemm.get() + t_gemm.elapsed().as_secs_f64() * 1000.0);
+            self.hqq_correction_gemm_calls
+                .set(self.hqq_correction_gemm_calls.get() + 1);
+        }
 
         let blocks = (correction_elems as u32).div_ceil(threads);
+        let t_add = if self.gqa_timing_enabled.get() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let mut a0 = output_ptr;
         let mut a1 = correction_out_ptr;
         let mut a2 = correction_elems as i32;
@@ -6281,6 +6370,13 @@ impl PrefillEngine {
                     &mut a2 as *mut _ as *mut std::ffi::c_void,
                 ],
             )?;
+        }
+        if let Some(t_add) = t_add {
+            self.stream_sync()?;
+            self.t_hqq_correction_add
+                .set(self.t_hqq_correction_add.get() + t_add.elapsed().as_secs_f64() * 1000.0);
+            self.hqq_correction_add_calls
+                .set(self.hqq_correction_add_calls.get() + 1);
         }
         Ok(())
     }
@@ -7903,6 +7999,14 @@ impl PrefillEngine {
             self.t_gqa_fa2.set(0.0);
             self.t_gqa_gate.set(0.0);
             self.t_gqa_oproj.set(0.0);
+            self.t_hqq_marlin_float_zp.set(0.0);
+            self.t_hqq_group_sums.set(0.0);
+            self.t_hqq_correction_gemm.set(0.0);
+            self.t_hqq_correction_add.set(0.0);
+            self.hqq_marlin_float_zp_calls.set(0);
+            self.hqq_group_sum_calls.set(0);
+            self.hqq_correction_gemm_calls.set(0);
+            self.hqq_correction_add_calls.set(0);
             self.gqa_fa2_calls.set(0);
             self.gqa_fp8_calls.set(0);
             self.gqa_bf16_calls.set(0);
@@ -7911,16 +8015,30 @@ impl PrefillEngine {
             self.gqa_kv_cross_current_tokens.set(0);
             self.gqa_kv_cross_total_tokens.set(0);
             self.t_la_proj.set(0.0);
+            self.t_la_qkvz_proj.set(0.0);
+            self.t_la_ba_proj.set(0.0);
             self.t_la_uninterleave.set(0.0);
             self.t_la_conv.set(0.0);
             self.t_la_prep.set(0.0);
             self.t_la_convert.set(0.0);
             self.t_la_fla.set(0.0);
+            self.t_la_fla_cumsum.set(0.0);
+            self.t_la_fla_kkt.set(0.0);
+            self.t_la_fla_solve.set(0.0);
+            self.t_la_fla_wy.set(0.0);
+            self.t_la_fla_state.set(0.0);
+            self.t_la_fla_output.set(0.0);
             self.t_la_postfla.set(0.0);
             self.t_la_norm.set(0.0);
             self.t_la_oproj.set(0.0);
             self.t_moe_gate.set(0.0);
             self.t_moe_dma.set(0.0);
+            self.t_moe_route_d2h.set(0.0);
+            self.t_moe_ptr_alloc.set(0.0);
+            self.t_moe_ptr_build.set(0.0);
+            self.t_moe_cold_h2d.set(0.0);
+            self.t_moe_ptr_upload.set(0.0);
+            self.t_moe_dma_wait.set(0.0);
             self.t_moe_w1.set(0.0);
             self.t_moe_w2.set(0.0);
             self.t_moe_scatter.set(0.0);
@@ -9776,7 +9894,8 @@ impl PrefillEngine {
                         append_calls
                     );
                 }
-                eprintln!("[PREFILL-TIMING]       fa2:     {:>8.1}ms ({:>5.1}% of gqa)  [{:.1}ms/call avg]",
+                eprintln!("[PREFILL-TIMING]       {:<6} {:>8.1}ms ({:>5.1}% of gqa)  [{:.1}ms/call avg]",
+                    "fa2",
                     gf, if t_gqa_ms > 0.0 { gf / t_gqa_ms * 100.0 } else { 0.0 },
                     if fc > 0 { gf / fc as f64 } else { 0.0 });
                 eprintln!(
@@ -9798,13 +9917,53 @@ impl PrefillEngine {
                     }
                 );
             }
+            let hm = self.t_hqq_marlin_float_zp.get();
+            let hg = self.t_hqq_group_sums.get();
+            let hc = self.t_hqq_correction_gemm.get();
+            let ha = self.t_hqq_correction_add.get();
+            let htotal = hm + hg + hc + ha;
+            let hmc = self.hqq_marlin_float_zp_calls.get();
+            let hgc = self.hqq_group_sum_calls.get();
+            let hcc = self.hqq_correction_gemm_calls.get();
+            let hac = self.hqq_correction_add_calls.get();
+            if htotal > 0.0 || hmc > 0 || hgc > 0 || hcc > 0 || hac > 0 {
+                eprintln!("[PREFILL-TIMING]     hqq projection internals:");
+                eprintln!(
+                    "[PREFILL-TIMING]       marlin_float_zp: {:>8.1}ms over {} calls",
+                    hm,
+                    hmc
+                );
+                eprintln!(
+                    "[PREFILL-TIMING]       group_sums:      {:>8.1}ms over {} calls",
+                    hg,
+                    hgc
+                );
+                eprintln!(
+                    "[PREFILL-TIMING]       correction_gemm: {:>8.1}ms over {} calls",
+                    hc,
+                    hcc
+                );
+                eprintln!(
+                    "[PREFILL-TIMING]       correction_add:  {:>8.1}ms over {} calls",
+                    ha,
+                    hac
+                );
+            }
             // LA sub-component breakdown
             let lp = self.t_la_proj.get();
+            let lp_qkvz = self.t_la_qkvz_proj.get();
+            let lp_ba = self.t_la_ba_proj.get();
             let lu = self.t_la_uninterleave.get();
             let lc = self.t_la_conv.get();
             let lr = self.t_la_prep.get();
             let lv = self.t_la_convert.get();
             let lf = self.t_la_fla.get();
+            let lf_cumsum = self.t_la_fla_cumsum.get();
+            let lf_kkt = self.t_la_fla_kkt.get();
+            let lf_solve = self.t_la_fla_solve.get();
+            let lf_wy = self.t_la_fla_wy.get();
+            let lf_state = self.t_la_fla_state.get();
+            let lf_output = self.t_la_fla_output.get();
             let lo = self.t_la_postfla.get();
             let ln = self.t_la_norm.get();
             let lq = self.t_la_oproj.get();
@@ -9816,6 +9975,13 @@ impl PrefillEngine {
                     lp,
                     lp / t_la_ms * 100.0
                 );
+                if lp_qkvz > 0.0 || lp_ba > 0.0 {
+                    eprintln!(
+                        "[PREFILL-TIMING]         qkvz:    {:>8.1}ms    ba: {:>8.1}ms",
+                        lp_qkvz,
+                        lp_ba
+                    );
+                }
                 eprintln!(
                     "[PREFILL-TIMING]       uninter: {:>8.1}ms ({:>5.1}% of la)",
                     lu,
@@ -9841,6 +10007,20 @@ impl PrefillEngine {
                     lf,
                     lf / t_la_ms * 100.0
                 );
+                if lf_cumsum > 0.0 || lf_kkt > 0.0 || lf_solve > 0.0 || lf_wy > 0.0 || lf_state > 0.0 || lf_output > 0.0 {
+                    eprintln!(
+                        "[PREFILL-TIMING]         fla/cumsum:{:>8.1}ms kkt:{:>8.1}ms solve:{:>8.1}ms",
+                        lf_cumsum,
+                        lf_kkt,
+                        lf_solve
+                    );
+                    eprintln!(
+                        "[PREFILL-TIMING]         fla/wy:    {:>8.1}ms state:{:>8.1}ms output:{:>8.1}ms",
+                        lf_wy,
+                        lf_state,
+                        lf_output
+                    );
+                }
                 eprintln!(
                     "[PREFILL-TIMING]       postfla: {:>8.1}ms ({:>5.1}% of la)",
                     lo,
@@ -9865,6 +10045,12 @@ impl PrefillEngine {
             // MoE sub-component breakdown
             let mg = self.t_moe_gate.get();
             let md = self.t_moe_dma.get();
+            let m_route = self.t_moe_route_d2h.get();
+            let m_alloc = self.t_moe_ptr_alloc.get();
+            let m_build = self.t_moe_ptr_build.get();
+            let m_cold = self.t_moe_cold_h2d.get();
+            let m_upload = self.t_moe_ptr_upload.get();
+            let m_wait = self.t_moe_dma_wait.get();
             let mw1 = self.t_moe_w1.get();
             let mw2 = self.t_moe_w2.get();
             let msc = self.t_moe_scatter.get();
@@ -9890,6 +10076,20 @@ impl PrefillEngine {
                         0.0
                     }
                 );
+                if m_route > 0.0 || m_alloc > 0.0 || m_build > 0.0 || m_cold > 0.0 || m_upload > 0.0 || m_wait > 0.0 {
+                    eprintln!(
+                        "[PREFILL-TIMING]         route_d2h:{:>8.1}ms ptr_alloc:{:>8.1}ms ptr_build:{:>8.1}ms",
+                        m_route,
+                        m_alloc,
+                        m_build
+                    );
+                    eprintln!(
+                        "[PREFILL-TIMING]         cold_h2d: {:>8.1}ms ptr_upload:{:>8.1}ms dma_wait:{:>8.1}ms",
+                        m_cold,
+                        m_upload,
+                        m_wait
+                    );
+                }
                 eprintln!(
                     "[PREFILL-TIMING]       w1+act:  {:>8.1}ms ({:>5.1}% of moe)",
                     mw1,
@@ -11148,7 +11348,7 @@ impl PrefillEngine {
         unsafe {
             launch(
                 self.kernels.hqq_prefill_group_sums_bf16,
-                (m as u32, groups as u32, 1),
+                (m as u32, (groups as u32).div_ceil(8), 1),
                 (threads, 1, 1),
                 0,
                 self.stream,
@@ -12668,11 +12868,17 @@ impl PrefillEngine {
         // Attention: use vendored FlashAttention-2 when available (start_pos==0),
         // otherwise fall back to custom tiled kernel for cross-chunk KV cache support.
         let mut kv_cache_already_stored = false; // Set true by FP8 cross-chunk path
-        if let Some(fa2_fwd) = self.kernels.flash_attn_fwd {
-            if start_pos == 0 {
-                attn_path = "fa2_bf16";
-                // FA2 varlen forward: Q/K/V are [total_q, heads, head_dim] contiguous BF16.
-                // For single-sequence prefill: batch=1, cu_seqlens_q=[0,m], cu_seqlens_k=[0,m].
+        if start_pos == 0 && self.kernels.flash_attn_fwd.is_some() {
+            let gqa_fwd = self
+                .kernels
+                .flash_attn_fwd
+                .expect("checked flash_attn_fwd presence");
+            let gqa_backend_name = "FlashAttention-2";
+            let gqa_path_name = "fa2_bf16_fixed";
+            attn_path = gqa_path_name;
+                // FA2 fixed-length forward for the normal single-sequence prefill path.
+                // Q/K/V are laid out compatibly as [batch=1, seqlen, heads, head_dim].
+                // Cross-chunk/stateful attention keeps the varlen cu_seqlens path below.
                 let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
                 let lse_ptr = self
                     .scratch
@@ -12681,31 +12887,16 @@ impl PrefillEngine {
                     .map(|s| *s.device_ptr() as *mut std::ffi::c_void)
                     .unwrap_or(std::ptr::null_mut());
 
-                // Build cu_seqlens on host and upload (2 ints: [0, m])
-                let cu_data: [i32; 2] = [0, m as i32];
-                let cu_ptr = *self.scratch.d_workspace.device_ptr();
-                unsafe {
-                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        cu_ptr,
-                        cu_data.as_ptr() as *const _,
-                        8,
-                        self.stream,
-                    );
-                }
-
-                if gt {
-                    self.stream_sync()?;
-                }
                 let gt_fa2 = Instant::now();
                 let ret = unsafe {
-                    fa2_fwd(
+                    gqa_fwd(
                         q as *const _,
                         k as *const _,
                         v as *const _,
                         attn_out as *mut _,
                         lse_ptr,
-                        cu_ptr as *const _, // cu_seqlens_q
-                        cu_ptr as *const _, // cu_seqlens_k (same: self-attention)
+                        std::ptr::null(), // cu_seqlens_q: null selects fixed-length mode
+                        std::ptr::null(), // cu_seqlens_k
                         1,                  // batch_size
                         m as i32,           // seqlen_q (max)
                         m as i32,           // seqlen_k (max)
@@ -12716,12 +12907,12 @@ impl PrefillEngine {
                         m as i32, // total_k
                         scale,
                         1, // is_causal
-                        1, // unpadded_lse
+                        0, // unpadded_lse: fixed-length LSE layout
                         self.stream as *mut _,
                     )
                 };
                 if ret != 0 {
-                    return Err(format!("FlashAttention-2 forward failed with code {}", ret));
+                    return Err(format!("{} forward failed with code {}", gqa_backend_name, ret));
                 }
                 if gt {
                     self.stream_sync()?;
@@ -12730,7 +12921,8 @@ impl PrefillEngine {
                     self.gqa_fa2_calls.set(self.gqa_fa2_calls.get() + 1);
                     self.gqa_bf16_calls.set(self.gqa_bf16_calls.get() + 1);
                 }
-            } else if self.kv_format == 2
+        } else if let Some(fa2_fwd) = self.kernels.flash_attn_fwd {
+            if self.kv_format == 2
                 && layer_idx < self.kv_k_radius_ptrs.len()
                 && self.kv_k_radius_ptrs[layer_idx] != 0
             {
@@ -14590,6 +14782,7 @@ impl PrefillEngine {
             );
         }
         // 1. in_proj_qkvz GEMM: [M, hidden] -> [M, qkvz_dim] BF16
+        let lt_qkvz = if lt { Some(Instant::now()) } else { None };
         self.la_gemm(
             layer_idx,
             "in_proj_qkvz",
@@ -14600,6 +14793,11 @@ impl PrefillEngine {
             proj_buf,
             m,
         )?;
+        if let Some(t) = lt_qkvz {
+            self.stream_sync()?;
+            self.t_la_qkvz_proj
+                .set(self.t_la_qkvz_proj.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
         let qkvz_projection_sync_success = if reference_layer1_la_trace {
             self.stream_sync().is_ok()
         } else {
@@ -14930,6 +15128,7 @@ impl PrefillEngine {
             }
 
             // 3. in_proj_ba GEMM: [M, hidden] -> [M, ba_dim] BF16
+            let lt_ba = if lt { Some(Instant::now()) } else { None };
             self.la_gemm(
                 layer_idx,
                 "in_proj_ba",
@@ -14940,6 +15139,11 @@ impl PrefillEngine {
                 proj_buf,
                 m,
             )?;
+            if let Some(t) = lt_ba {
+                self.stream_sync()?;
+                self.t_la_ba_proj
+                    .set(self.t_la_ba_proj.get() + t.elapsed().as_secs_f64() * 1000.0);
+            }
             if trace_la_projection_summary {
                 self.trace_emit_bf16_row_summary(
                     0,
@@ -15881,6 +16085,7 @@ impl PrefillEngine {
                 // la_cumsum expects head-major [nv, num_chunks, BT], while the FLA
                 // kernels consume token-major [T, nv]. Transpose into head-major for
                 // the prefix sum, then transpose the FP32 cumulative gate back.
+                let lt_fla_cumsum = if lt { Some(Instant::now()) } else { None };
                 self.launch_transpose_f32(g_cum_fla, gate_fp32_token_major, fla_total, nv)?;
                 {
                     let mut cs0 = fp32_scratch; // head-major FP32 cumsum scratch
@@ -15904,6 +16109,11 @@ impl PrefillEngine {
                     }
                 }
                 self.launch_transpose_f32(g_cum_fla, fp32_scratch, nv, fla_total)?;
+                if let Some(t) = lt_fla_cumsum {
+                    self.stream_sync()?;
+                    self.t_la_fla_cumsum
+                        .set(self.t_la_fla_cumsum.get() + t.elapsed().as_secs_f64() * 1000.0);
+                }
                 if trace_la_projection_summary {
                     self.trace_emit_f32_row_summary(
                         0,
@@ -16343,6 +16553,7 @@ impl PrefillEngine {
                         }),
                     );
                 }
+                let lt_fla_kkt = if lt { Some(Instant::now()) } else { None };
                 let rc = unsafe {
                     (fla.kkt)(
                         fla_k_bf16,
@@ -16365,6 +16576,11 @@ impl PrefillEngine {
                 };
                 if rc != 0 {
                     return Err(format!("FLA kkt failed: {}", rc));
+                }
+                if let Some(t) = lt_fla_kkt {
+                    self.stream_sync()?;
+                    self.t_la_fla_kkt
+                        .set(self.t_la_fla_kkt.get() + t.elapsed().as_secs_f64() * 1000.0);
                 }
                 if reference_layer1_la_trace {
                     self.push_reference_stage_f32_snapshot(
@@ -16612,6 +16828,7 @@ impl PrefillEngine {
                         }),
                     );
                 }
+                let lt_fla_solve = if lt { Some(Instant::now()) } else { None };
                 let rc = unsafe {
                     (fla.solve_tril)(
                         a_fla,
@@ -16627,6 +16844,11 @@ impl PrefillEngine {
                 };
                 if rc != 0 {
                     return Err(format!("FLA solve_tril failed: {}", rc));
+                }
+                if let Some(t) = lt_fla_solve {
+                    self.stream_sync()?;
+                    self.t_la_fla_solve
+                        .set(self.t_la_fla_solve.get() + t.elapsed().as_secs_f64() * 1000.0);
                 }
                 if reference_layer1_la_trace {
                     self.push_reference_stage_snapshot(
@@ -16854,6 +17076,7 @@ impl PrefillEngine {
                         }),
                     );
                 }
+                let lt_fla_wy = if lt { Some(Instant::now()) } else { None };
                 let rc = unsafe {
                     (fla.wy_repr)(
                         fla_k_bf16,
@@ -16874,6 +17097,11 @@ impl PrefillEngine {
                 };
                 if rc != 0 {
                     return Err(format!("FLA wy_repr failed: {}", rc));
+                }
+                if let Some(t) = lt_fla_wy {
+                    self.stream_sync()?;
+                    self.t_la_fla_wy
+                        .set(self.t_la_fla_wy.get() + t.elapsed().as_secs_f64() * 1000.0);
                 }
                 if reference_layer1_la_trace {
                     self.push_reference_stage_snapshot(
@@ -17165,11 +17393,18 @@ impl PrefillEngine {
                 }
 
                 // Step 5: state_recurrence — k, u, w, g, h0 → h, v_new, ht
-                // Grid: (cdiv(V, BV), B*H) = (cdiv(dv, 32), nv) — BV=32 baked into cubin
+                // Grid: (cdiv(V, BV), B*H); BV is selected by the loaded FLA symbol.
                 // "blockdim64" in the kernel name refers to BT=64 (chunk time dim), NOT BV.
                 // C wrapper params: k, v(=u), w, v_new, g, h, h0, ht, T
                 // h0 is BF16 (zeroed), ht is FP32 — separate buffers to avoid dtype/overlap issues
-                let sr_grid_x = ((dv + 31) / 32) as u32;
+                let state_bv = if fla.state_recurrence_bv64_enabled { 64usize } else { 32usize };
+                let sr_grid_x = ((dv + state_bv - 1) / state_bv) as u32;
+                let state_recurrence = if fla.state_recurrence_bv64_enabled {
+                    fla.state_recurrence_bv64
+                        .ok_or("FLA BV64 state recurrence requested but symbol is not loaded")?
+                } else {
+                    fla.state_recurrence
+                };
                 if reference_layer1_la_trace {
                     let current_chunk = trace_last_pos / fla_bt;
                     let state_row = current_chunk * nv;
@@ -17302,6 +17537,7 @@ impl PrefillEngine {
                                 "grid_x": sr_grid_x,
                                 "grid_y": nv,
                                 "grid_z": 1,
+                                "bv": state_bv,
                             },
                             "sync_before_snapshot": true,
                             "kv_cache_applicable": false,
@@ -17309,8 +17545,9 @@ impl PrefillEngine {
                         }),
                     );
                 }
+                let lt_fla_state = if lt { Some(Instant::now()) } else { None };
                 let rc = unsafe {
-                    (fla.state_recurrence)(
+                    (state_recurrence)(
                         fla_k_bf16, // k (BF16)
                         u_fla,      // v (kernel param) = Python's u (BF16)
                         w_fla,      // w (kernel param) = Python's w (BF16)
@@ -17326,6 +17563,11 @@ impl PrefillEngine {
                 };
                 if rc != 0 {
                     return Err(format!("FLA state_recurrence failed: {}", rc));
+                }
+                if let Some(t) = lt_fla_state {
+                    self.stream_sync()?;
+                    self.t_la_fla_state
+                        .set(self.t_la_fla_state.get() + t.elapsed().as_secs_f64() * 1000.0);
                 }
                 if reference_layer1_la_trace {
                     let current_chunk = trace_last_pos / fla_bt;
@@ -17536,6 +17778,7 @@ impl PrefillEngine {
                         }),
                     );
                 }
+                let lt_fla_output = if lt { Some(Instant::now()) } else { None };
                 let rc = unsafe {
                     (fla.output)(
                         fla_q_bf16, // q (already includes scale from fused repeat+l2norm)
@@ -17557,6 +17800,11 @@ impl PrefillEngine {
                 };
                 if rc != 0 {
                     return Err(format!("FLA output failed: {}", rc));
+                }
+                if let Some(t) = lt_fla_output {
+                    self.stream_sync()?;
+                    self.t_la_fla_output
+                        .set(self.t_la_fla_output.get() + t.elapsed().as_secs_f64() * 1000.0);
                 }
                 if reference_layer1_la_trace {
                     let current_chunk = trace_last_pos / fla_bt;
@@ -20477,6 +20725,7 @@ impl PrefillEngine {
         let mt1 = if mt { Some(Instant::now()) } else { None };
 
         // Download expert counts to determine which experts are active
+        let mt_route_d2h = if mt { Some(Instant::now()) } else { None };
         let mut h_expert_counts = vec![0i32; n_experts];
         unsafe {
             cuda_sys::lib().cuMemcpyDtoH_v2(
@@ -20497,6 +20746,10 @@ impl PrefillEngine {
         }
         let total_sorted = h_num_post[0] as usize;
         let active_experts = h_expert_counts.iter().filter(|&&c| c > 0).count();
+        if let Some(t) = mt_route_d2h {
+            self.t_moe_route_d2h
+                .set(self.t_moe_route_d2h.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
         if diag_moe && layer_idx == 0 {
             eprintln!(
                 "[DIAG MoE L0] selective DMA: {}/{} experts active, total_sorted={}",
@@ -20597,6 +20850,7 @@ impl PrefillEngine {
         // IMPORTANT: Allocate fresh each layer to avoid corruption from cudarc pool
         // overlapping with HCS raw cuMemAlloc_v2. Only 4 * 4KB = 16KB, negligible.
         let ptrs_bytes = n_experts * 8;
+        let mt_ptr_alloc = if mt { Some(Instant::now()) } else { None };
         let (w1_ptrs_gpu, w1s_ptrs_gpu, w2_ptrs_gpu, w2s_ptrs_gpu) = unsafe {
             let mut p1: u64 = 0;
             let mut p2: u64 = 0;
@@ -20608,8 +20862,14 @@ impl PrefillEngine {
             cuda_sys::lib().cuMemAlloc_v2(&mut p4, ptrs_bytes);
             (p1, p2, p3, p4)
         };
+        if let Some(t) = mt_ptr_alloc {
+            self.t_moe_ptr_alloc
+                .set(self.t_moe_ptr_alloc.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
 
         if use_ptr_table {
+            let mt_ptr_build = if mt { Some(Instant::now()) } else { None };
+            let mut cold_h2d_ms = 0.0f64;
             // Build pointer tables for active experts
             let active: Vec<usize> = h_expert_counts
                 .iter()
@@ -20699,6 +20959,7 @@ impl PrefillEngine {
                             let w1s_off = eid * self.w1_scales_per_expert;
                             let w2_off = eid * self.w2_packed_per_expert;
                             let w2s_off = eid * self.w2_scales_per_expert;
+                            let mt_cold = if mt { Some(Instant::now()) } else { None };
                             unsafe {
                                 cuda_sys::lib().cuMemcpyHtoDAsync_v2(
                                     *w1b.device_ptr() + w1_off as u64,
@@ -20725,6 +20986,9 @@ impl PrefillEngine {
                                     self.copy_stream,
                                 );
                             }
+                            if let Some(t) = mt_cold {
+                                cold_h2d_ms += t.elapsed().as_secs_f64() * 1000.0;
+                            }
                             self.h_expert_w1_ptrs[eid] = *w1b.device_ptr() + w1_off as u64;
                             self.h_expert_w1s_ptrs[eid] = *w1sb.device_ptr() + w1s_off as u64;
                             self.h_expert_w2_ptrs[eid] = *w2b.device_ptr() + w2_off as u64;
@@ -20736,6 +21000,7 @@ impl PrefillEngine {
                         let slot_base =
                             cold_staging_base + (cold_slot * self.cold_expert_bytes) as u64;
                         let mut off = 0u64;
+                        let mt_cold = if mt { Some(Instant::now()) } else { None };
                         // w1 packed
                         unsafe {
                             cuda_sys::lib().cuMemcpyHtoDAsync_v2(
@@ -20779,6 +21044,9 @@ impl PrefillEngine {
                             );
                         }
                         self.h_expert_w2s_ptrs[eid] = slot_base + off;
+                        if let Some(t) = mt_cold {
+                            cold_h2d_ms += t.elapsed().as_secs_f64() * 1000.0;
+                        }
                         cold_slot += 1;
                         cold_count += 1;
                     }
@@ -20788,35 +21056,50 @@ impl PrefillEngine {
             trace_pinned_count = pinned_count;
             trace_cold_count = cold_count;
             trace_active_count = active.len();
+            if let Some(t) = mt_ptr_build {
+                let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
+                self.t_moe_ptr_build
+                    .set(self.t_moe_ptr_build.get() + (elapsed_ms - cold_h2d_ms).max(0.0));
+            }
+            if cold_h2d_ms > 0.0 {
+                self.t_moe_cold_h2d
+                    .set(self.t_moe_cold_h2d.get() + cold_h2d_ms);
+            }
 
-            // Upload pointer tables to GPU using SYNCHRONOUS copy.
-            // cudarc pool allocations can be corrupted by HCS raw cuMemAlloc_v2 allocations,
-            // so we must verify the data reaches the correct GPU address.
-            // Expert H2D staging was already on copy_stream; sync it first.
+            // Upload pointer tables on the main stream and order cold expert copies with
+            // a CUDA event. This keeps the CPU out of the copy-stream wait while preserving
+            // the same "pointer table + cold staging ready before MoE GEMM" dependency.
+            let mt_upload = if mt { Some(Instant::now()) } else { None };
             unsafe {
-                cuda_sys::lib().cuStreamSynchronize(self.copy_stream);
-                // Now use synchronous cuMemcpyHtoD on the default stream
-                cuda_sys::lib().cuMemcpyHtoD_v2(
+                cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
                     w1_ptrs_gpu,
                     self.h_expert_w1_ptrs.as_ptr() as *const _,
                     n_experts * 8,
+                    self.stream,
                 );
-                cuda_sys::lib().cuMemcpyHtoD_v2(
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
                     w1s_ptrs_gpu,
                     self.h_expert_w1s_ptrs.as_ptr() as *const _,
                     n_experts * 8,
+                    self.stream,
                 );
-                cuda_sys::lib().cuMemcpyHtoD_v2(
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
                     w2_ptrs_gpu,
                     self.h_expert_w2_ptrs.as_ptr() as *const _,
                     n_experts * 8,
+                    self.stream,
                 );
-                cuda_sys::lib().cuMemcpyHtoD_v2(
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
                     w2s_ptrs_gpu,
                     self.h_expert_w2s_ptrs.as_ptr() as *const _,
                     n_experts * 8,
+                    self.stream,
                 );
-                cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
+            }
+            if let Some(t) = mt_upload {
+                self.t_moe_ptr_upload
+                    .set(self.t_moe_ptr_upload.get() + t.elapsed().as_secs_f64() * 1000.0);
             }
 
             if layer_idx == 0 {
@@ -20899,12 +21182,17 @@ impl PrefillEngine {
         );
 
         // Wait for DMA/pointer table upload to complete (stream dependency)
+        let mt_dma_wait = if mt { Some(Instant::now()) } else { None };
         unsafe {
             cuda_sys::lib().cuStreamWaitEvent(self.stream, self.dma_event, 0);
         }
         if let Some(t) = mt1 {
             // Sync to measure actual DMA wait time (timing mode only)
             self.stream_sync()?;
+            if let Some(wait_t) = mt_dma_wait {
+                self.t_moe_dma_wait
+                    .set(self.t_moe_dma_wait.get() + wait_t.elapsed().as_secs_f64() * 1000.0);
+            }
             self.t_moe_dma
                 .set(self.t_moe_dma.get() + t.elapsed().as_secs_f64() * 1000.0);
         }
@@ -29695,6 +29983,24 @@ Set KRASIS_NO_FLA=1 only if you explicitly want the slower custom LA path."
             }};
         }
 
+        let use_state_bv64 = std::env::var("KRASIS_FLA_STATE_BV64").ok().as_deref() == Some("1");
+        let state_recurrence_bv64 = if use_state_bv64 {
+            let sym = match load_sym_for(
+                "krasis_fla_chunk_gated_delta_rule_fwd_kernel_h_blockdim64_bv64",
+            ) {
+                Ok(sym) => sym,
+                Err(msg) => {
+                    let _ = libc::dlclose(lib);
+                    return fail_or_warn(format!(
+                        "{msg}; KRASIS_FLA_STATE_BV64=1 requires the BV64 FLA sidecar variant"
+                    ));
+                }
+            };
+            Some(std::mem::transmute(sym))
+        } else {
+            None
+        };
+
         let kernels = FlaKernels {
             cumsum: load_fla_sym!("krasis_fla_chunk_local_cumsum_scalar_kernel"),
             kkt: load_fla_sym!("krasis_fla_chunk_scaled_dot_kkt_fwd_kernel"),
@@ -29703,6 +30009,8 @@ Set KRASIS_NO_FLA=1 only if you explicitly want the slower custom LA path."
             state_recurrence: load_fla_sym!(
                 "krasis_fla_chunk_gated_delta_rule_fwd_kernel_h_blockdim64"
             ),
+            state_recurrence_bv64,
+            state_recurrence_bv64_enabled: use_state_bv64,
             output: load_fla_sym!("krasis_fla_chunk_fwd_kernel_o"),
         };
 

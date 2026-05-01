@@ -14,8 +14,32 @@
 #include "hardware_info.h"
 #include "flash.h"
 #include "flash_fwd_kernel.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace FLASH_NAMESPACE {
+
+inline int krasis_hdim128_causal_tile_override() {
+    static int mode = []() {
+        const char *value = std::getenv("KRASIS_FA2_HDIM128_CAUSAL_TILE");
+        if (value == nullptr || value[0] == '\0') {
+            return 0;
+        }
+        if (std::strcmp(value, "64x64") == 0) {
+            return 1;
+        }
+        if (std::strcmp(value, "128x64") == 0) {
+            return 2;
+        }
+        std::fprintf(
+            stderr,
+            "KRASIS_FA2_HDIM128_CAUSAL_TILE=%s is unsupported; expected 64x64 or 128x64\n",
+            value);
+        return 0;
+    }();
+    return mode;
+}
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -339,7 +363,12 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 }
             } else {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                const int tile_override = Is_causal ? krasis_hdim128_causal_tile_override() : 0;
+                if (tile_override == 1) {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                }
             }
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);

@@ -1,5 +1,129 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-05-01 (Phase 2EU MoE decode stages)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: current `./dev speed-test` surface, Qwen3-Coder-Next
+`tests/qcn-k4v4-hqq8-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ8
+attention, `k4v4` KV cache, graph replay enabled, timing instrumentation off.
+
+| Stage | Variant | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|-------|---------|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Baseline | nearest same-config FA2/HQQ8/k4v4 row | 6,191.3 | 80.03 | n/a | 14256/24576 (58.0%) | 732 MB | [log](20260430_1502_qcn_k4v4_hqq8_int4_benchmark.log) |
+| 2 | grouped batched MoE path also allowed for `k_splits=1` | 6,501.4 | 79.75 | 149.47 | 14256/24576 (58.0%) | 732 MB | [log](20260501_phase2eu_stage2_grouped_ksplit1_speed_test.log) |
+| 3 | top-k=10 weighted-add specialization, tested then reverted | 6,039.4 | 78.30 | 144.36 | 14256/24576 (58.0%) | 732 MB | [log](20260501_phase2eu_stage3_topk10_accum_speed_test.log) |
+
+Notes:
+- Stage 1 graph-internal CUDA event markers were attempted with decode timing
+  enabled, but graph replay failed with
+  `CUDA_ERROR_INVALID_VALUE` from `cuEventElapsedTime`; the markers were
+  reverted and no speed row was recorded.
+- Stage 2 is effectively neutral on QCN decode (`79.75` vs `80.03 tok/s`) but
+  removes the graph-replay `k_splits=1` rejection encountered during the 122B
+  first-run probe.
+- Stage 3 made decode slower (`78.30 tok/s`), so the specialization was removed
+  and is not part of the retained code.
+- Stage 4 was not enabled because the existing GPU-side route/classify path is
+  explicitly disabled in code due to prior no-gain measurements and
+  first-token illegal-address faults. Re-enabling it would risk degrading a
+  working path rather than fixing the underlying correctness issue.
+
+---
+
+## Standard Benchmarks — 2026-05-01 (Phase 2ES cuDNN SDPA opt-in probe)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: current `./dev speed-test` surface, Qwen3-Coder-Next
+`tests/qcn-k4v4-hqq8-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ8
+attention, `k4v4` KV cache, graph replay enabled, timing instrumentation off.
+cuDNN SDPA was explicitly enabled with `KRASIS_CUDNN_SDPA=1`; the sidecar was
+built against `nvidia-cudnn-cu12 9.21.1.3` and `nvidia-cudnn-frontend 1.23.0`.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-----|--------------:|-----|
+| QCN k4v4 HQQ8, INT4 experts, cuDNN SDPA opt-in | HQQ8 | k4v4 | 5,246.6 | 80.48 | 14175/24576 (57.7%) | 674 MB | [log](20260501_cudnn_sdpa_speed_test.log) |
+
+Notes:
+- Direct sidecar correctness smoke against existing FA2 passed for BF16 causal
+  GQA (`B=1`, `S=128`, `HQ=16`, `HKV=2`, `D=128`): both calls returned `0`,
+  outputs were finite, mean absolute difference was `6.7e-05`, and max
+  absolute difference was `0.00390625`.
+- Compared with the nearest same-config FA2/HQQ8/k4v4 QCN benchmark row
+  (`20260430_1502_qcn_k4v4_hqq8_int4_benchmark.log`: `6,191.3 tok/s`
+  prefill, `80.03 tok/s` decode, `732 MB` min free), cuDNN SDPA reduced
+  prefill by about `15.3%`, left decode effectively unchanged, and reduced
+  HCS coverage slightly due to lower available VRAM.
+- Decision: keep cuDNN SDPA as an explicit opt-in prototype only. It is useful
+  because the current latest cuDNN stack builds and runs through Krasis' Rust
+  sidecar path, but it is not a default replacement for FA2 on this measured
+  surface.
+
+---
+
+## Standard Benchmarks — 2026-05-01 (Phase 2EN FA2/FLA prefill variants)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-35B-A3B `tests/q35b-4-4-hqq8-benchmark.conf`, INT4
+GPU/CPU experts, INT8 shared/dense/lm-head, FP8 KV (`fp8_e4m3`, 4v4), layer
+group size 2, graph replay enabled, timing instrumentation off for benchmark
+rows. Q35B reached full HCS coverage in every benchmark row.
+
+| Step | Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|------|---------|----------------:|---------------:|-----|--------------:|-----|
+| Baseline | Phase 2EJ Q35B HQQ8 | 8,029.9 | 116.01 | 10240/10240 (100.0%) | 7180 MB | [log](20260430_2124_q35b_k4v4_hqq8_int4_benchmark.log) |
+| 1 | FA2 exact `sm80` restored after failed extra-arch probe | 8,103.7 | 114.27 | 10240/10240 (100.0%) | 7180 MB | [log](20260501_0047_q35b_k4v4_hqq8_int4_fa2_exact_sm80_benchmark.log) |
+| 2 | Fixed-length single-sequence FA2 for `start_pos=0` | 8,095.0 | 115.06 | 10240/10240 (100.0%) | 7180 MB | [log](20260501_0054_q35b_k4v4_hqq8_int4_fa2_fixed_benchmark.log) |
+| 3 | Opt-in FLA state `BV=64` (`KRASIS_FLA_STATE_BV64=1`) | 5,416.7 | 114.29 | 10240/10240 (100.0%) | 5074 MB | [log](20260501_0103_q35b_k4v4_hqq8_int4_fla_bv64_benchmark.log) |
+| 4 | Opt-in FA2 hdim128 causal `64x64` tile (`KRASIS_FA2_HDIM128_CAUSAL_TILE=64x64`) | 8,140.7 | 116.78 | 10240/10240 (100.0%) | 7180 MB | [log](20260501_0128_q35b_k4v4_hqq8_int4_fa2_tile64_benchmark.log) |
+
+Timing notes:
+- Step 1 attempted a targeted `sm89/sm90/sm120` FA2 hdim128 fatbin. It failed
+  visibly on the 5090 with `FlashAttention-2 forward failed with code -2`
+  after the FA2 shim was fixed to return launch errors. Default FA2 is restored
+  to the previous known-good `sm80` build; extra-arch FA2 builds are opt-in via
+  `KRASIS_FA2_HDIM128_EXTRA_ARCHES=1` or `KRASIS_FA2_ALL_ARCHES=1`.
+- Step 2 removed per-GQA-layer cu-seqlens upload for single-sequence prefill,
+  but long-prompt FA2 time stayed flat (`598.2 ms`), so it is a small cleanup,
+  not a kernel speed win.
+- Step 3 was a hard negative: FLA state increased from about `317-339 ms` to
+  `2708.9 ms` on the long timing diagnostic, so `BV=64` remains opt-in only.
+- Step 4 was mildly positive in clean benchmark terms, but the timing diagnostic
+  still showed FA2 at `598.4 ms`; the improvement is small enough that it should
+  stay opt-in until more repeat runs and an opt-in witness gate justify changing
+  defaults.
+
+---
+
+## Standard Benchmarks — 2026-04-30 (Phase 2EL HQQ6 group-sum + async pointer upload)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Configs: Qwen3.5-35B-A3B `tests/q35b-4-4-hqq6-benchmark.conf`, INT4
+GPU/CPU experts, INT8 shared/dense/lm-head, FP8 KV (`fp8_e4m3`, 4v4), layer
+group size 2, graph replay enabled, timing instrumentation off for benchmark
+rows.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-----|--------------:|-----|
+| Q35B k4v4 HQQ6, tiled group-sum | HQQ6 | fp8_e4m3 | 7,788.5 | 112.67 | 10240/10240 (100.0%) | 7148 MB | [log](20260430_2241_q35b_k4v4_hqq6_int4_groupsum_tiled_benchmark.log) |
+| Q35B k4v4 HQQ6, tiled group-sum + async ptr upload | HQQ6 | fp8_e4m3 | 7,824.5 | 116.62 | 10240/10240 (100.0%) | 7148 MB | [log](20260430_2250_q35b_k4v4_hqq6_int4_groupsum_async_benchmark.log) |
+
+Notes:
+- Timing-enabled Q35B HQQ6 diagnostics showed the group-sum kernel sub-bucket
+  improved from `111.6 ms` to `17.8 ms` over the long prefill (`130` calls).
+- Clean timing-off benchmarks did not beat the earlier Q35B HQQ6 baseline
+  (`7,873.0 tok/s`), so this is recorded as a sub-bucket cleanup rather than a
+  headline production speed win.
+- Async pointer upload moved the measured startup-calibration MoE time from
+  `ptr_upload` into `dma_wait`; total MoE DMA time stayed effectively the same.
+  This confirms it removes CPU blocking/attribution noise but does not remove
+  the underlying GPU wait for cold expert staging.
+
+---
+
 ## Standard Benchmarks — 2026-04-30 (Phase 2EJ Q35B no-cold-DMA HQQ ladder)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.

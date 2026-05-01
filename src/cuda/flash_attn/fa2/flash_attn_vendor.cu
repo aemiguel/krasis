@@ -220,6 +220,11 @@ extern "C" int krasis_flash_attn_fwd_bf16(
         }
     }
 
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "krasis_flash_attn: launch failed: %s\n", cudaGetErrorString(launch_err));
+        return -2;
+    }
     return 0;
 }
 
@@ -284,5 +289,10 @@ extern "C" int krasis_flash_attn_fwd_bf16q_fp8kv(
         }
     }
 
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "krasis_flash_attn_fp8kv: launch failed: %s\n", cudaGetErrorString(launch_err));
+        return -2;
+    }
     return 0;
 }

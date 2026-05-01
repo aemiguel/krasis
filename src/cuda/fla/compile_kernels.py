@@ -115,6 +115,27 @@ KERNEL_SPECS = [
         "h_dependent": True,
     },
     {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64_bv64",
+        "import": ("fla.ops.common.chunk_delta_h",
+                    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
+        "symbol_base": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64_bv64",
+        "signature": {
+            "k": "*bf16", "v": "*bf16", "w": "*bf16", "v_new": "*bf16",
+            "g": "*fp32", "gk": "*bf16", "h": "*bf16", "h0": "*bf16",
+            "ht": "*fp32", "cu_seqlens": "*i32", "chunk_offsets": "*i32",
+            "T": "i32",
+        },
+        "constexprs": {
+            "K": 128, "V": 128, "BT": 64, "BV": 64,
+            "USE_G": True, "USE_GK": False,
+            "USE_INITIAL_STATE": True, "STORE_FINAL_STATE": True,
+            "SAVE_NEW_VALUE": True, "USE_EXP2": False,
+            "TRANSPOSE_STATE": False, "IS_VARLEN": False,
+        },
+        "options": {"num_warps": 2, "num_stages": 2},
+        "h_dependent": True,
+    },
+    {
         "name": "recompute_w_u_fwd_kernel",
         "import": ("fla.ops.gated_delta_rule.wy_fast",
                     "recompute_w_u_fwd_kernel"),

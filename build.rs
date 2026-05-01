@@ -8,6 +8,8 @@ fn main() {
     // Force rerun when env changes (e.g. CUDA_HOME)
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=KRASIS_FA2_HDIM128_EXTRA_ARCHES");
+    println!("cargo:rerun-if-env-changed=KRASIS_FA2_ALL_ARCHES");
 
     // Probe for libnuma — link only if the library is found.
     // The runtime code (numa.rs) checks numa_available() and falls back
@@ -36,6 +38,7 @@ fn main() {
 
     // Compile vendored FlashAttention-2 kernels into libkrasis_flash_attn.so
     compile_flash_attn_kernels();
+
 }
 
 fn is_output_fresh(inputs: &[&str], outputs: &[&str]) -> bool {
@@ -437,6 +440,7 @@ fn compile_flash_attn_kernels() {
     // The .cu template instantiation files are generated and never edited,
     // so we only need to check the headers that contain the actual kernel logic.
     let fa_sources_owned: Vec<String> = vec![
+        "build.rs".to_string(),
         vendor_src.clone(),
         format!("{fa_dir}/flash_attn_vendor.h"),
         format!("{fa_dir}/flash.h"),
@@ -461,7 +465,6 @@ fn compile_flash_attn_kernels() {
         "-allow-unsupported-compiler".to_string(),
         "-Xcompiler".to_string(),
         "-fPIC".to_string(),
-        "-arch=sm_80".to_string(),
         "-O3".to_string(),
         "--use_fast_math".to_string(),
         "-DKRASIS_FA_VENDOR".to_string(),
@@ -472,7 +475,6 @@ fn compile_flash_attn_kernels() {
         format!("-I{fa_dir}"),
         format!("-I{cutlass_dir}"),
     ];
-
     // Template instantiations to compile (BF16 forward only + FP8 KV variants)
     let cu_files = [
         "flash_attn_vendor.cu",
@@ -504,6 +506,7 @@ fn compile_flash_attn_kernels() {
         .map(|cu_file| format!("{fa_dir}/{cu_file}"))
         .collect();
     let mut freshness_inputs: Vec<&str> = tracked_inputs.to_vec();
+    freshness_inputs.push("build.rs");
     freshness_inputs.extend(source_paths.iter().map(|s| s.as_str()));
     let obj_paths: Vec<String> = cu_files
         .iter()
@@ -533,6 +536,7 @@ fn compile_flash_attn_kernels() {
             .arg("-o")
             .arg(&obj_path)
             .args(&common_args)
+            .args(fa2_arch_args(cu_file))
             .args(nvcc_host_compiler_args())
             .arg(&src_path);
         let status =
@@ -576,6 +580,31 @@ fn compile_flash_attn_kernels() {
             println!("cargo:warning=nvcc link error for FlashAttention .so: {e}");
         }
     }
+}
+
+fn fa2_arch_args(cu_file: &str) -> Vec<String> {
+    let hdim128_extra_arches =
+        std::env::var("KRASIS_FA2_HDIM128_EXTRA_ARCHES").ok().as_deref() == Some("1");
+    let all_arches = std::env::var("KRASIS_FA2_ALL_ARCHES").ok().as_deref() == Some("1");
+    if !all_arches && !(hdim128_extra_arches && cu_file.contains("hdim128")) {
+        return vec!["-arch=sm_80".to_string()];
+    }
+
+    let mut archs = vec![80];
+    if all_arches || (hdim128_extra_arches && cu_file.contains("hdim128")) {
+        archs.extend([89, 90, 120]);
+    }
+
+    let mut args = Vec::with_capacity(archs.len() * 2);
+    for arch in archs {
+        args.push("-gencode".to_string());
+        if arch == 120 {
+            args.push("arch=compute_120,code=[sm_120,compute_120]".to_string());
+        } else {
+            args.push(format!("arch=compute_{arch},code=sm_{arch}"));
+        }
+    }
+    args
 }
 
 /// Returns true if `output` exists and is newer than every file in `sources`.
