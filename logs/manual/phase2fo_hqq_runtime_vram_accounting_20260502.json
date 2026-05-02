@@ -1,0 +1,49 @@
+{
+  "phase": "2FO",
+  "rows": [
+    {
+      "bf16_equiv_mib": 9099.0,
+      "cache_mib": 2559.096954345703,
+      "cache_ratio_vs_bf16": 0.28125035216460087,
+      "label": "122B hqq4",
+      "manifest": "/home/main/.krasis/cache/Qwen3.5-122B-A10B/attention_hqq_v5_grid65_33/manifest.json",
+      "nbits": 4,
+      "tensor_count": 168
+    },
+    {
+      "bf16_equiv_mib": 9099.0,
+      "cache_mib": 3696.471954345703,
+      "cache_ratio_vs_bf16": 0.40625035216460087,
+      "decode_mib": 3696.47,
+      "decode_ratio_vs_bf16": 0.4062501373777338,
+      "label": "122B hqq6",
+      "manifest": "/home/main/.krasis/cache/Qwen3.5-122B-A10B/attention_hqq6_v5/manifest.json",
+      "nbits": 6,
+      "prefill_mib": 4904.93,
+      "prefill_ratio_vs_bf16": 0.5390625343444335,
+      "tensor_count": 168
+    },
+    {
+      "bf16_equiv_mib": 9099.0,
+      "cache_mib": 4833.846954345703,
+      "cache_ratio_vs_bf16": 0.5312503521646008,
+      "label": "122B hqq8",
+      "manifest": "/home/main/.krasis/cache/Qwen3.5-122B-A10B/attention_hqq8_v5/manifest.json",
+      "nbits": 8,
+      "tensor_count": 168
+    },
+    {
+      "bf16_equiv_mib": 19552.0,
+      "cache_mib": 7943.008964538574,
+      "cache_ratio_vs_bf16": 0.4062504584972675,
+      "decode_mib": 7943.0,
+      "decode_ratio_vs_bf16": 0.40625,
+      "label": "235B hqq6",
+      "manifest": "/home/main/.krasis/cache/Qwen3-235B-A22B/attention_hqq6_v5/manifest.json",
+      "nbits": 6,
+      "prefill_mib": 10539.75,
+      "prefill_ratio_vs_bf16": 0.5390625,
+      "tensor_count": 470
+    }
+  ]
+}

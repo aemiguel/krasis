@@ -4382,12 +4382,12 @@ impl HqqRuntimeSlotEntry {
 }
 
 fn hqq_stage_compaction_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("KRASIS_HQQ_STAGE_COMPACT")
             .unwrap_or_default()
             .to_ascii_lowercase()
             .as_str(),
-        "1" | "true" | "yes" | "on"
+        "0" | "false" | "no" | "off"
     )
 }
 
@@ -6878,7 +6878,17 @@ impl GpuDecodeStore {
                 }
 
             let prefill_result = match engine.run_prefill(&token_ids, temperature, &[]) {
-                Ok(r) => r,
+                Ok(r) => {
+                    if let Err(e) = engine.finalize_stage_exact_prefill_kv(r.prompt_len) {
+                        engine.clear_prefill_hcs_guard_store_addr();
+                        let _ = engine.release_scratch();
+                        let _ = self.prepare_runtime_for_decode_rust();
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            format!("KV stage export failed: {}", e)
+                        ));
+                    }
+                    r
+                }
                 Err(e) => {
                     engine.clear_prefill_hcs_guard_store_addr();
                     let _ = engine.release_scratch();
@@ -14463,6 +14473,22 @@ impl GpuDecodeStore {
             kv_v_angles_ptrs: graph.kv_v_angles_ptrs.clone(),
             kv_tq4_sign_ptrs: graph.kv_tq4_sign_ptrs.clone(),
             kv_num_blocks: graph.kv_num_blocks,
+            decode_kv_k_ptrs: graph.kv_k_ptrs.clone(),
+            decode_kv_v_ptrs: graph.kv_v_ptrs.clone(),
+            decode_kv_k_radius_ptrs: graph.kv_k_radius_ptrs.clone(),
+            decode_kv_v_radius_ptrs: graph.kv_v_radius_ptrs.clone(),
+            decode_kv_k_angles_ptrs: graph.kv_k_angles_ptrs.clone(),
+            decode_kv_v_angles_ptrs: graph.kv_v_angles_ptrs.clone(),
+            decode_kv_tq4_sign_ptrs: graph.kv_tq4_sign_ptrs.clone(),
+            decode_kv_format: graph.kv_format,
+            decode_kv_max_seq: graph.kv_max_seq,
+            decode_kv_num_blocks: graph.kv_num_blocks,
+            prefill_kv_temp_k: None,
+            prefill_kv_temp_v: None,
+            prefill_kv_layer_offsets: Vec::new(),
+            prefill_kv_temp_seq: 0,
+            prefill_kv_temp_layers: 0,
+            prefill_kv_active: false,
             stream: prefill_stream,
             copy_stream,
             cublas_handle,
@@ -14982,24 +15008,47 @@ impl GpuDecodeStore {
         let mut max_proj_dim: usize = 0;
         let mut max_attn_out_dim: usize = 0;
         for layer in graph.layers.iter() {
-            match &layer.attn {
-                GpuAttnConfig::LinearAttention { in_proj_qkvz, in_proj_ba, nv, dv, .. } => {
-                    let qkvz_w = &graph.weights[*in_proj_qkvz];
-                    let ba_w = &graph.weights[*in_proj_ba];
-                    max_proj_dim = max_proj_dim.max(qkvz_w.rows).max(ba_w.rows);
-                    max_attn_out_dim = max_attn_out_dim.max(nv * dv); // gated_size for output proj
-                }
-                GpuAttnConfig::GQA { q_proj, fused_qkv, num_heads, head_dim, .. } => {
-                    if let Some(fid) = fused_qkv {
-                        let fw = &graph.weights[*fid];
-                        max_proj_dim = max_proj_dim.max(fw.rows);
-                    } else {
-                        let qw = &graph.weights[*q_proj];
-                        max_proj_dim = max_proj_dim.max(qw.rows);
+            if let Some(hqq_exec) = &layer.hqq_exec {
+                match hqq_exec {
+                    HqqExecutionDescriptor::LinearAttention(desc) => {
+                        max_proj_dim = max_proj_dim
+                            .max(desc.in_proj_qkvz.rows)
+                            .max(desc.in_proj_ba.rows);
+                        max_attn_out_dim = max_attn_out_dim.max(desc.num_v_heads * desc.v_head_dim);
                     }
-                    max_attn_out_dim = max_attn_out_dim.max(num_heads * head_dim);
+                    HqqExecutionDescriptor::Gqa(desc) => {
+                        if let Some(fused_qkv) = &desc.fused_qkv {
+                            max_proj_dim = max_proj_dim.max(fused_qkv.rows);
+                        } else {
+                            max_proj_dim = max_proj_dim
+                                .max(desc.q_proj.rows)
+                                .max(desc.k_proj.rows)
+                                .max(desc.v_proj.rows);
+                        }
+                        max_attn_out_dim = max_attn_out_dim.max(desc.num_heads * desc.head_dim);
+                    }
+                    HqqExecutionDescriptor::Mla(_) => {}
                 }
-                _ => {}
+            } else {
+                match &layer.attn {
+                    GpuAttnConfig::LinearAttention { in_proj_qkvz, in_proj_ba, nv, dv, .. } => {
+                        let qkvz_w = &graph.weights[*in_proj_qkvz];
+                        let ba_w = &graph.weights[*in_proj_ba];
+                        max_proj_dim = max_proj_dim.max(qkvz_w.rows).max(ba_w.rows);
+                        max_attn_out_dim = max_attn_out_dim.max(nv * dv); // gated_size for output proj
+                    }
+                    GpuAttnConfig::GQA { q_proj, fused_qkv, num_heads, head_dim, .. } => {
+                        if let Some(fid) = fused_qkv {
+                            let fw = &graph.weights[*fid];
+                            max_proj_dim = max_proj_dim.max(fw.rows);
+                        } else {
+                            let qw = &graph.weights[*q_proj];
+                            max_proj_dim = max_proj_dim.max(qw.rows);
+                        }
+                        max_attn_out_dim = max_attn_out_dim.max(num_heads * head_dim);
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -16587,9 +16636,100 @@ impl GpuDecodeStore {
                         let nh = *num_heads; let nkv = *num_kv_heads;
                         let hd = *head_dim; let half_dim = graph.rope_half_dim;
                         let kv_stride = nkv * hd;
+                        let hqq_gqa_exec = match &layer.hqq_exec {
+                            Some(HqqExecutionDescriptor::Gqa(desc))
+                                if (desc.fused_qkv.is_some()
+                                    && hqq_gqa_fused_decode_ready(
+                                        desc,
+                                        *gated,
+                                        nh,
+                                        nkv,
+                                        hd,
+                                    ))
+                                    || (desc.fused_qkv.is_none()
+                                        && hqq_gqa_split_decode_ready(
+                                            desc,
+                                            *gated,
+                                            nh,
+                                            hd,
+                                        )) =>
+                            {
+                                Some(desc.clone())
+                            }
+                            Some(exec) => {
+                                let requested_projection_mode = match exec {
+                                    HqqExecutionDescriptor::Gqa(desc) if desc.fused_qkv.is_some() => {
+                                        Some("fused_qkv")
+                                    }
+                                    HqqExecutionDescriptor::Gqa(_) => Some("split_qkv"),
+                                    _ => None,
+                                };
+                                return Err(hqq_decode_dispatch_error(
+                                    layer_idx,
+                                    "gqa",
+                                    exec,
+                                    requested_projection_mode,
+                                ));
+                            }
+                            None => None,
+                        };
 
                         // QKV projection
-                        if let Some(fid) = fused_qkv {
+                        if let Some(hqq_exec) = hqq_gqa_exec.as_ref() {
+                            if let Some(fused_desc) = hqq_exec.fused_qkv.as_ref() {
+                                self.launch_hqq_decode_gemv_f32(
+                                    "fused_qkv",
+                                    fused_desc,
+                                    *graph.d_hidden.device_ptr(),
+                                    *graph.d_gqa_q.device_ptr(),
+                                )?;
+                                let k_offset = hqq_exec.fused_q_rows;
+                                let v_offset = k_offset + hqq_exec.fused_k_rows;
+                                unsafe {
+                                    let err = cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                                        *graph.d_gqa_k.device_ptr(),
+                                        (*graph.d_gqa_q.device_ptr() as *const f32).add(k_offset) as u64,
+                                        hqq_exec.fused_k_rows * 4,
+                                        cu_stream,
+                                    );
+                                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                        return Err(format!("D2D HQQ graph K split[{}]: {:?}", layer_idx, err));
+                                    }
+                                    let err = cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                                        *graph.d_gqa_v.device_ptr(),
+                                        (*graph.d_gqa_q.device_ptr() as *const f32).add(v_offset) as u64,
+                                        hqq_exec.fused_v_rows * 4,
+                                        cu_stream,
+                                    );
+                                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                        return Err(format!("D2D HQQ graph V split[{}]: {:?}", layer_idx, err));
+                                    }
+                                }
+                            } else {
+                                self.launch_hqq_decode_gemv_f32(
+                                    "q_proj",
+                                    &hqq_exec.q_proj,
+                                    *graph.d_hidden.device_ptr(),
+                                    if *gated {
+                                        *graph.d_gqa_out.device_ptr()
+                                    } else {
+                                        *graph.d_gqa_q.device_ptr()
+                                    },
+                                )?;
+                                self.launch_hqq_decode_gemv_f32(
+                                    "k_proj",
+                                    &hqq_exec.k_proj,
+                                    *graph.d_hidden.device_ptr(),
+                                    *graph.d_gqa_k.device_ptr(),
+                                )?;
+                                self.launch_hqq_decode_gemv_f32(
+                                    "v_proj",
+                                    &hqq_exec.v_proj,
+                                    *graph.d_hidden.device_ptr(),
+                                    *graph.d_gqa_v.device_ptr(),
+                                )?;
+                            }
+                        } else if let Some(fid) = fused_qkv {
                             let fw = &graph.weights[*fid];
                             self.gemv_bf16_to_f32(fw, *graph.d_hidden.device_ptr(),
                                 *graph.d_gqa_q.device_ptr())?;
@@ -16624,16 +16764,22 @@ impl GpuDecodeStore {
                         // multiple CUDA blocks and cross-block read/write aliasing has no
                         // ordering guarantee, corrupting the gate values.
                         if *gated {
-                            // Copy the gated QKV output to d_gqa_out so split reads from
-                            // a different buffer than it writes Q to (d_gqa_q).
-                            let gated_q_size = nh * hd * 2; // Q + gate interleaved
-                            unsafe {
-                                let err = cuda_sys::lib().cuMemcpyDtoDAsync_v2(
-                                    *graph.d_gqa_out.device_ptr(),
-                                    *graph.d_gqa_q.device_ptr(),
-                                    gated_q_size * 4, cu_stream);
-                                if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                                    return Err(format!("D2D gated_q copy[{}]: {:?}", layer_idx, err));
+                            let qg_input_already_in_split_buffer = hqq_gqa_exec
+                                .as_ref()
+                                .map(|exec| exec.fused_qkv.is_none())
+                                .unwrap_or(false);
+                            if !qg_input_already_in_split_buffer {
+                                // Copy the gated QKV output to d_gqa_out so split reads from
+                                // a different buffer than it writes Q to (d_gqa_q).
+                                let gated_q_size = nh * hd * 2; // Q + gate interleaved
+                                unsafe {
+                                    let err = cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                                        *graph.d_gqa_out.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        gated_q_size * 4, cu_stream);
+                                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                        return Err(format!("D2D gated_q copy[{}]: {:?}", layer_idx, err));
+                                    }
                                 }
                             }
                             let total = (nh * hd) as u32;
@@ -17282,9 +17428,18 @@ impl GpuDecodeStore {
                         }
 
                         // O projection
-                        let o_w = &graph.weights[*o_proj];
-                        self.gemv_bf16_internal(o_w, *graph.d_scratch.device_ptr(),
-                            *graph.d_hidden.device_ptr())?;
+                        if let Some(hqq_exec) = hqq_gqa_exec.as_ref() {
+                            self.launch_hqq_decode_gemv_bf16(
+                                "o_proj",
+                                &hqq_exec.o_proj,
+                                *graph.d_scratch.device_ptr(),
+                                *graph.d_hidden.device_ptr(),
+                            )?;
+                        } else {
+                            let o_w = &graph.weights[*o_proj];
+                            self.gemv_bf16_internal(o_w, *graph.d_scratch.device_ptr(),
+                                *graph.d_hidden.device_ptr())?;
+                        }
 
                         gqa_cache_idx += 1;
                     }

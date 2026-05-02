@@ -530,20 +530,31 @@ fn compile_flash_attn_kernels() {
         format!("-I{fa_dir}"),
         format!("-I{cutlass_dir}"),
     ];
-    // Template instantiations to compile. Keep this BF16-only for Ampere; FP8
-    // KV kernels are not a supported Krasis surface on SM80-class hardware.
+    // Template instantiations to compile. The vendor wrapper exports both
+    // BF16-KV and FP8-KV entrypoints; omitting FP8-KV objects leaves unresolved
+    // symbols and disables the whole FA2 sidecar at dlopen time.
     let cu_files = [
         "flash_attn_vendor.cu",
         "flash_fwd_hdim64_bf16_causal_sm80.cu",
         "flash_fwd_hdim64_bf16_sm80.cu",
+        "flash_fwd_hdim64_bf16q_fp8kv_causal_sm80.cu",
+        "flash_fwd_hdim64_bf16q_fp8kv_sm80.cu",
         "flash_fwd_hdim96_bf16_causal_sm80.cu",
         "flash_fwd_hdim96_bf16_sm80.cu",
+        "flash_fwd_hdim96_bf16q_fp8kv_causal_sm80.cu",
+        "flash_fwd_hdim96_bf16q_fp8kv_sm80.cu",
         "flash_fwd_hdim128_bf16_causal_sm80.cu",
         "flash_fwd_hdim128_bf16_sm80.cu",
+        "flash_fwd_hdim128_bf16q_fp8kv_causal_sm80.cu",
+        "flash_fwd_hdim128_bf16q_fp8kv_sm80.cu",
         "flash_fwd_hdim192_bf16_causal_sm80.cu",
         "flash_fwd_hdim192_bf16_sm80.cu",
+        "flash_fwd_hdim192_bf16q_fp8kv_causal_sm80.cu",
+        "flash_fwd_hdim192_bf16q_fp8kv_sm80.cu",
         "flash_fwd_hdim256_bf16_causal_sm80.cu",
         "flash_fwd_hdim256_bf16_sm80.cu",
+        "flash_fwd_hdim256_bf16q_fp8kv_causal_sm80.cu",
+        "flash_fwd_hdim256_bf16q_fp8kv_sm80.cu",
     ];
 
     let source_paths: Vec<String> = cu_files

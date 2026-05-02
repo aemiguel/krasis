@@ -45,6 +45,16 @@ fn prefill_disable_ptr_table() -> bool {
         .unwrap_or(false)
 }
 
+fn kv_stage_exact_enabled() -> bool {
+    !matches!(
+        std::env::var("KRASIS_KV_STAGE_EXACT")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 #[derive(Clone, Debug)]
 struct TraceRange {
     start: usize,
@@ -2382,6 +2392,8 @@ pub struct PrefillKernels {
     kv_cache_append_k6v6: RawCuFunc,
     kv_cache_append_k8v6: RawCuFunc,
     kv_cache_append_tq4: RawCuFunc,
+    kv_convert_fp8_to_k4v4: RawCuFunc,
+    kv_convert_fp8_to_k6v6: RawCuFunc,
     kv_dequant_concat_polar4: RawCuFunc,
     kv_dequant_concat_k4: RawCuFunc,
     kv_dequant_concat_k6: RawCuFunc,
@@ -3142,6 +3154,22 @@ pub struct PrefillEngine {
     pub kv_v_angles_ptrs: Vec<u64>,
     pub kv_tq4_sign_ptrs: Vec<u64>,
     pub kv_num_blocks: usize,
+    pub decode_kv_k_ptrs: Vec<u64>,
+    pub decode_kv_v_ptrs: Vec<u64>,
+    pub decode_kv_k_radius_ptrs: Vec<u64>,
+    pub decode_kv_v_radius_ptrs: Vec<u64>,
+    pub decode_kv_k_angles_ptrs: Vec<u64>,
+    pub decode_kv_v_angles_ptrs: Vec<u64>,
+    pub decode_kv_tq4_sign_ptrs: Vec<u64>,
+    pub decode_kv_format: u32,
+    pub decode_kv_max_seq: usize,
+    pub decode_kv_num_blocks: usize,
+    pub prefill_kv_temp_k: Option<CudaSlice<u8>>,
+    pub prefill_kv_temp_v: Option<CudaSlice<u8>>,
+    pub prefill_kv_layer_offsets: Vec<usize>,
+    pub prefill_kv_temp_seq: usize,
+    pub prefill_kv_temp_layers: usize,
+    pub prefill_kv_active: bool,
     pub stream: cuda_sys::CUstream,
     pub copy_stream: cuda_sys::CUstream,
     pub cublas_handle: cudarc::cublas::sys::cublasHandle_t,
@@ -7221,6 +7249,256 @@ impl PrefillEngine {
         Ok(())
     }
 
+    fn restore_decode_kv_pointers(&mut self) {
+        self.kv_k_ptrs = self.decode_kv_k_ptrs.clone();
+        self.kv_v_ptrs = self.decode_kv_v_ptrs.clone();
+        self.kv_k_radius_ptrs = self.decode_kv_k_radius_ptrs.clone();
+        self.kv_v_radius_ptrs = self.decode_kv_v_radius_ptrs.clone();
+        self.kv_k_angles_ptrs = self.decode_kv_k_angles_ptrs.clone();
+        self.kv_v_angles_ptrs = self.decode_kv_v_angles_ptrs.clone();
+        self.kv_tq4_sign_ptrs = self.decode_kv_tq4_sign_ptrs.clone();
+        self.kv_format = self.decode_kv_format;
+        self.kv_max_seq = self.decode_kv_max_seq;
+        self.kv_num_blocks = self.decode_kv_num_blocks;
+        self.prefill_kv_active = false;
+    }
+
+    fn release_prefill_kv_temp(&mut self) {
+        self.prefill_kv_temp_k = None;
+        self.prefill_kv_temp_v = None;
+        self.prefill_kv_layer_offsets.clear();
+        self.prefill_kv_temp_seq = 0;
+        self.prefill_kv_temp_layers = 0;
+        self.restore_decode_kv_pointers();
+    }
+
+    fn setup_stage_exact_prefill_kv(&mut self, prompt_tokens: usize) -> Result<(), String> {
+        self.release_prefill_kv_temp();
+        let diag = std::env::var("KRASIS_KV_STAGE_DIAG").is_ok();
+        if !kv_stage_exact_enabled() || prompt_tokens == 0 {
+            if diag {
+                eprintln!(
+                    "[KV-STAGE] disabled_or_empty enabled={} prompt_tokens={}",
+                    kv_stage_exact_enabled(),
+                    prompt_tokens
+                );
+            }
+            return Ok(());
+        }
+        if self.decode_kv_format != 7 && self.decode_kv_format != 9 {
+            if diag {
+                eprintln!(
+                    "[KV-STAGE] unsupported_decode_format={} prompt_tokens={}",
+                    self.decode_kv_format,
+                    prompt_tokens
+                );
+            }
+            return Ok(());
+        }
+        let kv_stride = self.config.num_kv_heads * self.config.head_dim;
+        if kv_stride == 0 {
+            if diag {
+                eprintln!(
+                    "[KV-STAGE] zero_kv_stride decode_format={} prompt_tokens={}",
+                    self.decode_kv_format,
+                    prompt_tokens
+                );
+            }
+            return Ok(());
+        }
+        let mut active_layers = Vec::new();
+        for layer_idx in 0..self.decode_kv_k_radius_ptrs.len() {
+            if self.decode_kv_k_radius_ptrs[layer_idx] != 0
+                && layer_idx < self.decode_kv_v_radius_ptrs.len()
+                && self.decode_kv_v_radius_ptrs[layer_idx] != 0
+            {
+                active_layers.push(layer_idx);
+            }
+        }
+        if active_layers.is_empty() {
+            if diag {
+                let k_radius_nonzero = self.decode_kv_k_radius_ptrs.iter().filter(|&&p| p != 0).count();
+                let v_radius_nonzero = self.decode_kv_v_radius_ptrs.iter().filter(|&&p| p != 0).count();
+                eprintln!(
+                    "[KV-STAGE] no_active_layers decode_format={} k_radius_nonzero={} v_radius_nonzero={} ptr_lens=({}, {})",
+                    self.decode_kv_format,
+                    k_radius_nonzero,
+                    v_radius_nonzero,
+                    self.decode_kv_k_radius_ptrs.len(),
+                    self.decode_kv_v_radius_ptrs.len()
+                );
+            }
+            return Ok(());
+        }
+        let bytes_per_layer = prompt_tokens
+            .checked_mul(kv_stride)
+            .ok_or("stage-exact prefill KV bytes/layer overflow")?;
+        let total_bytes = bytes_per_layer
+            .checked_mul(active_layers.len())
+            .ok_or("stage-exact prefill KV total bytes overflow")?;
+        let temp_k = self
+            .device
+            .alloc_zeros::<u8>(total_bytes)
+            .map_err(|e| format!("alloc stage-exact prefill K FP8 KV: {e}"))?;
+        let temp_v = self
+            .device
+            .alloc_zeros::<u8>(total_bytes)
+            .map_err(|e| format!("alloc stage-exact prefill V FP8 KV: {e}"))?;
+        let k_base = *temp_k.device_ptr();
+        let v_base = *temp_v.device_ptr();
+        let ptr_count = self
+            .decode_kv_k_ptrs
+            .len()
+            .max(self.decode_kv_k_radius_ptrs.len());
+        let mut temp_k_ptrs = vec![0u64; ptr_count];
+        let mut temp_v_ptrs = vec![0u64; ptr_count];
+        let mut offsets = vec![usize::MAX; ptr_count];
+        for (slot_idx, &layer_idx) in active_layers.iter().enumerate() {
+            let offset = slot_idx
+                .checked_mul(bytes_per_layer)
+                .ok_or("stage-exact prefill KV pointer offset overflow")?;
+            temp_k_ptrs[layer_idx] = k_base + offset as u64;
+            temp_v_ptrs[layer_idx] = v_base + offset as u64;
+            offsets[layer_idx] = slot_idx;
+        }
+        self.prefill_kv_temp_k = Some(temp_k);
+        self.prefill_kv_temp_v = Some(temp_v);
+        self.prefill_kv_layer_offsets = offsets;
+        self.prefill_kv_temp_seq = prompt_tokens;
+        self.prefill_kv_temp_layers = active_layers.len();
+        self.prefill_kv_active = true;
+        self.kv_k_ptrs = temp_k_ptrs;
+        self.kv_v_ptrs = temp_v_ptrs;
+        self.kv_k_radius_ptrs = vec![0u64; ptr_count];
+        self.kv_v_radius_ptrs = vec![0u64; ptr_count];
+        self.kv_k_angles_ptrs = vec![0u64; ptr_count];
+        self.kv_v_angles_ptrs = vec![0u64; ptr_count];
+        self.kv_tq4_sign_ptrs = vec![0u64; ptr_count];
+        self.kv_format = 1;
+        self.kv_max_seq = prompt_tokens;
+        self.kv_num_blocks = 0;
+        log::info!(
+            "Stage-exact KV prefill: decode_format={} active_layers={} prompt_tokens={} kv_stride={} temp_fp8_mb={:.1}",
+            self.decode_kv_format,
+            active_layers.len(),
+            prompt_tokens,
+            kv_stride,
+            (total_bytes * 2) as f64 / 1024.0 / 1024.0,
+        );
+        if diag {
+            eprintln!(
+                "[KV-STAGE] active decode_format={} active_layers={} prompt_tokens={} kv_stride={} temp_fp8_mb={:.1}",
+                self.decode_kv_format,
+                active_layers.len(),
+                prompt_tokens,
+                kv_stride,
+                (total_bytes * 2) as f64 / 1024.0 / 1024.0,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn finalize_stage_exact_prefill_kv(&mut self, prompt_tokens: usize) -> Result<(), String> {
+        if !self.prefill_kv_active {
+            self.restore_decode_kv_pointers();
+            return Ok(());
+        }
+        if prompt_tokens > self.decode_kv_max_seq {
+            return Err(format!(
+                "stage-exact KV export prompt length {} exceeds decode KV max_seq {}",
+                prompt_tokens, self.decode_kv_max_seq
+            ));
+        }
+        let kv_stride = self.config.num_kv_heads * self.config.head_dim;
+        let num_blocks = kv_stride / 16;
+        if num_blocks != self.decode_kv_num_blocks {
+            return Err(format!(
+                "stage-exact KV export block mismatch: kv_stride={} blocks={} decode_blocks={}",
+                kv_stride, num_blocks, self.decode_kv_num_blocks
+            ));
+        }
+        let k_temp = self
+            .prefill_kv_temp_k
+            .as_ref()
+            .ok_or("stage-exact KV export missing temp K cache")?;
+        let v_temp = self
+            .prefill_kv_temp_v
+            .as_ref()
+            .ok_or("stage-exact KV export missing temp V cache")?;
+        let bytes_per_layer = self
+            .prefill_kv_temp_seq
+            .checked_mul(kv_stride)
+            .ok_or("stage-exact KV export bytes/layer overflow")?;
+        let k_base = *k_temp.device_ptr();
+        let v_base = *v_temp.device_ptr();
+        let threads =
+            std::cmp::max(32, ((std::cmp::min(256, num_blocks) + 31) / 32) * 32) as u32;
+        let t0 = Instant::now();
+        let mut converted = 0usize;
+        for layer_idx in 0..self.prefill_kv_layer_offsets.len() {
+            let slot_idx = self.prefill_kv_layer_offsets[layer_idx];
+            if slot_idx == usize::MAX {
+                continue;
+            }
+            let offset = slot_idx
+                .checked_mul(bytes_per_layer)
+                .ok_or("stage-exact KV export pointer offset overflow")?;
+            let mut p0 = self.decode_kv_k_radius_ptrs[layer_idx];
+            let mut p1 = self.decode_kv_k_angles_ptrs[layer_idx];
+            let mut p2 = self.decode_kv_v_radius_ptrs[layer_idx];
+            let mut p3 = self.decode_kv_v_angles_ptrs[layer_idx];
+            let mut p4 = k_base + offset as u64;
+            let mut p5 = v_base + offset as u64;
+            let mut p6 = prompt_tokens as i32;
+            let mut p7 = kv_stride as i32;
+            let mut p8 = self.decode_kv_max_seq as i32;
+            let mut p9 = self.polar4_norm_correction_mode;
+            let kernel = match self.decode_kv_format {
+                7 => self.kernels.kv_convert_fp8_to_k6v6,
+                9 => self.kernels.kv_convert_fp8_to_k4v4,
+                other => {
+                    return Err(format!(
+                        "stage-exact KV export unsupported decode format {}",
+                        other
+                    ))
+                }
+            };
+            unsafe {
+                launch(
+                    kernel,
+                    (prompt_tokens as u32, 1, 1),
+                    (threads, 1, 1),
+                    0,
+                    self.stream,
+                    &mut [
+                        &mut p0 as *mut _ as *mut std::ffi::c_void,
+                        &mut p1 as *mut _ as *mut std::ffi::c_void,
+                        &mut p2 as *mut _ as *mut std::ffi::c_void,
+                        &mut p3 as *mut _ as *mut std::ffi::c_void,
+                        &mut p4 as *mut _ as *mut std::ffi::c_void,
+                        &mut p5 as *mut _ as *mut std::ffi::c_void,
+                        &mut p6 as *mut _ as *mut std::ffi::c_void,
+                        &mut p7 as *mut _ as *mut std::ffi::c_void,
+                        &mut p8 as *mut _ as *mut std::ffi::c_void,
+                        &mut p9 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+            converted += 1;
+        }
+        self.stream_sync()?;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        log::info!(
+            "Stage-exact KV export: format={} layers={} prompt_tokens={} export_ms={:.3}",
+            self.decode_kv_format,
+            converted,
+            prompt_tokens,
+            ms,
+        );
+        self.restore_decode_kv_pointers();
+        Ok(())
+    }
+
     /// Dynamically allocate scratch buffers sized for this prompt.
     /// Called before each prefill. GpuBuf uses raw cuMemAlloc_v2 (synchronous,
     /// no pool) so alloc/free is immediate — no cudarc pool interaction.
@@ -7299,6 +7577,7 @@ impl PrefillEngine {
         self.d_fla_final_state = None;
         self.d_fla_v_new = None;
         self.d_fla_o = None;
+        self.setup_stage_exact_prefill_kv(prompt_tokens)?;
         // Old scratch + prefill buffers now dropped, VRAM is freed.
 
         // 4. Measure free VRAM and compute optimal chunk_size for this prompt.
@@ -7328,23 +7607,6 @@ impl PrefillEngine {
         let target = prompt_tokens.min(50000);
         let mut scratch_tokens = max_by_vram.min(target).max(128);
         let debug_prefill = prefill_debug_enabled();
-        let mut measured_cap_debug: Option<usize> = None;
-
-        // If decode store calibration is available for this live request, further cap
-        // scratch/chunk size using the measured no-HCS prefill model. This handles
-        // model/GPU-specific VRAM consumers that the static scratch estimator misses.
-        if self.prefill_hcs_store_addr != 0 {
-            let free_mb = (free_bytes / (1024 * 1024)) as u64;
-            let measured_cap = unsafe {
-                let store =
-                    &*(self.prefill_hcs_store_addr as *const crate::gpu_decode::GpuDecodeStore);
-                store.max_safe_prefill_chunk_tokens(target, free_mb)
-            };
-            if let Some(measured_cap) = measured_cap {
-                measured_cap_debug = Some(measured_cap);
-                scratch_tokens = scratch_tokens.min(measured_cap.max(128));
-            }
-        }
         if let Ok(raw) = std::env::var("KRASIS_PREFILL_DIAG_MAX_CHUNK_TOKENS") {
             let diag_cap = raw.parse::<usize>().map_err(|e| {
                 format!("KRASIS_PREFILL_DIAG_MAX_CHUNK_TOKENS must be an integer: {e}")
@@ -7358,7 +7620,7 @@ impl PrefillEngine {
         }
         if debug_prefill {
             eprintln!(
-                "[PREFILL-DEBUG] prepare prompt_tokens={} free_mb={} total_mb={} safety_mb={} fixed_mb={:.1} per_tok_kb={:.1} usable_mb={:.1} target={} max_by_vram={} measured_cap={} initial_scratch={}",
+                "[PREFILL-DEBUG] prepare prompt_tokens={} free_mb={} total_mb={} safety_mb={} fixed_mb={:.1} per_tok_kb={:.1} usable_mb={:.1} target={} max_by_vram={} initial_scratch={}",
                 prompt_tokens,
                 free_bytes / (1024 * 1024),
                 total_bytes / (1024 * 1024),
@@ -7368,7 +7630,6 @@ impl PrefillEngine {
                 usable as f64 / (1024.0 * 1024.0),
                 target,
                 max_by_vram,
-                measured_cap_debug.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
                 scratch_tokens,
             );
         }
@@ -7529,6 +7790,7 @@ impl PrefillEngine {
                         }
                     }
                     if scratch_tokens <= 128 {
+                        self.release_prefill_kv_temp();
                         return Err(e);
                     }
                     let next_tokens = (scratch_tokens / 2).max(128);
@@ -7725,6 +7987,7 @@ impl PrefillEngine {
         self.d_fla_final_state = None;
         self.d_fla_v_new = None;
         self.d_fla_o = None;
+        self.release_prefill_kv_temp();
         // Trim cudarc's memory pool so freed memory returns to the OS immediately.
         // Without this, cudarc holds the freed cold_staging/shared_scratch in its pool,
         // and HCS reload can't use that VRAM.
@@ -14300,6 +14563,19 @@ impl PrefillEngine {
                 kv_cache_already_stored,
             ),
         );
+        if std::env::var("KRASIS_KV_STAGE_DIAG").is_ok() && layer_idx < 8 {
+            eprintln!(
+                "[KV-STAGE] gqa layer={} m={} start_pos={} kv_format={} attn_path={} kv_append_path={} cache_ptrs={} cache_prestored={}",
+                layer_idx,
+                m,
+                start_pos,
+                self.kv_format,
+                attn_path,
+                kv_append_path,
+                layer_k_ptr != 0 && layer_v_ptr != 0,
+                kv_cache_already_stored,
+            );
+        }
         if self.trace.as_ref().map_or(false, |t| {
             t.should_emit(trace_step, Some(layer_idx), "gqa_prefill")
         }) {
@@ -28749,6 +29025,8 @@ impl PrefillKernels {
                     "kv_cache_append_k6v6_kernel",
                     "kv_cache_append_k8v6_kernel",
                     "kv_cache_append_tq4_kernel",
+                    "kv_cache_convert_fp8_to_k4v4_kernel",
+                    "kv_cache_convert_fp8_to_k6v6_kernel",
                     "kv_cache_dequant_concat_polar4_kernel",
                     "kv_cache_dequant_concat_k4_kernel",
                     "kv_cache_dequant_concat_k6_kernel",
@@ -28849,6 +29127,8 @@ impl PrefillKernels {
             kv_cache_append_k6v6: get("kv_cache_append_k6v6_kernel")?,
             kv_cache_append_k8v6: get("kv_cache_append_k8v6_kernel")?,
             kv_cache_append_tq4: get("kv_cache_append_tq4_kernel")?,
+            kv_convert_fp8_to_k4v4: get("kv_cache_convert_fp8_to_k4v4_kernel")?,
+            kv_convert_fp8_to_k6v6: get("kv_cache_convert_fp8_to_k6v6_kernel")?,
             kv_dequant_concat_polar4: get("kv_cache_dequant_concat_polar4_kernel")?,
             kv_dequant_concat_k4: get("kv_cache_dequant_concat_k4_kernel")?,
             kv_dequant_concat_k6: get("kv_cache_dequant_concat_k6_kernel")?,

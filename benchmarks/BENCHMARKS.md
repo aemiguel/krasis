@@ -1,5 +1,151 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks - 2026-05-02 (Phase 2GB HQQ graph GQA fix 122B)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-122B-A10B
+`tests/q122b-k4v4-hqq6-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ6
+attention, `k4v4` KV cache, INT8 shared/dense/lm-head, layer group size 2,
+graph replay enabled, timing instrumentation off.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Q122B fixed HQQ graph GQA, HQQ6/k4v4, INT4 experts | HQQ6 | k4v4 | 2071.5 | 22.54 | 41.47 | 3483/12288 (28.3%) | 640 MB | [log](20260502_phase2gb_q122b_k4v4_hqq6_graph_gqa_fix_benchmark.log) |
+
+Notes:
+- This run follows the Phase 2GB HQQ graph GQA decode fix. HQQ remains the
+  only resident attention weight path; BF16 attention projection tensors were
+  not restored.
+- Startup rebuilt the benchmark heatmap with exact benchmark decode params:
+  `temperature=0.0`, `top_k=50`, `top_p=0.95`, `enable_thinking=false`.
+- Compared with Phase 2FU exact-heatmap on the same config, prefill is
+  effectively unchanged (`2030.4 -> 2071.5 tok/s`), while internal decode
+  recovered from `8.85` to `22.54 tok/s`.
+- Min free decode VRAM remained at the configured safety floor class
+  (`640 MB`), so the run completed without OOM but the 2 GB k4v4 config is
+  still tight.
+
+---
+
+## Standard Benchmarks - 2026-05-02 (Phase 2FU exact heatmap 122B)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-122B-A10B
+`tests/q122b-k4v4-hqq6-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ6
+attention, `k4v4` KV cache, INT8 shared/dense/lm-head, layer group size 2,
+graph replay enabled, timing instrumentation off.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Q122B exact-heatmap HQQ6/k4v4, INT4 experts | HQQ6 | k4v4 | 2030.4 | 8.85 | 14.36 | 3483/12288 (28.3%) | 640 MB | [log](20260502_phase2fu_q122b_k4v4_hqq6_exact_heatmap_benchmark.log) |
+
+Notes:
+- Normal startup rebuilt `auto_heatmap.json`; no explicit `--heatmap-path`
+  was used.
+- Heatmap generation used exact benchmark decode params:
+  `temperature=0.0`, `top_k=50`, `top_p=0.95`, `enable_thinking=false`,
+  `mode=benchmark`.
+- Heatmap prompts were the held-out `heatmap_prompts.txt` set, not benchmark
+  `decode_prompt_*`.
+- HCS capacity remained essentially unchanged from Phase 2FR, and decode did
+  not improve. This falsifies the narrow hypothesis that the 122B decode
+  regression was mainly caused by sampled-vs-greedy heatmap parameter mismatch.
+- Timed prefill emitted a VRAM monitor low of `218 MB`, below the configured
+  `600 MB` safety margin, but the benchmark completed.
+
+---
+
+## Standard Benchmarks - 2026-05-02 (Phase 2FR HQQ exclusive residency 122B)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-122B-A10B
+`tests/q122b-k4v4-hqq6-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ6
+attention, `k4v4` KV cache, INT8 shared/dense/lm-head, layer group size 2,
+graph replay enabled, timing instrumentation off.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Q122B exclusive HQQ6/k4v4, INT4 experts | HQQ6 | k4v4 | 2070.2 | 9.03 | 14.62 | 3456/12288 (28.1%) | 672 MB | [log](20260502_phase2fr_q122b_k4v4_hqq6_exclusive_residency_benchmark.log) |
+
+Notes:
+- HQQ runtime residency is now exclusive for this surface: the run has one
+  `HQQ runtime staging prepared` line at `device_mb=3696.47`.
+- The HQQ path released `108` replaced BF16 attention projection tensors,
+  returning `6075.00 MB` of CUDA tensor residency before calibration.
+- Reclaimable HCS budget improved to `19330 MB`; startup HCS reached
+  `3888/12288 (31.6%)`, above the previous BF16/fp8 control startup coverage
+  of `3537/12288 (28.8%)`.
+- Prefill improved from Phase 2FQ `1377.3 tok/s` to `2070.2 tok/s`, and from
+  the earlier broken Phase 2FM HQQ6/k4v4 row of `541.9 tok/s`.
+- Decode regressed versus Phase 2FQ (`16.41 -> 9.03 tok/s`) despite restored
+  HCS coverage. This points to a decode-path issue, not insufficient HCS
+  capacity, and needs a separate timing-enabled diagnosis.
+- VRAM remains tight on the 2 GB k4v4 config: timed prefill emitted a VRAM
+  monitor low of `518 MB`, below the configured `600 MB` safety margin.
+
+---
+
+## Standard Benchmarks — 2026-05-02 (Phase 2FQ stage-exact HQQ/KV 122B)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-122B-A10B
+`tests/q122b-k4v4-hqq6-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ6
+attention, `k4v4` KV cache, INT8 shared/dense/lm-head, layer group size 2,
+graph replay enabled, timing instrumentation off.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Q122B stage-exact HQQ6/k4v4, INT4 experts | HQQ6 | k4v4 | 1377.3 | 16.41 | 29.46 | 1755/12288 (14.3%) | 716 MB | [log](20260502_phase2fq_q122b_k4v4_hqq6_stage_exact_chunkfix_benchmark.log) |
+
+Notes:
+- Stage-exact HQQ compaction was active: 122B HQQ6 runtime registered
+  `device_mb=3696.47` with `prefill_mb=4904.93` and `decode_mb=3696.47`.
+- Stage-exact k4v4 prefill used temporary FP8 KV and bulk-exported to compact
+  decode KV. The invalid post-HCS measured chunk cap was removed after
+  instrumentation showed it forced the first 25K prefill warmup into
+  `196` chunks of `128` tokens.
+- Compared with Phase 2FM on the same HQQ6/k4v4 benchmark config, best prefill
+  improved from `541.9` to `1377.3 tok/s`; decode moved from `17.66` to
+  `16.41 tok/s`.
+- VRAM remains tight on the 2 GB k4v4 config: warmup emitted VRAM monitor lows
+  of `530 MB` and `512 MB`, below the configured `600 MB` safety margin.
+- This is still below the old BF16-attention/FP8-KV 122B control surface
+  (`2765.6 tok/s` prefill, `23.20 tok/s` decode).
+
+---
+
+## Standard Benchmarks — 2026-05-02 (Phase 2FM 122B HQQ6/k4v4 refresh)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-122B-A10B
+`tests/q122b-k4v4-hqq6-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ6
+attention, `k4v4` KV cache, INT8 shared/dense/lm-head, layer group size 2,
+graph replay enabled, timing instrumentation off.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Q122B k4v4 HQQ6, INT4 experts | HQQ6 | k4v4 | 541.9 | 17.66 | 31.23 | 2187/12288 (17.8%) | 736 MB | [log](20260502_phase2fm_q122b_k4v4_hqq6_int4_benchmark.log) |
+
+Notes:
+- This run was requested as a README v0.1.63 comparison for the 122B release
+  row (`2897 tok/s` prefill, `27.7 tok/s` decode).
+- HQQ6/k4v4 is not the faster 122B surface: best prefill was `541.9 tok/s` at
+  5K tokens and best internal decode was `17.66 tok/s`.
+- Long calibration reached `39,920` prompt tokens with prefill min free
+  `692 MB`; timed prefill later emitted VRAM monitor lows below the configured
+  `600 MB` safety margin but completed.
+- Q235 HQQ6/k4v4 was also attempted in Phase 2FM but no completed standard
+  benchmark row was recorded: 2 GB KV failed long calibration with a measured
+  scratch OOM, and 1 GB KV loaded/calibrated but was stopped after spending an
+  extended GPU-bound period in the first `17,324`-token prefill warmup.
+
+---
+
 ## Standard Benchmarks — 2026-05-01 (Phase 2EU MoE decode stages)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.

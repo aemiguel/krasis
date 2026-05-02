@@ -883,11 +883,17 @@ fn handle_chat_completion(
             let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
             store.suppress_tokens_clone()
         };
-        let result = engine.run_prefill(
+        let result = match engine.run_prefill(
             &token_ids,
             temperature,
             &suppress_tokens,
-        );
+        ) {
+            Ok(r) => match engine.finalize_stage_exact_prefill_kv(r.prompt_len) {
+                Ok(()) => Ok(r),
+                Err(e) => Err(format!("KV stage export failed: {}", e)),
+            },
+            Err(e) => Err(e),
+        };
 
         // Release scratch to free VRAM for decode/HCS
         if let Err(e) = engine.release_scratch() {
@@ -1345,11 +1351,17 @@ fn handle_reference_test(
         store.suppress_tokens_clone()
     };
     engine.set_reference_debug_trace_enabled(debug_reference_trace);
-    let prefill_result = engine.run_prefill(
+    let prefill_result = match engine.run_prefill(
         &input_token_ids,
         0.0, // temperature=0 for greedy
         &suppress_tokens,
-    );
+    ) {
+        Ok(r) => match engine.finalize_stage_exact_prefill_kv(r.prompt_len) {
+            Ok(()) => Ok(r),
+            Err(e) => Err(format!("KV stage export failed: {}", e)),
+        },
+        Err(e) => Err(e),
+    };
     let debug_prefill_stage_trace = if debug_reference_trace {
         engine.take_reference_debug_trace()
     } else {
@@ -2501,12 +2513,19 @@ impl RustServer {
         }
 
         let suppress_tokens = store.suppress_tokens_clone();
-        let prefill_result = engine.run_prefill(
+        let prefill_result = match engine.run_prefill(
             &token_ids,
             temperature,
             &suppress_tokens,
-        ).map_err(|e| {
+        ) {
+            Ok(r) => match engine.finalize_stage_exact_prefill_kv(r.prompt_len) {
+                Ok(()) => Ok(r),
+                Err(e) => Err(format!("KV stage export failed: {}", e)),
+            },
+            Err(e) => Err(e),
+        }.map_err(|e| {
             engine.clear_prefill_hcs_guard_store_addr();
+            let _ = engine.release_scratch();
             let _ = store.prepare_runtime_for_decode_rust();
             pyo3::exceptions::PyRuntimeError::new_err(
                 format!("Rust prefill failed: {}", e))

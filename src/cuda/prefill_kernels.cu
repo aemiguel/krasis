@@ -4760,6 +4760,109 @@ extern "C" __global__ void kv_cache_append_k6v6_kernel(
     }
 }
 
+extern "C" __global__ void kv_cache_convert_fp8_to_k4v4_kernel(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_radius_cache,
+    unsigned char* __restrict__ v_angles_cache,
+    const __nv_fp8_e4m3* __restrict__ k_fp8,
+    const __nv_fp8_e4m3* __restrict__ v_fp8,
+    int M,
+    int kv_stride,
+    int max_seq,
+    int norm_correction
+) {
+    int ti = blockIdx.x;
+    if (ti >= M || ti >= max_seq) return;
+
+    int num_blocks = kv_stride / 16;
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int src_offset = ti * kv_stride + block_idx * 16;
+        float k_local[16];
+        float v_local[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            k_local[i] = fp8e4m3_to_float(k_fp8[src_offset + i]);
+            v_local[i] = fp8e4m3_to_float(v_fp8[src_offset + i]) * polar4_signs_p[i];
+        }
+
+        unsigned char codes[16];
+        float k_scale = quantize_k4_one_pass_ls_p(k_local, codes);
+        unsigned char* k_pack = k_idx_cache + (ti * num_blocks + block_idx) * 8;
+        pack_k4_16_p(k_pack, codes);
+        __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+        k_scale_cache[ti * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+        fht16_p(v_local);
+        #pragma unroll
+        for (int i = 0; i < 16; i++) v_local[i] *= 0.25f;
+
+        float v_r = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) v_r += v_local[i] * v_local[i];
+        v_r = sqrtf(v_r + 1e-12f);
+        float inv_v_r = 1.0f / v_r;
+        unsigned char* v_ang = v_angles_cache + (ti * num_blocks + block_idx) * 8;
+        float v_qnorm2 = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int v0 = quantize_polar4_p(v_local[i*2] * inv_v_r);
+            int v1 = quantize_polar4_p(v_local[i*2+1] * inv_v_r);
+            v_ang[i] = (unsigned char)((v1 << 4) | v0);
+            float v0v = polar4_codebook_p[v0];
+            float v1v = polar4_codebook_p[v1];
+            v_qnorm2 += v0v * v0v + v1v * v1v;
+        }
+        if (norm_correction & 2) {
+            v_r = v_r / sqrtf(v_qnorm2 + 1e-12f);
+        }
+        __nv_bfloat16 v_rb = __float2bfloat16(v_r);
+        v_radius_cache[ti * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_rb);
+    }
+}
+
+extern "C" __global__ void kv_cache_convert_fp8_to_k6v6_kernel(
+    unsigned short* __restrict__ k_scale_cache,
+    unsigned char* __restrict__ k_idx_cache,
+    unsigned short* __restrict__ v_scale_cache,
+    unsigned char* __restrict__ v_idx_cache,
+    const __nv_fp8_e4m3* __restrict__ k_fp8,
+    const __nv_fp8_e4m3* __restrict__ v_fp8,
+    int M,
+    int kv_stride,
+    int max_seq,
+    int norm_correction
+) {
+    (void)norm_correction;
+    int ti = blockIdx.x;
+    if (ti >= M || ti >= max_seq) return;
+
+    int num_blocks = kv_stride / 16;
+    for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
+        int src_offset = ti * kv_stride + block_idx * 16;
+        float k_local[16];
+        float v_local[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            k_local[i] = fp8e4m3_to_float(k_fp8[src_offset + i]);
+            v_local[i] = fp8e4m3_to_float(v_fp8[src_offset + i]);
+        }
+
+        unsigned char codes[16];
+        float k_scale = quantize_k6_one_pass_ls_p(k_local, codes);
+        unsigned char* k_pack = k_idx_cache + (ti * num_blocks + block_idx) * 12;
+        pack_k6_16_p(k_pack, codes);
+        __nv_bfloat16 k_sb = __float2bfloat16(k_scale);
+        k_scale_cache[ti * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&k_sb);
+
+        float v_scale = quantize_k6_one_pass_ls_p(v_local, codes);
+        unsigned char* v_pack = v_idx_cache + (ti * num_blocks + block_idx) * 12;
+        pack_k6_16_p(v_pack, codes);
+        __nv_bfloat16 v_sb = __float2bfloat16(v_scale);
+        v_scale_cache[ti * num_blocks + block_idx] = *reinterpret_cast<unsigned short*>(&v_sb);
+    }
+}
+
 extern "C" __global__ void kv_cache_append_k8v6_kernel(
     unsigned short* __restrict__ k_scale_cache,
     unsigned char* __restrict__ k_idx_cache,

@@ -5864,23 +5864,6 @@ class KrasisModel:
 
         attn_quant = self.quant_cfg.attention  # "bf16" or "awq"
         hqq_active = is_hqq_attention(attn_quant)
-        if hqq_active:
-            registered_layers = self._register_hqq_attention_layers_on_store(
-                store, device, self._rust_decode_weights
-            )
-            cache_bytes = hqq_attention_cache_total_bytes(
-                self.cfg.model_path,
-                self.quant_cfg.hqq_cache_profile,
-                attention_quant_cache_nbits(self.quant_cfg.attention) or 4,
-                self.quant_cfg.hqq_group_size,
-            ) or 0
-            logger.info(
-                "HQQ attention registration completed on cuda:%d: %d layers, %d MB validated cache, %d tensors loaded. Runtime execution descriptors are active on the decode store.",
-                gpu_idx,
-                registered_layers,
-                cache_bytes >> 20,
-                self._hqq_attention_loaded_tensors,
-            )
         marlin_gs = 128  # Marlin group size for both INT8 and INT4
 
         # AWQ template: per-layer channel scales from calibration
@@ -6073,6 +6056,85 @@ class KrasisModel:
         else:
             self._aux_bf16_stash = None  # streaming has its own CPU copies
 
+        def _release_hqq_bf16_attention_residency() -> None:
+            """Drop BF16 attention projection tensors replaced by HQQ runtime descriptors."""
+            released_bytes = 0
+            released_tensors = 0
+
+            def _release_attr(obj, attr_name: str) -> None:
+                nonlocal released_bytes, released_tensors
+                if obj is None or not hasattr(obj, attr_name):
+                    return
+                value = getattr(obj, attr_name)
+                if isinstance(value, torch.Tensor):
+                    if value.is_cuda:
+                        released_bytes += value.numel() * value.element_size()
+                    released_tensors += 1
+                    setattr(obj, attr_name, None)
+
+            def _release_dict_tensor(dct, key: str) -> None:
+                nonlocal released_bytes, released_tensors
+                if not isinstance(dct, dict) or key not in dct:
+                    return
+                value = dct.get(key)
+                if isinstance(value, torch.Tensor):
+                    if value.is_cuda:
+                        released_bytes += value.numel() * value.element_size()
+                    released_tensors += 1
+                    dct[key] = None
+
+            for hqq_layer in self.layers:
+                attn_obj = hqq_layer.attention
+                if attn_obj is None:
+                    continue
+                if hqq_layer.layer_type == "linear_attention":
+                    for name in ("in_proj_qkvz", "in_proj_ba", "out_proj"):
+                        _release_attr(attn_obj, name)
+                elif hasattr(attn_obj, "kv_a_proj"):
+                    for name in (
+                        "q_proj", "q_a_proj", "q_b_proj",
+                        "kv_a_proj", "kv_a_proj_with_mqa", "kv_b_proj",
+                        "o_proj",
+                    ):
+                        _release_attr(attn_obj, name)
+                else:
+                    gqa_w = getattr(hqq_layer, "gqa_weights", None)
+                    for name in ("q_proj", "k_proj", "v_proj", "o_proj", "fused_qkv"):
+                        _release_dict_tensor(gqa_w, name)
+                        _release_attr(attn_obj, name)
+
+            if released_tensors:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.info(
+                    "HQQ BF16 attention projection residency released: tensors=%d cuda_mb=%.2f",
+                    released_tensors,
+                    released_bytes / (1024.0 * 1024.0),
+                )
+
+        hqq_registered_layers = 0
+        hqq_cache_bytes = 0
+        if hqq_active:
+            hqq_registered_layers = self._register_hqq_attention_layers_on_store(
+                store, device, self._rust_decode_weights
+            )
+            hqq_cache_bytes = hqq_attention_cache_total_bytes(
+                self.cfg.model_path,
+                self.quant_cfg.hqq_cache_profile,
+                attention_quant_cache_nbits(self.quant_cfg.attention) or 4,
+                self.quant_cfg.hqq_group_size,
+            ) or 0
+            logger.info(
+                "HQQ attention registration completed on cuda:%d: %d layers, %d MB validated cache, %d tensors loaded. Runtime execution descriptors are active on the decode store.",
+                gpu_idx,
+                hqq_registered_layers,
+                hqq_cache_bytes >> 20,
+                self._hqq_attention_loaded_tensors,
+            )
+            _release_hqq_bf16_attention_residency()
+
         for layer_idx, layer in enumerate(self.layers):
             attn = layer.attention
             inp_norm = layer.input_norm_weight
@@ -6106,7 +6168,13 @@ class KrasisModel:
                     get_layer_scales, is_awq_scaled_tensor)
                 _layer_awq_scales = get_layer_scales(_awq_template, layer_idx)
 
-            if layer.layer_type == "linear_attention":
+            if hqq_active:
+                # HQQ registration below owns attention projection residency.
+                # Do not route HQQ tensors through the normal BF16/Marlin
+                # registration path, otherwise quantized attention becomes
+                # additive over resident BF16 weights instead of replacing it.
+                pass
+            elif layer.layer_type == "linear_attention":
                 # Source projection weights — when quantizing, keep on CPU to avoid
                 # putting full BF16 in VRAM. Only upload to GPU for BF16 mode.
                 if self._stream_attn_enabled and layer_idx in self._stream_attn_cpu:
@@ -6702,14 +6770,33 @@ class KrasisModel:
             logger.info("MLA-only KV cache: max_seq=%d (%d pages × %d)",
                         max_seq, cache.max_pages, cache.page_size)
 
-        if hqq_active:
-            registered_layers = self._register_hqq_attention_layers_on_store(
-                store, device, self._rust_decode_weights
+        if hqq_active and not rope_set:
+            max_seq = max(
+                c.max_context_tokens for c in self.kv_caches if c is not None
             )
+            rope_half = self.cfg.rotary_dim // 2
+            inv_freq = 1.0 / (self.cfg.rope_theta ** (
+                torch.arange(0, rope_half * 2, 2, dtype=torch.float32) / (rope_half * 2)))
+            t = torch.arange(max_seq, dtype=torch.float32)
+            freqs = torch.outer(t, inv_freq)
+            cos_f32 = freqs.cos().contiguous().to(device)
+            sin_f32 = freqs.sin().contiguous().to(device)
+            self._rust_rope_cos = cos_f32
+            self._rust_rope_sin = sin_f32
+            store.set_rope_tables(
+                cos_f32.data_ptr(), sin_f32.data_ptr(),
+                cos_f32.shape[1], max_seq,
+            )
+            rope_set = True
+            logger.info("HQQ attention RoPE tables registered: max_seq=%d rope_half=%d", max_seq, rope_half)
+
+        if hqq_active:
             logger.info(
-                "HQQ attention execution descriptors restored after shared decode setup on cuda:%d: %d layers registered.",
+                "HQQ attention execution descriptors retained after shared decode setup on cuda:%d: %d layers registered, %d MB validated cache, %d tensors loaded.",
                 gpu_idx,
-                registered_layers,
+                hqq_registered_layers,
+                hqq_cache_bytes >> 20,
+                self._hqq_attention_loaded_tensors,
             )
 
         self._gpu_decode_store = store

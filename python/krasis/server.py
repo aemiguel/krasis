@@ -7,6 +7,7 @@ Usage:
 import argparse
 import atexit
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from krasis.attention_backend import (
     ATTENTION_QUANT_CHOICES,
@@ -90,6 +91,12 @@ from krasis.config import (
 from krasis.model import KrasisModel
 
 logger = logging.getLogger("krasis.server")
+
+HEATMAP_FORMAT = "krasis_hcs_heatmap"
+HEATMAP_FORMAT_VERSION = 2
+HEATMAP_DEFAULT_TOP_K = 50
+HEATMAP_DEFAULT_TOP_P = 0.95
+HEATMAP_DEFAULT_PRESENCE_PENALTY = 0.0
 
 # ANSI formatting for status output
 _BOLD = "\033[1m"
@@ -265,70 +272,225 @@ def _start_session_bridge(host: str, port: int) -> Optional[subprocess.Popen]:
         return None
 
 
-def _validate_heatmap(heatmap_path: str, cfg) -> bool:
-    """Check if a cached heatmap matches the current model config.
+def _sha256_file(path: str) -> Optional[str]:
+    if not os.path.isfile(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    Returns True if valid, False if it should be rebuilt.
-    Only triggers rebuild on structural mismatches (wrong layer count or
-    expert count), NOT on missing metadata or sparse coverage.
-    """
+
+def _sha256_jsonable(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _krasis_runtime_code_hash() -> dict[str, Any]:
+    """Hash first-party files that affect heatmap routing/validation behavior."""
+    package_dir = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates = [
+        "pyproject.toml",
+        "Cargo.toml",
+        "build.rs",
+        "python/krasis/__init__.py",
+        "python/krasis/server.py",
+        "python/krasis/benchmark.py",
+        "python/krasis/model.py",
+        "python/krasis/config.py",
+        "python/krasis/tokenizer.py",
+        "src/server.rs",
+        "src/gpu_decode.rs",
+        "src/gpu_prefill.rs",
+        "src/cuda/prefill_kernels.cu",
+    ]
+    h = hashlib.sha256()
+    hashed_files: list[str] = []
+    for rel in candidates:
+        path = repo_root / rel
+        if not path.is_file() and rel.startswith("python/krasis/"):
+            path = package_dir / rel.removeprefix("python/krasis/")
+        if not path.is_file():
+            continue
+        hashed_files.append(rel)
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        h.update(b"\0")
+    return {"sha256": h.hexdigest(), "files": hashed_files}
+
+
+def _model_config_fingerprints(model_path: str) -> dict[str, Optional[str]]:
+    names = [
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]
+    return {name: _sha256_file(os.path.join(model_path, name)) for name in names}
+
+
+def _load_benchmark_decode_prompt_texts() -> dict[str, str]:
+    prompts_dir = os.path.join(os.path.dirname(__file__), "prompts")
+    prompts: dict[str, str] = {}
+    for i in range(1, 100):
+        filename = f"decode_prompt_{i}"
+        path = os.path.join(prompts_dir, filename)
+        if not os.path.isfile(path):
+            break
+        with open(path) as f:
+            prompts[filename] = f.read().strip()
+    return prompts
+
+
+def _assert_heatmap_prompts_are_held_out(prompts: list[str]) -> None:
+    benchmark_prompts = _load_benchmark_decode_prompt_texts()
+    normalized_benchmark = {
+        " ".join(text.split()): name for name, text in benchmark_prompts.items()
+    }
+    for idx, prompt in enumerate(prompts, start=1):
+        key = " ".join(prompt.split())
+        if key in normalized_benchmark:
+            raise RuntimeError(
+                "Heatmap prompt set overlaps the benchmark decode prompt set: "
+                f"heatmap prompt {idx} exactly matches {normalized_benchmark[key]}. "
+                "Use held-out heatmap prompts so benchmark decode remains an unseen workload."
+            )
+
+
+def _heatmap_decode_params(args) -> dict[str, Any]:
+    benchmark_mode = bool(getattr(args, "benchmark", False) or getattr(args, "benchmark_only", False))
+    return {
+        "mode": "benchmark" if benchmark_mode else "server-default",
+        "temperature": 0.0 if benchmark_mode else float(args.temperature),
+        "top_k": HEATMAP_DEFAULT_TOP_K,
+        "top_p": HEATMAP_DEFAULT_TOP_P,
+        "presence_penalty": HEATMAP_DEFAULT_PRESENCE_PENALTY,
+        "enable_thinking": False if benchmark_mode else bool(args.enable_thinking),
+        "decode_tokens_per_prompt": HEATMAP_DECODE_TOKENS,
+    }
+
+
+def _expected_heatmap_metadata(model: KrasisModel, args, prompts: list[str]) -> dict[str, Any]:
+    from krasis import __version__ as krasis_version
+
+    prompt_file = os.path.join(os.path.dirname(__file__), "prompts", "heatmap_prompts.txt")
+    cfg = model.cfg
+    quant_cfg = getattr(model, "quant_cfg", None)
+    try:
+        import torch
+        resolved_num_gpus = int(args.num_gpus or torch.cuda.device_count())
+    except Exception:
+        resolved_num_gpus = int(args.num_gpus or 0)
+    metadata = {
+        "format": HEATMAP_FORMAT,
+        "format_version": HEATMAP_FORMAT_VERSION,
+        "krasis": {
+            "version": krasis_version,
+            "runtime_code": _krasis_runtime_code_hash(),
+        },
+        "model": {
+            "model_path": os.path.abspath(args.model_path),
+            "model_name": os.path.basename(os.path.abspath(args.model_path)),
+            "model_type": cfg.model_type,
+            "num_hidden_layers": cfg.num_hidden_layers,
+            "num_moe_layers": cfg.num_moe_layers,
+            "n_routed_experts": cfg.n_routed_experts,
+            "num_experts_per_tok": cfg.num_experts_per_tok,
+            "num_full_attention_layers": cfg.num_full_attention_layers,
+            "config_fingerprints": _model_config_fingerprints(args.model_path),
+        },
+        "runtime": {
+            "num_gpus": resolved_num_gpus,
+            "selected_gpus": args.selected_gpus or "",
+            "gpu_expert_bits": int(args.gpu_expert_bits),
+            "expert_group_size": int(args.expert_group_size),
+            "gpu_expert_int4_calib": args.gpu_expert_int4_calib,
+            "cpu_expert_bits": int(args.cpu_expert_bits),
+            "attention_quant": args.attention_quant,
+            "hqq_cache_profile": args.hqq_cache_profile,
+            "hqq_group_size": int(args.hqq_group_size),
+            "hqq_auto_budget_pct": args.hqq_auto_budget_pct,
+            "hqq46_auto_budget_mib": args.hqq46_auto_budget_mib,
+            "hqq_sidecar_manifest": os.path.abspath(args.hqq_sidecar_manifest) if args.hqq_sidecar_manifest else None,
+            "shared_expert_quant": args.shared_expert_quant,
+            "dense_mlp_quant": args.dense_mlp_quant,
+            "lm_head_quant": args.lm_head_quant,
+            "kv_dtype": args.kv_dtype,
+            "kv_cache_mb": int(args.kv_cache_mb),
+            "layer_group_size": int(args.layer_group_size),
+            "multi_gpu_hcs": bool(args.multi_gpu_hcs),
+            "hcs": bool(args.hcs),
+            "quant_config": getattr(quant_cfg, "__dict__", {}) if quant_cfg is not None else {},
+        },
+        "heatmap_build": {
+            "prompt_source": "python/krasis/prompts/heatmap_prompts.txt",
+            "prompt_file_sha256": _sha256_file(prompt_file),
+            "prompt_count": len(prompts),
+            "prompt_set_sha256": _sha256_jsonable(prompts),
+            "benchmark_prompt_overlap": False,
+            "decode_params": _heatmap_decode_params(args),
+        },
+    }
+    return metadata
+
+
+def _metadata_mismatches(expected: Any, actual: Any, path: str = "") -> list[str]:
+    mismatches: list[str] = []
+    label = path or "metadata"
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return [f"{label}: expected object, found {type(actual).__name__}"]
+        for key in sorted(expected):
+            child_path = f"{label}.{key}" if path else key
+            if key not in actual:
+                mismatches.append(f"{child_path}: missing")
+            else:
+                mismatches.extend(_metadata_mismatches(expected[key], actual[key], child_path))
+        for key in sorted(set(actual) - set(expected)):
+            if key == "generated_at_utc":
+                continue
+            child_path = f"{label}.{key}" if path else key
+            mismatches.append(f"{child_path}: unexpected")
+        return mismatches
+    if expected != actual:
+        mismatches.append(f"{label}: expected {expected!r}, found {actual!r}")
+    return mismatches
+
+
+def _load_validated_heatmap(heatmap_path: str, expected_metadata: dict[str, Any]) -> dict[str, Any]:
     try:
         with open(heatmap_path) as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        logger.warning("Heatmap file corrupt or unreadable, will rebuild")
-        return False
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Heatmap file is not valid JSON: {heatmap_path}: {e}") from e
+    except OSError as e:
+        raise RuntimeError(f"Heatmap file is unreadable: {heatmap_path}: {e}") from e
 
     meta = data.get("_metadata")
-    if meta:
-        # New format with embedded metadata -- exact check
-        expected_moe = cfg.num_moe_layers
-        expected_experts = cfg.n_routed_experts
-        if meta.get("num_moe_layers") != expected_moe:
-            logger.warning(
-                "Heatmap stale: num_moe_layers=%s but model has %d, will rebuild",
-                meta.get("num_moe_layers"), expected_moe,
-            )
-            return False
-        if meta.get("n_routed_experts") != expected_experts:
-            logger.warning(
-                "Heatmap stale: n_routed_experts=%s but model has %d, will rebuild",
-                meta.get("n_routed_experts"), expected_experts,
-            )
-            return False
-        return True
-
-    # Old format (no metadata) -- infer from data keys
-    layers_seen = set()
-    max_expert = -1
-    for key in data:
-        if key.startswith("_"):
-            continue
-        parts = key.split(",")
-        if len(parts) == 2:
-            layers_seen.add(int(parts[0]))
-            max_expert = max(max_expert, int(parts[1]))
-
-    expected_moe = cfg.num_moe_layers
-    if len(layers_seen) < expected_moe:
-        # Some layers have zero activations in a 10K sample -- only flag if
-        # a significant number are missing (>20% of layers absent is suspicious)
-        missing_pct = (expected_moe - len(layers_seen)) / expected_moe
-        if missing_pct > 0.2:
-            logger.warning(
-                "Heatmap covers %d/%d MoE layers (%.0f%% missing), will rebuild",
-                len(layers_seen), expected_moe, missing_pct * 100,
-            )
-            return False
-
-    if max_expert >= cfg.n_routed_experts:
-        logger.warning(
-            "Heatmap references expert %d but model only has %d experts, will rebuild",
-            max_expert, cfg.n_routed_experts,
+    if not isinstance(meta, dict):
+        raise RuntimeError(
+            "Refusing to use heatmap without validation metadata: "
+            f"{heatmap_path}. Rebuild it with the current Krasis server so the "
+            "runtime params, heatmap params, prompt hash, and Krasis version can be verified."
         )
-        return False
-
-    return True
+    mismatches = _metadata_mismatches(expected_metadata, meta)
+    if mismatches:
+        sample = "\n  - ".join(mismatches[:20])
+        extra = "" if len(mismatches) <= 20 else f"\n  - ... {len(mismatches) - 20} more"
+        raise RuntimeError(
+            "Refusing to use heatmap because it was not built for this exact runtime. "
+            f"Path: {heatmap_path}\n"
+            f"Mismatches:\n  - {sample}{extra}\n"
+            "Rebuild the heatmap without --heatmap-path, or provide a heatmap built "
+            "with the same Krasis version, runtime config, heatmap build params, "
+            "and heatmap prompt set."
+        )
+    return data
 
 
 def _load_heatmap_prompts() -> list[str]:
@@ -436,10 +598,18 @@ def _make_startup_calibration_prompts(model: KrasisModel, lengths: list[int]) ->
 HEATMAP_DECODE_TOKENS = 256
 
 
-def _chat_prompt_tokens(model: KrasisModel, prompt_text: str) -> list[int]:
+def _chat_prompt_tokens(
+    model: KrasisModel,
+    prompt_text: str,
+    enable_thinking: Optional[bool] = None,
+) -> list[int]:
+    kwargs = {}
+    if enable_thinking is not None:
+        kwargs["enable_thinking"] = enable_thinking
     return model.tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt_text}],
         add_generation_prompt=True,
+        **kwargs,
     )
 
 
@@ -447,7 +617,7 @@ def _default_stop_ids(model: KrasisModel) -> list[int]:
     return [model.cfg.eos_token_id] + list(model.cfg.extra_stop_token_ids)
 
 
-def _build_heatmap(model: KrasisModel, save_path: str) -> str:
+def _build_heatmap(model: KrasisModel, save_path: str, args) -> str:
     """Build expert activation heatmap by running decode-heavy inference.
 
     Loads diverse short prompts from heatmap_prompts.txt, runs each with a
@@ -461,6 +631,9 @@ def _build_heatmap(model: KrasisModel, save_path: str) -> str:
     import os, json
 
     prompts = _load_heatmap_prompts()
+    _assert_heatmap_prompts_are_held_out(prompts)
+    heatmap_metadata = _expected_heatmap_metadata(model, args, prompts)
+    decode_params = heatmap_metadata["heatmap_build"]["decode_params"]
 
     gpu_store = getattr(model, '_gpu_decode_store', None)
     if gpu_store is None:
@@ -476,24 +649,40 @@ def _build_heatmap(model: KrasisModel, save_path: str) -> str:
 
     # Run each prompt with long decode to build a decode-weighted heatmap
     total_decode_tokens = 0
-    logger.info("Building heatmap from %d prompts (%d decode tokens each)...",
-                len(prompts), HEATMAP_DECODE_TOKENS)
+    logger.info(
+        "Building heatmap from %d held-out prompts (%d decode tokens each, "
+        "temperature=%.3f top_k=%d top_p=%.3f enable_thinking=%s mode=%s)...",
+        len(prompts),
+        HEATMAP_DECODE_TOKENS,
+        decode_params["temperature"],
+        decode_params["top_k"],
+        decode_params["top_p"],
+        decode_params["enable_thinking"],
+        decode_params["mode"],
+    )
     stop_ids = _default_stop_ids(model)
     for i, prompt_text in enumerate(prompts):
-        tokens = _chat_prompt_tokens(model, prompt_text)
+        tokens = _chat_prompt_tokens(
+            model,
+            prompt_text,
+            enable_thinking=decode_params["enable_thinking"],
+        )
         logger.info("  Heatmap prompt %d/%d: %d prefill tokens + %d decode tokens",
                     i + 1, len(prompts), len(tokens), HEATMAP_DECODE_TOKENS)
-        first_token, prompt_len, kv_overflow = gpu_store.rust_prefill_tokens(tokens, temperature=0.6)
+        first_token, prompt_len, kv_overflow = gpu_store.rust_prefill_tokens(
+            tokens,
+            temperature=decode_params["temperature"],
+        )
         if not kv_overflow and first_token not in stop_ids:
             generated = gpu_store.gpu_generate_batch(
                 first_token=first_token,
                 start_position=prompt_len,
                 max_tokens=HEATMAP_DECODE_TOKENS,
-                temperature=0.6,
-                top_k=50,
-                top_p=0.95,
+                temperature=decode_params["temperature"],
+                top_k=decode_params["top_k"],
+                top_p=decode_params["top_p"],
                 stop_ids=stop_ids,
-                presence_penalty=0.0,
+                presence_penalty=decode_params["presence_penalty"],
             )
             total_decode_tokens += 1 + len(generated)
         else:
@@ -504,9 +693,11 @@ def _build_heatmap(model: KrasisModel, save_path: str) -> str:
 
     # Export and save heatmap
     heatmap_dict = gpu_store.hcs_export_heatmap()
+    heatmap_metadata["generated_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    heatmap_dict["_metadata"] = heatmap_metadata
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     with open(save_path, 'w') as f:
-        json.dump(heatmap_dict, f)
+        json.dump(heatmap_dict, f, sort_keys=True)
     logger.info("Heatmap saved to %s (%d entries)", save_path, len(heatmap_dict))
 
     # Tear down collection-only HCS so normal startup can re-init with real budget
@@ -1099,6 +1290,15 @@ def main():
         return
     _model.load(gpu_only=gpu_only)
 
+    _hf_tok = _model.tokenizer.tokenizer  # unwrap Tokenizer -> HF AutoTokenizer
+    _template = getattr(_hf_tok, "chat_template", "") or ""
+    template_supports_enable_thinking = "enable_thinking" in _template
+    if args.enable_thinking and not template_supports_enable_thinking:
+        logger.info(
+            "Model template does not support enable_thinking; forcing server default thinking off"
+        )
+        args.enable_thinking = False
+
     # Resolve heatmap save path (rebuilt fresh on every startup unless --heatmap-path)
     cache_dir = cache_dir_for_model(args.model_path)
     heatmap_path = args.heatmap_path
@@ -1600,22 +1800,27 @@ def main():
 
         # ── Build heatmap ──
         # Always rebuild fresh on startup so the heatmap reflects current decode
-        # routing.  A stale cached heatmap causes dramatically worse HCS hit
-        # rates even with the same budget (March 2026: 69% coverage / 24% miss
-        # with stale vs 54% coverage / 8% miss with fresh).
-        #
-        # Exception: if the user explicitly passed --heatmap-path, trust it.
+        # routing and exact heatmap build parameters. Reuse is only allowed via
+        # explicit --heatmap-path, and that path must validate against the same
+        # runtime params, heatmap params, prompt hash, and Krasis version.
+        heatmap_prompts = _load_heatmap_prompts()
+        _assert_heatmap_prompts_are_held_out(heatmap_prompts)
+        expected_heatmap_metadata = _expected_heatmap_metadata(_model, args, heatmap_prompts)
+        validated_heatmap_data = None
         if args.heatmap_path:
             _dim(f"Using user-provided heatmap: {os.path.basename(heatmap_path)}")
-            if not _validate_heatmap(heatmap_path, cfg):
-                _warn("User-provided heatmap doesn't match model config — using it anyway")
+            validated_heatmap_data = _load_validated_heatmap(heatmap_path, expected_heatmap_metadata)
+            _detail("Heatmap metadata validated against current runtime and build params")
         else:
             _status("Building expert heatmap (decode-weighted calibration)")
-            heatmap_path = _build_heatmap(_model, heatmap_path)
+            heatmap_path = _build_heatmap(_model, heatmap_path, args)
 
         # ── Load heatmap and build sorted ranking ──
-        with open(heatmap_path) as f:
-            raw_heatmap = json.load(f)
+        if validated_heatmap_data is not None:
+            raw_heatmap = validated_heatmap_data
+        else:
+            with open(heatmap_path) as f:
+                raw_heatmap = json.load(f)
         # Strip metadata before building ranking
         raw_heatmap.pop("_metadata", None)
         sorted_ranking = sorted(raw_heatmap.items(), key=lambda x: x[1], reverse=True)
@@ -2056,14 +2261,6 @@ def main():
     # Only activate if the model's chat template actually supports enable_thinking
     # (i.e. the template contains <think> logic). Without this check, models
     # without thinking support would never emit </think>, breaking the budget.
-    _hf_tok = _model.tokenizer.tokenizer  # unwrap Tokenizer → HF AutoTokenizer
-    _template = getattr(_hf_tok, "chat_template", "") or ""
-    template_supports_enable_thinking = "enable_thinking" in _template
-    if args.enable_thinking and not template_supports_enable_thinking:
-        logger.info(
-            "Model template does not support enable_thinking; forcing server default thinking off"
-        )
-        args.enable_thinking = False
     think_end_id = 0
     if template_supports_enable_thinking:
         _raw_id = _hf_tok.convert_tokens_to_ids("</think>")
