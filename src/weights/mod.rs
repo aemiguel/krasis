@@ -3006,6 +3006,12 @@ impl WeightStore {
         log::info!("Rayon thread pool: {physical_cores} physical cores (cache build)");
 
         let overall_start = std::time::Instant::now();
+        let mut total_route_io = std::time::Duration::new(0, 0);
+        let mut total_route_repack = std::time::Duration::new(0, 0);
+        let mut total_route_write = std::time::Duration::new(0, 0);
+        let mut total_shared_io = std::time::Duration::new(0, 0);
+        let mut total_shared_repack = std::time::Duration::new(0, 0);
+        let mut total_shared_write = std::time::Duration::new(0, 0);
 
         // Prefetch first layer's expert data asynchronously
         let first_layer_idx = config.moe_abs_layer(start_moe_layer);
@@ -3077,55 +3083,57 @@ impl WeightStore {
                     config, effective_group_size, gpu_bits, expert_int4_calib_mode, expert_int4_calib_data,
                 )?
             } else {
-                let mut data = Vec::with_capacity(config.n_routed_experts);
-                for eidx in 0..config.n_routed_experts {
-                    let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.experts.{eidx}");
-                    let (gate, up, down) = if !experts_gated {
-                        // Nemotron: ungated experts (no gate_proj, just up_proj + down_proj)
-                        if prequantized {
-                            let u = QuantWeight::Int4(load_prequantized_weight(
-                                &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
-                            )?);
-                            let d = QuantWeight::Int4(load_prequantized_weight(
-                                &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
-                            )?);
-                            (QuantWeight::empty(4), u, d)
+                (0..config.n_routed_experts)
+                    .into_par_iter()
+                    .map(|eidx| -> Result<ExpertWeights, String> {
+                        let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.experts.{eidx}");
+                        let (gate, up, down) = if !experts_gated {
+                            // Nemotron: ungated experts (no gate_proj, just up_proj + down_proj)
+                            if prequantized {
+                                let u = QuantWeight::Int4(load_prequantized_weight(
+                                    &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                                )?);
+                                let d = QuantWeight::Int4(load_prequantized_weight(
+                                    &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                                )?);
+                                (QuantWeight::empty(4), u, d)
+                            } else {
+                                load_and_quantize_expert_ungated(
+                                    &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                                )?
+                            }
+                        } else if prequantized {
+                            if gpu_bits == 8 {
+                                // Pre-quantized INT4 → need to dequant and re-quantize as INT8
+                                // For now, load BF16 and quantize fresh (fall through to non-prequant path)
+                                load_and_quantize_expert(
+                                    layer_idx, eidx, &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
+                                    ExpertInt4CalibMode::Amax, None,
+                                )?
+                            } else {
+                                let g = QuantWeight::Int4(load_prequantized_weight(
+                                    &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
+                                )?);
+                                let u = QuantWeight::Int4(load_prequantized_weight(
+                                    &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
+                                )?);
+                                let d = QuantWeight::Int4(load_prequantized_weight(
+                                    &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
+                                )?);
+                                (g, u, d)
+                            }
                         } else {
-                            load_and_quantize_expert_ungated(
-                                &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
-                            )?
-                        }
-                    } else if prequantized {
-                        if gpu_bits == 8 {
-                            // Pre-quantized INT4 → need to dequant and re-quantize as INT8
-                            // For now, load BF16 and quantize fresh (fall through to non-prequant path)
                             load_and_quantize_expert(
                                 layer_idx, eidx, &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
-                                ExpertInt4CalibMode::Amax, None,
+                                expert_int4_calib_mode, expert_int4_calib_data,
                             )?
-                        } else {
-                            let g = QuantWeight::Int4(load_prequantized_weight(
-                                &prefix, "gate_proj", &index.weight_map, &shards, effective_group_size,
-                            )?);
-                            let u = QuantWeight::Int4(load_prequantized_weight(
-                                &prefix, "up_proj", &index.weight_map, &shards, effective_group_size,
-                            )?);
-                            let d = QuantWeight::Int4(load_prequantized_weight(
-                                &prefix, "down_proj", &index.weight_map, &shards, effective_group_size,
-                            )?);
-                            (g, u, d)
-                        }
-                    } else {
-                        load_and_quantize_expert(
-                            layer_idx, eidx, &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
-                            expert_int4_calib_mode, expert_int4_calib_data,
-                        )?
-                    };
-                    data.push(ExpertWeights { gate, up, down });
-                }
-                data
+                        };
+                        Ok(ExpertWeights { gate, up, down })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
             };
             let io_elapsed = io_start.elapsed();
+            total_route_io += io_elapsed;
 
             // Prefetch next layer's data while we do CPU-bound Marlin repack
             let next_moe_idx = moe_idx + 1;
@@ -3185,14 +3193,18 @@ impl WeightStore {
                 .map(|ew| UnifiedExpertWeights::from_expert_weights_marlin(&ew, gpu_bits))
                 .collect();
             let repack_elapsed = repack_start.elapsed();
+            total_route_repack += repack_elapsed;
 
             // Phase 3: Sequential write (file format requires expert ordering)
+            let write_start = std::time::Instant::now();
             for marlin in &expert_results {
                 write_vec_u32(&mut w, &marlin.w13_packed)?;
                 write_vec_u16(&mut w, &marlin.w13_scales)?;
                 write_vec_u32(&mut w, &marlin.w2_packed)?;
                 write_vec_u16(&mut w, &marlin.w2_scales)?;
             }
+            let write_elapsed = write_start.elapsed();
+            total_route_write += write_elapsed;
             drop(expert_results); // Free Marlin results immediately
 
             let layers_done = moe_idx - start_moe_layer + 1;
@@ -3206,18 +3218,20 @@ impl WeightStore {
                     overall_elapsed, remaining,
                 );
                 crate::syscheck::log_memory_usage(&format!(
-                    "Marlin cache: {layers_done}/{num_moe_layers} layers ({:.1}s/layer, io={:.1}s repack={:.1}s)",
+                    "Marlin cache: {layers_done}/{num_moe_layers} layers ({:.1}s/layer, io={:.1}s repack={:.1}s write={:.1}s)",
                     layer_elapsed.as_secs_f64(),
                     io_elapsed.as_secs_f64(),
                     repack_elapsed.as_secs_f64(),
+                    write_elapsed.as_secs_f64(),
                 ));
             } else {
                 log::info!(
-                    "  Layer {layer_idx}: {} experts in {:.1}s (io={:.1}s repack={:.1}s) [{layers_done}/{num_moe_layers}]",
+                    "  Layer {layer_idx}: {} experts in {:.1}s (io={:.1}s repack={:.1}s write={:.1}s) [{layers_done}/{num_moe_layers}]",
                     config.n_routed_experts,
                     layer_elapsed.as_secs_f64(),
                     io_elapsed.as_secs_f64(),
                     repack_elapsed.as_secs_f64(),
+                    write_elapsed.as_secs_f64(),
                 );
             }
         }
@@ -3230,6 +3244,7 @@ impl WeightStore {
             for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
                 let layer_idx = config.moe_abs_layer(moe_idx);
                 let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
+                let shared_io_start = std::time::Instant::now();
                 let (gate, up, down) = if experts_gated {
                     load_and_quantize_expert(
                         layer_idx, 0, &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
@@ -3240,21 +3255,31 @@ impl WeightStore {
                         &prefix, &index.weight_map, &shards, effective_group_size, gpu_bits,
                     )?
                 };
+                let shared_io_elapsed = shared_io_start.elapsed();
+                total_shared_io += shared_io_elapsed;
                 let ew = ExpertWeights { gate, up, down };
+                let shared_repack_start = std::time::Instant::now();
                 let marlin = UnifiedExpertWeights::from_expert_weights_marlin(&ew, gpu_bits);
+                let shared_repack_elapsed = shared_repack_start.elapsed();
+                total_shared_repack += shared_repack_elapsed;
 
+                let shared_write_start = std::time::Instant::now();
                 write_vec_u32(&mut w, &marlin.w13_packed)?;
                 write_vec_u16(&mut w, &marlin.w13_scales)?;
                 write_vec_u32(&mut w, &marlin.w2_packed)?;
                 write_vec_u16(&mut w, &marlin.w2_scales)?;
+                let shared_write_elapsed = shared_write_start.elapsed();
+                total_shared_write += shared_write_elapsed;
             }
         }
 
         // Flush + atomic rename
+        let flush_start = std::time::Instant::now();
         w.flush().map_err(|e| format!("Flush error: {e}"))?;
         drop(w);
         std::fs::rename(&tmp_path, cache_path)
             .map_err(|e| format!("Failed to rename cache file: {e}"))?;
+        let flush_elapsed = flush_start.elapsed();
 
         // Evict safetensors page cache, then free mmaps and reclaim RAM
         for shard in shards.values() {
@@ -3270,11 +3295,31 @@ impl WeightStore {
             "  \x1b[0;32m✓ GPU INT{} Marlin cache built: {:.1} GB in {:.0}s\x1b[0m",
             gpu_bits, size as f64 / 1e9, elapsed.as_secs_f64(),
         );
+        eprintln!(
+            "    Marlin timing: routed io/quant={:.1}s repack={:.1}s write={:.1}s; shared io/quant={:.1}s repack={:.1}s write={:.1}s; flush={:.1}s",
+            total_route_io.as_secs_f64(),
+            total_route_repack.as_secs_f64(),
+            total_route_write.as_secs_f64(),
+            total_shared_io.as_secs_f64(),
+            total_shared_repack.as_secs_f64(),
+            total_shared_write.as_secs_f64(),
+            flush_elapsed.as_secs_f64(),
+        );
         log::info!(
             "Marlin cache built: {:.1} GB in {:.1}s ({:.1} GB/s)",
             size as f64 / 1e9,
             elapsed.as_secs_f64(),
             size as f64 / 1e9 / elapsed.as_secs_f64(),
+        );
+        log::info!(
+            "Marlin cache timing totals: routed_io_quant={:.3}s routed_repack={:.3}s routed_write={:.3}s shared_io_quant={:.3}s shared_repack={:.3}s shared_write={:.3}s flush_rename={:.3}s",
+            total_route_io.as_secs_f64(),
+            total_route_repack.as_secs_f64(),
+            total_route_write.as_secs_f64(),
+            total_shared_io.as_secs_f64(),
+            total_shared_repack.as_secs_f64(),
+            total_shared_write.as_secs_f64(),
+            flush_elapsed.as_secs_f64(),
         );
         crate::syscheck::log_memory_usage("after streaming_build_marlin_cache");
 
