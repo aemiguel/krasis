@@ -30,6 +30,7 @@ fn krasis(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hqq::hqq4_solve_group_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(hqq::hqq4_rmse_group_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(hqq::hqq4_quantize_tensor_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(hqq::hqq_search_cuda_tensor_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(syscheck::system_check, m)?)?;
     Ok(())
 }

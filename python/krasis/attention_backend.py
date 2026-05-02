@@ -35,9 +35,12 @@ from krasis.krasis import (
 
 
 HQQ_ATTENTION_CACHE_VERSION = 5
-HQQ_ATTENTION_CACHE_DIRNAME = f"attention_hqq_v{HQQ_ATTENTION_CACHE_VERSION}"
-HQQ46_ATTENTION_CACHE_DIRNAME = f"attention_hqq46_v{HQQ_ATTENTION_CACHE_VERSION}"
-HQQ46_AUTO_ATTENTION_CACHE_DIRNAME = f"attention_hqq46_auto_v{HQQ_ATTENTION_CACHE_VERSION}"
+HQQ4_GLOBAL_STEPS = 65
+HQQ4_LOCAL_STEPS = 33
+HQQ4_SEARCH_ALGORITHM = f"grid{HQQ4_GLOBAL_STEPS}_{HQQ4_LOCAL_STEPS}"
+HQQ_ATTENTION_CACHE_DIRNAME = f"attention_hqq_v{HQQ_ATTENTION_CACHE_VERSION}_{HQQ4_SEARCH_ALGORITHM}"
+HQQ46_ATTENTION_CACHE_DIRNAME = f"attention_hqq46_v{HQQ_ATTENTION_CACHE_VERSION}_{HQQ4_SEARCH_ALGORITHM}"
+HQQ46_AUTO_ATTENTION_CACHE_DIRNAME = f"attention_hqq46_auto_v{HQQ_ATTENTION_CACHE_VERSION}_{HQQ4_SEARCH_ALGORITHM}"
 HQQ6_ATTENTION_CACHE_DIRNAME = f"attention_hqq6_v{HQQ_ATTENTION_CACHE_VERSION}"
 HQQ68_AUTO_ATTENTION_CACHE_DIRNAME = f"attention_hqq68_auto_v{HQQ_ATTENTION_CACHE_VERSION}"
 HQQ8_ATTENTION_CACHE_DIRNAME = f"attention_hqq8_v{HQQ_ATTENTION_CACHE_VERSION}"
@@ -282,6 +285,20 @@ def hqq_layout_for_nbits(nbits: int) -> str:
     return HQQ_LAYOUT_BY_NBITS[nbits]
 
 
+def hqq_cache_algorithm_for_nbits(nbits: int) -> Optional[dict]:
+    if nbits in (4, HQQ_MIXED_46_CACHE_NBITS, HQQ_MIXED_46_AUTO_CACHE_NBITS):
+        return {
+            "hqq4_search": HQQ4_SEARCH_ALGORITHM,
+            "hqq4_global_steps": HQQ4_GLOBAL_STEPS,
+            "hqq4_local_steps": HQQ4_LOCAL_STEPS,
+        }
+    return None
+
+
+def hqq_cache_storage_nbits(nbits: int) -> int:
+    return int(nbits)
+
+
 def _emit_real_model_timing(payload: dict) -> None:
     if os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1":
         print(json.dumps({"hqq_real_model_timing": payload}, sort_keys=True), flush=True)
@@ -420,6 +437,67 @@ def _artifact_tensor_bytes(path: str) -> int:
                 tensor = handle.get_tensor(key)
                 total += tensor.numel() * tensor.element_size()
     return total
+
+
+def _tensor_payload_bytes(tensors: Dict[str, torch.Tensor]) -> int:
+    return sum(int(t.numel()) * int(t.element_size()) for t in tensors.values())
+
+
+def _record_hqq_worst_groups(
+    stats: dict,
+    group_mean_abs: torch.Tensor,
+    group_rmse: torch.Tensor,
+    abs_diff: torch.Tensor,
+    scale: torch.Tensor,
+    zero: torch.Tensor,
+    group_idx: int,
+    start_col: int,
+    end_col: int,
+    worst_groups_limit: int,
+) -> None:
+    if worst_groups_limit <= 0:
+        return
+    row_count = int(group_mean_abs.numel())
+    if row_count == 0:
+        return
+
+    top_count = min(int(worst_groups_limit), row_count)
+    top_mean_abs, top_rows = torch.topk(group_mean_abs, k=top_count, largest=True, sorted=True)
+    row_max_abs = abs_diff.amax(dim=1)
+
+    top_rmse = group_rmse.index_select(0, top_rows)
+    top_max_abs = row_max_abs.index_select(0, top_rows)
+    top_scale = scale.index_select(0, top_rows)
+    top_zero = zero.index_select(0, top_rows)
+
+    top_mean_abs = top_mean_abs.detach().cpu()
+    top_rows = top_rows.detach().cpu()
+    top_rmse = top_rmse.detach().cpu()
+    top_max_abs = top_max_abs.detach().cpu()
+    top_scale = top_scale.detach().cpu()
+    top_zero = top_zero.detach().cpu()
+
+    new_entries = []
+    for pos in range(top_count):
+        row_idx = int(top_rows[pos].item())
+        new_entries.append(
+            {
+                "row": row_idx,
+                "group": int(group_idx),
+                "start_col": int(start_col),
+                "end_col": int(end_col),
+                "mean_abs": float(top_mean_abs[pos].item()),
+                "rmse": float(top_rmse[pos].item()),
+                "max_abs": float(top_max_abs[pos].item()),
+                "scale": float(top_scale[pos].item()),
+                "zero": float(top_zero[pos].item()),
+            }
+        )
+
+    worst_groups = stats["worst_groups"]
+    worst_groups.extend(new_entries)
+    worst_groups.sort(key=lambda item: item["mean_abs"], reverse=True)
+    del worst_groups[int(worst_groups_limit):]
 
 
 def hqq46_auto_budget_bytes_from_mib(value: Optional[int]) -> int:
@@ -917,6 +995,9 @@ def init_hqq_attention_manifest(
             "num_tensors": 0,
         },
     }
+    algorithm = hqq_cache_algorithm_for_nbits(nbits)
+    if algorithm is not None:
+        manifest["quantizer"] = algorithm
     if nbits == HQQ_MIXED_46_CACHE_NBITS:
         manifest["mixed_precision"] = {
             "base_nbits": HQQ46_PROMOTION_POLICY["base_nbits"],
@@ -982,6 +1063,10 @@ def require_complete_hqq_attention_manifest(
     expected_layout = hqq_layout_for_nbits(expected_nbits)
     if manifest.get("layout") != expected_layout:
         errors.append(f"layout={manifest.get('layout')}")
+    expected_algorithm = hqq_cache_algorithm_for_nbits(expected_nbits)
+    if expected_algorithm is not None:
+        if manifest.get("quantizer") != expected_algorithm:
+            errors.append(f"quantizer={manifest.get('quantizer')}")
     if not manifest.get("complete"):
         errors.append("complete=false")
 
@@ -1483,7 +1568,7 @@ def _refine_hqq4_group_fit(
     range_scale = ((chunk.amax(dim=1) - chunk.amin(dim=1)) / qmax).clamp(min=1e-8)
     abs_scale = ((2.0 * chunk.abs().amax(dim=1)) / qmax).clamp(min=1e-8)
 
-    global_zero_grid = torch.linspace(0.0, qmax, steps=129, dtype=torch.float32)
+    global_zero_grid = torch.linspace(0.0, qmax, steps=HQQ4_GLOBAL_STEPS, dtype=torch.float32)
     if timing_stats is not None:
         _accumulate_hqq4_core_timing(timing_stats, "zero_grid_setup_s", time.perf_counter() - setup_started)
     best_q, best_scale, best_zero, best_rmse = _run_hqq4_group_search_driver(
@@ -1503,7 +1588,7 @@ def _refine_hqq4_group_fit(
     local_setup_started = time.perf_counter() if timing_stats is not None else 0.0
     local_zero_min = max(0.0, float(best_zero.min().item()) - 0.5)
     local_zero_max = min(qmax, float(best_zero.max().item()) + 0.5)
-    local_zero_grid = torch.linspace(local_zero_min, local_zero_max, steps=65, dtype=torch.float32)
+    local_zero_grid = torch.linspace(local_zero_min, local_zero_max, steps=HQQ4_LOCAL_STEPS, dtype=torch.float32)
     if timing_stats is not None:
         _accumulate_hqq4_core_timing(timing_stats, "zero_grid_setup_s", time.perf_counter() - local_setup_started)
     local_scale_seed = best_scale.clone()
@@ -1527,6 +1612,7 @@ def quantize_hqq4_tensor_rust(
     *,
     collect_stats: bool = False,
     worst_groups_limit: int = 8,
+    inner_threads: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Experimental Rust shadow implementation for HQQ4 tensor quantization."""
     if weight.ndim != 2:
@@ -1549,6 +1635,7 @@ def quantize_hqq4_tensor_rust(
         int(packed.data_ptr()),
         int(scales.data_ptr()),
         int(zeros.data_ptr()),
+        None if inner_threads is None else int(inner_threads),
     )
 
     result = {
@@ -1585,28 +1672,18 @@ def quantize_hqq4_tensor_rust(
             stats["max_abs"] = max(stats["max_abs"], float(abs_diff.max().item()))
             group_mean_abs = abs_diff.mean(dim=1)
             group_rmse = torch.sqrt(torch.mean(diff * diff, dim=1))
-            if worst_groups_limit > 0:
-                for row_idx in range(rows):
-                    entry = {
-                        "row": int(row_idx),
-                        "group": int(g),
-                        "start_col": int(start),
-                        "end_col": int(end),
-                        "mean_abs": float(group_mean_abs[row_idx].item()),
-                        "rmse": float(group_rmse[row_idx].item()),
-                        "max_abs": float(abs_diff[row_idx].max().item()),
-                        "scale": float(scale[row_idx].item()),
-                        "zero": float(zero[row_idx].item()),
-                    }
-                    if len(stats["worst_groups"]) < worst_groups_limit:
-                        stats["worst_groups"].append(entry)
-                    else:
-                        min_idx = min(
-                            range(len(stats["worst_groups"])),
-                            key=lambda idx: stats["worst_groups"][idx]["mean_abs"],
-                        )
-                        if entry["mean_abs"] > stats["worst_groups"][min_idx]["mean_abs"]:
-                            stats["worst_groups"][min_idx] = entry
+            _record_hqq_worst_groups(
+                stats,
+                group_mean_abs,
+                group_rmse,
+                abs_diff,
+                scale,
+                zero,
+                g,
+                start,
+                end,
+                worst_groups_limit,
+            )
         stats["worst_groups"].sort(key=lambda item: item["mean_abs"], reverse=True)
         denom = max(1, stats["numel"])
         result["stats"] = {
@@ -1755,28 +1832,18 @@ def quantize_hqq4_tensor(
             stats["max_abs"] = max(stats["max_abs"], float(abs_diff.max().item()))
             group_mean_abs = abs_diff.mean(dim=1)
             group_rmse = torch.sqrt(torch.mean(diff * diff, dim=1))
-            if worst_groups_limit > 0:
-                for row_idx in range(rows):
-                    entry = {
-                        "row": int(row_idx),
-                        "group": int(g),
-                        "start_col": int(start),
-                        "end_col": int(end),
-                        "mean_abs": float(group_mean_abs[row_idx].item()),
-                        "rmse": float(group_rmse[row_idx].item()),
-                        "max_abs": float(abs_diff[row_idx].max().item()),
-                        "scale": float(scale[row_idx].item()),
-                        "zero": float(zero[row_idx].item()),
-                    }
-                    if len(stats["worst_groups"]) < worst_groups_limit:
-                        stats["worst_groups"].append(entry)
-                    else:
-                        min_idx = min(
-                            range(len(stats["worst_groups"])),
-                            key=lambda idx: stats["worst_groups"][idx]["mean_abs"],
-                        )
-                        if entry["mean_abs"] > stats["worst_groups"][min_idx]["mean_abs"]:
-                            stats["worst_groups"][min_idx] = entry
+            _record_hqq_worst_groups(
+                stats,
+                group_mean_abs,
+                group_rmse,
+                abs_diff,
+                scale,
+                zero,
+                g,
+                start,
+                end,
+                worst_groups_limit,
+            )
         if end - start < group_size:
             q = torch.nn.functional.pad(q, (0, group_size - (end - start)))
         quant_chunks.append(q)
@@ -1841,6 +1908,210 @@ def quantize_hqq4_tensor(
     return result
 
 
+def _hqq_quality_stats_from_quant(
+    w: torch.Tensor,
+    quant: torch.Tensor,
+    scales: torch.Tensor,
+    zeros: torch.Tensor,
+    *,
+    group_size: int,
+    worst_groups_limit: int,
+) -> dict:
+    rows, cols = w.shape
+    groups = _hqq_num_groups(cols, group_size)
+    stats = {
+        "numel": 0,
+        "sum_abs": 0.0,
+        "sum_sq": 0.0,
+        "max_abs": 0.0,
+        "worst_groups": [],
+    }
+    for g in range(groups):
+        start = g * group_size
+        end = min(start + group_size, cols)
+        q = quant[:, start:end]
+        scale = scales[:, g]
+        zero = zeros[:, g]
+        chunk = w[:, start:end]
+        deq = (q.to(torch.float32) - zero.unsqueeze(1)) * scale.unsqueeze(1)
+        diff = deq - chunk
+        abs_diff = diff.abs()
+        stats["numel"] += diff.numel()
+        stats["sum_abs"] += float(abs_diff.sum().item())
+        stats["sum_sq"] += float((diff * diff).sum().item())
+        stats["max_abs"] = max(stats["max_abs"], float(abs_diff.max().item()))
+        group_mean_abs = abs_diff.mean(dim=1)
+        group_rmse = torch.sqrt(torch.mean(diff * diff, dim=1))
+        _record_hqq_worst_groups(
+            stats,
+            group_mean_abs,
+            group_rmse,
+            abs_diff,
+            scale,
+            zero,
+            g,
+            start,
+            end,
+            worst_groups_limit,
+        )
+    stats["worst_groups"].sort(key=lambda item: item["mean_abs"], reverse=True)
+    denom = max(1, stats["numel"])
+    return {
+        "numel": int(stats["numel"]),
+        "mean_abs": stats["sum_abs"] / denom,
+        "rmse": math.sqrt(stats["sum_sq"] / denom),
+        "max_abs": stats["max_abs"],
+        "worst_groups": stats["worst_groups"],
+    }
+
+
+def quantize_hqq_search_cuda_tensor(
+    weight: torch.Tensor,
+    nbits: int,
+    group_size: int = HQQ_DEFAULT_GROUP_SIZE,
+    *,
+    collect_stats: bool = False,
+    worst_groups_limit: int = 8,
+    device: Optional[torch.device] = None,
+    timing_context: Optional[dict] = None,
+) -> Dict[str, torch.Tensor]:
+    validate_hqq_nbits(nbits)
+    if weight.ndim != 2:
+        raise ValueError(f"HQQ attention expects 2D weights, got shape {tuple(weight.shape)}")
+    if group_size <= 0:
+        raise ValueError(f"Invalid HQQ group_size {group_size}")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"HQQ{nbits}-search requires CUDA, but torch.cuda.is_available() is false. "
+            "Use the non-search HQQ mode or run on a CUDA-capable build."
+        )
+    try:
+        from krasis import hqq_search_cuda_tensor_ptr
+    except ImportError as exc:
+        raise RuntimeError(
+            f"HQQ{nbits}-search requires the Rust/CUDA HQQ search extension, "
+            "but hqq_search_cuda_tensor_ptr is not available in this build."
+        ) from exc
+
+    timing_enabled = os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1"
+    timing_prefix = dict(timing_context or {})
+    device_obj = torch.device(f"cuda:{torch.cuda.current_device()}" if device is None else device)
+    if device_obj.type != "cuda":
+        raise RuntimeError(f"HQQ{nbits}-search requires a CUDA device, got {device_obj}")
+    torch.cuda.set_device(device_obj)
+
+    normalize_started = time.perf_counter() if timing_enabled else 0.0
+    w_cpu = weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if timing_enabled:
+        _emit_real_model_timing(
+            {
+                **timing_prefix,
+                "phase": "artifact_pack_stage",
+                "stage": "cuda_search_cpu_normalize",
+                "elapsed_s": time.perf_counter() - normalize_started,
+                "input_dtype": str(weight.dtype).replace("torch.", ""),
+                "input_device": str(weight.device),
+            }
+        )
+
+    rows, cols = w_cpu.shape
+    groups = _hqq_num_groups(cols, group_size)
+    padded_cols = _hqq_padded_cols(cols, group_size)
+
+    h2d_started = time.perf_counter() if timing_enabled else 0.0
+    w = w_cpu.to(device=device_obj, dtype=torch.float32, non_blocking=False).contiguous()
+    quant_gpu = torch.empty((rows, padded_cols), device=device_obj, dtype=torch.uint8)
+    scales_gpu = torch.empty((rows, groups), device=device_obj, dtype=torch.float32)
+    zeros_gpu = torch.empty((rows, groups), device=device_obj, dtype=torch.float32)
+    torch.cuda.synchronize(device_obj)
+    if timing_enabled:
+        _emit_real_model_timing(
+            {
+                **timing_prefix,
+                "phase": "artifact_pack_stage",
+                "stage": "cuda_search_h2d_alloc",
+                "elapsed_s": time.perf_counter() - h2d_started,
+                "rows": int(rows),
+                "cols": int(cols),
+                "groups": int(groups),
+                "device": str(device_obj),
+            }
+        )
+
+    search_started = time.perf_counter() if timing_enabled else 0.0
+    algorithm = hqq_cache_algorithm_for_nbits(4)
+    global_steps = int(algorithm.get("global_steps", HQQ4_GLOBAL_STEPS)) if algorithm else HQQ4_GLOBAL_STEPS
+    local_steps = int(algorithm.get("local_steps", HQQ4_LOCAL_STEPS)) if algorithm else HQQ4_LOCAL_STEPS
+    iters = int(algorithm.get("iters", 6)) if algorithm else 6
+    hqq_search_cuda_tensor_ptr(
+        int(w.data_ptr()),
+        int(rows),
+        int(cols),
+        int(group_size),
+        int(nbits),
+        int(global_steps),
+        int(local_steps),
+        int(iters),
+        int(quant_gpu.data_ptr()),
+        int(scales_gpu.data_ptr()),
+        int(zeros_gpu.data_ptr()),
+        int(device_obj.index or 0),
+    )
+    torch.cuda.synchronize(device_obj)
+    if timing_enabled:
+        _emit_real_model_timing(
+            {
+                **timing_prefix,
+                "phase": "artifact_pack_stage",
+                "stage": "cuda_search",
+                "elapsed_s": time.perf_counter() - search_started,
+                "backend": "rust_cuda",
+                "nbits": int(nbits),
+                "global_steps": global_steps,
+                "local_steps": local_steps,
+                "iters": iters,
+            }
+        )
+
+    d2h_started = time.perf_counter() if timing_enabled else 0.0
+    quant = quant_gpu.to(device="cpu")[:, :cols].contiguous()
+    scales = scales_gpu.to(device="cpu").contiguous()
+    zeros = zeros_gpu.to(device="cpu").contiguous()
+    torch.cuda.synchronize(device_obj)
+    packed = _pack_hqq_quant(quant, nbits)
+    if timing_enabled:
+        _emit_real_model_timing(
+            {
+                **timing_prefix,
+                "phase": "artifact_pack_stage",
+                "stage": "cuda_search_d2h_pack",
+                "elapsed_s": time.perf_counter() - d2h_started,
+                "packed_rows": int(packed.shape[0]),
+                "packed_cols": int(packed.shape[1]),
+            }
+        )
+
+    result = {
+        "packed": packed,
+        "scales": scales,
+        "zeros": zeros,
+        "orig_shape": torch.tensor([rows, cols], dtype=torch.int32),
+        "group_size": torch.tensor([group_size], dtype=torch.int32),
+        "axis": torch.tensor([HQQ_DEFAULT_AXIS], dtype=torch.int32),
+        "nbits": torch.tensor([nbits], dtype=torch.int32),
+    }
+    if collect_stats:
+        result["stats"] = _hqq_quality_stats_from_quant(
+            w_cpu,
+            quant,
+            scales,
+            zeros,
+            group_size=group_size,
+            worst_groups_limit=worst_groups_limit,
+        )
+    return result
+
+
 def quantize_hqq8_tensor(
     weight: torch.Tensor,
     group_size: int = HQQ_DEFAULT_GROUP_SIZE,
@@ -1892,28 +2163,18 @@ def quantize_hqq8_tensor(
             stats["max_abs"] = max(stats["max_abs"], float(abs_diff.max().item()))
             group_mean_abs = abs_diff.mean(dim=1)
             group_rmse = torch.sqrt(torch.mean(diff * diff, dim=1))
-            if worst_groups_limit > 0:
-                for row_idx in range(rows):
-                    entry = {
-                        "row": int(row_idx),
-                        "group": int(g),
-                        "start_col": int(start),
-                        "end_col": int(end),
-                        "mean_abs": float(group_mean_abs[row_idx].item()),
-                        "rmse": float(group_rmse[row_idx].item()),
-                        "max_abs": float(abs_diff[row_idx].max().item()),
-                        "scale": float(scale[row_idx].item()),
-                        "zero": float(zero[row_idx].item()),
-                    }
-                    if len(stats["worst_groups"]) < worst_groups_limit:
-                        stats["worst_groups"].append(entry)
-                    else:
-                        min_idx = min(
-                            range(len(stats["worst_groups"])),
-                            key=lambda idx: stats["worst_groups"][idx]["mean_abs"],
-                        )
-                        if entry["mean_abs"] > stats["worst_groups"][min_idx]["mean_abs"]:
-                            stats["worst_groups"][min_idx] = entry
+            _record_hqq_worst_groups(
+                stats,
+                group_mean_abs,
+                group_rmse,
+                abs_diff,
+                scale,
+                zero,
+                g,
+                start,
+                end,
+                worst_groups_limit,
+            )
 
     if timing_enabled:
         _emit_real_model_timing(
@@ -1997,28 +2258,18 @@ def quantize_hqq6_tensor(
             stats["max_abs"] = max(stats["max_abs"], float(abs_diff.max().item()))
             group_mean_abs = abs_diff.mean(dim=1)
             group_rmse = torch.sqrt(torch.mean(diff * diff, dim=1))
-            if worst_groups_limit > 0:
-                for row_idx in range(rows):
-                    entry = {
-                        "row": int(row_idx),
-                        "group": int(g),
-                        "start_col": int(start),
-                        "end_col": int(end),
-                        "mean_abs": float(group_mean_abs[row_idx].item()),
-                        "rmse": float(group_rmse[row_idx].item()),
-                        "max_abs": float(abs_diff[row_idx].max().item()),
-                        "scale": float(scale[row_idx].item()),
-                        "zero": float(zero[row_idx].item()),
-                    }
-                    if len(stats["worst_groups"]) < worst_groups_limit:
-                        stats["worst_groups"].append(entry)
-                    else:
-                        min_idx = min(
-                            range(len(stats["worst_groups"])),
-                            key=lambda idx: stats["worst_groups"][idx]["mean_abs"],
-                        )
-                        if entry["mean_abs"] > stats["worst_groups"][min_idx]["mean_abs"]:
-                            stats["worst_groups"][min_idx] = entry
+            _record_hqq_worst_groups(
+                stats,
+                group_mean_abs,
+                group_rmse,
+                abs_diff,
+                scale,
+                zero,
+                g,
+                start,
+                end,
+                worst_groups_limit,
+            )
 
     result = {
         "packed": _pack_uint6(quant),
@@ -2067,6 +2318,8 @@ def write_hqq_attention_artifact(
     cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
     group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
     cache_nbits: Optional[int] = None,
+    hqq4_inner_threads: Optional[int] = None,
+    hqq_search_device: Optional[torch.device] = None,
 ) -> dict:
     validate_hqq_nbits(nbits)
     normalized_group_size = normalize_hqq_attention_group_size(group_size)
@@ -2093,6 +2346,7 @@ def write_hqq_attention_artifact(
             weight,
             group_size=normalized_group_size,
             collect_stats=True,
+            inner_threads=hqq4_inner_threads,
         )
     elif nbits == 6:
         tensors = quantize_hqq6_tensor(
@@ -2136,7 +2390,7 @@ def write_hqq_attention_artifact(
         )
     file_started = time.perf_counter() if os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1" else 0.0
     save_file(payload_tensors, path, metadata=metadata)
-    tensor_bytes = _artifact_tensor_bytes(path)
+    tensor_bytes = _tensor_payload_bytes(payload_tensors)
     if file_started:
         _emit_real_model_timing(
             {
@@ -2172,6 +2426,239 @@ def write_hqq_attention_artifact(
         "tensor_bytes": tensor_bytes,
         "structure": structure,
         "quality": stats,
+    }
+
+
+def _combine_hqq_quality_records(records: List[dict], row_offsets: List[int]) -> dict:
+    total_numel = 0
+    sum_abs = 0.0
+    sum_sq = 0.0
+    max_abs = 0.0
+    source_sum_abs = 0.0
+    source_sum_sq = 0.0
+    worst_groups: List[dict] = []
+
+    for record, row_offset in zip(records, row_offsets):
+        quality = record.get("quality")
+        if not isinstance(quality, dict):
+            raise RuntimeError(
+                "Cannot synthesize HQQ fused_qkv artifact: split artifact is missing quality metadata."
+            )
+        numel = int(quality.get("numel", 0) or 0)
+        if numel <= 0:
+            raise RuntimeError(
+                "Cannot synthesize HQQ fused_qkv artifact: split artifact has invalid quality numel."
+            )
+        total_numel += numel
+        mean_abs = float(quality.get("mean_abs", 0.0) or 0.0)
+        rmse = float(quality.get("rmse", 0.0) or 0.0)
+        source_mean_abs = float(quality.get("source_mean_abs", 0.0) or 0.0)
+        source_rms = float(quality.get("source_rms", 0.0) or 0.0)
+        sum_abs += mean_abs * numel
+        sum_sq += rmse * rmse * numel
+        source_sum_abs += source_mean_abs * numel
+        source_sum_sq += source_rms * source_rms * numel
+        max_abs = max(max_abs, float(quality.get("max_abs", 0.0) or 0.0))
+        for item in quality.get("worst_groups", []):
+            if not isinstance(item, dict):
+                continue
+            copied = dict(item)
+            copied["row"] = int(copied.get("row", 0)) + int(row_offset)
+            worst_groups.append(copied)
+
+    denom = max(1, total_numel)
+    mean_abs = sum_abs / denom
+    rmse = math.sqrt(sum_sq / denom)
+    source_mean_abs = source_sum_abs / denom
+    source_rms = math.sqrt(source_sum_sq / denom)
+    worst_groups.sort(key=lambda item: float(item.get("mean_abs", 0.0) or 0.0), reverse=True)
+    return {
+        "numel": int(total_numel),
+        "mean_abs": mean_abs,
+        "rmse": rmse,
+        "max_abs": max_abs,
+        "worst_groups": worst_groups[:8],
+        "source_rms": source_rms,
+        "source_mean_abs": source_mean_abs,
+        "relative_rmse": rmse / source_rms if source_rms > 0.0 else 0.0,
+        "relative_mean_abs": mean_abs / source_mean_abs if source_mean_abs > 0.0 else 0.0,
+    }
+
+
+def synthesize_hqq_fused_qkv_artifact(
+    model_path: str,
+    layer_idx: int,
+    layer_type: str,
+    records_by_tensor: Dict[str, dict],
+    nbits: int,
+    cache_profile: Optional[str] = HQQ_CACHE_PROFILE_BASELINE,
+    group_size: Optional[int] = HQQ_DEFAULT_GROUP_SIZE,
+    cache_nbits: Optional[int] = None,
+) -> dict:
+    """Build fused_qkv by concatenating already-written split HQQ q/k/v rows."""
+    validate_hqq_nbits(nbits)
+    if int(nbits) == 4:
+        raise RuntimeError(
+            "HQQ4 fused_qkv cannot be synthesized from split q/k/v artifacts without "
+            "changing artifact values; build it from the BF16 fused tensor instead."
+        )
+    normalized_group_size = normalize_hqq_attention_group_size(group_size)
+    actual_cache_nbits = nbits if cache_nbits is None else int(cache_nbits)
+    validate_hqq_cache_nbits(actual_cache_nbits)
+
+    missing = [name for name in ("q_proj", "k_proj", "v_proj") if name not in records_by_tensor]
+    if missing:
+        raise RuntimeError(
+            "Cannot synthesize HQQ fused_qkv artifact: missing split artifacts "
+            + ", ".join(missing)
+        )
+
+    timing_context = {
+        "layer_idx": int(layer_idx),
+        "layer_type": layer_type,
+        "tensor_name": "fused_qkv",
+    }
+    synth_started = time.perf_counter() if os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1" else 0.0
+    ordered_records = [records_by_tensor[name] for name in ("q_proj", "k_proj", "v_proj")]
+    artifacts = [
+        load_hqq_attention_artifact(
+            model_path,
+            record,
+            expected_nbits=nbits,
+            device="cpu",
+            cache_profile=cache_profile,
+            group_size=normalized_group_size,
+            cache_nbits=actual_cache_nbits,
+        )
+        for record in ordered_records
+    ]
+
+    rows = []
+    cols = None
+    row_offsets = []
+    row_total = 0
+    original_dtype = ordered_records[0].get("original_dtype")
+    for record, artifact in zip(ordered_records, artifacts):
+        if int(record.get("nbits", -1)) != int(nbits):
+            raise RuntimeError(
+                f"Cannot synthesize HQQ fused_qkv artifact: {record.get('tensor_name')} "
+                f"has nbits={record.get('nbits')}, expected {nbits}."
+            )
+        if record.get("layout") != hqq_layout_for_nbits(nbits):
+            raise RuntimeError(
+                f"Cannot synthesize HQQ fused_qkv artifact: {record.get('tensor_name')} "
+                f"layout={record.get('layout')} expected {hqq_layout_for_nbits(nbits)}."
+            )
+        if int(record.get("group_size", -1)) != int(normalized_group_size):
+            raise RuntimeError(
+                f"Cannot synthesize HQQ fused_qkv artifact: {record.get('tensor_name')} "
+                f"group_size={record.get('group_size')} expected {normalized_group_size}."
+            )
+        if int(record.get("axis", -1)) != int(HQQ_DEFAULT_AXIS):
+            raise RuntimeError(
+                f"Cannot synthesize HQQ fused_qkv artifact: {record.get('tensor_name')} "
+                f"axis={record.get('axis')} expected {HQQ_DEFAULT_AXIS}."
+            )
+        shape = record.get("original_shape")
+        if not isinstance(shape, list) or len(shape) != 2:
+            raise RuntimeError(
+                f"Cannot synthesize HQQ fused_qkv artifact: {record.get('tensor_name')} "
+                "has invalid original_shape."
+            )
+        record_rows, record_cols = int(shape[0]), int(shape[1])
+        if cols is None:
+            cols = record_cols
+        elif cols != record_cols:
+            raise RuntimeError(
+                "Cannot synthesize HQQ fused_qkv artifact: q/k/v input widths differ."
+            )
+        if record.get("original_dtype") != original_dtype:
+            raise RuntimeError(
+                "Cannot synthesize HQQ fused_qkv artifact: q/k/v original dtypes differ."
+            )
+        rows.append(record_rows)
+        row_offsets.append(row_total)
+        row_total += record_rows
+        stored_shape = artifact["tensors"]["orig_shape"].tolist()
+        if stored_shape != [record_rows, record_cols]:
+            raise RuntimeError(
+                f"Cannot synthesize HQQ fused_qkv artifact: stored shape {stored_shape} "
+                f"does not match manifest shape {[record_rows, record_cols]}."
+            )
+
+    payload_tensors = {
+        "packed": torch.cat([artifact["tensors"]["packed"] for artifact in artifacts], dim=0).contiguous(),
+        "scales": torch.cat([artifact["tensors"]["scales"] for artifact in artifacts], dim=0).contiguous(),
+        "zeros": torch.cat([artifact["tensors"]["zeros"] for artifact in artifacts], dim=0).contiguous(),
+        "orig_shape": torch.tensor([row_total, int(cols)], dtype=torch.int32),
+        "group_size": torch.tensor([normalized_group_size], dtype=torch.int32),
+        "axis": torch.tensor([HQQ_DEFAULT_AXIS], dtype=torch.int32),
+        "nbits": torch.tensor([nbits], dtype=torch.int32),
+    }
+    if synth_started:
+        _emit_real_model_timing(
+            {
+                **timing_context,
+                "phase": "artifact_pack_stage",
+                "stage": "fused_qkv_synthesize",
+                "elapsed_s": time.perf_counter() - synth_started,
+            }
+        )
+
+    path = hqq_attention_tensor_path(
+        model_path,
+        layer_idx,
+        "fused_qkv",
+        nbits=nbits,
+        cache_profile=cache_profile,
+        group_size=normalized_group_size,
+        cache_nbits=actual_cache_nbits,
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    metadata = {
+        "backend": hqq_backend_name(nbits),
+        "format_version": str(HQQ_ATTENTION_CACHE_VERSION),
+        "layer_idx": str(layer_idx),
+        "layer_type": layer_type,
+        "tensor_name": "fused_qkv",
+        "layout": hqq_layout_for_nbits(nbits),
+        "dtype": str(original_dtype or ""),
+    }
+    file_started = time.perf_counter() if os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1" else 0.0
+    save_file(payload_tensors, path, metadata=metadata)
+    tensor_bytes = _tensor_payload_bytes(payload_tensors)
+    if file_started:
+        _emit_real_model_timing(
+            {
+                **timing_context,
+                "phase": "artifact_pack_stage",
+                "stage": "file_write",
+                "elapsed_s": time.perf_counter() - file_started,
+                "tensor_bytes": int(tensor_bytes),
+            }
+        )
+
+    structure = validate_hqq_attention_tensors(
+        payload_tensors,
+        expected_nbits=nbits,
+        expected_layout=hqq_layout_for_nbits(nbits),
+    )
+    quality = _combine_hqq_quality_records(ordered_records, row_offsets)
+    return {
+        "layer_idx": layer_idx,
+        "layer_type": layer_type,
+        "tensor_name": "fused_qkv",
+        "file": os.path.basename(path),
+        "path": path,
+        "nbits": nbits,
+        "group_size": int(payload_tensors["group_size"][0].item()),
+        "axis": int(payload_tensors["axis"][0].item()),
+        "layout": hqq_layout_for_nbits(nbits),
+        "original_shape": payload_tensors["orig_shape"].tolist(),
+        "original_dtype": metadata["dtype"],
+        "tensor_bytes": tensor_bytes,
+        "structure": structure,
+        "quality": quality,
     }
 
 

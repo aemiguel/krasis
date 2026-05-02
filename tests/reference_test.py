@@ -70,7 +70,7 @@ COMPARE_CONFIGS = {
         ("INT4/BF16", "tests/q35b-4-4-a16.conf"),
     ],
     "q122b": [
-        ("INT4/BF16", "tests/q122b-4-4-a16.conf"),
+        ("INT4/BF16KV", "tests/q122b-bf16kv-a16-accuracy.conf"),
     ],
 }
 

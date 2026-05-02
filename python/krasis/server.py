@@ -12,6 +12,7 @@ import logging
 import os
 import select
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -19,9 +20,14 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from krasis.attention_backend import ATTENTION_QUANT_CHOICES, attention_quant_label
+from krasis.attention_backend import (
+    ATTENTION_QUANT_CHOICES,
+    attention_quant_cache_nbits,
+    attention_quant_label,
+    hqq_attention_cache_dir,
+)
 from krasis.config import DEPRECATED_ATTENTION_QUANT_CHOICES, DEPRECATED_KV_CACHE_FORMAT_CHOICES, KV_CACHE_FORMAT_CHOICES
-from krasis.config import HQQ_CACHE_PROFILE_CHOICES
+from krasis.config import HQQ_CACHE_PROFILE_BASELINE, HQQ_CACHE_PROFILE_CHOICES
 from krasis.run_paths import get_run_dir
 
 def _normalize_selected_gpus(raw: Optional[str], source: str) -> str:
@@ -614,6 +620,7 @@ def main():
             "CFG_GGUF_PATH": "gguf_path",
             "CFG_FORCE_LOAD": "force_load",
             "CFG_FORCE_REBUILD_CACHE": "force_rebuild_cache",
+            "CFG_FORCE_REBUILD_HQQ_CACHE": "force_rebuild_hqq_cache",
             "CFG_BUILD_CACHE": "build_cache",
             "CFG_HCS": "hcs",
             "CFG_MULTI_GPU_HCS": "multi_gpu_hcs",
@@ -651,7 +658,17 @@ def main():
                             config_defaults["selected_gpus"] = selected
                             config_defaults["num_gpus"] = len(gpu_list)
                         continue
-                    if key in ("CFG_FORCE_LOAD", "CFG_ENABLE_THINKING", "CFG_SESSION_ENABLED", "CFG_HCS", "CFG_MULTI_GPU_HCS", "CFG_CPU_DECODE"):
+                    if key in (
+                        "CFG_FORCE_LOAD",
+                        "CFG_FORCE_REBUILD_CACHE",
+                        "CFG_FORCE_REBUILD_HQQ_CACHE",
+                        "CFG_BUILD_CACHE",
+                        "CFG_ENABLE_THINKING",
+                        "CFG_SESSION_ENABLED",
+                        "CFG_HCS",
+                        "CFG_MULTI_GPU_HCS",
+                        "CFG_CPU_DECODE",
+                    ):
                         # CFG_ format uses "1"/"" for booleans
                         config_defaults[dest] = val == "1"
                         continue
@@ -724,7 +741,7 @@ def main():
     parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bits for CPU decode experts")
     parser.add_argument("--attention-quant", default="bf16", choices=list(ATTENTION_QUANT_CHOICES),
-                        help="Attention weight precision: hqq8 quality-first; hqq68_auto budget-planned mixed HQQ6/HQQ8; hqq6 packed middle-ground; hqq46_auto budget-planned mixed HQQ4/HQQ6; hqq46 fixed-policy mixed; hqq4 and bf16 remain explicit alternatives")
+                        help="Attention weight precision: hqq8 quality-first, hqq68_auto budget-planned mixed HQQ6/HQQ8, hqq6 packed middle-ground, hqq46_auto budget-planned mixed HQQ4/HQQ6, hqq46 fixed-policy mixed, hqq4 and bf16 remain explicit alternatives")
     parser.add_argument("--hqq-cache-profile", default="baseline", choices=list(HQQ_CACHE_PROFILE_CHOICES),
                         help="HQQ attention cache profile: baseline (default) or an explicit calibrated profile")
     parser.add_argument("--hqq-group-size", type=int, default=128, choices=[32, 64, 128],
@@ -747,6 +764,8 @@ def main():
                         help="Override RAM safety checks and load anyway")
     parser.add_argument("--force-rebuild-cache", action="store_true",
                         help="Delete existing expert caches and rebuild from safetensors")
+    parser.add_argument("--force-rebuild-hqq-cache", action="store_true",
+                        help="Delete the selected HQQ attention cache and rebuild from safetensors")
     parser.add_argument("--build-cache", action="store_true",
                         help="Build expert caches (if missing) and exit without starting server")
     parser.add_argument("--hcs", action=argparse.BooleanOptionalAction, default=True,
@@ -1006,6 +1025,32 @@ def main():
             _status(f"Deleted {len(_deleted)} cache files: {', '.join(_deleted)}")
         else:
             _detail("No existing cache files to delete")
+
+    # ── Force HQQ rebuild: delete selected HQQ attention cache before loading ──
+    if getattr(args, 'force_rebuild_hqq_cache', False):
+        cache_nbits = attention_quant_cache_nbits(quant_cfg.attention)
+        if cache_nbits is None:
+            _detail(f"No HQQ attention cache to rebuild for attention={quant_cfg.attention}")
+        elif quant_cfg.hqq_cache_profile != HQQ_CACHE_PROFILE_BASELINE:
+            raise RuntimeError(
+                "Cannot rebuild calibrated HQQ attention cache profile "
+                f"{quant_cfg.hqq_cache_profile!r} from normal server startup. "
+                "Use the HQQ calibration/build command for that profile, or switch "
+                "to the baseline profile before using --force-rebuild-hqq-cache."
+            )
+        else:
+            hqq_cache_dir = hqq_attention_cache_dir(
+                args.model_path,
+                quant_cfg.hqq_cache_profile,
+                cache_nbits,
+                quant_cfg.hqq_group_size,
+            )
+            if os.path.isdir(hqq_cache_dir):
+                shutil.rmtree(hqq_cache_dir)
+                _status("Deleted HQQ attention cache")
+                _detail(hqq_cache_dir)
+            else:
+                _detail(f"No HQQ attention cache directory to delete: {hqq_cache_dir}")
 
     pp_partition = [num_layers]  # PP=1: all layers on primary GPU
     logger.info("HCS strategy: PP=1, %d GPUs available", num_gpus_available)

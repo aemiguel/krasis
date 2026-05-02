@@ -33,6 +33,8 @@ from krasis.attention_backend import (
     hqq_attention_cache_dir,
     hqq_attention_cache_total_bytes,
     hqq_backend_name,
+    hqq_cache_algorithm_for_nbits,
+    hqq_cache_storage_nbits,
     hqq_attention_manifest_path,
     hqq_attention_pending_manifest_path,
     init_hqq_attention_manifest,
@@ -55,6 +57,7 @@ from krasis.attention_backend import (
     is_hqq_auto_attention,
     is_hqq_mixed_attention,
     select_hqq_auto_promotions,
+    synthesize_hqq_fused_qkv_artifact,
     validate_hqq_cache_nbits,
     validate_hqq_nbits,
     write_hqq_attention_artifact,
@@ -1227,6 +1230,67 @@ class KrasisModel:
                 result["fused_qkv"] = fused_qkv
         return result
 
+    def _record_hqq_expected_attention_tensors(
+        self,
+        layer_idx: int,
+        layer_type: str,
+        weights: dict,
+    ) -> None:
+        expected = getattr(self, "_hqq_expected_tensors", None)
+        expected_set = getattr(self, "_hqq_expected_tensor_set", None)
+        if expected is None or expected_set is None:
+            expected = []
+            expected_set = set()
+            self._hqq_expected_tensors = expected
+            self._hqq_expected_tensor_set = expected_set
+
+        tensor_names = list(self._hqq_attention_tensor_map(layer_type, weights))
+        if (
+            layer_type in ("full_attention", "sliding_attention")
+            and not self.cfg.is_mla
+            and "fused_qkv" not in tensor_names
+            and all(isinstance(weights.get(name), torch.Tensor) for name in ("q_proj", "k_proj", "v_proj"))
+        ):
+            tensor_names.append("fused_qkv")
+        for tensor_name in tensor_names:
+            key = (int(layer_idx), tensor_name)
+            if key not in expected_set:
+                expected_set.add(key)
+                expected.append(key)
+
+    def _hqq4_cache_parallelism(self, tensor_count: int) -> tuple[int, int]:
+        """Return bounded HQQ4 outer concurrency and per-artifact Rayon threads."""
+        if tensor_count <= 1:
+            return 1, max(1, int(self.krasis_threads))
+
+        raw_workers = os.environ.get("KRASIS_HQQ4_CACHE_CONCURRENCY")
+        if raw_workers:
+            try:
+                requested_workers = int(raw_workers)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"KRASIS_HQQ4_CACHE_CONCURRENCY must be an integer, got {raw_workers!r}"
+                ) from exc
+        else:
+            requested_workers = 1
+
+        # Keep the first-time HQQ cache build memory bound: one BF16 layer is
+        # materialized, and at most two independent tensor quantizers run inside it.
+        workers = max(1, min(2, int(tensor_count), requested_workers))
+
+        raw_inner = os.environ.get("KRASIS_HQQ4_INNER_THREADS")
+        if raw_inner:
+            try:
+                inner_threads = int(raw_inner)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"KRASIS_HQQ4_INNER_THREADS must be an integer, got {raw_inner!r}"
+                ) from exc
+        else:
+            inner_threads = max(1, int(self.krasis_threads) // workers)
+
+        return workers, max(1, inner_threads)
+
     def _prepare_hqq_attention_cache(self) -> None:
         nbits = attention_quant_cache_nbits(self.quant_cfg.attention)
         if nbits is None:
@@ -1289,6 +1353,7 @@ class KrasisModel:
                 and candidate.get("group_size") == manifest["group_size"]
                 and candidate.get("axis") == manifest["axis"]
                 and candidate.get("layout") == manifest["layout"]
+                and candidate.get("quantizer") == manifest.get("quantizer")
             )
             if compatible and is_hqq_auto_attention(self.quant_cfg.attention):
                 candidate_mixed = candidate.get("mixed_precision", {})
@@ -1371,8 +1436,11 @@ class KrasisModel:
                 delete_hqq_attention_pending_manifest(self.cfg.model_path, cache_profile, nbits, hqq_group_size)
             save_hqq_attention_pending_manifest(self.cfg.model_path, manifest, cache_profile, nbits, hqq_group_size)
         self._hqq_manifest = manifest
+        self._hqq_expected_tensors = []
+        self._hqq_expected_tensor_set = set()
 
     def _maybe_write_hqq_attention_artifacts(self, layer_idx: int, layer_type: str, weights: dict) -> None:
+        self._record_hqq_expected_attention_tensors(layer_idx, layer_type, weights)
         if not getattr(self, "_hqq_rebuild", False):
             return
         cache_nbits = getattr(self, "_hqq_cache_nbits", attention_quant_cache_nbits(self.quant_cfg.attention))
@@ -1397,7 +1465,13 @@ class KrasisModel:
         timing_entries = []
         timing_started = time.perf_counter() if timing_enabled else 0.0
 
-        def _write_record(tensor_name: str, tensor: torch.Tensor, nbits: int) -> dict:
+        def _write_record(
+            tensor_name: str,
+            tensor: torch.Tensor,
+            nbits: int,
+            *,
+            hqq4_inner_threads: Optional[int] = None,
+        ) -> dict:
             return write_hqq_attention_artifact(
                 self.cfg.model_path,
                 layer_idx=layer_idx,
@@ -1408,6 +1482,8 @@ class KrasisModel:
                 cache_profile=self.quant_cfg.hqq_cache_profile,
                 group_size=self.quant_cfg.hqq_group_size,
                 cache_nbits=cache_nbits,
+                hqq4_inner_threads=hqq4_inner_threads if int(nbits) == 4 else None,
+                hqq_search_device=getattr(self, "_hqq_search_cuda_device", None),
             )
 
         def _existing_auto_entry(tensor_name: str, entries_key: str) -> Optional[dict]:
@@ -1483,7 +1559,12 @@ class KrasisModel:
                 "tensor_bytes": total_bytes,
             }
 
-        def _write_selected_or_candidate(tensor_name: str, tensor: torch.Tensor) -> tuple[int, dict]:
+        def _write_selected_or_candidate(
+            tensor_name: str,
+            tensor: torch.Tensor,
+            *,
+            hqq4_inner_threads: Optional[int] = None,
+        ) -> tuple[int, dict]:
             if is_hqq_auto_attention(self.quant_cfg.attention):
                 policy = hqq_auto_promotion_policy(self.quant_cfg.attention)
                 direct_nbits = hqq_auto_direct_edge_nbits(
@@ -1494,7 +1575,12 @@ class KrasisModel:
                     existing = _existing_auto_entry(tensor_name, "tensors")
                     if existing is not None:
                         return 0, existing
-                    record = _write_record(tensor_name, tensor, direct_nbits)
+                    record = _write_record(
+                        tensor_name,
+                        tensor,
+                        direct_nbits,
+                        hqq4_inner_threads=hqq4_inner_threads,
+                    )
                     self._hqq_manifest["tensors"].append(record)
                     self._hqq_manifest["totals"]["tensor_bytes"] += record["tensor_bytes"]
                     self._hqq_manifest["totals"]["num_tensors"] += 1
@@ -1504,8 +1590,18 @@ class KrasisModel:
                 existing = _existing_auto_entry(tensor_name, "planner")
                 if existing is not None:
                     return 0, existing
-                base_record = _write_record(tensor_name, tensor, int(policy["base_nbits"]))
-                promoted_record = _write_record(tensor_name, tensor, int(policy["promoted_nbits"]))
+                base_record = _write_record(
+                    tensor_name,
+                    tensor,
+                    int(policy["base_nbits"]),
+                    hqq4_inner_threads=hqq4_inner_threads,
+                )
+                promoted_record = _write_record(
+                    tensor_name,
+                    tensor,
+                    int(policy["promoted_nbits"]),
+                    hqq4_inner_threads=hqq4_inner_threads,
+                )
                 candidate = hqq_auto_candidate_from_records(base_record, promoted_record)
                 planner = self._hqq_manifest.setdefault(
                     "planner",
@@ -1515,105 +1611,269 @@ class KrasisModel:
                 planner["candidate_count"] = len(planner["candidates"])
                 return base_record["tensor_bytes"] + promoted_record["tensor_bytes"], candidate
 
-            record = _write_record(tensor_name, tensor, _artifact_nbits(tensor_name))
+            record = _write_record(
+                tensor_name,
+                tensor,
+                _artifact_nbits(tensor_name),
+                hqq4_inner_threads=hqq4_inner_threads,
+            )
             self._hqq_manifest["tensors"].append(record)
             self._hqq_manifest["totals"]["tensor_bytes"] += record["tensor_bytes"]
             self._hqq_manifest["totals"]["num_tensors"] += 1
             return record["tensor_bytes"], record
 
         tensor_map = self._hqq_attention_tensor_map(layer_type, weights)
-        for tensor_name, tensor in tensor_map.items():
-            tensor_started = time.perf_counter() if timing_enabled else 0.0
-            if timing_enabled:
-                print(
-                    json.dumps(
-                        {
-                            "hqq_real_model_timing": {
-                                "phase": "artifact_write_tensor_start",
-                                "layer_idx": int(layer_idx),
-                                "layer_type": layer_type,
-                                "tensor_name": tensor_name,
-                            }
-                        },
-                        sort_keys=True,
-                    ),
-                    flush=True,
+        records_by_tensor = {}
+        fixed_hqq4_parallel = (
+            self.quant_cfg.attention == "hqq4"
+            and not is_hqq_auto_attention(self.quant_cfg.attention)
+            and int(cache_nbits) == 4
+        )
+        hqq4_workers, hqq4_inner_threads = (
+            self._hqq4_cache_parallelism(len(tensor_map)) if fixed_hqq4_parallel else (1, None)
+        )
+        if fixed_hqq4_parallel and layer_idx == 0:
+            logger.info(
+                "HQQ4 cache build concurrency: workers=%d inner_threads=%d total_threads=%d",
+                hqq4_workers,
+                hqq4_inner_threads,
+                self.krasis_threads,
+            )
+
+        def _emit_tensor_start(tensor_name: str, extra: Optional[dict] = None) -> None:
+            if not timing_enabled:
+                return
+            payload = {
+                "phase": "artifact_write_tensor_start",
+                "layer_idx": int(layer_idx),
+                "layer_type": layer_type,
+                "tensor_name": tensor_name,
+            }
+            if extra:
+                payload.update(extra)
+            print(json.dumps({"hqq_real_model_timing": payload}, sort_keys=True), flush=True)
+
+        def _emit_tensor_done(
+            tensor_name: str,
+            elapsed_s: float,
+            written_bytes: int,
+            extra: Optional[dict] = None,
+        ) -> None:
+            if not timing_enabled:
+                return
+            entry = {
+                "tensor_name": tensor_name,
+                "elapsed_s": elapsed_s,
+                "tensor_bytes": int(written_bytes),
+            }
+            if extra:
+                entry.update(extra)
+            timing_entries.append(entry)
+            payload = {
+                "phase": "artifact_write_tensor_done",
+                "layer_idx": int(layer_idx),
+                "layer_type": layer_type,
+                "tensor_name": tensor_name,
+                "elapsed_s": elapsed_s,
+                "tensor_bytes": int(written_bytes),
+            }
+            if extra:
+                payload.update(extra)
+            print(json.dumps({"hqq_real_model_timing": payload}, sort_keys=True), flush=True)
+
+        def _record_fixed_artifact(tensor_name: str, record: dict, written_bytes: int) -> None:
+            self._hqq_manifest["tensors"].append(record)
+            self._hqq_manifest["totals"]["tensor_bytes"] += int(written_bytes)
+            self._hqq_manifest["totals"]["num_tensors"] += 1
+            if isinstance(record, dict) and record.get("tensor_name") == tensor_name:
+                records_by_tensor[tensor_name] = record
+
+        if fixed_hqq4_parallel and hqq4_workers > 1 and len(tensor_map) > 1:
+            def _write_record_timed(tensor_name: str, tensor: torch.Tensor) -> tuple[dict, float]:
+                worker_started = time.perf_counter()
+                record = _write_record(
+                    tensor_name,
+                    tensor,
+                    4,
+                    hqq4_inner_threads=hqq4_inner_threads,
                 )
-            written_bytes, record = _write_selected_or_candidate(tensor_name, tensor)
-            if timing_enabled:
-                elapsed_s = time.perf_counter() - tensor_started
-                timing_entries.append(
-                    {
-                        "tensor_name": tensor_name,
-                        "elapsed_s": elapsed_s,
-                        "tensor_bytes": int(written_bytes),
+                return record, time.perf_counter() - worker_started
+
+            future_records = []
+            with ThreadPoolExecutor(max_workers=hqq4_workers, thread_name_prefix="hqq4-cache") as executor:
+                for tensor_name, tensor in tensor_map.items():
+                    tensor_started = time.perf_counter()
+                    timing_extra = {
+                        "concurrency_workers": hqq4_workers,
+                        "hqq4_inner_threads": hqq4_inner_threads,
                     }
+                    _emit_tensor_start(tensor_name, timing_extra)
+                    future = executor.submit(_write_record_timed, tensor_name, tensor)
+                    future_records.append((tensor_name, tensor_started, future, timing_extra))
+
+                for tensor_name, tensor_started, future, timing_extra in future_records:
+                    record, worker_elapsed_s = future.result()
+                    written_bytes = int(record["tensor_bytes"])
+                    _record_fixed_artifact(tensor_name, record, written_bytes)
+                    timing_extra = {
+                        **timing_extra,
+                        "queued_elapsed_s": time.perf_counter() - tensor_started,
+                    }
+                    _emit_tensor_done(
+                        tensor_name,
+                        worker_elapsed_s,
+                        written_bytes,
+                        timing_extra,
+                    )
+        else:
+            for tensor_name, tensor in tensor_map.items():
+                tensor_started = time.perf_counter() if timing_enabled else 0.0
+                _emit_tensor_start(tensor_name)
+                written_bytes, record = _write_selected_or_candidate(
+                    tensor_name,
+                    tensor,
+                    hqq4_inner_threads=hqq4_inner_threads,
                 )
-                print(
-                    json.dumps(
-                        {
-                            "hqq_real_model_timing": {
-                                "phase": "artifact_write_tensor_done",
-                                "layer_idx": int(layer_idx),
-                                "layer_type": layer_type,
-                                "tensor_name": tensor_name,
-                                "elapsed_s": elapsed_s,
-                                "tensor_bytes": int(written_bytes),
-                            }
-                        },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
+                if isinstance(record, dict) and record.get("tensor_name") == tensor_name:
+                    records_by_tensor[tensor_name] = record
+                if timing_enabled:
+                    _emit_tensor_done(
+                        tensor_name,
+                        time.perf_counter() - tensor_started,
+                        int(written_bytes),
+                    )
         if "fused_qkv" not in tensor_map:
             fused_build_started = time.perf_counter() if timing_enabled else 0.0
-            fused_qkv = self._build_hqq_fused_qkv_artifact_weight(layer_type, weights)
-            if fused_qkv is not None:
-                fused_write_started = time.perf_counter() if timing_enabled else 0.0
-                if timing_enabled:
-                    print(
-                        json.dumps(
+            can_synthesize_fused_qkv = (
+                not is_hqq_auto_attention(self.quant_cfg.attention)
+                and self.quant_cfg.attention in ("hqq6", "hqq8")
+                and layer_type in ("full_attention", "sliding_attention")
+                and not self.cfg.is_mla
+                and all(name in records_by_tensor for name in ("q_proj", "k_proj", "v_proj"))
+            )
+            if can_synthesize_fused_qkv:
+                fused_nbits = _artifact_nbits("fused_qkv")
+                if not all(int(records_by_tensor[name].get("nbits", -1)) == fused_nbits for name in ("q_proj", "k_proj", "v_proj")):
+                    raise RuntimeError(
+                        "Cannot synthesize fixed-HQQ fused_qkv artifact: split q/k/v nbits differ."
+                    )
+                if all(int(records_by_tensor[name].get("nbits", -1)) == fused_nbits for name in ("q_proj", "k_proj", "v_proj")):
+                    fused_write_started = time.perf_counter() if timing_enabled else 0.0
+                    if timing_enabled:
+                        print(
+                            json.dumps(
+                                {
+                                    "hqq_real_model_timing": {
+                                        "phase": "artifact_write_tensor_start",
+                                        "layer_idx": int(layer_idx),
+                                        "layer_type": layer_type,
+                                        "tensor_name": "fused_qkv",
+                                        "build_elapsed_s": fused_write_started - fused_build_started,
+                                        "source": "split_hqq_artifacts",
+                                    }
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+                    record = synthesize_hqq_fused_qkv_artifact(
+                        self.cfg.model_path,
+                        layer_idx=layer_idx,
+                        layer_type=layer_type,
+                        records_by_tensor=records_by_tensor,
+                        nbits=fused_nbits,
+                        cache_profile=self.quant_cfg.hqq_cache_profile,
+                        group_size=self.quant_cfg.hqq_group_size,
+                        cache_nbits=cache_nbits,
+                    )
+                    self._hqq_manifest["tensors"].append(record)
+                    self._hqq_manifest["totals"]["tensor_bytes"] += record["tensor_bytes"]
+                    self._hqq_manifest["totals"]["num_tensors"] += 1
+                    written_bytes = record["tensor_bytes"]
+                    if timing_enabled:
+                        elapsed_s = time.perf_counter() - fused_write_started
+                        timing_entries.append(
                             {
-                                "hqq_real_model_timing": {
-                                    "phase": "artifact_write_tensor_start",
-                                    "layer_idx": int(layer_idx),
-                                    "layer_type": layer_type,
-                                    "tensor_name": "fused_qkv",
-                                    "build_elapsed_s": fused_write_started - fused_build_started,
-                                }
-                            },
-                            sort_keys=True,
-                        ),
-                        flush=True,
+                                "tensor_name": "fused_qkv",
+                                "build_elapsed_s": fused_write_started - fused_build_started,
+                                "elapsed_s": elapsed_s,
+                                "tensor_bytes": int(written_bytes),
+                                "source": "split_hqq_artifacts",
+                            }
+                        )
+                        print(
+                            json.dumps(
+                                {
+                                    "hqq_real_model_timing": {
+                                        "phase": "artifact_write_tensor_done",
+                                        "layer_idx": int(layer_idx),
+                                        "layer_type": layer_type,
+                                        "tensor_name": "fused_qkv",
+                                        "build_elapsed_s": fused_write_started - fused_build_started,
+                                        "elapsed_s": elapsed_s,
+                                        "tensor_bytes": int(written_bytes),
+                                        "source": "split_hqq_artifacts",
+                                    }
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+            else:
+                fused_qkv = self._build_hqq_fused_qkv_artifact_weight(layer_type, weights)
+                if fused_qkv is not None:
+                    fused_write_started = time.perf_counter() if timing_enabled else 0.0
+                    if timing_enabled:
+                        print(
+                            json.dumps(
+                                {
+                                    "hqq_real_model_timing": {
+                                        "phase": "artifact_write_tensor_start",
+                                        "layer_idx": int(layer_idx),
+                                        "layer_type": layer_type,
+                                        "tensor_name": "fused_qkv",
+                                        "build_elapsed_s": fused_write_started - fused_build_started,
+                                        "source": "bf16_concat",
+                                    }
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+                    written_bytes, record = _write_selected_or_candidate(
+                        "fused_qkv",
+                        fused_qkv,
+                        hqq4_inner_threads=max(1, int(self.krasis_threads)) if fixed_hqq4_parallel else hqq4_inner_threads,
                     )
-                written_bytes, record = _write_selected_or_candidate("fused_qkv", fused_qkv)
-                if timing_enabled:
-                    elapsed_s = time.perf_counter() - fused_write_started
-                    timing_entries.append(
-                        {
-                            "tensor_name": "fused_qkv",
-                            "build_elapsed_s": fused_write_started - fused_build_started,
-                            "elapsed_s": elapsed_s,
-                            "tensor_bytes": int(written_bytes),
-                        }
-                    )
-                    print(
-                        json.dumps(
+                    if timing_enabled:
+                        elapsed_s = time.perf_counter() - fused_write_started
+                        timing_entries.append(
                             {
-                                "hqq_real_model_timing": {
-                                    "phase": "artifact_write_tensor_done",
-                                    "layer_idx": int(layer_idx),
-                                    "layer_type": layer_type,
-                                    "tensor_name": "fused_qkv",
-                                    "build_elapsed_s": fused_write_started - fused_build_started,
-                                    "elapsed_s": elapsed_s,
-                                    "tensor_bytes": int(written_bytes),
-                                }
-                            },
-                            sort_keys=True,
-                        ),
-                        flush=True,
-                    )
+                                "tensor_name": "fused_qkv",
+                                "build_elapsed_s": fused_write_started - fused_build_started,
+                                "elapsed_s": elapsed_s,
+                                "tensor_bytes": int(written_bytes),
+                                "source": "bf16_concat",
+                            }
+                        )
+                        print(
+                            json.dumps(
+                                {
+                                    "hqq_real_model_timing": {
+                                        "phase": "artifact_write_tensor_done",
+                                        "layer_idx": int(layer_idx),
+                                        "layer_type": layer_type,
+                                        "tensor_name": "fused_qkv",
+                                        "build_elapsed_s": fused_write_started - fused_build_started,
+                                        "elapsed_s": elapsed_s,
+                                        "tensor_bytes": int(written_bytes),
+                                        "source": "bf16_concat",
+                                    }
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
         save_hqq_attention_pending_manifest(
             self.cfg.model_path,
             self._hqq_manifest,
@@ -1772,6 +2032,38 @@ class KrasisModel:
             promotion_span_bytes / (1024 * 1024),
         )
 
+    def _build_hqq_attention_cache_from_safetensors(self, loader, primary_dev: torch.device) -> None:
+        if not getattr(self, "_hqq_rebuild", False):
+            return
+
+        logger.info(
+            "Building HQQ attention cache in bounded safetensors pass: at most one BF16 layer materialized at a time"
+        )
+        cpu = torch.device("cpu")
+        self._hqq_search_cuda_device = primary_dev if primary_dev.type == "cuda" else None
+        started = time.perf_counter()
+        for layer_idx in range(self.cfg.num_hidden_layers):
+            weights = loader.load_layer(layer_idx, primary_dev, attn_device=cpu)
+            layer_type = weights.get("layer_type", "full_attention")
+            attn_key = "linear_attention" if layer_type == "linear_attention" else "attention"
+            self._maybe_write_hqq_attention_artifacts(
+                layer_idx,
+                layer_type,
+                weights.get(attn_key, {}),
+            )
+            del weights
+            if (layer_idx + 1) % 2 == 0 or layer_idx == self.cfg.num_hidden_layers - 1:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        self._validate_hqq_attention_cache()
+        self._hqq_rebuild = False
+        self._hqq_finalize_pending_manifest = False
+        logger.info(
+            "HQQ attention cache bounded build complete in %.1fs; continuing normal model load from cache",
+            time.perf_counter() - started,
+        )
+
     def _validate_hqq_attention_cache(self) -> None:
         cache_nbits = getattr(self, "_hqq_cache_nbits", attention_quant_cache_nbits(self.quant_cfg.attention))
         if cache_nbits is None:
@@ -1803,29 +2095,32 @@ class KrasisModel:
             manifest.get("format_version") != HQQ_ATTENTION_CACHE_VERSION
             or manifest.get("backend") != expected_backend
             or manifest.get("group_size") != hqq_group_size
+            or manifest.get("quantizer") != hqq_cache_algorithm_for_nbits(cache_nbits)
         ):
             raise RuntimeError(
                 "HQQ attention cache manifest is incompatible with this build. "
                 f"Found format_version={manifest.get('format_version')} backend={manifest.get('backend')} "
-                f"group_size={manifest.get('group_size')} expected_group_size={hqq_group_size}"
+                f"group_size={manifest.get('group_size')} expected_group_size={hqq_group_size} "
+                f"quantizer={manifest.get('quantizer')} expected_quantizer={hqq_cache_algorithm_for_nbits(cache_nbits)}"
             )
 
-        expected = []
-        for layer_idx, layer in enumerate(self.layers):
-            layer_weights = self._extract_layer_weights(layer, layer.device)
-            layer_type = layer_weights.get("layer_type", "full_attention")
-            attn_key = "linear_attention" if layer_type == "linear_attention" else "attention"
-            attn_weights = layer_weights.get(attn_key, {})
-            expected_tensor_names = list(self._hqq_attention_tensor_map(layer_type, attn_weights))
-            if (
-                layer_type in ("full_attention", "sliding_attention")
-                and not self.cfg.is_mla
-                and "fused_qkv" not in expected_tensor_names
-                and all(isinstance(attn_weights.get(name), torch.Tensor) for name in ("q_proj", "k_proj", "v_proj"))
-            ):
-                expected_tensor_names.append("fused_qkv")
-            for tensor_name in expected_tensor_names:
-                expected.append((layer_idx, tensor_name))
+        expected = list(getattr(self, "_hqq_expected_tensors", []) or [])
+        if not expected:
+            for layer_idx, layer in enumerate(self.layers):
+                layer_weights = self._extract_layer_weights(layer, layer.device)
+                layer_type = layer_weights.get("layer_type", "full_attention")
+                attn_key = "linear_attention" if layer_type == "linear_attention" else "attention"
+                attn_weights = layer_weights.get(attn_key, {})
+                expected_tensor_names = list(self._hqq_attention_tensor_map(layer_type, attn_weights))
+                if (
+                    layer_type in ("full_attention", "sliding_attention")
+                    and not self.cfg.is_mla
+                    and "fused_qkv" not in expected_tensor_names
+                    and all(isinstance(attn_weights.get(name), torch.Tensor) for name in ("q_proj", "k_proj", "v_proj"))
+                ):
+                    expected_tensor_names.append("fused_qkv")
+                for tensor_name in expected_tensor_names:
+                    expected.append((layer_idx, tensor_name))
 
         if is_hqq_auto_attention(self.quant_cfg.attention):
             cache_dir = hqq_attention_cache_dir(self.cfg.model_path, cache_profile, cache_nbits, hqq_group_size)
@@ -2361,7 +2656,7 @@ class KrasisModel:
         if nbits is None:
             raise RuntimeError("HQQ registration requires loaded runtime state.")
         validate_hqq_cache_nbits(nbits)
-        layer_register_nbits = 4 if is_hqq_mixed_attention(self.quant_cfg.attention) else nbits
+        layer_register_nbits = 4 if is_hqq_mixed_attention(self.quant_cfg.attention) else hqq_cache_storage_nbits(nbits)
 
         registered_layers = 0
         staged_runtime_tensors = 0
@@ -2655,6 +2950,7 @@ class KrasisModel:
         hqq_active = is_hqq_attention(self.quant_cfg.attention)
         if hqq_active:
             self._prepare_hqq_attention_cache()
+            self._build_hqq_attention_cache_from_safetensors(loader, primary_dev)
 
         if self.stream_attention:
             # Incremental load: attention goes directly to CPU (never touches GPU),

@@ -2,6 +2,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(no_numa)");
     println!("cargo::rustc-check-cfg=cfg(has_decode_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_prefill_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_hqq_search_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_marlin_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_flash_attn_kernels)");
 
@@ -32,6 +33,9 @@ fn main() {
 
     // Compile CUDA prefill kernels to PTX (Rust prefill path).
     compile_prefill_kernels();
+
+    // Compile diagnostic HQQ search kernels to PTX.
+    compile_hqq_search_kernels();
 
     // Compile vendored Marlin GEMM kernels into libkrasis_marlin.so
     compile_marlin_kernels();
@@ -272,6 +276,57 @@ fn compile_prefill_kernels() {
     }
 }
 
+fn compile_hqq_search_kernels() {
+    let cu_src = "src/cuda/hqq_search_kernels.cu";
+    println!("cargo:rerun-if-changed={cu_src}");
+    if !std::path::Path::new(cu_src).exists() {
+        println!("cargo:warning=hqq_search_kernels.cu not found — HQQ CUDA search disabled");
+        return;
+    }
+
+    let nvcc = find_nvcc();
+    let Some(nvcc) = nvcc else {
+        println!("cargo:warning=nvcc not found — HQQ CUDA search disabled");
+        return;
+    };
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let ptx_path = format!("{out_dir}/hqq_search_kernels.ptx");
+
+    if is_output_fresh(&[cu_src], &[&ptx_path]) {
+        println!("cargo:rustc-cfg=has_hqq_search_kernels");
+        println!("cargo:warning=Reusing cached HQQ CUDA search kernels at {ptx_path}");
+        return;
+    }
+
+    let mut cmd = std::process::Command::new(&nvcc);
+    cmd.args([
+        "-ptx",
+        "-allow-unsupported-compiler",
+        "-arch=sm_80",
+        "-O3",
+        "--use_fast_math",
+        "-o",
+        &ptx_path,
+        cu_src,
+    ])
+    .args(nvcc_host_compiler_args());
+    let status = cmd.status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("cargo:rustc-cfg=has_hqq_search_kernels");
+            println!("cargo:warning=Compiled HQQ CUDA search kernels to PTX ({ptx_path})");
+        }
+        Ok(s) => {
+            println!("cargo:warning=nvcc failed with status {s} — HQQ CUDA search disabled");
+        }
+        Err(e) => {
+            println!("cargo:warning=nvcc execution error: {e} — HQQ CUDA search disabled");
+        }
+    }
+}
+
 fn compile_marlin_kernels() {
     let marlin_dir = "src/cuda/marlin";
     let src_regular = format!("{marlin_dir}/marlin_vendor.cu");
@@ -475,7 +530,8 @@ fn compile_flash_attn_kernels() {
         format!("-I{fa_dir}"),
         format!("-I{cutlass_dir}"),
     ];
-    // Template instantiations to compile (BF16 forward only + FP8 KV variants)
+    // Template instantiations to compile. Keep this BF16-only for Ampere; FP8
+    // KV kernels are not a supported Krasis surface on SM80-class hardware.
     let cu_files = [
         "flash_attn_vendor.cu",
         "flash_fwd_hdim64_bf16_causal_sm80.cu",
@@ -488,17 +544,6 @@ fn compile_flash_attn_kernels() {
         "flash_fwd_hdim192_bf16_sm80.cu",
         "flash_fwd_hdim256_bf16_causal_sm80.cu",
         "flash_fwd_hdim256_bf16_sm80.cu",
-        // FP8 E4M3 K/V variants (BF16 Q, all head dims)
-        "flash_fwd_hdim64_bf16q_fp8kv_causal_sm80.cu",
-        "flash_fwd_hdim64_bf16q_fp8kv_sm80.cu",
-        "flash_fwd_hdim96_bf16q_fp8kv_causal_sm80.cu",
-        "flash_fwd_hdim96_bf16q_fp8kv_sm80.cu",
-        "flash_fwd_hdim128_bf16q_fp8kv_causal_sm80.cu",
-        "flash_fwd_hdim128_bf16q_fp8kv_sm80.cu",
-        "flash_fwd_hdim192_bf16q_fp8kv_causal_sm80.cu",
-        "flash_fwd_hdim192_bf16q_fp8kv_sm80.cu",
-        "flash_fwd_hdim256_bf16q_fp8kv_causal_sm80.cu",
-        "flash_fwd_hdim256_bf16q_fp8kv_sm80.cu",
     ];
 
     let source_paths: Vec<String> = cu_files

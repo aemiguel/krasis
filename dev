@@ -30,6 +30,7 @@
 #   ./dev witness-compare <config>  Compare Krasis against llama-witness JSON
 #   ./dev hqq-attn-diff <model>     Offline HQQ attention artifact diff against BF16 source
 #   ./dev hqq-self-calibrate <config>  Capture self-calibration evidence / candidates only
+#   ./dev hqq-gpu-search-probe       Prototype GPU HQQ candidate-search timing/quality
 #   ./dev capture-box <subcommand>  ARCHIVED HF capture wrapper; requires explicit override
 #   ./dev capture-preflight         ARCHIVED HF capture host preflight; requires explicit override
 #   ./dev reference-prep <model>    ARCHIVED HF dependency/model prep; requires explicit override
@@ -1599,6 +1600,21 @@ do_hqq_self_calibrate_test() {
     KRASIS_DEV_SCRIPT=1 run_repo_python "$SCRIPT_DIR/tests/test_hqq_self_calibrate.py"
 }
 
+do_hqq_gpu_search_probe() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: ./dev hqq-gpu-search-probe [--model q122b|q35b|qcn] [--layer N]"
+        echo "       [--tensors q_proj,k_proj,o_proj,fused_qkv] [--nbits 4,6,8]"
+        echo "       [--global-steps N] [--local-steps N] [--candidate-batch N]"
+        echo "       [--backend torch|rust-cuda] [--output PATH]"
+        echo "  Diagnostic-only GPU HQQ candidate-search prototype. Does not write cache artifacts."
+        echo "  HQQ8 here means integer 8-bit HQQ, not FP8."
+        return 0
+    fi
+    verify_repo_imports
+    KRASIS_DEV_SCRIPT=1 KRASIS_RUN_TYPE="hqq-gpu-search-probe" run_repo_python \
+        "$SCRIPT_DIR/tests/hqq_gpu_search_probe.py" "$@"
+}
+
 json_escape() {
     local s="$1"
     s=${s//\\/\\\\}
@@ -2577,6 +2593,7 @@ case "$cmd" in
     hqq-attn-diff) do_hqq_attn_diff "$@" ;;
     hqq-self-calibrate) do_hqq_self_calibrate "$@" ;;
     hqq-self-calibrate-test) do_hqq_self_calibrate_test "$@" ;;
+    hqq-gpu-search-probe) do_hqq_gpu_search_probe "$@" ;;
     reference-inventory) do_reference_inventory "$@" ;;
     capture-box)    do_capture_box "$@" ;;
     capture-preflight) do_capture_preflight "$@" ;;

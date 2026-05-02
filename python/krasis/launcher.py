@@ -17,7 +17,11 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-from krasis.attention_backend import ATTENTION_QUANT_CHOICES, attention_quant_label
+from krasis.attention_backend import (
+    ATTENTION_QUANT_CHOICES,
+    attention_quant_cache_nbits,
+    attention_quant_label,
+)
 from krasis.config import (
     DEPRECATED_ATTENTION_QUANT_CHOICES,
     DEPRECATED_KV_CACHE_FORMAT_CHOICES,
@@ -427,6 +431,7 @@ class LauncherConfig:
         self.vram_safety_margin: int = 600
         self.force_load: bool = False
         self.force_rebuild_cache: bool = False
+        self.force_rebuild_hqq_cache: bool = False
         self.build_cache: bool = False
         self.enable_thinking: bool = True
         self.session_enabled: bool = False
@@ -588,6 +593,8 @@ class LauncherConfig:
             self.force_load = saved["CFG_FORCE_LOAD"] == "1"
         if "CFG_FORCE_REBUILD_CACHE" in saved and saved["CFG_FORCE_REBUILD_CACHE"]:
             self.force_rebuild_cache = saved["CFG_FORCE_REBUILD_CACHE"] == "1"
+        if "CFG_FORCE_REBUILD_HQQ_CACHE" in saved and saved["CFG_FORCE_REBUILD_HQQ_CACHE"]:
+            self.force_rebuild_hqq_cache = saved["CFG_FORCE_REBUILD_HQQ_CACHE"] == "1"
         if "CFG_BUILD_CACHE" in saved and saved["CFG_BUILD_CACHE"]:
             self.build_cache = saved["CFG_BUILD_CACHE"] == "1"
         if "CFG_ENABLE_THINKING" in saved:
@@ -625,6 +632,7 @@ class LauncherConfig:
             "CFG_VRAM_SAFETY_MARGIN": str(self.vram_safety_margin),
             "CFG_FORCE_LOAD": "1" if self.force_load else "",
             "CFG_FORCE_REBUILD_CACHE": "1" if self.force_rebuild_cache else "",
+            "CFG_FORCE_REBUILD_HQQ_CACHE": "1" if self.force_rebuild_hqq_cache else "",
             "CFG_BUILD_CACHE": "1" if self.build_cache else "",
             "CFG_ENABLE_THINKING": "1" if self.enable_thinking else "0",
             "CFG_SESSION_ENABLED": "1" if self.session_enabled else "0",
@@ -686,6 +694,10 @@ OPTIONS = [
                  choices=[True, False]),
     ConfigOption("Session messenger", "session_enabled",
                  choices=[True, False]),
+    ConfigOption("Rebuild Marlin cache", "force_rebuild_cache",
+                 choices=[False, True], advanced=True),
+    ConfigOption("Rebuild HQQ cache(s)", "force_rebuild_hqq_cache",
+                 choices=[False, True], advanced=True),
 ]
 
 def _format_value(opt: ConfigOption, val: Any) -> str:
@@ -719,6 +731,9 @@ def _is_option_visible(
     if opt.key == "dense_mlp_quant":
         # Only show if model has dense (non-MoE) layers
         if model_info and model_info.get("dense_layers", 0) == 0:
+            return False
+    if opt.key == "force_rebuild_hqq_cache":
+        if cfg is None or attention_quant_cache_nbits(cfg.attention_quant) is None:
             return False
     return True
 
@@ -1941,6 +1956,8 @@ def parse_args() -> argparse.Namespace:
                         help="Override RAM safety checks and load anyway")
     parser.add_argument("--force-rebuild-cache", action="store_true",
                         help="Delete existing expert caches and rebuild from safetensors")
+    parser.add_argument("--force-rebuild-hqq-cache", action="store_true",
+                        help="Delete the selected HQQ attention cache and rebuild from safetensors")
     parser.add_argument("--build-cache", action="store_true",
                         help="Build expert caches (if missing) and exit without starting server")
     parser.add_argument("--session-enabled", action="store_true",
@@ -2046,6 +2063,8 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         cfg.force_load = True
     if getattr(args, 'force_rebuild_cache', False):
         cfg.force_rebuild_cache = True
+    if getattr(args, 'force_rebuild_hqq_cache', False):
+        cfg.force_rebuild_hqq_cache = True
     if getattr(args, 'build_cache', False):
         cfg.build_cache = True
     if getattr(args, 'session_enabled', False):

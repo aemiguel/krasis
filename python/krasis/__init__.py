@@ -36,6 +36,10 @@ except PackageNotFoundError:
 try:
     from krasis.krasis import KrasisEngine, WeightStore, RustServer, system_check
     try:
+        from krasis.krasis import hqq_search_cuda_tensor_ptr
+    except ImportError:
+        pass  # Built without HQQ CUDA search kernels
+    try:
         from krasis.krasis import GpuDecodeStore
     except ImportError:
         pass  # Built without CUDA feature

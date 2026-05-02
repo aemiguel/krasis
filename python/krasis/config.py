@@ -6,7 +6,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 
-ATTENTION_QUANT_CHOICES = ("bf16", "hqq4", "hqq46", "hqq46_auto", "hqq6", "hqq68_auto", "hqq8")
+ATTENTION_QUANT_CHOICES = (
+    "bf16",
+    "hqq4",
+    "hqq46",
+    "hqq46_auto",
+    "hqq6",
+    "hqq68_auto",
+    "hqq8",
+)
 DEPRECATED_ATTENTION_QUANT_CHOICES = ("awq",)
 KV_CACHE_FORMAT_CHOICES = ("fp8", "fp8_e4m3", "bf16", "bfloat16", "k8v4", "k8v6", "k7v4", "k6v6", "k6v4", "k4v4", "tq4")
 DEPRECATED_KV_CACHE_FORMAT_CHOICES = ("polar4",)
@@ -316,12 +324,12 @@ class QuantConfig:
             )
         if not self.attention.startswith("hqq") and self.hqq_cache_profile != HQQ_CACHE_PROFILE_BASELINE:
             raise ValueError(
-                f"hqq_cache_profile={self.hqq_cache_profile} requires attention='hqq4', attention='hqq46', attention='hqq46_auto', attention='hqq6', attention='hqq68_auto', or attention='hqq8'. "
+                f"hqq_cache_profile={self.hqq_cache_profile} requires an HQQ attention mode. "
                 "Non-HQQ attention backends must use hqq_cache_profile='baseline'."
             )
         if not self.attention.startswith("hqq") and self.hqq_group_size != HQQ_ATTENTION_DEFAULT_GROUP_SIZE:
             raise ValueError(
-                f"hqq_group_size={self.hqq_group_size} requires attention='hqq4', attention='hqq46', attention='hqq46_auto', attention='hqq6', attention='hqq68_auto', or attention='hqq8'. "
+                f"hqq_group_size={self.hqq_group_size} requires an HQQ attention mode. "
                 "Non-HQQ attention backends must use the default HQQ group size."
             )
         if isinstance(self.hqq_auto_budget_pct, str) and not self.hqq_auto_budget_pct.strip():
