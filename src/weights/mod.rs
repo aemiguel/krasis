@@ -3006,15 +3006,19 @@ impl WeightStore {
         log::info!("Rayon thread pool: {physical_cores} physical cores (cache build)");
 
         let overall_start = std::time::Instant::now();
+        let mut total_initial_prefetch = std::time::Duration::new(0, 0);
         let mut total_route_io = std::time::Duration::new(0, 0);
+        let mut total_route_prefetch = std::time::Duration::new(0, 0);
         let mut total_route_repack = std::time::Duration::new(0, 0);
         let mut total_route_write = std::time::Duration::new(0, 0);
+        let mut total_route_misc = std::time::Duration::new(0, 0);
         let mut total_shared_io = std::time::Duration::new(0, 0);
         let mut total_shared_repack = std::time::Duration::new(0, 0);
         let mut total_shared_write = std::time::Duration::new(0, 0);
 
         // Prefetch first layer's expert data asynchronously
         let first_layer_idx = config.moe_abs_layer(start_moe_layer);
+        let initial_prefetch_start = std::time::Instant::now();
         if stacked || mxfp4 {
             // Stacked/MXFP4: prefetch bulk tensors for first layer
             let suffixes: &[&str] = if stacked {
@@ -3036,34 +3040,16 @@ impl WeightStore {
             let fmt = if stacked { "stacked" } else { "MXFP4" };
             log::info!("Issued {fmt} prefetch for layer {first_layer_idx} bulk tensors");
         } else {
-            let proj_names = if !experts_gated {
-                if prequantized {
-                    vec!["up_proj.weight_packed", "up_proj.weight_scale",
-                         "down_proj.weight_packed", "down_proj.weight_scale"]
-                } else {
-                    vec!["up_proj.weight", "down_proj.weight"]
-                }
-            } else if prequantized {
-                vec!["gate_proj.weight_packed", "gate_proj.weight_scale",
-                     "up_proj.weight_packed", "up_proj.weight_scale",
-                     "down_proj.weight_packed", "down_proj.weight_scale"]
-            } else {
-                vec!["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
-            };
-            for eidx in 0..config.n_routed_experts {
-                for proj in &proj_names {
-                    let tensor_name = format!(
-                        "{layers_prefix}.layers.{first_layer_idx}.{expert_sublayer}.experts.{eidx}.{proj}"
-                    );
-                    if let Some(shard_name) = index.weight_map.get(&tensor_name) {
-                        if let Some(shard) = shards.get(shard_name) {
-                            shard.prefetch_tensor(&tensor_name);
-                        }
-                    }
-                }
-            }
-            log::info!("Issued MADV_WILLNEED prefetch for layer {first_layer_idx} experts");
+            log::info!(
+                "Skipping non-stacked per-expert prefetch for layer {first_layer_idx}; parallel expert load already provides demand paging"
+            );
         }
+        let initial_prefetch_elapsed = initial_prefetch_start.elapsed();
+        total_initial_prefetch += initial_prefetch_elapsed;
+        log::info!(
+            "Marlin initial prefetch for layer {first_layer_idx}: {:.3}s",
+            initial_prefetch_elapsed.as_secs_f64(),
+        );
 
         // Stream routed experts layer by layer
         for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
@@ -3136,6 +3122,7 @@ impl WeightStore {
             total_route_io += io_elapsed;
 
             // Prefetch next layer's data while we do CPU-bound Marlin repack
+            let prefetch_start = std::time::Instant::now();
             let next_moe_idx = moe_idx + 1;
             if next_moe_idx < start_moe_layer + num_moe_layers {
                 let next_layer_idx = config.moe_abs_layer(next_moe_idx);
@@ -3157,34 +3144,15 @@ impl WeightStore {
                         }
                     }
                 } else {
-                    let proj_names: &[&str] = if !experts_gated {
-                        if prequantized {
-                            &["up_proj.weight_packed", "up_proj.weight_scale",
-                              "down_proj.weight_packed", "down_proj.weight_scale"]
-                        } else {
-                            &["up_proj.weight", "down_proj.weight"]
-                        }
-                    } else if prequantized {
-                        &["gate_proj.weight_packed", "gate_proj.weight_scale",
-                          "up_proj.weight_packed", "up_proj.weight_scale",
-                          "down_proj.weight_packed", "down_proj.weight_scale"]
-                    } else {
-                        &["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
-                    };
-                    for eidx in 0..config.n_routed_experts {
-                        for proj in proj_names {
-                            let tensor_name = format!(
-                                "{layers_prefix}.layers.{next_layer_idx}.{expert_sublayer}.experts.{eidx}.{proj}"
-                            );
-                            if let Some(shard_name) = index.weight_map.get(&tensor_name) {
-                                if let Some(shard) = shards.get(shard_name) {
-                                    shard.prefetch_tensor(&tensor_name);
-                                }
-                            }
-                        }
-                    }
+                    // The non-stacked QCN path has many small expert tensors.
+                    // Issuing MADV_WILLNEED per tensor is synchronous and was
+                    // measured as ~76s of a 173s cache build after expert
+                    // quantization became parallel. Demand paging during the
+                    // parallel load is faster and keeps the same memory bound.
                 }
             }
+            let prefetch_elapsed = prefetch_start.elapsed();
+            total_route_prefetch += prefetch_elapsed;
 
             // Phase 2: Parallel Marlin repack across all CPU cores
             let repack_start = std::time::Instant::now();
@@ -3209,6 +3177,11 @@ impl WeightStore {
 
             let layers_done = moe_idx - start_moe_layer + 1;
             let layer_elapsed = layer_start.elapsed();
+            let known_layer_elapsed = io_elapsed + prefetch_elapsed + repack_elapsed + write_elapsed;
+            let misc_elapsed = layer_elapsed
+                .checked_sub(known_layer_elapsed)
+                .unwrap_or_else(|| std::time::Duration::new(0, 0));
+            total_route_misc += misc_elapsed;
             let overall_elapsed = overall_start.elapsed().as_secs_f64();
             let avg_per_layer = overall_elapsed / layers_done as f64;
             let remaining = (num_moe_layers - layers_done) as f64 * avg_per_layer;
@@ -3218,20 +3191,24 @@ impl WeightStore {
                     overall_elapsed, remaining,
                 );
                 crate::syscheck::log_memory_usage(&format!(
-                    "Marlin cache: {layers_done}/{num_moe_layers} layers ({:.1}s/layer, io={:.1}s repack={:.1}s write={:.1}s)",
+                    "Marlin cache: {layers_done}/{num_moe_layers} layers ({:.1}s/layer, io={:.1}s prefetch={:.1}s repack={:.1}s write={:.1}s misc={:.1}s)",
                     layer_elapsed.as_secs_f64(),
                     io_elapsed.as_secs_f64(),
+                    prefetch_elapsed.as_secs_f64(),
                     repack_elapsed.as_secs_f64(),
                     write_elapsed.as_secs_f64(),
+                    misc_elapsed.as_secs_f64(),
                 ));
             } else {
                 log::info!(
-                    "  Layer {layer_idx}: {} experts in {:.1}s (io={:.1}s repack={:.1}s write={:.1}s) [{layers_done}/{num_moe_layers}]",
+                    "  Layer {layer_idx}: {} experts in {:.1}s (io={:.1}s prefetch={:.1}s repack={:.1}s write={:.1}s misc={:.1}s) [{layers_done}/{num_moe_layers}]",
                     config.n_routed_experts,
                     layer_elapsed.as_secs_f64(),
                     io_elapsed.as_secs_f64(),
+                    prefetch_elapsed.as_secs_f64(),
                     repack_elapsed.as_secs_f64(),
                     write_elapsed.as_secs_f64(),
+                    misc_elapsed.as_secs_f64(),
                 );
             }
         }
@@ -3296,10 +3273,13 @@ impl WeightStore {
             gpu_bits, size as f64 / 1e9, elapsed.as_secs_f64(),
         );
         eprintln!(
-            "    Marlin timing: routed io/quant={:.1}s repack={:.1}s write={:.1}s; shared io/quant={:.1}s repack={:.1}s write={:.1}s; flush={:.1}s",
+            "    Marlin timing: initial_prefetch={:.1}s routed io/quant={:.1}s prefetch={:.1}s repack={:.1}s write={:.1}s misc={:.1}s; shared io/quant={:.1}s repack={:.1}s write={:.1}s; flush={:.1}s",
+            total_initial_prefetch.as_secs_f64(),
             total_route_io.as_secs_f64(),
+            total_route_prefetch.as_secs_f64(),
             total_route_repack.as_secs_f64(),
             total_route_write.as_secs_f64(),
+            total_route_misc.as_secs_f64(),
             total_shared_io.as_secs_f64(),
             total_shared_repack.as_secs_f64(),
             total_shared_write.as_secs_f64(),
@@ -3312,10 +3292,13 @@ impl WeightStore {
             size as f64 / 1e9 / elapsed.as_secs_f64(),
         );
         log::info!(
-            "Marlin cache timing totals: routed_io_quant={:.3}s routed_repack={:.3}s routed_write={:.3}s shared_io_quant={:.3}s shared_repack={:.3}s shared_write={:.3}s flush_rename={:.3}s",
+            "Marlin cache timing totals: initial_prefetch={:.3}s routed_io_quant={:.3}s routed_prefetch={:.3}s routed_repack={:.3}s routed_write={:.3}s routed_misc={:.3}s shared_io_quant={:.3}s shared_repack={:.3}s shared_write={:.3}s flush_rename={:.3}s",
+            total_initial_prefetch.as_secs_f64(),
             total_route_io.as_secs_f64(),
+            total_route_prefetch.as_secs_f64(),
             total_route_repack.as_secs_f64(),
             total_route_write.as_secs_f64(),
+            total_route_misc.as_secs_f64(),
             total_shared_io.as_secs_f64(),
             total_shared_repack.as_secs_f64(),
             total_shared_write.as_secs_f64(),
