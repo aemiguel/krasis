@@ -1,5 +1,26 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks - 2026-05-03 (Phase 2GR QCN HCS cold swaps)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+QCN was run with opt-in approximate HCS cold swaps enabled. Timing
+instrumentation was disabled. The exact default remains unchanged.
+
+| Model / run | Config / command | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|-------------|------------------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Qwen3-Coder-Next HCS cold swaps | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_HCS_COLD_SWAP=1 ./dev speed-test` | HQQ8 | k4v4 | 8488.2 | 84.45 | 192.63 | 15147/24576 (61.6%) | 706 MB | [log](20260503_phase2gr_qcn_hcs_cold_swap_speedtest.log) |
+
+Notes:
+- This was worse than the recent exact prompt-HCS QCN rows:
+  Phase 2GO 85% default `89.37 tok/s`, Phase 2GP 90% retain `90.78 tok/s`.
+- Official internal rows applied only `1604` swaps over `397` decoded tokens
+  (`4.04/tok`), much less than Q122B's `19.11/tok`.
+- Weighted cold after swaps was `16.48/tok`. The QCN cold-miss surface is
+  already small enough that this approximate mode does not help.
+
+---
+
 ## Standard Benchmarks - 2026-05-03 (Phase 2GQ opt-in HCS cold swaps)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
