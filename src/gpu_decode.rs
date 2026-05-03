@@ -380,10 +380,23 @@ impl RouteSwapShadowStats {
 #[derive(Clone, Default)]
 struct PromptHcsShadowLayerStats {
     selected: u64,
-    actual_hcs: u64,
     shadow_hcs: u64,
     extra_hits: u64,
     lost_hits: u64,
+}
+
+#[derive(Clone)]
+struct PromptHcsShadowVariant {
+    retain_pct: usize,
+    heatmap_retained: usize,
+    prompt_ranked: usize,
+    backfilled: usize,
+    candidate_resident: Vec<bool>,
+    shadow_hcs: u64,
+    shadow_cold: u64,
+    extra_hits: u64,
+    lost_hits: u64,
+    layer_stats: Vec<PromptHcsShadowLayerStats>,
 }
 
 #[derive(Clone)]
@@ -394,20 +407,15 @@ struct PromptHcsShadowStats {
     num_experts_per_layer: usize,
     soft_capacity: usize,
     hard_resident: usize,
-    prompt_ranked: usize,
-    backfilled: usize,
-    candidate_resident: Vec<bool>,
     selected_total: u64,
     actual_hcs: u64,
     actual_cold: u64,
-    shadow_hcs: u64,
-    shadow_cold: u64,
-    extra_hits: u64,
-    lost_hits: u64,
-    layer_stats: Vec<PromptHcsShadowLayerStats>,
+    variants: Vec<PromptHcsShadowVariant>,
 }
 
 impl PromptHcsShadowStats {
+    const RETAIN_PCTS: [usize; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+
     fn disabled() -> Self {
         Self {
             enabled: false,
@@ -416,17 +424,10 @@ impl PromptHcsShadowStats {
             num_experts_per_layer: 0,
             soft_capacity: 0,
             hard_resident: 0,
-            prompt_ranked: 0,
-            backfilled: 0,
-            candidate_resident: Vec::new(),
             selected_total: 0,
             actual_hcs: 0,
             actual_cold: 0,
-            shadow_hcs: 0,
-            shadow_cold: 0,
-            extra_hits: 0,
-            lost_hits: 0,
-            layer_stats: Vec::new(),
+            variants: Vec::new(),
         }
     }
 
@@ -481,7 +482,7 @@ impl PromptHcsShadowStats {
         }
         let hard_resident = hard.iter().filter(|&&v| v).count();
 
-        let mut ranked: Vec<(u64, usize, usize)> = Vec::new();
+        let mut prompt_ranked_candidates: Vec<(u64, usize, usize)> = Vec::new();
         for layer_idx in 0..num_layers.min(count_layers) {
             for expert_idx in 0..num_experts.min(count_experts_per_layer) {
                 let hcs_idx = layer_idx * num_experts + expert_idx;
@@ -491,54 +492,114 @@ impl PromptHcsShadowStats {
                 let count_idx = layer_idx * count_experts_per_layer + expert_idx;
                 let count = counts.get(count_idx).copied().unwrap_or(0);
                 if count > 0 {
-                    ranked.push((count, layer_idx, expert_idx));
+                    prompt_ranked_candidates.push((count, layer_idx, expert_idx));
                 }
             }
         }
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+        prompt_ranked_candidates.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
 
-        let mut filled = 0usize;
-        let mut prompt_ranked = 0usize;
-        for &(_, layer_idx, expert_idx) in &ranked {
-            if filled >= soft_capacity {
-                break;
-            }
-            let idx = layer_idx * num_experts + expert_idx;
-            if candidate[idx] {
+        let mut heatmap_candidates: Vec<(usize, usize)> = Vec::new();
+        for &(layer_idx, expert_idx) in &hcs.soft_ranking {
+            if layer_idx >= num_layers || expert_idx >= num_experts {
                 continue;
             }
-            candidate[idx] = true;
-            filled += 1;
-            prompt_ranked += 1;
+            let idx = layer_idx * num_experts + expert_idx;
+            if hard[idx] {
+                continue;
+            }
+            heatmap_candidates.push((layer_idx, expert_idx));
         }
 
-        let mut backfilled = 0usize;
-        if filled < soft_capacity {
-            for &(layer_idx, expert_idx) in &hcs.soft_ranking {
-                if filled >= soft_capacity {
+        let mut variants = Vec::new();
+        for retain_pct in Self::RETAIN_PCTS {
+            let retain_slots = (soft_capacity.saturating_mul(retain_pct) + 99) / 100;
+            let mut candidate = candidate.clone();
+            let mut filled = 0usize;
+            let mut heatmap_retained = 0usize;
+
+            for &(layer_idx, expert_idx) in &heatmap_candidates {
+                if heatmap_retained >= retain_slots || filled >= soft_capacity {
                     break;
-                }
-                if layer_idx >= num_layers || expert_idx >= num_experts {
-                    continue;
                 }
                 let idx = layer_idx * num_experts + expert_idx;
                 if hard[idx] || candidate[idx] {
                     continue;
                 }
                 candidate[idx] = true;
+                heatmap_retained += 1;
                 filled += 1;
-                backfilled += 1;
             }
+
+            let mut prompt_ranked = 0usize;
+            for &(_, layer_idx, expert_idx) in &prompt_ranked_candidates {
+                if filled >= soft_capacity {
+                    break;
+                }
+                let idx = layer_idx * num_experts + expert_idx;
+                if hard[idx] || candidate[idx] {
+                    continue;
+                }
+                candidate[idx] = true;
+                prompt_ranked += 1;
+                filled += 1;
+            }
+
+            let mut backfilled = 0usize;
+            if filled < soft_capacity {
+                for &(layer_idx, expert_idx) in &heatmap_candidates {
+                    if filled >= soft_capacity {
+                        break;
+                    }
+                    let idx = layer_idx * num_experts + expert_idx;
+                    if hard[idx] || candidate[idx] {
+                        continue;
+                    }
+                    candidate[idx] = true;
+                    backfilled += 1;
+                    filled += 1;
+                }
+            }
+
+            log::info!(
+                "PROMPT HCS SHADOW BUILD retain_pct={} prompt_tokens={} hard_resident={} soft_capacity={} heatmap_retained={} prompt_ranked={} backfilled={} candidate_total={} count_layers={} count_experts={}",
+                retain_pct,
+                prompt_tokens,
+                hard_resident,
+                soft_capacity,
+                heatmap_retained,
+                prompt_ranked,
+                backfilled,
+                candidate.iter().filter(|&&v| v).count(),
+                count_layers,
+                count_experts_per_layer,
+            );
+
+            variants.push(PromptHcsShadowVariant {
+                retain_pct,
+                heatmap_retained,
+                prompt_ranked,
+                backfilled,
+                candidate_resident: candidate,
+                shadow_hcs: 0,
+                shadow_cold: 0,
+                extra_hits: 0,
+                lost_hits: 0,
+                layer_stats: vec![PromptHcsShadowLayerStats::default(); num_layers],
+            });
         }
 
         log::info!(
-            "PROMPT HCS SHADOW BUILD prompt_tokens={} hard_resident={} soft_capacity={} prompt_ranked={} backfilled={} candidate_total={} count_layers={} count_experts={}",
+            "PROMPT HCS SHADOW BUILD variants={} prompt_tokens={} hard_resident={} soft_capacity={} prompt_ranked_candidates={} heatmap_candidates={} count_layers={} count_experts={}",
+            variants.len(),
             prompt_tokens,
             hard_resident,
             soft_capacity,
-            prompt_ranked,
-            backfilled,
-            candidate.iter().filter(|&&v| v).count(),
+            prompt_ranked_candidates.len(),
+            heatmap_candidates.len(),
             count_layers,
             count_experts_per_layer,
         );
@@ -550,17 +611,10 @@ impl PromptHcsShadowStats {
             num_experts_per_layer: num_experts,
             soft_capacity,
             hard_resident,
-            prompt_ranked,
-            backfilled,
-            candidate_resident: candidate,
             selected_total: 0,
             actual_hcs: 0,
             actual_cold: 0,
-            shadow_hcs: 0,
-            shadow_cold: 0,
-            extra_hits: 0,
-            lost_hits: 0,
-            layer_stats: vec![PromptHcsShadowLayerStats::default(); num_layers],
+            variants,
         }
     }
 
@@ -568,12 +622,14 @@ impl PromptHcsShadowStats {
         self.selected_total = 0;
         self.actual_hcs = 0;
         self.actual_cold = 0;
-        self.shadow_hcs = 0;
-        self.shadow_cold = 0;
-        self.extra_hits = 0;
-        self.lost_hits = 0;
-        for st in &mut self.layer_stats {
-            *st = PromptHcsShadowLayerStats::default();
+        for variant in &mut self.variants {
+            variant.shadow_hcs = 0;
+            variant.shadow_cold = 0;
+            variant.extra_hits = 0;
+            variant.lost_hits = 0;
+            for st in &mut variant.layer_stats {
+                *st = PromptHcsShadowLayerStats::default();
+            }
         }
     }
 
@@ -585,7 +641,6 @@ impl PromptHcsShadowStats {
             return;
         }
         let idx = layer_idx * self.num_experts_per_layer + expert_idx;
-        let shadow_hit = self.candidate_resident.get(idx).copied().unwrap_or(false);
 
         self.selected_total += 1;
         if actual_hit {
@@ -593,29 +648,30 @@ impl PromptHcsShadowStats {
         } else {
             self.actual_cold += 1;
         }
-        if shadow_hit {
-            self.shadow_hcs += 1;
-        } else {
-            self.shadow_cold += 1;
-        }
-        if !actual_hit && shadow_hit {
-            self.extra_hits += 1;
-        } else if actual_hit && !shadow_hit {
-            self.lost_hits += 1;
-        }
 
-        if let Some(st) = self.layer_stats.get_mut(layer_idx) {
-            st.selected += 1;
-            if actual_hit {
-                st.actual_hcs += 1;
-            }
+        for variant in &mut self.variants {
+            let shadow_hit = variant.candidate_resident.get(idx).copied().unwrap_or(false);
             if shadow_hit {
-                st.shadow_hcs += 1;
+                variant.shadow_hcs += 1;
+            } else {
+                variant.shadow_cold += 1;
             }
             if !actual_hit && shadow_hit {
-                st.extra_hits += 1;
+                variant.extra_hits += 1;
             } else if actual_hit && !shadow_hit {
-                st.lost_hits += 1;
+                variant.lost_hits += 1;
+            }
+
+            if let Some(st) = variant.layer_stats.get_mut(layer_idx) {
+                st.selected += 1;
+                if shadow_hit {
+                    st.shadow_hcs += 1;
+                }
+                if !actual_hit && shadow_hit {
+                    st.extra_hits += 1;
+                } else if actual_hit && !shadow_hit {
+                    st.lost_hits += 1;
+                }
             }
         }
     }
@@ -626,74 +682,86 @@ impl PromptHcsShadowStats {
         }
         let tokens = generated_tokens.max(1) as f64;
         let actual_cold_per_tok = self.actual_cold as f64 / tokens;
-        let shadow_cold_per_tok = self.shadow_cold as f64 / tokens;
-        let extra_hits_per_tok = self.extra_hits as f64 / tokens;
-        let lost_hits_per_tok = self.lost_hits as f64 / tokens;
-        let net_hits = self.shadow_hcs as i64 - self.actual_hcs as i64;
-        let net_hits_per_tok = net_hits as f64 / tokens;
-        let cold_reduction_pct = if self.actual_cold > 0 {
-            (self.actual_cold as i64 - self.shadow_cold as i64) as f64
-                / self.actual_cold as f64
-                * 100.0
-        } else {
-            0.0
-        };
-        let mut layer_top: Vec<(usize, u64, u64, u64)> = self.layer_stats.iter()
-            .enumerate()
-            .filter_map(|(idx, st)| {
-                if st.extra_hits == 0 && st.lost_hits == 0 {
-                    None
-                } else {
-                    Some((idx, st.extra_hits, st.lost_hits, st.selected))
-                }
-            })
-            .collect();
-        layer_top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
-        let top_layers: Vec<String> = layer_top.iter().take(8)
-            .map(|(layer, extra, lost, selected)| {
-                format!("L{}:+{} -{} sel={}", layer, extra, lost, selected)
-            })
-            .collect();
 
         eprintln!("  \x1b[36m┌─────────────────────────────────────────────────┐\x1b[0m");
         eprintln!("  \x1b[36m│\x1b[0m  PROMPT HCS SHADOW (exact execution)         \x1b[36m│\x1b[0m");
         eprintln!("  \x1b[36m├─────────────────────────────────────────────────┤\x1b[0m");
         eprintln!("  \x1b[36m│\x1b[0m  Prompt: {} tokens | hard {} | soft cap {}      \x1b[36m│\x1b[0m",
             self.prompt_tokens, self.hard_resident, self.soft_capacity);
-        eprintln!("  \x1b[36m│\x1b[0m  Prompt-ranked {} | heatmap backfill {}          \x1b[36m│\x1b[0m",
-            self.prompt_ranked, self.backfilled);
-        eprintln!("  \x1b[36m│\x1b[0m  Actual cold: {:.1}/tok | shadow cold: {:.1}/tok  \x1b[36m│\x1b[0m",
-            actual_cold_per_tok, shadow_cold_per_tok);
-        eprintln!("  \x1b[36m│\x1b[0m  Extra hits: {:.1}/tok | lost hits: {:.1}/tok     \x1b[36m│\x1b[0m",
-            extra_hits_per_tok, lost_hits_per_tok);
-        eprintln!("  \x1b[36m│\x1b[0m  Net hits: {:+.1}/tok | cold change: {:+.1}%      \x1b[36m│\x1b[0m",
-            net_hits_per_tok, cold_reduction_pct);
+        eprintln!("  \x1b[36m│\x1b[0m  Actual cold: {:.1}/tok | variants {}             \x1b[36m│\x1b[0m",
+            actual_cold_per_tok, self.variants.len());
+        for variant in &self.variants {
+            let shadow_cold_per_tok = variant.shadow_cold as f64 / tokens;
+            let net_hits = variant.shadow_hcs as i64 - self.actual_hcs as i64;
+            let net_hits_per_tok = net_hits as f64 / tokens;
+            let cold_reduction_pct = if self.actual_cold > 0 {
+                (self.actual_cold as i64 - variant.shadow_cold as i64) as f64
+                    / self.actual_cold as f64
+                    * 100.0
+            } else {
+                0.0
+            };
+            eprintln!("  \x1b[36m│\x1b[0m  Keep {:>2}% heatmap: shadow {:.1}/tok net {:+.1} ({:+.1}%) \x1b[36m│\x1b[0m",
+                variant.retain_pct, shadow_cold_per_tok, net_hits_per_tok, cold_reduction_pct);
+        }
         eprintln!("  \x1b[36m└─────────────────────────────────────────────────┘\x1b[0m");
 
-        log::info!(
-            "PROMPT HCS SHADOW SUMMARY generated={} prompt_tokens={} selected={} actual_hcs={} actual_cold={} shadow_hcs={} shadow_cold={} extra_hits={} lost_hits={} actual_cold_per_tok={:.3} shadow_cold_per_tok={:.3} extra_hits_per_tok={:.3} lost_hits_per_tok={:.3} net_hits={} net_hits_per_tok={:.3} cold_reduction_pct={:.3} hard_resident={} soft_capacity={} prompt_ranked={} backfilled={} top_layers=[{}]",
-            generated_tokens,
-            self.prompt_tokens,
-            self.selected_total,
-            self.actual_hcs,
-            self.actual_cold,
-            self.shadow_hcs,
-            self.shadow_cold,
-            self.extra_hits,
-            self.lost_hits,
-            actual_cold_per_tok,
-            shadow_cold_per_tok,
-            extra_hits_per_tok,
-            lost_hits_per_tok,
-            net_hits,
-            net_hits_per_tok,
-            cold_reduction_pct,
-            self.hard_resident,
-            self.soft_capacity,
-            self.prompt_ranked,
-            self.backfilled,
-            top_layers.join("; "),
-        );
+        for variant in &self.variants {
+            let shadow_cold_per_tok = variant.shadow_cold as f64 / tokens;
+            let extra_hits_per_tok = variant.extra_hits as f64 / tokens;
+            let lost_hits_per_tok = variant.lost_hits as f64 / tokens;
+            let net_hits = variant.shadow_hcs as i64 - self.actual_hcs as i64;
+            let net_hits_per_tok = net_hits as f64 / tokens;
+            let cold_reduction_pct = if self.actual_cold > 0 {
+                (self.actual_cold as i64 - variant.shadow_cold as i64) as f64
+                    / self.actual_cold as f64
+                    * 100.0
+            } else {
+                0.0
+            };
+            let mut layer_top: Vec<(usize, u64, u64, u64)> = variant.layer_stats.iter()
+                .enumerate()
+                .filter_map(|(idx, st)| {
+                    if st.extra_hits == 0 && st.lost_hits == 0 {
+                        None
+                    } else {
+                        Some((idx, st.extra_hits, st.lost_hits, st.selected))
+                    }
+                })
+                .collect();
+            layer_top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+            let top_layers: Vec<String> = layer_top.iter().take(8)
+                .map(|(layer, extra, lost, selected)| {
+                    format!("L{}:+{} -{} sel={}", layer, extra, lost, selected)
+                })
+                .collect();
+            log::info!(
+                "PROMPT HCS SHADOW SUMMARY retain_pct={} generated={} prompt_tokens={} selected={} actual_hcs={} actual_cold={} shadow_hcs={} shadow_cold={} extra_hits={} lost_hits={} actual_cold_per_tok={:.3} shadow_cold_per_tok={:.3} extra_hits_per_tok={:.3} lost_hits_per_tok={:.3} net_hits={} net_hits_per_tok={:.3} cold_reduction_pct={:.3} hard_resident={} soft_capacity={} heatmap_retained={} prompt_ranked={} backfilled={} top_layers=[{}]",
+                variant.retain_pct,
+                generated_tokens,
+                self.prompt_tokens,
+                self.selected_total,
+                self.actual_hcs,
+                self.actual_cold,
+                variant.shadow_hcs,
+                variant.shadow_cold,
+                variant.extra_hits,
+                variant.lost_hits,
+                actual_cold_per_tok,
+                shadow_cold_per_tok,
+                extra_hits_per_tok,
+                lost_hits_per_tok,
+                net_hits,
+                net_hits_per_tok,
+                cold_reduction_pct,
+                self.hard_resident,
+                self.soft_capacity,
+                variant.heatmap_retained,
+                variant.prompt_ranked,
+                variant.backfilled,
+                top_layers.join("; "),
+            );
+        }
     }
 }
 
