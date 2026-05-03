@@ -3240,6 +3240,7 @@ pub struct PrefillEngine {
     pub pinning_active: bool,
     // Pre-scan routing data: per-layer list of predicted active expert IDs per chunk
     pub prescan_active_experts: Vec<Vec<Vec<usize>>>, // [moe_layer_idx][chunk_idx] -> Vec<expert_id>
+    pub prescan_token_count: usize,
     // Expert pointer table for zero-copy MoE (avoids contiguous fused buffer)
     // GPU-side arrays: each entry is a raw GPU pointer to that expert's weights/scales.
     // For HCS-resident experts, points directly into HCS VRAM (zero copy).
@@ -3257,6 +3258,15 @@ pub struct PrefillEngine {
     pub d_cold_staging: Option<CudaSlice<u8>>,
     pub cold_expert_bytes: usize, // bytes per cold expert slot (w1p + w1s + w2p + w2s)
     pub max_cold_experts: usize,  // max cold experts the staging buffer can hold
+    // Dense pointer-table prefetch for current-layer MoE.
+    // When active, these raw pointer-table buffers were populated before the
+    // layer attention ran, so MoE only waits for the copy-stream event.
+    pub ptr_prefetch_layer: Option<usize>,
+    pub ptr_prefetch_ptrs: [u64; 4],
+    pub ptr_prefetch_hcs_count: usize,
+    pub ptr_prefetch_pinned_count: usize,
+    pub ptr_prefetch_cold_count: usize,
+    pub ptr_prefetch_total_count: usize,
     // ScalarType for Marlin GEMM dispatch (matches weight quantization format)
     pub q_type: ScalarType,
     // BF16 copies of QK norm weights (converted from FP32 at engine creation)
@@ -3360,6 +3370,12 @@ unsafe impl Sync for PrefillEngine {}
 impl Drop for PrefillEngine {
     fn drop(&mut self) {
         unsafe {
+            for ptr in &mut self.ptr_prefetch_ptrs {
+                if *ptr != 0 {
+                    let _ = cuda_sys::lib().cuMemFree_v2(*ptr);
+                    *ptr = 0;
+                }
+            }
             if !self.shared_event.is_null() {
                 let _ = cuda_sys::lib().cuEventDestroy_v2(self.shared_event);
             }
@@ -5973,6 +5989,300 @@ impl PrefillEngine {
         }
     }
 
+    fn release_prefetched_ptr_table(&mut self) {
+        unsafe {
+            for ptr in &mut self.ptr_prefetch_ptrs {
+                if *ptr != 0 {
+                    let _ = cuda_sys::lib().cuMemFree_v2(*ptr);
+                    *ptr = 0;
+                }
+            }
+        }
+        self.ptr_prefetch_layer = None;
+        self.ptr_prefetch_hcs_count = 0;
+        self.ptr_prefetch_pinned_count = 0;
+        self.ptr_prefetch_cold_count = 0;
+        self.ptr_prefetch_total_count = 0;
+    }
+
+    fn should_prefetch_dense_ptr_table(
+        &self,
+        moe_layer_idx: usize,
+        chunk_idx: usize,
+        chunk_size: usize,
+        m: usize,
+        topk: usize,
+        n_experts: usize,
+    ) -> bool {
+        if n_experts == 0 || std::env::var("KRASIS_PREFILL_DISABLE_PTR_PREFETCH").is_ok() {
+            return false;
+        }
+        if std::env::var("KRASIS_PREFILL_PTR_PREFETCH_ALL").is_ok() {
+            return true;
+        }
+        let fallback_active = || (m.saturating_mul(topk)).min(n_experts);
+        let chunk_start = chunk_idx.saturating_mul(chunk_size);
+        let chunk_end = chunk_start.saturating_add(m);
+        let chunk_fully_prescanned = self.prescan_token_count >= chunk_end;
+        let measured_active = self
+            .prescan_active_experts
+            .get(moe_layer_idx)
+            .and_then(|chunks| chunks.get(chunk_idx))
+            .map(|active| active.len())
+            .filter(|&active| active > 0);
+        let predicted_active = if chunk_fully_prescanned {
+            measured_active.unwrap_or_else(fallback_active)
+        } else {
+            fallback_active()
+        };
+
+        // Dense prefetch stages every non-resident expert for the layer. Use it
+        // only when the routing set is already dense enough that over-copy is
+        // small; sparse chunks keep the exact current-layer pointer-table path.
+        predicted_active.saturating_mul(4) >= n_experts.saturating_mul(3)
+    }
+
+    fn prefetch_dense_pointer_table_for_layer(
+        &mut self,
+        layer_idx: usize,
+        chunk_idx: usize,
+        chunk_size: usize,
+        m: usize,
+    ) -> Result<(), String> {
+        if self.layer_weights[layer_idx].moe_gate_ptr == 0
+            || self.d_expert_w1_ptrs.is_none()
+            || self.d_cold_staging.is_none()
+            || prefill_disable_ptr_table()
+        {
+            return Ok(());
+        }
+        let Some(moe_layer_idx) = self.layer_weights[layer_idx].moe_layer_idx else {
+            return Ok(());
+        };
+        let n_experts = self.layer_weights[layer_idx].moe_num_experts;
+        let topk = self.layer_weights[layer_idx].moe_topk;
+        if !self.should_prefetch_dense_ptr_table(
+            moe_layer_idx,
+            chunk_idx,
+            chunk_size,
+            m,
+            topk,
+            n_experts,
+        ) {
+            return Ok(());
+        }
+        if self.ptr_prefetch_layer == Some(layer_idx) {
+            return Ok(());
+        }
+        if self.ptr_prefetch_layer.is_some() {
+            self.release_prefetched_ptr_table();
+        }
+
+        let Some(moe_data) = self.moe_layers.get(moe_layer_idx).and_then(|o| o.as_ref()) else {
+            return Ok(());
+        };
+        let cold_staging_base = self.d_cold_staging.as_ref().map_or(0, |s| *s.device_ptr());
+        if cold_staging_base == 0 || self.max_cold_experts < n_experts {
+            return Err(format!(
+                "dense pointer-table prefetch requires cold staging for all experts: max_cold={} n_experts={}",
+                self.max_cold_experts, n_experts
+            ));
+        }
+
+        let ptrs_bytes = n_experts * std::mem::size_of::<u64>();
+        let mut ptrs = [0u64; 4];
+        unsafe {
+            for (idx, dst) in ptrs.iter_mut().enumerate() {
+                let err = cuda_sys::lib().cuMemAlloc_v2(dst, ptrs_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    for prev in ptrs.iter_mut().take(idx) {
+                        if *prev != 0 {
+                            let _ = cuda_sys::lib().cuMemFree_v2(*prev);
+                            *prev = 0;
+                        }
+                    }
+                    return Err(format!(
+                        "dense pointer-table prefetch alloc table {} ({} bytes): {:?}",
+                        idx, ptrs_bytes, err
+                    ));
+                }
+            }
+        }
+
+        for i in 0..n_experts {
+            self.h_expert_w1_ptrs[i] = 0;
+            self.h_expert_w1s_ptrs[i] = 0;
+            self.h_expert_w2_ptrs[i] = 0;
+            self.h_expert_w2s_ptrs[i] = 0;
+        }
+
+        let mut hcs_count = 0usize;
+        let mut pinned_count = 0usize;
+        let mut cold_count = 0usize;
+        let mut cold_slot = 0usize;
+        let pool_base = self.pinning_pool_ptr;
+        let mt = self.gqa_timing_enabled.get();
+        let mt_build = if mt { Some(Instant::now()) } else { None };
+        let mut cold_h2d_ms = 0.0f64;
+
+        for eid in 0..n_experts {
+            if let Some((hw1p, hw1s, hw2p, hw2s)) = self.expert_lookup(moe_layer_idx, eid) {
+                self.h_expert_w1_ptrs[eid] = hw1p;
+                self.h_expert_w1s_ptrs[eid] = hw1s;
+                self.h_expert_w2_ptrs[eid] = hw2p;
+                self.h_expert_w2s_ptrs[eid] = hw2s;
+                hcs_count += 1;
+                continue;
+            }
+
+            let pin_offset = if self.pinning_active
+                && moe_layer_idx < self.pinned_expert_offsets.len()
+                && eid < self.pinned_expert_offsets[moe_layer_idx].len()
+            {
+                self.pinned_expert_offsets[moe_layer_idx][eid]
+            } else {
+                None
+            };
+            if let Some(pool_off) = pin_offset {
+                let src = pool_base + pool_off as u64;
+                let mut off = 0u64;
+                self.h_expert_w1_ptrs[eid] = src + off;
+                off += self.w1_packed_per_expert as u64;
+                self.h_expert_w1s_ptrs[eid] = src + off;
+                off += self.w1_scales_per_expert as u64;
+                self.h_expert_w2_ptrs[eid] = src + off;
+                off += self.w2_packed_per_expert as u64;
+                self.h_expert_w2s_ptrs[eid] = src + off;
+                pinned_count += 1;
+                continue;
+            }
+
+            if eid >= moe_data.experts.len() {
+                continue;
+            }
+            if cold_slot >= self.max_cold_experts {
+                unsafe {
+                    for ptr in &mut ptrs {
+                        if *ptr != 0 {
+                            let _ = cuda_sys::lib().cuMemFree_v2(*ptr);
+                            *ptr = 0;
+                        }
+                    }
+                }
+                return Err(format!(
+                    "dense pointer-table prefetch cold staging overflow: layer={} cold_slot={} max={}",
+                    layer_idx, cold_slot, self.max_cold_experts
+                ));
+            }
+            let e = &moe_data.experts[eid];
+            let slot_base = cold_staging_base + (cold_slot * self.cold_expert_bytes) as u64;
+            let mut off = 0u64;
+            let mt_cold = if mt { Some(Instant::now()) } else { None };
+            unsafe {
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    slot_base + off,
+                    e.w13_packed_ptr as *const _,
+                    e.w13_packed_bytes,
+                    self.copy_stream,
+                );
+            }
+            self.h_expert_w1_ptrs[eid] = slot_base + off;
+            off += self.w1_packed_per_expert as u64;
+            unsafe {
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    slot_base + off,
+                    e.w13_scales_ptr as *const _,
+                    e.w13_scales_bytes,
+                    self.copy_stream,
+                );
+            }
+            self.h_expert_w1s_ptrs[eid] = slot_base + off;
+            off += self.w1_scales_per_expert as u64;
+            unsafe {
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    slot_base + off,
+                    e.w2_packed_ptr as *const _,
+                    e.w2_packed_bytes,
+                    self.copy_stream,
+                );
+            }
+            self.h_expert_w2_ptrs[eid] = slot_base + off;
+            off += self.w2_packed_per_expert as u64;
+            unsafe {
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    slot_base + off,
+                    e.w2_scales_ptr as *const _,
+                    e.w2_scales_bytes,
+                    self.copy_stream,
+                );
+            }
+            self.h_expert_w2s_ptrs[eid] = slot_base + off;
+            if let Some(t) = mt_cold {
+                cold_h2d_ms += t.elapsed().as_secs_f64() * 1000.0;
+            }
+            cold_slot += 1;
+            cold_count += 1;
+        }
+
+        if let Some(t) = mt_build {
+            let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
+            self.t_moe_ptr_build
+                .set(self.t_moe_ptr_build.get() + (elapsed_ms - cold_h2d_ms).max(0.0));
+        }
+        if cold_h2d_ms > 0.0 {
+            self.t_moe_cold_h2d
+                .set(self.t_moe_cold_h2d.get() + cold_h2d_ms);
+        }
+
+        let mt_upload = if mt { Some(Instant::now()) } else { None };
+        unsafe {
+            cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
+            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                ptrs[0],
+                self.h_expert_w1_ptrs.as_ptr() as *const _,
+                ptrs_bytes,
+                self.stream,
+            );
+            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                ptrs[1],
+                self.h_expert_w1s_ptrs.as_ptr() as *const _,
+                ptrs_bytes,
+                self.stream,
+            );
+            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                ptrs[2],
+                self.h_expert_w2_ptrs.as_ptr() as *const _,
+                ptrs_bytes,
+                self.stream,
+            );
+            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                ptrs[3],
+                self.h_expert_w2s_ptrs.as_ptr() as *const _,
+                ptrs_bytes,
+                self.stream,
+            );
+        }
+        if let Some(t) = mt_upload {
+            self.t_moe_ptr_upload
+                .set(self.t_moe_ptr_upload.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        self.ptr_prefetch_layer = Some(layer_idx);
+        self.ptr_prefetch_ptrs = ptrs;
+        self.ptr_prefetch_hcs_count = hcs_count;
+        self.ptr_prefetch_pinned_count = pinned_count;
+        self.ptr_prefetch_cold_count = cold_count;
+        self.ptr_prefetch_total_count = n_experts;
+
+        if prefill_debug_enabled() && layer_idx == 0 {
+            eprintln!(
+                "[PTR-PREFETCH] layer0 all-expert table hcs={} pinned={} cold={} total={} chunk={}",
+                hcs_count, pinned_count, cold_count, n_experts, chunk_idx
+            );
+        }
+        Ok(())
+    }
+
     fn run_prefill_chunk_hcs_guard(
         &mut self,
         chunk_tokens: usize,
@@ -8187,6 +8497,7 @@ impl PrefillEngine {
             // Run gate pre-scan on embedded tokens (routing info used by pointer table DMA)
             match self.gate_prescan(prescan_m, chunk_size, num_chunks) {
                 Ok(prescan_counts) => {
+                    self.prescan_token_count = prescan_m;
                     let pinned_per_layer = self
                         .allocate_pinning_pool(&prescan_counts)
                         .map_err(|e| format!("pinning pool allocation: {}", e))?;
@@ -8213,6 +8524,7 @@ impl PrefillEngine {
                     }
                 }
                 Err(e) => {
+                    self.prescan_token_count = 0;
                     if stderr_debug_enabled() {
                         eprintln!("[PREFILL] Gate pre-scan failed (non-fatal): {}", e);
                     }
@@ -9101,6 +9413,10 @@ impl PrefillEngine {
                         m.saturating_sub(1),
                         h,
                     );
+                }
+
+                if self.layer_weights[layer_idx].moe_gate_ptr != 0 {
+                    self.prefetch_dense_pointer_table_for_layer(layer_idx, chunk_idx, chunk_size, m)?;
                 }
 
                 // Mixer
@@ -10096,6 +10412,7 @@ impl PrefillEngine {
             self.pinned_expert_offsets.clear();
             self.pinning_active = false;
             self.prescan_active_experts.clear();
+            self.prescan_token_count = 0;
         }
 
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -10655,6 +10972,10 @@ impl PrefillEngine {
                     m,
                     h,
                 )?;
+            }
+
+            if self.layer_weights[layer_idx].moe_gate_ptr != 0 {
+                self.prefetch_dense_pointer_table_for_layer(layer_idx, 0, m, m)?;
             }
 
             match layer_type {
@@ -21330,36 +21651,75 @@ impl PrefillEngine {
             );
         }
 
-        // GPU pointers for the pointer table buffers.
-        // IMPORTANT: Allocate fresh each layer to avoid corruption from cudarc pool
-        // overlapping with HCS raw cuMemAlloc_v2. Only 4 * 4KB = 16KB, negligible.
         let ptrs_bytes = n_experts * 8;
-        let mt_ptr_alloc = if mt { Some(Instant::now()) } else { None };
-        let (w1_ptrs_gpu, w1s_ptrs_gpu, w2_ptrs_gpu, w2s_ptrs_gpu) = unsafe {
-            let mut p1: u64 = 0;
-            let mut p2: u64 = 0;
-            let mut p3: u64 = 0;
-            let mut p4: u64 = 0;
-            cuda_sys::lib().cuMemAlloc_v2(&mut p1, ptrs_bytes);
-            cuda_sys::lib().cuMemAlloc_v2(&mut p2, ptrs_bytes);
-            cuda_sys::lib().cuMemAlloc_v2(&mut p3, ptrs_bytes);
-            cuda_sys::lib().cuMemAlloc_v2(&mut p4, ptrs_bytes);
-            (p1, p2, p3, p4)
-        };
-        if let Some(t) = mt_ptr_alloc {
-            self.t_moe_ptr_alloc
-                .set(self.t_moe_ptr_alloc.get() + t.elapsed().as_secs_f64() * 1000.0);
-        }
-
-        if use_ptr_table {
-            let mt_ptr_build = if mt { Some(Instant::now()) } else { None };
-            let mut cold_h2d_ms = 0.0f64;
-            // Build pointer tables for active experts
-            let active: Vec<usize> = h_expert_counts
+        let ptr_prefetched = use_ptr_table && self.ptr_prefetch_layer == Some(layer_idx);
+        let active: Vec<usize> = if use_ptr_table {
+            h_expert_counts
                 .iter()
                 .enumerate()
                 .filter_map(|(eid, &cnt)| if cnt > 0 { Some(eid) } else { None })
-                .collect();
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut w1_ptrs_gpu = 0u64;
+        let mut w1s_ptrs_gpu = 0u64;
+        let mut w2_ptrs_gpu = 0u64;
+        let mut w2s_ptrs_gpu = 0u64;
+
+        if ptr_prefetched {
+            w1_ptrs_gpu = self.ptr_prefetch_ptrs[0];
+            w1s_ptrs_gpu = self.ptr_prefetch_ptrs[1];
+            w2_ptrs_gpu = self.ptr_prefetch_ptrs[2];
+            w2s_ptrs_gpu = self.ptr_prefetch_ptrs[3];
+            trace_hcs_count = self.ptr_prefetch_hcs_count;
+            trace_pinned_count = self.ptr_prefetch_pinned_count;
+            trace_cold_count = self.ptr_prefetch_cold_count;
+            trace_active_count = active.len();
+            if debug_prefill && layer_idx == 0 {
+                eprintln!(
+                    "[PTR-PREFETCH] layer0 consuming prefetched table hcs={} pinned={} cold={} active={}/{}",
+                    trace_hcs_count, trace_pinned_count, trace_cold_count, trace_active_count, n_experts
+                );
+            }
+        } else if use_ptr_table {
+            // GPU pointers for the pointer table buffers.
+            // IMPORTANT: Allocate fresh each layer to avoid corruption from cudarc pool
+            // overlapping with HCS raw cuMemAlloc_v2. Only 4 * 4KB = 16KB, negligible.
+            let mt_ptr_alloc = if mt { Some(Instant::now()) } else { None };
+            unsafe {
+                cuda_sys::lib().cuMemAlloc_v2(&mut w1_ptrs_gpu, ptrs_bytes);
+                cuda_sys::lib().cuMemAlloc_v2(&mut w1s_ptrs_gpu, ptrs_bytes);
+                cuda_sys::lib().cuMemAlloc_v2(&mut w2_ptrs_gpu, ptrs_bytes);
+                cuda_sys::lib().cuMemAlloc_v2(&mut w2s_ptrs_gpu, ptrs_bytes);
+            }
+            if w1_ptrs_gpu == 0 || w1s_ptrs_gpu == 0 || w2_ptrs_gpu == 0 || w2s_ptrs_gpu == 0 {
+                unsafe {
+                    if w1_ptrs_gpu != 0 {
+                        let _ = cuda_sys::lib().cuMemFree_v2(w1_ptrs_gpu);
+                    }
+                    if w1s_ptrs_gpu != 0 {
+                        let _ = cuda_sys::lib().cuMemFree_v2(w1s_ptrs_gpu);
+                    }
+                    if w2_ptrs_gpu != 0 {
+                        let _ = cuda_sys::lib().cuMemFree_v2(w2_ptrs_gpu);
+                    }
+                    if w2s_ptrs_gpu != 0 {
+                        let _ = cuda_sys::lib().cuMemFree_v2(w2s_ptrs_gpu);
+                    }
+                }
+                return Err(format!(
+                    "prefill pointer table allocation failed for layer {} ({} bytes/table)",
+                    layer_idx, ptrs_bytes
+                ));
+            }
+            if let Some(t) = mt_ptr_alloc {
+                self.t_moe_ptr_alloc
+                    .set(self.t_moe_ptr_alloc.get() + t.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            let mt_ptr_build = if mt { Some(Instant::now()) } else { None };
+            let mut cold_h2d_ms = 0.0f64;
 
             let mi = moe_layer_idx.unwrap_or(0);
             let mut hcs_count = 0usize;
@@ -21652,10 +22012,11 @@ impl PrefillEngine {
             Some(layer_idx),
             "moe_prefill",
             &format!(
-                "phase=route_ready active_experts={} total_sorted={} use_ptr_table={} hcs_hits={} pinned_hits={} cold_experts={} max_cold_experts={} has_shared={} preloaded_layer={:?}",
+                "phase=route_ready active_experts={} total_sorted={} use_ptr_table={} ptr_prefetched={} hcs_hits={} pinned_hits={} cold_experts={} max_cold_experts={} has_shared={} preloaded_layer={:?}",
                 trace_active_count,
                 total_sorted,
                 use_ptr_table,
+                ptr_prefetched,
                 trace_hcs_count,
                 trace_pinned_count,
                 trace_cold_count,
@@ -21700,10 +22061,11 @@ impl PrefillEngine {
             Some(layer_idx),
             "moe_prefill",
             &format!(
-                "phase=dma_ready active_experts={} total_sorted={} use_ptr_table={} hcs_hits={} pinned_hits={} cold_experts={}",
+                "phase=dma_ready active_experts={} total_sorted={} use_ptr_table={} ptr_prefetched={} hcs_hits={} pinned_hits={} cold_experts={}",
                 trace_active_count,
                 total_sorted,
                 use_ptr_table,
+                ptr_prefetched,
                 trace_hcs_count,
                 trace_pinned_count,
                 trace_cold_count,
@@ -25508,8 +25870,11 @@ impl PrefillEngine {
         // Single-chunk prompts have no cross-chunk reuse, so pinning wastes VRAM and fragments
         // the allocator. The fused_pin_queue data is available when rolling-scan is implemented.
 
-        // Free per-layer pointer table GPU buffers (allocated with raw cuMemAlloc_v2)
-        if use_ptr_table {
+        // Free per-layer pointer table GPU buffers (allocated with raw cuMemAlloc_v2),
+        // or release the prefetched table consumed by this layer.
+        if ptr_prefetched {
+            self.release_prefetched_ptr_table();
+        } else if use_ptr_table {
             unsafe {
                 cuda_sys::lib().cuMemFree_v2(w1_ptrs_gpu);
                 cuda_sys::lib().cuMemFree_v2(w1s_ptrs_gpu);

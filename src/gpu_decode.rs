@@ -3925,6 +3925,7 @@ struct GpuDecodeGraph {
     t_graph_cold_dma: f64,    // cold expert DMA + copy_stream sync
     t_graph_upload: f64,      // batch pointer upload H2D
     t_graph_launch: f64,      // cuGraphLaunch calls (just the CPU-side launch cost)
+    t_graph_final_sync_wait: f64, // final cuStreamSynchronize after the last graph segment
     graph_internal_timing: bool,
     graph_timing_events: Option<DecodeGraphTimingEvents>,
     t_graph_segment_total: f64,   // captured graph event elapsed time
@@ -3934,6 +3935,7 @@ struct GpuDecodeGraph {
     graph_segment_labels: Vec<String>,
     graph_segment_kinds: Vec<u8>,
     graph_segment_elapsed: Vec<f64>,
+    graph_segment_sync_wait: Vec<f64>,
     // DMA instrumentation (accumulated across all layers per token, then across tokens)
     dma_bytes_total: u64,    // total bytes DMA'd (cold experts only)
     dma_call_count: u64,     // number of cuMemcpyHtoDAsync calls
@@ -4202,6 +4204,7 @@ const GRAPH_SEG_ROUTE_MLA: u8 = 3;
 const GRAPH_SEG_ROUTE_MAMBA: u8 = 4;
 const GRAPH_SEG_ROUTE_OTHER: u8 = 5;
 const GRAPH_SEG_FINAL: u8 = 6;
+const GRAPH_SEG_KIND_COUNT: usize = 7;
 
 fn decode_graph_route_kind(graph: &GpuDecodeGraph, layer_idx: usize) -> (&'static str, u8) {
     match graph.layers.get(layer_idx).map(|layer| &layer.attn) {
@@ -7571,6 +7574,7 @@ impl GpuDecodeStore {
             t_graph_cold_dma: 0.0,
             t_graph_upload: 0.0,
             t_graph_launch: 0.0,
+            t_graph_final_sync_wait: 0.0,
             graph_internal_timing: false,
             graph_timing_events: None,
             t_graph_segment_total: 0.0,
@@ -7580,6 +7584,7 @@ impl GpuDecodeStore {
             graph_segment_labels: Vec::new(),
             graph_segment_kinds: Vec::new(),
             graph_segment_elapsed: Vec::new(),
+            graph_segment_sync_wait: Vec::new(),
             dma_bytes_total: 0,
             dma_call_count: 0,
             dma_cold_experts: 0,
@@ -9182,12 +9187,16 @@ impl GpuDecodeStore {
                 graph.t_graph_cold_dma = 0.0;
                 graph.t_graph_upload = 0.0;
                 graph.t_graph_launch = 0.0;
+                graph.t_graph_final_sync_wait = 0.0;
                 graph.t_graph_segment_total = 0.0;
                 graph.t_graph_segment_expert = 0.0;
                 graph.t_graph_segment_routing = 0.0;
                 graph.t_graph_segment_final = 0.0;
                 for elapsed in &mut graph.graph_segment_elapsed {
                     *elapsed = 0.0;
+                }
+                for wait in &mut graph.graph_segment_sync_wait {
+                    *wait = 0.0;
                 }
                 graph.dma_bytes_total = 0;
                 graph.dma_call_count = 0;
@@ -15071,6 +15080,7 @@ impl GpuDecodeStore {
             pinning_pool_expert_bytes: 0,
             pinning_active: false,
             prescan_active_experts: Vec::new(),
+            prescan_token_count: 0,
             // Expert pointer table for zero-copy MoE
             d_expert_w1_ptrs: if can_fused {
                 Some(self.device.alloc_zeros::<u64>(n_routed.max(1))
@@ -15095,6 +15105,12 @@ impl GpuDecodeStore {
             d_cold_staging: None,  // allocated dynamically in prepare_for_prefill
             cold_expert_bytes: cold_per_expert,
             max_cold_experts: actual_max_cold,
+            ptr_prefetch_layer: None,
+            ptr_prefetch_ptrs: [0, 0, 0, 0],
+            ptr_prefetch_hcs_count: 0,
+            ptr_prefetch_pinned_count: 0,
+            ptr_prefetch_cold_count: 0,
+            ptr_prefetch_total_count: 0,
             q_type,
             qk_norm_bf16_bufs,
             hqq_bf16_weight_bufs: Vec::new(),
@@ -16264,9 +16280,11 @@ impl GpuDecodeStore {
             graph.graph_segment_labels.clear();
             graph.graph_segment_kinds.clear();
             graph.graph_segment_elapsed.clear();
+            graph.graph_segment_sync_wait.clear();
             graph.graph_segment_labels.reserve(num_graphs);
             graph.graph_segment_kinds.reserve(num_graphs);
             graph.graph_segment_elapsed.resize(num_graphs, 0.0);
+            graph.graph_segment_sync_wait.resize(num_graphs, 0.0);
             for graph_idx in 0..num_graphs {
                 let (kind, label) = decode_graph_segment_timing_label(&graph, graph_idx, &moe_indices);
                 graph.graph_segment_kinds.push(kind);
@@ -16276,6 +16294,7 @@ impl GpuDecodeStore {
             graph.graph_segment_labels.clear();
             graph.graph_segment_kinds.clear();
             graph.graph_segment_elapsed.clear();
+            graph.graph_segment_sync_wait.clear();
         }
 
         trace_emit_global_mark(
@@ -18530,6 +18549,8 @@ impl GpuDecodeStore {
             }
         }
 
+        let timing = graph.timing_enabled;
+
         if mapped_reads {
             // ═══ MAPPED READS FAST PATH ═══
             // All experts (hot + cold) have valid pointers in d_expert_ptrs.
@@ -18550,12 +18571,20 @@ impl GpuDecodeStore {
                 }
             }
 
-            // Single final sync — all 49 graphs execute sequentially on the stream
+            // Single final sync — all graphs execute sequentially on the stream.
+            // Mapped reads do not synchronize between graph segments, so this
+            // wait cannot be assigned to one prior segment without using CUDA
+            // event proportions; keep it as final-sync wait and rely on the
+            // event breakdown for segment attribution.
+            let t_final_sync_start = if timing { Some(std::time::Instant::now()) } else { None };
             unsafe {
                 let err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
                 if err != cuda_sys::CUresult::CUDA_SUCCESS {
                     return Err(format!("mapped reads final sync: {:?}", err));
                 }
+            }
+            if let Some(t) = t_final_sync_start {
+                graph.t_graph_final_sync_wait += t.elapsed().as_secs_f64();
             }
             if graph.graph_internal_timing {
                 if let Some(events) = graph.graph_timing_events.as_ref() {
@@ -18602,8 +18631,6 @@ impl GpuDecodeStore {
         }
 
         // ═══ LEGACY PATH (non-mapped reads) ═══
-        let timing = graph.timing_enabled;
-
         for graph_idx in 0..num_graphs {
             let mut wait_for_cold_dma = false;
             // ── If not first graph: populate d_batch_upload with expert pointers ──
@@ -18767,7 +18794,11 @@ impl GpuDecodeStore {
                     }
 
                     if let Some(t) = t_sync_start {
-                        graph.t_graph_sync_wait += t.elapsed().as_secs_f64();
+                        let elapsed = t.elapsed().as_secs_f64();
+                        graph.t_graph_sync_wait += elapsed;
+                        if let Some(slot) = graph.graph_segment_sync_wait.get_mut(graph_idx - 1) {
+                            *slot += elapsed;
+                        }
                     }
                     let t_classify_start = if timing { Some(std::time::Instant::now()) } else { None };
 
@@ -19027,11 +19058,22 @@ impl GpuDecodeStore {
             }
         }
 
-        // Final sync
+        // Final sync. In the non-mapped graph replay path, all earlier graph
+        // segments have already been synchronized before their following
+        // route/classify step. This sync therefore waits for the final graph
+        // segment and can be attributed to that segment for timing reports.
+        let t_final_sync_start = if timing { Some(std::time::Instant::now()) } else { None };
         unsafe {
             let err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
             if err != cuda_sys::CUresult::CUDA_SUCCESS {
                 return Err(format!("final sync: {:?}", err));
+            }
+        }
+        if let Some(t) = t_final_sync_start {
+            let elapsed = t.elapsed().as_secs_f64();
+            graph.t_graph_final_sync_wait += elapsed;
+            if let Some(slot) = graph.graph_segment_sync_wait.get_mut(num_graphs.saturating_sub(1)) {
+                *slot += elapsed;
             }
         }
         if graph.graph_internal_timing {
@@ -25574,11 +25616,14 @@ impl GpuDecodeStore {
                 g.t_dma_expert_wait = 0.0; g.t_dma_expert_compute = 0.0;
                 g.t_graph_sync_wait = 0.0; g.t_graph_classify = 0.0;
                 g.t_graph_cold_dma = 0.0; g.t_graph_upload = 0.0;
-                g.t_graph_launch = 0.0;
+                g.t_graph_launch = 0.0; g.t_graph_final_sync_wait = 0.0;
                 g.t_graph_segment_total = 0.0; g.t_graph_segment_expert = 0.0;
                 g.t_graph_segment_routing = 0.0; g.t_graph_segment_final = 0.0;
                 for elapsed in &mut g.graph_segment_elapsed {
                     *elapsed = 0.0;
+                }
+                for wait in &mut g.graph_segment_sync_wait {
+                    *wait = 0.0;
                 }
             }
         }
@@ -26392,7 +26437,9 @@ impl GpuDecodeStore {
                 eprintln!("  \x1b[36m├─────────────────────────────────────────────────┤\x1b[0m");
                 eprintln!("  \x1b[36m│\x1b[0m  Total:       {:7.2} ms/tok  ({:5.1} tok/s)    \x1b[36m│\x1b[0m", avg_total, 1000.0 / avg_total);
                 if graph_mode {
-                    let avg_sync = graph.t_graph_sync_wait / n * 1000.0;
+                    let avg_sync_inter = graph.t_graph_sync_wait / n * 1000.0;
+                    let avg_sync_final = graph.t_graph_final_sync_wait / n * 1000.0;
+                    let avg_sync = avg_sync_inter + avg_sync_final;
                     let avg_classify = graph.t_graph_classify / n * 1000.0;
                     let avg_cold_dma = graph.t_graph_cold_dma / n * 1000.0;
                     let avg_upload = graph.t_graph_upload / n * 1000.0;
@@ -26403,6 +26450,7 @@ impl GpuDecodeStore {
                     eprintln!("  \x1b[36m│\x1b[0m  Graph inter-layer breakdown:                  \x1b[36m│\x1b[0m");
                     eprintln!("  \x1b[36m│\x1b[0m    GPU compute: {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_gpu_compute, avg_gpu_compute / avg_total * 100.0);
                     eprintln!("  \x1b[36m│\x1b[0m    Sync wait:   {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_sync, avg_sync / avg_total * 100.0);
+                    eprintln!("  \x1b[36m│\x1b[0m      inter:     {:6.2} ms  final:{:6.2} ms     \x1b[36m│\x1b[0m", avg_sync_inter, avg_sync_final);
                     eprintln!("  \x1b[36m│\x1b[0m    Classify:    {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_classify, avg_classify / avg_total * 100.0);
                     eprintln!("  \x1b[36m│\x1b[0m    Cold DMA:    {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_cold_dma, avg_cold_dma / avg_total * 100.0);
                     eprintln!("  \x1b[36m│\x1b[0m    Upload:      {:6.2} ms  ({:4.1}%)            \x1b[36m│\x1b[0m", avg_upload, avg_upload / avg_total * 100.0);
@@ -26451,6 +26499,76 @@ impl GpuDecodeStore {
                             print_kind("Mamba2:", GRAPH_SEG_ROUTE_MAMBA);
                             print_kind("Other:", GRAPH_SEG_ROUTE_OTHER);
                             print_kind("Final:", GRAPH_SEG_FINAL);
+
+                            if !graph.graph_segment_sync_wait.is_empty() {
+                                let mut wait_kind_sum = [0.0f64; GRAPH_SEG_KIND_COUNT];
+                                let mut wait_kind_count = [0usize; GRAPH_SEG_KIND_COUNT];
+                                for (idx, &seconds) in graph.graph_segment_sync_wait.iter().enumerate() {
+                                    let kind = graph.graph_segment_kinds.get(idx).copied()
+                                        .unwrap_or(GRAPH_SEG_ROUTE_OTHER) as usize;
+                                    if kind < wait_kind_sum.len() {
+                                        wait_kind_sum[kind] += seconds;
+                                        wait_kind_count[kind] += 1;
+                                    }
+                                }
+                                let print_wait_kind = |name: &str, kind: u8| {
+                                    let k = kind as usize;
+                                    if wait_kind_count[k] > 0 {
+                                        let total_ms_tok = wait_kind_sum[k] / n * 1000.0;
+                                        let avg_ms_seg = total_ms_tok / wait_kind_count[k] as f64;
+                                        eprintln!(
+                                            "  \x1b[36m│\x1b[0m    {:<11}{:6.2} ms/tok ({:4.2} ms/seg) \x1b[36m│\x1b[0m",
+                                            name, total_ms_tok, avg_ms_seg,
+                                        );
+                                    }
+                                };
+                                eprintln!("  \x1b[36m│\x1b[0m  Sync wait attributed to segment:           \x1b[36m│\x1b[0m");
+                                print_wait_kind("First:", GRAPH_SEG_FIRST_ROUTE);
+                                print_wait_kind("LA route:", GRAPH_SEG_ROUTE_LA);
+                                print_wait_kind("GQA route:", GRAPH_SEG_ROUTE_GQA);
+                                print_wait_kind("MLA route:", GRAPH_SEG_ROUTE_MLA);
+                                print_wait_kind("Mamba2:", GRAPH_SEG_ROUTE_MAMBA);
+                                print_wait_kind("Other:", GRAPH_SEG_ROUTE_OTHER);
+                                print_wait_kind("Final:", GRAPH_SEG_FINAL);
+
+                                let mut sync_per_graph: Vec<(usize, f64)> = graph.graph_segment_sync_wait
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, &seconds)| (idx, seconds / n * 1000.0))
+                                    .collect();
+                                sync_per_graph.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                                let top_waits: Vec<String> = sync_per_graph
+                                    .iter()
+                                    .take(6)
+                                    .map(|(idx, avg_ms)| {
+                                        let label = graph.graph_segment_labels.get(*idx)
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("unlabelled");
+                                        format!("#{}={:.3}ms:{}", idx, avg_ms, label)
+                                    })
+                                    .collect();
+                                log::info!(
+                                    "DECODE GRAPH SYNC WAIT avg_ms_per_tok first={:.3} la_route={:.3} gqa_route={:.3} mla_route={:.3} mamba2_route={:.3} other={:.3} final={:.3} top=[{}]",
+                                    wait_kind_sum[GRAPH_SEG_FIRST_ROUTE as usize] / n * 1000.0,
+                                    wait_kind_sum[GRAPH_SEG_ROUTE_LA as usize] / n * 1000.0,
+                                    wait_kind_sum[GRAPH_SEG_ROUTE_GQA as usize] / n * 1000.0,
+                                    wait_kind_sum[GRAPH_SEG_ROUTE_MLA as usize] / n * 1000.0,
+                                    wait_kind_sum[GRAPH_SEG_ROUTE_MAMBA as usize] / n * 1000.0,
+                                    wait_kind_sum[GRAPH_SEG_ROUTE_OTHER as usize] / n * 1000.0,
+                                    wait_kind_sum[GRAPH_SEG_FINAL as usize] / n * 1000.0,
+                                    top_waits.join("; "),
+                                );
+                                eprintln!("  \x1b[36m│\x1b[0m  Slowest sync-wait segments:                \x1b[36m│\x1b[0m");
+                                for (idx, avg_ms) in sync_per_graph.into_iter().take(6) {
+                                    let label = graph.graph_segment_labels.get(idx)
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("unlabelled");
+                                    eprintln!(
+                                        "  \x1b[36m│\x1b[0m    #{:<2} {:6.2} ms  {:<38.38}\x1b[36m│\x1b[0m",
+                                        idx, avg_ms, label,
+                                    );
+                                }
+                            }
 
                             let mut per_graph: Vec<(usize, f64)> = graph.graph_segment_elapsed
                                 .iter()

@@ -1,5 +1,37 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks - 2026-05-03 (Phase 2GH pointer-table prefill prefetch)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-122B-A10B
+`tests/q122b-k4v4-hqq6-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ6
+attention, `k4v4` KV cache, INT8 shared/dense/lm-head, layer group size 2,
+graph replay enabled, timing instrumentation off.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Q122B materialized HQQ prefill + dense pointer-table prefetch | HQQ6 | k4v4 | 4689.8 | 24.80 | 42.45 | 3780/12288 (30.8%) | 662 MB | [log](20260503_phase2gh_q122b_k4v4_hqq6_ptrprefetch_benchmark.log) |
+
+Notes:
+- This run used `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1`.
+- Dense pointer-table prefetch stages all non-HCS/non-pinned experts for dense
+  MoE chunks before layer attention, then MoE consumes the prefetched pointer
+  table. Sparse chunks keep the exact current-layer pointer-table path.
+- No second cold staging buffer and no persistent expert/BF16 residency were
+  added; the path reuses the existing cold staging allocation and frees raw
+  pointer-table buffers after each layer.
+- Q122B HQQ6+k4v4 seq32 witness passed before speed testing:
+  first token `14/14`, prefill `14/14`, exact `270/361`, containment
+  `292/361`.
+- Timing-enabled diagnostics confirmed all dense 35K/50K chunks used
+  `[PTR-PREFETCH]`, while sparse short heatmap/decode prompts used exact
+  `[PTR-TABLE]`.
+- Compared with Phase 2GE materialized HQQ prefill, prefill improved
+  `3003.9 -> 4689.8 tok/s`; internal decode and HCS stayed effectively flat.
+
+---
+
 ## Standard Benchmarks - 2026-05-03 (Phase 2GE materialized HQQ prefill)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
