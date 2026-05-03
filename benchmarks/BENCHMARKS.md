@@ -1,5 +1,36 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks - 2026-05-03 (Phase 2GP 35B control and QCN retain sweep)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the runs.
+
+Prompt-conditioned HCS reload was enabled. Timing instrumentation was disabled
+for all speed rows below.
+
+35B was run once to confirm the prompt-HCS default basically does not affect a
+full-HCS model. QCN was run with explicit retain percentages using the standard
+fixed `./dev speed-test` surface.
+
+| Model / run | Config / command | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|-------------|------------------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Qwen3.5-35B-A3B prompt-HCS default | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 ./dev benchmark tests/q35b-4-4-hqq6-benchmark.conf` | HQQ6 | fp8 | 12127.0 | 113.70 | 230.83 | 10240/10240 (100.0%) | 8990 MB | [log](20260503_phase2gp_q35b_hqq6_prompt_hcs_default_benchmark.log) |
+| Qwen3-Coder-Next retain 75% | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_PROMPT_HCS_RETAIN_PCT=75 ./dev speed-test` | HQQ8 | k4v4 | 7875.8 | 87.81 | 143.15 | 15147/24576 (61.6%) | 706 MB | [log](20260503_phase2gp_qcn_hqq8_k4v4_retain75_speedtest.log) |
+| Qwen3-Coder-Next retain 80% | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_PROMPT_HCS_RETAIN_PCT=80 ./dev speed-test` | HQQ8 | k4v4 | 7910.7 | 88.07 | 142.08 | 15147/24576 (61.6%) | 706 MB | [log](20260503_phase2gp_qcn_hqq8_k4v4_retain80_speedtest.log) |
+| Qwen3-Coder-Next retain 85% | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_PROMPT_HCS_RETAIN_PCT=85 ./dev speed-test` | HQQ8 | k4v4 | 8178.1 | 87.50 | 153.63 | 15147/24576 (61.6%) | 706 MB | [log](20260503_phase2gp_qcn_hqq8_k4v4_retain85_speedtest.log) |
+| Qwen3-Coder-Next retain 90% | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_PROMPT_HCS_RETAIN_PCT=90 ./dev speed-test` | HQQ8 | k4v4 | 7993.1 | 90.78 | 136.69 | 15147/24576 (61.6%) | 706 MB | [log](20260503_phase2gp_qcn_hqq8_k4v4_retain90_speedtest.log) |
+
+Notes:
+- Qwen3.5-35B decode was effectively unchanged versus the Phase 2GI row
+  (`113.32 -> 113.70 tok/s`), as expected with full HCS coverage.
+- All QCN retain settings remained above the Phase 2GI pre-prompt-HCS decode
+  baseline (`81.02 tok/s`).
+- In this pass, `90%` was the best QCN internal decode row at
+  `90.78 tok/s`. The earlier Phase 2GO 85% QCN run reported `89.37 tok/s`,
+  so a default change from `85%` to `90%` should use another paired A/B if we
+  want to separate policy from normal run variance.
+
+---
+
 ## Standard Benchmarks - 2026-05-03 (Phase 2GO prompt-conditioned HCS reload default)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the runs.
