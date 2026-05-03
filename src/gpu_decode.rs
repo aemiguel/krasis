@@ -22,6 +22,391 @@ use cudarc::cublas::result as cublas_result;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig};
 use cudarc::driver::sys as cuda_sys;
 
+const GPU_ROUTE_SYNC_DEFAULT_TIMEOUT_MS: u64 = 10_000;
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ))
+        .unwrap_or(false)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn bind_hcs_route_pointer_device(
+    device: &Arc<CudaDevice>,
+    reason: &str,
+) -> bool {
+    if let Err(e) = device.bind_to_thread() {
+        log::error!(
+            "GPU route sync: failed to bind CUDA device before HCS pointer-table update ({}): {:?}",
+            reason,
+            e,
+        );
+        false
+    } else {
+        true
+    }
+}
+
+#[derive(Clone, Default)]
+struct RouteSwapShadowLayerStats {
+    low_cold: u64,
+    matched: u64,
+    matched_weight_sum: f64,
+}
+
+#[derive(Clone)]
+struct RouteSwapShadowStats {
+    enabled: bool,
+    protect_rank_pct: f64,
+    abs_tol: f32,
+    rel_tol: f32,
+    route_events: u64,
+    selected_total: u64,
+    cold_selected: u64,
+    hcs_selected: u64,
+    protected_selected: u64,
+    protected_cold: u64,
+    low_rank_selected: u64,
+    low_rank_cold: u64,
+    matched_cold: u64,
+    unmatched_no_resident: u64,
+    unmatched_not_similar: u64,
+    selected_weight_sum: f64,
+    cold_weight_sum: f64,
+    low_cold_weight_sum: f64,
+    matched_weight_sum: f64,
+    matched_delta_sum: f64,
+    matched_rel_delta_sum: f64,
+    matched_delta_max: f32,
+    matched_rel_delta_max: f32,
+    layer_stats: Vec<RouteSwapShadowLayerStats>,
+}
+
+impl RouteSwapShadowStats {
+    fn from_env() -> Self {
+        let enabled = env_truthy("KRASIS_ROUTE_SWAP_SHADOW");
+        let protect_rank_pct = env_f64("KRASIS_ROUTE_SWAP_PROTECT_RANK_PCT", 75.0)
+            .clamp(0.0, 100.0);
+        let abs_tol = env_f64("KRASIS_ROUTE_SWAP_ABS_TOL", 0.005)
+            .max(0.0) as f32;
+        let rel_tol = (env_f64("KRASIS_ROUTE_SWAP_REL_TOL_PCT", 10.0)
+            .max(0.0) / 100.0) as f32;
+        let s = Self {
+            enabled,
+            protect_rank_pct,
+            abs_tol,
+            rel_tol,
+            route_events: 0,
+            selected_total: 0,
+            cold_selected: 0,
+            hcs_selected: 0,
+            protected_selected: 0,
+            protected_cold: 0,
+            low_rank_selected: 0,
+            low_rank_cold: 0,
+            matched_cold: 0,
+            unmatched_no_resident: 0,
+            unmatched_not_similar: 0,
+            selected_weight_sum: 0.0,
+            cold_weight_sum: 0.0,
+            low_cold_weight_sum: 0.0,
+            matched_weight_sum: 0.0,
+            matched_delta_sum: 0.0,
+            matched_rel_delta_sum: 0.0,
+            matched_delta_max: 0.0,
+            matched_rel_delta_max: 0.0,
+            layer_stats: Vec::new(),
+        };
+        if enabled {
+            log::info!(
+                "ROUTE SWAP SHADOW enabled: protect_rank_pct={:.1} abs_tol={:.6} rel_tol_pct={:.2}",
+                s.protect_rank_pct,
+                s.abs_tol,
+                s.rel_tol * 100.0,
+            );
+        }
+        s
+    }
+
+    fn reset_counts(&mut self) {
+        self.route_events = 0;
+        self.selected_total = 0;
+        self.cold_selected = 0;
+        self.hcs_selected = 0;
+        self.protected_selected = 0;
+        self.protected_cold = 0;
+        self.low_rank_selected = 0;
+        self.low_rank_cold = 0;
+        self.matched_cold = 0;
+        self.unmatched_no_resident = 0;
+        self.unmatched_not_similar = 0;
+        self.selected_weight_sum = 0.0;
+        self.cold_weight_sum = 0.0;
+        self.low_cold_weight_sum = 0.0;
+        self.matched_weight_sum = 0.0;
+        self.matched_delta_sum = 0.0;
+        self.matched_rel_delta_sum = 0.0;
+        self.matched_delta_max = 0.0;
+        self.matched_rel_delta_max = 0.0;
+        self.layer_stats.clear();
+    }
+
+    fn record(
+        &mut self,
+        layer_idx: usize,
+        num_experts: usize,
+        topk: usize,
+        topk_ids: &[i32],
+        topk_weights: &[f32],
+        scores: &[f32],
+        hcs: Option<&HcsState>,
+    ) {
+        if !self.enabled || topk == 0 || num_experts == 0 || scores.len() < num_experts {
+            return;
+        }
+        let Some(hcs) = hcs else { return; };
+        if self.layer_stats.len() <= layer_idx {
+            self.layer_stats.resize_with(layer_idx + 1, RouteSwapShadowLayerStats::default);
+        }
+
+        self.route_events += 1;
+        let protected_count = ((topk as f64) * self.protect_rank_pct / 100.0)
+            .ceil()
+            .max(0.0) as usize;
+        let protected_count = protected_count.min(topk);
+
+        let mut selected = vec![false; num_experts];
+        let mut used_replacement = vec![false; num_experts];
+        for &raw in topk_ids.iter().take(topk) {
+            if raw >= 0 {
+                let eid = raw as usize;
+                if eid < num_experts {
+                    selected[eid] = true;
+                    used_replacement[eid] = true;
+                }
+            }
+        }
+
+        for i in 0..topk {
+            let raw_eid = *topk_ids.get(i).unwrap_or(&-1);
+            if raw_eid < 0 {
+                continue;
+            }
+            let eid = raw_eid as usize;
+            if eid >= num_experts {
+                continue;
+            }
+            let weight = *topk_weights.get(i).unwrap_or(&0.0);
+            self.selected_total += 1;
+            self.selected_weight_sum += weight as f64;
+
+            let resident = hcs.get_fast(layer_idx, eid).is_some();
+            if resident {
+                self.hcs_selected += 1;
+            } else {
+                self.cold_selected += 1;
+                self.cold_weight_sum += weight as f64;
+            }
+
+            if i < protected_count {
+                self.protected_selected += 1;
+                if !resident {
+                    self.protected_cold += 1;
+                }
+                continue;
+            }
+
+            self.low_rank_selected += 1;
+            if resident {
+                continue;
+            }
+
+            self.low_rank_cold += 1;
+            self.low_cold_weight_sum += weight as f64;
+            self.layer_stats[layer_idx].low_cold += 1;
+
+            let target_score = scores[eid];
+            if !target_score.is_finite() {
+                self.unmatched_not_similar += 1;
+                continue;
+            }
+            let threshold = self.abs_tol.max(target_score.abs() * self.rel_tol);
+            let mut best: Option<(usize, f32, f32)> = None;
+            let mut resident_candidates = 0usize;
+            for cand in 0..num_experts {
+                if selected[cand] || used_replacement[cand] {
+                    continue;
+                }
+                if hcs.get_fast(layer_idx, cand).is_none() {
+                    continue;
+                }
+                resident_candidates += 1;
+                let cand_score = scores[cand];
+                if !cand_score.is_finite() {
+                    continue;
+                }
+                let delta = (cand_score - target_score).abs();
+                if delta <= threshold {
+                    let rel = delta / target_score.abs().max(1.0e-9);
+                    match best {
+                        Some((_, best_delta, _)) if delta >= best_delta => {}
+                        _ => best = Some((cand, delta, rel)),
+                    }
+                }
+            }
+
+            if let Some((cand, delta, rel)) = best {
+                used_replacement[cand] = true;
+                self.matched_cold += 1;
+                self.matched_weight_sum += weight as f64;
+                self.matched_delta_sum += delta as f64;
+                self.matched_rel_delta_sum += rel as f64;
+                self.matched_delta_max = self.matched_delta_max.max(delta);
+                self.matched_rel_delta_max = self.matched_rel_delta_max.max(rel);
+                self.layer_stats[layer_idx].matched += 1;
+                self.layer_stats[layer_idx].matched_weight_sum += weight as f64;
+            } else if resident_candidates == 0 {
+                self.unmatched_no_resident += 1;
+            } else {
+                self.unmatched_not_similar += 1;
+            }
+        }
+    }
+
+    fn emit_summary(&self, generated_tokens: usize, exact_cold_experts: u64) {
+        if !self.enabled || self.route_events == 0 {
+            return;
+        }
+        let tokens = generated_tokens.max(1) as f64;
+        let low_cold = self.low_rank_cold.max(1) as f64;
+        let matched = self.matched_cold as f64;
+        let matched_pct_low_cold = matched / low_cold * 100.0;
+        let exact_cold_per_tok = exact_cold_experts as f64 / tokens;
+        let avoided_per_tok = self.matched_cold as f64 / tokens;
+        let avoided_pct_exact_cold = if exact_cold_experts > 0 {
+            self.matched_cold as f64 / exact_cold_experts as f64 * 100.0
+        } else {
+            0.0
+        };
+        let avg_delta = if self.matched_cold > 0 {
+            self.matched_delta_sum / self.matched_cold as f64
+        } else {
+            0.0
+        };
+        let avg_rel_delta = if self.matched_cold > 0 {
+            self.matched_rel_delta_sum / self.matched_cold as f64 * 100.0
+        } else {
+            0.0
+        };
+        let mut layer_top: Vec<(usize, u64, u64, f64)> = self.layer_stats.iter()
+            .enumerate()
+            .filter_map(|(idx, st)| {
+                if st.low_cold == 0 && st.matched == 0 {
+                    None
+                } else {
+                    Some((idx, st.low_cold, st.matched, st.matched_weight_sum))
+                }
+            })
+            .collect();
+        layer_top.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
+        let top_layers: Vec<String> = layer_top.iter().take(8)
+            .map(|(layer, low, matched, weight)| {
+                format!("L{}:{}/{} w={:.4}", layer, matched, low, weight)
+            })
+            .collect();
+
+        eprintln!("  \x1b[35m┌─────────────────────────────────────────────────┐\x1b[0m");
+        eprintln!("  \x1b[35m│\x1b[0m  ROUTE SWAP SHADOW (exact execution)          \x1b[35m│\x1b[0m");
+        eprintln!("  \x1b[35m├─────────────────────────────────────────────────┤\x1b[0m");
+        eprintln!("  \x1b[35m│\x1b[0m  Policy: protect top {:4.1}% ranks, tol=max({:.4},{:.1}%) \x1b[35m│\x1b[0m",
+            self.protect_rank_pct, self.abs_tol, self.rel_tol * 100.0);
+        eprintln!("  \x1b[35m│\x1b[0m  Routes: {} | selected: {} | cold: {}        \x1b[35m│\x1b[0m",
+            self.route_events, self.selected_total, self.cold_selected);
+        eprintln!("  \x1b[35m│\x1b[0m  Low-rank cold: {} | matched: {} ({:.1}%)       \x1b[35m│\x1b[0m",
+            self.low_rank_cold, self.matched_cold, matched_pct_low_cold);
+        eprintln!("  \x1b[35m│\x1b[0m  Estimated cold saved: {:.1}/tok ({:.1}% of exact cold) \x1b[35m│\x1b[0m",
+            avoided_per_tok, avoided_pct_exact_cold);
+        eprintln!("  \x1b[35m│\x1b[0m  Affected weight mass: {:.4} total, {:.6}/tok   \x1b[35m│\x1b[0m",
+            self.matched_weight_sum, self.matched_weight_sum / tokens);
+        eprintln!("  \x1b[35m│\x1b[0m  Score delta: avg {:.6}, max {:.6}, rel avg {:.2}% max {:.2}% \x1b[35m│\x1b[0m",
+            avg_delta, self.matched_delta_max, avg_rel_delta, self.matched_rel_delta_max * 100.0);
+        eprintln!("  \x1b[35m└─────────────────────────────────────────────────┘\x1b[0m");
+
+        log::info!(
+            "ROUTE SWAP SHADOW SUMMARY generated={} routes={} selected={} cold={} hcs={} protected_cold={} low_cold={} matched={} unmatched_no_resident={} unmatched_not_similar={} exact_cold_per_tok={:.3} estimated_saved_per_tok={:.3} estimated_saved_pct_exact_cold={:.2} affected_weight_sum={:.6} affected_weight_per_tok={:.8} avg_score_delta={:.8} max_score_delta={:.8} avg_rel_delta_pct={:.4} max_rel_delta_pct={:.4} protect_rank_pct={:.2} abs_tol={:.6} rel_tol_pct={:.4} top_layers=[{}]",
+            generated_tokens,
+            self.route_events,
+            self.selected_total,
+            self.cold_selected,
+            self.hcs_selected,
+            self.protected_cold,
+            self.low_rank_cold,
+            self.matched_cold,
+            self.unmatched_no_resident,
+            self.unmatched_not_similar,
+            exact_cold_per_tok,
+            avoided_per_tok,
+            avoided_pct_exact_cold,
+            self.matched_weight_sum,
+            self.matched_weight_sum / tokens,
+            avg_delta,
+            self.matched_delta_max,
+            avg_rel_delta,
+            self.matched_rel_delta_max * 100.0,
+            self.protect_rank_pct,
+            self.abs_tol,
+            self.rel_tol * 100.0,
+            top_layers.join("; "),
+        );
+    }
+}
+
+fn sync_hcs_route_pointer_updates(
+    device: &Arc<CudaDevice>,
+    reason: &str,
+    updates: usize,
+) -> bool {
+    if updates == 0 {
+        return true;
+    }
+    if !bind_hcs_route_pointer_device(device, reason) {
+        return false;
+    }
+    let err = unsafe { cuda_sys::lib().cuStreamSynchronize(std::ptr::null_mut()) };
+    if err == cuda_sys::CUresult::CUDA_SUCCESS {
+        log::debug!(
+            "GPU route sync: synchronized {} HCS pointer-table updates ({})",
+            updates,
+            reason,
+        );
+        true
+    } else {
+        log::error!(
+            "GPU route sync: HCS pointer-table synchronization failed after {} updates ({}): {:?}",
+            updates,
+            reason,
+            err,
+        );
+        false
+    }
+}
+
 fn parse_polar4_norm_correction_mode() -> i32 {
     match std::env::var("KRASIS_POLAR4_NORM_CORRECTION") {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
@@ -1324,7 +1709,11 @@ impl HcsState {
     }
 
     /// Drop loaded soft chunks down to target_chunks, freeing VRAM and clearing cache entries.
-    fn trim_soft_chunks_to(&mut self, target_chunks: usize) -> (usize, usize) {
+    fn trim_soft_chunks_to(
+        &mut self,
+        target_chunks: usize,
+        route_sync_device: Option<&Arc<CudaDevice>>,
+    ) -> (usize, usize) {
         if target_chunks >= self.soft_chunks_loaded {
             return (0, 0);
         }
@@ -1332,6 +1721,9 @@ impl HcsState {
         let spc = self.soft_slots_per_chunk;
         let mut evicted = 0usize;
         let mut freed_bytes = 0usize;
+        if let Some(device) = route_sync_device {
+            bind_hcs_route_pointer_device(device, "trim soft chunks before pointer clears");
+        }
 
         for drop_idx in target_chunks..self.soft_chunks_loaded {
             let slots_this = if drop_idx == self.soft_total_chunks.saturating_sub(1) {
@@ -1351,6 +1743,10 @@ impl HcsState {
                     }
                 }
             }
+        }
+
+        if let Some(device) = route_sync_device {
+            sync_hcs_route_pointer_updates(device, "trim soft chunks before free", evicted);
         }
 
         self.soft_chunks.truncate(target_chunks);
@@ -3958,6 +4354,11 @@ struct GpuDecodeGraph {
     validation_decode_cold_events: Vec<(usize, usize, usize)>,
     validation_decode_cold_file: String,
     validation_decode_cold_events_file: String,
+    route_swap_shadow: RouteSwapShadowStats,
+    route_shadow_logits: Vec<f32>,
+    route_shadow_bias: Vec<f32>,
+    route_shadow_corr: Vec<f32>,
+    route_shadow_scores: Vec<f32>,
 
     // ── Speculative decode batch buffers (allocated when draft model loaded) ──
     /// Max batch size for speculative decode (draft_k + 1).
@@ -4041,6 +4442,10 @@ struct GpuDecodeGraph {
     /// without recapture -- only the scalar params (token_id, pos, seq_len) and
     /// LA state contents change, both handled via GPU-side indirection buffers.
     graphs_ever_captured: bool,
+    /// Whether the currently captured graph set includes metadata-only GPU route sync.
+    captured_gpu_route_sync: bool,
+    /// Number of expert_classify_prepare launches recorded during the current graph capture.
+    captured_route_sync_classifies: usize,
     /// Snapshot of LA state pointers at capture time, for verifying address stability.
     /// Vec of (layer_idx, conv_state_ptr, recur_state_ptr).
     captured_la_ptrs: Vec<(usize, u64, u64)>,
@@ -7606,6 +8011,11 @@ impl GpuDecodeStore {
             validation_decode_cold_events: Vec::new(),
             validation_decode_cold_file: String::new(),
             validation_decode_cold_events_file: String::new(),
+            route_swap_shadow: RouteSwapShadowStats::from_env(),
+            route_shadow_logits: Vec::new(),
+            route_shadow_bias: Vec::new(),
+            route_shadow_corr: Vec::new(),
+            route_shadow_scores: Vec::new(),
             batch_max: 0,
             d_batch_hidden: None,
             d_batch_residual: None,
@@ -7639,6 +8049,8 @@ impl GpuDecodeStore {
             per_layer_graphs: Vec::new(),
             per_layer_graphs_valid: false,
             graphs_ever_captured: false,
+            captured_gpu_route_sync: false,
+            captured_route_sync_classifies: 0,
             captured_la_ptrs: Vec::new(),
             captured_kv_ptrs: Vec::new(),
             captured_mla_ptrs: Vec::new(),
@@ -10354,8 +10766,10 @@ impl GpuDecodeStore {
         }
 
         // Now allocate and fill the soft tier
+        let route_sync_device = self.device.clone();
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let sync_route_ptrs = graph.gpu_route_sync;
         let hcs = graph.hcs.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("HCS not initialized"))?;
 
@@ -10587,6 +11001,9 @@ impl GpuDecodeStore {
 
         // Build cache entries from GPU pointers
         if dma_ok {
+            if sync_route_ptrs {
+                bind_hcs_route_pointer_device(&route_sync_device, "initial soft tier pointer sets");
+            }
             for slot in 0..soft_slot {
                 if let Some((layer_idx, expert_idx, w13p_off, w13s_off, w2p_off, w2s_off)) = experts_per_slot[slot] {
                     let chunk_idx = slot / slots_per_chunk;
@@ -10626,6 +11043,9 @@ impl GpuDecodeStore {
         hcs.soft_loaded = true;
         hcs.num_cached += soft_loaded;
         hcs.vram_bytes += soft_alloc_bytes;
+        if sync_route_ptrs && soft_loaded > 0 {
+            sync_hcs_route_pointer_updates(&route_sync_device, "initial soft tier load", soft_loaded);
+        }
 
         let total_experts: usize = graph.moe_layers.iter()
             .filter_map(|m| m.as_ref())
@@ -12741,8 +13161,10 @@ impl GpuDecodeStore {
     /// Clamp the soft-tier resident budget to a measured target.
     /// Used by startup decode residency calibration after HCS load.
     fn hcs_clamp_soft_budget_mb(&mut self, target_soft_mb: usize) -> PyResult<(usize, usize)> {
+        let route_sync_device = self.device.clone();
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let sync_route_ptrs = graph.gpu_route_sync;
         let hcs = graph.hcs.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("HCS not initialized"))?;
 
@@ -12761,7 +13183,11 @@ impl GpuDecodeStore {
             ((target_soft_slots + spc - 1) / spc).min(hcs.soft_total_chunks)
         };
 
-        let (_evicted, _freed_bytes) = hcs.trim_soft_chunks_to(target_chunks);
+        let (_evicted, _freed_bytes) =
+            hcs.trim_soft_chunks_to(
+                target_chunks,
+                sync_route_ptrs.then_some(&route_sync_device),
+            );
 
         let loaded_slots = if hcs.soft_chunks_loaded >= hcs.soft_total_chunks {
             hcs.soft_num_slots
@@ -16241,6 +16667,28 @@ impl GpuDecodeStore {
             return Err("Call init_cuda_graph_buffers first".to_string());
         }
 
+        if graph.gpu_route_sync {
+            let has_hcs_ptrs = graph
+                .hcs
+                .as_ref()
+                .and_then(|h| h.d_expert_ptrs.as_ref())
+                .is_some();
+            if !has_hcs_ptrs {
+                self.graph = Some(graph);
+                return Err(
+                    "GPU route sync graph capture requested before HCS expert pointer table is attached"
+                        .to_string(),
+                );
+            }
+            if graph.mapped_cold_buf.is_none() {
+                self.graph = Some(graph);
+                return Err(
+                    "GPU route sync graph capture requested without mapped cold metadata buffer"
+                        .to_string(),
+                );
+            }
+        }
+
         // Set segment config so run_segment_kernels uses correct GQA cache indices
         if let Some((start, _end)) = layer_range {
             graph.segment_layer_start = start;
@@ -16258,6 +16706,8 @@ impl GpuDecodeStore {
             events.destroy();
         }
         graph.per_layer_graphs_valid = false;
+        graph.captured_gpu_route_sync = false;
+        graph.captured_route_sync_classifies = 0;
 
         // Identify which layers have MoE data (within our range)
         let num_layers = graph.layers.len();
@@ -16482,9 +16932,22 @@ impl GpuDecodeStore {
             return Err(format!("Per-layer graph capture failed: {}", e));
         }
 
+        if graph.gpu_route_sync && graph.captured_route_sync_classifies != num_moe {
+            for exec in captured_graphs {
+                unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
+            }
+            let captured = graph.captured_route_sync_classifies;
+            self.graph = Some(graph);
+            return Err(format!(
+                "Per-layer graph capture failed: GPU route sync captured {} classify launches for {} MoE routing segments",
+                captured, num_moe,
+            ));
+        }
+
         graph.per_layer_graphs = captured_graphs;
         graph.per_layer_graphs_valid = true;
         graph.graphs_ever_captured = true;
+        graph.captured_gpu_route_sync = graph.gpu_route_sync;
 
         // Snapshot LA and KV pointers at capture time for cross-request reuse verification.
         // If these pointers are stable across requests (they should be: KV is allocated once,
@@ -18402,6 +18865,7 @@ impl GpuDecodeStore {
                                     ).map_err(|e| format!("expert_classify[{}]: ptrs=[ids={:#x} wts={:#x} eptrs={:#x} upload={:#x} cold={:#x} dummy={:#x}] err={:?}",
                                         layer_idx, topk_ids_dptr, topk_wts_dptr, d_eptrs_ptr, d_upload_ptr, cold_buf_dptr, dummy_base, e))?;
                                 }
+                                graph.captured_route_sync_classifies += 1;
                             }
                         }
                     }
@@ -18453,6 +18917,145 @@ impl GpuDecodeStore {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn record_route_swap_shadow(
+        graph: &mut GpuDecodeGraph,
+        layer_idx: usize,
+        num_experts: usize,
+        topk: usize,
+        scoring_func: u8,
+        norm_topk_prob: bool,
+        gate_bias_ptr: u64,
+        e_score_corr_ptr: u64,
+        logits_ptr: u64,
+    ) -> Result<(), String> {
+        if !graph.route_swap_shadow.enabled {
+            return Ok(());
+        }
+        if graph.gpu_route_sync {
+            return Ok(());
+        }
+        if num_experts == 0 || topk == 0 {
+            return Ok(());
+        }
+
+        graph.route_shadow_logits.resize(num_experts, 0.0);
+        let err = unsafe {
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                graph.route_shadow_logits.as_mut_ptr() as *mut std::ffi::c_void,
+                logits_ptr,
+                num_experts * std::mem::size_of::<f32>(),
+            )
+        };
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!(
+                "route swap shadow D2H logits layer={} experts={}: {:?}",
+                layer_idx, num_experts, err,
+            ));
+        }
+
+        if gate_bias_ptr != 0 {
+            graph.route_shadow_bias.resize(num_experts, 0.0);
+            let err = unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    graph.route_shadow_bias.as_mut_ptr() as *mut std::ffi::c_void,
+                    gate_bias_ptr,
+                    num_experts * std::mem::size_of::<f32>(),
+                )
+            };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!(
+                    "route swap shadow D2H gate bias layer={} experts={}: {:?}",
+                    layer_idx, num_experts, err,
+                ));
+            }
+        } else {
+            graph.route_shadow_bias.clear();
+        }
+
+        if e_score_corr_ptr != 0 {
+            graph.route_shadow_corr.resize(num_experts, 0.0);
+            let err = unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    graph.route_shadow_corr.as_mut_ptr() as *mut std::ffi::c_void,
+                    e_score_corr_ptr,
+                    num_experts * std::mem::size_of::<f32>(),
+                )
+            };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!(
+                    "route swap shadow D2H e_score_corr layer={} experts={}: {:?}",
+                    layer_idx, num_experts, err,
+                ));
+            }
+        } else {
+            graph.route_shadow_corr.clear();
+        }
+
+        graph.route_shadow_scores.resize(num_experts, 0.0);
+        if scoring_func == 1 {
+            for i in 0..num_experts {
+                let mut x = graph.route_shadow_logits[i];
+                if !graph.route_shadow_bias.is_empty() {
+                    x += graph.route_shadow_bias[i];
+                }
+                let mut score = 1.0f32 / (1.0 + (-x).exp());
+                if !graph.route_shadow_corr.is_empty() {
+                    score += graph.route_shadow_corr[i];
+                }
+                graph.route_shadow_scores[i] = score;
+            }
+        } else {
+            let max_logit = graph.route_shadow_logits.iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            if max_logit.is_finite() {
+                for i in 0..num_experts {
+                    let score = (graph.route_shadow_logits[i] - max_logit).exp();
+                    graph.route_shadow_scores[i] = score;
+                    sum += score;
+                }
+            }
+            if sum > 0.0 {
+                let inv = 1.0 / sum;
+                for score in graph.route_shadow_scores.iter_mut().take(num_experts) {
+                    *score *= inv;
+                }
+            }
+        }
+
+        if scoring_func == 1 || norm_topk_prob {
+            let mut topk_sum = 0.0f32;
+            for i in 0..topk {
+                let eid = graph.h_topk_ids.get(i).copied().unwrap_or(-1);
+                if eid >= 0 {
+                    let eid = eid as usize;
+                    if eid < num_experts {
+                        topk_sum += graph.route_shadow_scores[eid];
+                    }
+                }
+            }
+            if topk_sum > 0.0 {
+                let inv = 1.0 / topk_sum;
+                for score in graph.route_shadow_scores.iter_mut().take(num_experts) {
+                    *score *= inv;
+                }
+            }
+        }
+
+        let hcs_ref = graph.hcs.as_ref();
+        graph.route_swap_shadow.record(
+            layer_idx,
+            num_experts,
+            topk,
+            &graph.h_topk_ids,
+            &graph.h_topk_weights,
+            &graph.route_shadow_scores,
+            hcs_ref,
+        );
         Ok(())
     }
 
@@ -18537,14 +19140,49 @@ impl GpuDecodeStore {
 
         // GPU-side route sync state
         let gpu_rs = graph.gpu_route_sync;
-        let cold_buf_host = if gpu_rs && !mapped_reads {
-            graph.mapped_cold_buf.as_ref().map(|m| m.host_ptr as *mut i32)
-        } else { None };
+        if mapped_reads {
+            return Err(
+                "mapped cold-weight reads are disabled; use KRASIS_GPU_ROUTE_SYNC=1 for metadata-only route sync"
+                    .to_string(),
+            );
+        }
+        if gpu_rs {
+            let num_moe = moe_indices.len();
+            if !graph.captured_gpu_route_sync {
+                return Err(
+                    "GPU route sync replay requested with graphs captured without classify kernels"
+                        .to_string(),
+                );
+            }
+            if graph.captured_route_sync_classifies != num_moe {
+                return Err(format!(
+                    "GPU route sync replay classify count mismatch: captured {} for {} MoE layers",
+                    graph.captured_route_sync_classifies, num_moe,
+                ));
+            }
+        }
+        let cold_buf_host = if gpu_rs {
+            Some(
+                graph
+                    .mapped_cold_buf
+                    .as_ref()
+                    .ok_or_else(|| "GPU route sync active without mapped cold metadata buffer".to_string())?
+                    .host_ptr as *mut i32,
+            )
+        } else {
+            None
+        };
+        let route_sync_timeout_ms = env_u64(
+            "KRASIS_GPU_ROUTE_SYNC_TIMEOUT_MS",
+            GPU_ROUTE_SYNC_DEFAULT_TIMEOUT_MS,
+        )
+        .max(1);
 
         // Pre-clear ready flag before the first graph (only needed for non-mapped GPU route sync)
-        if gpu_rs && !mapped_reads {
+        if gpu_rs {
             unsafe {
                 let cold_ptr = cold_buf_host.unwrap();
+                std::ptr::write_volatile(cold_ptr, 0i32);
                 std::ptr::write_volatile(cold_ptr.add(1), 0i32);
             }
         }
@@ -18650,19 +19288,60 @@ impl GpuDecodeStore {
 
                     let cold_ptr = cold_buf_host.unwrap();
 
-                    // Poll mapped memory ready_flag (CPU spin-wait, ~microseconds)
+                    let t_sync_start = if timing { Some(std::time::Instant::now()) } else { None };
+                    let poll_start = std::time::Instant::now();
+                    let timeout = std::time::Duration::from_millis(route_sync_timeout_ms);
+
+                    // Poll mapped memory ready_flag. This must be bounded: if graph capture
+                    // ever misses the classify kernel or the kernel faults, decode should fail
+                    // visibly instead of hanging indefinitely.
                     unsafe {
                         let ready_ptr = cold_ptr.add(1) as *const std::sync::atomic::AtomicI32;
+                        let mut spins = 0u64;
                         loop {
                             let val = (*ready_ptr).load(std::sync::atomic::Ordering::Acquire);
                             if val != 0 { break; }
+                            spins = spins.wrapping_add(1);
+                            if spins & 0x3ff == 0 && poll_start.elapsed() >= timeout {
+                                let sync_err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
+                                return Err(format!(
+                                    "GPU route sync timeout layer={} graph_idx={} waited_ms={} replay_stream_sync={:?} (classify kernel did not publish ready_flag)",
+                                    moe_layer_idx, graph_idx, route_sync_timeout_ms, sync_err
+                                ));
+                            }
                             std::hint::spin_loop();
                         }
                         // Clear ready flag for next layer
                         (*ready_ptr).store(0, std::sync::atomic::Ordering::Release);
                     }
+                    if let Some(t) = t_sync_start {
+                        let elapsed = t.elapsed().as_secs_f64();
+                        graph.t_graph_sync_wait += elapsed;
+                        if let Some(slot) = graph.graph_segment_sync_wait.get_mut(graph_idx - 1) {
+                            *slot += elapsed;
+                        }
+                    }
 
-                    let cold_count = unsafe { std::ptr::read_volatile(cold_ptr) } as usize;
+                    let cold_count_raw = unsafe { std::ptr::read_volatile(cold_ptr) };
+                    if cold_count_raw < 0 {
+                        return Err(format!(
+                            "GPU route sync invalid negative cold_count layer={} value={}",
+                            moe_layer_idx, cold_count_raw,
+                        ));
+                    }
+                    let cold_count = cold_count_raw as usize;
+                    if topk > max_ept {
+                        return Err(format!(
+                            "GPU route sync topk {} exceeds max_experts_per_tok {} at layer {}",
+                            topk, max_ept, moe_layer_idx,
+                        ));
+                    }
+                    if cold_count > topk {
+                        return Err(format!(
+                            "GPU route sync cold_count {} exceeds topk {} at layer {}",
+                            cold_count, topk, moe_layer_idx,
+                        ));
+                    }
 
                     // Count hot experts (topk - cold)
                     graph.dma_hcs_experts += (topk - cold_count) as u64;
@@ -18690,6 +19369,18 @@ impl GpuDecodeStore {
                         for ci in 0..cold_count {
                             let eid = unsafe { std::ptr::read_volatile(cold_ptr.add(2 + ci)) } as usize;
                             let batch_slot = unsafe { std::ptr::read_volatile(cold_ptr.add(2 + topk + ci)) } as usize;
+                            if eid >= moe_data.experts.len() {
+                                return Err(format!(
+                                    "GPU route sync cold expert id OOB layer={} ci={} expert={} num_experts={}",
+                                    moe_layer_idx, ci, eid, moe_data.experts.len(),
+                                ));
+                            }
+                            if batch_slot >= topk || batch_slot >= max_ept {
+                                return Err(format!(
+                                    "GPU route sync cold slot OOB layer={} ci={} batch_slot={} topk={} max_ept={}",
+                                    moe_layer_idx, ci, batch_slot, topk, max_ept,
+                                ));
+                            }
                             let token_idx = graph.validation_decode_steps as usize + 1;
                             validation_record_cold_load(
                                 &mut graph.validation_decode_cold_hist,
@@ -18699,13 +19390,6 @@ impl GpuDecodeStore {
                                 token_idx,
                             );
                             let expert = &moe_data.experts[eid];
-
-                            if batch_slot >= max_ept {
-                                return Err(format!(
-                                    "graph replay cold expert slot OOB layer={} expert={} batch_slot={} max_ept={}",
-                                    moe_layer_idx, eid, batch_slot, max_ept
-                                ));
-                            }
 
                             let base = graph_buf_base[ci];
                             let (w13p, w13s, w2p, w2s) = (
@@ -18822,6 +19506,32 @@ impl GpuDecodeStore {
                                 *graph.d_topk_weights.device_ptr(), topk * 4);
                         }
                     }
+
+                    let (ne, sf, ntp, gate_bias_ptr, e_score_corr_ptr) = {
+                        let moe_data = graph.moe_layers[moe_layer_idx].as_ref().unwrap();
+                        (
+                            moe_data.num_experts,
+                            moe_data.scoring_func,
+                            moe_data.norm_topk_prob,
+                            moe_data.gate_bias_ptr,
+                            moe_data.e_score_corr_ptr,
+                        )
+                    };
+                    let logits_ptr = unsafe {
+                        (*graph.d_fp32_scratch.device_ptr() as *const f32)
+                            .add(graph.hidden_size) as u64
+                    };
+                    Self::record_route_swap_shadow(
+                        graph,
+                        moe_layer_idx,
+                        ne,
+                        topk,
+                        sf,
+                        ntp,
+                        gate_bias_ptr,
+                        e_score_corr_ptr,
+                        logits_ptr,
+                    )?;
 
                     // Classify experts: HCS hit vs cold (need DMA)
                     let mut batch_count = 0usize;
@@ -24525,6 +25235,7 @@ impl GpuDecodeStore {
         let cal = self.vram_calibration;
         let trace_cfg = self.active_trace_owned();
         let hqq_prefill_growth_bytes = self.hqq_runtime_prefill_growth_bytes();
+        let route_sync_device = self.device.clone();
         if std::env::var("KRASIS_HCS_EVICT_DEBUG").is_ok() {
             eprintln!(
                 "[KRASIS-HCS-EVICT-DEBUG] hcs_evict_for_prefill enter estimated_tokens={} has_graph={} hqq_growth_mb={:.0}",
@@ -24544,6 +25255,7 @@ impl GpuDecodeStore {
                 return (0, 0.0);
             }
         };
+        let sync_route_ptrs = graph.gpu_route_sync;
         let hcs = match graph.hcs.as_mut() {
             Some(h) => h,
             None => {
@@ -24706,6 +25418,12 @@ impl GpuDecodeStore {
         let mut chunks_to_drop = 0usize;
         let mut freed_bytes = 0usize;
         let mut evicted = 0usize;
+        if sync_route_ptrs {
+            bind_hcs_route_pointer_device(
+                &route_sync_device,
+                "prefill eviction pointer clears",
+            );
+        }
 
         // Walk chunks from the tail (coldest experts)
         let total_chunks = hcs.soft_chunks_loaded;
@@ -24740,6 +25458,13 @@ impl GpuDecodeStore {
 
         // Actually drop the chunks (from the end)
         let new_loaded = total_chunks - chunks_to_drop;
+        if sync_route_ptrs && evicted > 0 {
+            sync_hcs_route_pointer_updates(
+                &route_sync_device,
+                "prefill eviction before soft chunk free",
+                evicted,
+            );
+        }
         hcs.soft_chunks.truncate(new_loaded);
         hcs.soft_chunks_loaded = new_loaded;
         hcs.num_cached -= evicted;
@@ -24795,10 +25520,12 @@ impl GpuDecodeStore {
     pub fn hcs_reload_after_prefill(&mut self, actual_tokens: usize) -> (usize, f64) {
         let cal = self.vram_calibration;
         let trace_cfg = self.active_trace_owned();
+        let route_sync_device = self.device.clone();
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
         };
+        let sync_route_ptrs = graph.gpu_route_sync;
         let hcs = match graph.hcs.as_mut() {
             Some(h) => h,
             None => return (0, 0.0),
@@ -24830,7 +25557,11 @@ impl GpuDecodeStore {
         };
 
         if hcs.soft_chunks_loaded > target_chunks {
-            let (evicted, freed_bytes) = hcs.trim_soft_chunks_to(target_chunks);
+            let (evicted, freed_bytes) =
+                hcs.trim_soft_chunks_to(
+                    target_chunks,
+                    sync_route_ptrs.then_some(&route_sync_device),
+                );
             if evicted > 0 || freed_bytes > 0 {
                 log::info!(
                     "HCS soft reload: trimmed to {} chunks for {} tokens (budget={} MB, evicted {} experts, freed {:.1} MB)",
@@ -24852,6 +25583,12 @@ impl GpuDecodeStore {
         let t0 = std::time::Instant::now();
         let mut loaded = 0usize;
         let mut alloc_bytes = 0usize;
+        if sync_route_ptrs {
+            bind_hcs_route_pointer_device(
+                &route_sync_device,
+                "synchronous soft reload pointer sets",
+            );
+        }
 
         // Reallocate and batch-DMA only the missing chunks
         for c in already_loaded..target_chunks {
@@ -24963,6 +25700,13 @@ impl GpuDecodeStore {
         hcs.soft_loaded = hcs.soft_chunks_loaded == hcs.soft_total_chunks;
         hcs.num_cached += loaded;
         hcs.vram_bytes += alloc_bytes;
+        if sync_route_ptrs && loaded > 0 {
+            sync_hcs_route_pointer_updates(
+                &route_sync_device,
+                "synchronous soft reload activation",
+                loaded,
+            );
+        }
 
         let alloc_mb = alloc_bytes as f64 / (1024.0 * 1024.0);
         self.last_soft_reload_queued = loaded;
@@ -24994,10 +25738,12 @@ impl GpuDecodeStore {
     pub fn hcs_reload_after_prefill_async(&mut self, actual_tokens: usize) -> (usize, f64) {
         let cal = self.vram_calibration;
         let trace_cfg = self.active_trace_owned();
+        let route_sync_device = self.device.clone();
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
         };
+        let sync_route_ptrs = graph.gpu_route_sync;
         let hcs = match graph.hcs.as_mut() {
             Some(h) => h,
             None => return (0, 0.0),
@@ -25029,7 +25775,11 @@ impl GpuDecodeStore {
         };
 
         if hcs.soft_chunks_loaded > target_chunks {
-            let (evicted, freed_bytes) = hcs.trim_soft_chunks_to(target_chunks);
+            let (evicted, freed_bytes) =
+                hcs.trim_soft_chunks_to(
+                    target_chunks,
+                    sync_route_ptrs.then_some(&route_sync_device),
+                );
             if evicted > 0 || freed_bytes > 0 {
                 log::info!(
                     "HCS soft async reload: trimmed to {} chunks for {} tokens (budget={} MB, evicted {} experts, freed {:.1} MB)",
@@ -25233,10 +25983,12 @@ impl GpuDecodeStore {
     /// Returns true if the soft tier just became available this call.
     pub fn hcs_check_soft_reload_complete(&mut self) -> bool {
         let trace_cfg = self.active_trace_owned();
+        let route_sync_device = self.device.clone();
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return false,
         };
+        let sync_route_ptrs = graph.gpu_route_sync;
         let hcs = match graph.hcs.as_mut() {
             Some(h) => h,
             None => return false,
@@ -25261,6 +26013,12 @@ impl GpuDecodeStore {
         // DMA complete — activate all cache entries
         let entries = std::mem::take(&mut hcs.soft_reload_entries);
         let activated = entries.len();
+        if sync_route_ptrs {
+            bind_hcs_route_pointer_device(
+                &route_sync_device,
+                "asynchronous soft reload pointer sets",
+            );
+        }
         for (layer_idx, expert_idx, entry) in entries {
             hcs.cache_fast_set(layer_idx, expert_idx, &entry);
             hcs.cache.insert((layer_idx, expert_idx), entry);
@@ -25270,6 +26028,13 @@ impl GpuDecodeStore {
         hcs.soft_reload_pending = false;
         hcs.num_cached += activated;
         self.last_soft_reload_activated = activated;
+        if sync_route_ptrs && activated > 0 {
+            sync_hcs_route_pointer_updates(
+                &route_sync_device,
+                "asynchronous soft reload activation",
+                activated,
+            );
+        }
 
         trace_emit_global_mark(
             trace_cfg.as_ref(),
@@ -25293,10 +26058,12 @@ impl GpuDecodeStore {
     /// Returns (activated_count, real_dma_ms). Returns (0, 0.0) if no reload pending.
     pub fn hcs_sync_soft_reload(&mut self) -> (usize, f64) {
         let trace_cfg = self.active_trace_owned();
+        let route_sync_device = self.device.clone();
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
         };
+        let sync_route_ptrs = graph.gpu_route_sync;
         let hcs = match graph.hcs.as_mut() {
             Some(h) => h,
             None => return (0, 0.0),
@@ -25324,6 +26091,12 @@ impl GpuDecodeStore {
         // Activate all cache entries (same as hcs_check_soft_reload_complete)
         let entries = std::mem::take(&mut hcs.soft_reload_entries);
         let activated = entries.len();
+        if sync_route_ptrs {
+            bind_hcs_route_pointer_device(
+                &route_sync_device,
+                "synchronized soft reload pointer sets",
+            );
+        }
         for (layer_idx, expert_idx, entry) in entries {
             hcs.cache_fast_set(layer_idx, expert_idx, &entry);
             hcs.cache.insert((layer_idx, expert_idx), entry);
@@ -25333,6 +26106,13 @@ impl GpuDecodeStore {
         hcs.soft_reload_pending = false;
         hcs.num_cached += activated;
         self.last_soft_reload_activated = activated;
+        if sync_route_ptrs && activated > 0 {
+            sync_hcs_route_pointer_updates(
+                &route_sync_device,
+                "synchronized soft reload activation",
+                activated,
+            );
+        }
 
         trace_emit_global_mark(
             trace_cfg.as_ref(),
@@ -25598,6 +26378,7 @@ impl GpuDecodeStore {
             g.validation_decode_cold_events.clear();
             g.validation_decode_cold_file.clear();
             g.validation_decode_cold_events_file.clear();
+            g.route_swap_shadow.reset_counts();
             if g.timing_enabled {
                 g.timing_step_count = 0;
                 g.t_total = 0.0; g.t_norm = 0.0; g.t_attn = 0.0;
@@ -26386,6 +27167,10 @@ impl GpuDecodeStore {
             eprintln!("  \x1b[32mdecode: {} tokens in {:.2}s ({:.1} tok/s)  VRAM: {} MB free now, {} MB min free during decode\x1b[0m",
                 generated, elapsed, tps, free_mb, min_free_mb);
 
+        }
+
+        if let Some(graph) = self.graph.as_ref() {
+            graph.route_swap_shadow.emit_summary(generated, graph.dma_cold_experts);
         }
 
         // Print speculative decode stats
@@ -30592,14 +31377,63 @@ impl GpuDecodeStore {
         hcs.pool_free_slots = free_slots;
         hcs.pool_slot_to_expert = slot_to_expert;
 
-        // GPU-side route sync: disabled. Benchmarking showed zero speed gain (+0.4%,
-        // within noise) because the classify kernel runs at end of graph segment — by the
-        // time it writes to mapped memory, cuStreamSynchronize would have returned anyway.
-        // The kernel also has persistent CUDA_ERROR_ILLEGAL_ADDRESS issues on first token.
-        // Keeping d_expert_ptrs for HCS bookkeeping but not running the classify kernel.
-        let gpu_rs = false;
+        if env_truthy("KRASIS_MAPPED_READS") {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "KRASIS_MAPPED_READS is disabled: mapped cold-weight reads over PCIe are not a valid route-sync mode",
+            ));
+        }
+
+        let gpu_rs = env_truthy("KRASIS_GPU_ROUTE_SYNC");
+        if gpu_rs {
+            if graph.mapped_cold_buf.is_none() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "KRASIS_GPU_ROUTE_SYNC=1 requires mapped cold metadata buffer allocation",
+                ));
+            }
+            if graph
+                .kernels
+                .as_ref()
+                .is_none()
+            {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "KRASIS_GPU_ROUTE_SYNC=1 requires decode kernels to be loaded before HCS init",
+                ));
+            }
+            if hcs.d_expert_ptrs.is_none() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "KRASIS_GPU_ROUTE_SYNC=1 requires HCS GPU expert pointer table allocation",
+                ));
+            }
+            log::info!(
+                "GPU route sync ACTIVE: metadata-only classification enabled; cold experts still use CPU DMA into VRAM"
+            );
+        } else {
+            log::info!("GPU route sync disabled (set KRASIS_GPU_ROUTE_SYNC=1 to enable metadata-only route sync)");
+        }
         graph.hcs = Some(hcs);
         graph.gpu_route_sync = gpu_rs;
+        if gpu_rs {
+            let err = unsafe { cuda_sys::lib().cuCtxSynchronize() };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "KRASIS_GPU_ROUTE_SYNC=1 initial pointer-table sync failed: {:?}",
+                    err,
+                )));
+            }
+            if graph.per_layer_graphs_valid || !graph.per_layer_graphs.is_empty() {
+                let n = graph.per_layer_graphs.len();
+                for exec in graph.per_layer_graphs.drain(..) {
+                    unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
+                }
+                graph.per_layer_graphs_valid = false;
+                graph.captured_gpu_route_sync = false;
+                graph.captured_route_sync_classifies = 0;
+                log::info!(
+                    "GPU route sync invalidated {} pre-HCS CUDA graph segments; next decode will recapture with classify kernels",
+                    n,
+                );
+            }
+        }
 
         // ── Populate mapped fallback + d_expert_ptrs for cold experts ──
         // If experts have mapped device pointers, fill d_expert_ptrs for ALL uncached experts
@@ -30631,75 +31465,12 @@ impl GpuDecodeStore {
             }
 
             hcs.mapped_fallback = fallback;
-            hcs.mapped_reads_available = fully_mapped == total_experts;
-
-            if hcs.mapped_reads_available {
-                // Upload mapped pointers for all cold (uncached) experts to d_expert_ptrs
-                if let Some(ref d_ptrs_buf) = hcs.d_expert_ptrs {
-                    let mut cold_uploaded = 0usize;
-                    for layer_idx in 0..num_layers {
-                        for eidx in 0..num_experts_per_layer {
-                            // If this expert is NOT in the HCS cache, set its mapped pointer
-                            let is_cached = {
-                                let flat = layer_idx * num_experts_per_layer + eidx;
-                                flat < hcs.cache_fast.len() && hcs.cache_fast[flat][0] != 0
-                            };
-                            if !is_cached {
-                                let flat = layer_idx * num_experts_per_layer + eidx;
-                                let ptrs = hcs.mapped_fallback[flat];
-                                if ptrs[0] != 0 {
-                                    let gpu_idx = (layer_idx * hcs.d_expert_ptrs_ne + eidx) * 4;
-                                    unsafe {
-                                        let dst = *d_ptrs_buf.device_ptr() + (gpu_idx * 8) as u64;
-                                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                            dst,
-                                            ptrs.as_ptr() as *const std::ffi::c_void,
-                                            32,
-                                            std::ptr::null_mut(),
-                                        );
-                                    }
-                                    cold_uploaded += 1;
-                                }
-                            }
-                        }
-                    }
-                    log::info!(
-                        "Mapped reads: uploaded {} cold expert mapped pointers to d_expert_ptrs",
-                        cold_uploaded,
-                    );
-                }
-
-                // Allocate mapped activation buffer: [num_moe_layers * topk] i32
-                let topk_val = graph.moe_layers.iter()
-                    .filter_map(|m| m.as_ref())
-                    .map(|m| m.topk)
-                    .max()
-                    .unwrap_or(10);
-                let num_moe = graph.moe_layers.iter().filter(|m| m.is_some()).count();
-                let act_size = num_moe * topk_val * 4; // i32 per topk per MoE layer
-                graph.mapped_activations = PinnedMapped::new(act_size).ok();
-
-                // Mapped reads: disabled by default. Benchmarking showed 30% regression due to
-                // SM stalls during PCIe reads (Marlin GEMV access pattern generates many small
-                // non-coalesced reads, effective bandwidth << 25 GB/s). The 2ms sync savings
-                // from eliminating CPU round-trips is dwarfed by ~8.7ms of SM stall time.
-                // Enable with KRASIS_MAPPED_READS=1 for testing.
-                let mapped_reads_enabled = std::env::var("KRASIS_MAPPED_READS").map(|v| v == "1").unwrap_or(false);
-                graph.mapped_reads_active = mapped_reads_enabled;
-
-                log::info!(
-                    "Mapped reads {}: {}/{} experts mapped, GPU {}read cold experts via PCIe",
-                    if mapped_reads_enabled { "ACTIVE" } else { "AVAILABLE (disabled, use KRASIS_MAPPED_READS=1)" },
-                    fully_mapped, total_experts,
-                    if mapped_reads_enabled { "will " } else { "can " },
-                );
-            } else {
-                graph.mapped_reads_active = false;
-                log::info!(
-                    "Mapped reads NOT available: {}/{} experts mapped (need all)",
-                    fully_mapped, total_experts,
-                );
-            }
+            hcs.mapped_reads_available = false;
+            graph.mapped_reads_active = false;
+            log::info!(
+                "Mapped cold-weight reads disabled: {}/{} experts have mapped pointers, but d_expert_ptrs remains VRAM-only",
+                fully_mapped, total_experts,
+            );
         }
 
         let mapped_reads = graph.mapped_reads_active;

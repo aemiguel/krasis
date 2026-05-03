@@ -1,5 +1,37 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks - 2026-05-03 (Phase 2GJ metadata-only GPU route sync experiment)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-122B-A10B
+`tests/q122b-k4v4-hqq6-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ6
+attention, `k4v4` KV cache, INT8 shared/dense/lm-head, layer group size 2,
+graph replay enabled, timing instrumentation off.
+
+This was an opt-in route-sync experiment using
+`KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_GPU_ROUTE_SYNC=1`. Mapped
+cold-weight reads remained disabled (`mapped_reads=false`); cold experts still
+used CPU-initiated DMA into VRAM.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Q122B materialized HQQ prefill + metadata-only GPU route sync | HQQ6 | k4v4 | 4094.5 | 23.87 | 42.69 | 3780/12288 (30.8%) | 1846 MB | [log](20260503_phase2gj_q122b_k4v4_hqq6_gpu_route_sync_benchmark.log) |
+
+Notes:
+- Q122B HQQ6+k4v4 seq32 witness passed before speed testing:
+  first token `14/14`, prefill `14/14`, exact `283/361`, containment
+  `304/361`.
+- The route-sync path initially loaded `4050/12288 (33.0%)` soft experts, but
+  the benchmark settled at `3780/12288 (30.8%)` after prefill/decode
+  transitions, matching the current best baseline coverage.
+- Compared with Phase 2GH pointer-table prefill prefetch, decode regressed
+  `24.80 -> 23.87 tok/s` and prefill regressed `4689.8 -> 4094.5 tok/s`.
+- Conclusion: metadata-only GPU route sync is stable as an opt-in diagnostic
+  path, but it is not a speed win and should remain disabled by default.
+
+---
+
 ## Standard Benchmarks - 2026-05-03 (Phase 2GI QCN/35B pointer-prefetch regression)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for both runs.
