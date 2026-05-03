@@ -399,6 +399,314 @@ impl RouteSwapShadowStats {
     }
 }
 
+#[derive(Clone, Debug)]
+struct HcsColdSwapApplied {
+    topk_pos: usize,
+    original_expert: usize,
+    replacement_expert: usize,
+    weight: f32,
+    delta: f32,
+    rel_delta: f32,
+}
+
+#[derive(Clone)]
+struct HcsColdSwapStats {
+    enabled: bool,
+    log_enabled: bool,
+    protect_rank_pct: f64,
+    abs_tol: f32,
+    rel_tol: f32,
+    route_events: u64,
+    selected_total: u64,
+    cold_selected: u64,
+    protected_cold: u64,
+    low_rank_cold: u64,
+    swapped: u64,
+    unmatched_no_resident: u64,
+    unmatched_not_similar: u64,
+    affected_weight_sum: f64,
+    delta_sum: f64,
+    rel_delta_sum: f64,
+    delta_max: f32,
+    rel_delta_max: f32,
+}
+
+impl HcsColdSwapStats {
+    fn from_env() -> Self {
+        let enabled = env_truthy("KRASIS_HCS_COLD_SWAP");
+        let protect_rank_pct = env_f64("KRASIS_ROUTE_SWAP_PROTECT_RANK_PCT", 75.0)
+            .clamp(0.0, 100.0);
+        let abs_tol = env_f64("KRASIS_ROUTE_SWAP_ABS_TOL", 0.005)
+            .max(0.0) as f32;
+        let rel_tol = (env_f64("KRASIS_ROUTE_SWAP_REL_TOL_PCT", 10.0)
+            .max(0.0) / 100.0) as f32;
+        let s = Self {
+            enabled,
+            log_enabled: env_truthy("KRASIS_HCS_COLD_SWAP_LOG"),
+            protect_rank_pct,
+            abs_tol,
+            rel_tol,
+            route_events: 0,
+            selected_total: 0,
+            cold_selected: 0,
+            protected_cold: 0,
+            low_rank_cold: 0,
+            swapped: 0,
+            unmatched_no_resident: 0,
+            unmatched_not_similar: 0,
+            affected_weight_sum: 0.0,
+            delta_sum: 0.0,
+            rel_delta_sum: 0.0,
+            delta_max: 0.0,
+            rel_delta_max: 0.0,
+        };
+        if enabled {
+            log::warn!(
+                "HCS cold swaps enabled: approximate decode mode protect_rank_pct={:.1} abs_tol={:.6} rel_tol_pct={:.2}",
+                s.protect_rank_pct,
+                s.abs_tol,
+                s.rel_tol * 100.0,
+            );
+        }
+        s
+    }
+
+    fn reset_counts(&mut self) {
+        self.route_events = 0;
+        self.selected_total = 0;
+        self.cold_selected = 0;
+        self.protected_cold = 0;
+        self.low_rank_cold = 0;
+        self.swapped = 0;
+        self.unmatched_no_resident = 0;
+        self.unmatched_not_similar = 0;
+        self.affected_weight_sum = 0.0;
+        self.delta_sum = 0.0;
+        self.rel_delta_sum = 0.0;
+        self.delta_max = 0.0;
+        self.rel_delta_max = 0.0;
+    }
+
+    fn plan(
+        &self,
+        layer_idx: usize,
+        num_experts: usize,
+        topk: usize,
+        topk_ids: &[i32],
+        topk_weights: &[f32],
+        scores: &[f32],
+        hcs: &HcsState,
+    ) -> Result<Vec<HcsColdSwapApplied>, String> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        if topk == 0 || num_experts == 0 {
+            return Ok(Vec::new());
+        }
+        if scores.len() < num_experts {
+            return Err(format!(
+                "HCS cold swap enabled but router scores are incomplete layer={} scores={} experts={}",
+                layer_idx,
+                scores.len(),
+                num_experts,
+            ));
+        }
+
+        let protected_count = ((topk as f64) * self.protect_rank_pct / 100.0)
+            .ceil()
+            .max(0.0) as usize;
+        let protected_count = protected_count.min(topk);
+
+        let mut selected = vec![false; num_experts];
+        let mut used_replacement = vec![false; num_experts];
+        for &raw in topk_ids.iter().take(topk) {
+            if raw >= 0 {
+                let eid = raw as usize;
+                if eid < num_experts {
+                    selected[eid] = true;
+                    used_replacement[eid] = true;
+                }
+            }
+        }
+
+        let mut swaps = Vec::new();
+        for i in protected_count..topk {
+            let raw_eid = *topk_ids.get(i).unwrap_or(&-1);
+            if raw_eid < 0 {
+                continue;
+            }
+            let eid = raw_eid as usize;
+            if eid >= num_experts || hcs.get_fast(layer_idx, eid).is_some() {
+                continue;
+            }
+
+            let target_score = scores[eid];
+            if !target_score.is_finite() {
+                continue;
+            }
+            let threshold = self.abs_tol.max(target_score.abs() * self.rel_tol);
+            let mut best: Option<(usize, f32, f32)> = None;
+            for cand in 0..num_experts {
+                if selected[cand] || used_replacement[cand] {
+                    continue;
+                }
+                if hcs.get_fast(layer_idx, cand).is_none() {
+                    continue;
+                }
+                let cand_score = scores[cand];
+                if !cand_score.is_finite() {
+                    continue;
+                }
+                let delta = (cand_score - target_score).abs();
+                if delta <= threshold {
+                    let rel = delta / target_score.abs().max(1.0e-9);
+                    match best {
+                        Some((_, best_delta, _)) if delta >= best_delta => {}
+                        _ => best = Some((cand, delta, rel)),
+                    }
+                }
+            }
+
+            if let Some((replacement, delta, rel_delta)) = best {
+                used_replacement[replacement] = true;
+                swaps.push(HcsColdSwapApplied {
+                    topk_pos: i,
+                    original_expert: eid,
+                    replacement_expert: replacement,
+                    weight: *topk_weights.get(i).unwrap_or(&0.0),
+                    delta,
+                    rel_delta,
+                });
+            }
+        }
+        Ok(swaps)
+    }
+
+    fn record_route(
+        &mut self,
+        layer_idx: usize,
+        num_experts: usize,
+        topk: usize,
+        original_topk_ids: &[i32],
+        hcs: Option<&HcsState>,
+        swaps: &[HcsColdSwapApplied],
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.route_events += 1;
+        let protected_count = ((topk as f64) * self.protect_rank_pct / 100.0)
+            .ceil()
+            .max(0.0) as usize;
+        let protected_count = protected_count.min(topk);
+
+        if let Some(hcs) = hcs {
+            for (i, &raw) in original_topk_ids.iter().take(topk).enumerate() {
+                if raw < 0 {
+                    continue;
+                }
+                let eid = raw as usize;
+                if eid >= num_experts {
+                    continue;
+                }
+                self.selected_total += 1;
+                if hcs.get_fast(layer_idx, eid).is_some() {
+                    continue;
+                }
+                self.cold_selected += 1;
+                if i < protected_count {
+                    self.protected_cold += 1;
+                } else {
+                    self.low_rank_cold += 1;
+                }
+            }
+        }
+
+        for swap in swaps {
+            self.swapped += 1;
+            self.affected_weight_sum += swap.weight as f64;
+            self.delta_sum += swap.delta as f64;
+            self.rel_delta_sum += swap.rel_delta as f64;
+            self.delta_max = self.delta_max.max(swap.delta);
+            self.rel_delta_max = self.rel_delta_max.max(swap.rel_delta);
+            if self.log_enabled {
+                log::info!(
+                    "HCS COLD SWAP layer={} rank={} original={} replacement={} weight={:.6} delta={:.8} rel_delta_pct={:.4}",
+                    layer_idx,
+                    swap.topk_pos,
+                    swap.original_expert,
+                    swap.replacement_expert,
+                    swap.weight,
+                    swap.delta,
+                    swap.rel_delta * 100.0,
+                );
+            }
+        }
+        let unmatched_low = self.low_rank_cold.saturating_sub(self.swapped);
+        self.unmatched_not_similar = unmatched_low;
+    }
+
+    fn emit_summary(&self, generated_tokens: usize, actual_cold_experts: u64) {
+        if !self.enabled || self.route_events == 0 {
+            return;
+        }
+        let tokens = generated_tokens.max(1) as f64;
+        let swapped = self.swapped as f64;
+        let avg_delta = if self.swapped > 0 {
+            self.delta_sum / self.swapped as f64
+        } else {
+            0.0
+        };
+        let avg_rel_delta = if self.swapped > 0 {
+            self.rel_delta_sum / self.swapped as f64 * 100.0
+        } else {
+            0.0
+        };
+        let cold_per_tok = actual_cold_experts as f64 / tokens;
+        let swapped_per_tok = swapped / tokens;
+        let swapped_pct = if self.cold_selected > 0 {
+            self.swapped as f64 / self.cold_selected as f64 * 100.0
+        } else {
+            0.0
+        };
+        eprintln!("  \x1b[33m┌─────────────────────────────────────────────────┐\x1b[0m");
+        eprintln!("  \x1b[33m│\x1b[0m  HCS COLD SWAPS (approximate decode)        \x1b[33m│\x1b[0m");
+        eprintln!("  \x1b[33m├─────────────────────────────────────────────────┤\x1b[0m");
+        eprintln!("  \x1b[33m│\x1b[0m  Policy: protect top {:4.1}% ranks, tol=max({:.4},{:.1}%) \x1b[33m│\x1b[0m",
+            self.protect_rank_pct, self.abs_tol, self.rel_tol * 100.0);
+        eprintln!("  \x1b[33m│\x1b[0m  Swapped: {} ({:.2}/tok, {:.1}% of original cold) \x1b[33m│\x1b[0m",
+            self.swapped, swapped_per_tok, swapped_pct);
+        eprintln!("  \x1b[33m│\x1b[0m  Actual cold after swaps: {:.2}/tok              \x1b[33m│\x1b[0m",
+            cold_per_tok);
+        eprintln!("  \x1b[33m│\x1b[0m  Score delta: avg {:.6}, max {:.6}, rel avg {:.2}% max {:.2}% \x1b[33m│\x1b[0m",
+            avg_delta, self.delta_max, avg_rel_delta, self.rel_delta_max * 100.0);
+        eprintln!("  \x1b[33m└─────────────────────────────────────────────────┘\x1b[0m");
+        log::info!(
+            "HCS COLD SWAP SUMMARY generated={} routes={} selected={} original_cold={} protected_cold={} low_cold={} swapped={} swapped_per_tok={:.4} swapped_pct_original_cold={:.2} actual_cold_after_swap={} actual_cold_per_tok={:.4} affected_weight_sum={:.6} affected_weight_per_tok={:.8} avg_score_delta={:.8} max_score_delta={:.8} avg_rel_delta_pct={:.4} max_rel_delta_pct={:.4} protect_rank_pct={:.2} abs_tol={:.6} rel_tol_pct={:.4}",
+            generated_tokens,
+            self.route_events,
+            self.selected_total,
+            self.cold_selected,
+            self.protected_cold,
+            self.low_rank_cold,
+            self.swapped,
+            swapped_per_tok,
+            swapped_pct,
+            actual_cold_experts,
+            cold_per_tok,
+            self.affected_weight_sum,
+            self.affected_weight_sum / tokens,
+            avg_delta,
+            self.delta_max,
+            avg_rel_delta,
+            self.rel_delta_max * 100.0,
+            self.protect_rank_pct,
+            self.abs_tol,
+            self.rel_tol * 100.0,
+        );
+    }
+}
+
 #[derive(Clone, Default)]
 struct PromptHcsShadowLayerStats {
     selected: u64,
@@ -5041,6 +5349,7 @@ struct GpuDecodeGraph {
     validation_decode_cold_file: String,
     validation_decode_cold_events_file: String,
     route_swap_shadow: RouteSwapShadowStats,
+    hcs_cold_swap: HcsColdSwapStats,
     route_shadow_logits: Vec<f32>,
     route_shadow_bias: Vec<f32>,
     route_shadow_corr: Vec<f32>,
@@ -8703,6 +9012,7 @@ impl GpuDecodeStore {
             validation_decode_cold_file: String::new(),
             validation_decode_cold_events_file: String::new(),
             route_swap_shadow: RouteSwapShadowStats::from_env(),
+            hcs_cold_swap: HcsColdSwapStats::from_env(),
             route_shadow_logits: Vec::new(),
             route_shadow_bias: Vec::new(),
             route_shadow_corr: Vec::new(),
@@ -19633,10 +19943,16 @@ impl GpuDecodeStore {
         e_score_corr_ptr: u64,
         logits_ptr: u64,
     ) -> Result<(), String> {
-        if !graph.route_swap_shadow.enabled {
+        if !graph.route_swap_shadow.enabled && !graph.hcs_cold_swap.enabled {
             return Ok(());
         }
         if graph.gpu_route_sync {
+            if graph.hcs_cold_swap.enabled {
+                return Err(
+                    "KRASIS_HCS_COLD_SWAP=1 is not compatible with KRASIS_GPU_ROUTE_SYNC=1; CPU-side route classification is required for swaps"
+                        .to_string()
+                );
+            }
             return Ok(());
         }
         if num_experts == 0 || topk == 0 {
@@ -19748,15 +20064,62 @@ impl GpuDecodeStore {
             }
         }
 
-        let hcs_ref = graph.hcs.as_ref();
-        graph.route_swap_shadow.record(
+        if graph.route_swap_shadow.enabled {
+            let hcs_ref = graph.hcs.as_ref();
+            graph.route_swap_shadow.record(
+                layer_idx,
+                num_experts,
+                topk,
+                &graph.h_topk_ids,
+                &graph.h_topk_weights,
+                &graph.route_shadow_scores,
+                hcs_ref,
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_hcs_cold_swaps(
+        graph: &mut GpuDecodeGraph,
+        layer_idx: usize,
+        num_experts: usize,
+        topk: usize,
+    ) -> Result<(), String> {
+        if !graph.hcs_cold_swap.enabled {
+            return Ok(());
+        }
+        if graph.gpu_route_sync {
+            return Err(
+                "KRASIS_HCS_COLD_SWAP=1 is not compatible with KRASIS_GPU_ROUTE_SYNC=1; CPU-side route classification is required for swaps"
+                    .to_string()
+            );
+        }
+        let Some(hcs) = graph.hcs.as_ref() else {
+            return Ok(());
+        };
+        let original_topk_ids: Vec<i32> = graph.h_topk_ids.iter().take(topk).copied().collect();
+        let swaps = graph.hcs_cold_swap.plan(
             layer_idx,
             num_experts,
             topk,
-            &graph.h_topk_ids,
+            &original_topk_ids,
             &graph.h_topk_weights,
             &graph.route_shadow_scores,
+            hcs,
+        )?;
+        for swap in swaps.iter() {
+            if swap.topk_pos < graph.h_topk_ids.len() {
+                graph.h_topk_ids[swap.topk_pos] = swap.replacement_expert as i32;
+            }
+        }
+        let hcs_ref = graph.hcs.as_ref();
+        graph.hcs_cold_swap.record_route(
+            layer_idx,
+            num_experts,
+            topk,
+            &original_topk_ids,
             hcs_ref,
+            &swaps,
         );
         Ok(())
     }
@@ -20233,6 +20596,12 @@ impl GpuDecodeStore {
                         gate_bias_ptr,
                         e_score_corr_ptr,
                         logits_ptr,
+                    )?;
+                    Self::apply_hcs_cold_swaps(
+                        graph,
+                        moe_layer_idx,
+                        ne,
+                        topk,
                     )?;
 
                     // Classify experts: HCS hit vs cold (need DMA)
@@ -27236,6 +27605,7 @@ impl GpuDecodeStore {
             g.validation_decode_cold_file.clear();
             g.validation_decode_cold_events_file.clear();
             g.route_swap_shadow.reset_counts();
+            g.hcs_cold_swap.reset_counts();
             g.prompt_hcs_shadow.reset_counts();
             if g.timing_enabled {
                 g.timing_step_count = 0;
@@ -28029,6 +28399,7 @@ impl GpuDecodeStore {
 
         if let Some(graph) = self.graph.as_ref() {
             graph.route_swap_shadow.emit_summary(generated, graph.dma_cold_experts);
+            graph.hcs_cold_swap.emit_summary(generated, graph.dma_cold_experts);
             graph.prompt_hcs_shadow.emit_summary(generated);
         }
 
@@ -29566,24 +29937,41 @@ impl GpuDecodeStore {
         let prefetch_stream = self.prefetch_stream.0;
         let timing = graph.timing_enabled;
 
-        let moe = graph.moe_layers.get(layer_idx)
-            .and_then(|m| m.as_ref())
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("MoE layer {} not registered", layer_idx)))?;
-
         let hs = graph.hidden_size;
         let intermediate = graph.moe_intermediate_size;
         let gs = graph.group_size;
-        let topk = moe.topk;
-        let ne = moe.num_experts;
-        let sf = moe.scoring_func;
-        let rsf = moe.routed_scaling_factor;
-        let gate_wid = moe.gate_wid;
-        let gate_bias_ptr = moe.gate_bias_ptr;
-        let e_score_corr_ptr = moe.e_score_corr_ptr;
+        let (
+            topk,
+            ne,
+            sf,
+            norm_topk_prob,
+            rsf,
+            gate_wid,
+            gate_bias_ptr,
+            e_score_corr_ptr,
+            act_type,
+            gated,
+            moe_input_size,
+        ) = {
+            let moe = graph.moe_layers.get(layer_idx)
+                .and_then(|m| m.as_ref())
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("MoE layer {} not registered", layer_idx)))?;
+            (
+                moe.topk,
+                moe.num_experts,
+                moe.scoring_func,
+                moe.norm_topk_prob,
+                moe.routed_scaling_factor,
+                moe.gate_wid,
+                moe.gate_bias_ptr,
+                moe.e_score_corr_ptr,
+                moe.activation_type,
+                moe.gated_experts,
+                moe.moe_input_size,
+            )
+        };
         let is_int8 = graph.expert_bits == 8;
-        let act_type = moe.activation_type;
-        let gated = moe.gated_experts;
         let inv_wp = if is_int8 {
             *graph.d_inv_weight_perm_int8.device_ptr()
         } else {
@@ -29592,7 +29980,7 @@ impl GpuDecodeStore {
         let inv_sp = *graph.d_inv_scale_perm.device_ptr();
 
         // LatentMoE: expert input/output dimension may differ from hidden_size
-        let expert_hs = if moe.moe_input_size > 0 { moe.moe_input_size } else { hs };
+        let expert_hs = if moe_input_size > 0 { moe_input_size } else { hs };
         // Expert w13 input pointer: d_scratch (latent) for LatentMoE, d_hidden for standard
         let expert_input_ptr = if graph.moe_input_override_ptr != 0 {
             graph.moe_input_override_ptr
@@ -29630,10 +30018,8 @@ impl GpuDecodeStore {
 
         // Get cached kernel handles (avoids HashMap lookup per call)
         let k = graph.kernels.as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Kernels not cached"))?;
-
-        // Use pre-allocated events if available, otherwise create on demand
-        let pre_ev = &graph.pre_events;
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Kernels not cached"))?
+            .clone();
 
         // ── Step 0: Zero moe_out accumulator ──
         // Required: fused_silu_accum does read-modify-write. Without zeroing,
@@ -29719,7 +30105,7 @@ impl GpuDecodeStore {
                         topk_wts_dptr,
                         ne as i32,
                         topk as i32,
-                        if moe.norm_topk_prob { 1i32 } else { 0i32 },
+                        if norm_topk_prob { 1i32 } else { 0i32 },
                     )).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                         format!("softmax_topk: {:?}", e)))?;
                 }
@@ -29791,10 +30177,33 @@ impl GpuDecodeStore {
             topk,
             &ids,
             &wts,
-            moe.norm_topk_prob,
+            norm_topk_prob,
             sf,
             ne,
         );
+        Self::record_route_swap_shadow(
+            graph,
+            layer_idx,
+            ne,
+            topk,
+            sf,
+            norm_topk_prob,
+            gate_bias_ptr,
+            e_score_corr_ptr,
+            logits_ptr,
+        ).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        Self::apply_hcs_cold_swaps(
+            graph,
+            layer_idx,
+            ne,
+            topk,
+        ).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let moe = graph.moe_layers.get(layer_idx)
+            .and_then(|m| m.as_ref())
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("MoE layer {} not registered", layer_idx)))?;
+        // Use pre-allocated events if available, otherwise create on demand.
+        let pre_ev = &graph.pre_events;
 
         // ── Step 4.5a: Process PENDING spec results from previous layer ──
         //
@@ -30556,12 +30965,12 @@ impl GpuDecodeStore {
                         w13p, w13s,
                         expert_input_ptr,
                         partial_ptr, inv_wp, inv_sp,
-                        expert_hs, w13_n, gs, w13_ksplits, k, is_int8,
+                        expert_hs, w13_n, gs, w13_ksplits, &k, is_int8,
                     )?;
                     self.launch_reduce_ksplits_bf16(
                         *graph.d_expert_gate_up.device_ptr(),
                         partial_ptr,
-                        w13_n, w13_ksplits, k,
+                        w13_n, w13_ksplits, &k,
                     )?;
                 } else {
                     self.launch_marlin_gemv_raw(
@@ -30578,7 +30987,7 @@ impl GpuDecodeStore {
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
                     intermediate, expert_hs, gs,
-                    weight, 0u64, k, is_int8,
+                    weight, 0u64, &k, is_int8,
                 )?;
             }
         }
@@ -30680,12 +31089,12 @@ impl GpuDecodeStore {
                         base + w13p_off as u64, base + w13s_off as u64,
                         expert_input_ptr,
                         partial_ptr, inv_wp, inv_sp,
-                        expert_hs, w13_n, gs, w13_ksplits, k, is_int8,
+                        expert_hs, w13_n, gs, w13_ksplits, &k, is_int8,
                     )?;
                     self.launch_reduce_ksplits_bf16(
                         *graph.d_expert_gate_up.device_ptr(),
                         partial_ptr,
-                        w13_n, w13_ksplits, k,
+                        w13_n, w13_ksplits, &k,
                     )?;
                 } else {
                     self.launch_marlin_gemv_raw(
@@ -30719,7 +31128,7 @@ impl GpuDecodeStore {
                     inv_wp, inv_sp,
                     intermediate, expert_hs, gs,
                     weight, 0u64,
-                    k, is_int8,
+                    &k, is_int8,
                 )?;
                 if timing {
                     unsafe { cuda_sys::lib().cuStreamSynchronize(default_stream); }
@@ -30783,12 +31192,12 @@ impl GpuDecodeStore {
                         buf_w13_packed, buf_w13_scales,
                         expert_input_ptr,
                         partial_ptr, inv_wp, inv_sp,
-                        expert_hs, w13_n, gs, w13_ksplits, k, is_int8,
+                        expert_hs, w13_n, gs, w13_ksplits, &k, is_int8,
                     )?;
                     self.launch_reduce_ksplits_bf16(
                         *graph.d_expert_gate_up.device_ptr(),
                         partial_ptr,
-                        w13_n, w13_ksplits, k,
+                        w13_n, w13_ksplits, &k,
                     )?;
                 } else {
                     self.launch_marlin_gemv_raw(
@@ -30829,7 +31238,7 @@ impl GpuDecodeStore {
                     inv_wp, inv_sp,
                     intermediate, expert_hs, gs,
                     weight, 0u64,
-                    k, is_int8,
+                    &k, is_int8,
                 )?;
             }
         }
@@ -30948,7 +31357,7 @@ impl GpuDecodeStore {
                 inv_wp, inv_sp,
                 graph.shared_expert_intermediate_size, hs, gs,
                 shared_weight, gate_weight_ptr,
-                k, is_int8,
+                &k, is_int8,
             )?;
         }
 
@@ -33394,7 +33803,7 @@ impl GpuDecodeStore {
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs, 0.1f32, 0u64, k, is_int8,
+                    intermediate, hs, gs, 0.1f32, 0u64, &k, is_int8,
                 )?;
             }
             self.device.synchronize()
@@ -33415,7 +33824,7 @@ impl GpuDecodeStore {
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs, 0.1f32, 0u64, k, is_int8,
+                    intermediate, hs, gs, 0.1f32, 0u64, &k, is_int8,
                 )?;
             }
             self.device.synchronize()
@@ -33451,7 +33860,7 @@ impl GpuDecodeStore {
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs, 0.1f32, 0u64, k,
+                    intermediate, hs, gs, 0.1f32, 0u64, &k,
                     is_int8,
                 )?;
             }
@@ -33484,13 +33893,13 @@ impl GpuDecodeStore {
                     w13p, w13s,
                     *graph.d_hidden.device_ptr(),
                     partial_ptr, inv_wp, inv_sp,
-                    hs, 2 * intermediate, gs, w13_ksplits, k,
+                    hs, 2 * intermediate, gs, w13_ksplits, &k,
                     is_int8,
                 )?;
                 self.launch_reduce_ksplits_bf16(
                     *graph.d_expert_gate_up.device_ptr(),
                     partial_ptr,
-                    2 * intermediate, w13_ksplits, k,
+                    2 * intermediate, w13_ksplits, &k,
                 )?;
             }
             self.device.synchronize()
@@ -33502,13 +33911,13 @@ impl GpuDecodeStore {
                     w13p, w13s,
                     *graph.d_hidden.device_ptr(),
                     partial_ptr, inv_wp, inv_sp,
-                    hs, 2 * intermediate, gs, w13_ksplits, k,
+                    hs, 2 * intermediate, gs, w13_ksplits, &k,
                     is_int8,
                 )?;
                 self.launch_reduce_ksplits_bf16(
                     *graph.d_expert_gate_up.device_ptr(),
                     partial_ptr,
-                    2 * intermediate, w13_ksplits, k,
+                    2 * intermediate, w13_ksplits, &k,
                 )?;
             }
             self.device.synchronize()
@@ -33634,20 +34043,20 @@ impl GpuDecodeStore {
                             *w13p, *w13s,
                             *graph.d_hidden.device_ptr(),
                             partial_ptr, inv_wp, inv_sp,
-                            hs, 2 * intermediate, gs, w13_ksplits, k,
+                            hs, 2 * intermediate, gs, w13_ksplits, &k,
                             is_int8,
                         )?;
                         self.launch_reduce_ksplits_bf16(
                             *graph.d_expert_gate_up.device_ptr(),
                             partial_ptr,
-                            2 * intermediate, w13_ksplits, k,
+                            2 * intermediate, w13_ksplits, &k,
                         )?;
                         self.launch_fused_silu_accum(
                             *w2p, *w2s,
                             *graph.d_expert_gate_up.device_ptr(),
                             *graph.d_moe_out.device_ptr(),
                             inv_wp, inv_sp,
-                            intermediate, hs, gs, 0.1f32, 0u64, k,
+                            intermediate, hs, gs, 0.1f32, 0u64, &k,
                             is_int8,
                         )?;
                     }
@@ -33663,20 +34072,20 @@ impl GpuDecodeStore {
                             *w13p, *w13s,
                             *graph.d_hidden.device_ptr(),
                             partial_ptr, inv_wp, inv_sp,
-                            hs, 2 * intermediate, gs, w13_ksplits, k,
+                            hs, 2 * intermediate, gs, w13_ksplits, &k,
                             is_int8,
                         )?;
                         self.launch_reduce_ksplits_bf16(
                             *graph.d_expert_gate_up.device_ptr(),
                             partial_ptr,
-                            2 * intermediate, w13_ksplits, k,
+                            2 * intermediate, w13_ksplits, &k,
                         )?;
                         self.launch_fused_silu_accum(
                             *w2p, *w2s,
                             *graph.d_expert_gate_up.device_ptr(),
                             *graph.d_moe_out.device_ptr(),
                             inv_wp, inv_sp,
-                            intermediate, hs, gs, 0.1f32, 0u64, k,
+                            intermediate, hs, gs, 0.1f32, 0u64, &k,
                             is_int8,
                         )?;
                     }

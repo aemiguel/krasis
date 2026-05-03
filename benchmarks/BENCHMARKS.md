@@ -1,5 +1,43 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks - 2026-05-03 (Phase 2GQ opt-in HCS cold swaps)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+HCS cold swaps are an approximate decode mode and are disabled by default.
+This run used `KRASIS_HCS_COLD_SWAP=1` with the default policy: protect the
+top `75%` selected expert ranks, and replace only lower-rank cold selected
+experts with same-layer HCS-resident experts whose router score is within
+`max(0.005, 10%)`. Routing weights are preserved, but selected expert identity
+changes for swapped slots.
+
+Timing instrumentation was disabled for the benchmark row.
+
+| Model / run | Config / command | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|-------------|------------------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Qwen3.5-122B-A10B HCS cold swaps | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_HCS_COLD_SWAP=1 ./dev benchmark tests/q122b-k4v4-hqq6-int4-benchmark.conf` | HQQ6 | k4v4 | 4280.2 | 27.30 | 50.01 | 3780/12288 (30.8%) | 662 MB | [log](20260503_phase2gq_q122b_k4v4_hqq6_hcs_cold_swap_benchmark.log) |
+
+Validation:
+- Q122B HQQ6+k4v4 seq32 witness with swaps enabled passed:
+  first token `14/14`, prefill `14/14`, exact `261/361`, containment
+  `279/361`, full exact `8/14`.
+- This is weaker than the exact prompt-HCS default witness row
+  (`280/361` exact, `303/361` containment), so HCS cold swaps remain an
+  opt-in approximate experiment, not a default.
+
+Notes:
+- Compared with Phase 2GO exact prompt-HCS default, Q122B internal decode
+  improved `25.29 -> 27.30 tok/s`, but generated-token agreement dropped.
+- Official internal benchmark swap summaries reported `7586` swaps over
+  `397` decoded tokens (`19.11/tok`), weighted cold after swaps
+  `109.03/tok`, and weighted router score delta `0.004325` absolute
+  (`5.30%` relative).
+- Prefill changed `4880.4 -> 4280.2 tok/s` in this run. This mode only changes
+  decode routing after prefill, so treat the prefill movement as run variance
+  unless reproduced.
+
+---
+
 ## Standard Benchmarks - 2026-05-03 (Phase 2GP 35B control and QCN retain sweep)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the runs.
