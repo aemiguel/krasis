@@ -414,7 +414,7 @@ struct PromptHcsShadowStats {
 }
 
 impl PromptHcsShadowStats {
-    const RETAIN_PCTS: [usize; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+    const RETAIN_PCTS: [usize; 11] = [10, 20, 30, 40, 50, 60, 70, 75, 80, 85, 90];
 
     fn disabled() -> Self {
         Self {
