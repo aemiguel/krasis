@@ -286,6 +286,59 @@ __device__ __forceinline__ float hqq_load_weight(
 }
 
 template<int NBITS>
+__device__ __forceinline__ void hqq_dequant_bf16_device(
+    __nv_bfloat16* __restrict__ out,
+    const unsigned char* __restrict__ packed,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = rows * cols;
+    if (idx >= total) return;
+
+    int row = idx / cols;
+    int col = idx - row * cols;
+    const unsigned char* w_row = packed + (long long)row * packed_row_stride_bytes;
+    const float* s_row = (const float*)((const char*)scales + (long long)row * scales_row_stride_bytes);
+    const float* z_row = (const float*)((const char*)zeros + (long long)row * zeros_row_stride_bytes);
+    out[idx] = float_to_bf16(hqq_load_weight<NBITS>(w_row, s_row, z_row, col, group_size));
+}
+
+extern "C" __global__ void hqq_dequant_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const unsigned char* __restrict__ packed,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    int rows,
+    int cols,
+    int group_size,
+    int packed_row_stride_bytes,
+    int scales_row_stride_bytes,
+    int zeros_row_stride_bytes,
+    int nbits)
+{
+    if (nbits == 4) {
+        hqq_dequant_bf16_device<4>(
+            out, packed, scales, zeros, rows, cols, group_size,
+            packed_row_stride_bytes, scales_row_stride_bytes, zeros_row_stride_bytes);
+    } else if (nbits == 6) {
+        hqq_dequant_bf16_device<6>(
+            out, packed, scales, zeros, rows, cols, group_size,
+            packed_row_stride_bytes, scales_row_stride_bytes, zeros_row_stride_bytes);
+    } else if (nbits == 8) {
+        hqq_dequant_bf16_device<8>(
+            out, packed, scales, zeros, rows, cols, group_size,
+            packed_row_stride_bytes, scales_row_stride_bytes, zeros_row_stride_bytes);
+    }
+}
+
+template<int NBITS>
 __device__ void hqq_quantized_prefill_gemm_bf16_device(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ input,

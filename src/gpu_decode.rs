@@ -5383,6 +5383,29 @@ impl GpuDecodeStore {
                 packed_cols,
             ));
         }
+        if Self::hqq_prefill_materialize_bf16_enabled() {
+            return Ok(HqqRuntimeFormatDescriptor {
+                stage: "prefill",
+                kind: HqqRuntimeFormatKind::PrefillRowMajorV1,
+                layout: hqq_expected_layout(nbits as u8, "prefill")?.to_string(),
+                packed_dtype: "uint8".to_string(),
+                scales_dtype: "float32".to_string(),
+                zeros_dtype: "float32".to_string(),
+                packed_host: packed_host.to_vec(),
+                scales_host: scales_host.to_vec(),
+                zeros_host: zeros_host.to_vec(),
+                packed_component_bytes: packed_cols,
+                scales_component_bytes: groups * std::mem::size_of::<f32>(),
+                zeros_component_bytes: groups * std::mem::size_of::<f32>(),
+                row_blocks: rows,
+                rows_per_tile: 1,
+                packed_row_stride_bytes: packed_cols,
+                scales_row_stride_bytes: groups * std::mem::size_of::<f32>(),
+                zeros_row_stride_bytes: groups * std::mem::size_of::<f32>(),
+                build_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                kernel_ready: true,
+            });
+        }
         if nbits == 4 {
             if cols % 16 != 0 || rows % 64 != 0 || cols % group_size != 0 {
                 return Err(format!(
@@ -5747,6 +5770,17 @@ impl GpuDecodeStore {
             build_ms: t0.elapsed().as_secs_f64() * 1000.0,
             kernel_ready: true,
         })
+    }
+
+    fn hqq_prefill_materialize_bf16_enabled() -> bool {
+        std::env::var("KRASIS_HQQ_PREFILL_MATERIALIZE_BF16")
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
     }
 
     fn build_hqq_decode_runtime_format(

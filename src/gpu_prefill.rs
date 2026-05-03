@@ -2361,6 +2361,7 @@ pub struct PrefillKernels {
     fused_add_rmsnorm: RawCuFunc,
     embedding: RawCuFunc,
     hqq4_dequant_bf16: RawCuFunc,
+    hqq_dequant_bf16: RawCuFunc,
     hqq4_prefill_gemm_bf16: RawCuFunc,
     hqq6_prefill_gemm_bf16: RawCuFunc,
     hqq8_prefill_gemm_bf16: RawCuFunc,
@@ -3038,6 +3039,7 @@ pub struct PrefillScratch {
     pub d_residual: GpuBuf<u16>,
     pub d_scratch1: GpuBuf<u16>,
     pub d_scratch2: GpuBuf<u16>,
+    pub d_hqq_bf16_weight: Option<GpuBuf<u16>>,
     pub d_fp32_scratch: GpuBuf<f32>,
     pub d_workspace: GpuBuf<i32>,
     pub d_topk_weights: GpuBuf<f32>,
@@ -11492,6 +11494,107 @@ impl PrefillEngine {
         Ok(())
     }
 
+    fn validate_hqq_row_major_materialize_tensor_desc(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+    ) -> Result<u8, String> {
+        if desc.axis != 1 {
+            return Err(format!(
+                "HQQ materialized prefill tensor {} uses unsupported axis {} (expected axis=1)",
+                tensor_name, desc.axis
+            ));
+        }
+        let nbits = Self::hqq_nbits_from_desc(desc)?;
+        let expected_layout = match nbits {
+            4 => "row_major_axis1_grouped_uint4_packed",
+            6 => "row_major_axis1_grouped_uint6_packed",
+            8 => "row_major_axis1_grouped_uint8",
+            _ => return Err(format!("Unsupported HQQ materialized prefill nbits={}", nbits)),
+        };
+        if desc.layout != expected_layout {
+            return Err(format!(
+                "HQQ{} materialized prefill tensor {} uses unsupported layout {} (expected {})",
+                nbits, tensor_name, desc.layout, expected_layout
+            ));
+        }
+        if desc.packed_dtype != "uint8"
+            || desc.scales_dtype != "float32"
+            || desc.zeros_dtype != "float32"
+        {
+            return Err(format!(
+                "HQQ{} materialized prefill tensor {} uses unsupported dtypes packed={} scales={} zeros={} (expected uint8/float32/float32)",
+                nbits, tensor_name, desc.packed_dtype, desc.scales_dtype, desc.zeros_dtype
+            ));
+        }
+        if desc.group_size == 0 {
+            return Err(format!(
+                "HQQ{} materialized prefill tensor {} has invalid group_size=0",
+                nbits, tensor_name
+            ));
+        }
+        Ok(nbits)
+    }
+
+    fn hqq_row_major_dequant_to_bf16(
+        &self,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        out_ptr: u64,
+    ) -> Result<(), String> {
+        let nbits = self.validate_hqq_row_major_materialize_tensor_desc(tensor_name, desc)?;
+        let total = desc.rows * desc.cols;
+        if total == 0 {
+            return Ok(());
+        }
+        let groups = desc.cols.div_ceil(desc.group_size);
+        let padded_cols = groups * desc.group_size;
+        let packed_row_stride_bytes = match nbits {
+            4 => padded_cols.div_ceil(2),
+            6 => padded_cols.div_ceil(4) * 3,
+            8 => padded_cols,
+            _ => return Err(format!("Unsupported HQQ materialized prefill nbits={}", nbits)),
+        };
+        let scales_row_stride_bytes = groups * std::mem::size_of::<f32>();
+        let zeros_row_stride_bytes = scales_row_stride_bytes;
+        let threads = 256u32;
+        let blocks = (total as u32).div_ceil(threads);
+        let mut a0 = out_ptr;
+        let mut a1 = desc.packed_ptr;
+        let mut a2 = desc.scales_ptr;
+        let mut a3 = desc.zeros_ptr;
+        let mut a4 = desc.rows as i32;
+        let mut a5 = desc.cols as i32;
+        let mut a6 = desc.group_size as i32;
+        let mut a7 = packed_row_stride_bytes as i32;
+        let mut a8 = scales_row_stride_bytes as i32;
+        let mut a9 = zeros_row_stride_bytes as i32;
+        let mut a10 = nbits as i32;
+        unsafe {
+            launch(
+                self.kernels.hqq_dequant_bf16,
+                (blocks, 1, 1),
+                (threads, 1, 1),
+                0,
+                self.stream,
+                &mut [
+                    &mut a0 as *mut _ as *mut std::ffi::c_void,
+                    &mut a1 as *mut _ as *mut std::ffi::c_void,
+                    &mut a2 as *mut _ as *mut std::ffi::c_void,
+                    &mut a3 as *mut _ as *mut std::ffi::c_void,
+                    &mut a4 as *mut _ as *mut std::ffi::c_void,
+                    &mut a5 as *mut _ as *mut std::ffi::c_void,
+                    &mut a6 as *mut _ as *mut std::ffi::c_void,
+                    &mut a7 as *mut _ as *mut std::ffi::c_void,
+                    &mut a8 as *mut _ as *mut std::ffi::c_void,
+                    &mut a9 as *mut _ as *mut std::ffi::c_void,
+                    &mut a10 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn hqq_prefill_has_sidecar(&self, layer_idx: usize, tensor_name: &str) -> bool {
         self.layer_weights
             .get(layer_idx)
@@ -12499,6 +12602,53 @@ impl PrefillEngine {
         Ok(())
     }
 
+    fn hqq_materialized_prefill_gemm_bf16(
+        &self,
+        layer_idx: usize,
+        tensor_name: &str,
+        desc: &HqqTensorExecDescriptor,
+        input_ptr: u64,
+        output_ptr: u64,
+        m: usize,
+    ) -> Result<(), String> {
+        if m == 0 || desc.rows == 0 || desc.cols == 0 {
+            return Ok(());
+        }
+        let required_elems = desc
+            .rows
+            .checked_mul(desc.cols)
+            .ok_or_else(|| {
+                format!(
+                    "HQQ materialized prefill tensor {} shape overflow: rows={} cols={}",
+                    tensor_name, desc.rows, desc.cols
+                )
+            })?;
+        let scratch = self.scratch.d_hqq_bf16_weight.as_ref().ok_or_else(|| {
+            format!(
+                "HQQ materialized prefill requested but BF16 weight scratch is not allocated for layer {} tensor {}",
+                layer_idx, tensor_name
+            )
+        })?;
+        if scratch.len() < required_elems {
+            return Err(format!(
+                "HQQ materialized prefill scratch too small for layer {} tensor {}: need {} elems, have {}",
+                layer_idx,
+                tensor_name,
+                required_elems,
+                scratch.len()
+            ));
+        }
+        let weight_ptr = *scratch.device_ptr();
+        self.hqq_row_major_dequant_to_bf16(tensor_name, desc, weight_ptr)?;
+        self.apply_hqq_prefill_sidecars(layer_idx, tensor_name, weight_ptr, desc.rows, desc.cols)?;
+        let weight = Bf16Weight {
+            ptr: weight_ptr,
+            n: desc.rows,
+            k: desc.cols,
+        };
+        self.cublas_bf16_gemm(input_ptr, &weight, output_ptr, m)
+    }
+
     /// Dispatch GEMM: HQQ quantized, Marlin (INT4/INT8), or cuBLAS BF16 fallback.
     fn la_gemm(
         &self,
@@ -12512,7 +12662,11 @@ impl PrefillEngine {
         m: usize,
     ) -> Result<(), String> {
         if let Some(desc) = hqq {
-            self.hqq_quantized_prefill_gemm_bf16(layer_idx, tensor_name, desc, a, c, m)
+            if hqq_prefill_materialize_bf16_enabled() {
+                self.hqq_materialized_prefill_gemm_bf16(layer_idx, tensor_name, desc, a, c, m)
+            } else {
+                self.hqq_quantized_prefill_gemm_bf16(layer_idx, tensor_name, desc, a, c, m)
+            }
         } else if let Some(w) = marlin {
             self.marlin_gemm(a, w, c, m)
         } else if let Some(w) = bf16 {
@@ -28943,6 +29097,7 @@ impl PrefillKernels {
                     "fused_add_rmsnorm_batched_kernel",
                     "embedding_batched_kernel",
                     "hqq4_dequant_bf16_kernel",
+                    "hqq_dequant_bf16_kernel",
                     "hqq4_prefill_gemm_bf16_kernel",
                     "hqq6_prefill_gemm_bf16_kernel",
                     "hqq8_prefill_gemm_bf16_kernel",
@@ -29096,6 +29251,7 @@ impl PrefillKernels {
             fused_add_rmsnorm: get("fused_add_rmsnorm_batched_kernel")?,
             embedding: get("embedding_batched_kernel")?,
             hqq4_dequant_bf16: get("hqq4_dequant_bf16_kernel")?,
+            hqq_dequant_bf16: get("hqq_dequant_bf16_kernel")?,
             hqq4_prefill_gemm_bf16: get("hqq4_prefill_gemm_bf16_kernel")?,
             hqq6_prefill_gemm_bf16: get("hqq6_prefill_gemm_bf16_kernel")?,
             hqq8_prefill_gemm_bf16: get("hqq8_prefill_gemm_bf16_kernel")?,
@@ -29210,6 +29366,46 @@ impl PrefillKernels {
 /// allocator fragmentation, cuBLAS workspace, and FLA Triton kernel temporaries.
 /// Used by both `prepare_for_prefill` and `hcs_evict_for_prefill` to ensure consistency.
 pub const PREFILL_SAFETY_MARGIN_MB: usize = 600;
+
+pub fn hqq_prefill_materialize_bf16_enabled() -> bool {
+    std::env::var("KRASIS_HQQ_PREFILL_MATERIALIZE_BF16")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn hqq_prefill_materialize_weight_elems(config: &PrefillModelConfig) -> usize {
+    let h = config.hidden_size;
+    let q_dim = config.num_q_heads * config.head_dim;
+    let kv_dim = config.num_kv_heads * config.head_dim;
+    let mut max_elems = q_dim
+        .checked_mul(2)
+        .and_then(|rows| rows.checked_mul(h))
+        .unwrap_or(0)
+        .max(kv_dim.checked_mul(h).unwrap_or(0))
+        .max(h.checked_mul(q_dim).unwrap_or(0));
+
+    if config.layer_types.iter().any(|&t| t == 3) {
+        let nk = config.la_num_k_heads;
+        let nv = config.la_num_v_heads;
+        let dk = config.la_k_head_dim;
+        let dv = config.la_v_head_dim;
+        let hr = config.la_head_ratio.max(1);
+        let qkvz_rows = nk * (2 * dk + 2 * hr * dv);
+        let ba_rows = nk * 2 * hr;
+        let value_dim = nv * dv;
+        max_elems = max_elems
+            .max(qkvz_rows.checked_mul(h).unwrap_or(0))
+            .max(ba_rows.checked_mul(h).unwrap_or(0))
+            .max(h.checked_mul(value_dim).unwrap_or(0));
+    }
+
+    max_elems
+}
 
 /// Compute total VRAM bytes needed for prefill buffers as a function of max_tokens.
 /// Returns (fixed_bytes, per_token_bytes) including both scratch AND fused MoE buffers.
@@ -29371,6 +29567,9 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
 
     // Fixed costs (independent of max_tokens):
     let mut fixed: usize = 0;
+    if hqq_prefill_materialize_bf16_enabled() {
+        fixed += hqq_prefill_materialize_weight_elems(config) * std::mem::size_of::<u16>();
+    }
     // d_workspace: sms * MARLIN_MAX_LOCK_SLOTS_PER_SM * 4
     fixed += config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM * 4;
     // d_shared_workspace: sms * MARLIN_MAX_LOCK_SLOTS_PER_SM * 4 (shared expert stream, allocated in prepare_for_prefill)
@@ -29536,6 +29735,12 @@ pub fn allocate_scratch_for_prompt(
         d_residual: alloc_u16(max_tokens * h, "residual")?,
         d_scratch1: alloc_u16(max_inter, "scratch1")?,
         d_scratch2: alloc_u16(max_inter, "scratch2")?,
+        d_hqq_bf16_weight: if hqq_prefill_materialize_bf16_enabled() && max_tokens > 0 {
+            let elems = hqq_prefill_materialize_weight_elems(config);
+            Some(alloc_u16(elems, "hqq_bf16_weight")?)
+        } else {
+            None
+        },
         d_fp32_scratch: {
             // fp32_scratch must be large enough for:
             // 1. Marlin C_tmp (FP32 reduce): max_tokens * max_gemm_n

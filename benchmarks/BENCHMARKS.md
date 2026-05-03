@@ -1,5 +1,38 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks - 2026-05-03 (Phase 2GE materialized HQQ prefill)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-122B-A10B
+`tests/q122b-k4v4-hqq6-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ6
+attention, `k4v4` KV cache, INT8 shared/dense/lm-head, layer group size 2,
+graph replay enabled, timing instrumentation off.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Q122B materialized HQQ prefill, HQQ6/k4v4, INT4 experts | HQQ6 | k4v4 | 3003.9 | 24.28 | 42.29 | 3780/12288 (30.8%) | 662 MB | [log](20260503_phase2ge_q122b_k4v4_hqq6_materialized_prefill_benchmark.log) |
+
+Notes:
+- This run used `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1`, an opt-in
+  prefill-only HQQ path. Decode remains compact HQQ/VMM.
+- The HQQ prefill runtime was forced to row-major compact HQQ and each
+  projection was dequantized into a reusable transient BF16 scratch buffer
+  before cuBLAS BF16 GEMM. No persistent BF16 attention residency was added.
+- Q122B HQQ6+k4v4 seq32 witness was run before speed testing and passed:
+  first token `14/14`, prefill `14/14`, exact `280/361`, containment
+  `303/361`.
+- Bounded 10K component timing improved from Phase 2FS `4143.2 ms` to
+  `3600.9 ms`; the old `marlin_float_zp` HQQ projection counter no longer
+  appears in the materialized path.
+- Compared with Phase 2GC stable HQQ VMM graphs, prefill improved
+  `2029.1 -> 3003.9 tok/s`; internal decode was effectively flat
+  `24.49 -> 24.28 tok/s`.
+- VRAM remained tight but inside the configured safety floor: min decode free
+  was `662 MB`.
+
+---
+
 ## Standard Benchmarks - 2026-05-03 (Phase 2GC stable HQQ CUDA graph addresses)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
