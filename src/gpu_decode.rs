@@ -23,6 +23,7 @@ use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig
 use cudarc::driver::sys as cuda_sys;
 
 const GPU_ROUTE_SYNC_DEFAULT_TIMEOUT_MS: u64 = 10_000;
+const PROMPT_HCS_DEFAULT_RETAIN_PCT: usize = 85;
 
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
@@ -31,6 +32,27 @@ fn env_truthy(name: &str) -> bool {
             "1" | "true" | "yes" | "on"
         ))
         .unwrap_or(false)
+}
+
+fn env_enabled_default(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|v| match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        })
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn prompt_hcs_log_enabled() -> bool {
+    env_truthy("KRASIS_PROMPT_HCS_LOG")
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -399,6 +421,19 @@ struct PromptHcsShadowVariant {
     layer_stats: Vec<PromptHcsShadowLayerStats>,
 }
 
+struct PromptHcsBlendPlan {
+    retain_pct: usize,
+    heatmap_retained: usize,
+    prompt_ranked: usize,
+    backfilled: usize,
+    soft_capacity: usize,
+    hard_resident: usize,
+    prompt_ranked_candidates: usize,
+    heatmap_candidates: usize,
+    ranking: Vec<(usize, usize)>,
+    candidate_resident: Vec<bool>,
+}
+
 #[derive(Clone)]
 struct PromptHcsShadowStats {
     enabled: bool,
@@ -415,6 +450,146 @@ struct PromptHcsShadowStats {
 
 impl PromptHcsShadowStats {
     const RETAIN_PCTS: [usize; 11] = [10, 20, 30, 40, 50, 60, 70, 75, 80, 85, 90];
+
+    fn build_blend_plan(
+        counts: &[u64],
+        count_layers: usize,
+        count_experts_per_layer: usize,
+        hcs: &HcsState,
+        retain_pct: usize,
+        min_heatmap_slots: usize,
+    ) -> Option<PromptHcsBlendPlan> {
+        let num_layers = hcs.cache_fast_num_layers;
+        let num_experts = hcs.num_experts_per_layer;
+        let total = num_layers.saturating_mul(num_experts);
+        if total == 0 || count_layers == 0 || count_experts_per_layer == 0 {
+            return None;
+        }
+
+        let mut hard = vec![false; total];
+        let mut candidate = vec![false; total];
+        for idx in 0..total.min(hcs.cache_fast.len()) {
+            if hcs.cache_fast[idx][0] != 0 {
+                hard[idx] = true;
+                candidate[idx] = true;
+            }
+        }
+
+        for slot in 0..hcs.soft_slot_to_expert.len().min(hcs.soft_num_slots) {
+            if let Some((layer_idx, expert_idx)) = hcs.soft_slot_to_expert[slot] {
+                if layer_idx < num_layers && expert_idx < num_experts {
+                    let idx = layer_idx * num_experts + expert_idx;
+                    hard[idx] = false;
+                    candidate[idx] = false;
+                }
+            }
+        }
+        let hard_resident = hard.iter().filter(|&&v| v).count();
+        let soft_capacity = hcs.soft_num_slots;
+        if soft_capacity == 0 {
+            return None;
+        }
+
+        let mut prompt_ranked_candidates: Vec<(u64, usize, usize)> = Vec::new();
+        for layer_idx in 0..num_layers.min(count_layers) {
+            for expert_idx in 0..num_experts.min(count_experts_per_layer) {
+                let hcs_idx = layer_idx * num_experts + expert_idx;
+                if hard[hcs_idx] {
+                    continue;
+                }
+                let count_idx = layer_idx * count_experts_per_layer + expert_idx;
+                let count = counts.get(count_idx).copied().unwrap_or(0);
+                if count > 0 {
+                    prompt_ranked_candidates.push((count, layer_idx, expert_idx));
+                }
+            }
+        }
+        prompt_ranked_candidates.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        let prompt_ranked_candidates_len = prompt_ranked_candidates.len();
+
+        let heatmap_source = if hcs.soft_heatmap_ranking.is_empty() {
+            &hcs.soft_ranking
+        } else {
+            &hcs.soft_heatmap_ranking
+        };
+        let mut heatmap_candidates: Vec<(usize, usize)> = Vec::new();
+        for &(layer_idx, expert_idx) in heatmap_source {
+            if layer_idx >= num_layers || expert_idx >= num_experts {
+                continue;
+            }
+            let idx = layer_idx * num_experts + expert_idx;
+            if hard[idx] {
+                continue;
+            }
+            heatmap_candidates.push((layer_idx, expert_idx));
+        }
+        let heatmap_candidates_len = heatmap_candidates.len();
+
+        let retain_slots = ((soft_capacity.saturating_mul(retain_pct) + 99) / 100)
+            .max(min_heatmap_slots)
+            .min(soft_capacity);
+        let mut ranking: Vec<(usize, usize)> = Vec::with_capacity(soft_capacity);
+        let mut heatmap_retained = 0usize;
+        for &(layer_idx, expert_idx) in &heatmap_candidates {
+            if heatmap_retained >= retain_slots || ranking.len() >= soft_capacity {
+                break;
+            }
+            let idx = layer_idx * num_experts + expert_idx;
+            if hard[idx] || candidate[idx] {
+                continue;
+            }
+            candidate[idx] = true;
+            ranking.push((layer_idx, expert_idx));
+            heatmap_retained += 1;
+        }
+
+        let mut prompt_ranked = 0usize;
+        for &(_, layer_idx, expert_idx) in &prompt_ranked_candidates {
+            if ranking.len() >= soft_capacity {
+                break;
+            }
+            let idx = layer_idx * num_experts + expert_idx;
+            if hard[idx] || candidate[idx] {
+                continue;
+            }
+            candidate[idx] = true;
+            ranking.push((layer_idx, expert_idx));
+            prompt_ranked += 1;
+        }
+
+        let mut backfilled = 0usize;
+        if ranking.len() < soft_capacity {
+            for &(layer_idx, expert_idx) in &heatmap_candidates {
+                if ranking.len() >= soft_capacity {
+                    break;
+                }
+                let idx = layer_idx * num_experts + expert_idx;
+                if hard[idx] || candidate[idx] {
+                    continue;
+                }
+                candidate[idx] = true;
+                ranking.push((layer_idx, expert_idx));
+                backfilled += 1;
+            }
+        }
+
+        Some(PromptHcsBlendPlan {
+            retain_pct,
+            heatmap_retained,
+            prompt_ranked,
+            backfilled,
+            soft_capacity,
+            hard_resident,
+            prompt_ranked_candidates: prompt_ranked_candidates_len,
+            heatmap_candidates: heatmap_candidates_len,
+            ranking,
+            candidate_resident: candidate,
+        })
+    }
 
     fn disabled() -> Self {
         Self {
@@ -443,8 +618,7 @@ impl PromptHcsShadowStats {
         }
         let num_layers = hcs.cache_fast_num_layers;
         let num_experts = hcs.num_experts_per_layer;
-        let total = num_layers.saturating_mul(num_experts);
-        if total == 0 || count_layers == 0 || count_experts_per_layer == 0 {
+        if num_layers == 0 || num_experts == 0 || count_layers == 0 || count_experts_per_layer == 0 {
             log::warn!(
                 "PROMPT HCS SHADOW disabled: invalid dimensions hcs_layers={} hcs_experts={} count_layers={} count_experts={}",
                 num_layers,
@@ -455,135 +629,51 @@ impl PromptHcsShadowStats {
             return Self::disabled();
         }
 
-        let mut hard = vec![false; total];
-        let mut candidate = vec![false; total];
-        for idx in 0..total.min(hcs.cache_fast.len()) {
-            if hcs.cache_fast[idx][0] != 0 {
-                hard[idx] = true;
-                candidate[idx] = true;
-            }
-        }
-
-        let loaded_soft_slots = hcs
-            .soft_chunks_loaded
-            .saturating_mul(hcs.soft_slots_per_chunk)
-            .min(hcs.soft_num_slots)
-            .min(hcs.soft_slot_to_expert.len());
-        let mut soft_capacity = 0usize;
-        for slot in 0..loaded_soft_slots {
-            if let Some((layer_idx, expert_idx)) = hcs.soft_slot_to_expert[slot] {
-                if layer_idx < num_layers && expert_idx < num_experts {
-                    let idx = layer_idx * num_experts + expert_idx;
-                    hard[idx] = false;
-                    candidate[idx] = false;
-                    soft_capacity += 1;
-                }
-            }
-        }
-        let hard_resident = hard.iter().filter(|&&v| v).count();
-
-        let mut prompt_ranked_candidates: Vec<(u64, usize, usize)> = Vec::new();
-        for layer_idx in 0..num_layers.min(count_layers) {
-            for expert_idx in 0..num_experts.min(count_experts_per_layer) {
-                let hcs_idx = layer_idx * num_experts + expert_idx;
-                if hard[hcs_idx] {
-                    continue;
-                }
-                let count_idx = layer_idx * count_experts_per_layer + expert_idx;
-                let count = counts.get(count_idx).copied().unwrap_or(0);
-                if count > 0 {
-                    prompt_ranked_candidates.push((count, layer_idx, expert_idx));
-                }
-            }
-        }
-        prompt_ranked_candidates.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.2.cmp(&b.2))
-        });
-
-        let mut heatmap_candidates: Vec<(usize, usize)> = Vec::new();
-        for &(layer_idx, expert_idx) in &hcs.soft_ranking {
-            if layer_idx >= num_layers || expert_idx >= num_experts {
-                continue;
-            }
-            let idx = layer_idx * num_experts + expert_idx;
-            if hard[idx] {
-                continue;
-            }
-            heatmap_candidates.push((layer_idx, expert_idx));
-        }
+        let Some(summary_plan) = Self::build_blend_plan(
+            counts,
+            count_layers,
+            count_experts_per_layer,
+            hcs,
+            PROMPT_HCS_DEFAULT_RETAIN_PCT,
+            0,
+        ) else {
+            log::warn!("PROMPT HCS SHADOW disabled: failed to build default blend plan");
+            return Self::disabled();
+        };
 
         let mut variants = Vec::new();
         for retain_pct in Self::RETAIN_PCTS {
-            let retain_slots = (soft_capacity.saturating_mul(retain_pct) + 99) / 100;
-            let mut candidate = candidate.clone();
-            let mut filled = 0usize;
-            let mut heatmap_retained = 0usize;
-
-            for &(layer_idx, expert_idx) in &heatmap_candidates {
-                if heatmap_retained >= retain_slots || filled >= soft_capacity {
-                    break;
-                }
-                let idx = layer_idx * num_experts + expert_idx;
-                if hard[idx] || candidate[idx] {
-                    continue;
-                }
-                candidate[idx] = true;
-                heatmap_retained += 1;
-                filled += 1;
-            }
-
-            let mut prompt_ranked = 0usize;
-            for &(_, layer_idx, expert_idx) in &prompt_ranked_candidates {
-                if filled >= soft_capacity {
-                    break;
-                }
-                let idx = layer_idx * num_experts + expert_idx;
-                if hard[idx] || candidate[idx] {
-                    continue;
-                }
-                candidate[idx] = true;
-                prompt_ranked += 1;
-                filled += 1;
-            }
-
-            let mut backfilled = 0usize;
-            if filled < soft_capacity {
-                for &(layer_idx, expert_idx) in &heatmap_candidates {
-                    if filled >= soft_capacity {
-                        break;
-                    }
-                    let idx = layer_idx * num_experts + expert_idx;
-                    if hard[idx] || candidate[idx] {
-                        continue;
-                    }
-                    candidate[idx] = true;
-                    backfilled += 1;
-                    filled += 1;
-                }
-            }
+            let Some(plan) = Self::build_blend_plan(
+                counts,
+                count_layers,
+                count_experts_per_layer,
+                hcs,
+                retain_pct,
+                0,
+            ) else {
+                continue;
+            };
 
             log::info!(
                 "PROMPT HCS SHADOW BUILD retain_pct={} prompt_tokens={} hard_resident={} soft_capacity={} heatmap_retained={} prompt_ranked={} backfilled={} candidate_total={} count_layers={} count_experts={}",
-                retain_pct,
+                plan.retain_pct,
                 prompt_tokens,
-                hard_resident,
-                soft_capacity,
-                heatmap_retained,
-                prompt_ranked,
-                backfilled,
-                candidate.iter().filter(|&&v| v).count(),
+                plan.hard_resident,
+                plan.soft_capacity,
+                plan.heatmap_retained,
+                plan.prompt_ranked,
+                plan.backfilled,
+                plan.candidate_resident.iter().filter(|&&v| v).count(),
                 count_layers,
                 count_experts_per_layer,
             );
 
             variants.push(PromptHcsShadowVariant {
-                retain_pct,
-                heatmap_retained,
-                prompt_ranked,
-                backfilled,
-                candidate_resident: candidate,
+                retain_pct: plan.retain_pct,
+                heatmap_retained: plan.heatmap_retained,
+                prompt_ranked: plan.prompt_ranked,
+                backfilled: plan.backfilled,
+                candidate_resident: plan.candidate_resident,
                 shadow_hcs: 0,
                 shadow_cold: 0,
                 extra_hits: 0,
@@ -596,10 +686,10 @@ impl PromptHcsShadowStats {
             "PROMPT HCS SHADOW BUILD variants={} prompt_tokens={} hard_resident={} soft_capacity={} prompt_ranked_candidates={} heatmap_candidates={} count_layers={} count_experts={}",
             variants.len(),
             prompt_tokens,
-            hard_resident,
-            soft_capacity,
-            prompt_ranked_candidates.len(),
-            heatmap_candidates.len(),
+            summary_plan.hard_resident,
+            summary_plan.soft_capacity,
+            summary_plan.prompt_ranked_candidates,
+            summary_plan.heatmap_candidates,
             count_layers,
             count_experts_per_layer,
         );
@@ -609,8 +699,8 @@ impl PromptHcsShadowStats {
             prompt_tokens,
             num_layers,
             num_experts_per_layer: num_experts,
-            soft_capacity,
-            hard_resident,
+            soft_capacity: summary_plan.soft_capacity,
+            hard_resident: summary_plan.hard_resident,
             selected_total: 0,
             actual_hcs: 0,
             actual_cold: 0,
@@ -763,6 +853,210 @@ impl PromptHcsShadowStats {
             );
         }
     }
+}
+
+fn prompt_hcs_reload_enabled() -> bool {
+    env_enabled_default("KRASIS_PROMPT_HCS_RELOAD", true)
+}
+
+fn prompt_hcs_reload_retain_pct() -> usize {
+    env_usize("KRASIS_PROMPT_HCS_RETAIN_PCT", PROMPT_HCS_DEFAULT_RETAIN_PCT)
+        .clamp(0, 100)
+}
+
+fn pack_soft_host_slot(
+    hcs: &mut HcsState,
+    moe_layers: &[Option<MoeLayerData>],
+    slot: usize,
+    layer_idx: usize,
+    expert_idx: usize,
+) -> bool {
+    let spc = hcs.soft_slots_per_chunk;
+    let slot_size = hcs.soft_slot_size;
+    if spc == 0 || slot_size == 0 || slot >= hcs.soft_num_slots {
+        return false;
+    }
+    let Some(moe) = moe_layers.get(layer_idx).and_then(|m| m.as_ref()) else {
+        return false;
+    };
+    let Some(expert) = moe.experts.get(expert_idx) else {
+        return false;
+    };
+    let chunk_idx = slot / spc;
+    if chunk_idx >= hcs.soft_host_chunks.len() {
+        return false;
+    }
+    let offset_in_chunk = slot % spc;
+    let host_offset = offset_in_chunk * slot_size;
+    let w13p_off = 0usize;
+    let w13s_off = expert.w13_packed_bytes;
+    let w2p_off = w13s_off + expert.w13_scales_bytes;
+    let w2s_off = w2p_off + expert.w2_packed_bytes;
+    let needed = w2s_off.saturating_add(expert.w2_scales_bytes);
+    if needed > slot_size {
+        log::warn!(
+            "PROMPT HCS RELOAD: slot pack skipped L{}E{} needs {} bytes > slot_size {}",
+            layer_idx,
+            expert_idx,
+            needed,
+            slot_size,
+        );
+        return false;
+    }
+    unsafe {
+        let dst = hcs.soft_host_chunks[chunk_idx].as_mut_ptr().add(host_offset);
+        std::ptr::copy_nonoverlapping(
+            expert.w13_packed_ptr as *const u8,
+            dst.add(w13p_off),
+            expert.w13_packed_bytes,
+        );
+        std::ptr::copy_nonoverlapping(
+            expert.w13_scales_ptr as *const u8,
+            dst.add(w13s_off),
+            expert.w13_scales_bytes,
+        );
+        std::ptr::copy_nonoverlapping(
+            expert.w2_packed_ptr as *const u8,
+            dst.add(w2p_off),
+            expert.w2_packed_bytes,
+        );
+        std::ptr::copy_nonoverlapping(
+            expert.w2_scales_ptr as *const u8,
+            dst.add(w2s_off),
+            expert.w2_scales_bytes,
+        );
+    }
+    true
+}
+
+fn apply_prompt_hcs_reload_blend(
+    hcs: &mut HcsState,
+    moe_layers: &[Option<MoeLayerData>],
+    counts: &[u64],
+    count_layers: usize,
+    count_experts_per_layer: usize,
+    prompt_tokens: usize,
+    target_chunks: usize,
+) -> usize {
+    if !prompt_hcs_reload_enabled()
+        || counts.is_empty()
+        || hcs.soft_num_slots == 0
+        || hcs.soft_slots_per_chunk == 0
+        || hcs.soft_host_chunks.is_empty()
+    {
+        return 0;
+    }
+    let retain_pct = prompt_hcs_reload_retain_pct();
+    let spc = hcs.soft_slots_per_chunk;
+    let requested_retain_slots =
+        (hcs.soft_num_slots.saturating_mul(retain_pct) + 99) / 100;
+    let retain_chunks = if requested_retain_slots == 0 {
+        0
+    } else {
+        ((requested_retain_slots + spc - 1) / spc).min(hcs.soft_total_chunks)
+    };
+    let retained_chunks = retain_chunks.min(target_chunks);
+    let min_heatmap_slots = retained_chunks.saturating_mul(spc).min(hcs.soft_num_slots);
+    let Some(plan) = PromptHcsShadowStats::build_blend_plan(
+        counts,
+        count_layers,
+        count_experts_per_layer,
+        hcs,
+        retain_pct,
+        min_heatmap_slots,
+    ) else {
+        log::warn!(
+            "PROMPT HCS RELOAD disabled for request: failed to build blend plan prompt_tokens={} count_layers={} count_experts={}",
+            prompt_tokens,
+            count_layers,
+            count_experts_per_layer,
+        );
+        return 0;
+    };
+
+    if prompt_hcs_log_enabled() {
+        eprintln!(
+            "[PROMPT-HCS] reload plan retain_pct={} effective_heatmap_slots={} prompt_tokens={} target_chunks={} loaded_chunks={} prompt_ranked={} backfilled={}",
+            retain_pct,
+            min_heatmap_slots,
+            prompt_tokens,
+            target_chunks,
+            hcs.soft_chunks_loaded,
+            plan.prompt_ranked,
+            plan.backfilled,
+        );
+    }
+
+    let loaded_slots = hcs
+        .soft_chunks_loaded
+        .saturating_mul(spc)
+        .min(hcs.soft_num_slots);
+    let target_slots = target_chunks
+        .saturating_mul(spc)
+        .min(hcs.soft_num_slots)
+        .min(plan.ranking.len());
+    if target_slots <= loaded_slots {
+        return 0;
+    }
+
+    let mut changed_slots = 0usize;
+    let mut repacked_slots = 0usize;
+    for slot in loaded_slots..target_slots {
+        let desired = plan.ranking[slot];
+        let current = hcs.soft_ranking.get(slot).copied();
+        if current == Some(desired) {
+            continue;
+        }
+        changed_slots += 1;
+        if pack_soft_host_slot(hcs, moe_layers, slot, desired.0, desired.1) {
+            repacked_slots += 1;
+        } else {
+            panic!(
+                "PROMPT HCS RELOAD failed to repack soft slot {} as L{}E{}; refusing to continue with mismatched ranking/host contents",
+                slot,
+                desired.0,
+                desired.1,
+            );
+        }
+    }
+
+    if hcs.soft_ranking.len() == plan.ranking.len() {
+        hcs.soft_ranking = plan.ranking;
+    } else {
+        log::warn!(
+            "PROMPT HCS RELOAD: ranking length mismatch current={} planned={}; keeping current ranking",
+            hcs.soft_ranking.len(),
+            plan.ranking.len(),
+        );
+        return 0;
+    }
+
+    log::info!(
+        "PROMPT HCS RELOAD applied: retain_pct={} effective_heatmap_slots={} prompt_tokens={} target_chunks={} loaded_chunks={} changed_slots={} repacked_slots={} heatmap_retained={} prompt_ranked={} backfilled={} prompt_candidates={} heatmap_candidates={}",
+        retain_pct,
+        min_heatmap_slots,
+        prompt_tokens,
+        target_chunks,
+        hcs.soft_chunks_loaded,
+        changed_slots,
+        repacked_slots,
+        plan.heatmap_retained,
+        plan.prompt_ranked,
+        plan.backfilled,
+        plan.prompt_ranked_candidates,
+        plan.heatmap_candidates,
+    );
+    if prompt_hcs_log_enabled() {
+        eprintln!(
+            "[PROMPT-HCS] reload applied retain_pct={} changed_slots={} repacked_slots={} target_chunks={} loaded_chunks={}",
+            retain_pct,
+            changed_slots,
+            repacked_slots,
+            target_chunks,
+            hcs.soft_chunks_loaded,
+        );
+    }
+    repacked_slots
 }
 
 fn sync_hcs_route_pointer_updates(
@@ -1991,6 +2285,9 @@ struct HcsState {
     /// Ordered list of experts in the soft tier (for reload after eviction).
     /// Stored in ranking order so reload is deterministic.
     soft_ranking: Vec<(usize, usize)>,
+    /// Original global heatmap ranking for soft tier. This stays unchanged so
+    /// request-scoped prompt blends never overwrite the baseline ordering.
+    soft_heatmap_ranking: Vec<(usize, usize)>,
     /// Number of soft experts currently loaded.
     soft_num_cached: usize,
     /// Whether soft tier is currently loaded (false during prefill).
@@ -2066,6 +2363,7 @@ impl HcsState {
             soft_slot_size: 0,
             soft_slot_to_expert: Vec::new(),
             soft_ranking: Vec::new(),
+            soft_heatmap_ranking: Vec::new(),
             soft_num_cached: 0,
             soft_loaded: false,
             soft_reload_pending: false,
@@ -4747,6 +5045,10 @@ struct GpuDecodeGraph {
     route_shadow_bias: Vec<f32>,
     route_shadow_corr: Vec<f32>,
     route_shadow_scores: Vec<f32>,
+    prompt_hcs_counts: Vec<u64>,
+    prompt_hcs_count_layers: usize,
+    prompt_hcs_count_experts_per_layer: usize,
+    prompt_hcs_prompt_tokens: usize,
     prompt_hcs_shadow: PromptHcsShadowStats,
 
     // ── Speculative decode batch buffers (allocated when draft model loaded) ──
@@ -8405,6 +8707,10 @@ impl GpuDecodeStore {
             route_shadow_bias: Vec::new(),
             route_shadow_corr: Vec::new(),
             route_shadow_scores: Vec::new(),
+            prompt_hcs_counts: Vec::new(),
+            prompt_hcs_count_layers: 0,
+            prompt_hcs_count_experts_per_layer: 0,
+            prompt_hcs_prompt_tokens: 0,
             prompt_hcs_shadow: PromptHcsShadowStats::disabled(),
             batch_max: 0,
             d_batch_hidden: None,
@@ -11429,6 +11735,7 @@ impl GpuDecodeStore {
         hcs.soft_slot_size = slot_size;
         hcs.soft_slot_to_expert = soft_slot_to_expert;
         hcs.soft_ranking = soft_ranking;
+        hcs.soft_heatmap_ranking = hcs.soft_ranking.clone();
         hcs.soft_num_cached = soft_loaded;
         hcs.soft_loaded = true;
         hcs.num_cached += soft_loaded;
@@ -25923,6 +26230,10 @@ impl GpuDecodeStore {
             None => return (0, 0.0),
         };
         let sync_route_ptrs = graph.gpu_route_sync;
+        let prompt_counts = graph.prompt_hcs_counts.clone();
+        let prompt_count_layers = graph.prompt_hcs_count_layers;
+        let prompt_count_experts_per_layer = graph.prompt_hcs_count_experts_per_layer;
+        let prompt_tokens = graph.prompt_hcs_prompt_tokens;
         let hcs = match graph.hcs.as_mut() {
             Some(h) => h,
             None => return (0, 0.0),
@@ -25969,6 +26280,42 @@ impl GpuDecodeStore {
                     freed_bytes as f64 / (1024.0 * 1024.0),
                 );
             }
+        }
+
+        if prompt_hcs_reload_enabled() && !prompt_counts.is_empty() && target_chunks > 0 {
+            let retain_pct = prompt_hcs_reload_retain_pct();
+            let retain_slots = (hcs.soft_num_slots.saturating_mul(retain_pct) + 99) / 100;
+            let retain_chunks = if retain_slots == 0 {
+                0
+            } else {
+                ((retain_slots + spc - 1) / spc).min(hcs.soft_total_chunks)
+            }
+            .min(target_chunks);
+            if target_chunks > retain_chunks && hcs.soft_chunks_loaded > retain_chunks {
+                let (evicted, freed_bytes) =
+                    hcs.trim_soft_chunks_to(
+                        retain_chunks,
+                        sync_route_ptrs.then_some(&route_sync_device),
+                    );
+                if evicted > 0 || freed_bytes > 0 {
+                    log::info!(
+                        "PROMPT HCS RELOAD: trimmed soft tail to {} chunks for retain_pct={} before prompt-tail reload (evicted {} experts, freed {:.1} MB)",
+                        retain_chunks,
+                        retain_pct,
+                        evicted,
+                        freed_bytes as f64 / (1024.0 * 1024.0),
+                    );
+                }
+            }
+            apply_prompt_hcs_reload_blend(
+                hcs,
+                &graph.moe_layers,
+                &prompt_counts,
+                prompt_count_layers,
+                prompt_count_experts_per_layer,
+                prompt_tokens,
+                target_chunks,
+            );
         }
 
         let already_loaded = hcs.soft_chunks_loaded;
@@ -26132,6 +26479,46 @@ impl GpuDecodeStore {
     /// Call hcs_check_soft_reload_complete() each decode step to activate
     /// the soft tier once all DMA finishes.
     /// Returns (num_experts_queued, alloc_mb).
+    pub fn install_prompt_hcs_counts(
+        &mut self,
+        counts: Vec<u64>,
+        count_layers: usize,
+        count_experts_per_layer: usize,
+        prompt_tokens: usize,
+    ) {
+        let graph = match self.graph.as_mut() {
+            Some(g) => g,
+            None => return,
+        };
+        graph.prompt_hcs_counts = counts;
+        graph.prompt_hcs_count_layers = count_layers;
+        graph.prompt_hcs_count_experts_per_layer = count_experts_per_layer;
+        graph.prompt_hcs_prompt_tokens = prompt_tokens;
+        if prompt_hcs_log_enabled() {
+            eprintln!(
+                "[PROMPT-HCS] counts installed prompt_tokens={} count_layers={} count_experts={}",
+                prompt_tokens,
+                count_layers,
+                count_experts_per_layer,
+            );
+        }
+        log::info!(
+            "PROMPT HCS RELOAD counts installed: prompt_tokens={} count_layers={} count_experts={}",
+            prompt_tokens,
+            count_layers,
+            count_experts_per_layer,
+        );
+    }
+
+    pub fn clear_prompt_hcs_counts(&mut self) {
+        if let Some(graph) = self.graph.as_mut() {
+            graph.prompt_hcs_counts.clear();
+            graph.prompt_hcs_count_layers = 0;
+            graph.prompt_hcs_count_experts_per_layer = 0;
+            graph.prompt_hcs_prompt_tokens = 0;
+        }
+    }
+
     pub fn install_prompt_hcs_shadow(
         &mut self,
         counts: Vec<u64>,
@@ -26174,6 +26561,10 @@ impl GpuDecodeStore {
             None => return (0, 0.0),
         };
         let sync_route_ptrs = graph.gpu_route_sync;
+        let prompt_counts = graph.prompt_hcs_counts.clone();
+        let prompt_count_layers = graph.prompt_hcs_count_layers;
+        let prompt_count_experts_per_layer = graph.prompt_hcs_count_experts_per_layer;
+        let prompt_tokens = graph.prompt_hcs_prompt_tokens;
         let hcs = match graph.hcs.as_mut() {
             Some(h) => h,
             None => return (0, 0.0),
@@ -26220,6 +26611,42 @@ impl GpuDecodeStore {
                     freed_bytes as f64 / (1024.0 * 1024.0),
                 );
             }
+        }
+
+        if prompt_hcs_reload_enabled() && !prompt_counts.is_empty() && target_chunks > 0 {
+            let retain_pct = prompt_hcs_reload_retain_pct();
+            let retain_slots = (hcs.soft_num_slots.saturating_mul(retain_pct) + 99) / 100;
+            let retain_chunks = if retain_slots == 0 {
+                0
+            } else {
+                ((retain_slots + spc - 1) / spc).min(hcs.soft_total_chunks)
+            }
+            .min(target_chunks);
+            if target_chunks > retain_chunks && hcs.soft_chunks_loaded > retain_chunks {
+                let (evicted, freed_bytes) =
+                    hcs.trim_soft_chunks_to(
+                        retain_chunks,
+                        sync_route_ptrs.then_some(&route_sync_device),
+                    );
+                if evicted > 0 || freed_bytes > 0 {
+                    log::info!(
+                        "PROMPT HCS RELOAD: trimmed soft tail to {} chunks for retain_pct={} before prompt-tail async reload (evicted {} experts, freed {:.1} MB)",
+                        retain_chunks,
+                        retain_pct,
+                        evicted,
+                        freed_bytes as f64 / (1024.0 * 1024.0),
+                    );
+                }
+            }
+            apply_prompt_hcs_reload_blend(
+                hcs,
+                &graph.moe_layers,
+                &prompt_counts,
+                prompt_count_layers,
+                prompt_count_experts_per_layer,
+                prompt_tokens,
+                target_chunks,
+            );
         }
 
         let already_loaded = hcs.soft_chunks_loaded;

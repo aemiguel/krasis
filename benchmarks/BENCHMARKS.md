@@ -1,5 +1,47 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks - 2026-05-03 (Phase 2GO prompt-conditioned HCS reload default)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the runs.
+
+Prompt-conditioned HCS reload is enabled by default. It preserves the hard tier,
+keeps the top `85%` of the global heatmap soft ranking, and fills the lower
+soft tail from exact prefill expert counts for the current request. Routing,
+expert execution, weights, and outputs remain exact; only soft-tier residency
+order changes. `KRASIS_PROMPT_HCS_RELOAD=0` disables it, and
+`KRASIS_PROMPT_HCS_RETAIN_PCT` can override the retain percentage.
+
+Timing instrumentation was disabled for all speed rows below.
+
+| Model / run | Config / command | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|-------------|------------------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Qwen3.5-122B-A10B prompt-HCS default | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 ./dev benchmark tests/q122b-k4v4-hqq6-int4-benchmark.conf` | HQQ6 | k4v4 | 4880.4 | 25.29 | 44.95 | 3780/12288 (30.8%) | 662 MB | [log](20260503_phase2go_q122b_k4v4_hqq6_prompt_hcs_reload_benchmark.log) |
+| Qwen3.5-122B-A10B same-build reload-off control | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_PROMPT_HCS_RELOAD=0 ./dev benchmark tests/q122b-k4v4-hqq6-int4-benchmark.conf` | HQQ6 | k4v4 | 4060.3 | 24.30 | 43.63 | 3780/12288 (30.8%) | 662 MB | [log](20260503_phase2go_q122b_k4v4_hqq6_prompt_hcs_reload_off_control_benchmark.log) |
+| Qwen3-Coder-Next prompt-HCS default | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 ./dev speed-test` | HQQ8 | k4v4 | 8231.6 | 89.37 | 145.21 | 15147/24576 (61.6%) | 706 MB | [log](20260503_phase2go_qcn_hqq8_k4v4_prompt_hcs_speedtest.log) |
+
+Validation:
+- Q122B HQQ6+k4v4 seq32 witness passed before speed testing:
+  first token `14/14`, prefill `14/14`, exact `280/361`, containment
+  `303/361`, full exact `7/14`.
+- A marker-enabled run verified the path was active:
+  `retain_pct=85`, `effective_heatmap_slots=3456`, and roughly
+  `588-594` soft tail slots repacked for short benchmark requests. The final
+  production benchmark gated those stderr markers behind
+  `KRASIS_PROMPT_HCS_LOG=1`.
+
+Notes:
+- Compared with Phase 2GH Q122B baseline, prompt-HCS default improved prefill
+  `4689.8 -> 4880.4 tok/s` and internal decode `24.80 -> 25.29 tok/s`, with
+  min free VRAM unchanged at `662 MB`.
+- The same-build reload-off control was slower than the production-default
+  run, confirming the default behavior is not just benchmark variance in this
+  pair.
+- QCN speed-test decode improved versus the prior Phase 2GI QCN row
+  (`81.02 -> 89.37 tok/s`); prefill remained in the same band
+  (`8352.2 -> 8231.6 tok/s`).
+
+---
+
 ## Standard Benchmarks - 2026-05-03 (Phase 2GJ metadata-only GPU route sync experiment)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.

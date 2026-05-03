@@ -1005,6 +1005,19 @@ fn handle_chat_completion(
     crate::vram_monitor::report_event("reload_start");
     let t_reload = Instant::now();
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+    if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot.as_ref() {
+        log::info!(
+            "Request {}: prompt-HCS snapshot ready: prompt_tokens={} layers={} experts={}",
+            request_id,
+            prompt_tokens,
+            layers,
+            experts,
+        );
+        store.install_prompt_hcs_counts(counts.clone(), *layers, *experts, *prompt_tokens);
+    } else {
+        log::warn!("Request {}: prompt-HCS snapshot missing before reload", request_id);
+        store.clear_prompt_hcs_counts();
+    }
     {
         let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async(prompt_len);
         if queued > 0 {
@@ -1020,8 +1033,8 @@ fn handle_chat_completion(
         log::info!("Request {}: HCS reload complete: {} experts, {:.1}ms DMA",
             request_id, activated, real_reload_ms);
     }
-    if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot {
-        store.install_prompt_hcs_shadow(counts, layers, experts, prompt_tokens);
+    if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot.as_ref() {
+        store.install_prompt_hcs_shadow(counts.clone(), *layers, *experts, *prompt_tokens);
     } else {
         store.clear_prompt_hcs_shadow();
     }
@@ -1423,6 +1436,18 @@ fn handle_reference_test(
 
     // ── Reload soft HCS after prefill ──
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+    if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot.as_ref() {
+        log::info!(
+            "reference_test: prompt-HCS snapshot ready: prompt_tokens={} layers={} experts={}",
+            prompt_tokens,
+            layers,
+            experts,
+        );
+        store.install_prompt_hcs_counts(counts.clone(), *layers, *experts, *prompt_tokens);
+    } else {
+        log::warn!("reference_test: prompt-HCS snapshot missing before reload");
+        store.clear_prompt_hcs_counts();
+    }
     let (queued, alloc_mb) = {
         let (queued, alloc_mb) = store.hcs_reload_after_prefill_async(prompt_len);
         if queued > 0 {
@@ -1435,8 +1460,8 @@ fn handle_reference_test(
     if activated > 0 {
         log::info!("reference_test: HCS reload complete: {} experts, {:.1}ms DMA", activated, dma_ms);
     }
-    if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot {
-        store.install_prompt_hcs_shadow(counts, layers, experts, prompt_tokens);
+    if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot.as_ref() {
+        store.install_prompt_hcs_shadow(counts.clone(), *layers, *experts, *prompt_tokens);
     } else {
         store.clear_prompt_hcs_shadow();
     }
@@ -2633,6 +2658,18 @@ impl RustServer {
         // Reload soft HCS after prefill
         crate::vram_monitor::report_event("hcs_soft_load_start");
         let t_reload = Instant::now();
+        if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot.as_ref() {
+            log::info!(
+                "Benchmark: prompt-HCS snapshot ready: prompt_tokens={} layers={} experts={}",
+                prompt_tokens,
+                layers,
+                experts,
+            );
+            store.install_prompt_hcs_counts(counts.clone(), *layers, *experts, *prompt_tokens);
+        } else {
+            log::warn!("Benchmark: prompt-HCS snapshot missing before reload");
+            store.clear_prompt_hcs_counts();
+        }
         let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async(prompt_len);
         if queued > 0 {
             log::info!("Benchmark: HCS soft async reload queued {} experts ({} tokens)",
@@ -2644,8 +2681,8 @@ impl RustServer {
             log::info!("Benchmark: HCS reload complete: {} experts, {:.1}ms DMA",
                 activated, real_reload_dma_ms);
         }
-        if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot {
-            store.install_prompt_hcs_shadow(counts, layers, experts, prompt_tokens);
+        if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot.as_ref() {
+            store.install_prompt_hcs_shadow(counts.clone(), *layers, *experts, *prompt_tokens);
         } else {
             store.clear_prompt_hcs_shadow();
         }

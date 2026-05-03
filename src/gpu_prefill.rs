@@ -33,6 +33,15 @@ fn stderr_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn prompt_hcs_log_enabled() -> bool {
+    std::env::var("KRASIS_PROMPT_HCS_LOG")
+        .map(|v| matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ))
+        .unwrap_or(false)
+}
+
 fn prefill_debug_enabled() -> bool {
     std::env::var("KRASIS_PREFILL_DEBUG")
         .map(|v| v == "1")
@@ -3422,12 +3431,19 @@ impl Drop for PrefillEngine {
 
 impl PrefillEngine {
     fn prompt_hcs_shadow_env_enabled() -> bool {
-        std::env::var("KRASIS_PROMPT_HCS_SHADOW")
+        let shadow = std::env::var("KRASIS_PROMPT_HCS_SHADOW")
             .map(|v| matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             ))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let reload = std::env::var("KRASIS_PROMPT_HCS_RELOAD")
+            .map(|v| !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ))
+            .unwrap_or(true);
+        shadow || reload
     }
 
     fn reset_prompt_hcs_shadow(&mut self, prompt_tokens: usize) {
@@ -3459,8 +3475,16 @@ impl PrefillEngine {
         let total = num_moe_layers.saturating_mul(num_experts);
         self.prompt_hcs_counts.clear();
         self.prompt_hcs_counts.resize(total, 0);
+        if prompt_hcs_log_enabled() {
+            eprintln!(
+                "[PROMPT-HCS] prefill collection enabled prompt_tokens={} moe_layers={} experts_per_layer={}",
+                prompt_tokens,
+                num_moe_layers,
+                num_experts,
+            );
+        }
         log::info!(
-            "PROMPT HCS SHADOW prefill collection enabled: prompt_tokens={} moe_layers={} experts_per_layer={}",
+            "PROMPT HCS prefill collection enabled: prompt_tokens={} moe_layers={} experts_per_layer={}",
             prompt_tokens,
             num_moe_layers,
             num_experts,
