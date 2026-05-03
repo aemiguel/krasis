@@ -1,5 +1,34 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks - 2026-05-03 (Phase 2GI QCN/35B pointer-prefetch regression)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for both runs.
+
+These runs validate the current materialized-HQQ-prefill and pointer-table
+prefetch code on QCN and Qwen3.5-35B after the Q122B Phase 2GH speed win.
+Timing instrumentation was disabled for both speed runs.
+
+| Model | Config / command | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|-------|------------------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Qwen3-Coder-Next | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 ./dev speed-test` | HQQ8 | k4v4 | 8352.2 | 81.02 | 165.05 | 15147/24576 (61.6%) | 706 MB | [log](20260503_phase2gi_qcn_hqq8_k4v4_speedtest.log) |
+| Qwen3.5-35B-A3B | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 ./dev benchmark tests/q35b-4-4-hqq6-benchmark.conf` | HQQ6 | fp8 | 11074.0 | 113.32 | 230.62 | 10240/10240 (100.0%) | 8990 MB | [log](20260503_phase2gi_q35b_hqq6_fp8_benchmark.log) |
+
+Accuracy gates before speed:
+- QCN `tests/qcn-k6v6-hqq8-accuracy.conf` with
+  `llama_witness_stage3_qcn_expanded`: PASS, first token `8/8`, prefill
+  `8/8`, exact generated prefix `8/8`, containment `8/8`.
+- Qwen3.5-35B `tests/q35b-4-4-hqq6-benchmark.conf` with
+  `llama_witness_qwen35_expanded_thinking_off`: PASS, first token `10/10`,
+  prefill `10/10`, exact generated prefix `10/10`, containment `10/10`.
+
+Notes:
+- QCN accuracy used the compact `k6v6` HQQ8 witness config; QCN speed used the
+  standard fixed `./dev speed-test` surface, which is HQQ8/k4v4.
+- 35B HCS fit all experts in soft residency (`10240/10240`), so decode is a
+  useful fully cached contrast against Q122B's hybrid decode path.
+
+---
+
 ## Standard Benchmarks - 2026-05-03 (Phase 2GH pointer-table prefill prefetch)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
