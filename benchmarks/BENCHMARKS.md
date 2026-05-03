@@ -1,5 +1,34 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks - 2026-05-03 (Phase 2GC stable HQQ CUDA graph addresses)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Config: Qwen3.5-122B-A10B
+`tests/q122b-k4v4-hqq6-int4-benchmark.conf`, INT4 GPU/CPU experts, HQQ6
+attention, `k4v4` KV cache, INT8 shared/dense/lm-head, layer group size 2,
+graph replay enabled, timing instrumentation off.
+
+| Variant | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|--------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Q122B stable HQQ VMM graphs, HQQ6/k4v4, INT4 experts | HQQ6 | k4v4 | 2029.1 | 24.49 | 44.35 | 3780/12288 (30.8%) | 664 MB | [log](20260503_phase2gc_q122b_k4v4_hqq6_stable_graph_benchmark.log) |
+
+Notes:
+- This run follows Phase 2GC stable HQQ graph-address work. HQQ runtime slots
+  use stable CUDA VMM virtual addresses and active-stage physical remapping;
+  no BF16 attention fallback or duplicate HQQ residency was added.
+- Accuracy/regression gates were run before speed testing:
+  QCN HQQ8/BF16-KV, QCN HQQ8+k6v6, Q122B HQQ6+k4v4, and a non-HQQ
+  QCN BF16-attention/BF16-KV control all passed.
+- Graph trace on QCN HQQ8/BF16-KV showed one capture, 15 pointer-check reuses,
+  and zero graph invalidations / HQQ decode pointer changes.
+- Compared with Phase 2GB on the same config, internal decode improved
+  `22.54 -> 24.49 tok/s`, round trip improved `41.47 -> 44.35 tok/s`, and HCS
+  coverage improved `3483 -> 3780` experts. Prefill was essentially flat,
+  `2071.5 -> 2029.1 tok/s`.
+
+---
+
 ## Standard Benchmarks - 2026-05-02 (Phase 2GB HQQ graph GQA fix 122B)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.

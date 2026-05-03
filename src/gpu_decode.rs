@@ -1088,32 +1088,58 @@ impl Drop for PinnedHostChunk {
 const ALIGN_64KB: u64 = 64 * 1024;
 
 struct AlignedGpuBuffer {
-    /// The underlying allocation (overallocated by up to ALIGN_64KB).
-    inner: cudarc::driver::CudaSlice<u8>,
+    /// The underlying raw allocation (overallocated by up to ALIGN_64KB).
+    raw_ptr: u64,
     /// The 64 KB-aligned device pointer (stored for returning &u64).
     aligned_ptr: u64,
-    /// Usable size (the size the caller requested).
-    len: usize,
 }
 
 impl AlignedGpuBuffer {
     /// Allocate `size` bytes of zeroed GPU memory aligned to 64 KB.
-    fn new_zeroed(device: &std::sync::Arc<cudarc::driver::CudaDevice>, size: usize) -> Result<Self, cudarc::driver::DriverError> {
+    fn new_zeroed(device: &std::sync::Arc<cudarc::driver::CudaDevice>, size: usize) -> Result<Self, String> {
         let alloc_size = size + ALIGN_64KB as usize;
-        let inner = device.alloc_zeros::<u8>(alloc_size)?;
-        let raw_ptr = *inner.device_ptr() as u64;
+        device
+            .bind_to_thread()
+            .map_err(|e| format!("AlignedGpuBuffer bind_to_thread: {:?}", e))?;
+        let mut raw_ptr = 0u64;
+        let alloc_err = unsafe { cuda_sys::lib().cuMemAlloc_v2(&mut raw_ptr, alloc_size) };
+        if alloc_err != cuda_sys::CUresult::CUDA_SUCCESS || raw_ptr == 0 {
+            return Err(format!(
+                "AlignedGpuBuffer cuMemAlloc_v2({} bytes) failed: {:?}",
+                alloc_size, alloc_err
+            ));
+        }
+        let memset_err = unsafe { cuda_sys::lib().cuMemsetD8_v2(raw_ptr, 0, alloc_size) };
+        if memset_err != cuda_sys::CUresult::CUDA_SUCCESS {
+            unsafe {
+                let _ = cuda_sys::lib().cuMemFree_v2(raw_ptr);
+            }
+            return Err(format!(
+                "AlignedGpuBuffer cuMemsetD8({} bytes) failed: {:?}",
+                alloc_size, memset_err
+            ));
+        }
         let aligned_ptr = (raw_ptr + ALIGN_64KB - 1) & !(ALIGN_64KB - 1);
-        Ok(Self { inner, aligned_ptr, len: size })
+        Ok(Self { raw_ptr, aligned_ptr })
     }
 
     /// Allocate `size` bytes of uninitialised GPU memory aligned to 64 KB.
     /// Use when data will be immediately overwritten (e.g. async DMA reload).
-    unsafe fn new_uninit(device: &std::sync::Arc<cudarc::driver::CudaDevice>, size: usize) -> Result<Self, cudarc::driver::DriverError> {
+    unsafe fn new_uninit(device: &std::sync::Arc<cudarc::driver::CudaDevice>, size: usize) -> Result<Self, String> {
         let alloc_size = size + ALIGN_64KB as usize;
-        let inner = device.alloc::<u8>(alloc_size)?;
-        let raw_ptr = *inner.device_ptr() as u64;
+        device
+            .bind_to_thread()
+            .map_err(|e| format!("AlignedGpuBuffer bind_to_thread: {:?}", e))?;
+        let mut raw_ptr = 0u64;
+        let alloc_err = cuda_sys::lib().cuMemAlloc_v2(&mut raw_ptr, alloc_size);
+        if alloc_err != cuda_sys::CUresult::CUDA_SUCCESS || raw_ptr == 0 {
+            return Err(format!(
+                "AlignedGpuBuffer cuMemAlloc_v2({} bytes) failed: {:?}",
+                alloc_size, alloc_err
+            ));
+        }
         let aligned_ptr = (raw_ptr + ALIGN_64KB - 1) & !(ALIGN_64KB - 1);
-        Ok(Self { inner, aligned_ptr, len: size })
+        Ok(Self { raw_ptr, aligned_ptr })
     }
 
     /// The 64 KB-aligned device pointer.
@@ -1121,6 +1147,17 @@ impl AlignedGpuBuffer {
     #[inline]
     fn device_ptr(&self) -> &u64 {
         &self.aligned_ptr
+    }
+}
+
+impl Drop for AlignedGpuBuffer {
+    fn drop(&mut self) {
+        if self.raw_ptr != 0 {
+            unsafe {
+                let _ = cuda_sys::lib().cuMemFree_v2(self.raw_ptr);
+            }
+            self.raw_ptr = 0;
+        }
     }
 }
 
@@ -4330,10 +4367,260 @@ struct HqqRuntimeSwapStats {
     zeros_memcpy_bytes: usize,
 }
 
+struct HqqRuntimeVmmBuffer {
+    ptr: u64,
+    reserved_bytes: usize,
+    mapped_bytes: usize,
+    handle: Option<cuda_sys::CUmemGenericAllocationHandle>,
+    device_ordinal: i32,
+}
+
+impl HqqRuntimeVmmBuffer {
+    fn allocation_prop(device_ordinal: i32) -> cuda_sys::CUmemAllocationProp {
+        let mut prop = cuda_sys::CUmemAllocationProp::default();
+        prop.type_ = cuda_sys::CUmemAllocationType_enum::CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.requestedHandleTypes =
+            cuda_sys::CUmemAllocationHandleType_enum::CU_MEM_HANDLE_TYPE_NONE;
+        prop.location.type_ = cuda_sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = device_ordinal;
+        prop
+    }
+
+    fn allocation_granularity(prop: &cuda_sys::CUmemAllocationProp) -> Result<usize, String> {
+        let lib = unsafe { cuda_sys::lib() };
+        let cu_mem_get_allocation_granularity = lib
+            .cuMemGetAllocationGranularity
+            .as_ref()
+            .map_err(|e| format!("CUDA VMM cuMemGetAllocationGranularity unavailable: {}", e))?;
+        let mut granularity = 0usize;
+        let err = unsafe {
+            cu_mem_get_allocation_granularity(
+                &mut granularity as *mut usize,
+                prop as *const cuda_sys::CUmemAllocationProp,
+                cuda_sys::CUmemAllocationGranularity_flags_enum::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+            )
+        };
+        if err != cuda_sys::CUresult::CUDA_SUCCESS || granularity == 0 {
+            return Err(format!(
+                "CUDA VMM allocation granularity query failed: {:?} granularity={}",
+                err, granularity
+            ));
+        }
+        Ok(granularity)
+    }
+
+    fn align_bytes(bytes: usize, granularity: usize) -> usize {
+        bytes.max(1).div_ceil(granularity) * granularity
+    }
+
+    fn new(
+        device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+        reserve_bytes: usize,
+        active_bytes: usize,
+    ) -> Result<Self, String> {
+        device
+            .bind_to_thread()
+            .map_err(|e| format!("HQQ VMM bind_to_thread: {:?}", e))?;
+        let device_ordinal = device.ordinal() as i32;
+        let prop = Self::allocation_prop(device_ordinal);
+        let granularity = Self::allocation_granularity(&prop)?;
+        let reserved_bytes = Self::align_bytes(reserve_bytes, granularity);
+
+        let lib = unsafe { cuda_sys::lib() };
+        let cu_mem_address_reserve = lib
+            .cuMemAddressReserve
+            .as_ref()
+            .map_err(|e| format!("CUDA VMM cuMemAddressReserve unavailable: {}", e))?;
+        let mut ptr = 0u64;
+        let err = unsafe {
+            cu_mem_address_reserve(
+                &mut ptr as *mut cuda_sys::CUdeviceptr,
+                reserved_bytes,
+                granularity,
+                0,
+                0,
+            )
+        };
+        if err != cuda_sys::CUresult::CUDA_SUCCESS || ptr == 0 {
+            return Err(format!(
+                "HQQ VMM address reserve failed bytes={} granularity={} err={:?}",
+                reserved_bytes, granularity, err
+            ));
+        }
+
+        let mut buffer = Self {
+            ptr,
+            reserved_bytes,
+            mapped_bytes: 0,
+            handle: None,
+            device_ordinal,
+        };
+        if let Err(e) = buffer.remap(active_bytes) {
+            unsafe {
+                let lib = cuda_sys::lib();
+                if let Ok(cu_mem_address_free) = lib.cuMemAddressFree.as_ref() {
+                    let _ = cu_mem_address_free(buffer.ptr, buffer.reserved_bytes);
+                }
+            }
+            return Err(e);
+        }
+        Ok(buffer)
+    }
+
+    fn unmap_current(&mut self) -> Result<(), String> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        if self.mapped_bytes == 0 {
+            return Err("HQQ VMM buffer has handle with zero mapped bytes".to_string());
+        }
+        let lib = unsafe { cuda_sys::lib() };
+        let cu_mem_release = lib
+            .cuMemRelease
+            .as_ref()
+            .map_err(|e| format!("CUDA VMM cuMemRelease unavailable: {}", e))?;
+        let cu_mem_unmap = lib
+            .cuMemUnmap
+            .as_ref()
+            .map_err(|e| format!("CUDA VMM cuMemUnmap unavailable: {}", e))?;
+        unsafe {
+            let err = cu_mem_unmap(self.ptr, self.mapped_bytes);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                self.handle = Some(handle);
+                return Err(format!(
+                    "HQQ VMM unmap failed ptr={:#x} bytes={} err={:?}",
+                    self.ptr, self.mapped_bytes, err
+                ));
+            }
+            let err = cu_mem_release(handle);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("HQQ VMM release failed err={:?}", err));
+            }
+        }
+        self.mapped_bytes = 0;
+        Ok(())
+    }
+
+    fn remap(&mut self, active_bytes: usize) -> Result<(), String> {
+        let prop = Self::allocation_prop(self.device_ordinal);
+        let granularity = Self::allocation_granularity(&prop)?;
+        let mapped_bytes = Self::align_bytes(active_bytes, granularity);
+        if mapped_bytes > self.reserved_bytes {
+            return Err(format!(
+                "HQQ VMM remap exceeds reservation: requested={} reserved={}",
+                mapped_bytes, self.reserved_bytes
+            ));
+        }
+
+        let lib = unsafe { cuda_sys::lib() };
+        let cu_mem_create = lib
+            .cuMemCreate
+            .as_ref()
+            .map_err(|e| format!("CUDA VMM cuMemCreate unavailable: {}", e))?;
+        let cu_mem_release = lib
+            .cuMemRelease
+            .as_ref()
+            .map_err(|e| format!("CUDA VMM cuMemRelease unavailable: {}", e))?;
+        let cu_mem_map = lib
+            .cuMemMap
+            .as_ref()
+            .map_err(|e| format!("CUDA VMM cuMemMap unavailable: {}", e))?;
+        let cu_mem_unmap = lib
+            .cuMemUnmap
+            .as_ref()
+            .map_err(|e| format!("CUDA VMM cuMemUnmap unavailable: {}", e))?;
+        let cu_mem_set_access = lib
+            .cuMemSetAccess
+            .as_ref()
+            .map_err(|e| format!("CUDA VMM cuMemSetAccess unavailable: {}", e))?;
+
+        self.unmap_current()?;
+
+        let mut handle: cuda_sys::CUmemGenericAllocationHandle = 0;
+        let err = unsafe {
+            cu_mem_create(
+                &mut handle as *mut cuda_sys::CUmemGenericAllocationHandle,
+                mapped_bytes,
+                &prop as *const cuda_sys::CUmemAllocationProp,
+                0,
+            )
+        };
+        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+            return Err(format!(
+                "HQQ VMM create failed bytes={} err={:?}",
+                mapped_bytes, err
+            ));
+        }
+
+        let map_err = unsafe { cu_mem_map(self.ptr, mapped_bytes, 0, handle, 0) };
+        if map_err != cuda_sys::CUresult::CUDA_SUCCESS {
+            unsafe {
+                let _ = cu_mem_release(handle);
+            }
+            return Err(format!(
+                "HQQ VMM map failed ptr={:#x} bytes={} err={:?}",
+                self.ptr, mapped_bytes, map_err
+            ));
+        }
+
+        let mut access = cuda_sys::CUmemAccessDesc::default();
+        access.location.type_ = cuda_sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = self.device_ordinal;
+        access.flags = cuda_sys::CUmemAccess_flags_enum::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        let access_err = unsafe {
+            cu_mem_set_access(
+                self.ptr,
+                mapped_bytes,
+                &access as *const cuda_sys::CUmemAccessDesc,
+                1,
+            )
+        };
+        if access_err != cuda_sys::CUresult::CUDA_SUCCESS {
+            unsafe {
+                let _ = cu_mem_unmap(self.ptr, mapped_bytes);
+                let _ = cu_mem_release(handle);
+            }
+            return Err(format!(
+                "HQQ VMM set access failed ptr={:#x} bytes={} err={:?}",
+                self.ptr, mapped_bytes, access_err
+            ));
+        }
+
+        self.handle = Some(handle);
+        self.mapped_bytes = mapped_bytes;
+        Ok(())
+    }
+
+    fn device_ptr(&self) -> u64 {
+        self.ptr
+    }
+}
+
+impl Drop for HqqRuntimeVmmBuffer {
+    fn drop(&mut self) {
+        let lib = unsafe { cuda_sys::lib() };
+        unsafe {
+            if let Some(handle) = self.handle.take() {
+                if let Ok(cu_mem_unmap) = lib.cuMemUnmap.as_ref() {
+                    let _ = cu_mem_unmap(self.ptr, self.mapped_bytes);
+                }
+                if let Ok(cu_mem_release) = lib.cuMemRelease.as_ref() {
+                    let _ = cu_mem_release(handle);
+                }
+            }
+            if self.ptr != 0 && self.reserved_bytes != 0 {
+                if let Ok(cu_mem_address_free) = lib.cuMemAddressFree.as_ref() {
+                    let _ = cu_mem_address_free(self.ptr, self.reserved_bytes);
+                }
+            }
+        }
+    }
+}
+
 struct HqqRuntimeDeviceBuffers {
-    packed: CudaSlice<u8>,
-    scales: CudaSlice<u8>,
-    zeros: CudaSlice<u8>,
+    packed: HqqRuntimeVmmBuffer,
+    scales: HqqRuntimeVmmBuffer,
+    zeros: HqqRuntimeVmmBuffer,
 }
 
 struct HqqRuntimeSlotEntry {
@@ -7948,7 +8235,7 @@ impl GpuDecodeStore {
             let packed_slot_ptr = slot.packed_slot_ptr;
             let scales_slot_ptr = slot.scales_slot_ptr;
             let zeros_slot_ptr = slot.zeros_slot_ptr;
-            drop(slot);
+            let _ = slot;
             self.recompute_hqq_runtime_staging_stats();
             log::info!(
                 "HQQ runtime restaging reused existing slot: layer={} tensor={} ptrs=({:#x},{:#x},{:#x}) registered={}",
@@ -8212,18 +8499,30 @@ impl GpuDecodeStore {
             } else {
                 slot.prefill.zeros_host.len().max(slot.decode.zeros_host.len())
             };
-            let packed = self.device.alloc_zeros::<u8>(slot_packed_bytes)
+            let reserve_packed_bytes = slot.prefill.packed_host.len().max(slot.decode.packed_host.len());
+            let reserve_scales_bytes = slot.prefill.scales_host.len().max(slot.decode.scales_host.len());
+            let reserve_zeros_bytes = slot.prefill.zeros_host.len().max(slot.decode.zeros_host.len());
+            let packed = HqqRuntimeVmmBuffer::new(&self.device, reserve_packed_bytes, slot_packed_bytes)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("HQQ register packed slot layer={} tensor={}: {:?}", slot.layer_idx, slot.tensor_name, e)))?;
-            let scales = self.device.alloc_zeros::<u8>(slot_scales_bytes)
+                    format!(
+                        "HQQ register packed VMM slot layer={} tensor={} active_bytes={} reserve_bytes={}: {}",
+                        slot.layer_idx, slot.tensor_name, slot_packed_bytes, reserve_packed_bytes, e
+                    )))?;
+            let scales = HqqRuntimeVmmBuffer::new(&self.device, reserve_scales_bytes, slot_scales_bytes)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("HQQ register scales slot layer={} tensor={}: {:?}", slot.layer_idx, slot.tensor_name, e)))?;
-            let zeros = self.device.alloc_zeros::<u8>(slot_zeros_bytes)
+                    format!(
+                        "HQQ register scales VMM slot layer={} tensor={} active_bytes={} reserve_bytes={}: {}",
+                        slot.layer_idx, slot.tensor_name, slot_scales_bytes, reserve_scales_bytes, e
+                    )))?;
+            let zeros = HqqRuntimeVmmBuffer::new(&self.device, reserve_zeros_bytes, slot_zeros_bytes)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("HQQ register zeros slot layer={} tensor={}: {:?}", slot.layer_idx, slot.tensor_name, e)))?;
-            slot.packed_slot_ptr = *packed.device_ptr();
-            slot.scales_slot_ptr = *scales.device_ptr();
-            slot.zeros_slot_ptr = *zeros.device_ptr();
+                    format!(
+                        "HQQ register zeros VMM slot layer={} tensor={} active_bytes={} reserve_bytes={}: {}",
+                        slot.layer_idx, slot.tensor_name, slot_zeros_bytes, reserve_zeros_bytes, e
+                    )))?;
+            slot.packed_slot_ptr = packed.device_ptr();
+            slot.scales_slot_ptr = scales.device_ptr();
+            slot.zeros_slot_ptr = zeros.device_ptr();
             slot.packed_slot_bytes = slot_packed_bytes;
             slot.scales_slot_bytes = slot_scales_bytes;
             slot.zeros_slot_bytes = slot_zeros_bytes;
@@ -13108,7 +13407,32 @@ impl GpuDecodeStore {
     pub fn prepare_runtime_for_prefill_rust(&mut self) -> Result<bool, String> {
         self.swap_to_marlin_rust()?;
         let has_hqq_runtime_slots = self.has_hqq_runtime_slots();
+        if std::env::var("KRASIS_HCS_EVICT_DEBUG").is_ok() {
+            eprintln!(
+                "[KRASIS-HCS-EVICT-DEBUG] prepare_runtime_for_prefill has_hqq={} slots={}",
+                has_hqq_runtime_slots,
+                self.hqq_runtime_slots.len(),
+            );
+        }
         if has_hqq_runtime_slots {
+            let hqq_growth_bytes = self.hqq_runtime_prefill_growth_bytes();
+            let (evicted, freed_mb) = self.hcs_evict_for_prefill(128);
+            if std::env::var("KRASIS_HCS_EVICT_DEBUG").is_ok() {
+                eprintln!(
+                    "[KRASIS-HCS-EVICT-DEBUG] prepare_runtime_for_prefill evict_result evicted={} freed_mb={:.1} hqq_growth_mb={:.0}",
+                    evicted,
+                    freed_mb,
+                    hqq_growth_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+            if evicted > 0 || freed_mb > 0.0 {
+                log::info!(
+                    "HQQ prefill stage guard evicted HCS soft experts: evicted={} freed_mb={:.1} hqq_growth_mb={:.0}",
+                    evicted,
+                    freed_mb,
+                    hqq_growth_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
             self.swap_hqq_runtime_to_prefill_rust()?;
         }
         Ok(has_hqq_runtime_slots)
@@ -13127,6 +13451,51 @@ impl GpuDecodeStore {
         self.swap_to_simple_int4_rust()
     }
 
+    fn hqq_runtime_stage_active_bytes_for_slot(slot: &HqqRuntimeSlotEntry, stage: &str) -> Result<usize, String> {
+        let (stage_packed_bytes, stage_scales_bytes, stage_zeros_bytes) =
+            Self::hqq_runtime_stage_component_bytes(slot, stage)?;
+        if hqq_stage_compaction_enabled() {
+            Ok(stage_packed_bytes + stage_scales_bytes + stage_zeros_bytes)
+        } else {
+            Ok(slot.prefill.packed_host.len().max(slot.decode.packed_host.len())
+                + slot.prefill.scales_host.len().max(slot.decode.scales_host.len())
+                + slot.prefill.zeros_host.len().max(slot.decode.zeros_host.len()))
+        }
+    }
+
+    fn hqq_runtime_stage_remap_growth_bytes(&self, stage: &str) -> usize {
+        if self.hqq_runtime_slots.is_empty() {
+            return 0;
+        }
+        let mut current_remap_bytes = 0usize;
+        let mut target_remap_bytes = 0usize;
+        for slot in self.hqq_runtime_slots.iter().filter(|slot| slot.is_registered()) {
+            let target = match Self::hqq_runtime_stage_active_bytes_for_slot(slot, stage) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::warn!(
+                        "HQQ runtime {} growth estimate failed for layer={} tensor={}; assuming no extra eviction for this slot: {}",
+                        stage,
+                        slot.layer_idx,
+                        slot.tensor_name,
+                        e
+                    );
+                    continue;
+                }
+            };
+            let current = slot.device_bytes();
+            if current != target {
+                current_remap_bytes = current_remap_bytes.saturating_add(current);
+                target_remap_bytes = target_remap_bytes.saturating_add(target);
+            }
+        }
+        target_remap_bytes.saturating_sub(current_remap_bytes)
+    }
+
+    fn hqq_runtime_prefill_growth_bytes(&self) -> usize {
+        self.hqq_runtime_stage_remap_growth_bytes("prefill")
+    }
+
     fn swap_hqq_runtime_stage_rust(&mut self, stage: &str) -> Result<(), String> {
         if self.hqq_runtime_slots.is_empty() {
             return Ok(());
@@ -13142,6 +13511,7 @@ impl GpuDecodeStore {
         let mut zeros_memcpy_bytes = 0usize;
 
         let compact = hqq_stage_compaction_enabled();
+        let mut remap_indices = Vec::new();
         for slot_idx in 0..self.hqq_runtime_slots.len() {
             let (stage_packed_bytes, stage_scales_bytes, stage_zeros_bytes) = {
                 let slot = &self.hqq_runtime_slots[slot_idx];
@@ -13157,14 +13527,76 @@ impl GpuDecodeStore {
                     slot.prefill.zeros_host.len().max(slot.decode.zeros_host.len()),
                 )
             };
-            let needs_realloc = {
+            let slot = &self.hqq_runtime_slots[slot_idx];
+            if slot.is_registered()
+                && (slot.packed_slot_bytes != target_packed_bytes
+                    || slot.scales_slot_bytes != target_scales_bytes
+                    || slot.zeros_slot_bytes != target_zeros_bytes)
+            {
+                remap_indices.push(slot_idx);
+            }
+        }
+        if !remap_indices.is_empty() {
+            for slot_idx in remap_indices {
+                let slot = &mut self.hqq_runtime_slots[slot_idx];
+                let layer_idx = slot.layer_idx;
+                let tensor_name = slot.tensor_name.clone();
+                let old_bytes = slot.device_bytes();
+                let buffers = slot.device_buffers.as_mut().ok_or_else(|| format!(
+                    "HQQ VMM pre-unmap requested for unregistered layer={} tensor={}",
+                    layer_idx, tensor_name,
+                ))?;
+                buffers.packed.unmap_current()
+                    .map_err(|e| format!("HQQ {} packed VMM pre-unmap layer={} tensor={}: {}", stage, layer_idx, tensor_name, e))?;
+                buffers.scales.unmap_current()
+                    .map_err(|e| format!("HQQ {} scales VMM pre-unmap layer={} tensor={}: {}", stage, layer_idx, tensor_name, e))?;
+                buffers.zeros.unmap_current()
+                    .map_err(|e| format!("HQQ {} zeros VMM pre-unmap layer={} tensor={}: {}", stage, layer_idx, tensor_name, e))?;
+                slot.current_stage = "registered_unloaded".to_string();
+                log::debug!(
+                    "HQQ runtime VMM slot pre-unmapped: stage={} layer={} tensor={} old_active_mb={:.3}",
+                    stage,
+                    layer_idx,
+                    tensor_name,
+                    old_bytes as f64 / 1024.0 / 1024.0,
+                );
+            }
+        }
+        for slot_idx in 0..self.hqq_runtime_slots.len() {
+            let (stage_packed_bytes, stage_scales_bytes, stage_zeros_bytes) = {
+                let slot = &self.hqq_runtime_slots[slot_idx];
+                Self::hqq_runtime_stage_component_bytes(slot, stage)?
+            };
+            let (target_packed_bytes, target_scales_bytes, target_zeros_bytes) = if compact {
+                (stage_packed_bytes, stage_scales_bytes, stage_zeros_bytes)
+            } else {
+                let slot = &self.hqq_runtime_slots[slot_idx];
+                (
+                    slot.prefill.packed_host.len().max(slot.decode.packed_host.len()),
+                    slot.prefill.scales_host.len().max(slot.decode.scales_host.len()),
+                    slot.prefill.zeros_host.len().max(slot.decode.zeros_host.len()),
+                )
+            };
+            let (reserve_packed_bytes, reserve_scales_bytes, reserve_zeros_bytes) = {
+                let slot = &self.hqq_runtime_slots[slot_idx];
+                (
+                    slot.prefill.packed_host.len().max(slot.decode.packed_host.len()),
+                    slot.prefill.scales_host.len().max(slot.decode.scales_host.len()),
+                    slot.prefill.zeros_host.len().max(slot.decode.zeros_host.len()),
+                )
+            };
+            let needs_register = {
                 let slot = &self.hqq_runtime_slots[slot_idx];
                 !slot.is_registered()
-                    || slot.packed_slot_bytes != target_packed_bytes
-                    || slot.scales_slot_bytes != target_scales_bytes
-                    || slot.zeros_slot_bytes != target_zeros_bytes
             };
-            if needs_realloc {
+            let needs_remap = {
+                let slot = &self.hqq_runtime_slots[slot_idx];
+                slot.is_registered()
+                    && (slot.packed_slot_bytes != target_packed_bytes
+                        || slot.scales_slot_bytes != target_scales_bytes
+                        || slot.zeros_slot_bytes != target_zeros_bytes)
+            };
+            if needs_register {
                 let (layer_idx, tensor_name, old_bytes) = {
                     let slot = &self.hqq_runtime_slots[slot_idx];
                     (
@@ -13174,25 +13606,34 @@ impl GpuDecodeStore {
                     )
                 };
                 let t_alloc = std::time::Instant::now();
-                let packed = self.device.alloc_zeros::<u8>(target_packed_bytes)
-                    .map_err(|e| format!(
-                        "HQQ {} packed slot alloc layer={} tensor={} bytes={}: {:?}",
-                        stage, layer_idx, tensor_name, target_packed_bytes, e
-                    ))?;
-                let scales = self.device.alloc_zeros::<u8>(target_scales_bytes)
-                    .map_err(|e| format!(
-                        "HQQ {} scales slot alloc layer={} tensor={} bytes={}: {:?}",
-                        stage, layer_idx, tensor_name, target_scales_bytes, e
-                    ))?;
-                let zeros = self.device.alloc_zeros::<u8>(target_zeros_bytes)
-                    .map_err(|e| format!(
-                        "HQQ {} zeros slot alloc layer={} tensor={} bytes={}: {:?}",
-                        stage, layer_idx, tensor_name, target_zeros_bytes, e
-                    ))?;
+                let packed = HqqRuntimeVmmBuffer::new(
+                    &self.device,
+                    reserve_packed_bytes,
+                    target_packed_bytes,
+                ).map_err(|e| format!(
+                    "HQQ {} packed VMM slot alloc layer={} tensor={} active_bytes={} reserve_bytes={}: {}",
+                    stage, layer_idx, tensor_name, target_packed_bytes, reserve_packed_bytes, e
+                ))?;
+                let scales = HqqRuntimeVmmBuffer::new(
+                    &self.device,
+                    reserve_scales_bytes,
+                    target_scales_bytes,
+                ).map_err(|e| format!(
+                    "HQQ {} scales VMM slot alloc layer={} tensor={} active_bytes={} reserve_bytes={}: {}",
+                    stage, layer_idx, tensor_name, target_scales_bytes, reserve_scales_bytes, e
+                ))?;
+                let zeros = HqqRuntimeVmmBuffer::new(
+                    &self.device,
+                    reserve_zeros_bytes,
+                    target_zeros_bytes,
+                ).map_err(|e| format!(
+                    "HQQ {} zeros VMM slot alloc layer={} tensor={} active_bytes={} reserve_bytes={}: {}",
+                    stage, layer_idx, tensor_name, target_zeros_bytes, reserve_zeros_bytes, e
+                ))?;
                 let slot = &mut self.hqq_runtime_slots[slot_idx];
-                slot.packed_slot_ptr = *packed.device_ptr();
-                slot.scales_slot_ptr = *scales.device_ptr();
-                slot.zeros_slot_ptr = *zeros.device_ptr();
+                slot.packed_slot_ptr = packed.device_ptr();
+                slot.scales_slot_ptr = scales.device_ptr();
+                slot.zeros_slot_ptr = zeros.device_ptr();
                 slot.packed_slot_bytes = target_packed_bytes;
                 slot.scales_slot_bytes = target_scales_bytes;
                 slot.zeros_slot_bytes = target_zeros_bytes;
@@ -13200,7 +13641,67 @@ impl GpuDecodeStore {
                 slot.current_stage = "registered_unloaded".to_string();
                 slot.device_buffers = Some(HqqRuntimeDeviceBuffers { packed, scales, zeros });
                 log::info!(
-                    "HQQ runtime slot resized: stage={} layer={} tensor={} old_mb={:.3} new_mb={:.3} alloc_ms={:.3}",
+                    "HQQ runtime VMM slot registered: stage={} layer={} tensor={} old_mb={:.3} active_mb={:.3} reserve_mb={:.3} alloc_ms={:.3}",
+                    stage,
+                    layer_idx,
+                    tensor_name,
+                    old_bytes as f64 / 1024.0 / 1024.0,
+                    slot.device_bytes() as f64 / 1024.0 / 1024.0,
+                    (reserve_packed_bytes + reserve_scales_bytes + reserve_zeros_bytes) as f64 / 1024.0 / 1024.0,
+                    slot.registered_ms,
+                );
+            } else if needs_remap {
+                let (layer_idx, tensor_name, old_bytes) = {
+                    let slot = &self.hqq_runtime_slots[slot_idx];
+                    (
+                        slot.layer_idx,
+                        slot.tensor_name.clone(),
+                        slot.device_bytes(),
+                    )
+                };
+                let t_remap = std::time::Instant::now();
+                let slot = &mut self.hqq_runtime_slots[slot_idx];
+                let buffers = slot
+                    .device_buffers
+                    .as_mut()
+                    .ok_or_else(|| format!(
+                        "HQQ VMM remap requested for unregistered layer={} tensor={}",
+                        layer_idx, tensor_name,
+                    ))?;
+                buffers.packed.remap(target_packed_bytes)
+                    .map_err(|e| format!("HQQ {} packed VMM remap layer={} tensor={} bytes={}: {}", stage, layer_idx, tensor_name, target_packed_bytes, e))?;
+                buffers.scales.remap(target_scales_bytes)
+                    .map_err(|e| format!("HQQ {} scales VMM remap layer={} tensor={} bytes={}: {}", stage, layer_idx, tensor_name, target_scales_bytes, e))?;
+                buffers.zeros.remap(target_zeros_bytes)
+                    .map_err(|e| format!("HQQ {} zeros VMM remap layer={} tensor={} bytes={}: {}", stage, layer_idx, tensor_name, target_zeros_bytes, e))?;
+                let old_packed_ptr = slot.packed_slot_ptr;
+                let old_scales_ptr = slot.scales_slot_ptr;
+                let old_zeros_ptr = slot.zeros_slot_ptr;
+                slot.packed_slot_ptr = buffers.packed.device_ptr();
+                slot.scales_slot_ptr = buffers.scales.device_ptr();
+                slot.zeros_slot_ptr = buffers.zeros.device_ptr();
+                if slot.packed_slot_ptr != old_packed_ptr
+                    || slot.scales_slot_ptr != old_scales_ptr
+                    || slot.zeros_slot_ptr != old_zeros_ptr
+                {
+                    return Err(format!(
+                        "HQQ VMM remap changed stable pointer layer={} tensor={} packed {:#x}->{:#x} scales {:#x}->{:#x} zeros {:#x}->{:#x}",
+                        layer_idx,
+                        tensor_name,
+                        old_packed_ptr,
+                        slot.packed_slot_ptr,
+                        old_scales_ptr,
+                        slot.scales_slot_ptr,
+                        old_zeros_ptr,
+                        slot.zeros_slot_ptr,
+                    ));
+                }
+                slot.packed_slot_bytes = target_packed_bytes;
+                slot.scales_slot_bytes = target_scales_bytes;
+                slot.zeros_slot_bytes = target_zeros_bytes;
+                slot.registered_ms = t_remap.elapsed().as_secs_f64() * 1000.0;
+                log::info!(
+                    "HQQ runtime VMM slot remapped: stage={} layer={} tensor={} old_active_mb={:.3} new_active_mb={:.3} remap_ms={:.3}",
                     stage,
                     layer_idx,
                     tensor_name,
@@ -23947,14 +24448,47 @@ impl GpuDecodeStore {
         self.last_soft_reload_activated = 0;
         let cal = self.vram_calibration;
         let trace_cfg = self.active_trace_owned();
+        let hqq_prefill_growth_bytes = self.hqq_runtime_prefill_growth_bytes();
+        if std::env::var("KRASIS_HCS_EVICT_DEBUG").is_ok() {
+            eprintln!(
+                "[KRASIS-HCS-EVICT-DEBUG] hcs_evict_for_prefill enter estimated_tokens={} has_graph={} hqq_growth_mb={:.0}",
+                estimated_tokens,
+                self.graph.is_some(),
+                hqq_prefill_growth_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
         let graph = match self.graph.as_mut() {
             Some(g) => g,
-            None => return (0, 0.0),
+            None => {
+                log::warn!(
+                    "HCS soft evict skipped: decode graph is not configured (estimated_tokens={} hqq_stage_growth_mb={:.0})",
+                    estimated_tokens,
+                    hqq_prefill_growth_bytes as f64 / (1024.0 * 1024.0),
+                );
+                return (0, 0.0);
+            }
         };
         let hcs = match graph.hcs.as_mut() {
             Some(h) => h,
-            None => return (0, 0.0),
+            None => {
+                log::warn!(
+                    "HCS soft evict skipped: HCS state is not attached (estimated_tokens={} hqq_stage_growth_mb={:.0})",
+                    estimated_tokens,
+                    hqq_prefill_growth_bytes as f64 / (1024.0 * 1024.0),
+                );
+                return (0, 0.0);
+            }
         };
+        if std::env::var("KRASIS_HCS_EVICT_DEBUG").is_ok() {
+            eprintln!(
+                "[KRASIS-HCS-EVICT-DEBUG] hcs_state soft_chunks={} soft_loaded={} soft_num_cached={} soft_chunks_loaded={} soft_slot_mb={:.3}",
+                hcs.soft_chunks.len(),
+                hcs.soft_loaded,
+                hcs.soft_num_cached,
+                hcs.soft_chunks_loaded,
+                hcs.soft_slot_size as f64 / (1024.0 * 1024.0),
+            );
+        }
 
         // Always sync the reload stream before eviction to prevent races between
         // async DMA (reload stream) and prefill (default stream). Without this,
@@ -24002,6 +24536,12 @@ impl GpuDecodeStore {
         }
 
         if hcs.soft_chunks.is_empty() {
+            log::warn!(
+                "HCS soft evict skipped: no soft chunks are allocated (estimated_tokens={} soft_num_cached={} hqq_stage_growth_mb={:.0})",
+                estimated_tokens,
+                hcs.soft_num_cached,
+                hqq_prefill_growth_bytes as f64 / (1024.0 * 1024.0),
+            );
             return (0, 0.0);
         }
         // If soft chunks are allocated but empty (0 cached experts), still free them
@@ -24030,13 +24570,22 @@ impl GpuDecodeStore {
                 &mut total as *mut usize);
             if err == cuda_sys::CUresult::CUDA_SUCCESS { free } else { 0 }
         };
+        if std::env::var("KRASIS_HCS_EVICT_DEBUG").is_ok() {
+            eprintln!(
+                "[KRASIS-HCS-EVICT-DEBUG] hcs_evict free_mb={:.0} capped_tokens={} cal_present={} scratch_present={}",
+                free_bytes as f64 / (1024.0 * 1024.0),
+                capped_tokens,
+                cal.is_some(),
+                self.prefill_scratch_info.is_some(),
+            );
+        }
 
         // Primary model: no-HCS prefill calibration tells us how much free VRAM
         // must remain while HCS is resident so the measured prefill transient still
         // leaves the configured safety margin.
         //
         // Fallback: if calibration is unavailable, use the older scratch estimate.
-        let needed_bytes = if let Some(cal) = cal {
+        let base_needed_bytes = if let Some(cal) = cal {
             cal.required_prefill_idle_free_mb(capped_tokens) as usize * 1024 * 1024
         } else if let Some((fixed_bytes, per_token_bytes)) = self.prefill_scratch_info {
             let scratch = fixed_bytes + per_token_bytes * capped_tokens;
@@ -24045,22 +24594,27 @@ impl GpuDecodeStore {
         } else {
             usize::MAX
         };
+        let needed_bytes = base_needed_bytes.saturating_add(hqq_prefill_growth_bytes);
 
         if free_bytes >= needed_bytes {
             trace_emit_global_mark(
                 trace_cfg.as_ref(),
                 "hcs",
                 &format!(
-                    "phase=soft_skip_eviction free_mb={:.0} needed_mb={:.0} estimated_tokens={}",
+                    "phase=soft_skip_eviction free_mb={:.0} needed_mb={:.0} base_needed_mb={:.0} hqq_prefill_growth_mb={:.0} estimated_tokens={}",
                     free_bytes as f64 / (1024.0 * 1024.0),
                     needed_bytes as f64 / (1024.0 * 1024.0),
+                    base_needed_bytes as f64 / (1024.0 * 1024.0),
+                    hqq_prefill_growth_bytes as f64 / (1024.0 * 1024.0),
                     capped_tokens,
                 ),
             );
             log::info!(
-                "HCS soft: skip eviction — {:.0} MB free >= {:.0} MB prefill floor for ~{} tokens",
+                "HCS soft: skip eviction — {:.0} MB free >= {:.0} MB prefill floor for ~{} tokens (base={:.0} MB, hqq_stage_growth={:.0} MB)",
                 free_bytes as f64 / (1024.0 * 1024.0),
                 needed_bytes as f64 / (1024.0 * 1024.0),
+                base_needed_bytes as f64 / (1024.0 * 1024.0),
+                hqq_prefill_growth_bytes as f64 / (1024.0 * 1024.0),
                 capped_tokens,
             );
             return (0, 0.0);
@@ -24134,12 +24688,26 @@ impl GpuDecodeStore {
             trace_cfg.as_ref(),
             "hcs",
             &format!(
-                "phase=soft_evict experts={} freed_mb={:.1} chunks_dropped={} total_chunks={} elapsed_ms={:.1} estimated_tokens={}",
-                evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens
+                "phase=soft_evict experts={} freed_mb={:.1} chunks_dropped={} total_chunks={} elapsed_ms={:.1} estimated_tokens={} base_needed_mb={:.0} hqq_prefill_growth_mb={:.0}",
+                evicted,
+                freed_mb,
+                chunks_to_drop,
+                total_chunks,
+                elapsed_ms,
+                estimated_tokens,
+                base_needed_bytes as f64 / (1024.0 * 1024.0),
+                hqq_prefill_growth_bytes as f64 / (1024.0 * 1024.0)
             ),
         );
-        log::info!("HCS soft: evicted {} experts ({:.1} MB, {} of {} chunks dropped) in {:.1}ms for prefill (~{} tokens)",
-            evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens);
+        log::info!("HCS soft: evicted {} experts ({:.1} MB, {} of {} chunks dropped) in {:.1}ms for prefill (~{} tokens, base={:.0} MB, hqq_stage_growth={:.0} MB)",
+            evicted,
+            freed_mb,
+            chunks_to_drop,
+            total_chunks,
+            elapsed_ms,
+            estimated_tokens,
+            base_needed_bytes as f64 / (1024.0 * 1024.0),
+            hqq_prefill_growth_bytes as f64 / (1024.0 * 1024.0));
 
         (evicted, freed_mb)
     }

@@ -1214,8 +1214,7 @@ fn handle_prefill_logits(
     let _ = store.prepare_runtime_for_decode_rust();
     let _ = store.hcs_reload_after_prefill_async(token_ids.len());
     let _ = store.hcs_sync_soft_reload();
-    store.invalidate_cuda_graph();
-    log::info!("prefill_logits: invalidated CUDA graphs after diagnostic prefill restore");
+    log::info!("prefill_logits: restored decode runtime after diagnostic prefill");
 
     // Match the normal reference/inference cleanup path so diagnostic prefill
     // requests do not leak sequence state into the next prompt.
