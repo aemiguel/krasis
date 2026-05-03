@@ -3351,6 +3351,13 @@ pub struct PrefillEngine {
     /// Temporary pointer back to the decode store for chunk-boundary HCS guardrails.
     /// Set only for the lifetime of an active prefill request.
     pub prefill_hcs_store_addr: usize,
+    /// Request-scoped prompt expert-use histogram for prompt-conditioned HCS diagnostics.
+    /// Flat [moe_layer_idx * num_experts_per_layer + expert_id] counts selected routes during exact prefill.
+    pub prompt_hcs_shadow_enabled: bool,
+    pub prompt_hcs_counts: Vec<u64>,
+    pub prompt_hcs_num_moe_layers: usize,
+    pub prompt_hcs_num_experts_per_layer: usize,
+    pub prompt_hcs_prompt_tokens: usize,
 }
 
 /// Double-buffer BF16 attention weight streaming buffers.
@@ -3414,6 +3421,98 @@ impl Drop for PrefillEngine {
 }
 
 impl PrefillEngine {
+    fn prompt_hcs_shadow_env_enabled() -> bool {
+        std::env::var("KRASIS_PROMPT_HCS_SHADOW")
+            .map(|v| matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ))
+            .unwrap_or(false)
+    }
+
+    fn reset_prompt_hcs_shadow(&mut self, prompt_tokens: usize) {
+        self.prompt_hcs_shadow_enabled = Self::prompt_hcs_shadow_env_enabled();
+        self.prompt_hcs_prompt_tokens = prompt_tokens;
+        if !self.prompt_hcs_shadow_enabled {
+            self.prompt_hcs_counts.clear();
+            self.prompt_hcs_num_moe_layers = 0;
+            self.prompt_hcs_num_experts_per_layer = 0;
+            return;
+        }
+
+        let num_moe_layers = self
+            .layer_weights
+            .iter()
+            .filter_map(|layer| layer.moe_layer_idx)
+            .max()
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let num_experts = self
+            .layer_weights
+            .iter()
+            .map(|layer| layer.moe_num_experts)
+            .max()
+            .unwrap_or(0);
+
+        self.prompt_hcs_num_moe_layers = num_moe_layers;
+        self.prompt_hcs_num_experts_per_layer = num_experts;
+        let total = num_moe_layers.saturating_mul(num_experts);
+        self.prompt_hcs_counts.clear();
+        self.prompt_hcs_counts.resize(total, 0);
+        log::info!(
+            "PROMPT HCS SHADOW prefill collection enabled: prompt_tokens={} moe_layers={} experts_per_layer={}",
+            prompt_tokens,
+            num_moe_layers,
+            num_experts,
+        );
+    }
+
+    fn record_prompt_hcs_counts(
+        &mut self,
+        moe_layer_idx: Option<usize>,
+        n_experts: usize,
+        counts: &[i32],
+    ) {
+        if !self.prompt_hcs_shadow_enabled {
+            return;
+        }
+        let Some(mi) = moe_layer_idx else { return; };
+        if self.prompt_hcs_num_experts_per_layer == 0
+            || mi >= self.prompt_hcs_num_moe_layers
+        {
+            return;
+        }
+        let stride = self.prompt_hcs_num_experts_per_layer;
+        let base = mi.saturating_mul(stride);
+        let limit = n_experts.min(stride).min(counts.len());
+        if base + limit > self.prompt_hcs_counts.len() {
+            return;
+        }
+        for eid in 0..limit {
+            let cnt = counts[eid];
+            if cnt > 0 {
+                self.prompt_hcs_counts[base + eid] =
+                    self.prompt_hcs_counts[base + eid].saturating_add(cnt as u64);
+            }
+        }
+    }
+
+    pub fn prompt_hcs_shadow_snapshot(&self) -> Option<(Vec<u64>, usize, usize, usize)> {
+        if !self.prompt_hcs_shadow_enabled
+            || self.prompt_hcs_counts.is_empty()
+            || self.prompt_hcs_num_moe_layers == 0
+            || self.prompt_hcs_num_experts_per_layer == 0
+        {
+            return None;
+        }
+        Some((
+            self.prompt_hcs_counts.clone(),
+            self.prompt_hcs_num_moe_layers,
+            self.prompt_hcs_num_experts_per_layer,
+            self.prompt_hcs_prompt_tokens,
+        ))
+    }
+
     pub fn set_safety_margin_mb(&mut self, margin_mb: usize) {
         self.safety_margin_mb = margin_mb.max(PREFILL_SAFETY_MARGIN_MB);
     }
@@ -8337,6 +8436,7 @@ impl PrefillEngine {
         if total_m == 0 {
             return Err("Empty token sequence".to_string());
         }
+        self.reset_prompt_hcs_shadow(total_m);
         trace_emit_prefill_global_mark(
             self.trace.as_ref(),
             "prefill",
@@ -21551,6 +21651,7 @@ impl PrefillEngine {
         }
         let total_sorted = h_num_post[0] as usize;
         let active_experts = h_expert_counts.iter().filter(|&&c| c > 0).count();
+        self.record_prompt_hcs_counts(moe_layer_idx, n_experts, &h_expert_counts);
         if let Some(t) = mt_route_d2h {
             self.t_moe_route_d2h
                 .set(self.t_moe_route_d2h.get() + t.elapsed().as_secs_f64() * 1000.0);

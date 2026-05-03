@@ -377,6 +377,326 @@ impl RouteSwapShadowStats {
     }
 }
 
+#[derive(Clone, Default)]
+struct PromptHcsShadowLayerStats {
+    selected: u64,
+    actual_hcs: u64,
+    shadow_hcs: u64,
+    extra_hits: u64,
+    lost_hits: u64,
+}
+
+#[derive(Clone)]
+struct PromptHcsShadowStats {
+    enabled: bool,
+    prompt_tokens: usize,
+    num_layers: usize,
+    num_experts_per_layer: usize,
+    soft_capacity: usize,
+    hard_resident: usize,
+    prompt_ranked: usize,
+    backfilled: usize,
+    candidate_resident: Vec<bool>,
+    selected_total: u64,
+    actual_hcs: u64,
+    actual_cold: u64,
+    shadow_hcs: u64,
+    shadow_cold: u64,
+    extra_hits: u64,
+    lost_hits: u64,
+    layer_stats: Vec<PromptHcsShadowLayerStats>,
+}
+
+impl PromptHcsShadowStats {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            prompt_tokens: 0,
+            num_layers: 0,
+            num_experts_per_layer: 0,
+            soft_capacity: 0,
+            hard_resident: 0,
+            prompt_ranked: 0,
+            backfilled: 0,
+            candidate_resident: Vec::new(),
+            selected_total: 0,
+            actual_hcs: 0,
+            actual_cold: 0,
+            shadow_hcs: 0,
+            shadow_cold: 0,
+            extra_hits: 0,
+            lost_hits: 0,
+            layer_stats: Vec::new(),
+        }
+    }
+
+    fn build_from_prompt_counts(
+        counts: &[u64],
+        count_layers: usize,
+        count_experts_per_layer: usize,
+        prompt_tokens: usize,
+        hcs: &HcsState,
+    ) -> Self {
+        if !env_truthy("KRASIS_PROMPT_HCS_SHADOW") {
+            return Self::disabled();
+        }
+        let num_layers = hcs.cache_fast_num_layers;
+        let num_experts = hcs.num_experts_per_layer;
+        let total = num_layers.saturating_mul(num_experts);
+        if total == 0 || count_layers == 0 || count_experts_per_layer == 0 {
+            log::warn!(
+                "PROMPT HCS SHADOW disabled: invalid dimensions hcs_layers={} hcs_experts={} count_layers={} count_experts={}",
+                num_layers,
+                num_experts,
+                count_layers,
+                count_experts_per_layer,
+            );
+            return Self::disabled();
+        }
+
+        let mut hard = vec![false; total];
+        let mut candidate = vec![false; total];
+        for idx in 0..total.min(hcs.cache_fast.len()) {
+            if hcs.cache_fast[idx][0] != 0 {
+                hard[idx] = true;
+                candidate[idx] = true;
+            }
+        }
+
+        let loaded_soft_slots = hcs
+            .soft_chunks_loaded
+            .saturating_mul(hcs.soft_slots_per_chunk)
+            .min(hcs.soft_num_slots)
+            .min(hcs.soft_slot_to_expert.len());
+        let mut soft_capacity = 0usize;
+        for slot in 0..loaded_soft_slots {
+            if let Some((layer_idx, expert_idx)) = hcs.soft_slot_to_expert[slot] {
+                if layer_idx < num_layers && expert_idx < num_experts {
+                    let idx = layer_idx * num_experts + expert_idx;
+                    hard[idx] = false;
+                    candidate[idx] = false;
+                    soft_capacity += 1;
+                }
+            }
+        }
+        let hard_resident = hard.iter().filter(|&&v| v).count();
+
+        let mut ranked: Vec<(u64, usize, usize)> = Vec::new();
+        for layer_idx in 0..num_layers.min(count_layers) {
+            for expert_idx in 0..num_experts.min(count_experts_per_layer) {
+                let hcs_idx = layer_idx * num_experts + expert_idx;
+                if hard[hcs_idx] {
+                    continue;
+                }
+                let count_idx = layer_idx * count_experts_per_layer + expert_idx;
+                let count = counts.get(count_idx).copied().unwrap_or(0);
+                if count > 0 {
+                    ranked.push((count, layer_idx, expert_idx));
+                }
+            }
+        }
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+
+        let mut filled = 0usize;
+        let mut prompt_ranked = 0usize;
+        for &(_, layer_idx, expert_idx) in &ranked {
+            if filled >= soft_capacity {
+                break;
+            }
+            let idx = layer_idx * num_experts + expert_idx;
+            if candidate[idx] {
+                continue;
+            }
+            candidate[idx] = true;
+            filled += 1;
+            prompt_ranked += 1;
+        }
+
+        let mut backfilled = 0usize;
+        if filled < soft_capacity {
+            for &(layer_idx, expert_idx) in &hcs.soft_ranking {
+                if filled >= soft_capacity {
+                    break;
+                }
+                if layer_idx >= num_layers || expert_idx >= num_experts {
+                    continue;
+                }
+                let idx = layer_idx * num_experts + expert_idx;
+                if hard[idx] || candidate[idx] {
+                    continue;
+                }
+                candidate[idx] = true;
+                filled += 1;
+                backfilled += 1;
+            }
+        }
+
+        log::info!(
+            "PROMPT HCS SHADOW BUILD prompt_tokens={} hard_resident={} soft_capacity={} prompt_ranked={} backfilled={} candidate_total={} count_layers={} count_experts={}",
+            prompt_tokens,
+            hard_resident,
+            soft_capacity,
+            prompt_ranked,
+            backfilled,
+            candidate.iter().filter(|&&v| v).count(),
+            count_layers,
+            count_experts_per_layer,
+        );
+
+        Self {
+            enabled: true,
+            prompt_tokens,
+            num_layers,
+            num_experts_per_layer: num_experts,
+            soft_capacity,
+            hard_resident,
+            prompt_ranked,
+            backfilled,
+            candidate_resident: candidate,
+            selected_total: 0,
+            actual_hcs: 0,
+            actual_cold: 0,
+            shadow_hcs: 0,
+            shadow_cold: 0,
+            extra_hits: 0,
+            lost_hits: 0,
+            layer_stats: vec![PromptHcsShadowLayerStats::default(); num_layers],
+        }
+    }
+
+    fn reset_counts(&mut self) {
+        self.selected_total = 0;
+        self.actual_hcs = 0;
+        self.actual_cold = 0;
+        self.shadow_hcs = 0;
+        self.shadow_cold = 0;
+        self.extra_hits = 0;
+        self.lost_hits = 0;
+        for st in &mut self.layer_stats {
+            *st = PromptHcsShadowLayerStats::default();
+        }
+    }
+
+    fn record(&mut self, layer_idx: usize, expert_idx: usize, actual_hit: bool) {
+        if !self.enabled
+            || layer_idx >= self.num_layers
+            || expert_idx >= self.num_experts_per_layer
+        {
+            return;
+        }
+        let idx = layer_idx * self.num_experts_per_layer + expert_idx;
+        let shadow_hit = self.candidate_resident.get(idx).copied().unwrap_or(false);
+
+        self.selected_total += 1;
+        if actual_hit {
+            self.actual_hcs += 1;
+        } else {
+            self.actual_cold += 1;
+        }
+        if shadow_hit {
+            self.shadow_hcs += 1;
+        } else {
+            self.shadow_cold += 1;
+        }
+        if !actual_hit && shadow_hit {
+            self.extra_hits += 1;
+        } else if actual_hit && !shadow_hit {
+            self.lost_hits += 1;
+        }
+
+        if let Some(st) = self.layer_stats.get_mut(layer_idx) {
+            st.selected += 1;
+            if actual_hit {
+                st.actual_hcs += 1;
+            }
+            if shadow_hit {
+                st.shadow_hcs += 1;
+            }
+            if !actual_hit && shadow_hit {
+                st.extra_hits += 1;
+            } else if actual_hit && !shadow_hit {
+                st.lost_hits += 1;
+            }
+        }
+    }
+
+    fn emit_summary(&self, generated_tokens: usize) {
+        if !self.enabled || self.selected_total == 0 {
+            return;
+        }
+        let tokens = generated_tokens.max(1) as f64;
+        let actual_cold_per_tok = self.actual_cold as f64 / tokens;
+        let shadow_cold_per_tok = self.shadow_cold as f64 / tokens;
+        let extra_hits_per_tok = self.extra_hits as f64 / tokens;
+        let lost_hits_per_tok = self.lost_hits as f64 / tokens;
+        let net_hits = self.shadow_hcs as i64 - self.actual_hcs as i64;
+        let net_hits_per_tok = net_hits as f64 / tokens;
+        let cold_reduction_pct = if self.actual_cold > 0 {
+            (self.actual_cold as i64 - self.shadow_cold as i64) as f64
+                / self.actual_cold as f64
+                * 100.0
+        } else {
+            0.0
+        };
+        let mut layer_top: Vec<(usize, u64, u64, u64)> = self.layer_stats.iter()
+            .enumerate()
+            .filter_map(|(idx, st)| {
+                if st.extra_hits == 0 && st.lost_hits == 0 {
+                    None
+                } else {
+                    Some((idx, st.extra_hits, st.lost_hits, st.selected))
+                }
+            })
+            .collect();
+        layer_top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+        let top_layers: Vec<String> = layer_top.iter().take(8)
+            .map(|(layer, extra, lost, selected)| {
+                format!("L{}:+{} -{} sel={}", layer, extra, lost, selected)
+            })
+            .collect();
+
+        eprintln!("  \x1b[36m┌─────────────────────────────────────────────────┐\x1b[0m");
+        eprintln!("  \x1b[36m│\x1b[0m  PROMPT HCS SHADOW (exact execution)         \x1b[36m│\x1b[0m");
+        eprintln!("  \x1b[36m├─────────────────────────────────────────────────┤\x1b[0m");
+        eprintln!("  \x1b[36m│\x1b[0m  Prompt: {} tokens | hard {} | soft cap {}      \x1b[36m│\x1b[0m",
+            self.prompt_tokens, self.hard_resident, self.soft_capacity);
+        eprintln!("  \x1b[36m│\x1b[0m  Prompt-ranked {} | heatmap backfill {}          \x1b[36m│\x1b[0m",
+            self.prompt_ranked, self.backfilled);
+        eprintln!("  \x1b[36m│\x1b[0m  Actual cold: {:.1}/tok | shadow cold: {:.1}/tok  \x1b[36m│\x1b[0m",
+            actual_cold_per_tok, shadow_cold_per_tok);
+        eprintln!("  \x1b[36m│\x1b[0m  Extra hits: {:.1}/tok | lost hits: {:.1}/tok     \x1b[36m│\x1b[0m",
+            extra_hits_per_tok, lost_hits_per_tok);
+        eprintln!("  \x1b[36m│\x1b[0m  Net hits: {:+.1}/tok | cold change: {:+.1}%      \x1b[36m│\x1b[0m",
+            net_hits_per_tok, cold_reduction_pct);
+        eprintln!("  \x1b[36m└─────────────────────────────────────────────────┘\x1b[0m");
+
+        log::info!(
+            "PROMPT HCS SHADOW SUMMARY generated={} prompt_tokens={} selected={} actual_hcs={} actual_cold={} shadow_hcs={} shadow_cold={} extra_hits={} lost_hits={} actual_cold_per_tok={:.3} shadow_cold_per_tok={:.3} extra_hits_per_tok={:.3} lost_hits_per_tok={:.3} net_hits={} net_hits_per_tok={:.3} cold_reduction_pct={:.3} hard_resident={} soft_capacity={} prompt_ranked={} backfilled={} top_layers=[{}]",
+            generated_tokens,
+            self.prompt_tokens,
+            self.selected_total,
+            self.actual_hcs,
+            self.actual_cold,
+            self.shadow_hcs,
+            self.shadow_cold,
+            self.extra_hits,
+            self.lost_hits,
+            actual_cold_per_tok,
+            shadow_cold_per_tok,
+            extra_hits_per_tok,
+            lost_hits_per_tok,
+            net_hits,
+            net_hits_per_tok,
+            cold_reduction_pct,
+            self.hard_resident,
+            self.soft_capacity,
+            self.prompt_ranked,
+            self.backfilled,
+            top_layers.join("; "),
+        );
+    }
+}
+
 fn sync_hcs_route_pointer_updates(
     device: &Arc<CudaDevice>,
     reason: &str,
@@ -4359,6 +4679,7 @@ struct GpuDecodeGraph {
     route_shadow_bias: Vec<f32>,
     route_shadow_corr: Vec<f32>,
     route_shadow_scores: Vec<f32>,
+    prompt_hcs_shadow: PromptHcsShadowStats,
 
     // ── Speculative decode batch buffers (allocated when draft model loaded) ──
     /// Max batch size for speculative decode (draft_k + 1).
@@ -8016,6 +8337,7 @@ impl GpuDecodeStore {
             route_shadow_bias: Vec::new(),
             route_shadow_corr: Vec::new(),
             route_shadow_scores: Vec::new(),
+            prompt_hcs_shadow: PromptHcsShadowStats::disabled(),
             batch_max: 0,
             d_batch_hidden: None,
             d_batch_residual: None,
@@ -15610,6 +15932,11 @@ impl GpuDecodeStore {
                 .map(|cal| cal.safety_margin_mb as usize)
                 .unwrap_or(crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB),
             prefill_hcs_store_addr: 0,
+            prompt_hcs_shadow_enabled: false,
+            prompt_hcs_counts: Vec::new(),
+            prompt_hcs_num_moe_layers: 0,
+            prompt_hcs_num_experts_per_layer: 0,
+            prompt_hcs_prompt_tokens: 0,
         };
         Ok(engine)
     }
@@ -19552,6 +19879,8 @@ impl GpuDecodeStore {
                         let hcs_ptrs = if let Some(ref hcs) = graph.hcs {
                             hcs.get_fast(moe_layer_idx, eid)
                         } else { None };
+                        let actual_hcs_hit = hcs_ptrs.is_some();
+                        graph.prompt_hcs_shadow.record(moe_layer_idx, eid, actual_hcs_hit);
 
                         if let Some((w13p, w13s, w2p, w2s)) = hcs_ptrs {
                             if batch_count < max_ept {
@@ -25735,6 +26064,39 @@ impl GpuDecodeStore {
     /// Call hcs_check_soft_reload_complete() each decode step to activate
     /// the soft tier once all DMA finishes.
     /// Returns (num_experts_queued, alloc_mb).
+    pub fn install_prompt_hcs_shadow(
+        &mut self,
+        counts: Vec<u64>,
+        count_layers: usize,
+        count_experts_per_layer: usize,
+        prompt_tokens: usize,
+    ) {
+        let graph = match self.graph.as_mut() {
+            Some(g) => g,
+            None => return,
+        };
+        let hcs = match graph.hcs.as_ref() {
+            Some(h) => h,
+            None => {
+                graph.prompt_hcs_shadow = PromptHcsShadowStats::disabled();
+                return;
+            }
+        };
+        graph.prompt_hcs_shadow = PromptHcsShadowStats::build_from_prompt_counts(
+            &counts,
+            count_layers,
+            count_experts_per_layer,
+            prompt_tokens,
+            hcs,
+        );
+    }
+
+    pub fn clear_prompt_hcs_shadow(&mut self) {
+        if let Some(graph) = self.graph.as_mut() {
+            graph.prompt_hcs_shadow = PromptHcsShadowStats::disabled();
+        }
+    }
+
     pub fn hcs_reload_after_prefill_async(&mut self, actual_tokens: usize) -> (usize, f64) {
         let cal = self.vram_calibration;
         let trace_cfg = self.active_trace_owned();
@@ -26379,6 +26741,7 @@ impl GpuDecodeStore {
             g.validation_decode_cold_file.clear();
             g.validation_decode_cold_events_file.clear();
             g.route_swap_shadow.reset_counts();
+            g.prompt_hcs_shadow.reset_counts();
             if g.timing_enabled {
                 g.timing_step_count = 0;
                 g.t_total = 0.0; g.t_norm = 0.0; g.t_attn = 0.0;
@@ -27171,6 +27534,7 @@ impl GpuDecodeStore {
 
         if let Some(graph) = self.graph.as_ref() {
             graph.route_swap_shadow.emit_summary(generated, graph.dma_cold_experts);
+            graph.prompt_hcs_shadow.emit_summary(generated);
         }
 
         // Print speculative decode stats
@@ -29265,6 +29629,8 @@ impl GpuDecodeStore {
             } else {
                 None
             };
+            let actual_hcs_hit = hcs_ptrs.is_some();
+            graph.prompt_hcs_shadow.record(layer_idx, eid, actual_hcs_hit);
 
             if let Some((w13p, w13s, w2p, w2s)) = hcs_ptrs {
                 // Gather HCS expert pointers for batched launch

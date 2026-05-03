@@ -835,6 +835,7 @@ fn handle_chat_completion(
     crate::vram_monitor::report_event("prefill_start");
     let t_prefill_gil = Instant::now();
 
+    let mut prompt_hcs_snapshot: Option<(Vec<u64>, usize, usize, usize)> = None;
     let prefill_result: Result<(usize, usize, Vec<usize>, bool), String> = {
         // ── Rust prefill: zero GIL, zero Python ──
         let token_ids: Vec<u32> = match state.tokenizer.encode(rendered.as_str(), true) {
@@ -894,6 +895,8 @@ fn handle_chat_completion(
             },
             Err(e) => Err(e),
         };
+
+        prompt_hcs_snapshot = engine.prompt_hcs_shadow_snapshot();
 
         // Release scratch to free VRAM for decode/HCS
         if let Err(e) = engine.release_scratch() {
@@ -1016,6 +1019,11 @@ fn handle_chat_completion(
     if activated > 0 {
         log::info!("Request {}: HCS reload complete: {} experts, {:.1}ms DMA",
             request_id, activated, real_reload_ms);
+    }
+    if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot {
+        store.install_prompt_hcs_shadow(counts, layers, experts, prompt_tokens);
+    } else {
+        store.clear_prompt_hcs_shadow();
     }
     // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
     // ── Multi-GPU: copy KV+LA state from primary to all aux GPUs after prefill ──
@@ -1401,6 +1409,8 @@ fn handle_reference_test(
         log::error!("reference_test: Failed to release scratch: {}", e);
     }
 
+    let prompt_hcs_snapshot = engine.prompt_hcs_shadow_snapshot();
+
     // Set KV position and swap to simple INT4 for decode
     {
         let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
@@ -1424,6 +1434,11 @@ fn handle_reference_test(
     let (activated, dma_ms) = store.hcs_sync_soft_reload();
     if activated > 0 {
         log::info!("reference_test: HCS reload complete: {} experts, {:.1}ms DMA", activated, dma_ms);
+    }
+    if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot {
+        store.install_prompt_hcs_shadow(counts, layers, experts, prompt_tokens);
+    } else {
+        store.clear_prompt_hcs_shadow();
     }
 
     // Disable thinking suppression for reference test (greedy, no thinking budget logic)
@@ -2530,6 +2545,8 @@ impl RustServer {
                 format!("Rust prefill failed: {}", e))
         })?;
 
+        let prompt_hcs_snapshot = engine.prompt_hcs_shadow_snapshot();
+
         // Release scratch to free VRAM for decode/HCS
         if let Err(e) = engine.release_scratch() {
             log::error!("Failed to release scratch: {}", e);
@@ -2626,6 +2643,11 @@ impl RustServer {
         if activated > 0 {
             log::info!("Benchmark: HCS reload complete: {} experts, {:.1}ms DMA",
                 activated, real_reload_dma_ms);
+        }
+        if let Some((counts, layers, experts, prompt_tokens)) = prompt_hcs_snapshot {
+            store.install_prompt_hcs_shadow(counts, layers, experts, prompt_tokens);
+        } else {
+            store.clear_prompt_hcs_shadow();
         }
         let reload_pending_at_decode_start = store.hcs_soft_reload_pending();
         // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
