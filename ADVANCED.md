@@ -30,7 +30,7 @@ BF16 validation policy:
 | `./dev build` | Rebuild Rust extension (maturin develop --release) |
 | `./dev run <config> [flags]` | Launch server from a test config |
 | `./dev benchmark <config>` | Run standard benchmark and exit |
-| `./dev release-test <model>` | Run full release test (4 configs, produces markdown report) |
+| `./dev release-test <model>` | Run full release test (release config matrix, produces markdown report) |
 | `./dev test <config>` | Short model test (benchmark + network tests) |
 | `./dev test <config> --thorough` | Thorough test (+ stress + large prompts) |
 | `./dev network <port> [--large] [--quick]` | Run network tests against a running server |
@@ -72,7 +72,7 @@ Config files use `KEY=VALUE` format. CLI flags override config file values.
 |------|---------|-------------|
 | `--gpu-expert-bits` | 4 | GPU Marlin expert bits: `4` or `8` |
 | `--cpu-expert-bits` | 4 | CPU decode expert bits: `4` or `8` |
-| `--attention-quant` | bf16 direct, hqq8 launcher | Attention weight precision: `hqq8`, `hqq6`, `hqq4`, or mixed planners `hqq68_auto` / `hqq46_auto`; `bf16` remains an explicit validation/debug mode |
+| `--attention-quant` | bf16 direct, hqq6 launcher | Attention weight precision: interactive launcher presets are HQQ4, HQQ4+10% (`hqq46_auto`), HQQ6, and HQQ6+10% (`hqq68_auto`); `hqq8`, `hqq46`, and `bf16` remain explicit advanced modes |
 | `--shared-expert-quant` | int8 | Shared expert quant: `int8` or `bf16` |
 | `--dense-mlp-quant` | int8 | Dense MLP quant: `int8` or `bf16` |
 | `--lm-head-quant` | int8 | LM head quant: `int8` or `bf16` |
@@ -151,7 +151,7 @@ Krasis lets you quantize each component independently. The defaults are a good s
 |-----------|---------|---------|
 | GPU experts | INT4, INT8 | INT4 |
 | CPU experts | INT4, INT8 | INT4 |
-| Attention | HQQ4, HQQ6, HQQ8, HQQ46/HQQ68 auto, BF16 | BF16 |
+| Attention | HQQ4, HQQ4+10%, HQQ6, HQQ6+10%, HQQ8, BF16 | BF16 |
 | Shared expert | INT8, BF16 | INT8 |
 | Dense MLP | INT8, BF16 | INT8 |
 | LM head | INT8, BF16 | INT8 |

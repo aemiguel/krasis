@@ -1,5 +1,8 @@
 /target
 *.so
+*.so.bak
+*.so.ours
+*.so.rej
 *.pyc
 __pycache__/
 *.egg-info/

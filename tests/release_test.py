@@ -54,14 +54,12 @@ SUPPORTED_MODELS = [
     "Qwen3.5-35B-A3B",
     "Qwen3.5-122B-A10B",
     "Qwen3-235B-A22B",
-    "Qwen3.5-397B-A17B",
 ]
 
 CONFIG_VARIANTS = [
-    {"name": "INT4 BF16", "bits": 4, "attention": "bf16"},
-    {"name": "INT4 HQQ4", "bits": 4, "attention": "hqq4"},
-    {"name": "INT4 HQQ8", "bits": 4, "attention": "hqq8"},
-    {"name": "INT4 HQQ8 Multi-GPU", "bits": 4, "attention": "hqq8", "multi_gpu": True},
+    {"name": "INT4 k4v4 HQQ4", "bits": 4, "kv": "k4v4", "attention": "hqq4"},
+    {"name": "INT4 k6v6 HQQ6+8", "bits": 4, "kv": "k6v6", "attention": "hqq68_auto", "hqq_auto_budget_pct": 25.0},
+    {"name": "INT8 k6v6 HQQ6+8 Multi-GPU", "bits": 8, "kv": "k6v6", "attention": "hqq68_auto", "hqq_auto_budget_pct": 25.0, "multi_gpu": True},
 ]
 
 REFERENCE_VALIDATE_MAX_PROMPTS = 4
@@ -243,10 +241,15 @@ def generate_config(model_name: str, variant: Dict, gpu_idx: int,
         f'CFG_SELECTED_GPUS="{gpu_selection}"',
         f'CFG_PP_PARTITION="{num_layers}"',
         f'CFG_LAYER_GROUP_SIZE="2"',
-        f'CFG_KV_DTYPE="k6v6"',
+        f'CFG_KV_DTYPE="{variant.get("kv", "k6v6")}"',
         f'CFG_GPU_EXPERT_BITS="{bits}"',
         f'CFG_CPU_EXPERT_BITS="{bits}"',
         f'CFG_ATTENTION_QUANT="{variant["attention"]}"',
+        *(
+            [f'CFG_HQQ_AUTO_BUDGET_PCT="{variant["hqq_auto_budget_pct"]}"']
+            if variant.get("hqq_auto_budget_pct") is not None
+            else []
+        ),
         f'CFG_SHARED_EXPERT_QUANT="int8"',
         f'CFG_DENSE_MLP_QUANT="int8"',
         f'CFG_LM_HEAD_QUANT="int8"',
@@ -282,7 +285,8 @@ def cache_exists(model_name: str, bits: int) -> bool:
 
 def build_caches(model_name: str, gpu_idx: int, num_layers: int,
                  log_dir: str, force: bool = False,
-                 skip_int8: bool = False) -> Dict[int, bool]:
+                 skip_int8: bool = False,
+                 variants: Optional[List[Dict]] = None) -> Dict[int, bool]:
     """Build expert caches for all required bit-widths before running tests.
 
     Launches krasis with --build-cache for each unique bit-width (INT4 and INT8).
@@ -291,11 +295,9 @@ def build_caches(model_name: str, gpu_idx: int, num_layers: int,
 
     Returns dict mapping bits -> success.
     """
-    # Collect unique bit-widths needed across all config variants
+    # Collect unique bit-widths needed across the variants that will run.
     needed_bits = set()
-    for variant in CONFIG_VARIANTS:
-        if variant.get("multi_gpu"):
-            continue
+    for variant in (variants if variants is not None else CONFIG_VARIANTS):
         if skip_int8 and variant["bits"] == 8:
             continue
         needed_bits.add(variant["bits"])
@@ -1452,11 +1454,52 @@ def check_perplexity_baseline(baselines: Dict, model_name: str, variant_name: st
 
 def _html_escape(text: str) -> str:
     """Escape HTML special characters."""
+    text = str(text)
     return (text
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace('"', "&quot;"))
+
+
+def _reference_exact_prefix_summary(validation: Dict) -> Dict:
+    """Aggregate exact-prefix token coverage from validate_model results."""
+    results = validation.get("results", []) if validation else []
+    compared = []
+    for r in results:
+        match_count = r.get("match_count")
+        ref_tokens = r.get("ref_tokens")
+        if isinstance(match_count, int) and isinstance(ref_tokens, int) and ref_tokens >= 0:
+            compared.append(r)
+
+    total_match = sum(max(0, r.get("match_count", 0)) for r in compared)
+    total_ref = sum(max(0, r.get("ref_tokens", 0)) for r in compared)
+    exact_cases = sum(
+        1 for r in compared
+        if r.get("status") == "MATCH" or (
+            r.get("ref_tokens", 0) > 0 and r.get("match_count") == r.get("ref_tokens")
+        )
+    )
+    pct = (total_match / total_ref * 100.0) if total_ref > 0 else None
+    return {
+        "compared_cases": len(compared),
+        "exact_cases": exact_cases,
+        "match_tokens": total_match,
+        "ref_tokens": total_ref,
+        "pct": pct,
+    }
+
+
+def _format_exact_prefix(summary: Dict) -> str:
+    if summary["compared_cases"] == 0:
+        return "—"
+    if summary["ref_tokens"] == 0:
+        return f'{summary["exact_cases"]}/{summary["compared_cases"]} exact'
+    return (
+        f'{summary["exact_cases"]}/{summary["compared_cases"]} exact, '
+        f'{summary["match_tokens"]}/{summary["ref_tokens"]} tok '
+        f'({summary["pct"]:.1f}%)'
+    )
 
 
 def _generate_vram_svg(key_events: List[Dict], config_name: str, gpu_idx: int = 0) -> str:
@@ -2088,7 +2131,8 @@ table.data td.num { text-align: right; font-family: monospace; }
         h.append(f'<p style="color:#8b949e">Short greedy-output validation against stored reference outputs. '
                  f'Each config runs Layer 1 token matching only, capped at {REFERENCE_VALIDATE_MAX_PROMPTS} prompts.</p>')
         h.append('<table class="data"><thead><tr>')
-        h.append('<th>Config</th><th>Prompts</th><th>Match</th><th>Warn</th><th>Fail</th><th>Status</th>')
+        h.append('<th>Config</th><th>Prompts</th><th>Match</th><th>Warn</th><th>Fail</th>'
+                 '<th>Exact Prefix</th><th>Status</th>')
         h.append('</tr></thead><tbody>')
         for cr in config_results:
             validation = cr.get("reference_validation")
@@ -2104,13 +2148,81 @@ table.data td.num { text-align: right; font-family: monospace; }
                 badge = '<span class="badge badge-warn">WARN</span>'
             else:
                 badge = '<span class="badge badge-pass">PASS</span>'
+            prefix_summary = _reference_exact_prefix_summary(validation)
             h.append(f'<tr><td>{_html_escape(cr["variant"]["name"])}</td>')
             h.append(f'<td class="num">{prompts_run}</td>')
             h.append(f'<td class="num">{match_count}</td>')
             h.append(f'<td class="num">{warn_count}</td>')
             h.append(f'<td class="num">{fail_count}</td>')
+            h.append(f'<td class="num">{_html_escape(_format_exact_prefix(prefix_summary))}</td>')
             h.append(f'<td>{badge}</td></tr>')
         h.append('</tbody></table>')
+
+        for i, cr in enumerate(config_results):
+            validation = cr.get("reference_validation")
+            results = validation.get("results", []) if validation else []
+            if not results:
+                continue
+
+            variant_name = _html_escape(cr["variant"]["name"])
+            h.append(f'<details><summary>Config {i+1}: {variant_name} reference prompts</summary>')
+            h.append('<div class="detail-body">')
+            h.append('<table class="data"><thead><tr>')
+            h.append('<th>#</th><th>Status</th><th>Exact Prefix</th><th>Divergence</th>'
+                     '<th>Top-K</th><th>Tokens</th><th>Prompt</th>')
+            h.append('</tr></thead><tbody>')
+
+            for prompt_idx, r in enumerate(results, 1):
+                status = r.get("status", "UNKNOWN")
+                if status == "FAIL":
+                    badge_key = "fail"
+                elif status == "WARN":
+                    badge_key = "warn"
+                elif status == "SKIP":
+                    badge_key = "skip"
+                else:
+                    badge_key = "pass"
+                match_count = r.get("match_count")
+                ref_tokens = r.get("ref_tokens")
+                krasis_tokens = r.get("krasis_tokens")
+                first_divergence = r.get("first_divergence")
+
+                if isinstance(match_count, int) and isinstance(ref_tokens, int):
+                    prefix_text = f"{match_count}/{ref_tokens}"
+                    token_text = f"ref {ref_tokens}"
+                    if isinstance(krasis_tokens, int):
+                        token_text += f" / krasis {krasis_tokens}"
+                else:
+                    prefix_text = "—"
+                    token_text = "—"
+
+                if first_divergence is None:
+                    divergence_text = "—"
+                else:
+                    divergence_text = str(first_divergence)
+
+                top_k = r.get("divergence_in_top_k")
+                if top_k is True:
+                    rank = r.get("divergence_top_k_rank")
+                    top_k_text = f"rank {rank}" if rank is not None else "yes"
+                elif top_k is False:
+                    top_k_text = "no"
+                else:
+                    top_k_text = "—"
+
+                prompt_text = r.get("prompt") or r.get("error") or ""
+                h.append('<tr>')
+                h.append(f'<td class="num">{prompt_idx}</td>')
+                h.append(f'<td><span class="badge badge-{badge_key}">{_html_escape(status)}</span></td>')
+                h.append(f'<td class="num">{_html_escape(prefix_text)}</td>')
+                h.append(f'<td class="num">{_html_escape(divergence_text)}</td>')
+                h.append(f'<td class="num">{_html_escape(top_k_text)}</td>')
+                h.append(f'<td class="num">{_html_escape(token_text)}</td>')
+                h.append(f'<td>{_html_escape(prompt_text)}</td>')
+                h.append('</tr>')
+
+            h.append('</tbody></table>')
+            h.append('</div></details>')
 
     # ── Sanity Tests ──────────────────────────────────────────────
     h.append('<h2 id="sanity">Sanity Tests</h2>')
@@ -2267,7 +2379,8 @@ def main():
 
     cache_results = build_caches(model_name, gpu_idx, num_layers, output_dir,
                                  force=args.force_rebuild_cache,
-                                 skip_int8=skip_int8)
+                                 skip_int8=skip_int8,
+                                 variants=active_variants)
 
     cache_ok = all(cache_results.values())
     if cache_ok:

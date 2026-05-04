@@ -13,7 +13,7 @@
 #   ./dev benchmark <config>        Run standard benchmark (prefill/decode/round trip) and exit
 #   ./dev speed-test                Run the fixed standard speed benchmark (QCN INT4 HQQ8 k4v4)
 #   ./dev perplexity <config>       Run perplexity eval (WikiText-2 by default) and exit
-#   ./dev release-test <model>      Run full release test (4 configs, produces report)
+#   ./dev release-test <model>      Run full release test (release config matrix, produces report)
 #   ./dev release-test-all [target]  Run release test on all supported models sequentially
 #                                     If a target name is given (e.g. "rc8"), progress is saved
 #                                     to a state file. Re-running with the same target resumes
@@ -798,7 +798,6 @@ do_release_test_all() {
         "Qwen3.5-35B-A3B"
         "Qwen3.5-122B-A10B"
         "Qwen3-235B-A22B"
-        "Qwen3.5-397B-A17B"
     )
 
     local total=${#MODELS[@]}
@@ -2685,7 +2684,7 @@ case "$cmd" in
         echo "  generate-reference <model>     ARCHIVED HF reference capture; requires explicit override"
         echo "  reference-backfill-topk <model>  ARCHIVED HF top-k backfill; requires explicit override"
         echo "  trace-diff <expected> <actual> Diff two KRASIS_TRACE logs offline"
-        echo "  release-test <model>           Run full release test (4 configs, report)"
+        echo "  release-test <model>           Run full release test (config matrix, report)"
         echo "  release-test-all [target]      Run release test on all supported models sequentially"
         echo ""
         echo "Maintenance commands:"

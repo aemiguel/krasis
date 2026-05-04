@@ -4,17 +4,22 @@ This module centralizes the user-facing backend surface and cache layout rules
 without forcing different backends into one runtime tensor contract.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 import hashlib
 import json
 import math
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 from safetensors import safe_open
-from safetensors.torch import save_file
-import torch
+
+if TYPE_CHECKING:
+    import torch
+else:
+    torch = None
 
 from krasis.config import (
     ATTENTION_QUANT_CHOICES,
@@ -26,12 +31,61 @@ from krasis.config import (
     HQQ_CACHE_PROFILE_SELFCAL_V1,
     cache_dir_for_model,
 )
-from krasis.krasis import (
-    hqq4_init_group_ptr,
-    hqq4_quantize_tensor_ptr,
-    hqq4_rmse_group_ptr,
-    hqq4_solve_group_ptr,
-)
+_hqq4_init_group_ptr = None
+_hqq4_rmse_group_ptr = None
+_hqq4_solve_group_ptr = None
+
+
+def _require_torch():
+    global torch
+    if torch is not None:
+        return torch
+    try:
+        import torch as torch_module
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "PyTorch is required for HQQ attention cache/runtime operations. "
+            "Run `krasis-setup` after installing Krasis."
+        ) from exc
+    torch = torch_module
+    return torch
+
+
+def _save_safetensors_file(tensors: dict, path: str, *, metadata: dict) -> None:
+    _require_torch()
+    try:
+        from safetensors.torch import save_file
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "safetensors.torch is required to write HQQ attention artifacts. "
+            "Run `krasis-setup` after installing Krasis."
+        ) from exc
+    save_file(tensors, path, metadata=metadata)
+
+
+def _require_hqq4_rust_symbols() -> tuple:
+    global _hqq4_init_group_ptr, _hqq4_rmse_group_ptr, _hqq4_solve_group_ptr
+    if (
+        _hqq4_init_group_ptr is not None
+        and _hqq4_rmse_group_ptr is not None
+        and _hqq4_solve_group_ptr is not None
+    ):
+        return _hqq4_init_group_ptr, _hqq4_rmse_group_ptr, _hqq4_solve_group_ptr
+    try:
+        from krasis.krasis import (
+            hqq4_init_group_ptr,
+            hqq4_rmse_group_ptr,
+            hqq4_solve_group_ptr,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "The Krasis Rust extension and native runtime libraries are required for "
+            "HQQ4 Rust quantization. Run `krasis-setup` after installing Krasis."
+        ) from exc
+    _hqq4_init_group_ptr = hqq4_init_group_ptr
+    _hqq4_rmse_group_ptr = hqq4_rmse_group_ptr
+    _hqq4_solve_group_ptr = hqq4_solve_group_ptr
+    return _hqq4_init_group_ptr, _hqq4_rmse_group_ptr, _hqq4_solve_group_ptr
 
 
 HQQ_ATTENTION_CACHE_VERSION = 5
@@ -425,6 +479,7 @@ def _dtype_nbytes(dtype: str) -> int:
 
 
 def _artifact_tensor_bytes(path: str) -> int:
+    _require_torch()
     total = 0
     with safe_open(path, framework="pt", device="cpu") as handle:
         for key in handle.keys():
@@ -1300,6 +1355,8 @@ def _quantize_hqq4_group_current(chunk: torch.Tensor, qmax: float) -> tuple[torc
 
 def quantize_hqq4_group_current_rust(chunk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Rust shadow init path for one HQQ4 group chunk."""
+    _require_torch()
+    hqq4_init_group_ptr, _, _ = _require_hqq4_rust_symbols()
     if chunk.ndim != 2:
         raise ValueError(f"HQQ group init expects 2D chunk, got shape {tuple(chunk.shape)}")
 
@@ -1325,6 +1382,8 @@ def solve_hqq4_fixed_zero_rust(
     scale_seed: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Rust shadow fixed-zero solve path for one HQQ4 group chunk."""
+    _require_torch()
+    _, _, hqq4_solve_group_ptr = _require_hqq4_rust_symbols()
     if chunk.ndim != 2:
         raise ValueError(f"HQQ group solve expects 2D chunk, got shape {tuple(chunk.shape)}")
     rows, cols = chunk.shape
@@ -1352,6 +1411,8 @@ def compute_hqq4_rmse_rust(
     zero: torch.Tensor,
 ) -> torch.Tensor:
     """Rust shadow RMSE path for one HQQ4 group chunk."""
+    _require_torch()
+    _, hqq4_rmse_group_ptr, _ = _require_hqq4_rust_symbols()
     if chunk.ndim != 2:
         raise ValueError(f"HQQ group RMSE expects 2D chunk, got shape {tuple(chunk.shape)}")
     rows, cols = chunk.shape
@@ -1615,6 +1676,7 @@ def quantize_hqq4_tensor_rust(
     inner_threads: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Experimental Rust shadow implementation for HQQ4 tensor quantization."""
+    _require_torch()
     if weight.ndim != 2:
         raise ValueError(f"HQQ attention expects 2D weights, got shape {tuple(weight.shape)}")
     if group_size <= 0:
@@ -1704,6 +1766,7 @@ def quantize_hqq4_tensor(
     worst_groups_limit: int = 8,
     timing_context: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
+    _require_torch()
     if weight.ndim != 2:
         raise ValueError(f"HQQ attention expects 2D weights, got shape {tuple(weight.shape)}")
     if group_size <= 0:
@@ -1975,6 +2038,7 @@ def quantize_hqq_search_cuda_tensor(
     device: Optional[torch.device] = None,
     timing_context: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
+    _require_torch()
     validate_hqq_nbits(nbits)
     if weight.ndim != 2:
         raise ValueError(f"HQQ attention expects 2D weights, got shape {tuple(weight.shape)}")
@@ -2120,6 +2184,7 @@ def quantize_hqq8_tensor(
     worst_groups_limit: int = 8,
     timing_context: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
+    _require_torch()
     if weight.ndim != 2:
         raise ValueError(f"HQQ attention expects 2D weights, got shape {tuple(weight.shape)}")
     if group_size <= 0:
@@ -2219,6 +2284,7 @@ def quantize_hqq6_tensor(
     worst_groups_limit: int = 8,
 ) -> Dict[str, torch.Tensor]:
     """HQQ6 tensor quantizer with true packed 6-bit storage."""
+    _require_torch()
     if weight.ndim != 2:
         raise ValueError(f"HQQ attention expects 2D weights, got shape {tuple(weight.shape)}")
     if group_size <= 0:
@@ -2300,6 +2366,7 @@ def quantize_hqq6_tensor_probe(
     collect_stats: bool = False,
     worst_groups_limit: int = 8,
 ) -> Dict[str, torch.Tensor]:
+    _require_torch()
     return quantize_hqq6_tensor(
         weight,
         group_size=group_size,
@@ -2321,6 +2388,7 @@ def write_hqq_attention_artifact(
     hqq4_inner_threads: Optional[int] = None,
     hqq_search_device: Optional[torch.device] = None,
 ) -> dict:
+    _require_torch()
     validate_hqq_nbits(nbits)
     normalized_group_size = normalize_hqq_attention_group_size(group_size)
     actual_cache_nbits = nbits if cache_nbits is None else int(cache_nbits)
@@ -2389,7 +2457,7 @@ def write_hqq_attention_artifact(
             }
         )
     file_started = time.perf_counter() if os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1" else 0.0
-    save_file(payload_tensors, path, metadata=metadata)
+    _save_safetensors_file(payload_tensors, path, metadata=metadata)
     tensor_bytes = _tensor_payload_bytes(payload_tensors)
     if file_started:
         _emit_real_model_timing(
@@ -2496,6 +2564,7 @@ def synthesize_hqq_fused_qkv_artifact(
     cache_nbits: Optional[int] = None,
 ) -> dict:
     """Build fused_qkv by concatenating already-written split HQQ q/k/v rows."""
+    _require_torch()
     validate_hqq_nbits(nbits)
     if int(nbits) == 4:
         raise RuntimeError(
@@ -2625,7 +2694,7 @@ def synthesize_hqq_fused_qkv_artifact(
         "dtype": str(original_dtype or ""),
     }
     file_started = time.perf_counter() if os.environ.get("KRASIS_HQQ_REAL_MODEL_TIMING") == "1" else 0.0
-    save_file(payload_tensors, path, metadata=metadata)
+    _save_safetensors_file(payload_tensors, path, metadata=metadata)
     tensor_bytes = _tensor_payload_bytes(payload_tensors)
     if file_started:
         _emit_real_model_timing(
@@ -2671,6 +2740,7 @@ def load_hqq_attention_artifact(
     group_size: Optional[int] = None,
     cache_nbits: Optional[int] = None,
 ) -> dict:
+    _require_torch()
     validate_hqq_nbits(expected_nbits)
     if entry.get("nbits") != expected_nbits:
         raise RuntimeError(
