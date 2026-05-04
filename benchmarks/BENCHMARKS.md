@@ -1,5 +1,168 @@
 # Krasis Benchmark Results
 
+## Experimental Runs - 2026-05-04 (Phase 2HA Q122B heatmap prefix + recency tail)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the runs.
+
+These extend the Phase 2GZ heatmap-prefix/recency-tail sweep to Qwen3.5-122B.
+Runs used normal global heatmap HCS plus `KRASIS_DYNAMIC_HCS=1
+KRASIS_DYNAMIC_HCS_TAIL_BLOCKS=N KRASIS_HCS_COLD_SWAP=0`. Timing
+instrumentation was disabled. Decode remained exact.
+
+For Q122B, one activated-expert block is computed at runtime as `48 * 8 = 384`
+routed expert invocations per generated token.
+
+| Model / run | Command | Tail slots | Protected slots | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Dynamic result | Log |
+|-------------|---------|-----------:|----------------:|----------------:|---------------:|-------------------:|-----|----------------|-----|
+| Qwen3.5-122B-A10B tail 1 block | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_DYNAMIC_HCS=1 KRASIS_DYNAMIC_HCS_TAIL_BLOCKS=1 KRASIS_HCS_COLD_SWAP=0 ./dev benchmark tests/q122b-k4v4-hqq6-int4-benchmark.conf` | 384 | 3396 | 4071.3 | 23.88 | 43.01 | 3780/12288 (30.8%) | Main final hit `66.44%`, final cumulative hit `66.12%`, `copy_failures=0` | [log](20260504_phase2ha_q122b_tail1.log) |
+| Qwen3.5-122B-A10B tail 2 blocks | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_DYNAMIC_HCS=1 KRASIS_DYNAMIC_HCS_TAIL_BLOCKS=2 KRASIS_HCS_COLD_SWAP=0 ./dev benchmark tests/q122b-k4v4-hqq6-int4-benchmark.conf` | 768 | 3012 | 4964.7 | 24.26 | 46.13 | 3780/12288 (30.8%) | Main final hit `68.33%`, final cumulative hit `68.06%`, `copy_failures=0` | [log](20260504_phase2ha_q122b_tail2.log) |
+
+Notes:
+- No CUDA/runtime errors were found in the two Phase 2HA logs.
+- Two blocks improved Q122B modestly over one block (`23.88 -> 24.26 tok/s`)
+  and increased main final hit (`66.44% -> 68.33%`).
+- Q122B still does not clearly beat the stronger prior static prompt-HCS result
+  (`25.29 tok/s` from Phase 2GO), so unlike Q235 this is not enough evidence to
+  make recency-tail mode the Q122B default.
+
+---
+
+## Experimental Runs - 2026-05-04 (Phase 2GZ heatmap prefix + recency tail)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the runs.
+
+These are opt-in runtime-policy experiments, not new defaults. Runs used normal
+global heatmap HCS plus `KRASIS_DYNAMIC_HCS=1 KRASIS_DYNAMIC_HCS_TAIL_BLOCKS=N
+KRASIS_HCS_COLD_SWAP=0`. Timing instrumentation was disabled. Decode remained
+exact: cold experts were still computed exactly, and dynamic HCS only changed
+soft-tier residency.
+
+The recency tail is measured in runtime activated-expert blocks. One block is
+computed from the model/layers as routed expert invocations per generated token:
+QCN `48 * 10 = 480`; Q235 `94 * 8 = 752`. The high-ranked heatmap prefix is
+protected; only the low-ranked tail can be replaced by recency promotions.
+
+| Model / run | Command | Tail slots | Protected slots | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Dynamic result | Log |
+|-------------|---------|-----------:|----------------:|----------------:|---------------:|-------------------:|-----|----------------|-----|
+| Qwen3-Coder-Next tail 1 block | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_DYNAMIC_HCS=1 KRASIS_DYNAMIC_HCS_TAIL_BLOCKS=1 KRASIS_HCS_COLD_SWAP=0 ./dev speed-test` | 480 | 14667 | 7856.8 | 87.95 | 140.43 | 15147/24576 (61.6%) | Final cumulative hit `95.20%`, `copy_failures=0`; small tail was safe but not best | [log](20260504_phase2gz_qcn_tail1.log) |
+| Qwen3-Coder-Next tail 2 blocks | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_DYNAMIC_HCS=1 KRASIS_DYNAMIC_HCS_TAIL_BLOCKS=2 KRASIS_HCS_COLD_SWAP=0 ./dev speed-test` | 960 | 14187 | 7287.4 | 90.53 | 151.01 | 15147/24576 (61.6%) | Best QCN row in this sweep; final cumulative hit `96.58%`, `copy_failures=0` | [log](20260504_phase2gz_qcn_tail2.log) |
+| Qwen3-235B-A22B tail 1 block | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_DYNAMIC_HCS=1 KRASIS_DYNAMIC_HCS_TAIL_BLOCKS=1 KRASIS_HCS_COLD_SWAP=0 ./dev benchmark tests/q235-k4v4-hqq6-int4-benchmark.conf` | 752 | 834 | 1943.2 | 4.69 | 8.33 | 1586/12032 (13.2%) | Stable improvement over static HCS, but below two-block tail; final cumulative hit `36.70%`, `copy_failures=0` | [log](20260504_phase2gz_q235_tail1.log) |
+| Qwen3-235B-A22B tail 2 blocks | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_DYNAMIC_HCS=1 KRASIS_DYNAMIC_HCS_TAIL_BLOCKS=2 KRASIS_HCS_COLD_SWAP=0 ./dev benchmark tests/q235-k4v4-hqq6-int4-benchmark.conf` | 1504 | 82 | 1758.1 | 4.86 | 7.94 | 1586/12032 (13.2%) | Best Q235 row in this sweep; final cumulative hit `40.87%`, `copy_failures=0` | [log](20260504_phase2gz_q235_tail2.log) |
+
+Notes:
+- No CUDA/runtime errors were found in the four Phase 2GZ logs.
+- QCN benefits from keeping most of the global heatmap cache; two recency
+  blocks (`960` slots, only `6.3%` of loaded HCS) performed best in this sweep.
+- Q235 still wants recency dominance: two blocks leave only `82` protected
+  heatmap slots and recover the previous budgeted dynamic best without using
+  heuristic startup. This suggests low-coverage models should prioritize
+  roughly 1-2 activated-expert blocks of recency tail over static heatmap tail.
+- These runs still pay global heatmap startup cost. The earlier heuristic
+  dynamic mode avoids that startup cost, but for QCN/Q122B it discarded too much
+  useful static heatmap state.
+
+---
+
+## Experimental Runs - 2026-05-04 (Phase 2GY dynamic recency HCS)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the runs.
+
+These are opt-in runtime-policy experiments, not new defaults. Runs used
+`KRASIS_DYNAMIC_HCS=1 KRASIS_HCS_HEURISTIC_INIT=1 KRASIS_HCS_COLD_SWAP=0`.
+Timing instrumentation was disabled. Decode remained exact: cold experts were
+still computed exactly, and dynamic HCS only changed soft-tier residency.
+
+The first unbounded Q235 attempt reached higher hit rate but regressed to
+`2.7-2.8 tok/s` because it promoted almost every cold expert. The completed
+rows below use the budgeted policy: at most one loaded soft-cache worth of
+promotions per decode request by default, controlled by
+`KRASIS_DYNAMIC_HCS_PROMOTION_BUDGET_MULT`.
+
+| Model / run | Config / command | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Dynamic result | Log |
+|-------------|------------------|-----------|----|----------------:|---------------:|-------------------:|-----|----------------|-----|
+| Qwen3-Coder-Next budgeted dynamic HCS | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_DYNAMIC_HCS=1 KRASIS_HCS_HEURISTIC_INIT=1 KRASIS_HCS_COLD_SWAP=0 ./dev speed-test` | HQQ8 | k4v4 | 7554.9 | 78.04 | 148.30 | 15147/24576 (61.6%) | Budget did not bind; final cumulative hit `97.14%`, `copy_failures=0` | [log](20260504_phase2gy_qcn_dynamic_hcs_budgeted.log) |
+| Qwen3.5-122B-A10B budgeted dynamic HCS | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_DYNAMIC_HCS=1 KRASIS_HCS_HEURISTIC_INIT=1 KRASIS_HCS_COLD_SWAP=0 ./dev benchmark tests/q122b-k4v4-hqq6-int4-benchmark.conf` | HQQ6 | k4v4 | 4159.0 | 23.30 | 32.45 | 3780/12288 (30.8%) | Final internal hit `72.65%`, but slower than static HCS; not useful as a blanket default | [log](20260504_phase2gy_q122b_dynamic_hcs_budgeted.log) |
+| Qwen3-235B-A22B budgeted dynamic HCS | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_DYNAMIC_HCS=1 KRASIS_HCS_HEURISTIC_INIT=1 KRASIS_HCS_COLD_SWAP=0 ./dev benchmark tests/q235-k4v4-hqq6-int4-benchmark.conf` | HQQ6 | k4v4 | 2018.9 | 4.87 | 8.01 | 1586/12032 (13.2%) | Improved Q235 exact decode `3.54 -> 4.87 tok/s`; final internal hit `40.07%`, `copy_failures=0` | [log](20260504_phase2gy_q235_dynamic_hcs_budgeted.log) |
+
+Notes:
+- Dynamic recency HCS helps the low-coverage Q235 case, but the budgeted
+  policy is still conservative. The `budget_skips` counters show many skipped
+  promotions on Q235, so there is room to tune admission without returning to
+  unbounded churn.
+- Q122B shows the opposite tradeoff: dynamic hit rate is high, but promotion
+  overhead and heuristic startup make it slower than the previous exact static
+  HCS row. Dynamic HCS should be gated by model/coverage/performance data.
+- Heuristic startup avoids global heatmap build cost and is explicitly rejected
+  unless `KRASIS_DYNAMIC_HCS=1` is also set.
+
+---
+
+## Diagnostic Runs - 2026-05-04 (Phase 2GX cache strategy shadow simulator)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the runs.
+
+These are instrumentation runs, not speed baselines. `KRASIS_ROUTE_LOCALITY=1`
+was enabled to shadow-simulate cache policies during exact decode. Runtime HCS
+behavior and expert selection were unchanged; the policy columns are simulated
+hit rates over the main internal 49/99/249 decode rows.
+
+| Model | Command | Runtime HCS | Actual HCS hit | Heatmap-only 15% | LRU 15% | Heatmap+LRU 15% | Decayed LFU 15% | Adaptive 15% | Log |
+|-------|---------|------------:|---------------:|-----------------:|--------:|----------------:|----------------:|-------------:|-----|
+| Qwen3-Coder-Next | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_ROUTE_LOCALITY=1 KRASIS_HCS_COLD_SWAP=0 ./dev speed-test` | 15147/24576 (61.6%) | 95.87% | 46.39% | 79.10% | 74.89% | 79.21% | 79.51% | [log](20260504_phase2gx_qcn_strategy_sim.log) |
+| Qwen3.5-122B-A10B | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_ROUTE_LOCALITY=1 KRASIS_HCS_COLD_SWAP=0 ./dev benchmark tests/q122b-k4v4-hqq6-int4-benchmark.conf` | 3780/12288 (30.8%) | 67.13% | 42.36% | 61.01% | 60.03% | 62.53% | 62.49% | [log](20260504_phase2gx_q122b_strategy_sim.log) |
+| Qwen3-235B-A22B | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 KRASIS_ROUTE_LOCALITY=1 KRASIS_HCS_COLD_SWAP=0 ./dev benchmark tests/q235-k4v4-hqq6-int4-benchmark.conf` | 1586/12032 (13.2%) | 37.62% | 40.21% | 64.95% | 58.81% | 64.61% | 64.72% | [log](20260504_phase2gx_q235_strategy_sim.log) |
+
+Notes:
+- The first Phase 2GW simulator archive was removed because a pre-report code
+  review found that fallback heatmap ranks were not stored in the per-layer
+  rank cache. Phase 2GX is the corrected rerun set.
+- Q235 shows the largest opportunity: at 15% simulated capacity, simple
+  recency/frequency policies hit about `64-65%` versus current runtime HCS
+  `37.62%`. With Q235's measured `~9.28 MB` INT4 expert payload, that would
+  reduce cold expert traffic from roughly `4.35 GB/tok` to `2.45-2.46 GB/tok`
+  if the simulated hits can be made resident or prefetched in the real runtime.
+- QCN's actual HCS hit rate is much higher because the real runtime cache has
+  `61.6%` coverage. The simulated 15% policies are useful for shape comparison,
+  not as a claim that QCN should reduce residency.
+
+---
+
+## Standard Benchmarks - 2026-05-03 (Phase 2GT Q235B llama-witness gate and benchmark)
+
+Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.
+
+Q235B was benchmarked only after building a BF16 llama-witness GGUF and
+capturing a non-HF witness artifact. The exact/default prompt-HCS path was
+used; HCS cold swaps were off and timing instrumentation was disabled.
+
+| Model / run | Config / command | Attention | KV | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Log |
+|-------------|------------------|-----------|----|----------------:|---------------:|-------------------:|-----|--------------:|-----|
+| Qwen3-235B-A22B prompt-HCS default | `KRASIS_HQQ_PREFILL_MATERIALIZE_BF16=1 ./dev benchmark tests/q235-k4v4-hqq6-int4-benchmark.conf` | HQQ6 | k4v4 | 1459.1 | 3.54 | 6.17 | 1586/12032 (13.2%) | 1062 MB | [log](20260503_phase2gt_q235_k4v4_hqq6_prompt_hcs_benchmark.log) |
+
+Validation:
+- Deleted the stale Q235 Q4_K_M GGUF shards from
+  `~/.krasis/models/Qwen3-235B-A22B-GGUF/Q4_K_M/Q4_K_M/`.
+- Added Q235 support to the built `./dev witness-*` wrappers.
+- `./dev witness-gguf-preflight q235` passed, then
+  `./dev witness-gguf-convert q235` produced
+  `~/.krasis/witness-gguf/Qwen3-235B-A22B-bf16.gguf`
+  (`470,293,436,256` bytes).
+- `./dev witness-capture q235` produced
+  `krasis-internal/reference-outputs/output/Qwen3-235B-A22B/llama_witness_q235_thinking_off.json`
+  with `14` llama-witness first-token cases.
+- Q235B reference gate against the llama-witness artifact passed:
+  prompts `14/14`, first token `13/14`, generated containment `14/14`,
+  prefill top-10 containment `14/14`.
+
+Notes:
+- The benchmark capped timed prefill at the config context limit, so the
+  best prefill row is `17,324` tokens rather than the nominal 20K/35K/50K
+  prompt sizes.
+- HCS coverage is low (`13.2%` during timed decode), so decode remains heavily
+  cold-expert limited.
+
+---
+
 ## Standard Benchmarks - 2026-05-03 (Phase 2GR QCN HCS cold swaps)
 
 Hardware: EPYC 7742, 1007 GB RAM, 1x RTX 5090 32 GB selected for the run.

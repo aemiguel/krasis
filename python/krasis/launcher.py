@@ -358,6 +358,7 @@ CONFIG_KEYS = [
     "CFG_SHARED_EXPERT_QUANT", "CFG_DENSE_MLP_QUANT",
     "CFG_LM_HEAD_QUANT", "CFG_KRASIS_THREADS", "CFG_HOST", "CFG_PORT",
     "CFG_GPU_PREFILL_THRESHOLD", "CFG_GGUF_PATH", "CFG_VRAM_SAFETY_MARGIN",
+    "CFG_DYNAMIC_HCS", "CFG_DYNAMIC_HCS_TAIL_BLOCKS",
     "CFG_FORCE_LOAD", "CFG_ENABLE_THINKING",
 ]
 
@@ -429,6 +430,8 @@ class LauncherConfig:
         self.gpu_prefill_threshold: int = 300
         self.gguf_path: str = ""
         self.vram_safety_margin: int = 600
+        self.dynamic_hcs: bool = True
+        self.dynamic_hcs_tail_blocks: int = 2
         self.force_load: bool = False
         self.force_rebuild_cache: bool = False
         self.force_rebuild_hqq_cache: bool = False
@@ -589,6 +592,15 @@ class LauncherConfig:
                 self.vram_safety_margin = int(saved["CFG_VRAM_SAFETY_MARGIN"])
             except (ValueError, TypeError):
                 pass
+        if "CFG_DYNAMIC_HCS" in saved:
+            self.dynamic_hcs = saved["CFG_DYNAMIC_HCS"] != "0"
+        if "CFG_DYNAMIC_HCS_TAIL_BLOCKS" in saved and saved["CFG_DYNAMIC_HCS_TAIL_BLOCKS"]:
+            try:
+                val = int(saved["CFG_DYNAMIC_HCS_TAIL_BLOCKS"])
+                if 1 <= val <= 5:
+                    self.dynamic_hcs_tail_blocks = val
+            except (ValueError, TypeError):
+                pass
         if "CFG_FORCE_LOAD" in saved and saved["CFG_FORCE_LOAD"]:
             self.force_load = saved["CFG_FORCE_LOAD"] == "1"
         if "CFG_FORCE_REBUILD_CACHE" in saved and saved["CFG_FORCE_REBUILD_CACHE"]:
@@ -630,6 +642,8 @@ class LauncherConfig:
             "CFG_GPU_PREFILL_THRESHOLD": str(self.gpu_prefill_threshold),
             "CFG_GGUF_PATH": self.gguf_path,
             "CFG_VRAM_SAFETY_MARGIN": str(self.vram_safety_margin),
+            "CFG_DYNAMIC_HCS": "1" if self.dynamic_hcs else "0",
+            "CFG_DYNAMIC_HCS_TAIL_BLOCKS": str(self.dynamic_hcs_tail_blocks),
             "CFG_FORCE_LOAD": "1" if self.force_load else "",
             "CFG_FORCE_REBUILD_CACHE": "1" if self.force_rebuild_cache else "",
             "CFG_FORCE_REBUILD_HQQ_CACHE": "1" if self.force_rebuild_hqq_cache else "",
@@ -694,6 +708,10 @@ OPTIONS = [
                  choices=[True, False]),
     ConfigOption("Session messenger", "session_enabled",
                  choices=[True, False]),
+    ConfigOption("Dynamic HCS", "dynamic_hcs",
+                 choices=[True, False], advanced=True),
+    ConfigOption("HCS tail blocks", "dynamic_hcs_tail_blocks",
+                 choices=[1, 2, 3, 4, 5], advanced=True),
     ConfigOption("Rebuild Marlin cache", "force_rebuild_cache",
                  choices=[False, True], advanced=True),
     ConfigOption("Rebuild HQQ cache(s)", "force_rebuild_hqq_cache",
@@ -710,6 +728,9 @@ def _format_value(opt: ConfigOption, val: Any) -> str:
         return f"{val:,} MB"
     if opt.key == "vram_safety_margin":
         return f"{val:,} MB"
+    if opt.key == "dynamic_hcs_tail_blocks":
+        suffix = "block" if int(val) == 1 else "blocks"
+        return f"{val} {suffix}"
     if opt.key == "attention_quant":
         if str(val) == "hqq4":
             return "HQQ4SC"
@@ -735,6 +756,8 @@ def _is_option_visible(
     if opt.key == "force_rebuild_hqq_cache":
         if cfg is None or attention_quant_cache_nbits(cfg.attention_quant) is None:
             return False
+    if opt.key == "dynamic_hcs_tail_blocks":
+        return cfg is None or bool(cfg.dynamic_hcs)
     return True
 
 
@@ -1952,6 +1975,12 @@ def parse_args() -> argparse.Namespace:
                         help="Path to GGUF file for CPU experts")
     parser.add_argument("--gpu-prefill-threshold", type=int, default=None,
                         help="Min tokens for GPU prefill (default: 300)")
+    parser.add_argument("--dynamic-hcs", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Enable dynamic HCS heatmap-prefix + recency-tail cache (default: on)")
+    parser.add_argument("--dynamic-hcs-tail-blocks", type=int, default=None,
+                        choices=[1, 2, 3, 4, 5],
+                        help="Advanced: recency tail size in activated-expert blocks (1-5, default: 2)")
     parser.add_argument("--force-load", action="store_true",
                         help="Override RAM safety checks and load anyway")
     parser.add_argument("--force-rebuild-cache", action="store_true",
@@ -2057,6 +2086,10 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         cfg.port = args.port
     if args.gpu_prefill_threshold is not None:
         cfg.gpu_prefill_threshold = args.gpu_prefill_threshold
+    if args.dynamic_hcs is not None:
+        cfg.dynamic_hcs = bool(args.dynamic_hcs)
+    if args.dynamic_hcs_tail_blocks is not None:
+        cfg.dynamic_hcs_tail_blocks = int(args.dynamic_hcs_tail_blocks)
     if args.gguf_path is not None:
         cfg.gguf_path = args.gguf_path
     if args.force_load:

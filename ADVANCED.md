@@ -91,12 +91,21 @@ When BF16 is selected for experts or major components, treat that run as validat
 | `--kv-cache-mb N` | 1000 | KV cache size in MB |
 | `--hcs` / `--no-hcs` | on | Hot Cache Strategy for expert pinning |
 | `--multi-gpu-hcs` | off | Pin HCS experts across all GPUs |
+| `--dynamic-hcs` / `--no-dynamic-hcs` | on | Dynamic HCS: protect the high-ranked heatmap prefix and reserve a recency-adaptive tail |
+| `--dynamic-hcs-tail-blocks N` | 2 | Advanced dynamic HCS recency-tail size, measured in activated-expert blocks; valid range `1..5` |
 | `--vram-safety-margin N` | 600 | Reserved VRAM in MB below which warnings fire |
 | `--stream-attention` | off | Stream attention weights from CPU (for very large models) |
 | `--force-load` | — | Override RAM safety checks and load anyway |
 | `--force-rebuild-cache` | — | Delete existing expert caches and rebuild from safetensors |
 | `--build-cache` | — | Build expert caches (if missing) and exit without starting server |
 | `--heatmap-path PATH` | — | Path to expert_heatmap.json for HCS init |
+
+Dynamic HCS uses the same physical HCS residency table as the heatmap cache.
+It does not create a second cache or allow duplicate expert residency across a
+heatmap region and a recency region. The default keeps the heatmap prefix and
+reserves two activated-expert blocks for recency promotion; use
+`--dynamic-hcs-tail-blocks 1..5` for model-specific tuning, or
+`--no-dynamic-hcs` to run static heatmap HCS only.
 
 ### Prefill & Decode
 

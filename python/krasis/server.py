@@ -776,6 +776,7 @@ def main():
     if pre_args.selected_gpus is not None:
         explicit_selected_gpus = _normalize_selected_gpus(pre_args.selected_gpus, "--selected-gpus")
     explicit_num_gpus = _argv_has_option(remaining_argv, "--num-gpus")
+    explicit_dynamic_tail_blocks = _argv_has_option(remaining_argv, "--dynamic-hcs-tail-blocks")
 
     config_defaults = {}
     config_selected_gpus = None
@@ -817,6 +818,8 @@ def main():
             "CFG_MULTI_GPU_HCS": "multi_gpu_hcs",
             "CFG_KV_CACHE_MB": "kv_cache_mb",
             "CFG_VRAM_SAFETY_MARGIN": "vram_safety_margin",
+            "CFG_DYNAMIC_HCS": "dynamic_hcs",
+            "CFG_DYNAMIC_HCS_TAIL_BLOCKS": "dynamic_hcs_tail_blocks",
             "CFG_ENABLE_THINKING": "enable_thinking",
             "CFG_SESSION_ENABLED": "session_enabled",
             "CFG_NUM_GPUS": "num_gpus",
@@ -858,6 +861,7 @@ def main():
                         "CFG_SESSION_ENABLED",
                         "CFG_HCS",
                         "CFG_MULTI_GPU_HCS",
+                        "CFG_DYNAMIC_HCS",
                         "CFG_CPU_DECODE",
                     ):
                         # CFG_ format uses "1"/"" for booleans
@@ -905,6 +909,7 @@ def main():
     elif explicit_selected_gpus is not None:
         config_defaults["selected_gpus"] = explicit_selected_gpus
         config_defaults["num_gpus"] = len(explicit_selected_gpus.split(","))
+    config_dynamic_tail_blocks = "dynamic_hcs_tail_blocks" in config_defaults
 
     parser = argparse.ArgumentParser(description="Krasis standalone LLM server",
                                      parents=[pre])
@@ -963,6 +968,10 @@ def main():
                         help="Enable Hot Cache Strategy (default: on for GPU decode, use --no-hcs to disable)")
     parser.add_argument("--multi-gpu-hcs", action="store_true", default=False,
                         help="Pin HCS experts across ALL GPUs (more capacity, but cross-device transfer)")
+    parser.add_argument("--dynamic-hcs", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable dynamic HCS heatmap-prefix + recency-tail cache (default: on)")
+    parser.add_argument("--dynamic-hcs-tail-blocks", type=int, default=2, choices=range(1, 6),
+                        help="Advanced: recency tail size in activated-expert blocks (1-5, default: 2)")
     # NOTE: --hcs-headroom-mb removed — HCS budget is computed from 4-point VRAM calibration, not a fixed headroom
     parser.add_argument("--vram-safety-margin", type=int, default=600,
                         help="VRAM safety margin in MB — reserved free VRAM for decode kernel intermediates "
@@ -1011,6 +1020,22 @@ def main():
     if config_defaults:
         parser.set_defaults(**config_defaults)
     args = parser.parse_args(remaining_argv)
+    try:
+        args.dynamic_hcs_tail_blocks = int(args.dynamic_hcs_tail_blocks)
+    except (TypeError, ValueError):
+        parser.error("--dynamic-hcs-tail-blocks must be an integer in 1..5")
+    if args.dynamic_hcs_tail_blocks < 1 or args.dynamic_hcs_tail_blocks > 5:
+        parser.error("--dynamic-hcs-tail-blocks must be in 1..5")
+    if args.hcs and args.dynamic_hcs:
+        os.environ["KRASIS_DYNAMIC_HCS"] = "1"
+        if (
+            explicit_dynamic_tail_blocks
+            or config_dynamic_tail_blocks
+            or "KRASIS_DYNAMIC_HCS_TAIL_BLOCKS" not in os.environ
+        ):
+            os.environ["KRASIS_DYNAMIC_HCS_TAIL_BLOCKS"] = str(args.dynamic_hcs_tail_blocks)
+    else:
+        os.environ["KRASIS_DYNAMIC_HCS"] = "0"
     if explicit_selected_gpus is not None:
         selected_count = len(explicit_selected_gpus.split(","))
         if explicit_num_gpus and args.num_gpus is not None and args.num_gpus != selected_count:
@@ -1798,34 +1823,54 @@ def main():
         primary_dev = devices[0]
         total_experts = cfg.n_routed_experts * cfg.num_moe_layers
 
-        # ── Build heatmap ──
-        # Always rebuild fresh on startup so the heatmap reflects current decode
-        # routing and exact heatmap build parameters. Reuse is only allowed via
-        # explicit --heatmap-path, and that path must validate against the same
-        # runtime params, heatmap params, prompt hash, and Krasis version.
-        heatmap_prompts = _load_heatmap_prompts()
-        _assert_heatmap_prompts_are_held_out(heatmap_prompts)
-        expected_heatmap_metadata = _expected_heatmap_metadata(_model, args, heatmap_prompts)
-        validated_heatmap_data = None
-        if args.heatmap_path:
-            _dim(f"Using user-provided heatmap: {os.path.basename(heatmap_path)}")
-            validated_heatmap_data = _load_validated_heatmap(heatmap_path, expected_heatmap_metadata)
-            _detail("Heatmap metadata validated against current runtime and build params")
+        heuristic_hcs_init = os.environ.get("KRASIS_HCS_HEURISTIC_INIT", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        dynamic_hcs = os.environ.get("KRASIS_DYNAMIC_HCS", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        if heuristic_hcs_init:
+            if not dynamic_hcs:
+                raise RuntimeError(
+                    "KRASIS_HCS_HEURISTIC_INIT=1 requires KRASIS_DYNAMIC_HCS=1; "
+                    "heuristic startup fill is only intended for the dynamic recency cache."
+                )
+            if args.heatmap_path:
+                raise RuntimeError(
+                    "KRASIS_HCS_HEURISTIC_INIT=1 cannot be combined with --heatmap-path; "
+                    "choose heuristic startup or an explicit validated heatmap."
+                )
+            _warn("Experimental HCS heuristic init enabled: skipping global heatmap build")
+            ranking = []
         else:
-            _status("Building expert heatmap (decode-weighted calibration)")
-            heatmap_path = _build_heatmap(_model, heatmap_path, args)
+            # ── Build heatmap ──
+            # Always rebuild fresh on startup so the heatmap reflects current decode
+            # routing and exact heatmap build parameters. Reuse is only allowed via
+            # explicit --heatmap-path, and that path must validate against the same
+            # runtime params, heatmap params, prompt hash, and Krasis version.
+            heatmap_prompts = _load_heatmap_prompts()
+            _assert_heatmap_prompts_are_held_out(heatmap_prompts)
+            expected_heatmap_metadata = _expected_heatmap_metadata(_model, args, heatmap_prompts)
+            validated_heatmap_data = None
+            if args.heatmap_path:
+                _dim(f"Using user-provided heatmap: {os.path.basename(heatmap_path)}")
+                validated_heatmap_data = _load_validated_heatmap(heatmap_path, expected_heatmap_metadata)
+                _detail("Heatmap metadata validated against current runtime and build params")
+            else:
+                _status("Building expert heatmap (decode-weighted calibration)")
+                heatmap_path = _build_heatmap(_model, heatmap_path, args)
 
-        # ── Load heatmap and build sorted ranking ──
-        if validated_heatmap_data is not None:
-            raw_heatmap = validated_heatmap_data
-        else:
-            with open(heatmap_path) as f:
-                raw_heatmap = json.load(f)
-        # Strip metadata before building ranking
-        raw_heatmap.pop("_metadata", None)
-        sorted_ranking = sorted(raw_heatmap.items(), key=lambda x: x[1], reverse=True)
-        ranking = [(int(k.split(",")[0]), int(k.split(",")[1])) for k, _ in sorted_ranking]
-        _detail(f"Heatmap: {len(ranking):,} experts ranked from {len(raw_heatmap):,} entries")
+            # ── Load heatmap and build sorted ranking ──
+            if validated_heatmap_data is not None:
+                raw_heatmap = validated_heatmap_data
+            else:
+                with open(heatmap_path) as f:
+                    raw_heatmap = json.load(f)
+            # Strip metadata before building ranking
+            raw_heatmap.pop("_metadata", None)
+            sorted_ranking = sorted(raw_heatmap.items(), key=lambda x: x[1], reverse=True)
+            ranking = [(int(k.split(",")[0]), int(k.split(",")[1])) for k, _ in sorted_ranking]
+            _detail(f"Heatmap: {len(ranking):,} experts ranked from {len(raw_heatmap):,} entries")
 
         # Build full ranking for a layer range: heatmap-ranked experts first,
         # then unranked experts to fill remaining VRAM (better than empty slots).
@@ -1842,6 +1887,16 @@ def main():
                 n_experts = cfg.n_routed_experts
                 for e in range(n_experts):
                     if (i, e) not in ranked_set:
+                        filtered.append((i, e))
+            return filtered
+
+        def _heuristic_ranking_for_layers(layer_start, layer_end):
+            """Return a balanced deterministic per-layer ranking without heatmap collection."""
+            filtered = []
+            for e in range(cfg.n_routed_experts):
+                for i in range(layer_start, layer_end):
+                    layer = _model.layers[i]
+                    if layer.is_moe:
                         filtered.append((i, e))
             return filtered
 
@@ -1878,14 +1933,22 @@ def main():
             gpu0_hard = 0
             gpu0_soft = reclaimable_hcs_budget
             if _multi_gpu_split > 0:
-                gpu0_ranking = _full_ranking_for_layers(ranking, 0, _multi_gpu_split)
+                gpu0_ranking = (
+                    _heuristic_ranking_for_layers(0, _multi_gpu_split)
+                    if heuristic_hcs_init
+                    else _full_ranking_for_layers(ranking, 0, _multi_gpu_split)
+                )
                 num_ranked = sum(1 for l, e in gpu0_ranking if (l, e) in set(ranking))
                 _dim(f"GPU0 HCS: {len(gpu0_ranking)} experts for layers [0..{_multi_gpu_split}) "
                      f"({num_ranked} ranked + {len(gpu0_ranking) - num_ranked} unranked), "
                      f"reclaimable: {gpu0_soft:,} MB")
             else:
                 # Single GPU: include all unranked experts too
-                gpu0_ranking = _full_ranking_for_layers(ranking, 0, len(_model.layers))
+                gpu0_ranking = (
+                    _heuristic_ranking_for_layers(0, len(_model.layers))
+                    if heuristic_hcs_init
+                    else _full_ranking_for_layers(ranking, 0, len(_model.layers))
+                )
                 num_ranked = len(ranking)
                 _dim(f"GPU0 HCS: {len(gpu0_ranking)} experts "
                      f"({num_ranked} ranked + {len(gpu0_ranking) - num_ranked} unranked), "
@@ -2085,14 +2148,18 @@ def main():
             total_mb = vram_monitor.total_mb(idx)
             _dim(f"  cuda:{idx} after aux store setup: {post_free:,.0f} MB free / {total_mb:,} MB total")
 
-        # Initialize HCS on each aux store if we have the heatmap
+        # Initialize HCS on each aux store if requested.
         if args.hcs and 'ranking' in locals():
             for i, aux_store in enumerate(aux_stores):
                 seg_start = boundaries[i + 1]
                 seg_end = boundaries[i + 2]
                 gpu_idx = device_indices[i + 1]
 
-                aux_ranking = _full_ranking_for_layers(ranking, seg_start, seg_end)
+                aux_ranking = (
+                    _heuristic_ranking_for_layers(seg_start, seg_end)
+                    if heuristic_hcs_init
+                    else _full_ranking_for_layers(ranking, seg_start, seg_end)
+                )
                 num_aux_ranked = sum(1 for l, e in aux_ranking if (l, e) in set(ranking))
                 _dim(f"  GPU{i+1} HCS: {len(aux_ranking)} experts for layers [{seg_start}..{seg_end}) "
                      f"({num_aux_ranked} ranked + {len(aux_ranking) - num_aux_ranked} unranked)")

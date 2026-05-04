@@ -24,6 +24,11 @@ use cudarc::driver::sys as cuda_sys;
 
 const GPU_ROUTE_SYNC_DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const PROMPT_HCS_DEFAULT_RETAIN_PCT: usize = 85;
+const ROUTE_LOCALITY_DEFAULT_COVERAGE_PCTS: &[f64] = &[10.0, 15.0, 20.0];
+const ROUTE_LOCALITY_HEATMAP_PIN_PCT: f64 = 50.0;
+const ROUTE_LOCALITY_LFU_DECAY: f32 = 0.97;
+const ROUTE_LOCALITY_ADAPTIVE_DECAY: f64 = 0.90;
+const ROUTE_LOCALITY_ADAPTIVE_SPLITS: &[f64] = &[50.0, 25.0, 75.0, 0.0, 100.0];
 
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
@@ -69,6 +74,81 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn env_f64_list(name: &str, default: &[f64]) -> Vec<f64> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let mut invalid = 0usize;
+            let mut parsed = Vec::new();
+            for part in raw.split(',') {
+                match part.trim().parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 && v <= 100.0 => parsed.push(v),
+                    _ => invalid += 1,
+                }
+            }
+            if parsed.is_empty() {
+                log::warn!(
+                    "{} was set but contained no valid percentages; using default {:?}",
+                    name,
+                    default,
+                );
+                default.to_vec()
+            } else {
+                if invalid > 0 {
+                    log::warn!(
+                        "{} ignored {} invalid percentage entries; using {:?}",
+                        name,
+                        invalid,
+                        parsed,
+                    );
+                }
+                parsed
+            }
+        }
+        Err(_) => default.to_vec(),
+    }
+}
+
+fn dynamic_hcs_enabled() -> bool {
+    env_truthy("KRASIS_DYNAMIC_HCS")
+}
+
+fn dynamic_hcs_log_enabled() -> bool {
+    env_truthy("KRASIS_DYNAMIC_HCS_LOG")
+}
+
+const DEFAULT_DYNAMIC_HCS_TAIL_BLOCKS: f64 = 2.0;
+const MIN_DYNAMIC_HCS_TAIL_BLOCKS: f64 = 1.0;
+const MAX_DYNAMIC_HCS_TAIL_BLOCKS: f64 = 5.0;
+
+fn dynamic_hcs_tail_blocks() -> Option<f64> {
+    match std::env::var("KRASIS_DYNAMIC_HCS_TAIL_BLOCKS") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Some(DEFAULT_DYNAMIC_HCS_TAIL_BLOCKS);
+            }
+            match trimmed.parse::<f64>() {
+                Ok(v)
+                    if v.is_finite()
+                        && (MIN_DYNAMIC_HCS_TAIL_BLOCKS..=MAX_DYNAMIC_HCS_TAIL_BLOCKS)
+                            .contains(&v) =>
+                {
+                    Some(v)
+                }
+                _ => {
+                    log::warn!(
+                        "KRASIS_DYNAMIC_HCS_TAIL_BLOCKS={} is invalid; using default {:.0} blocks",
+                        raw,
+                        DEFAULT_DYNAMIC_HCS_TAIL_BLOCKS,
+                    );
+                    Some(DEFAULT_DYNAMIC_HCS_TAIL_BLOCKS)
+                }
+            }
+        }
+        Err(_) => Some(DEFAULT_DYNAMIC_HCS_TAIL_BLOCKS),
+    }
+}
+
 fn bind_hcs_route_pointer_device(
     device: &Arc<CudaDevice>,
     reason: &str,
@@ -82,6 +162,677 @@ fn bind_hcs_route_pointer_device(
         false
     } else {
         true
+    }
+}
+
+#[derive(Clone, Default)]
+struct RouteLocalityLayerStats {
+    selected: u64,
+    last1_hits: u64,
+    actual_hcs_hits: u64,
+    heatmap_hits: Vec<u64>,
+    lru_hits: Vec<u64>,
+    heatmap_lru_hits: Vec<u64>,
+    decayed_lfu_hits: Vec<u64>,
+    adaptive_hits: Vec<u64>,
+}
+
+#[derive(Clone)]
+struct RouteLocalityCoverageState {
+    heatmap_hits: u64,
+    lru_hits: u64,
+    heatmap_lru_hits: u64,
+    decayed_lfu_hits: u64,
+    adaptive_hits: u64,
+    lru_by_layer: Vec<Vec<i32>>,
+    heatmap_lru_by_layer: Vec<Vec<i32>>,
+    lfu_scores_by_layer: Vec<Vec<f32>>,
+    adaptive_lru_by_split_layer: Vec<Vec<Vec<i32>>>,
+    adaptive_score_by_split_layer: Vec<Vec<f64>>,
+}
+
+impl RouteLocalityCoverageState {
+    fn new(split_count: usize) -> Self {
+        Self {
+            heatmap_hits: 0,
+            lru_hits: 0,
+            heatmap_lru_hits: 0,
+            decayed_lfu_hits: 0,
+            adaptive_hits: 0,
+            lru_by_layer: Vec::new(),
+            heatmap_lru_by_layer: Vec::new(),
+            lfu_scores_by_layer: Vec::new(),
+            adaptive_lru_by_split_layer: vec![Vec::new(); split_count],
+            adaptive_score_by_split_layer: vec![Vec::new(); split_count],
+        }
+    }
+
+    fn reset_counts(&mut self) {
+        self.heatmap_hits = 0;
+        self.lru_hits = 0;
+        self.heatmap_lru_hits = 0;
+        self.decayed_lfu_hits = 0;
+        self.adaptive_hits = 0;
+        self.lru_by_layer.clear();
+        self.heatmap_lru_by_layer.clear();
+        self.lfu_scores_by_layer.clear();
+        for split in self.adaptive_lru_by_split_layer.iter_mut() {
+            split.clear();
+        }
+        for split in self.adaptive_score_by_split_layer.iter_mut() {
+            split.clear();
+        }
+    }
+
+    fn ensure_layer(&mut self, layer_idx: usize, num_experts: usize) {
+        if self.lru_by_layer.len() <= layer_idx {
+            self.lru_by_layer.resize_with(layer_idx + 1, Vec::new);
+        }
+        if self.heatmap_lru_by_layer.len() <= layer_idx {
+            self.heatmap_lru_by_layer.resize_with(layer_idx + 1, Vec::new);
+        }
+        if self.lfu_scores_by_layer.len() <= layer_idx {
+            self.lfu_scores_by_layer.resize_with(layer_idx + 1, Vec::new);
+        }
+        if self.lfu_scores_by_layer[layer_idx].len() != num_experts {
+            self.lfu_scores_by_layer[layer_idx] = vec![0.0; num_experts];
+        }
+        for split in self.adaptive_lru_by_split_layer.iter_mut() {
+            if split.len() <= layer_idx {
+                split.resize_with(layer_idx + 1, Vec::new);
+            }
+        }
+        for split in self.adaptive_score_by_split_layer.iter_mut() {
+            if split.len() <= layer_idx {
+                split.resize(layer_idx + 1, 0.0);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RouteLocalityStats {
+    enabled: bool,
+    coverage_pcts: Vec<f64>,
+    heatmap_pin_pct: f64,
+    route_events: u64,
+    selected_total: u64,
+    last1_hits: u64,
+    actual_hcs_hits: u64,
+    actual_hcs_cached: usize,
+    actual_hcs_possible: usize,
+    previous_by_layer: Vec<Vec<i32>>,
+    heatmap_rank_by_layer: Vec<Vec<usize>>,
+    policy_states: Vec<RouteLocalityCoverageState>,
+    layer_stats: Vec<RouteLocalityLayerStats>,
+}
+
+impl RouteLocalityStats {
+    fn from_env() -> Self {
+        let enabled = env_truthy("KRASIS_ROUTE_LOCALITY");
+        let coverage_pcts = env_f64_list(
+            "KRASIS_ROUTE_LOCALITY_COVERAGE_PCTS",
+            ROUTE_LOCALITY_DEFAULT_COVERAGE_PCTS,
+        );
+        let policy_count = coverage_pcts.len();
+        let split_count = ROUTE_LOCALITY_ADAPTIVE_SPLITS.len();
+        let s = Self {
+            enabled,
+            coverage_pcts,
+            heatmap_pin_pct: ROUTE_LOCALITY_HEATMAP_PIN_PCT,
+            route_events: 0,
+            selected_total: 0,
+            last1_hits: 0,
+            actual_hcs_hits: 0,
+            actual_hcs_cached: 0,
+            actual_hcs_possible: 0,
+            previous_by_layer: Vec::new(),
+            heatmap_rank_by_layer: Vec::new(),
+            policy_states: (0..policy_count)
+                .map(|_| RouteLocalityCoverageState::new(split_count))
+                .collect(),
+            layer_stats: Vec::new(),
+        };
+        if enabled {
+            log::info!(
+                "Route locality diagnostic enabled: coverage_pcts={:?}, heatmap_pin_pct={:.1}, lfu_decay={:.3}, adaptive_splits={:?}",
+                s.coverage_pcts,
+                s.heatmap_pin_pct,
+                ROUTE_LOCALITY_LFU_DECAY,
+                ROUTE_LOCALITY_ADAPTIVE_SPLITS,
+            );
+        }
+        s
+    }
+
+    fn reset_counts(&mut self) {
+        self.route_events = 0;
+        self.selected_total = 0;
+        self.last1_hits = 0;
+        self.actual_hcs_hits = 0;
+        self.actual_hcs_cached = 0;
+        self.actual_hcs_possible = 0;
+        self.previous_by_layer.clear();
+        self.heatmap_rank_by_layer.clear();
+        for state in self.policy_states.iter_mut() {
+            state.reset_counts();
+        }
+        self.layer_stats.clear();
+    }
+
+    fn ensure_layer(&mut self, layer_idx: usize, num_experts: usize) {
+        if self.previous_by_layer.len() <= layer_idx {
+            self.previous_by_layer.resize_with(layer_idx + 1, Vec::new);
+        }
+        if self.heatmap_rank_by_layer.len() <= layer_idx {
+            self.heatmap_rank_by_layer.resize_with(layer_idx + 1, Vec::new);
+        }
+        if self.layer_stats.len() <= layer_idx {
+            self.layer_stats
+                .resize_with(layer_idx + 1, RouteLocalityLayerStats::default);
+        }
+        let policy_count = self.coverage_pcts.len();
+        if self.layer_stats[layer_idx].heatmap_hits.len() < policy_count {
+            self.layer_stats[layer_idx].heatmap_hits.resize(policy_count, 0);
+        }
+        if self.layer_stats[layer_idx].lru_hits.len() < policy_count {
+            self.layer_stats[layer_idx].lru_hits.resize(policy_count, 0);
+        }
+        if self.layer_stats[layer_idx].heatmap_lru_hits.len() < policy_count {
+            self.layer_stats[layer_idx].heatmap_lru_hits.resize(policy_count, 0);
+        }
+        if self.layer_stats[layer_idx].decayed_lfu_hits.len() < policy_count {
+            self.layer_stats[layer_idx].decayed_lfu_hits.resize(policy_count, 0);
+        }
+        if self.layer_stats[layer_idx].adaptive_hits.len() < policy_count {
+            self.layer_stats[layer_idx].adaptive_hits.resize(policy_count, 0);
+        }
+        for state in self.policy_states.iter_mut() {
+            state.ensure_layer(layer_idx, num_experts);
+        }
+    }
+
+    fn coverage_capacity(num_experts: usize, pct: f64) -> usize {
+        if num_experts == 0 {
+            0
+        } else {
+            ((num_experts as f64) * pct / 100.0).ceil()
+                .max(1.0) as usize
+        }
+    }
+
+    fn update_lru(cache: &mut Vec<i32>, eid: i32, capacity: usize) {
+        if capacity == 0 {
+            cache.clear();
+            return;
+        }
+        if let Some(pos) = cache.iter().position(|&v| v == eid) {
+            cache.remove(pos);
+        }
+        cache.insert(0, eid);
+        if cache.len() > capacity {
+            cache.truncate(capacity);
+        }
+    }
+
+    fn ensure_heatmap_rank(
+        &mut self,
+        layer_idx: usize,
+        num_experts: usize,
+        hcs: Option<&HcsState>,
+    ) {
+        if self.heatmap_rank_by_layer[layer_idx].len() == num_experts
+            && self.heatmap_rank_by_layer[layer_idx].iter().any(|&rank| rank != usize::MAX)
+        {
+            return;
+        }
+        let mut ranks = vec![usize::MAX; num_experts];
+        let Some(hcs) = hcs else {
+            self.heatmap_rank_by_layer[layer_idx] = ranks;
+            return;
+        };
+        if hcs.num_experts_per_layer == 0 {
+            self.heatmap_rank_by_layer[layer_idx] = ranks;
+            return;
+        }
+        let base = layer_idx.saturating_mul(hcs.num_experts_per_layer);
+        let mut entries: Vec<(u64, usize)> = (0..num_experts)
+            .map(|expert_idx| {
+                let idx = base + expert_idx;
+                let count = hcs.heatmap_flat.get(idx).copied().unwrap_or(0);
+                (count, expert_idx)
+            })
+            .collect();
+        if !entries.iter().any(|(count, _)| *count > 0) {
+            let mut fill_from_order = |ordered: &[(usize, usize)]| -> usize {
+                let mut layer_rank = ranks.iter()
+                    .filter(|&&rank| rank != usize::MAX)
+                    .count();
+                for &(rank_layer, expert_idx) in ordered.iter() {
+                    if rank_layer == layer_idx
+                        && expert_idx < num_experts
+                        && ranks[expert_idx] == usize::MAX
+                    {
+                        ranks[expert_idx] = layer_rank;
+                        layer_rank += 1;
+                    }
+                }
+                layer_rank
+            };
+            let mut filled = fill_from_order(&hcs.heatmap_ranking);
+            if filled == 0 {
+                filled = fill_from_order(&hcs.soft_heatmap_ranking);
+            }
+            if filled == 0 {
+                filled = fill_from_order(&hcs.soft_ranking);
+            }
+            if filled == 0 {
+                let pool_order: Vec<(usize, usize)> = hcs.pool_slot_to_expert.iter()
+                    .filter_map(|slot| *slot)
+                    .collect();
+                fill_from_order(&pool_order);
+            }
+            self.heatmap_rank_by_layer[layer_idx] = ranks;
+            return;
+        }
+        entries.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        for (rank, (_, expert_idx)) in entries.into_iter().enumerate() {
+            ranks[expert_idx] = rank;
+        }
+        self.heatmap_rank_by_layer[layer_idx] = ranks;
+    }
+
+    #[inline]
+    fn heatmap_hit(heatmap_rank: &[usize], eid: i32, capacity: usize) -> bool {
+        if capacity == 0 || eid < 0 {
+            return false;
+        }
+        heatmap_rank
+            .get(eid as usize)
+            .copied()
+            .map(|rank| rank < capacity)
+            .unwrap_or(false)
+    }
+
+    fn lfu_hit_count(scores: &[f32], selected: &[i32], capacity: usize) -> u64 {
+        if capacity == 0 || scores.is_empty() {
+            return 0;
+        }
+        let mut ranked: Vec<(f32, usize)> = scores.iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(idx, score)| {
+                if score > 0.0 && score.is_finite() {
+                    Some((score, idx))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if ranked.is_empty() {
+            return 0;
+        }
+        ranked.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        ranked.truncate(capacity.min(ranked.len()));
+        let mut hits = 0u64;
+        for &eid in selected {
+            if eid >= 0 {
+                let eid = eid as usize;
+                if ranked.iter().any(|&(_, idx)| idx == eid) {
+                    hits += 1;
+                }
+            }
+        }
+        hits
+    }
+
+    fn split_caps(capacity: usize, split_pct: f64) -> (usize, usize) {
+        let pin = ((capacity as f64) * split_pct / 100.0).round() as usize;
+        let pin = pin.min(capacity);
+        (pin, capacity.saturating_sub(pin))
+    }
+
+    fn heatmap_lru_hit_count(
+        heatmap_rank: &[usize],
+        lru_cache: &[i32],
+        selected: &[i32],
+        pin_capacity: usize,
+    ) -> u64 {
+        let mut hits = 0u64;
+        for &eid in selected {
+            if Self::heatmap_hit(heatmap_rank, eid, pin_capacity)
+                || lru_cache.contains(&eid)
+            {
+                hits += 1;
+            }
+        }
+        hits
+    }
+
+    fn record(
+        &mut self,
+        layer_idx: usize,
+        num_experts: usize,
+        topk: usize,
+        topk_ids: &[i32],
+        hcs: Option<&HcsState>,
+    ) {
+        if !self.enabled || num_experts == 0 || topk == 0 {
+            return;
+        }
+        self.ensure_layer(layer_idx, num_experts);
+        self.ensure_heatmap_rank(layer_idx, num_experts, hcs);
+
+        let selected: Vec<i32> = topk_ids.iter()
+            .take(topk)
+            .copied()
+            .filter(|&eid| eid >= 0 && (eid as usize) < num_experts)
+            .collect();
+        if selected.is_empty() {
+            return;
+        }
+
+        self.route_events += 1;
+        self.selected_total += selected.len() as u64;
+        self.layer_stats[layer_idx].selected += selected.len() as u64;
+
+        if let Some(hcs) = hcs {
+            self.actual_hcs_cached = hcs.num_cached;
+            self.actual_hcs_possible = hcs.cache_fast_num_layers
+                .saturating_mul(hcs.num_experts_per_layer);
+            for &eid in selected.iter() {
+                if eid >= 0 && hcs.get_fast(layer_idx, eid as usize).is_some() {
+                    self.actual_hcs_hits += 1;
+                    self.layer_stats[layer_idx].actual_hcs_hits += 1;
+                }
+            }
+        }
+
+        let prev = &self.previous_by_layer[layer_idx];
+        for &eid in selected.iter() {
+            if prev.contains(&eid) {
+                self.last1_hits += 1;
+                self.layer_stats[layer_idx].last1_hits += 1;
+            }
+        }
+
+        let heatmap_rank = self.heatmap_rank_by_layer[layer_idx].clone();
+        let policy_count = self.coverage_pcts.len();
+        let mut heatmap_hits_by_policy = vec![0u64; policy_count];
+        let mut lru_hits_by_policy = vec![0u64; policy_count];
+        let mut heatmap_lru_hits_by_policy = vec![0u64; policy_count];
+        let mut decayed_lfu_hits_by_policy = vec![0u64; policy_count];
+        let mut adaptive_hits_by_policy = vec![0u64; policy_count];
+
+        for policy_idx in 0..policy_count {
+            let pct = self.coverage_pcts[policy_idx];
+            let capacity = Self::coverage_capacity(num_experts, pct);
+            let (pin_capacity, lru_tail_capacity) =
+                Self::split_caps(capacity, self.heatmap_pin_pct);
+            let state = &mut self.policy_states[policy_idx];
+
+            let heatmap_hits = selected.iter()
+                .filter(|&&eid| Self::heatmap_hit(&heatmap_rank, eid, capacity))
+                .count() as u64;
+            heatmap_hits_by_policy[policy_idx] = heatmap_hits;
+            state.heatmap_hits += heatmap_hits;
+
+            let lru_cache = &mut state.lru_by_layer[layer_idx];
+            for &eid in selected.iter() {
+                if lru_cache.contains(&eid) {
+                    lru_hits_by_policy[policy_idx] += 1;
+                }
+            }
+            state.lru_hits += lru_hits_by_policy[policy_idx];
+
+            let heatmap_lru_cache = &mut state.heatmap_lru_by_layer[layer_idx];
+            let heatmap_lru_hits = Self::heatmap_lru_hit_count(
+                &heatmap_rank,
+                heatmap_lru_cache,
+                &selected,
+                pin_capacity,
+            );
+            heatmap_lru_hits_by_policy[policy_idx] = heatmap_lru_hits;
+            state.heatmap_lru_hits += heatmap_lru_hits;
+
+            let lfu_hits =
+                Self::lfu_hit_count(&state.lfu_scores_by_layer[layer_idx], &selected, capacity);
+            decayed_lfu_hits_by_policy[policy_idx] = lfu_hits;
+            state.decayed_lfu_hits += lfu_hits;
+
+            let mut best_split_idx = 0usize;
+            let mut best_score = f64::NEG_INFINITY;
+            for split_idx in 0..ROUTE_LOCALITY_ADAPTIVE_SPLITS.len() {
+                let score = state.adaptive_score_by_split_layer[split_idx][layer_idx];
+                if score > best_score {
+                    best_score = score;
+                    best_split_idx = split_idx;
+                }
+            }
+
+            let mut split_hits = vec![0u64; ROUTE_LOCALITY_ADAPTIVE_SPLITS.len()];
+            for (split_idx, split_pct) in ROUTE_LOCALITY_ADAPTIVE_SPLITS.iter().copied().enumerate() {
+                let (split_pin, _) = Self::split_caps(capacity, split_pct);
+                let cache = &state.adaptive_lru_by_split_layer[split_idx][layer_idx];
+                split_hits[split_idx] =
+                    Self::heatmap_lru_hit_count(&heatmap_rank, cache, &selected, split_pin);
+            }
+            let adaptive_hits = split_hits[best_split_idx];
+            adaptive_hits_by_policy[policy_idx] = adaptive_hits;
+            state.adaptive_hits += adaptive_hits;
+
+            for (split_idx, split_pct) in ROUTE_LOCALITY_ADAPTIVE_SPLITS.iter().copied().enumerate() {
+                let (split_pin, split_tail) = Self::split_caps(capacity, split_pct);
+                let hit_rate = split_hits[split_idx] as f64 / selected.len() as f64;
+                let score = &mut state.adaptive_score_by_split_layer[split_idx][layer_idx];
+                *score = *score * ROUTE_LOCALITY_ADAPTIVE_DECAY + hit_rate;
+                let cache = &mut state.adaptive_lru_by_split_layer[split_idx][layer_idx];
+                for &eid in selected.iter().rev() {
+                    if !Self::heatmap_hit(&heatmap_rank, eid, split_pin) {
+                        Self::update_lru(cache, eid, split_tail);
+                    }
+                }
+            }
+
+            for &eid in selected.iter().rev() {
+                Self::update_lru(lru_cache, eid, capacity);
+                if !Self::heatmap_hit(&heatmap_rank, eid, pin_capacity) {
+                    Self::update_lru(heatmap_lru_cache, eid, lru_tail_capacity);
+                }
+            }
+            for score in state.lfu_scores_by_layer[layer_idx].iter_mut() {
+                *score *= ROUTE_LOCALITY_LFU_DECAY;
+            }
+            for &eid in selected.iter() {
+                if eid >= 0 {
+                    let idx = eid as usize;
+                    if idx < state.lfu_scores_by_layer[layer_idx].len() {
+                        state.lfu_scores_by_layer[layer_idx][idx] += 1.0;
+                    }
+                }
+            }
+        }
+
+        for policy_idx in 0..policy_count {
+            self.layer_stats[layer_idx].heatmap_hits[policy_idx] += heatmap_hits_by_policy[policy_idx];
+            self.layer_stats[layer_idx].lru_hits[policy_idx] += lru_hits_by_policy[policy_idx];
+            self.layer_stats[layer_idx].heatmap_lru_hits[policy_idx] += heatmap_lru_hits_by_policy[policy_idx];
+            self.layer_stats[layer_idx].decayed_lfu_hits[policy_idx] += decayed_lfu_hits_by_policy[policy_idx];
+            self.layer_stats[layer_idx].adaptive_hits[policy_idx] += adaptive_hits_by_policy[policy_idx];
+        }
+        self.previous_by_layer[layer_idx] = selected;
+    }
+
+    fn emit_summary(&self, generated_tokens: usize) {
+        if !self.enabled || self.selected_total == 0 {
+            return;
+        }
+        let selected = self.selected_total as f64;
+        let last1_rate = self.last1_hits as f64 / selected;
+        let routes_per_token = if generated_tokens > 0 {
+            self.route_events as f64 / generated_tokens as f64
+        } else {
+            0.0
+        };
+        let selected_per_token = if generated_tokens > 0 {
+            self.selected_total as f64 / generated_tokens as f64
+        } else {
+            0.0
+        };
+
+        let format_policy = |label: &str, values: Vec<u64>| -> String {
+            let parts: Vec<String> = self.coverage_pcts.iter()
+                .zip(values.iter())
+                .map(|(pct, hits)| {
+                    let rate = *hits as f64 / selected;
+                    let lift = rate / (*pct / 100.0);
+                    format!("{:.1}%:{:.2}%/{:.2}x", pct, rate * 100.0, lift)
+                })
+                .collect();
+            format!("{}=[{}]", label, parts.join(", "))
+        };
+
+        let heatmap_parts = format_policy(
+            "heatmap",
+            self.policy_states.iter().map(|s| s.heatmap_hits).collect(),
+        );
+        let lru_parts = format_policy(
+            "lru",
+            self.policy_states.iter().map(|s| s.lru_hits).collect(),
+        );
+        let heatmap_lru_parts = format_policy(
+            "heatmap_lru",
+            self.policy_states.iter().map(|s| s.heatmap_lru_hits).collect(),
+        );
+        let lfu_parts = format_policy(
+            "decayed_lfu",
+            self.policy_states.iter().map(|s| s.decayed_lfu_hits).collect(),
+        );
+        let adaptive_parts = format_policy(
+            "adaptive",
+            self.policy_states.iter().map(|s| s.adaptive_hits).collect(),
+        );
+
+        let actual_hcs_rate = self.actual_hcs_hits as f64 / selected;
+        let actual_hcs_coverage = if self.actual_hcs_possible > 0 {
+            self.actual_hcs_cached as f64 / self.actual_hcs_possible as f64
+        } else {
+            0.0
+        };
+        let actual_hcs_lift = if actual_hcs_coverage > 0.0 {
+            actual_hcs_rate / actual_hcs_coverage
+        } else {
+            0.0
+        };
+        let heatmap_ranked_layers = self.heatmap_rank_by_layer.iter()
+            .filter(|ranks| ranks.iter().any(|&rank| rank != usize::MAX))
+            .count();
+
+        let lru_policy_parts: Vec<String> = self.coverage_pcts.iter()
+            .enumerate()
+            .map(|(idx, pct)| {
+                let rate = self.policy_states[idx].lru_hits as f64 / selected;
+                let lift = rate / (*pct / 100.0);
+                format!("{:.1}%:{:.2}%/{:.2}x", pct, rate * 100.0, lift)
+            })
+            .collect();
+
+        let focus_idx = self.coverage_pcts.iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                ((*a - 15.0).abs())
+                    .partial_cmp(&((*b - 15.0).abs()))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx);
+        let top_layers = if let Some(policy_idx) = focus_idx {
+            let mut layers: Vec<(usize, u64, u64, u64)> = self.layer_stats.iter()
+                .enumerate()
+                .filter_map(|(layer, st)| {
+                    if st.selected == 0 {
+                        None
+                    } else {
+                        Some((
+                            layer,
+                            st.selected,
+                            st.last1_hits,
+                            *st.lru_hits.get(policy_idx).unwrap_or(&0),
+                        ))
+                    }
+                })
+                .collect();
+            layers.sort_by(|a, b| {
+                let ar = a.3 as f64 / a.1.max(1) as f64;
+                let br = b.3 as f64 / b.1.max(1) as f64;
+                br.partial_cmp(&ar).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            layers.iter().take(8)
+                .map(|(layer, selected, last1, lru)| {
+                    format!(
+                        "L{}:last1={:.1}% lru={:.1}%",
+                        layer,
+                        *last1 as f64 / *selected as f64 * 100.0,
+                        *lru as f64 / *selected as f64 * 100.0,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else {
+            String::new()
+        };
+
+        eprintln!("  \x1b[36m┌─────────────────────────────────────────────────┐\x1b[0m");
+        eprintln!("  \x1b[36m│\x1b[0m  ROUTE LOCALITY DIAGNOSTIC                 \x1b[36m│\x1b[0m");
+        eprintln!("  \x1b[36m├─────────────────────────────────────────────────┤\x1b[0m");
+        eprintln!("  \x1b[36m│\x1b[0m  Routes: {} | selected: {} | selected/tok: {:.1} \x1b[36m│\x1b[0m",
+            self.route_events, self.selected_total, selected_per_token);
+        eprintln!("  \x1b[36m│\x1b[0m  Prev-token same-layer overlap: {:.2}%        \x1b[36m│\x1b[0m",
+            last1_rate * 100.0);
+        eprintln!("  \x1b[36m│\x1b[0m  Actual HCS: {:.2}% hit, {:.2}x lift       \x1b[36m│\x1b[0m",
+            actual_hcs_rate * 100.0, actual_hcs_lift);
+        eprintln!("  \x1b[36m│\x1b[0m  Heatmap-only: {} \x1b[36m│\x1b[0m",
+            heatmap_parts.trim_start_matches("heatmap="));
+        eprintln!("  \x1b[36m│\x1b[0m  LRU: {} \x1b[36m│\x1b[0m",
+            lru_parts.trim_start_matches("lru="));
+        eprintln!("  \x1b[36m│\x1b[0m  Heatmap+LRU: {} \x1b[36m│\x1b[0m",
+            heatmap_lru_parts.trim_start_matches("heatmap_lru="));
+        eprintln!("  \x1b[36m│\x1b[0m  Decayed LFU: {} \x1b[36m│\x1b[0m",
+            lfu_parts.trim_start_matches("decayed_lfu="));
+        eprintln!("  \x1b[36m│\x1b[0m  Adaptive: {} \x1b[36m│\x1b[0m",
+            adaptive_parts.trim_start_matches("adaptive="));
+        eprintln!("  \x1b[36m└─────────────────────────────────────────────────┘\x1b[0m");
+
+        log::info!(
+            "ROUTE LOCALITY SUMMARY generated={} routes={} routes_per_token={:.3} selected={} selected_per_token={:.3} last1_hits={} last1_hit_rate_pct={:.4} actual_hcs_hits={} actual_hcs_hit_rate_pct={:.4} actual_hcs_cached={} actual_hcs_possible={} actual_hcs_coverage_pct={:.4} actual_hcs_lift={:.4} heatmap_ranked_layers={} {} {} {} {} {} lru_legacy=[{}] top_layers=[{}]",
+            generated_tokens,
+            self.route_events,
+            routes_per_token,
+            self.selected_total,
+            selected_per_token,
+            self.last1_hits,
+            last1_rate * 100.0,
+            self.actual_hcs_hits,
+            actual_hcs_rate * 100.0,
+            self.actual_hcs_cached,
+            self.actual_hcs_possible,
+            actual_hcs_coverage * 100.0,
+            actual_hcs_lift,
+            heatmap_ranked_layers,
+            heatmap_parts,
+            lru_parts,
+            heatmap_lru_parts,
+            lfu_parts,
+            adaptive_parts,
+            lru_policy_parts.join(", "),
+            top_layers,
+        );
     }
 }
 
@@ -2388,6 +3139,25 @@ struct HcsCacheEntry {
     pool_slot: Option<usize>,
 }
 
+#[derive(Clone)]
+struct DynamicHcsPromotion {
+    layer_idx: usize,
+    expert_idx: usize,
+    src_base: u64,
+    src_w13p_off: usize,
+    src_w13s_off: usize,
+    src_w2p_off: usize,
+    src_w2s_off: usize,
+    w13p_host: usize,
+    w13s_host: usize,
+    w2p_host: usize,
+    w2s_host: usize,
+    w13p_bytes: usize,
+    w13s_bytes: usize,
+    w2p_bytes: usize,
+    w2s_bytes: usize,
+}
+
 impl HcsCacheEntry {
     fn w13_packed_ptr(&self) -> u64 {
         if let Some(ref buf) = self.d_buf {
@@ -2596,6 +3366,8 @@ struct HcsState {
     /// Original global heatmap ranking for soft tier. This stays unchanged so
     /// request-scoped prompt blends never overwrite the baseline ordering.
     soft_heatmap_ranking: Vec<(usize, usize)>,
+    /// Original global heatmap ranking used to build the HCS tiers.
+    heatmap_ranking: Vec<(usize, usize)>,
     /// Number of soft experts currently loaded.
     soft_num_cached: usize,
     /// Whether soft tier is currently loaded (false during prefill).
@@ -2642,6 +3414,27 @@ struct HcsState {
     mapped_fallback: Vec<[u64; 4]>,
     /// Whether mapped reads are available (all experts have mapped device pointers).
     mapped_reads_available: bool,
+
+    // ── Experimental dynamic soft-tier HCS ──
+    dynamic_enabled: bool,
+    dynamic_tick: u64,
+    dynamic_last_used: Vec<u64>,
+    dynamic_freq: Vec<f32>,
+    dynamic_layer_slots: Vec<Vec<usize>>,
+    dynamic_slot_evictable: Vec<bool>,
+    dynamic_tail_blocks: Option<f64>,
+    dynamic_active_block_slots: usize,
+    dynamic_tail_slots: usize,
+    dynamic_protected_slots: usize,
+    dynamic_promotion_budget_mult: f64,
+    dynamic_request_promotions: u64,
+    dynamic_request_promotion_limit: u64,
+    dynamic_promotions: u64,
+    dynamic_evictions: u64,
+    dynamic_touch_hits: u64,
+    dynamic_no_slot: u64,
+    dynamic_budget_skips: u64,
+    dynamic_copy_failures: u64,
 }
 
 impl HcsState {
@@ -2672,6 +3465,7 @@ impl HcsState {
             soft_slot_to_expert: Vec::new(),
             soft_ranking: Vec::new(),
             soft_heatmap_ranking: Vec::new(),
+            heatmap_ranking: Vec::new(),
             soft_num_cached: 0,
             soft_loaded: false,
             soft_reload_pending: false,
@@ -2688,6 +3482,25 @@ impl HcsState {
             d_expert_ptrs_nl: 0,
             mapped_fallback: Vec::new(),
             mapped_reads_available: false,
+            dynamic_enabled: false,
+            dynamic_tick: 1,
+            dynamic_last_used: Vec::new(),
+            dynamic_freq: Vec::new(),
+            dynamic_layer_slots: Vec::new(),
+            dynamic_slot_evictable: Vec::new(),
+            dynamic_tail_blocks: None,
+            dynamic_active_block_slots: 0,
+            dynamic_tail_slots: 0,
+            dynamic_protected_slots: 0,
+            dynamic_promotion_budget_mult: 1.0,
+            dynamic_request_promotions: 0,
+            dynamic_request_promotion_limit: 0,
+            dynamic_promotions: 0,
+            dynamic_evictions: 0,
+            dynamic_touch_hits: 0,
+            dynamic_no_slot: 0,
+            dynamic_budget_skips: 0,
+            dynamic_copy_failures: 0,
         }
     }
 
@@ -2749,6 +3562,7 @@ impl HcsState {
         self.num_cached = self.num_cached.saturating_sub(evicted);
         self.vram_bytes = self.vram_bytes.saturating_sub(freed_bytes);
         self.soft_loaded = self.soft_chunks_loaded == self.soft_total_chunks;
+        self.rebuild_dynamic_layer_slots();
 
         (evicted, freed_bytes)
     }
@@ -2984,6 +3798,325 @@ impl HcsState {
             );
             log::warn!("HCS post-reload: {} duplicate entries in soft_slot_to_expert!", soft_dupes);
         }
+    }
+
+    fn init_dynamic_hcs(&mut self) {
+        self.dynamic_enabled = dynamic_hcs_enabled();
+        self.dynamic_tail_blocks = dynamic_hcs_tail_blocks();
+        self.dynamic_promotion_budget_mult =
+            match std::env::var("KRASIS_DYNAMIC_HCS_PROMOTION_BUDGET_MULT") {
+                Ok(raw) => match raw.trim().parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 => v,
+                    _ => {
+                        log::warn!(
+                            "KRASIS_DYNAMIC_HCS_PROMOTION_BUDGET_MULT={} is invalid; using 1.0",
+                            raw
+                        );
+                        1.0
+                    }
+                },
+                Err(_) => 1.0,
+            };
+        let total = self
+            .cache_fast_num_layers
+            .saturating_mul(self.num_experts_per_layer);
+        self.dynamic_tick = 1;
+        self.dynamic_last_used = vec![0; total];
+        self.dynamic_freq = vec![0.0; total];
+        self.dynamic_request_promotions = 0;
+        self.dynamic_request_promotion_limit = 0;
+        self.dynamic_promotions = 0;
+        self.dynamic_evictions = 0;
+        self.dynamic_touch_hits = 0;
+        self.dynamic_no_slot = 0;
+        self.dynamic_budget_skips = 0;
+        self.dynamic_copy_failures = 0;
+        self.rebuild_dynamic_layer_slots();
+
+        for slot in 0..self.soft_slot_to_expert.len().min(self.soft_num_slots) {
+            if let Some((layer_idx, expert_idx)) = self.soft_slot_to_expert[slot] {
+                let idx = self.dynamic_flat_idx(layer_idx, expert_idx);
+                if idx < self.dynamic_last_used.len() {
+                    self.dynamic_last_used[idx] = 1;
+                    self.dynamic_freq[idx] = 1.0;
+                }
+            }
+        }
+
+        if self.dynamic_enabled {
+            log::info!(
+                "Dynamic HCS enabled: layers={} experts_per_layer={} soft_slots={} loaded_chunks={} policy=recency_dominant tail_blocks={:?} active_block_slots={} tail_slots={} protected_slots={} promotion_budget_mult={:.3}",
+                self.cache_fast_num_layers,
+                self.num_experts_per_layer,
+                self.soft_num_slots,
+                self.soft_chunks_loaded,
+                self.dynamic_tail_blocks,
+                self.dynamic_active_block_slots,
+                self.dynamic_tail_slots,
+                self.dynamic_protected_slots,
+                self.dynamic_promotion_budget_mult,
+            );
+        }
+    }
+
+    fn begin_dynamic_request(&mut self) {
+        if !self.dynamic_enabled {
+            return;
+        }
+        let loaded_slots = self
+            .soft_chunks_loaded
+            .saturating_mul(self.soft_slots_per_chunk)
+            .min(self.soft_num_slots);
+        let evictable_slots = if self.dynamic_tail_blocks.is_some() {
+            self.dynamic_slot_evictable
+                .iter()
+                .take(loaded_slots)
+                .filter(|&&v| v)
+                .count()
+        } else {
+            loaded_slots
+        };
+        self.dynamic_request_promotions = 0;
+        self.dynamic_request_promotion_limit =
+            ((evictable_slots as f64) * self.dynamic_promotion_budget_mult).ceil() as u64;
+    }
+
+    fn rebuild_dynamic_layer_slots(&mut self) {
+        self.dynamic_layer_slots = vec![Vec::new(); self.cache_fast_num_layers];
+        for slot in 0..self.soft_slot_to_expert.len().min(self.soft_num_slots) {
+            if let Some((layer_idx, _expert_idx)) = self.soft_slot_to_expert[slot] {
+                if layer_idx < self.dynamic_layer_slots.len() {
+                    self.dynamic_layer_slots[layer_idx].push(slot);
+                }
+            }
+        }
+        self.rebuild_dynamic_tail_slots();
+    }
+
+    fn rebuild_dynamic_tail_slots(&mut self) {
+        self.dynamic_slot_evictable = vec![false; self.soft_num_slots];
+        self.dynamic_tail_slots = 0;
+        self.dynamic_protected_slots = 0;
+
+        let loaded_slots = self
+            .soft_chunks_loaded
+            .saturating_mul(self.soft_slots_per_chunk)
+            .min(self.soft_num_slots);
+        if loaded_slots == 0 {
+            return;
+        }
+
+        let tail_slots = if let Some(blocks) = self.dynamic_tail_blocks {
+            if self.dynamic_active_block_slots == 0 {
+                log::warn!(
+                    "Dynamic HCS tail blocks requested but active expert block size is unknown; evictable tail disabled"
+                );
+                0
+            } else {
+                ((blocks * self.dynamic_active_block_slots as f64).ceil() as usize)
+                    .min(loaded_slots)
+            }
+        } else {
+            loaded_slots
+        };
+
+        let tail_start = loaded_slots.saturating_sub(tail_slots);
+        for slot in tail_start..loaded_slots {
+            self.dynamic_slot_evictable[slot] = true;
+        }
+        self.dynamic_tail_slots = tail_slots;
+        self.dynamic_protected_slots = loaded_slots.saturating_sub(tail_slots);
+    }
+
+    #[inline]
+    fn dynamic_flat_idx(&self, layer: usize, expert: usize) -> usize {
+        layer.saturating_mul(self.num_experts_per_layer).saturating_add(expert)
+    }
+
+    fn dynamic_touch(&mut self, layer: usize, expert: usize) {
+        if !self.dynamic_enabled || self.num_experts_per_layer == 0 {
+            return;
+        }
+        let idx = self.dynamic_flat_idx(layer, expert);
+        if idx >= self.dynamic_last_used.len() {
+            return;
+        }
+        self.dynamic_tick = self.dynamic_tick.wrapping_add(1).max(1);
+        self.dynamic_last_used[idx] = self.dynamic_tick;
+        self.dynamic_freq[idx] = (self.dynamic_freq[idx] + 1.0).min(1_000_000.0);
+    }
+
+    fn dynamic_victim_slot(&self, layer: usize, incoming_expert: usize) -> Option<usize> {
+        if layer >= self.dynamic_layer_slots.len() || self.soft_slots_per_chunk == 0 {
+            return None;
+        }
+        let loaded_slots = self
+            .soft_chunks_loaded
+            .saturating_mul(self.soft_slots_per_chunk)
+            .min(self.soft_num_slots);
+        let mut best: Option<(usize, u64, f32)> = None;
+        for &slot in &self.dynamic_layer_slots[layer] {
+            if slot >= loaded_slots {
+                continue;
+            }
+            if self.dynamic_tail_blocks.is_some()
+                && !self.dynamic_slot_evictable.get(slot).copied().unwrap_or(false)
+            {
+                continue;
+            }
+            let Some((resident_layer, resident_expert)) =
+                self.soft_slot_to_expert.get(slot).and_then(|v| *v)
+            else {
+                continue;
+            };
+            if resident_layer != layer || resident_expert == incoming_expert {
+                continue;
+            }
+            let idx = self.dynamic_flat_idx(resident_layer, resident_expert);
+            let last = self.dynamic_last_used.get(idx).copied().unwrap_or(0);
+            let freq = self.dynamic_freq.get(idx).copied().unwrap_or(0.0);
+            match best {
+                None => best = Some((slot, last, freq)),
+                Some((_best_slot, best_last, best_freq)) => {
+                    if last < best_last
+                        || (last == best_last && freq < best_freq)
+                        || (last == best_last && (freq - best_freq).abs() < f32::EPSILON && slot < _best_slot)
+                    {
+                        best = Some((slot, last, freq));
+                    }
+                }
+            }
+        }
+        best.map(|(slot, _last, _freq)| slot)
+    }
+
+    fn dynamic_promote_from_device(
+        &mut self,
+        promo: &DynamicHcsPromotion,
+        stream: cuda_sys::CUstream,
+    ) -> Result<bool, String> {
+        if !self.dynamic_enabled {
+            return Ok(false);
+        }
+        self.dynamic_touch(promo.layer_idx, promo.expert_idx);
+        if self.get_fast(promo.layer_idx, promo.expert_idx).is_some() {
+            self.dynamic_touch_hits += 1;
+            return Ok(false);
+        }
+        if self.dynamic_request_promotions >= self.dynamic_request_promotion_limit {
+            self.dynamic_budget_skips += 1;
+            return Ok(false);
+        }
+        let Some(slot) = self.dynamic_victim_slot(promo.layer_idx, promo.expert_idx) else {
+            self.dynamic_no_slot += 1;
+            return Ok(false);
+        };
+        if slot >= self.soft_num_slots || self.soft_slots_per_chunk == 0 {
+            self.dynamic_no_slot += 1;
+            return Ok(false);
+        }
+
+        let dst = self.soft_slot_ptr(slot);
+        let dst_w13p_off = 0usize;
+        let dst_w13s_off = promo.w13p_bytes;
+        let dst_w2p_off = dst_w13s_off.saturating_add(promo.w13s_bytes);
+        let dst_w2s_off = dst_w2p_off.saturating_add(promo.w2p_bytes);
+        let needed = dst_w2s_off.saturating_add(promo.w2s_bytes);
+        if needed > self.soft_slot_size {
+            self.dynamic_copy_failures += 1;
+            return Err(format!(
+                "dynamic HCS promotion L{}E{} needs {} bytes > soft_slot_size {}",
+                promo.layer_idx, promo.expert_idx, needed, self.soft_slot_size
+            ));
+        }
+
+        if let Some((victim_layer, victim_expert)) = self.soft_slot_to_expert[slot] {
+            self.cache_fast_clear(victim_layer, victim_expert);
+            self.cache.remove(&(victim_layer, victim_expert));
+            let victim_idx = self.dynamic_flat_idx(victim_layer, victim_expert);
+            if victim_idx < self.dynamic_last_used.len() {
+                self.dynamic_last_used[victim_idx] = 0;
+                self.dynamic_freq[victim_idx] = 0.0;
+            }
+            self.dynamic_evictions += 1;
+        }
+
+        let copy_part = |dst_off: usize, src_off: usize, bytes: usize| -> Result<(), String> {
+            if bytes == 0 {
+                return Ok(());
+            }
+            let err = unsafe {
+                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                    dst + dst_off as u64,
+                    promo.src_base + src_off as u64,
+                    bytes,
+                    stream,
+                )
+            };
+            if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                Ok(())
+            } else {
+                Err(format!("cuMemcpyDtoDAsync_v2 dynamic HCS promotion: {:?}", err))
+            }
+        };
+        copy_part(dst_w13p_off, promo.src_w13p_off, promo.w13p_bytes)?;
+        copy_part(dst_w13s_off, promo.src_w13s_off, promo.w13s_bytes)?;
+        copy_part(dst_w2p_off, promo.src_w2p_off, promo.w2p_bytes)?;
+        copy_part(dst_w2s_off, promo.src_w2s_off, promo.w2s_bytes)?;
+
+        let chunk_idx = slot / self.soft_slots_per_chunk;
+        if chunk_idx < self.soft_host_chunks.len() {
+            let host_offset = (slot % self.soft_slots_per_chunk) * self.soft_slot_size;
+            unsafe {
+                let dst_host = self.soft_host_chunks[chunk_idx].as_mut_ptr().add(host_offset);
+                std::ptr::copy_nonoverlapping(
+                    promo.w13p_host as *const u8,
+                    dst_host.add(dst_w13p_off),
+                    promo.w13p_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    promo.w13s_host as *const u8,
+                    dst_host.add(dst_w13s_off),
+                    promo.w13s_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    promo.w2p_host as *const u8,
+                    dst_host.add(dst_w2p_off),
+                    promo.w2p_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    promo.w2s_host as *const u8,
+                    dst_host.add(dst_w2s_off),
+                    promo.w2s_bytes,
+                );
+            }
+        }
+
+        let entry = HcsCacheEntry {
+            d_buf: None,
+            w13_packed_offset: 0,
+            w13_packed_size: 0,
+            w13_scales_offset: 0,
+            w13_scales_size: 0,
+            w2_packed_offset: 0,
+            w2_packed_size: 0,
+            w2_scales_offset: 0,
+            w2_scales_size: 0,
+            ext_w13_packed: dst + dst_w13p_off as u64,
+            ext_w13_scales: dst + dst_w13s_off as u64,
+            ext_w2_packed: dst + dst_w2p_off as u64,
+            ext_w2_scales: dst + dst_w2s_off as u64,
+            pool_slot: None,
+        };
+        self.soft_slot_to_expert[slot] = Some((promo.layer_idx, promo.expert_idx));
+        if slot < self.soft_ranking.len() {
+            self.soft_ranking[slot] = (promo.layer_idx, promo.expert_idx);
+        }
+        self.cache_fast_set(promo.layer_idx, promo.expert_idx, &entry);
+        self.cache.insert((promo.layer_idx, promo.expert_idx), entry);
+        self.dynamic_request_promotions += 1;
+        self.dynamic_promotions += 1;
+        Ok(true)
     }
 
     /// Record an expert activation in the heatmap and dynamic eviction bitset.
@@ -5350,6 +6483,7 @@ struct GpuDecodeGraph {
     validation_decode_cold_events_file: String,
     route_swap_shadow: RouteSwapShadowStats,
     hcs_cold_swap: HcsColdSwapStats,
+    route_locality: RouteLocalityStats,
     route_shadow_logits: Vec<f32>,
     route_shadow_bias: Vec<f32>,
     route_shadow_corr: Vec<f32>,
@@ -9013,6 +10147,7 @@ impl GpuDecodeStore {
             validation_decode_cold_events_file: String::new(),
             route_swap_shadow: RouteSwapShadowStats::from_env(),
             hcs_cold_swap: HcsColdSwapStats::from_env(),
+            route_locality: RouteLocalityStats::from_env(),
             route_shadow_logits: Vec::new(),
             route_shadow_bias: Vec::new(),
             route_shadow_corr: Vec::new(),
@@ -12050,6 +13185,23 @@ impl GpuDecodeStore {
         hcs.soft_loaded = true;
         hcs.num_cached += soft_loaded;
         hcs.vram_bytes += soft_alloc_bytes;
+        let mut soft_layers = std::collections::HashSet::new();
+        for slot_opt in hcs.soft_slot_to_expert.iter().take(hcs.soft_num_slots) {
+            if let Some((layer_idx, _expert_idx)) = *slot_opt {
+                soft_layers.insert(layer_idx);
+            }
+        }
+        hcs.dynamic_active_block_slots = soft_layers
+            .iter()
+            .filter_map(|&layer_idx| {
+                graph
+                    .moe_layers
+                    .get(layer_idx)
+                    .and_then(|m| m.as_ref())
+                    .map(|m| m.topk)
+            })
+            .sum();
+        hcs.init_dynamic_hcs();
         if sync_route_ptrs && soft_loaded > 0 {
             sync_hcs_route_pointer_updates(&route_sync_device, "initial soft tier load", soft_loaded);
         }
@@ -20336,6 +21488,7 @@ impl GpuDecodeStore {
         // ═══ LEGACY PATH (non-mapped reads) ═══
         for graph_idx in 0..num_graphs {
             let mut wait_for_cold_dma = false;
+            let mut dynamic_promotions: Vec<DynamicHcsPromotion> = Vec::new();
             // ── If not first graph: populate d_batch_upload with expert pointers ──
             if graph_idx > 0 {
                 let moe_layer_idx = moe_indices[graph_idx - 1];
@@ -20586,6 +21739,14 @@ impl GpuDecodeStore {
                         (*graph.d_fp32_scratch.device_ptr() as *const f32)
                             .add(graph.hidden_size) as u64
                     };
+                    let hcs_ref = graph.hcs.as_ref();
+                    graph.route_locality.record(
+                        moe_layer_idx,
+                        ne,
+                        topk,
+                        &graph.h_topk_ids,
+                        hcs_ref,
+                    );
                     Self::record_route_swap_shadow(
                         graph,
                         moe_layer_idx,
@@ -20620,7 +21781,8 @@ impl GpuDecodeStore {
                         let eid = eid as usize;
                         let weight = graph.h_topk_weights[i];
 
-                        let hcs_ptrs = if let Some(ref hcs) = graph.hcs {
+                        let hcs_ptrs = if let Some(ref mut hcs) = graph.hcs {
+                            hcs.dynamic_touch(moe_layer_idx, eid);
                             hcs.get_fast(moe_layer_idx, eid)
                         } else { None };
                         let actual_hcs_hit = hcs_ptrs.is_some();
@@ -20712,6 +21874,25 @@ impl GpuDecodeStore {
                             }
                         }
                         cold_ptrs_list.push((w13p, w13s, w2p, w2s));
+                        if graph.hcs.as_ref().map(|h| h.dynamic_enabled).unwrap_or(false) {
+                            dynamic_promotions.push(DynamicHcsPromotion {
+                                layer_idx: moe_layer_idx,
+                                expert_idx: eid,
+                                src_base: base,
+                                src_w13p_off: w13p_off,
+                                src_w13s_off: w13s_off,
+                                src_w2p_off: w2p_off,
+                                src_w2s_off: w2s_off,
+                                w13p_host: expert.w13_packed_ptr,
+                                w13s_host: expert.w13_scales_ptr,
+                                w2p_host: expert.w2_packed_ptr,
+                                w2s_host: expert.w2_scales_ptr,
+                                w13p_bytes: expert.w13_packed_bytes,
+                                w13s_bytes: expert.w13_scales_bytes,
+                                w2p_bytes: expert.w2_packed_bytes,
+                                w2s_bytes: expert.w2_scales_bytes,
+                            });
+                        }
                     }
 
                     // Record copy-stream completion instead of blocking the CPU.
@@ -20821,6 +22002,29 @@ impl GpuDecodeStore {
             }
             if let Some(t) = t_launch_start {
                 graph.t_graph_launch += t.elapsed().as_secs_f64();
+            }
+            if !dynamic_promotions.is_empty() {
+                let mut promoted = 0usize;
+                if let Some(ref mut hcs) = graph.hcs {
+                    for promo in &dynamic_promotions {
+                        match hcs.dynamic_promote_from_device(promo, replay_stream) {
+                            Ok(true) => promoted += 1,
+                            Ok(false) => {}
+                            Err(e) => {
+                                hcs.dynamic_copy_failures += 1;
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                if promoted > 0 && dynamic_hcs_log_enabled() {
+                    eprintln!(
+                        "[dynamic-hcs] graph_idx={} promoted={} candidates={}",
+                        graph_idx,
+                        promoted,
+                        dynamic_promotions.len(),
+                    );
+                }
             }
             // Optional crash narrowing under trace: require explicit graph_sync so
             // normal tracing does not serialize every graph replay.
@@ -26813,6 +28017,7 @@ impl GpuDecodeStore {
         hcs.soft_loaded = hcs.soft_chunks_loaded == hcs.soft_total_chunks;
         hcs.num_cached += loaded;
         hcs.vram_bytes += alloc_bytes;
+        hcs.rebuild_dynamic_layer_slots();
         if sync_route_ptrs && loaded > 0 {
             sync_hcs_route_pointer_updates(
                 &route_sync_device,
@@ -27253,6 +28458,7 @@ impl GpuDecodeStore {
         hcs.soft_loaded = true;
         hcs.soft_reload_pending = false;
         hcs.num_cached += activated;
+        hcs.rebuild_dynamic_layer_slots();
         self.last_soft_reload_activated = activated;
         if sync_route_ptrs && activated > 0 {
             sync_hcs_route_pointer_updates(
@@ -27331,6 +28537,7 @@ impl GpuDecodeStore {
         hcs.soft_loaded = true;
         hcs.soft_reload_pending = false;
         hcs.num_cached += activated;
+        hcs.rebuild_dynamic_layer_slots();
         self.last_soft_reload_activated = activated;
         if sync_route_ptrs && activated > 0 {
             sync_hcs_route_pointer_updates(
@@ -27606,6 +28813,7 @@ impl GpuDecodeStore {
             g.validation_decode_cold_events_file.clear();
             g.route_swap_shadow.reset_counts();
             g.hcs_cold_swap.reset_counts();
+            g.route_locality.reset_counts();
             g.prompt_hcs_shadow.reset_counts();
             if g.timing_enabled {
                 g.timing_step_count = 0;
@@ -27648,6 +28856,12 @@ impl GpuDecodeStore {
         let mut generated = 0usize;
         let mut seen_tokens: std::collections::HashSet<usize> = std::collections::HashSet::new();
         seen_tokens.insert(first_token);
+
+        if let Some(graph) = self.graph.as_mut() {
+            if let Some(hcs) = graph.hcs.as_mut() {
+                hcs.begin_dynamic_request();
+            }
+        }
 
         // Streaming detokenizer: buffers incomplete UTF-8 byte sequences
         // (e.g. emojis split across multiple BPE tokens) and emits only
@@ -28400,7 +29614,49 @@ impl GpuDecodeStore {
         if let Some(graph) = self.graph.as_ref() {
             graph.route_swap_shadow.emit_summary(generated, graph.dma_cold_experts);
             graph.hcs_cold_swap.emit_summary(generated, graph.dma_cold_experts);
+            graph.route_locality.emit_summary(generated);
             graph.prompt_hcs_shadow.emit_summary(generated);
+            if let Some(hcs) = graph.hcs.as_ref() {
+                if hcs.dynamic_enabled {
+                    let total = (graph.dma_cold_experts + graph.dma_hcs_experts).max(1) as f64;
+                    let hit_pct = graph.dma_hcs_experts as f64 / total * 100.0;
+                    eprintln!(
+                        "  \x1b[36mDynamic HCS: hit={:.2}% tail={}/{} protected={} promotions={} evictions={} request_promotions={}/{} budget_skips={} no_slot={} copy_failures={}\x1b[0m",
+                        hit_pct,
+                        hcs.dynamic_tail_slots,
+                        hcs.dynamic_active_block_slots,
+                        hcs.dynamic_protected_slots,
+                        hcs.dynamic_promotions,
+                        hcs.dynamic_evictions,
+                        hcs.dynamic_request_promotions,
+                        hcs.dynamic_request_promotion_limit,
+                        hcs.dynamic_budget_skips,
+                        hcs.dynamic_no_slot,
+                        hcs.dynamic_copy_failures,
+                    );
+                    log::info!(
+                        "DYNAMIC HCS SUMMARY generated={} hit_rate_pct={:.4} hcs={} cold={} tail_blocks={:?} active_block_slots={} tail_slots={} protected_slots={} promotions={} evictions={} request_promotions={} request_limit={} touch_hits={} budget_skips={} no_slot={} copy_failures={} cached={} soft_cached={}",
+                        generated,
+                        hit_pct,
+                        graph.dma_hcs_experts,
+                        graph.dma_cold_experts,
+                        hcs.dynamic_tail_blocks,
+                        hcs.dynamic_active_block_slots,
+                        hcs.dynamic_tail_slots,
+                        hcs.dynamic_protected_slots,
+                        hcs.dynamic_promotions,
+                        hcs.dynamic_evictions,
+                        hcs.dynamic_request_promotions,
+                        hcs.dynamic_request_promotion_limit,
+                        hcs.dynamic_touch_hits,
+                        hcs.dynamic_budget_skips,
+                        hcs.dynamic_no_slot,
+                        hcs.dynamic_copy_failures,
+                        hcs.num_cached,
+                        hcs.soft_num_cached,
+                    );
+                }
+            }
         }
 
         // Print speculative decode stats
@@ -30181,6 +31437,14 @@ impl GpuDecodeStore {
             sf,
             ne,
         );
+        let hcs_ref = graph.hcs.as_ref();
+        graph.route_locality.record(
+            layer_idx,
+            ne,
+            topk,
+            &graph.h_topk_ids,
+            hcs_ref,
+        );
         Self::record_route_swap_shadow(
             graph,
             layer_idx,
@@ -30525,6 +31789,7 @@ impl GpuDecodeStore {
             // Record activation for heatmap collection (no-op when not collecting)
             if let Some(ref mut hcs) = graph.hcs {
                 hcs.record_activation(layer_idx, eid);
+                hcs.dynamic_touch(layer_idx, eid);
             }
 
             // Check HCS cache (fast flat array lookup)
@@ -31133,6 +32398,30 @@ impl GpuDecodeStore {
                 if timing {
                     unsafe { cuda_sys::lib().cuStreamSynchronize(default_stream); }
                     graph.t_dma_expert_compute += (Instant::now() - t_dma_compute).as_secs_f64();
+                }
+
+                if let Some(ref mut hcs) = graph.hcs {
+                    if hcs.dynamic_enabled {
+                        let promo = DynamicHcsPromotion {
+                            layer_idx,
+                            expert_idx: eid,
+                            src_base: base,
+                            src_w13p_off: w13p_off,
+                            src_w13s_off: w13s_off,
+                            src_w2p_off: w2p_off,
+                            src_w2s_off: w2s_off,
+                            w13p_host: expert.w13_packed_ptr,
+                            w13s_host: expert.w13_scales_ptr,
+                            w2p_host: expert.w2_packed_ptr,
+                            w2s_host: expert.w2_scales_ptr,
+                            w13p_bytes: expert.w13_packed_bytes,
+                            w13s_bytes: expert.w13_scales_bytes,
+                            w2p_bytes: expert.w2_packed_bytes,
+                            w2s_bytes: expert.w2_scales_bytes,
+                        };
+                        hcs.dynamic_promote_from_device(&promo, default_stream)
+                            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+                    }
                 }
 
                 #[cfg(feature = "gpu-debug")]
@@ -32646,6 +33935,7 @@ impl GpuDecodeStore {
         }
         hcs.pool_free_slots = free_slots;
         hcs.pool_slot_to_expert = slot_to_expert;
+        hcs.heatmap_ranking = ranking;
 
         if env_truthy("KRASIS_MAPPED_READS") {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
