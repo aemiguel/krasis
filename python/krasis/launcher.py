@@ -157,8 +157,10 @@ def detect_hardware() -> Dict[str, Any]:
 
     # GPUs via nvidia-smi — per-GPU info + compute capability
     try:
+        _ensure_wsl_cuda_env()
+        nvidia_smi = _find_nvidia_smi() or "nvidia-smi"
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap",
+            [nvidia_smi, "--query-gpu=index,name,memory.total,compute_cap",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
         )
@@ -235,6 +237,45 @@ def detect_hardware() -> Dict[str, Any]:
         pass
 
     return hw
+
+
+def _is_wsl() -> bool:
+    """Return True when running under WSL/WSL2."""
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except FileNotFoundError:
+        return False
+
+
+def _wsl_cuda_dir() -> str:
+    return "/usr/lib/wsl/lib"
+
+
+def _ensure_wsl_cuda_env():
+    """Expose the WSL2 host driver binaries/libraries to subprocesses."""
+    wsl_cuda = _wsl_cuda_dir()
+    if not os.path.isdir(wsl_cuda):
+        return
+    path = os.environ.get("PATH", "")
+    if wsl_cuda not in path.split(":"):
+        os.environ["PATH"] = f"{wsl_cuda}:{path}" if path else wsl_cuda
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if wsl_cuda not in ld_path.split(":"):
+        os.environ["LD_LIBRARY_PATH"] = f"{wsl_cuda}:{ld_path}" if ld_path else wsl_cuda
+
+
+def _find_nvidia_smi() -> Optional[str]:
+    """Find nvidia-smi, including the WSL2 driver mount."""
+    import shutil
+
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        return nvidia_smi
+    wsl_smi = os.path.join(_wsl_cuda_dir(), "nvidia-smi")
+    if os.path.isfile(wsl_smi):
+        return wsl_smi
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1890,11 +1931,7 @@ class Launcher:
         # WSL2: LD_LIBRARY_PATH must be set BEFORE execvp so the new process
         # starts with it — glibc caches the library search path at startup,
         # so setting it inside the server's main() is too late for dlopen.
-        _wsl_cuda = "/usr/lib/wsl/lib"
-        if os.path.isdir(_wsl_cuda):
-            ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-            if _wsl_cuda not in ld_path:
-                os.environ["LD_LIBRARY_PATH"] = f"{_wsl_cuda}:{ld_path}" if ld_path else _wsl_cuda
+        _ensure_wsl_cuda_env()
 
         print(f"\n{GREEN}Starting Krasis server...{NC}\n")
         print(f"  Config: {config_path}")
@@ -2131,8 +2168,17 @@ def _check_gpu_deps():
     """Quick check that GPU dependencies are present. Points to krasis-setup if not."""
     import shutil
 
-    if not shutil.which("nvidia-smi"):
+    _ensure_wsl_cuda_env()
+    if not _find_nvidia_smi():
         print(f"{RED}No NVIDIA GPU detected. Krasis requires at least one NVIDIA GPU for prefill.{NC}")
+        if _is_wsl():
+            print(f"  WSL2 should expose the Windows NVIDIA driver at {_wsl_cuda_dir()}.")
+            print(f"  Check:")
+            print(f"    ls -l {_wsl_cuda_dir()}/nvidia-smi {_wsl_cuda_dir()}/libcuda.so.1")
+            print(f"    {_wsl_cuda_dir()}/nvidia-smi")
+            print(f"  If those files are missing or nvidia-smi fails, update the Windows")
+            print(f"  NVIDIA driver with WSL CUDA support, then run: wsl --shutdown")
+            print(f"  Do not install a Linux nvidia-driver package inside WSL.")
         sys.exit(1)
 
     # Find nvcc: try multiple common locations so it works even if

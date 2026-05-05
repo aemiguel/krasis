@@ -45,20 +45,46 @@ def _pkg_flag():
 
 def _has_nvidia_gpu():
     """Check if an NVIDIA GPU is present."""
-    if not shutil.which("nvidia-smi"):
+    nvidia_smi = _find_nvidia_smi()
+    if not nvidia_smi:
         return False
     try:
-        subprocess.check_output(["nvidia-smi"], timeout=10, stderr=subprocess.DEVNULL)
+        subprocess.check_output([nvidia_smi], timeout=10, stderr=subprocess.DEVNULL)
         return True
     except (subprocess.SubprocessError, FileNotFoundError):
         return False
 
 
+def _find_nvidia_smi():
+    """Find nvidia-smi, including the WSL2 driver mount."""
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        return nvidia_smi
+    wsl_smi = "/usr/lib/wsl/lib/nvidia-smi"
+    if os.path.isfile(wsl_smi):
+        return wsl_smi
+    return None
+
+
+def _ensure_wsl_cuda_env():
+    """Expose the WSL2 host driver libraries to subprocesses."""
+    wsl_cuda = "/usr/lib/wsl/lib"
+    if not os.path.isdir(wsl_cuda):
+        return
+    path = os.environ.get("PATH", "")
+    if wsl_cuda not in path.split(":"):
+        os.environ["PATH"] = f"{wsl_cuda}:{path}" if path else wsl_cuda
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if wsl_cuda not in ld_path.split(":"):
+        os.environ["LD_LIBRARY_PATH"] = f"{wsl_cuda}:{ld_path}" if ld_path else wsl_cuda
+
+
 def _get_cuda_version_from_driver():
     """Detect CUDA toolkit version from nvidia-smi driver version."""
     try:
+        nvidia_smi = _find_nvidia_smi() or "nvidia-smi"
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=driver_version",
+            [nvidia_smi, "--query-gpu=driver_version",
              "--format=csv,noheader,nounits"],
             text=True, timeout=10,
         ).strip().split("\n")[0]
@@ -152,8 +178,9 @@ def _get_driver_cuda_version():
     Returns None if it can't be determined.
     """
     try:
+        nvidia_smi = _find_nvidia_smi() or "nvidia-smi"
         out = subprocess.check_output(
-            ["nvidia-smi"], text=True, timeout=10, stderr=subprocess.DEVNULL,
+            [nvidia_smi], text=True, timeout=10, stderr=subprocess.DEVNULL,
         )
         # Parse "CUDA Version: 12.8" from nvidia-smi header
         for line in out.split("\n"):
@@ -169,20 +196,17 @@ def _get_driver_cuda_version():
 def _get_required_cuda_version():
     """Determine which CUDA toolkit version to install.
 
-    Prefers the driver's supported version (most likely to be in repos),
-    falling back to the minimum required for this GPU's compute capability.
+    Uses the minimum toolkit version needed for the GPU architecture. The CUDA
+    version printed by nvidia-smi is the driver's maximum supported runtime API,
+    not the toolkit version Krasis needs to build or run. On WSL2 especially, a
+    new Windows driver may advertise a newer CUDA version than NVIDIA's WSL
+    toolkit repo provides.
     Returns (major, minor) tuple, e.g. (12, 8).
     """
-    # Prefer the driver's CUDA version — it's the most compatible and
-    # most likely to exist in the NVIDIA package repos
-    driver_ver = _get_driver_cuda_version()
-    if driver_ver is not None:
-        return driver_ver
-
-    # Fallback: minimum version based on compute capability
     try:
+        nvidia_smi = _find_nvidia_smi() or "nvidia-smi"
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=compute_cap",
+            [nvidia_smi, "--query-gpu=compute_cap",
              "--format=csv,noheader,nounits"],
             text=True, timeout=10,
         ).strip().split("\n")[0]
@@ -595,6 +619,8 @@ def _install_session_deps():
 def main():
     global _auto_approve
 
+    _ensure_wsl_cuda_env()
+
     print(f"\n{BOLD}{CYAN}Krasis Setup{NC}")
     print(f"{DIM}{'─' * 50}{NC}\n")
 
@@ -606,8 +632,17 @@ def main():
     # Check for NVIDIA GPU — Krasis requires GPU for prefill
     if not _has_nvidia_gpu():
         print(f"{RED}No NVIDIA GPU detected. Krasis requires at least one NVIDIA GPU.{NC}")
-        print(f"  If you have an NVIDIA GPU, install the driver first:")
-        print(f"    sudo apt install nvidia-driver-560  # or newer")
+        if _is_wsl():
+            print(f"  WSL2 must see the Windows NVIDIA driver through /usr/lib/wsl/lib.")
+            print(f"  Check inside WSL:")
+            print(f"    ls -l /usr/lib/wsl/lib/nvidia-smi /usr/lib/wsl/lib/libcuda.so.1")
+            print(f"    /usr/lib/wsl/lib/nvidia-smi")
+            print(f"  If those files are missing or nvidia-smi fails, install/update the")
+            print(f"  Windows NVIDIA driver with WSL CUDA support, then run: wsl --shutdown")
+            print(f"  Do not install a Linux nvidia-driver package inside WSL.")
+        else:
+            print(f"  If you have an NVIDIA GPU, install the driver first:")
+            print(f"    sudo apt install nvidia-driver-560  # or newer")
         sys.exit(1)
 
     print(f"NVIDIA GPU detected.\n")
