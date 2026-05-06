@@ -13,12 +13,13 @@
 #   ./dev benchmark <config>        Run standard benchmark (prefill/decode/round trip) and exit
 #   ./dev speed-test                Run the fixed standard speed benchmark (QCN INT4 HQQ8 k4v4)
 #   ./dev perplexity <config>       Run perplexity eval (WikiText-2 by default) and exit
-#   ./dev release-test <model>      Run full release test (release config matrix, produces report)
+#   ./dev release-test <model>      Run full release test (launcher matrix + release config matrix, produces report)
 #   ./dev release-test-all [target]  Run release test on all supported models sequentially
 #                                     If a target name is given (e.g. "rc8"), progress is saved
 #                                     to a state file. Re-running with the same target resumes
 #                                     from the first non-passed model. Without a target, runs
 #                                     all models with no resume capability.
+#   ./dev launcher-test             Validate launcher config serialization and server startup parsing
 #   ./dev reference-test <config>   Compare against stored non-HF references; HF artifacts require override
 #   ./dev reference-test --compare <model>  Comparison matrix; HF artifacts require override
 #   ./dev reference-inventory       Inventory stored reference artifacts and classify contract state
@@ -787,6 +788,9 @@ do_release_test() {
     info "Starting release test for model: $model"
     info "Run dir: $run_dir"
     verify_repo_imports
+    if [[ "${KRASIS_SKIP_RELEASE_LAUNCHER_MATRIX:-}" != "1" ]]; then
+        run_launcher_matrix_test "$run_dir/launcher-matrix" "release-test-launcher-matrix"
+    fi
     KRASIS_DEV_SCRIPT=1 KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="release-test" run_repo_python "$SCRIPT_DIR/tests/release_test.py" "$model" "$@"
 }
 
@@ -858,6 +862,12 @@ do_release_test_all() {
         fi
     done
 
+    # Release-test-all runs the launcher matrix once before model work. Each
+    # per-model release-test then skips the duplicate preflight.
+    local launcher_run_dir
+    launcher_run_dir=$(create_run_dir "release-test-all-launcher-matrix")
+    run_launcher_matrix_test "$launcher_run_dir" "release-test-all-launcher-matrix"
+
     # Session start message
     if $resuming; then
         session-send "$SESSION_WS" "Resuming release-test-all '$release_target': $skipped/$total already passed, $(( total - skipped )) remaining.
@@ -888,7 +898,7 @@ Models: $(printf '%s, ' "${MODELS[@]}" | sed 's/, $//')" 2>/dev/null || warn "Co
         model_start=$(date +%s)
 
         # Run release test — cleanup_gpu is called inside do_release_test
-        if do_release_test "$model"; then
+        if KRASIS_SKIP_RELEASE_LAUNCHER_MATRIX=1 do_release_test "$model"; then
             completed=$((completed + 1))
             local model_elapsed=$(( $(date +%s) - model_start ))
             local model_mins=$((model_elapsed / 60))
@@ -2591,6 +2601,23 @@ do_verify_imports() {
     verify_repo_imports
 }
 
+run_launcher_matrix_test() {
+    local run_dir="$1"
+    local run_type="${2:-launcher-test}"
+    shift 2
+    mkdir -p "$run_dir"
+    info "Running launcher config matrix test"
+    info "Run dir: $run_dir"
+    KRASIS_RUN_DIR="$run_dir" KRASIS_RUN_TYPE="$run_type" \
+        run_repo_python -m unittest discover -s "$SCRIPT_DIR/tests" -p 'test_launcher_matrix.py' "$@"
+}
+
+do_launcher_test() {
+    local run_dir
+    run_dir=$(create_run_dir "launcher-test")
+    run_launcher_matrix_test "$run_dir" "launcher-test" "$@"
+}
+
 # ── Extract --timing flag ────────────────────────────────────────
 # Can appear anywhere in args. Removes it and sets KRASIS_DECODE_TIMING=1.
 TIMING_FLAG=false
@@ -2622,6 +2649,7 @@ case "$cmd" in
     decode-harness) do_decode_harness "$@" ;;
     release-test)   do_release_test "$@" ;;
     release-test-all) do_release_test_all "$@" ;;
+    launcher-test)  do_launcher_test "$@" ;;
     reference-test) do_reference_test "$@" ;;
     witness-inputs) do_witness_inputs "$@" ;;
     witness-model-check) do_witness_model_check "$@" ;;
@@ -2669,6 +2697,7 @@ case "$cmd" in
         echo "  validate <config>              Validate against stored non-HF references; HF artifacts require override"
         echo "  reference-test <config>        Compare against stored non-HF references; HF artifacts require override"
         echo "  reference-test --compare <model>  Comparison matrix; HF artifacts require override"
+        echo "  launcher-test                  Validate launcher config serialization and server startup parsing"
         echo "  reference-inventory            Inventory stored reference artifacts"
         echo "  witness-inputs <model>         Build stored input_token_ids from fixed prompt-source JSON"
         echo "  witness-model-check <model>    Check expected BF16 GGUF witness model readiness"
@@ -2684,7 +2713,7 @@ case "$cmd" in
         echo "  generate-reference <model>     ARCHIVED HF reference capture; requires explicit override"
         echo "  reference-backfill-topk <model>  ARCHIVED HF top-k backfill; requires explicit override"
         echo "  trace-diff <expected> <actual> Diff two KRASIS_TRACE logs offline"
-        echo "  release-test <model>           Run full release test (config matrix, report)"
+        echo "  release-test <model>           Run full release test (launcher matrix, config matrix, report)"
         echo "  release-test-all [target]      Run release test on all supported models sequentially"
         echo ""
         echo "Maintenance commands:"

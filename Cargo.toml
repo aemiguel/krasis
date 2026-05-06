@@ -1,6 +1,6 @@
 [package]
 name = "krasis"
-version = "0.1.66-rc9"
+version = "0.1.66-rc10"
 edition = "2021"
 description = "Hybrid LLM runtime — minimal VRAM, always-on GPU prefill, optimised CPU inference"
 license = "SSPL-1.0"

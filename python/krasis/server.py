@@ -826,6 +826,18 @@ def main():
             "CFG_CPU_DECODE": None,  # CPU decode removed, ignore config key
             "CFG_ATTN_SKIP_AFTER": "attn_skip_after",
         }
+        _BOOL_CFG_KEYS = {
+            "CFG_FORCE_LOAD",
+            "CFG_FORCE_REBUILD_CACHE",
+            "CFG_FORCE_REBUILD_HQQ_CACHE",
+            "CFG_BUILD_CACHE",
+            "CFG_ENABLE_THINKING",
+            "CFG_SESSION_ENABLED",
+            "CFG_HCS",
+            "CFG_MULTI_GPU_HCS",
+            "CFG_DYNAMIC_HCS",
+            "CFG_CPU_DECODE",
+        }
         with open(config_path) as f:
             for line in f:
                 line = line.strip()
@@ -841,6 +853,8 @@ def main():
                     dest = _CFG_KEY_MAP[key]
                     if dest is None:
                         continue  # skip keys not used by server
+                    if val == "" and key not in _BOOL_CFG_KEYS:
+                        continue
                     # Handle special cases for CFG_ format
                     if key == "CFG_SELECTED_GPUS":
                         # Convert comma-separated GPU indices to num_gpus count
@@ -852,18 +866,7 @@ def main():
                             config_defaults["selected_gpus"] = selected
                             config_defaults["num_gpus"] = len(gpu_list)
                         continue
-                    if key in (
-                        "CFG_FORCE_LOAD",
-                        "CFG_FORCE_REBUILD_CACHE",
-                        "CFG_FORCE_REBUILD_HQQ_CACHE",
-                        "CFG_BUILD_CACHE",
-                        "CFG_ENABLE_THINKING",
-                        "CFG_SESSION_ENABLED",
-                        "CFG_HCS",
-                        "CFG_MULTI_GPU_HCS",
-                        "CFG_DYNAMIC_HCS",
-                        "CFG_CPU_DECODE",
-                    ):
+                    if key in _BOOL_CFG_KEYS:
                         # CFG_ format uses "1"/"" for booleans
                         config_defaults[dest] = val == "1"
                         continue

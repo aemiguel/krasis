@@ -394,14 +394,16 @@ def scan_gguf_files(search_dir: str) -> List[Dict[str, Any]]:
 
 CONFIG_KEYS = [
     "MODEL_PATH", "CFG_SELECTED_GPUS", "CFG_PP_PARTITION", "CFG_LAYER_GROUP_SIZE",
-    "CFG_KV_CACHE_MB", "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS", "CFG_CPU_EXPERT_BITS",
+    "CFG_KV_CACHE_MB", "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS",
+    "CFG_EXPERT_GROUP_SIZE", "CFG_CPU_EXPERT_BITS",
     "CFG_GPU_EXPERT_INT4_CALIB",
     "CFG_ATTENTION_QUANT", "CFG_HQQ_CACHE_PROFILE", "CFG_HQQ_GROUP_SIZE", "CFG_HQQ_AUTO_BUDGET_PCT", "CFG_HQQ46_AUTO_BUDGET_MB", "CFG_HQQ_SIDECAR_MANIFEST",
     "CFG_SHARED_EXPERT_QUANT", "CFG_DENSE_MLP_QUANT",
     "CFG_LM_HEAD_QUANT", "CFG_KRASIS_THREADS", "CFG_HOST", "CFG_PORT",
     "CFG_GPU_PREFILL_THRESHOLD", "CFG_GGUF_PATH", "CFG_VRAM_SAFETY_MARGIN",
     "CFG_DYNAMIC_HCS", "CFG_DYNAMIC_HCS_TAIL_BLOCKS",
-    "CFG_FORCE_LOAD", "CFG_ENABLE_THINKING", "CFG_SESSION_ENABLED",
+    "CFG_FORCE_LOAD", "CFG_FORCE_REBUILD_CACHE", "CFG_FORCE_REBUILD_HQQ_CACHE",
+    "CFG_BUILD_CACHE", "CFG_ENABLE_THINKING", "CFG_SESSION_ENABLED",
 ]
 
 
@@ -657,8 +659,8 @@ class LauncherConfig:
             self.session_enabled = saved["CFG_SESSION_ENABLED"] == "1"
 
     def to_save_dict(self) -> Dict[str, Any]:
-        """Convert to dict for saving."""
-        return {
+        """Convert to dict for saving or launch config serialization."""
+        values = {
             "MODEL_PATH": self.model_path,
             "CFG_SELECTED_GPUS": ",".join(str(i) for i in self.selected_gpu_indices),
             "CFG_PP_PARTITION": self.pp_partition,
@@ -672,9 +674,6 @@ class LauncherConfig:
             "CFG_ATTENTION_QUANT": self.attention_quant,
             "CFG_HQQ_CACHE_PROFILE": self.hqq_cache_profile,
             "CFG_HQQ_GROUP_SIZE": str(self.hqq_group_size),
-            "CFG_HQQ_AUTO_BUDGET_PCT": str(self.hqq_auto_budget_pct or ""),
-            "CFG_HQQ46_AUTO_BUDGET_MB": str(self.hqq46_auto_budget_mib or ""),
-            "CFG_HQQ_SIDECAR_MANIFEST": self.hqq_sidecar_manifest,
             "CFG_SHARED_EXPERT_QUANT": self.shared_expert_quant,
             "CFG_DENSE_MLP_QUANT": self.dense_mlp_quant,
             "CFG_LM_HEAD_QUANT": self.lm_head_quant,
@@ -693,6 +692,13 @@ class LauncherConfig:
             "CFG_ENABLE_THINKING": "1" if self.enable_thinking else "0",
             "CFG_SESSION_ENABLED": "1" if self.session_enabled else "0",
         }
+        if self.attention_quant in ("hqq46_auto", "hqq68_auto"):
+            values["CFG_HQQ_AUTO_BUDGET_PCT"] = str(self.hqq_auto_budget_pct)
+        if self.attention_quant == "hqq46_auto" and self.hqq46_auto_budget_mib:
+            values["CFG_HQQ46_AUTO_BUDGET_MB"] = str(self.hqq46_auto_budget_mib)
+        if self.hqq_sidecar_manifest:
+            values["CFG_HQQ_SIDECAR_MANIFEST"] = self.hqq_sidecar_manifest
+        return values
 
 
 # ═══════════════════════════════════════════════════════════════════════
